@@ -1,0 +1,4 @@
+# Installed to /etc/sudoers.d/alasio-standalone by install-alasio-standalone-service.sh.
+# Lets the bot restart itself (and only itself) without a password so
+# restart-alasio-standalone.sh can record provenance and then restart the unit.
+operator ALL=(root) NOPASSWD: /usr/bin/systemctl restart alasio-standalone.service

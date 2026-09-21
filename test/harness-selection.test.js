@@ -483,6 +483,13 @@ test("restart recovery restores the interrupted turn's own harness session", asy
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-1");
     assert.equal(store.getHarnessSessionId(conversationId, CODEX_HARNESS), undefined);
     assert.match(buildRestartSyntheticText("operator_induced"), /You are Codex/);
+    assert.match(buildRestartSyntheticText("operator_induced"), /connected through `alasio\.service`/);
+    assert.match(buildRestartSyntheticText("operator_induced"), /bots\/alasio\/restart-alasio-operator\.sh`; from that directory use `\.\/restart-alasio-operator\.sh`/);
+    const standaloneEnv = { ALASIO_SERVICE_UNIT: "alasio-standalone.service", ALASIO_RESTART_WRAPPER: "/home/operator/alasio/restart-alasio-standalone.sh" };
+    const standalone = buildRestartSyntheticText("self_induced", CLAUDE_HARNESS, standaloneEnv);
+    assert.match(standalone, /You are Claude, connected through `alasio-standalone\.service`/);
+    assert.match(standalone, /`\/home\/operator\/alasio\/restart-alasio-standalone\.sh`; from that directory use `\.\/restart-alasio-standalone\.sh`/);
+    assert.match(standalone, /not raw `sudo systemctl restart alasio-standalone\.service`/);
   });
 });
 

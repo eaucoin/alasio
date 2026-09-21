@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SOURCE="$SCRIPT_DIR/systemd/alasio-standalone.service"
 UNIT_NAME="alasio-standalone.service"
+SUDOERS_SOURCE="$SCRIPT_DIR/systemd/alasio-standalone.sudoers"
+SUDOERS_TARGET="/etc/sudoers.d/alasio-standalone"
 
 if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
   echo "Missing $SCRIPT_DIR/.env (copy .env.example and fill it in)" >&2
@@ -29,6 +31,9 @@ if grep -q '"url_set": true' <<<"$DOCTOR_OUTPUT"; then
 fi
 
 sudo install -m 0644 "$UNIT_SOURCE" "/etc/systemd/system/$UNIT_NAME"
+# Passwordless restart of this one unit so ./restart-alasio-standalone.sh works from inside the bot.
+sudo visudo -cf "$SUDOERS_SOURCE"
+sudo install -m 0440 "$SUDOERS_SOURCE" "$SUDOERS_TARGET"
 sudo systemctl daemon-reload
 sudo systemctl enable --now "$UNIT_NAME"
 sleep 3

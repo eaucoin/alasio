@@ -43,7 +43,10 @@ mindmap
       Production runs from the isolated `/home/operator/monorepo-alasio-runtime/bots/alasio` deployment checkout while Codex works in `/home/operator/monorepo`
       The standalone checkout at `/home/operator/alasio` runs as `alasio-standalone.service` from `./install-alasio-standalone-service.sh` with its own `.env` `ALASIO_STATE_DIR` and `ALASIO_HOOK_PORT` so it coexists with `alasio.service`
       `.env.example` documents the standalone environment and `.env` stays mode 0600 and untracked because it holds the bot token
-      the standalone bot has no restart-provenance wrapper yet so `sudo systemctl restart alasio-standalone.service` is its only restart path
+      the standalone bot restarts with `./restart-alasio-standalone.sh` from `/home/operator/alasio` which records operator_induced provenance in its own state directory before restarting `alasio-standalone.service`
+      `install-alasio-standalone-service.sh` installs `systemd/alasio-standalone.sudoers` as a NOPASSWD rule scoped to restarting that one unit so the bot can restart itself without a password
+      the standalone unit sets `ALASIO_SERVICE_UNIT` and `ALASIO_RESTART_WRAPPER` so post-restart prompts name the standalone unit and wrapper instead of the deployment checkout paths
+      self-restart detection treats `restart-alasio-standalone.sh` and `systemctl restart alasio-standalone.service` as self-induced the same way as the deployment wrapper
       Normal restarts run from the deployment checkout with `./restart-alasio-operator.sh`
       Equivalent absolute restart path is `/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh`
       Wrapper calls from another checkout delegate to the systemd unit WorkingDirectory instead of restarting from source

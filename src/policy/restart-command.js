@@ -1,8 +1,11 @@
 import { resolveCommandTokens, tokenizeShellCommand, unwrapShellCommandOnce } from "./shell-command.js";
 
-const SERVICE_RESTART_PATTERN = /^(?:(?:\/usr\/bin\/)?sudo(?:\s+-n)?\s+)?(?:\/usr\/bin\/)?systemctl\s+restart\s+alasio(?:\.service)?$/i;
-const SERVICE_RESTART_NEAR_MISS_PATTERN = /^(?:(?:\/usr\/bin\/)?sudo(?:\s+-n)?\s+)?(?:\/usr\/bin\/)?systemctl\s+restart\s+alasio(?:\.service)?(?:\s+.+)?$/i;
-const ALASIO_CD_PREFIX_PATTERN = /^cd\s+(?:"\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?"|'\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?'|\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?|"bots\/alasio"|'bots\/alasio'|bots\/alasio)\s*&&\s*([\s\S]+)$/i;
+// Both the deployment unit (alasio.service) and the standalone checkout unit
+// (alasio-standalone.service) count as self-restarts; each has its own wrapper.
+const SERVICE_RESTART_PATTERN = /^(?:(?:\/usr\/bin\/)?sudo(?:\s+-n)?\s+)?(?:\/usr\/bin\/)?systemctl\s+restart\s+alasio(?:-standalone)?(?:\.service)?$/i;
+const SERVICE_RESTART_NEAR_MISS_PATTERN = /^(?:(?:\/usr\/bin\/)?sudo(?:\s+-n)?\s+)?(?:\/usr\/bin\/)?systemctl\s+restart\s+alasio(?:-standalone)?(?:\.service)?(?:\s+.+)?$/i;
+const ALASIO_CD_PREFIX_PATTERN = /^cd\s+(?:"\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?"|'\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?'|\/home\/operator\/monorepo-alasio-runtime(?:\/bots\/alasio)?|"\/home\/operator\/alasio"|'\/home\/operator\/alasio'|\/home\/operator\/alasio|"bots\/alasio"|'bots\/alasio'|bots\/alasio)\s*&&\s*([\s\S]+)$/i;
+const RESTART_WRAPPER_NAMES = new Set(["restart-alasio-operator.sh", "restart-alasio-standalone.sh"]);
 
 function candidateCommands(command) {
   const trimmed = command.trim();
@@ -22,11 +25,11 @@ function stripAlasioCdPrefix(command) {
 function isRestartScriptInvocation(command) {
   const normalized = stripAlasioCdPrefix(command);
   const { exe, args } = resolveCommandTokens(tokenizeShellCommand(normalized));
-  if (exe === "restart-alasio-operator.sh") {
+  if (RESTART_WRAPPER_NAMES.has(exe)) {
     return args.length === 0;
   }
   if ((exe === "bash" || exe === "sh") && args.length === 1) {
-    return args[0].split("/").pop() === "restart-alasio-operator.sh";
+    return RESTART_WRAPPER_NAMES.has(args[0].split("/").pop());
   }
   return false;
 }
@@ -34,11 +37,11 @@ function isRestartScriptInvocation(command) {
 function isRestartScriptNearMiss(command) {
   const normalized = stripAlasioCdPrefix(command);
   const { exe, args } = resolveCommandTokens(tokenizeShellCommand(normalized));
-  if (exe === "restart-alasio-operator.sh") {
+  if (RESTART_WRAPPER_NAMES.has(exe)) {
     return args.length > 0;
   }
   if (exe === "bash" || exe === "sh") {
-    return args.some((arg) => arg.split("/").pop() === "restart-alasio-operator.sh") && !isRestartScriptInvocation(normalized);
+    return args.some((arg) => RESTART_WRAPPER_NAMES.has(arg.split("/").pop())) && !isRestartScriptInvocation(normalized);
   }
   return false;
 }
