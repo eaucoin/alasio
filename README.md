@@ -4,7 +4,7 @@ mindmap
   root((alasio))
     Service selection
       alasio drives two harnesses Codex app-server and Claude Code through the Claude Agent SDK behind one harness adapter boundary
-      `/service` shows the active harness and both parked session pointers and switches with `Use Codex` or `Use Claude Code` buttons or `/service codex` and `/service claude`
+      `/service` shows the active harness and both parked session pointers and switches with `Use Codex` or `Use Claude` buttons or `/service codex` and `/service claude`
       each Telegram conversation has at most one active harness and switching is refused while a turn is active or prompts are queued
       conversations are neutral by default so until the operator mounts a service through `/service` every prompt `/start` and harness-scoped control is answered only with the service picker and nothing is queued
       the folder is the layer after the service so once a service is mounted `/workspace` must choose or create the folder the harness works in before any prompt is queued and mounting a service chains straight into the folder picker

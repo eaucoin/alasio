@@ -237,7 +237,7 @@ export async function executeClaudeTurn(params) {
           turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
           appendBlock(blockSequence, persistence, pendingResponseId, {
             type: "text",
-            content: `Error: ${projected?.error ?? "Claude Code did not complete"}`,
+            content: `Error: ${projected?.error ?? "Claude did not complete"}`,
           });
         }
         const cacheRead = cacheReadTokensFromUsage(projected?.usage);

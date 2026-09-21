@@ -16,7 +16,7 @@ export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS]);
 
 const DISPLAY_NAMES = Object.freeze({
   [CODEX_HARNESS]: "Codex",
-  [CLAUDE_HARNESS]: "Claude Code",
+  [CLAUDE_HARNESS]: "Claude",
 });
 
 export function isHarnessName(candidate) {

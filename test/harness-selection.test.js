@@ -122,7 +122,7 @@ test("harness names normalize operator spellings", () => {
   assert.equal(normalizeHarnessName("codex"), CODEX_HARNESS);
   assert.equal(normalizeHarnessName("gemini"), CODEX_HARNESS);
   assert.equal(normalizeHarnessName("gemini", null), null);
-  assert.equal(harnessDisplayName(CLAUDE_HARNESS), "Claude Code");
+  assert.equal(harnessDisplayName(CLAUDE_HARNESS), "Claude");
   assert.equal(resolveHarnessName({}, "telegram:1"), null);
   assert.equal(resolveHarnessName({ getActiveHarness: () => CLAUDE_HARNESS }, "telegram:1"), CLAUDE_HARNESS);
 });
@@ -396,8 +396,8 @@ test("switching services is refused while a turn is active or prompts are queued
     await assert.rejects(() => turns.switchHarness({ conversationId, harness: "gemini" }), /Unknown service/);
 
     activeQueries.set(conversationId, { abort: async () => undefined, steer: async () => false });
-    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "plain" }), /Claude Code is currently working/);
-    await assert.rejects(() => turns.createWorkspace({ conversationId, name: "fresh" }), /Claude Code is currently working/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "plain" }), /Claude is currently working/);
+    await assert.rejects(() => turns.createWorkspace({ conversationId, name: "fresh" }), /Claude is currently working/);
     activeQueries.delete(conversationId);
     const same = await turns.switchWorkspace({ conversationId, target: "repo" });
     assert.deepEqual(same, { switched: false, previous: paths.repo, workingDirectory: paths.repo });
@@ -479,7 +479,7 @@ test("restart recovery restores the interrupted turn's own harness session", asy
     const [turn] = store.getActiveTurns();
     const job = store.stageRestartRecovery({ turn, prompt: buildRestartSyntheticText("self_induced", turn.harness) });
     assert.equal(job.harness, CLAUDE_HARNESS);
-    assert.match(job.prompt, /You are Claude Code, connected through `alasio.service`/);
+    assert.match(job.prompt, /You are Claude, connected through `alasio.service`/);
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-1");
     assert.equal(store.getHarnessSessionId(conversationId, CODEX_HARNESS), undefined);
     assert.match(buildRestartSyntheticText("operator_induced"), /You are Codex/);
@@ -495,7 +495,7 @@ test("service panel lists both harness mounts and offers the inactive switch", a
     assert.match(neutral.text, /No service is mounted/);
     assert.deepEqual(
       neutral.options.reply_markup.inline_keyboard.flat().map((button) => button.text),
-      ["Use Codex", "Use Claude Code", "Close"],
+      ["Use Codex", "Use Claude", "Close"],
     );
 
     store.setActiveHarness(conversationId, CODEX_HARNESS);
@@ -503,9 +503,9 @@ test("service panel lists both harness mounts and offers the inactive switch", a
     const panel = buildServicePanel({ store, activeQueries: new Map(), conversationId });
     assert.match(panel.text, /Active: Codex/);
     assert.match(panel.text, /\* Codex: session codex-ab/);
-    assert.match(panel.text, /Claude Code: no mounted session/);
+    assert.match(panel.text, /Claude: no mounted session/);
     const buttons = panel.options.reply_markup.inline_keyboard.flat().map((button) => button.text);
-    assert.deepEqual(buttons, ["Use Claude Code", "Close"]);
+    assert.deepEqual(buttons, ["Use Claude", "Close"]);
   });
 });
 
@@ -530,8 +530,8 @@ test("/service text command switches and reports the outcome", async () => {
       switchHarness,
     });
     assert.deepEqual(switches, [{ conversationId, harness: CLAUDE_HARNESS }]);
-    assert.match(client.calls.sendMessage[0][1], /Mounted Claude Code\. Send a message to start\./);
-    assert.match(client.calls.sendMessage[0][1], /Active: Claude Code/);
+    assert.match(client.calls.sendMessage[0][1], /Mounted Claude\. Send a message to start\./);
+    assert.match(client.calls.sendMessage[0][1], /Active: Claude/);
 
     await handleServiceTextCommand({
       client,
@@ -625,7 +625,7 @@ test("prompts sent before a service and folder are chosen only get the pickers a
     assert.match(client.calls.sendMessage[0][1], /your message was not queued/);
     assert.deepEqual(
       client.calls.sendMessage[0][2].reply_markup.inline_keyboard.flat().map((button) => button.text),
-      ["Use Codex", "Use Claude Code", "Close"],
+      ["Use Codex", "Use Claude", "Close"],
     );
     assert.equal(store.hasOpenPromptJobs(conversationId), false);
     assert.equal(store.claimNextPromptJob(conversationId) ?? null, null);
@@ -638,7 +638,7 @@ test("prompts sent before a service and folder are chosen only get the pickers a
     assert.equal(client.calls.sendMessage[2][1], "No active query to stop.");
 
     await turns.processPrompt({ conversationId, chatId: "12", messageId: "4", text: "/service claude", filePaths: [] });
-    assert.match(client.calls.sendMessage[3][1], /Mounted Claude Code/);
+    assert.match(client.calls.sendMessage[3][1], /Mounted Claude/);
     assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
     // Service first, then folder: the folder picker follows immediately.
     assert.match(client.calls.sendMessage[4][1], /Workspace\n\nFolder: none/);
@@ -665,7 +665,7 @@ test("prompts sent before a service and folder are chosen only get the pickers a
     assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
 
     await turns.processPrompt({ conversationId, chatId: "12", messageId: "9", text: "/sessions new", filePaths: [] });
-    assert.match(client.calls.sendMessage[9][1], /New Claude Code session mounted: claude-f/);
+    assert.match(client.calls.sendMessage[9][1], /New Claude session mounted: claude-f/);
     assert.equal(claude.calls.length, 1);
     assert.equal(codex.calls.length, 0);
 

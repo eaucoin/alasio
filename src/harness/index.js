@@ -38,7 +38,7 @@ export function resolveWorkingDirectory(store, conversationId) {
   return typeof workingDirectory === "string" && workingDirectory.trim() ? workingDirectory : null;
 }
 
-export const NO_SERVICE_MOUNTED = "No service is mounted. Use /service to choose Codex or Claude Code.";
+export const NO_SERVICE_MOUNTED = "No service is mounted. Use /service to choose Codex or Claude.";
 export const NO_WORKSPACE_MOUNTED = "No folder is mounted. Use /workspace to choose or create one.";
 
 const FACTORIES = {

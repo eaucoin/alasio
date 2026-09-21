@@ -122,7 +122,7 @@ export function projectResultMessage(message) {
   if (message.subtype !== "success" || message.is_error) {
     const detail = errors.length > 0
       ? errors.join("\n")
-      : (typeof message.result === "string" && message.result.trim() ? message.result : `Claude Code ended with ${message.subtype}`);
+      : (typeof message.result === "string" && message.result.trim() ? message.result : `Claude ended with ${message.subtype}`);
     return { ok: false, error: detail, usage: message.usage ?? null };
   }
   return {

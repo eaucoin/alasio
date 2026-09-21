@@ -10,7 +10,7 @@ import { truncateText } from "./text.js";
 
 const SERVICE_KIND_PREFIX = "service:";
 
-export const CHOOSE_SERVICE_NOTICE = "No service is mounted. Choose Codex or Claude Code to start; your message was not queued.";
+export const CHOOSE_SERVICE_NOTICE = "No service is mounted. Choose Codex or Claude to start; your message was not queued.";
 
 function serviceKind(kind) {
   return `${SERVICE_KIND_PREFIX}${kind}`;
