@@ -1,5 +1,6 @@
-import { interruptCodexTurn } from "../codex/runtime.js";
+import { interruptActiveTurn, isHarnessName } from "../harness/index.js";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.js";
+import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.js";
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.js";
 
 function clientAfterCallbackAck(client) {
@@ -40,6 +41,14 @@ export class CallbackHandler {
       await this.client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
       return;
     }
+    if (!action.kind.endsWith(":close")
+      && !isServiceControlAction(action.kind)
+      && isHarnessName(action.payload?.expectedHarness)
+      && this.store.getActiveHarness?.(action.conversationId) !== action.payload.expectedHarness) {
+      await this.client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
+      return;
+    }
+    const harness = this.turns.harnessFor(action.conversationId);
     const chatId = callbackQuery.message?.chat?.id;
     const messageId = callbackQuery.message?.message_id;
     if (!chatId || !messageId) {
@@ -54,9 +63,23 @@ export class CallbackHandler {
       await handleSessionControlCallback({
         client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
         store: this.store,
+        harness,
         activeQueries: this.activeQueries,
         action,
         startNewSession: (args) => this.turns.startNewSession(args),
+        callbackQueryId: callbackQuery.id,
+        chatId,
+        messageId,
+      });
+      return;
+    }
+    if (isServiceControlAction(action.kind)) {
+      await handleServiceControlCallback({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        action,
+        switchHarness: (args) => this.turns.switchHarness(args),
         callbackQueryId: callbackQuery.id,
         chatId,
         messageId,
@@ -74,7 +97,7 @@ export class CallbackHandler {
           this.turns.enqueueMessage(action.conversationId, prompt);
         }
         await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-        await this.client.editMessageText(chatId, messageId, "Codex is not ready to steer yet. Queued instead.");
+        await this.client.editMessageText(chatId, messageId, `${harness.displayName} is not ready to steer yet. Queued instead.`);
         return;
       }
       try {
@@ -83,7 +106,7 @@ export class CallbackHandler {
           this.turns.setPromptDisposition(promptJob.id, "completed");
         }
         await this.client.answerCallbackQuery(callbackQuery.id, "Steered.");
-        await this.client.editMessageText(chatId, messageId, "Sent as guidance to the active Codex turn.");
+        await this.client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
       } catch (error) {
         if (promptJob) {
           this.turns.setPromptDisposition(promptJob.id, "pending");
@@ -97,6 +120,10 @@ export class CallbackHandler {
       return;
     }
     if (isGoalControlAction(action.kind)) {
+      if (!harness.supportsGoals && !action.kind.endsWith(":close")) {
+        await this.client.answerCallbackQuery(callbackQuery.id, `Goals are a Codex feature; ${harness.displayName} is active.`);
+        return;
+      }
       const acknowledged = !action.kind.endsWith(":close");
       if (acknowledged) {
         await this.client.answerCallbackQuery(callbackQuery.id, "Working...");
@@ -110,7 +137,7 @@ export class CallbackHandler {
         chatId,
         messageId,
         runGoalTurn: (args) => this.turns.runGoalTurn(args),
-        stopActiveTurn: async () => await interruptCodexTurn(this.activeQueries, action.conversationId),
+        stopActiveTurn: async () => await interruptActiveTurn(this.activeQueries, action.conversationId),
         isTurnActive: this.activeQueries.has(action.conversationId),
       });
       return;
@@ -122,7 +149,7 @@ export class CallbackHandler {
         this.turns.enqueueMessage(action.conversationId, action.payload.prompt);
       }
       await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-      await this.client.editMessageText(chatId, messageId, "Queued. Codex will process this after the current task.");
+      await this.client.editMessageText(chatId, messageId, `Queued. ${harness.displayName} will process this after the current task.`);
       return;
     }
     if (action.kind === "discard") {
@@ -147,7 +174,7 @@ export class CallbackHandler {
         void this.turns.scheduleConversation(action.conversationId);
       }
       await this.client.answerCallbackQuery(callbackQuery.id, "Swerving.");
-      await this.client.editMessageText(chatId, messageId, "Swerving Codex to this message.");
+      await this.client.editMessageText(chatId, messageId, `Swerving ${harness.displayName} to this message.`);
       return;
     }
     await this.client.answerCallbackQuery(callbackQuery.id, "Unknown action.");

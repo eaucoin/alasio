@@ -1,5 +1,5 @@
-import { shutdownCodexRuntime, warmCodexSession } from "../codex/runtime.js";
 import { TurnController } from "../codex/turn-controller.js";
+import { CODEX_HARNESS, createHarnessRegistry } from "../harness/index.js";
 import { HOOK_SERVER_PORT } from "../shared/runtime-constants.js";
 import { SqliteStore } from "../persistence/store.js";
 import { Authorizer } from "./authorizer.js";
@@ -30,6 +30,7 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
+    this.harnesses = config.harnesses ?? createHarnessRegistry({ config });
     this.turns = new TurnController({
       config: this.config,
       client: this.client,
@@ -39,6 +40,7 @@ export class TelegramCodexApp {
       workflowWaits: this.workflowWaits,
       workflowWakeEvents: this.workflowWakeEvents,
       isStopping: () => this.isStopping,
+      harnesses: this.harnesses,
     });
     this.callbacks = new CallbackHandler({
       authorizer: this.authorizer,
@@ -72,8 +74,9 @@ export class TelegramCodexApp {
 
   async start() {
     const me = await this.client.getMe();
-    log.info(`Starting Telegram Codex bot as @${me.username ?? me.id}`);
+    log.info(`Starting Telegram alasio bot as @${me.username ?? me.id}`);
     log.info(`  Working directory: ${this.config.workingDirectory}`);
+    log.info(`  Default service: ${this.config.defaultHarness ?? CODEX_HARNESS}`);
     await this.client.deleteWebhook(false);
     await this.configureNativeCommands();
     this.startHookServer();
@@ -85,7 +88,7 @@ export class TelegramCodexApp {
     this.turns.resumePendingPrompts();
     this.poller.start();
     this.startCompletedResponseRecovery();
-    this.warmLinkedCodexSessions().catch((error) => {
+    this.warmLinkedSessions().catch((error) => {
       log.warn(`Linked Codex session warmup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
@@ -104,17 +107,18 @@ export class TelegramCodexApp {
       this.hookServer = null;
     }
     await this.poller.stop();
-    shutdownCodexRuntime();
+    this.harnesses.shutdownAll();
     this.store.close();
   }
 
   async configureNativeCommands() {
     try {
       await this.client.setMyCommands([
-        { command: "session", description: "Manage the mounted Codex session" },
-        { command: "sessions", description: "Browse and mount Codex sessions" },
-        { command: "goal", description: "View or set the mounted session goal" },
-        { command: "stop", description: "Interrupt the active Codex turn" },
+        { command: "service", description: "Switch between Codex and Claude Code" },
+        { command: "session", description: "Manage the mounted agent session" },
+        { command: "sessions", description: "Browse and mount agent sessions" },
+        { command: "goal", description: "View or set the mounted session goal (Codex)" },
+        { command: "stop", description: "Interrupt the active turn" },
       ]);
       await this.client.setChatMenuButton({ type: "commands" });
     } catch (error) {
@@ -134,26 +138,33 @@ export class TelegramCodexApp {
     this.completedResponseRecoveryTimer.unref?.();
   }
 
-  async warmLinkedCodexSessions() {
+  async warmLinkedSessions() {
     if (!this.config.warmLinkedSessions) {
-      log.info("Skipping Codex session warmup because warmLinkedSessions is false");
+      log.info("Skipping session warmup because warmLinkedSessions is false");
       return;
     }
-    const conversations = this.store.listConversationsWithSessions();
-    if (conversations.length === 0) {
-      log.info("No linked Codex sessions to warm");
-      return;
-    }
-    for (const conversation of conversations) {
-      try {
-        log.info(`Warming Codex session ${conversation.codex_session_id.slice(0, 8)} for ${conversation.id}`);
-        await warmCodexSession({
-          sessionId: conversation.codex_session_id,
-          threadKey: conversation.id,
-          workingDirectory: this.config.workingDirectory,
-        });
-      } catch (error) {
-        log.warn(`Failed to warm Codex session for ${conversation.id}: ${error instanceof Error ? error.message : String(error)}`);
+    for (const harnessName of this.harnesses.names) {
+      const harness = this.harnesses.get(harnessName);
+      if (!harness.supportsWarmup) {
+        continue;
+      }
+      const conversations = this.store.listConversationsWithSessions(harnessName);
+      if (conversations.length === 0) {
+        log.info(`No linked ${harness.displayName} sessions to warm`);
+        continue;
+      }
+      for (const conversation of conversations) {
+        const sessionId = conversation.session_id ?? conversation.codex_session_id;
+        try {
+          log.info(`Warming ${harness.displayName} session ${sessionId.slice(0, 8)} for ${conversation.id}`);
+          await harness.warmSession({
+            sessionId,
+            threadKey: conversation.id,
+            workingDirectory: this.config.workingDirectory,
+          });
+        } catch (error) {
+          log.warn(`Failed to warm ${harness.displayName} session for ${conversation.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
     }
   }

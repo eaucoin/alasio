@@ -1,5 +1,5 @@
-import { executeCodexTurn, startFreshCodexSession } from "./runtime.js";
 import { RestartRecovery } from "./restart-recovery.js";
+import { createHarnessRegistry, isHarnessName } from "../harness/index.js";
 import { finalResponseToMarkdown } from "./response-markdown.js";
 import { buildFilePromptSuffix } from "../shared/file-prompt.js";
 import { CommandHandler } from "../operator/command-handler.js";
@@ -10,7 +10,7 @@ import { createLogger } from "../shared/log.js";
 const log = createLogger("codex-turn-controller");
 
 export class TurnController {
-  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping }) {
+  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null }) {
     this.config = config;
     this.client = client;
     this.store = store;
@@ -18,14 +18,17 @@ export class TurnController {
     this.isStopping = isStopping;
     this.queuedMessages = new Map();
     this.promptWorkers = new Map();
+    this.harnesses = harnesses ?? createHarnessRegistry({ config });
     this.commands = new CommandHandler({
       client,
       config,
       store,
       activeQueries,
+      harnesses: this.harnesses,
       runCodexTurn: (args) => this.runCodexTurn(args),
       runGoalTurn: (args) => this.runGoalTurn(args),
       startNewSession: (args) => this.startNewSession(args),
+      switchHarness: (args) => this.switchHarness(args),
     });
     this.status = new StatusReporter({
       client,
@@ -36,6 +39,46 @@ export class TurnController {
       log,
     });
     this.recovery = new RestartRecovery({ store });
+  }
+
+  harnessFor(conversationId) {
+    return this.harnesses.forConversation(this.store, conversationId);
+  }
+
+  harnessLabel(conversationId) {
+    return this.harnessFor(conversationId).displayName;
+  }
+
+  describeSwitchBlocker(conversationId) {
+    if (this.activeQueries.has(conversationId)) {
+      return `${this.harnessLabel(conversationId)} is currently working. Stop the active turn before switching services.`;
+    }
+    if (this.store.hasOpenPromptJobs?.(conversationId)) {
+      return "Queued prompts are still waiting for the current service. Let them finish or discard them before switching.";
+    }
+    return null;
+  }
+
+  async switchHarness({ conversationId, harness }) {
+    if (!isHarnessName(harness)) {
+      throw new Error(`Unknown service: ${String(harness)}`);
+    }
+    const previous = this.store.getActiveHarness(conversationId);
+    if (previous === harness) {
+      return { switched: false, previous, next: harness, sessionId: this.store.getSessionId(conversationId) ?? null };
+    }
+    const blocker = this.describeSwitchBlocker(conversationId);
+    if (blocker) {
+      throw new Error(blocker);
+    }
+    this.store.setActiveHarness(conversationId, harness);
+    log.info(`service.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${harness}`);
+    return {
+      switched: true,
+      previous,
+      next: harness,
+      sessionId: this.store.getSessionId(conversationId) ?? null,
+    };
   }
 
   enqueueMessage(conversationId, prompt, front = false) {
@@ -97,6 +140,10 @@ export class TurnController {
       if (!job) {
         return;
       }
+      const activeHarness = this.harnessFor(conversationId).name;
+      if (job.harness && job.harness !== activeHarness) {
+        log.warn(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
+      }
       try {
         const completed = await this.runCodexTurn({
           conversationId,
@@ -111,7 +158,7 @@ export class TurnController {
         this.store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled");
       } catch (error) {
         this.store.failPromptJob(job.id, error);
-        await this.client.sendMessage(job.chat_id, `Codex hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+        await this.client.sendMessage(job.chat_id, `${this.harnessLabel(conversationId)} hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
       }
     }
   }
@@ -140,10 +187,11 @@ export class TurnController {
   }
 
   async startNewSession({ conversationId }) {
+    const harness = this.harnessFor(conversationId);
     if (this.activeQueries.has(conversationId)) {
-      throw new Error("Codex is currently working. Stop the active turn before starting a new session.");
+      throw new Error(`${harness.displayName} is currently working. Stop the active turn before starting a new session.`);
     }
-    const sessionId = await startFreshCodexSession({
+    const sessionId = await harness.startFreshSession({
       threadKey: conversationId,
       workingDirectory: this.config.workingDirectory,
     });
@@ -157,7 +205,7 @@ export class TurnController {
     const steerAction = this.store.createCallbackAction({ conversationId, kind: "steer", payload });
     const swerveAction = this.store.createCallbackAction({ conversationId, kind: "swerve", payload });
     const discardAction = this.store.createCallbackAction({ conversationId, kind: "discard", payload });
-    await this.client.sendMessage(chatId, `Codex is currently working. What should I do with this message?\n\n${truncateText(visibleText, 220)}`, {
+    await this.client.sendMessage(chatId, `${this.harnessLabel(conversationId)} is currently working. What should I do with this message?\n\n${truncateText(visibleText, 220)}`, {
       reply_markup: {
         inline_keyboard: [[
           { text: "Steer", callback_data: steerAction },
@@ -204,11 +252,16 @@ export class TurnController {
   }
 
   async runCodexTurnWithSession({ conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }) {
+    const harness = this.harnessFor(conversationId);
+    if (attachedTurn && !harness.supportsGoals) {
+      throw new Error(`${harness.displayName} does not support attached goal turns.`);
+    }
     this.store.upsertActiveTurn({
       conversationId,
       chatId: String(chatId),
       messageId: String(messageId),
       sessionId: existingSession ?? null,
+      harness: harness.name,
       pendingResponseId: null,
       prompt,
       startedAt: Date.now() / 1000,
@@ -220,12 +273,13 @@ export class TurnController {
       chatId,
       signal: statusAbortController.signal,
       sessionId: existingSession ?? null,
+      harnessName: harness.displayName,
       onStatusMessageCreated: (createdMessageId, startTime) => {
         statusMessageId = createdMessageId;
         statusStartTime = startTime;
       },
     });
-    const queryResult = await executeCodexTurn({
+    const queryResult = await harness.executeTurn({
       prompt,
       resumeSession: existingSession ?? null,
       threadKey: conversationId,
@@ -264,7 +318,7 @@ export class TurnController {
       this.store.setSessionId(conversationId, newSessionId);
     }
     if (interrupted) {
-      await this.status.finishWithoutResponse({ chatId, pendingResponseId, statusMessageId });
+      await this.status.finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, harnessName: harness.displayName });
       this.store.clearActiveTurn(conversationId, pendingResponseId);
       this.store.clearRestartEvent(conversationId);
       const queued = this.queuedMessages.get(conversationId);
@@ -284,14 +338,14 @@ export class TurnController {
         chatId,
         pendingResponseId,
         statusMessageId,
-        statusText: "Codex did not complete.",
+        statusText: `${harness.displayName} did not complete.`,
       });
       this.store.clearActiveTurn(conversationId, pendingResponseId);
       this.store.clearRestartEvent(conversationId);
     } else {
       try {
         const response = finalResponseToMarkdown(blockSequence);
-        await this.status.postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime });
+        await this.status.postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime, harnessName: harness.displayName });
       } catch (error) {
         log.error(`Final response handoff deferred for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
       } finally {

@@ -19,7 +19,7 @@ export class RestartRecovery {
       }
       this.store.stageRestartRecovery({
         turn,
-        prompt: buildRestartSyntheticText(restartEvent.cause),
+        prompt: buildRestartSyntheticText(restartEvent.cause, turn.harness ?? this.store.getActiveHarness?.(conversationId)),
       });
     }
   }

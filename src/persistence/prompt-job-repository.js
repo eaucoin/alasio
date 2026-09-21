@@ -1,3 +1,4 @@
+import { CODEX_HARNESS, isHarnessName } from "../harness/names.js";
 import { newId } from "../shared/ids.js";
 
 function mapRow(row) {
@@ -9,14 +10,14 @@ export class SqlitePromptJobRepository {
     this.db = db;
   }
 
-  enqueue({ conversationId, chatId, messageId, prompt, filePaths = [], state = "pending", priority = 0 }) {
+  enqueue({ conversationId, chatId, messageId, prompt, filePaths = [], state = "pending", priority = 0, harness = CODEX_HARNESS }) {
     const id = newId();
     this.db.prepare(`
       insert into prompt_jobs
-        (id, conversation_id, chat_id, message_id, prompt, file_paths_json, state, priority, created_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, conversation_id, chat_id, message_id, prompt, file_paths_json, harness, state, priority, created_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(conversation_id, message_id) do nothing
-    `).run(id, conversationId, String(chatId), String(messageId), prompt, JSON.stringify(filePaths), state, priority, Date.now() / 1000);
+    `).run(id, conversationId, String(chatId), String(messageId), prompt, JSON.stringify(filePaths), isHarnessName(harness) ? harness : CODEX_HARNESS, state, priority, Date.now() / 1000);
     return mapRow(this.db.prepare("select * from prompt_jobs where conversation_id = ? and message_id = ?").get(conversationId, String(messageId)));
   }
 
@@ -78,6 +79,14 @@ export class SqlitePromptJobRepository {
     this.db.prepare(`
       update prompt_jobs set state = 'failed', last_error = ?, completed_at = ? where id = ?
     `).run(String(error).slice(0, 2000), Date.now() / 1000, id);
+  }
+
+  hasOpenJobs(conversationId) {
+    const row = this.db.prepare(`
+      select count(*) as count from prompt_jobs
+      where conversation_id = ? and state in ('pending', 'running', 'awaiting_choice')
+    `).get(conversationId);
+    return Number(row?.count ?? 0) > 0;
   }
 
   listPendingConversations() {

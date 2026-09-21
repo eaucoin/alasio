@@ -1,4 +1,4 @@
-const SCHEMA_VERSION = "4";
+const SCHEMA_VERSION = "5";
 
 const SQLITE_SCHEMA_SQL = `
   create table if not exists bot_state (
@@ -16,6 +16,8 @@ const SQLITE_SCHEMA_SQL = `
     first_name text,
     last_name text,
     codex_session_id text,
+    claude_session_id text,
+    active_harness text not null default 'codex',
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     unique (transport, chat_id)
@@ -75,6 +77,7 @@ const SQLITE_SCHEMA_SQL = `
     channel text not null,
     thread_ts text not null,
     session_id text,
+    harness text not null default 'codex',
     pending_response_id text,
     prompt text,
     state text not null,
@@ -139,6 +142,7 @@ const SQLITE_SCHEMA_SQL = `
     message_id text not null,
     prompt text not null,
     file_paths_json text not null default '[]',
+    harness text not null default 'codex',
     state text not null,
     priority integer not null default 0,
     attempts integer not null default 0,
@@ -177,6 +181,20 @@ export function migrateSqliteSchema(db) {
     const promptJobColumns = new Set(db.prepare("pragma table_info(prompt_jobs)").all().map((column) => column.name));
     if (!promptJobColumns.has("upstream_completed_at")) {
       db.exec("alter table prompt_jobs add column upstream_completed_at real");
+    }
+    if (!promptJobColumns.has("harness")) {
+      db.exec("alter table prompt_jobs add column harness text not null default 'codex'");
+    }
+    const conversationColumns = new Set(db.prepare("pragma table_info(conversations)").all().map((column) => column.name));
+    if (!conversationColumns.has("claude_session_id")) {
+      db.exec("alter table conversations add column claude_session_id text");
+    }
+    if (!conversationColumns.has("active_harness")) {
+      db.exec("alter table conversations add column active_harness text not null default 'codex'");
+    }
+    const turnColumns = new Set(db.prepare("pragma table_info(turns)").all().map((column) => column.name));
+    if (!turnColumns.has("harness")) {
+      db.exec("alter table turns add column harness text not null default 'codex'");
     }
     db.exec(`
       delete from telegram_outbox

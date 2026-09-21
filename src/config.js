@@ -1,3 +1,5 @@
+import { getDefaultHarness } from "./harness/names.js";
+
 export function requireEnv(key) {
   const value = process.env[key];
   if (!value) {
@@ -12,6 +14,7 @@ export function loadAlasioConfig() {
     allowedUserIds: process.env.TELEGRAM_ALLOWED_USER_IDS ?? "",
     workingDirectory: process.env.WORKING_DIRECTORY ?? "/home/operator/monorepo",
     warmLinkedSessions: process.env.ALASIO_WARM_LINKED_SESSIONS === "1",
+    defaultHarness: getDefaultHarness(),
   };
 }
 

@@ -1,3 +1,18 @@
+import { CLAUDE_HARNESS, CODEX_HARNESS, getDefaultHarness, isHarnessName } from "../harness/names.js";
+
+const SESSION_COLUMNS = Object.freeze({
+  [CODEX_HARNESS]: "codex_session_id",
+  [CLAUDE_HARNESS]: "claude_session_id",
+});
+
+function sessionColumn(harness) {
+  const column = SESSION_COLUMNS[harness];
+  if (!column) {
+    throw new Error(`Unknown harness: ${String(harness)}`);
+  }
+  return column;
+}
+
 export class SqliteConversationRepository {
   constructor(db) {
     this.db = db;
@@ -6,8 +21,8 @@ export class SqliteConversationRepository {
   upsertConversation({ chatId, user, sessionId }) {
     const id = `telegram:${chatId}`;
     this.db.prepare(`
-      insert into conversations (id, transport, chat_id, user_id, username, first_name, last_name, codex_session_id)
-      values (?, 'telegram', ?, ?, ?, ?, ?, ?)
+      insert into conversations (id, transport, chat_id, user_id, username, first_name, last_name, codex_session_id, active_harness)
+      values (?, 'telegram', ?, ?, ?, ?, ?, ?, ?)
       on conflict(id) do update set
         user_id = coalesce(excluded.user_id, conversations.user_id),
         username = coalesce(excluded.username, conversations.username),
@@ -23,6 +38,7 @@ export class SqliteConversationRepository {
       user?.first_name ?? null,
       user?.last_name ?? null,
       sessionId ?? null,
+      getDefaultHarness(),
     );
     return id;
   }
@@ -35,32 +51,58 @@ export class SqliteConversationRepository {
     return this.db.prepare("select * from conversations where id = ?").get(conversationId) ?? null;
   }
 
-  listConversationsWithSessions() {
+  listConversationsWithSessions(harness = CODEX_HARNESS) {
+    const column = sessionColumn(harness);
     return this.db.prepare(`
-      select id, codex_session_id
+      select id, ${column} as session_id, ${column} as codex_session_id, active_harness
       from conversations
-      where codex_session_id is not null and codex_session_id <> ''
+      where ${column} is not null and ${column} <> '' and active_harness = ?
       order by updated_at desc
-    `).all();
+    `).all(harness);
   }
 
-  getSessionId(threadKey) {
-    return this.getConversation(threadKey)?.codex_session_id ?? undefined;
+  getActiveHarness(threadKey) {
+    const harness = this.getConversation(threadKey)?.active_harness;
+    return isHarnessName(harness) ? harness : CODEX_HARNESS;
   }
 
-  setSessionId(threadKey, sessionId) {
+  setActiveHarness(threadKey, harness) {
+    if (!isHarnessName(harness)) {
+      throw new Error(`Unknown harness: ${String(harness)}`);
+    }
     this.db.prepare(`
       update conversations
-      set codex_session_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      set active_harness = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      where id = ?
+    `).run(harness, threadKey);
+  }
+
+  getHarnessSessionId(threadKey, harness) {
+    return this.getConversation(threadKey)?.[sessionColumn(harness)] ?? undefined;
+  }
+
+  setHarnessSessionId(threadKey, harness, sessionId) {
+    this.db.prepare(`
+      update conversations
+      set ${sessionColumn(harness)} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       where id = ?
     `).run(sessionId, threadKey);
   }
 
+  getSessionId(threadKey) {
+    const conversation = this.getConversation(threadKey);
+    if (!conversation) {
+      return undefined;
+    }
+    const harness = isHarnessName(conversation.active_harness) ? conversation.active_harness : CODEX_HARNESS;
+    return conversation[sessionColumn(harness)] ?? undefined;
+  }
+
+  setSessionId(threadKey, sessionId) {
+    this.setHarnessSessionId(threadKey, this.getActiveHarness(threadKey), sessionId);
+  }
+
   clearSessionId(threadKey) {
-    this.db.prepare(`
-      update conversations
-      set codex_session_id = null, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-      where id = ?
-    `).run(threadKey);
+    this.setHarnessSessionId(threadKey, this.getActiveHarness(threadKey), null);
   }
 }

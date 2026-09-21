@@ -74,8 +74,24 @@ export class SqliteStore {
     return this.conversations.getConversation(conversationId);
   }
 
-  listConversationsWithSessions() {
-    return this.conversations.listConversationsWithSessions();
+  listConversationsWithSessions(harness) {
+    return this.conversations.listConversationsWithSessions(harness);
+  }
+
+  getActiveHarness(threadKey) {
+    return this.conversations.getActiveHarness(threadKey);
+  }
+
+  setActiveHarness(threadKey, harness) {
+    this.conversations.setActiveHarness(threadKey, harness);
+  }
+
+  getHarnessSessionId(threadKey, harness) {
+    return this.conversations.getHarnessSessionId(threadKey, harness);
+  }
+
+  setHarnessSessionId(threadKey, harness, sessionId) {
+    this.conversations.setHarnessSessionId(threadKey, harness, sessionId);
   }
 
   getSessionId(threadKey) {
@@ -97,6 +113,7 @@ export class SqliteStore {
       payload: {
         ...payload,
         expectedSessionId: this.getSessionId(conversationId) ?? null,
+        expectedHarness: this.getActiveHarness(conversationId),
       },
     });
   }
@@ -147,6 +164,7 @@ export class SqliteStore {
       chatId: turn.chatId,
       messageId: turn.messageId,
       sessionId: turn.sessionId ?? null,
+      harness: turn.harness ?? this.getActiveHarness(turn.threadKey ?? turn.conversationId),
       pendingResponseId: turn.pendingResponseId ?? null,
       prompt: turn.prompt ?? null,
       startedAt: turn.startedAt ?? Date.now() / 1000,
@@ -214,7 +232,14 @@ export class SqliteStore {
   }
 
   enqueuePromptJob(args) {
-    return this.promptJobs.enqueue(args);
+    return this.promptJobs.enqueue({
+      ...args,
+      harness: args.harness ?? this.getActiveHarness(args.conversationId),
+    });
+  }
+
+  hasOpenPromptJobs(conversationId) {
+    return this.promptJobs.hasOpenJobs(conversationId);
   }
 
   getPromptJob(id) {
@@ -261,8 +286,9 @@ export class SqliteStore {
       }
       const eventTimestamp = Number(restartEvent.timestamp ?? turn.started_at);
       const recoveryMessageId = ["restart", turn.thread_ts, eventTimestamp].join(":");
+      const harness = turn.harness ?? this.getActiveHarness(turn.thread_key);
       if (restartEvent.session_id) {
-        this.conversations.setSessionId(turn.thread_key, restartEvent.session_id);
+        this.conversations.setHarnessSessionId(turn.thread_key, harness, restartEvent.session_id);
       }
       const job = this.promptJobs.enqueue({
         conversationId: turn.thread_key,
@@ -272,6 +298,7 @@ export class SqliteStore {
         filePaths: [],
         state: "pending",
         priority: 1,
+        harness,
       });
       if (turn.pending_response_id) {
         this.responses.markPendingAsPosted(turn.pending_response_id);

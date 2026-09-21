@@ -1,14 +1,22 @@
-import { interruptCodexTurn } from "../codex/runtime.js";
+import { createCodexHarness } from "../harness/codex.js";
+import { interruptActiveTurn } from "../harness/index.js";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.js";
-import { createForkedSession } from "../sessions/forking.js";
-import {
-  getSessionLastMessage,
-  getTotalRewindPages,
-  getTotalSessionPages,
-  listSessionMessages,
-  listSessions,
-} from "../sessions/index.js";
 import { truncateText } from "./text.js";
+
+let fallbackHarness = null;
+
+/**
+ * Session panels are rendered for the conversation's active harness. Callers
+ * that predate harness selection receive the Codex adapter so existing
+ * behavior is unchanged.
+ */
+function resolveHarness(harness) {
+  if (harness) {
+    return harness;
+  }
+  fallbackHarness = fallbackHarness ?? createCodexHarness({ workingDirectory: process.env.WORKING_DIRECTORY ?? process.cwd() });
+  return fallbackHarness;
+}
 
 const CONTROL_KIND_PREFIX = "control:";
 
@@ -57,12 +65,12 @@ function describeSession(session, mountedSessionId) {
   return `${marker}${session.timestamp || "-"} - ${session.label || shortSessionId(session.uuid)}`;
 }
 
-function buildMountedSummary(store, conversationId) {
+async function buildMountedSummary(store, harness, conversationId) {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
-    return ["Mounted", "No mounted Codex session."];
+    return ["Mounted", `No mounted ${harness.displayName} session.`];
   }
-  const lastMessage = getSessionLastMessage(sessionId);
+  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
   const tokens = store.getSessionTokens(sessionId);
   return [
     "Mounted",
@@ -71,16 +79,17 @@ function buildMountedSummary(store, conversationId) {
   ];
 }
 
-export function buildSessionsPanel({ store, conversationId, page = 1 }) {
+export async function buildSessionsPanel({ store, harness: harnessInput, conversationId, page = 1 }) {
+  const harness = resolveHarness(harnessInput);
   const mountedSessionId = store.getSessionId(conversationId);
-  const totalPages = getTotalSessionPages();
+  const totalPages = await harness.sessions.getTotalSessionPages();
   const safePage = normalizePage(page, totalPages);
-  const sessions = listSessions(safePage);
+  const sessions = await harness.sessions.listSessions(safePage);
   const startNumber = (safePage - 1) * SESSIONS_PER_PAGE + 1;
   const lines = [
-    "Sessions",
+    `Sessions (${harness.displayName})`,
     "",
-    ...buildMountedSummary(store, conversationId),
+    ...(await buildMountedSummary(store, harness, conversationId)),
     "",
     `Recent sessions (page ${safePage}/${totalPages})`,
   ];
@@ -123,14 +132,15 @@ export function buildSessionsPanel({ store, conversationId, page = 1 }) {
   };
 }
 
-export function buildCurrentSessionPanel({ store, activeQueries, conversationId }) {
+export async function buildCurrentSessionPanel({ store, harness: harnessInput, activeQueries, conversationId }) {
+  const harness = resolveHarness(harnessInput);
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return {
       text: [
-        "Current Session",
+        `Current Session (${harness.displayName})`,
         "",
-        "No Codex session is mounted.",
+        `No ${harness.displayName} session is mounted.`,
         "Start a new session or open Sessions to mount an existing one.",
       ].join("\n"),
       options: buildPanelOptions({
@@ -142,11 +152,11 @@ export function buildCurrentSessionPanel({ store, activeQueries, conversationId 
       }),
     };
   }
-  const lastMessage = getSessionLastMessage(sessionId);
+  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
   const tokens = store.getSessionTokens(sessionId);
   const active = activeQueries.has(conversationId);
   const lines = [
-    "Current Session",
+    `Current Session (${harness.displayName})`,
     "",
     `Session: ${shortSessionId(sessionId)}`,
     `Status: ${active ? "working" : "idle"}`,
@@ -173,8 +183,8 @@ export function buildCurrentSessionPanel({ store, activeQueries, conversationId 
   };
 }
 
-function buildSessionPreviewPanel({ store, conversationId, sessionId, page = 1 }) {
-  const lastMessage = getSessionLastMessage(sessionId);
+async function buildSessionPreviewPanel({ store, harness, conversationId, sessionId, page = 1 }) {
+  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
   const mountedSessionId = store.getSessionId(conversationId);
   const lines = [
     "Session",
@@ -199,14 +209,14 @@ function buildSessionPreviewPanel({ store, conversationId, sessionId, page = 1 }
   };
 }
 
-function buildRewindPanel({ store, activeQueries, conversationId, page = 1, sessionId = null }) {
+async function buildRewindPanel({ store, harness, activeQueries, conversationId, page = 1, sessionId = null }) {
   const targetSessionId = sessionId ?? store.getSessionId(conversationId);
   if (!targetSessionId) {
-    return buildCurrentSessionPanel({ store, activeQueries, conversationId });
+    return await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId });
   }
-  const totalPages = getTotalRewindPages(targetSessionId);
+  const totalPages = await harness.sessions.getTotalRewindPages(targetSessionId);
   const safePage = normalizePage(page, totalPages);
-  const messages = listSessionMessages(targetSessionId);
+  const messages = await harness.sessions.listSessionMessages(targetSessionId);
   const start = (safePage - 1) * SESSIONS_PER_PAGE;
   const pageMessages = messages.slice(start, start + SESSIONS_PER_PAGE);
   const lines = [
@@ -246,11 +256,11 @@ function buildRewindPanel({ store, activeQueries, conversationId, page = 1, sess
   };
 }
 
-function buildRewindPreviewPanel({ store, conversationId, sessionId, index, page = 1 }) {
-  const messages = listSessionMessages(sessionId);
+async function buildRewindPreviewPanel({ store, harness, conversationId, sessionId, index, page = 1 }) {
+  const messages = await harness.sessions.listSessionMessages(sessionId);
   const target = messages.find((message) => message.index === index);
   if (!target) {
-    return buildRewindPanel({ store, activeQueries: new Map(), conversationId, sessionId, page });
+    return await buildRewindPanel({ store, harness, activeQueries: new Map(), conversationId, sessionId, page });
   }
   return {
     text: [
@@ -280,19 +290,20 @@ async function editPanel(client, chatId, messageId, panel) {
   }
 }
 
-export async function sendSessionsPanel({ client, store, conversationId, chatId, page = 1 }) {
-  const panel = buildSessionsPanel({ store, conversationId, page });
+export async function sendSessionsPanel({ client, store, harness, conversationId, chatId, page = 1 }) {
+  const panel = await buildSessionsPanel({ store, harness, conversationId, page });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-export async function sendCurrentSessionPanel({ client, store, activeQueries, conversationId, chatId }) {
-  const panel = buildCurrentSessionPanel({ store, activeQueries, conversationId });
+export async function sendCurrentSessionPanel({ client, store, harness, activeQueries, conversationId, chatId }) {
+  const panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
 export async function handleSessionControlCallback({
   client,
   store,
+  harness: harnessInput,
   activeQueries,
   action,
   startNewSession,
@@ -300,27 +311,29 @@ export async function handleSessionControlCallback({
   chatId,
   messageId,
 }) {
+  const harness = resolveHarness(harnessInput);
   const kind = action.kind.slice(CONTROL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   let panel = null;
   let notice = "";
 
   if (kind === "sessions") {
-    panel = buildSessionsPanel({ store, conversationId: action.conversationId, page: payload.page });
+    panel = await buildSessionsPanel({ store, harness, conversationId: action.conversationId, page: payload.page });
   } else if (kind === "current") {
-    panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+    panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
   } else if (kind === "new") {
     if (activeQueries.has(action.conversationId)) {
-      notice = "Codex is currently working.";
-      panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+      notice = `${harness.displayName} is currently working.`;
+      panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
     } else {
       const sessionId = await startNewSession({ conversationId: action.conversationId });
       notice = `New session mounted: ${shortSessionId(sessionId)}.`;
-      panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+      panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
     }
   } else if (kind === "preview") {
-    panel = buildSessionPreviewPanel({
+    panel = await buildSessionPreviewPanel({
       store,
+      harness,
       conversationId: action.conversationId,
       sessionId: payload.sessionId,
       page: payload.page,
@@ -328,35 +341,38 @@ export async function handleSessionControlCallback({
   } else if (kind === "mount") {
     store.setSessionId(action.conversationId, payload.sessionId);
     notice = "Mounted.";
-    panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+    panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
   } else if (kind === "rewind") {
-    panel = buildRewindPanel({
+    panel = await buildRewindPanel({
       store,
+      harness,
       activeQueries,
       conversationId: action.conversationId,
       sessionId: payload.sessionId,
       page: payload.page,
     });
   } else if (kind === "rewind_preview") {
-    panel = buildRewindPreviewPanel({
+    panel = await buildRewindPreviewPanel({
       store,
+      harness,
       conversationId: action.conversationId,
       sessionId: payload.sessionId,
       index: payload.index,
       page: payload.page,
     });
   } else if (kind === "rewind_fork") {
-    const messages = listSessionMessages(payload.sessionId);
+    const messages = await harness.sessions.listSessionMessages(payload.sessionId);
     const target = messages.find((message) => message.index === payload.index);
-    const forkedId = target ? createForkedSession(payload.sessionId, target.uuid) : null;
+    const forkedId = target ? await harness.sessions.createForkedSession(payload.sessionId, target.uuid) : null;
     if (forkedId) {
       store.setSessionId(action.conversationId, forkedId);
       notice = "Fork mounted.";
-      panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+      panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
     } else {
       notice = "Failed to fork.";
-      panel = buildRewindPanel({
+      panel = await buildRewindPanel({
         store,
+        harness,
         activeQueries,
         conversationId: action.conversationId,
         sessionId: payload.sessionId,
@@ -364,9 +380,9 @@ export async function handleSessionControlCallback({
       });
     }
   } else if (kind === "stop") {
-    const interrupted = await interruptCodexTurn(activeQueries, action.conversationId);
+    const interrupted = await interruptActiveTurn(activeQueries, action.conversationId);
     notice = interrupted ? "Interrupted." : "No active turn.";
-    panel = buildCurrentSessionPanel({ store, activeQueries, conversationId: action.conversationId });
+    panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
   } else if (kind === "close") {
     await client.answerCallbackQuery(callbackQueryId, "Closed.");
     try {

@@ -4,6 +4,8 @@ mindmap
   root((alasio tests))
     Regression contracts
       authorization tests pin one private operator across message and callback ingress and reject callbacks before consuming stored actions
+      harness selection tests pin per-harness parked session pointers schema v5 migration switch refusal while working or queued restart recovery under the owning harness and the /service panel and callbacks
+      Claude harness tests pin prompt channel ordering tool_use projection result-as-final-answer interruption classification steering guardrail denial and SDK transcript to session and rewind mapping without spawning Claude Code
       Breadbutter capability tests pin Bayma Python and Rust classification fingerprint invalidation readiness evidence wait behavior and cleanup after success or failure
       app-server protocol tests pin notification turn identity across direct nested and item-shaped payloads
       app-server request contracts pin gpt-5.6-sol with high reasoning for thread creation and turn execution

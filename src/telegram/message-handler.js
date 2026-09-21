@@ -78,7 +78,8 @@ export class MessageHandler {
       filePaths: localPaths,
     }).catch((error) => {
       this.log.error(`Failed to process prompt for ${conversationId}: ${error}`);
-      this.client.sendMessage(message.chat.id, `Codex hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+      const agentName = this.turns.harnessLabel?.(conversationId) ?? "The agent";
+      this.client.sendMessage(message.chat.id, `${agentName} hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
     });
   }
 }

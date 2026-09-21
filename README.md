@@ -2,18 +2,32 @@
 ```mermaid
 mindmap
   root((alasio))
+    Service selection
+      alasio drives two harnesses Codex app-server and Claude Code through the Claude Agent SDK behind one harness adapter boundary
+      `/service` shows the active harness and both parked session pointers and switches with `Use Codex` or `Use Claude Code` buttons or `/service codex` and `/service claude`
+      each Telegram conversation has exactly one active harness and switching is refused while a turn is active or prompts are queued
+      sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
+      switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
+      Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
+      Claude Code uses the same MCP server table alasio materializes for Codex so both harnesses expose the same Bayma tool inventory
+      `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
+      `ALASIO_DEFAULT_HARNESS` selects the harness for newly created conversations and defaults to codex
+      `ALASIO_CLAUDE_MODEL` `ALASIO_CLAUDE_EFFORT` and `ALASIO_CLAUDE_BIN` are optional Claude Code overrides and default to the CLI's own configuration
     Telegram DM edge behavior
       ingress maps explicitly authorized private Bot API messages and callbacks to a single operator conversation
       egress emits progress edits and Telegram-rendered Markdown final responses in the same direct message stream
       Telegram media groups are buffered briefly so multi-file sends become one Codex turn
     Runtime control plane
-      turn orchestrator coordinates execution and interruption boundaries
+      turn orchestrator coordinates execution and interruption boundaries and resolves the conversation's active harness per turn
+      Claude Code turns are one Agent SDK query per Telegram prompt over the mounted session with streaming input so Steer pushes guidance into the live session
+      Claude Code final replies are the SDK result text and intermediate assistant text stays internal commentary
+      Claude Code Bash commands pass through a PreToolUse hook that records restart provenance and denies forbidden database commands with the same guardrail guidance
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency
       Codex SDK exec transport remains an explicit rollback path for runtime isolation
       Codex sessions materialize required MCP config explicitly instead of trusting ambient CLI state alone
       skill selection and instruction loading constrain tool behavior
-      SQLite content store manages update offsets, conversations, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
+      SQLite content store manages update offsets, conversations, per-harness session pointers, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
       SQLite Telegram outbox separates Codex completion from rate-limited Bot API delivery
       CI treats Alasio as a Node-native unit target whose semantic source surfaces select exact node:test files in the repository-wide pre-commit gate
     Canonical restart path
@@ -24,7 +38,7 @@ mindmap
       Wrapper calls from another checkout delegate to the systemd unit WorkingDirectory instead of restarting from source
       Raw `sudo systemctl restart alasio.service` is only a service-level last resort when no active turn provenance must be preserved
     Reliability guarantees
-      restart-aware continuation protocol avoids silent context loss
+      restart-aware continuation protocol avoids silent context loss and resumes under the harness that owned the interrupted turn
       restart provenance is resolved independently from recovered-output flushing
       shutdown path inspects live descendant commands so self-restarts survive SDK event races
       streamed self-restart detection accepts absolute-path sudo/systemctl variants plus quoted and single-token shell wrappers so shell differences do not silently degrade provenance
@@ -71,6 +85,12 @@ classDiagram
     +skillDrivenExecutionWithExplicitBoundaries
     +boundedThreadContextWithSummarizationDiscipline
   }
+  class HarnessRegistry {
+    +forConversation(store, conversationId)
+    +codexAdapter()
+    +claudeCodeAdapter()
+    +switchRefusedWhileWorking()
+  }
   class TelegramIngress {
     +pollUpdates()
     +authorizePrivateMessagesAndCallbacks()
@@ -98,6 +118,8 @@ classDiagram
     +avoidRawSystemctlForNormalCutovers()
   }
   CodexBridgeValues --> TelegramIngress
+  CodexBridgeValues --> HarnessRegistry
+  HarnessRegistry --> CodexRuntime
   CodexBridgeValues --> CodexRuntime
   CodexBridgeValues --> SQLiteContentStore
   CodexBridgeValues --> RestartWrapper
@@ -114,7 +136,11 @@ stateDiagram-v2
   ContextOverload --> ToolingDrift: skill/tool behavior no longer traceable to intent
   ToolingDrift --> UserMistrust: replies appear inconsistent or opaque
   UserMistrust --> EventProcessed
+  EventProcessed --> CrossHarnessMount: a Codex rollout or Claude transcript is mounted onto the other harness
+  CrossHarnessMount --> UserMistrust
   EventProcessed --> ScopedExecution: bounded context and explicit skill boundaries
+  EventProcessed --> OneActiveHarness: sessions stay parked per harness and switching waits for idle
+  OneActiveHarness --> TrustworthyReplies
   ScopedExecution --> TrustworthyReplies: progress and final replies match observable actions
   TrustworthyReplies --> [*]
 ```

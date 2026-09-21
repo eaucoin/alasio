@@ -3,7 +3,11 @@
 mindmap
   root((operator))
     Commands
-      command-parser maps Telegram text to the command algebra
+      command-parser maps Telegram text to the command algebra including /service and /service codex or claude
+      service-control owns the Telegram-native service panel that shows the active harness both parked session pointers and Use Codex or Use Claude Code switches
+      service switches route through the turn controller which refuses while a turn is active or prompts are queued
+      command-handler resolves the active harness adapter for stop sessions new-session rewind and resume so each control acts on that harness's own session store
+      /goal replies that goals are Codex-only while Claude Code is active
       command-handler executes stop sessions new-session goal rewind and resume behavior
       new-session commands and callbacks create then mount real Codex app-server threads
       session-control owns Telegram-native intercession and intersection panels over Codex session primitives
@@ -13,10 +17,11 @@ mindmap
       pause and clear goal controls interrupt the tracked active Telegram turn after updating upstream goal state
       stop controls report completion only after bounded transport cleanup has finished
       every session-control panel exposes Close so the operator can dismiss stale inline keyboards
+      session and goal callbacks record the harness generation they were rendered under and are rejected after a service switch
     Replies
       session-replies formats session and rewind listings for Telegram
       text owns truncation and compact command-list formatting
-      restart-prompts owns synthetic continuation prompts after service restarts
+      restart-prompts owns synthetic continuation prompts after service restarts and names the harness that owned the interrupted turn
 ```
 
 ## Preference Atlas

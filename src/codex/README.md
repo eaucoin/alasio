@@ -4,7 +4,8 @@ mindmap
   root((codex))
     Runtime boundary
       runtime owns one Codex turn and its guardrail recovery loop
-      turn-controller owns prompt orchestration queueing and delegation
+      turn-controller owns prompt orchestration queueing delegation and harness resolution and is shared by the Codex and Claude Code adapters
+      turn-controller owns service switching and refuses it while a turn is active or prompt jobs are open
       accepted prompts are serialized per conversation through durable SQLite prompt jobs
       status-reporter owns operator progress and final response delivery
       runtime exposes fresh app-server thread creation for Telegram New Session and no-session goal bootstrap paths

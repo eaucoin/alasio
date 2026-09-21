@@ -1,7 +1,10 @@
-export function buildRestartSyntheticText(cause) {
+import { harnessDisplayName } from "../harness/names.js";
+
+export function buildRestartSyntheticText(cause, harness = "codex") {
+  const agentName = harnessDisplayName(harness);
   if (cause === "self_induced") {
     return "[SYSTEM RESTART EVENT]\n\n" +
-      "You are Codex, connected through `alasio.service` on this machine.\n\n" +
+      `You are ${agentName}, connected through \`alasio.service\` on this machine.\n\n` +
       "Fact: the service restart that just occurred was initiated by your own prior action in this conversation.\n" +
       "Fact: the restart completed successfully and this is the post-restart continuation context for the same session.\n\n" +
       "Fact: the documented Alasio restart path is `/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh`; from that directory use `./restart-alasio-operator.sh`.\n\n" +
@@ -12,7 +15,7 @@ export function buildRestartSyntheticText(cause) {
   }
   if (cause === "operator_induced") {
     return "[SYSTEM RESTART EVENT]\n\n" +
-      "You are Codex, connected through `alasio.service` on this machine.\n\n" +
+      `You are ${agentName}, connected through \`alasio.service\` on this machine.\n\n` +
       "Fact: the service restart that just occurred was explicitly initiated by an operator outside your prior action in this conversation.\n" +
       "Fact: it was not recorded as user-initiated and not recorded as self-induced.\n" +
       "Fact: the documented Alasio restart path is `/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh`; from that directory use `./restart-alasio-operator.sh`.\n\n" +
@@ -21,7 +24,7 @@ export function buildRestartSyntheticText(cause) {
       "Instruction: otherwise briefly acknowledge the operator interruption and continue only if the remaining intent is still clear.";
   }
   return "[SYSTEM RESTART EVENT]\n\n" +
-    "You are Codex, connected through `alasio.service` on this machine.\n\n" +
+    `You are ${agentName}, connected through \`alasio.service\` on this machine.\n\n` +
     "Fact: the service restart that just occurred was external to your prior action in this conversation.\n" +
     "Fact: the runtime cannot verify whether it was initiated by the user, an operator, or other external automation.\n" +
     "Fact: the documented Alasio restart path is `/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh`; from that directory use `./restart-alasio-operator.sh`.\n\n" +

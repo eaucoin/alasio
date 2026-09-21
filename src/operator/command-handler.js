@@ -1,15 +1,7 @@
-import { interruptCodexTurn } from "../codex/runtime.js";
-import { createForkedSession } from "../sessions/forking.js";
-import {
-  getSessionByNumber,
-  getSessionLastMessage,
-  getTotalRewindPages,
-  getTotalSessionPages,
-  listSessionMessages,
-  listSessions,
-} from "../sessions/index.js";
+import { createHarnessRegistry, interruptActiveTurn } from "../harness/index.js";
 import { parseCommand } from "./command-parser.js";
 import { handleGoalTextCommand } from "./goal-control.js";
+import { handleServiceTextCommand } from "./service-control.js";
 import { sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.js";
 import { truncateText } from "./text.js";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.js";
@@ -19,14 +11,20 @@ function shortSessionId(sessionId) {
 }
 
 export class CommandHandler {
-  constructor({ client, config, store, activeQueries, runCodexTurn, runGoalTurn, startNewSession }) {
+  constructor({ client, config, store, activeQueries, harnesses = null, runCodexTurn, runGoalTurn, startNewSession, switchHarness = null }) {
     this.client = client;
     this.config = config;
     this.store = store;
     this.activeQueries = activeQueries;
+    this.harnesses = harnesses ?? createHarnessRegistry({ config });
     this.runCodexTurn = runCodexTurn;
     this.runGoalTurn = runGoalTurn;
     this.startNewSession = startNewSession;
+    this.switchHarness = switchHarness;
+  }
+
+  harnessFor(conversationId) {
+    return this.harnesses.forConversation(this.store, conversationId);
   }
 
   async handleTextCommand({ text, filePaths, conversationId, chatId, messageId }) {
@@ -38,14 +36,16 @@ export class CommandHandler {
   }
 
   async handleCommand({ cmd, conversationId, chatId, messageId }) {
+    const harness = this.harnessFor(conversationId);
+    const sessions = harness.sessions;
     if (cmd.type === "stop") {
       if (!this.activeQueries.has(conversationId)) {
         await this.client.sendMessage(chatId, "No active query to stop.");
         return true;
       }
-      const [status] = await this.client.sendMessage(chatId, "Stopping Codex...");
-      const interrupted = await interruptCodexTurn(this.activeQueries, conversationId);
-      const text = interrupted ? "Codex stopped." : "No active query to stop.";
+      const [status] = await this.client.sendMessage(chatId, `Stopping ${harness.displayName}...`);
+      const interrupted = await interruptActiveTurn(this.activeQueries, conversationId);
+      const text = interrupted ? `${harness.displayName} stopped.` : "No active query to stop.";
       if (status?.message_id) {
         await this.client.editMessageText(chatId, status.message_id, text, { format: "plain" }).catch(() => undefined);
       } else {
@@ -53,16 +53,33 @@ export class CommandHandler {
       }
       return true;
     }
+    if (cmd.type === "service") {
+      if (!this.switchHarness) {
+        await this.client.sendMessage(chatId, "Service switching is not available in this deployment.");
+        return true;
+      }
+      await handleServiceTextCommand({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        conversationId,
+        chatId,
+        target: cmd.target,
+        switchHarness: this.switchHarness,
+      });
+      return true;
+    }
     if (cmd.type === "sessions") {
-      const sessions = listSessions(cmd.page);
-      const totalPages = getTotalSessionPages();
-      await this.client.sendMessage(chatId, formatSessionsForTelegram(sessions, cmd.page, totalPages));
+      const sessionList = await sessions.listSessions(cmd.page);
+      const totalPages = await sessions.getTotalSessionPages();
+      await this.client.sendMessage(chatId, formatSessionsForTelegram(sessionList, cmd.page, totalPages));
       return true;
     }
     if (cmd.type === "sessions_panel") {
       await sendSessionsPanel({
         client: this.client,
         store: this.store,
+        harness,
         conversationId,
         chatId,
       });
@@ -72,6 +89,7 @@ export class CommandHandler {
       await sendCurrentSessionPanel({
         client: this.client,
         store: this.store,
+        harness,
         activeQueries: this.activeQueries,
         conversationId,
         chatId,
@@ -79,6 +97,10 @@ export class CommandHandler {
       return true;
     }
     if (cmd.type === "goal") {
+      if (!harness.supportsGoals) {
+        await this.client.sendMessage(chatId, `Goals are a Codex feature. ${harness.displayName} is active; use /service codex to switch back.`);
+        return true;
+      }
       await handleGoalTextCommand({
         client: this.client,
         config: this.config,
@@ -88,7 +110,7 @@ export class CommandHandler {
         messageId,
         args: cmd.args,
         runGoalTurn: this.runGoalTurn,
-        stopActiveTurn: async () => await interruptCodexTurn(this.activeQueries, conversationId),
+        stopActiveTurn: async () => await interruptActiveTurn(this.activeQueries, conversationId),
         startNewSession: this.startNewSession,
         isTurnActive: this.activeQueries.has(conversationId),
       });
@@ -96,11 +118,11 @@ export class CommandHandler {
     }
     if (cmd.type === "sessions_new") {
       if (this.activeQueries.has(conversationId)) {
-        await this.client.sendMessage(chatId, "Codex is currently working. Use /stop first, then /sessions new.");
+        await this.client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
         return true;
       }
       const sessionId = await this.startNewSession({ conversationId });
-      await this.client.sendMessage(chatId, `New session mounted: ${shortSessionId(sessionId)}. Send your next message to start a turn.`);
+      await this.client.sendMessage(chatId, `New ${harness.displayName} session mounted: ${shortSessionId(sessionId)}. Send your next message to start a turn.`);
       return true;
     }
     if (cmd.type === "rewind_list") {
@@ -109,8 +131,8 @@ export class CommandHandler {
         await this.client.sendMessage(chatId, "No session linked to this Telegram conversation. Use !resume <#> first.");
         return true;
       }
-      const messages = listSessionMessages(sessionId);
-      const totalPages = getTotalRewindPages(sessionId);
+      const messages = await sessions.listSessionMessages(sessionId);
+      const totalPages = await sessions.getTotalRewindPages(sessionId);
       await this.client.sendMessage(chatId, formatRewindForTelegram(messages, cmd.page, totalPages));
       return true;
     }
@@ -120,13 +142,13 @@ export class CommandHandler {
         await this.client.sendMessage(chatId, "No session linked. Use !resume <#> first.");
         return true;
       }
-      const messages = listSessionMessages(sessionId);
+      const messages = await sessions.listSessionMessages(sessionId);
       const target = messages.find((message) => message.index === cmd.index);
       if (!target) {
         await this.client.sendMessage(chatId, `Message ${cmd.index} not found. Use !rewind to see available points.`);
         return true;
       }
-      const forkedId = createForkedSession(sessionId, target.uuid);
+      const forkedId = await sessions.createForkedSession(sessionId, target.uuid);
       if (!forkedId) {
         await this.client.sendMessage(chatId, "Failed to create forked session.");
         return true;
@@ -138,7 +160,7 @@ export class CommandHandler {
     if (cmd.type === "resume") {
       let resolvedSessionId;
       if (/^\d+$/.test(cmd.ref)) {
-        resolvedSessionId = getSessionByNumber(Number.parseInt(cmd.ref, 10));
+        resolvedSessionId = await sessions.getSessionByNumber(Number.parseInt(cmd.ref, 10));
         if (!resolvedSessionId) {
           await this.client.sendMessage(chatId, `Session #${cmd.ref} not found. Use !sessions to see available sessions.`);
           return true;
@@ -156,8 +178,8 @@ export class CommandHandler {
         });
         return true;
       }
-      const lastMessage = getSessionLastMessage(resolvedSessionId);
-      await this.client.sendMessage(chatId, lastMessage ? `Resuming; most recent Codex message:\n\n${lastMessage}` : "Resuming session.");
+      const lastMessage = await sessions.getSessionLastMessage(resolvedSessionId);
+      await this.client.sendMessage(chatId, lastMessage ? `Resuming; most recent ${harness.displayName} message:\n\n${lastMessage}` : "Resuming session.");
       return true;
     }
     return false;

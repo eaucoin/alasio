@@ -15,11 +15,11 @@ export class StatusReporter {
     this.log = log;
   }
 
-  async postStatusUpdates({ chatId, signal, sessionId, onStatusMessageCreated }) {
+  async postStatusUpdates({ chatId, signal, sessionId, onStatusMessageCreated, harnessName = "Codex" }) {
     const startTime = Date.now();
     let statusMessageId = null;
     try {
-      const [sent] = await this.client.sendMessage(chatId, "Codex is now working...");
+      const [sent] = await this.client.sendMessage(chatId, `${harnessName} is now working...`);
       statusMessageId = sent?.message_id ?? null;
       if (statusMessageId) {
         onStatusMessageCreated(statusMessageId, startTime);
@@ -46,8 +46,8 @@ export class StatusReporter {
       const elapsedSeconds = (Date.now() - startTime) / 1000;
       const workflowWait = sessionId ? this.workflowWaits.get(sessionId) : null;
       const text = workflowWait
-        ? `Codex is watching workflow ${workflowWait.runId} (${workflowWait.waitType}).`
-        : `Codex has been working for ${formatDuration(elapsedSeconds)}.`;
+        ? `${harnessName} is watching workflow ${workflowWait.runId} (${workflowWait.waitType}).`
+        : `${harnessName} has been working for ${formatDuration(elapsedSeconds)}.`;
       await this.client.editMessageText(chatId, statusMessageId, text).catch((error) => {
         this.log.warn(`Failed to edit status message: ${error}`);
       });
@@ -55,11 +55,11 @@ export class StatusReporter {
     }
   }
 
-  async postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime }) {
+  async postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime, harnessName = "Codex" }) {
     const trimmedResponse = response.trim();
     if (statusMessageId && statusStartTime) {
       const elapsedSeconds = (Date.now() - statusStartTime) / 1000;
-      await this.client.editMessageText(chatId, statusMessageId, `Codex worked for ${formatDuration(elapsedSeconds)}.`).catch(() => undefined);
+      await this.client.editMessageText(chatId, statusMessageId, `${harnessName} worked for ${formatDuration(elapsedSeconds)}.`).catch(() => undefined);
     }
     if (!trimmedResponse) {
       if (pendingResponseId) {
@@ -70,8 +70,9 @@ export class StatusReporter {
     this.outbox.enqueueText({ chatId, text: trimmedResponse, pendingResponseId });
   }
 
-  async finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, statusText = "Codex interrupted." }) {
+  async finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, statusText = null, harnessName = "Codex" }) {
     if (statusMessageId) {
+      statusText = statusText ?? `${harnessName} interrupted.`;
       await this.client.editMessageText(chatId, statusMessageId, statusText).catch(() => undefined);
     }
     if (pendingResponseId) {
