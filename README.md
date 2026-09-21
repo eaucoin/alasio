@@ -41,6 +41,9 @@ mindmap
     Canonical restart path
       README.md is the source of truth for Alasio operator instructions and AGENTS.md plus CLAUDE.md must remain symlinks to README.md
       Production runs from the isolated `/home/operator/monorepo-alasio-runtime/bots/alasio` deployment checkout while Codex works in `/home/operator/monorepo`
+      The standalone checkout at `/home/operator/alasio` runs as `alasio-standalone.service` from `./install-alasio-standalone-service.sh` with its own `.env` `ALASIO_STATE_DIR` and `ALASIO_HOOK_PORT` so it coexists with `alasio.service`
+      `.env.example` documents the standalone environment and `.env` stays mode 0600 and untracked because it holds the bot token
+      the standalone bot has no restart-provenance wrapper yet so `sudo systemctl restart alasio-standalone.service` is its only restart path
       Normal restarts run from the deployment checkout with `./restart-alasio-operator.sh`
       Equivalent absolute restart path is `/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh`
       Wrapper calls from another checkout delegate to the systemd unit WorkingDirectory instead of restarting from source
