@@ -1,4 +1,4 @@
-const SCHEMA_VERSION = "5";
+const SCHEMA_VERSION = "6";
 
 const SQLITE_SCHEMA_SQL = `
   create table if not exists bot_state (
@@ -17,7 +17,7 @@ const SQLITE_SCHEMA_SQL = `
     last_name text,
     codex_session_id text,
     claude_session_id text,
-    active_harness text not null default 'codex',
+    active_harness text,
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     unique (transport, chat_id)
@@ -185,12 +185,28 @@ export function migrateSqliteSchema(db) {
     if (!promptJobColumns.has("harness")) {
       db.exec("alter table prompt_jobs add column harness text not null default 'codex'");
     }
-    const conversationColumns = new Set(db.prepare("pragma table_info(conversations)").all().map((column) => column.name));
+    const conversationColumnInfo = db.prepare("pragma table_info(conversations)").all();
+    const conversationColumns = new Set(conversationColumnInfo.map((column) => column.name));
     if (!conversationColumns.has("claude_session_id")) {
       db.exec("alter table conversations add column claude_session_id text");
     }
     if (!conversationColumns.has("active_harness")) {
-      db.exec("alter table conversations add column active_harness text not null default 'codex'");
+      // Pre-harness rows only ever ran Codex; keep them mounted there so an upgrade
+      // does not strand existing conversations behind the service picker.
+      db.exec("alter table conversations add column active_harness text");
+      db.exec("update conversations set active_harness = 'codex' where active_harness is null");
+    } else if (conversationColumnInfo.find((column) => column.name === "active_harness")?.notnull) {
+      // Schema v5 declared active_harness not null default 'codex'. v6 makes "nothing
+      // mounted" a real state, so the constraint has to go; SQLite can only do that by
+      // swapping the column. Existing rows keep whichever harness they had.
+      db.exec(`
+        begin;
+        alter table conversations rename column active_harness to active_harness_v5;
+        alter table conversations add column active_harness text;
+        update conversations set active_harness = active_harness_v5;
+        alter table conversations drop column active_harness_v5;
+        commit;
+      `);
     }
     const turnColumns = new Set(db.prepare("pragma table_info(turns)").all().map((column) => column.name));
     if (!turnColumns.has("harness")) {

@@ -399,6 +399,7 @@ test("goal resume callback edits to starting before fallback turn execution", as
 test("goal turns use normal concurrent-message decision panel when Codex is already working", async () => {
   const client = createClient();
   const store = {
+    getActiveHarness: () => "codex",
     createCallbackAction({ kind }) {
       return kind;
     },

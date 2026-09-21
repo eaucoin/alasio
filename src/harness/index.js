@@ -22,12 +22,15 @@ export {
 
 /**
  * Resolve the active harness name for a conversation from any store shape.
- * Test doubles that predate harness selection fall back to Codex.
+ * Returns null when nothing is mounted; callers gate on that instead of
+ * assuming a default.
  */
 export function resolveHarnessName(store, conversationId) {
   const harness = store?.getActiveHarness?.(conversationId);
-  return isHarnessName(harness) ? harness : CODEX_HARNESS;
+  return isHarnessName(harness) ? harness : null;
 }
+
+export const NO_SERVICE_MOUNTED = "No service is mounted. Use /service to choose Codex or Claude Code.";
 
 /**
  * Registry of harness adapters bound to one working directory.
@@ -48,7 +51,15 @@ export function createHarnessRegistry({ config, overrides = {} }) {
       return adapter;
     },
     forConversation(store, conversationId) {
-      return adapters[resolveHarnessName(store, conversationId)];
+      const name = resolveHarnessName(store, conversationId);
+      return name ? adapters[name] : null;
+    },
+    requireForConversation(store, conversationId) {
+      const adapter = this.forConversation(store, conversationId);
+      if (!adapter) {
+        throw new Error(NO_SERVICE_MOUNTED);
+      }
+      return adapter;
     },
     shutdownAll() {
       for (const adapter of Object.values(adapters)) {

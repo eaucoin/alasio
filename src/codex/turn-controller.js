@@ -3,6 +3,7 @@ import { createHarnessRegistry, isHarnessName } from "../harness/index.js";
 import { finalResponseToMarkdown } from "./response-markdown.js";
 import { buildFilePromptSuffix } from "../shared/file-prompt.js";
 import { CommandHandler } from "../operator/command-handler.js";
+import { sendChooseServicePanel } from "../operator/service-control.js";
 import { truncateText } from "../operator/text.js";
 import { StatusReporter } from "./status-reporter.js";
 import { createLogger } from "../shared/log.js";
@@ -45,8 +46,22 @@ export class TurnController {
     return this.harnesses.forConversation(this.store, conversationId);
   }
 
+  requireHarness(conversationId) {
+    return this.harnesses.requireForConversation(this.store, conversationId);
+  }
+
   harnessLabel(conversationId) {
-    return this.harnessFor(conversationId).displayName;
+    return this.harnessFor(conversationId)?.displayName ?? "No service";
+  }
+
+  async sendChooseServicePanel({ conversationId, chatId }) {
+    await sendChooseServicePanel({
+      client: this.client,
+      store: this.store,
+      activeQueries: this.activeQueries,
+      conversationId,
+      chatId,
+    });
   }
 
   describeSwitchBlocker(conversationId) {
@@ -107,6 +122,11 @@ export class TurnController {
     if (!prompt.trim()) {
       return;
     }
+    if (!this.harnessFor(conversationId)) {
+      // Neutral by default: nothing is queued until the operator chooses a service.
+      await this.sendChooseServicePanel({ conversationId, chatId });
+      return;
+    }
     const job = this.store.enqueuePromptJob({
       conversationId,
       chatId,
@@ -140,7 +160,7 @@ export class TurnController {
       if (!job) {
         return;
       }
-      const activeHarness = this.harnessFor(conversationId).name;
+      const activeHarness = this.requireHarness(conversationId).name;
       if (job.harness && job.harness !== activeHarness) {
         log.warn(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
       }
@@ -187,7 +207,7 @@ export class TurnController {
   }
 
   async startNewSession({ conversationId }) {
-    const harness = this.harnessFor(conversationId);
+    const harness = this.requireHarness(conversationId);
     if (this.activeQueries.has(conversationId)) {
       throw new Error(`${harness.displayName} is currently working. Stop the active turn before starting a new session.`);
     }
@@ -252,7 +272,7 @@ export class TurnController {
   }
 
   async runCodexTurnWithSession({ conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }) {
-    const harness = this.harnessFor(conversationId);
+    const harness = this.requireHarness(conversationId);
     if (attachedTurn && !harness.supportsGoals) {
       throw new Error(`${harness.displayName} does not support attached goal turns.`);
     }

@@ -3,10 +3,10 @@
 mindmap
   root((harness))
     Names
-      names owns the codex and claude identifiers display names spelling normalization and the ALASIO_DEFAULT_HARNESS default
+      names owns the codex and claude identifiers display names spelling normalization and the optional ALASIO_DEFAULT_HARNESS pre-mount which is null by default
     Registry
       index builds one adapter per harness bound to the alasio working directory and resolves the adapter for a conversation from the persisted active harness
-      resolveHarnessName falls back to codex for store doubles that predate harness selection
+      resolveHarnessName returns null while nothing is mounted and requireForConversation throws NO_SERVICE_MOUNTED so no caller can coerce a default harness
       interruptActiveTurn aborts whichever harness owns the active query for a thread key
     Adapter contract
       startFreshSession warmSession executeTurn shutdown and a sessions api with listSessions getTotalSessionPages getSessionByNumber getSessionLastMessage listSessionMessages getTotalRewindPages and createForkedSession
@@ -46,6 +46,8 @@ stateDiagram-v2
   DriftingFeatures --> OperatorMistrust
   HarnessChoice --> ForeignMount: a session id from one harness is passed to the other harness
   ForeignMount --> OperatorMistrust
+  HarnessChoice --> SilentDefault: a null harness is coerced to codex instead of surfacing the picker
+  SilentDefault --> OperatorMistrust
   HarnessChoice --> AdapterBoundary
   AdapterBoundary --> ParkedPointers: each harness keeps its own session pointer and switching waits for idle
   ParkedPointers --> [*]

@@ -61,9 +61,20 @@ export class SqliteConversationRepository {
     `).all(harness);
   }
 
+  /**
+   * Active harness for a conversation, or null while nothing is mounted.
+   */
   getActiveHarness(threadKey) {
     const harness = this.getConversation(threadKey)?.active_harness;
-    return isHarnessName(harness) ? harness : CODEX_HARNESS;
+    return isHarnessName(harness) ? harness : null;
+  }
+
+  requireActiveHarness(threadKey) {
+    const harness = this.getActiveHarness(threadKey);
+    if (!harness) {
+      throw new Error(`No service is mounted for ${threadKey}`);
+    }
+    return harness;
   }
 
   setActiveHarness(threadKey, harness) {
@@ -94,15 +105,15 @@ export class SqliteConversationRepository {
     if (!conversation) {
       return undefined;
     }
-    const harness = isHarnessName(conversation.active_harness) ? conversation.active_harness : CODEX_HARNESS;
-    return conversation[sessionColumn(harness)] ?? undefined;
+    const harness = isHarnessName(conversation.active_harness) ? conversation.active_harness : null;
+    return harness ? conversation[sessionColumn(harness)] ?? undefined : undefined;
   }
 
   setSessionId(threadKey, sessionId) {
-    this.setHarnessSessionId(threadKey, this.getActiveHarness(threadKey), sessionId);
+    this.setHarnessSessionId(threadKey, this.requireActiveHarness(threadKey), sessionId);
   }
 
   clearSessionId(threadKey) {
-    this.setHarnessSessionId(threadKey, this.getActiveHarness(threadKey), null);
+    this.setHarnessSessionId(threadKey, this.requireActiveHarness(threadKey), null);
   }
 }

@@ -1,7 +1,7 @@
 import { createHarnessRegistry, interruptActiveTurn } from "../harness/index.js";
 import { parseCommand } from "./command-parser.js";
 import { handleGoalTextCommand } from "./goal-control.js";
-import { handleServiceTextCommand } from "./service-control.js";
+import { handleServiceTextCommand, sendChooseServicePanel } from "./service-control.js";
 import { sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.js";
 import { truncateText } from "./text.js";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.js";
@@ -37,7 +37,7 @@ export class CommandHandler {
 
   async handleCommand({ cmd, conversationId, chatId, messageId }) {
     const harness = this.harnessFor(conversationId);
-    const sessions = harness.sessions;
+    const sessions = harness?.sessions;
     if (cmd.type === "stop") {
       if (!this.activeQueries.has(conversationId)) {
         await this.client.sendMessage(chatId, "No active query to stop.");
@@ -67,6 +67,11 @@ export class CommandHandler {
         target: cmd.target,
         switchHarness: this.switchHarness,
       });
+      return true;
+    }
+    if (!harness) {
+      // Every remaining control acts on the mounted service's own sessions or turns.
+      await sendChooseServicePanel({ client: this.client, store: this.store, activeQueries: this.activeQueries, conversationId, chatId });
       return true;
     }
     if (cmd.type === "sessions") {

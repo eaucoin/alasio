@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.js";
+import { CODEX_HARNESS } from "../src/harness/names.js";
 import { AppServerThreadClient } from "../src/codex/app-server/thread-client.js";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.js";
 import { interruptCodexTurn } from "../src/codex/runtime.js";
@@ -95,7 +96,7 @@ test("SQLite response recovery exposes only terminal upstream responses", () => 
   const root = mkdtempSync(join(tmpdir(), "alasio-response-phase-"));
   try {
     const store = new SqliteStore(root);
-    store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
     const pendingResponseId = store.createPendingResponse("123", "9");
     store.appendBlockToPending(pendingResponseId, {
       type: "text",
@@ -117,7 +118,7 @@ test("completed response recovery enqueues one final answer exactly once", async
   const root = mkdtempSync(join(tmpdir(), "alasio-response-once-"));
   try {
     const store = new SqliteStore(root);
-    store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
     const pendingResponseId = store.createPendingResponse("123", "9");
     store.appendBlockToPending(pendingResponseId, {
       type: "text",
@@ -157,7 +158,7 @@ test("outbox migration keeps sent evidence over a pending duplicate", () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-outbox-migration-"));
   try {
     const first = new SqliteStore(root);
-    first.upsertConversation({ chatId: "123", user: { id: 123 } });
+    first.setActiveHarness(first.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
     const pendingResponseId = first.createPendingResponse("123", "9");
     const sentId = first.enqueueOutboxText({ chatId: "123", text: "done", pendingResponseId });
     first.markOutboxSent(sentId);
@@ -185,6 +186,7 @@ test("SQLite prompt jobs and outbox survive process boundaries", () => {
   try {
     const first = new SqliteStore(root);
     const conversationId = first.upsertConversation({ chatId: "123", user: { id: 123 } });
+    first.setActiveHarness(conversationId, CODEX_HARNESS);
     const job = first.enqueuePromptJob({ conversationId, chatId: "123", messageId: "9", prompt: "hello" });
     const claimed = first.claimNextPromptJob(conversationId);
     assert.equal(claimed.id, job.id);
@@ -222,6 +224,7 @@ test("restart reconciliation preserves upstream-completed prompt jobs", () => {
   try {
     const store = new SqliteStore(root);
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
     const job = store.enqueuePromptJob({ conversationId, chatId: "123", messageId: "10", prompt: "finish" });
     store.claimNextPromptJob(conversationId);
     store.markPromptJobUpstreamStarted(job.id, "session", "turn");
@@ -239,6 +242,7 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
   try {
     const store = new SqliteStore(root);
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
     const original = store.enqueuePromptJob({
       conversationId,
       chatId: "123",
@@ -314,6 +318,7 @@ test("stale turn completion cannot clear a replacement turn", () => {
   try {
     const store = new SqliteStore(root);
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.upsertActiveTurn({ conversationId, chatId: "123", messageId: "1", pendingResponseId: "old" });
     store.upsertActiveTurn({ conversationId, chatId: "123", messageId: "2", pendingResponseId: "new" });
     store.clearActiveTurn(conversationId, "old");
@@ -329,6 +334,7 @@ test("callback actions capture the mounted session generation", () => {
   try {
     const store = new SqliteStore(root);
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.setSessionId(conversationId, "session-a");
     const id = store.createCallbackAction({ conversationId, kind: "goal:resume", payload: {} });
     assert.equal(store.consumeCallbackAction(id).payload.expectedSessionId, "session-a");

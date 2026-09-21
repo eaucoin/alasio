@@ -5,13 +5,14 @@ mindmap
     Service selection
       alasio drives two harnesses Codex app-server and Claude Code through the Claude Agent SDK behind one harness adapter boundary
       `/service` shows the active harness and both parked session pointers and switches with `Use Codex` or `Use Claude Code` buttons or `/service codex` and `/service claude`
-      each Telegram conversation has exactly one active harness and switching is refused while a turn is active or prompts are queued
+      each Telegram conversation has at most one active harness and switching is refused while a turn is active or prompts are queued
+      conversations are neutral by default so until the operator mounts a service through `/service` every prompt `/start` and harness-scoped control is answered only with the service picker and nothing is queued
       sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
       switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
       Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
       Claude Code uses the same MCP server table alasio materializes for Codex so both harnesses expose the same Bayma tool inventory
       `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
-      `ALASIO_DEFAULT_HARNESS` selects the harness for newly created conversations and defaults to codex
+      `ALASIO_DEFAULT_HARNESS` is unset by default and optionally pre-mounts codex or claude on newly created conversations so they skip the picker
       `ALASIO_CLAUDE_MODEL` `ALASIO_CLAUDE_EFFORT` and `ALASIO_CLAUDE_BIN` are optional Claude Code overrides and default to the CLI's own configuration
     Telegram DM edge behavior
       ingress maps explicitly authorized private Bot API messages and callbacks to a single operator conversation
@@ -138,6 +139,8 @@ stateDiagram-v2
   UserMistrust --> EventProcessed
   EventProcessed --> CrossHarnessMount: a Codex rollout or Claude transcript is mounted onto the other harness
   CrossHarnessMount --> UserMistrust
+  EventProcessed --> SilentDefaultMount: an unmounted conversation is coerced onto a harness the operator never chose
+  SilentDefaultMount --> UserMistrust
   EventProcessed --> ScopedExecution: bounded context and explicit skill boundaries
   EventProcessed --> OneActiveHarness: sessions stay parked per harness and switching waits for idle
   OneActiveHarness --> TrustworthyReplies

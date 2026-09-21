@@ -1,4 +1,4 @@
-import { interruptActiveTurn, isHarnessName } from "../harness/index.js";
+import { NO_SERVICE_MOUNTED, interruptActiveTurn, isHarnessName } from "../harness/index.js";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.js";
 import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.js";
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.js";
@@ -53,6 +53,10 @@ export class CallbackHandler {
     const messageId = callbackQuery.message?.message_id;
     if (!chatId || !messageId) {
       await this.client.answerCallbackQuery(callbackQuery.id, "Missing message context.");
+      return;
+    }
+    if (!harness && !isServiceControlAction(action.kind)) {
+      await this.client.answerCallbackQuery(callbackQuery.id, NO_SERVICE_MOUNTED);
       return;
     }
     if (isSessionControlAction(action.kind)) {

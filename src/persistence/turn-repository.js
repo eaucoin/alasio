@@ -1,4 +1,4 @@
-import { CODEX_HARNESS, isHarnessName } from "../harness/names.js";
+import { isHarnessName } from "../harness/names.js";
 
 export class SqliteTurnRepository {
   constructor(db, conversationRepository) {
@@ -9,6 +9,9 @@ export class SqliteTurnRepository {
   upsertActiveTurn(turn) {
     const threadKey = turn.threadKey;
     const harness = isHarnessName(turn.harness) ? turn.harness : this.conversations.getActiveHarness(threadKey);
+    if (!harness) {
+      throw new Error(`Cannot record an active turn for ${threadKey}: no service is mounted`);
+    }
     this.db.prepare(`
       insert into turns (id, conversation_id, thread_key, channel, thread_ts, session_id, harness, pending_response_id, prompt, state, started_at)
       values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
@@ -41,8 +44,8 @@ export class SqliteTurnRepository {
   updateActiveTurnSessionId(threadKey, sessionId) {
     this.db.prepare("update turns set session_id = ? where id = ? and state = 'active'").run(sessionId, threadKey);
     const activeTurn = this.db.prepare("select harness from turns where id = ? and state = 'active'").get(threadKey);
-    const harness = isHarnessName(activeTurn?.harness) ? activeTurn.harness : this.conversations.getActiveHarness(threadKey);
-    this.conversations.setHarnessSessionId(threadKey, harness ?? CODEX_HARNESS, sessionId);
+    const harness = isHarnessName(activeTurn?.harness) ? activeTurn.harness : this.conversations.requireActiveHarness(threadKey);
+    this.conversations.setHarnessSessionId(threadKey, harness, sessionId);
   }
 
   updateActiveTurnPendingResponseId(threadKey, pendingResponseId) {

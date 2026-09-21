@@ -10,6 +10,8 @@ import { truncateText } from "./text.js";
 
 const SERVICE_KIND_PREFIX = "service:";
 
+export const CHOOSE_SERVICE_NOTICE = "No service is mounted. Choose Codex or Claude Code to start; your message was not queued.";
+
 function serviceKind(kind) {
   return `${SERVICE_KIND_PREFIX}${kind}`;
 }
@@ -51,13 +53,15 @@ export function buildServicePanel({ store, activeQueries, conversationId, notice
   const lines = [
     "Service",
     "",
-    `Active: ${harnessDisplayName(active)}`,
+    `Active: ${active ? harnessDisplayName(active) : "none"}`,
     `Status: ${working ? "working" : "idle"}`,
     "",
     "Mounted sessions",
     ...HARNESS_NAMES.map((harness) => `${harness === active ? "* " : "  "}${mountedLine(store, conversationId, harness)}`),
     "",
-    "Sessions belong to one service. Switching parks the current session and resumes the other service's own session.",
+    active
+      ? "Sessions belong to one service. Switching parks the current session and resumes the other service's own session."
+      : "Nothing runs until a service is chosen. Each service keeps its own sessions and uses its own local login.",
   ];
   if (notice) {
     lines.push("", truncateText(notice, 300));
@@ -74,6 +78,22 @@ export function buildServicePanel({ store, activeQueries, conversationId, notice
     text: lines.join("\n"),
     options: buildPanelOptions({ inline_keyboard: keyboard }),
   };
+}
+
+/**
+ * Reply used whenever a prompt or control arrives before any service is mounted.
+ * It is the only thing alasio says in that state.
+ */
+export async function sendChooseServicePanel({ client, store, activeQueries, conversationId, chatId }) {
+  const panel = buildServicePanel({ store, activeQueries, conversationId, notice: CHOOSE_SERVICE_NOTICE });
+  await client.sendMessage(chatId, panel.text, panel.options);
+}
+
+function describeSwitch(result, harness) {
+  if (!result.switched) {
+    return `${harnessDisplayName(harness)} is already active.`;
+  }
+  return result.previous ? `Switched to ${harnessDisplayName(harness)}.` : `Mounted ${harnessDisplayName(harness)}. Send a message to start.`;
 }
 
 export function resolveServiceTarget(target) {
@@ -96,10 +116,7 @@ export async function handleServiceTextCommand({ client, store, activeQueries, c
     }
     let notice;
     try {
-      const result = await switchHarness({ conversationId, harness });
-      notice = result.switched
-        ? `Switched to ${harnessDisplayName(harness)}.`
-        : `${harnessDisplayName(harness)} is already active.`;
+      notice = describeSwitch(await switchHarness({ conversationId, harness }), harness);
     } catch (error) {
       notice = error instanceof Error ? error.message : String(error);
     }
@@ -150,10 +167,7 @@ export async function handleServiceControlCallback({
     }
     let notice;
     try {
-      const result = await switchHarness({ conversationId: action.conversationId, harness });
-      notice = result.switched
-        ? `Switched to ${harnessDisplayName(harness)}.`
-        : `${harnessDisplayName(harness)} is already active.`;
+      notice = describeSwitch(await switchHarness({ conversationId: action.conversationId, harness }), harness);
     } catch (error) {
       notice = error instanceof Error ? error.message : String(error);
     }

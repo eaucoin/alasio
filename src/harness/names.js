@@ -2,8 +2,13 @@
  * Harness identifiers shared by persistence, operator controls, and runtime selection.
  *
  * A harness is the agent runtime alasio drives for a Telegram conversation. Each
- * conversation has exactly one active harness at a time; the other harness keeps
+ * conversation has at most one active harness at a time; the other harness keeps
  * its own parked session pointer so switching never mounts a foreign session.
+ *
+ * A conversation starts with no harness mounted. Until the operator chooses one
+ * through /service, alasio only ever answers with the service picker. The
+ * `null` harness is therefore a real state, not a fallback, and callers must
+ * not coerce it to a default.
  */
 export const CODEX_HARNESS = "codex";
 export const CLAUDE_HARNESS = "claude";
@@ -23,7 +28,7 @@ export function normalizeHarnessName(candidate, fallback = CODEX_HARNESS) {
     return fallback;
   }
   const lowered = candidate.trim().toLowerCase();
-  if (lowered === "claude" || lowered === "claude-code" || lowered === "claude_code" || lowered === "claudecode") {
+  if (lowered === "claude" || lowered === "claude-code" || lowered === "claude_code" || lowered === "claudecode" || lowered === "claude code") {
     return CLAUDE_HARNESS;
   }
   if (lowered === "codex") {
@@ -36,6 +41,12 @@ export function harnessDisplayName(harness) {
   return DISPLAY_NAMES[harness] ?? DISPLAY_NAMES[CODEX_HARNESS];
 }
 
+/**
+ * Harness pre-mounted on newly created conversations.
+ *
+ * Neutral by default: returns null unless ALASIO_DEFAULT_HARNESS opts into a
+ * harness, in which case new conversations skip the picker.
+ */
 export function getDefaultHarness(env = process.env) {
-  return normalizeHarnessName(env.ALASIO_DEFAULT_HARNESS, CODEX_HARNESS);
+  return normalizeHarnessName(env.ALASIO_DEFAULT_HARNESS, null);
 }

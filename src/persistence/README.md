@@ -11,7 +11,8 @@ mindmap
       terminal response recovery reconstructs all blocks only after that marker exists
       each pending response id maps to at most one durable Telegram outbox entry
       store translates runtime chat/message terms onto persisted response column names without leaking them upward
-      conversations persist active_harness plus codex_session_id and claude_session_id so getSessionId and setSessionId always address the active harness pointer
+      conversations persist a nullable active_harness plus codex_session_id and claude_session_id so getSessionId returns nothing and setSessionId prompt job enqueue and active turn upsert refuse while no service is mounted
+      schema v6 relaxes the v5 not-null active_harness constraint by swapping the column and keeps every existing mount while pre-harness rows stay mounted on codex
       turns and prompt jobs record their admitting harness and restart recovery restores the session pointer of that harness
       callback actions capture expectedHarness beside expectedSessionId so panels rendered under one harness go stale after a switch
       schema version 5 adds the harness columns with additive alter-table migrations

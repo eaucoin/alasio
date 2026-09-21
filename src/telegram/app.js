@@ -1,5 +1,5 @@
 import { TurnController } from "../codex/turn-controller.js";
-import { CODEX_HARNESS, createHarnessRegistry } from "../harness/index.js";
+import { createHarnessRegistry } from "../harness/index.js";
 import { HOOK_SERVER_PORT } from "../shared/runtime-constants.js";
 import { SqliteStore } from "../persistence/store.js";
 import { Authorizer } from "./authorizer.js";
@@ -76,7 +76,7 @@ export class TelegramCodexApp {
     const me = await this.client.getMe();
     log.info(`Starting Telegram alasio bot as @${me.username ?? me.id}`);
     log.info(`  Working directory: ${this.config.workingDirectory}`);
-    log.info(`  Default service: ${this.config.defaultHarness ?? CODEX_HARNESS}`);
+    log.info(`  Default service: ${this.config.defaultHarness ?? "none (operator chooses with /service)"}`);
     await this.client.deleteWebhook(false);
     await this.configureNativeCommands();
     this.startHookServer();

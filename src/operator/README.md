@@ -4,9 +4,9 @@ mindmap
   root((operator))
     Commands
       command-parser maps Telegram text to the command algebra including /service and /service codex or claude
-      service-control owns the Telegram-native service panel that shows the active harness both parked session pointers and Use Codex or Use Claude Code switches
+      service-control owns the Telegram-native service panel that shows the active harness or none both parked session pointers and Use Codex or Use Claude Code switches plus sendChooseServicePanel which is the only reply an unmounted conversation receives
       service switches route through the turn controller which refuses while a turn is active or prompts are queued
-      command-handler resolves the active harness adapter for stop sessions new-session rewind and resume so each control acts on that harness's own session store
+      command-handler resolves the active harness adapter for stop sessions new-session rewind and resume so each control acts on that harness's own session store and answers with the service picker when nothing is mounted
       /goal replies that goals are Codex-only while Claude Code is active
       command-handler executes stop sessions new-session goal rewind and resume behavior
       new-session commands and callbacks create then mount real Codex app-server threads
