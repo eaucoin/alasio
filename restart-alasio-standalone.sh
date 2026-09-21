@@ -66,7 +66,9 @@ console.log(`Recorded operator_induced restart events for ${recorded} active tur
 NODE
 )
 
-if ! sudo -n true 2>/dev/null; then
+# The sudoers rule only covers the restart command itself, so probe with that
+# exact command (sudo -l) rather than `sudo -n true`, which it does not permit.
+if ! sudo -n -l /usr/bin/systemctl restart "$UNIT_NAME" >/dev/null 2>&1; then
   echo "sudo needs a password; run ./install-alasio-standalone-service.sh once to provision the NOPASSWD restart rule." >&2
   exit 1
 fi
