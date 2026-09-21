@@ -39,7 +39,13 @@ export class UpdatePoller {
           signal: this.abortController.signal,
         });
         for (const update of updates) {
-          await this.processUpdate(update);
+          try {
+            await this.processUpdate(update);
+          } catch (error) {
+            // The raw update is already persisted before processing, so skipping it
+            // loses nothing durable; re-fetching it forever would wedge the bot.
+            this.log.error(`Skipping update ${update.update_id} after processing failure: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+          }
           this.store.setTelegramOffset(update.update_id + 1);
         }
       } catch (error) {

@@ -1,5 +1,18 @@
 import { getMessageFiles, getMessageText } from "./message.js";
 
+/** Bot API getFile refuses anything larger than this, regardless of plan. */
+export const TELEGRAM_BOT_FILE_LIMIT_BYTES = 20 * 1024 * 1024;
+
+function describeDownloadFailure(file, error) {
+  const name = file.file_name ?? file.kind ?? "file";
+  const message = error instanceof Error ? error.message : String(error);
+  if ((file.file_size ?? 0) > TELEGRAM_BOT_FILE_LIMIT_BYTES || /file is too big/i.test(message)) {
+    const size = file.file_size ? ` (${(file.file_size / (1024 * 1024)).toFixed(1)} MB)` : "";
+    return `Could not fetch ${name}${size}: Telegram only lets bots download files up to 20 MB. Put it in the mounted folder yourself, or send a link or a smaller file.`;
+  }
+  return `Could not fetch ${name}: ${message}`;
+}
+
 export class MessageHandler {
   constructor({ authorizer, client, store, turns, mediaGroups, log }) {
     this.authorizer = authorizer;
@@ -46,16 +59,31 @@ export class MessageHandler {
     }
 
     const localPaths = [];
+    const failures = [];
     for (const file of files) {
-      const downloaded = await this.client.downloadTelegramFile(file, file.file_name ?? `telegram-${message.message_id}`);
-      this.store.insertFile({
-        conversationId,
-        messageId,
-        file,
-        localPath: downloaded.localPath,
-        sha256: downloaded.sha256,
-      });
-      localPaths.push(downloaded.localPath);
+      // A file the Bot API refuses must not poison the update: report it and carry on
+      // with whatever else the message carried.
+      if ((file.file_size ?? 0) > TELEGRAM_BOT_FILE_LIMIT_BYTES) {
+        failures.push(describeDownloadFailure(file, new Error("file is too big")));
+        continue;
+      }
+      try {
+        const downloaded = await this.client.downloadTelegramFile(file, file.file_name ?? `telegram-${message.message_id}`);
+        this.store.insertFile({
+          conversationId,
+          messageId,
+          file,
+          localPath: downloaded.localPath,
+          sha256: downloaded.sha256,
+        });
+        localPaths.push(downloaded.localPath);
+      } catch (error) {
+        this.log.warn(`Download failed for ${file.file_id} in ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(describeDownloadFailure(file, error));
+      }
+    }
+    if (failures.length > 0) {
+      await this.client.sendMessage(message.chat.id, failures.join("\n\n"));
     }
 
     if (!text && localPaths.length === 0) {

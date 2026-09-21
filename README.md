@@ -78,6 +78,8 @@ mindmap
       accepted prompts survive process restarts in a per-conversation SQLite queue
       restart continuations receive deterministic internal prompt identities and retire provenance only with durable queue staging
       Bot API retry-after responses defer durable outbox delivery instead of crashing the service
+      Telegram file downloads the Bot API refuses such as anything over its 20 MB getFile limit are reported to the operator and the rest of the message still runs instead of failing the update
+      the update poller records every raw update before processing and advances past one whose processing throws so a single poison update cannot wedge polling
       upstream turn completion is checkpointed separately from Telegram delivery so restart recovery cannot duplicate completed work
       terminal response handoff retries continue during normal service uptime rather than waiting for another restart
       final replies contain only Codex final-answer phase text while commentary tool activity and phase-less text remain internal
