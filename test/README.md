@@ -1,0 +1,75 @@
+## Concept Atlas
+```mermaid
+mindmap
+  root((alasio tests))
+    Regression contracts
+      authorization tests pin one private operator across message and callback ingress and reject callbacks before consuming stored actions
+      Breadbutter capability tests pin Bayma Python and Rust classification fingerprint invalidation readiness evidence wait behavior and cleanup after success or failure
+      app-server protocol tests pin notification turn identity across direct nested and item-shaped payloads
+      app-server request contracts pin gpt-5.6-sol with high reasoning for thread creation and turn execution
+      queue tests assert stale interrupted-turn completions cannot clear or satisfy the active Telegram turn
+      queue tests assert thread goal updates with turn ids are retained as attachable active turns
+      queue tests assert turn/start response handles cannot overwrite the observed notification turn id
+      queue tests assert response and notification aliases are retired by completion under either identity
+      queue tests reproduce completion arriving before the turn/start response and prove the next turn performs no false leftover interrupt
+      queue tests assert notification waits do not acquire a wall-clock timeout
+      reliability tests assert stop waits for cleanup stale completion cannot clear a replacement and prompt plus outbox state survives restart
+      reliability tests assert failed interrupt cleanup forgets every local alias while retaining its diagnostic origin
+      reliability tests assert callback controls retain their expected mounted-session generation
+      reliability tests assert app composition supplies final delivery and restart reconciliation preserves upstream-completed jobs
+      reliability tests assert final delivery selects upstream final-answer phase while phase-less and active-stream blocks remain private
+      reliability tests assert terminal response recovery produces one durable outbox handoff across repeated scans
+      reliability tests reproduce self-restart recovery through a distinct durable continuation and final-answer-only handoff
+      app-server stream tests assert turn/started notification ids are adopted before item turn filtering
+      app-server stream tests assert unknown same-thread progress cannot exhaust the stale-notification guard
+      app-server stream tests assert explicit mismatched turn ids still fail rather than contaminating a live turn
+      goal-control tests pin the no-mounted no-active active-goal and replacement-confirmation panel shapes
+      goal-control tests assert no-session goal objectives bootstrap fresh mounted sessions
+      goal-control tests assert fresh objective writes clear stale completed upstream goal state before replacement
+      goal-control tests assert active goals either attach to upstream goal turns or start fallback mounted-session turns
+      goal-control tests assert active goal controls use the normal concurrent-turn decision surface while Codex is working
+      session-control tests assert New Session callbacks create and mount fresh app-server sessions
+      command parser tests pin Telegram-native slash forms for session and goal controls
+      restart command tests pin the wrapper and direct systemd command recognition used for restart provenance
+      systemd service tests pin descendant OOM containment together with main-process restart recovery
+      systemd service tests pin locked Alasio dependency installation before capability doctors and unit activation
+      systemd service tests pin the provisioned Breadbutter Python 3.12 interpreter and Python-plus-Rust Breadbutter doctor across installer and service runtime
+    Scope
+      tests exercise alasio-local runtime behavior without booting Telegram polling or Codex subprocesses
+      fixtures stay inline when the wire shape is the behavior under test
+      CI runs affected files through the built-in Node test API and preserves normalized target-plus-file evidence without substituting Bun semantics
+```
+
+## Preference Atlas
+```mermaid
+sequenceDiagram
+  participant Test as node:test
+  participant Protocol as app-server/protocol
+  participant Queue as app-server/notification-queue
+  participant Thread as active turn identity
+  participant Telegram as Telegram operator turn
+  Test->>Protocol: assert turn id extraction and active-turn matching
+  Protocol-->>Test: distinguish current turn notifications from stale completions
+  Test->>Queue: assert stale completion leaves current-turn identity intact
+  Test->>Queue: assert logical-turn aliases clear together and idle waits remain timer-free
+  Queue->>Thread: retain current turn after unrelated completed notification
+  Thread-->>Telegram: keep later Telegram messages from inheriting old completion state
+  Test->>Telegram: assert goal control panels stay compact self-contained and callback-backed
+  Queue-->>Test: expose deterministic in-memory state without external services or Codex app-server startup
+```
+
+## Avoidance Atlas
+```mermaid
+stateDiagram-v2
+  [*] --> StaleCompletion
+  StaleCompletion: interrupted turn completion arrives after a later Telegram prompt has started
+  StaleCompletion --> FalseNoResponse: later turn accepts old completion and emits no visible answer
+  FalseNoResponse --> OperatorConfusion
+  OperatorConfusion --> RegressionTest
+  RegressionTest: pin app-server wire shapes that previously bypassed turn filtering
+  RegressionTest --> TurnBoundedStream
+  TurnBoundedStream --> HonestInterruption: interruption edits status without fabricating an error reply
+  HonestInterruption --> RetrySafeConversation
+  RetrySafeConversation: next Telegram message waits for its own Codex events
+  TurnBoundedStream --> [*]
+```

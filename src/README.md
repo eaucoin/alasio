@@ -1,0 +1,68 @@
+## Concept Atlas
+```mermaid
+mindmap
+  root((alasio source))
+    Root entrypoint
+      config owns alasio environment loading and index starts the Telegram Codex app
+      root stays intentionally thin so source domains do not collapse back into one flat namespace
+    telegram/
+      owns Bot API polling lifecycle authorization callbacks file downloads message projection Markdown-safe response rendering text splitting media-group buffering and durable outbox delivery
+      filenames omit telegram prefixes because the directory supplies that context
+    codex/
+      owns Codex turn orchestration runtime transport event projection status reporting restart recovery and app-server protocol
+      model owns the configured Codex model and reasoning effort shared by app-server and exec transports
+      app-server/ splits protocol-heavy transport mechanics into explicit smaller modules
+      exec transport remains a rollback path behind ALASIO_CODEX_TRANSPORT=exec
+      filenames omit codex prefixes except where external protocol names make them useful
+    operator/
+      owns operator command parsing command execution Telegram-native session and goal control panels session reply formatting restart prompts and shared operator-facing text helpers
+    sessions/
+      owns Codex rollout JSONL discovery session listing and rewind forking
+    persistence/
+      owns SQLite schema store facade and table-group repositories for callbacks conversations prompt jobs responses outbox restarts state Telegram content turns and usage
+      store remains the only persistence facade imported by transport/runtime code
+    policy/
+      owns shell command parsing restart command recognition forbidden database command detection and workflow wait detection
+    mcp/
+      owns MCP config merging Bayma state-dir materialization stdio preflight checks and repository-specific Breadbutter Python and Rust capability evidence
+    workflow/
+      owns the localhost hook server that receives CI wait notifications
+    shared/
+      owns cross-domain helpers for async timing file prompt suffixes duration text ids scoped logging and runtime constants
+    Persistence
+      state belongs under the configured alasio data directory rather than ad hoc JSON files
+      SQLite schema is canonical DDL for the local content database
+      table-group repositories stay behind persistence/store.js
+```
+
+## Preference Atlas
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Telegram
+  participant App as telegram/app
+  participant Store as persistence/store
+  participant Turns as codex/turn-controller
+  participant Codex as codex/runtime
+  participant Client as telegram/client
+  Telegram->>App: deliver authorized private-chat update
+  App->>Store: persist offset, message, file, and conversation continuity
+  App->>Turns: dispatch command, native session control callback, queued message, restart continuation, or Codex prompt through one turn boundary
+  Turns->>Codex: execute or resume a Codex turn with explicit working directory and thread key
+  Codex-->>Store: stream response blocks and restart provenance
+  Turns->>Store: enqueue the final Telegram reply independently from Codex completion
+  Store->>Client: drain durable outbound replies with rate-limit backoff
+```
+
+## Avoidance Atlas
+```mermaid
+stateDiagram-v2
+  [*] --> ExplicitRuntimeBoundary
+  ExplicitRuntimeBoundary --> HiddenState: source modules write untracked ad hoc state beside code
+  HiddenState --> RestartAmbiguity: service restarts cannot reconstruct transport or Codex continuity
+  RestartAmbiguity --> OperatorConfusion
+  OperatorConfusion --> HiddenState
+  ExplicitRuntimeBoundary --> SQLiteBackedContinuity
+  SQLiteBackedContinuity --> RestartSafeOperation
+  RestartSafeOperation --> [*]
+```
