@@ -11,6 +11,10 @@ export function parseCommand(text) {
     if (serviceMatch) {
         return { type: "service", target: (serviceMatch[1] || "").toLowerCase() };
     }
+    const workspaceMatch = /^\/workspace(?:\s+([\s\S]*))?$/i.exec(normalized);
+    if (workspaceMatch) {
+        return { type: "workspace", args: (workspaceMatch[1] || "").trim() };
+    }
     if (normalized.toLowerCase() === "/sessions") {
         return { type: "sessions_panel" };
     }

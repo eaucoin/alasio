@@ -14,15 +14,16 @@ function sessionColumn(harness) {
 }
 
 export class SqliteConversationRepository {
-  constructor(db) {
+  constructor(db, { defaultWorkingDirectory = null } = {}) {
     this.db = db;
+    this.defaultWorkingDirectory = defaultWorkingDirectory;
   }
 
   upsertConversation({ chatId, user, sessionId }) {
     const id = `telegram:${chatId}`;
     this.db.prepare(`
-      insert into conversations (id, transport, chat_id, user_id, username, first_name, last_name, codex_session_id, active_harness)
-      values (?, 'telegram', ?, ?, ?, ?, ?, ?, ?)
+      insert into conversations (id, transport, chat_id, user_id, username, first_name, last_name, codex_session_id, active_harness, working_directory)
+      values (?, 'telegram', ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(id) do update set
         user_id = coalesce(excluded.user_id, conversations.user_id),
         username = coalesce(excluded.username, conversations.username),
@@ -39,6 +40,7 @@ export class SqliteConversationRepository {
       user?.last_name ?? null,
       sessionId ?? null,
       getDefaultHarness(),
+      this.defaultWorkingDirectory,
     );
     return id;
   }
@@ -54,11 +56,62 @@ export class SqliteConversationRepository {
   listConversationsWithSessions(harness = CODEX_HARNESS) {
     const column = sessionColumn(harness);
     return this.db.prepare(`
-      select id, ${column} as session_id, ${column} as codex_session_id, active_harness
+      select id, ${column} as session_id, ${column} as codex_session_id, active_harness, working_directory
       from conversations
-      where ${column} is not null and ${column} <> '' and active_harness = ?
+      where ${column} is not null and ${column} <> '' and active_harness = ? and working_directory is not null
       order by updated_at desc
     `).all(harness);
+  }
+
+  /**
+   * Folder the conversation's harness runs in, or null until one is chosen.
+   */
+  getWorkingDirectory(threadKey) {
+    return this.getConversation(threadKey)?.working_directory ?? null;
+  }
+
+  /**
+   * Mount a folder. Sessions belong to one harness and one folder, so the
+   * current session pointers are parked under the outgoing folder and whatever
+   * was parked for the incoming folder is restored.
+   */
+  setWorkingDirectory(threadKey, workingDirectory) {
+    if (typeof workingDirectory !== "string" || !workingDirectory.trim()) {
+      throw new Error("Working directory must be a non-empty path");
+    }
+    const conversation = this.getConversation(threadKey);
+    if (!conversation) {
+      throw new Error(`Unknown conversation: ${threadKey}`);
+    }
+    const previous = conversation.working_directory ?? null;
+    if (previous === workingDirectory) {
+      return;
+    }
+    const park = this.db.prepare(`
+      insert into workspace_sessions (conversation_id, harness, working_directory, session_id, updated_at)
+      values (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      on conflict(conversation_id, harness, working_directory) do update set
+        session_id = excluded.session_id,
+        updated_at = excluded.updated_at
+    `);
+    const parked = this.db.prepare(`
+      select session_id from workspace_sessions
+      where conversation_id = ? and harness = ? and working_directory = ?
+    `);
+    this.db.transaction(() => {
+      const restored = {};
+      for (const [harness, column] of Object.entries(SESSION_COLUMNS)) {
+        if (previous) {
+          park.run(threadKey, harness, previous, conversation[column] ?? null);
+        }
+        restored[column] = parked.get(threadKey, harness, workingDirectory)?.session_id ?? null;
+      }
+      this.db.prepare(`
+        update conversations
+        set working_directory = ?, codex_session_id = ?, claude_session_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        where id = ?
+      `).run(workingDirectory, restored.codex_session_id, restored.claude_session_id, threadKey);
+    })();
   }
 
   /**

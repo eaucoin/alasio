@@ -1,9 +1,11 @@
 import { RestartRecovery } from "./restart-recovery.js";
-import { createHarnessRegistry, isHarnessName } from "../harness/index.js";
+import { NO_WORKSPACE_MOUNTED, createHarnessRegistry, harnessDisplayName, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.js";
 import { finalResponseToMarkdown } from "./response-markdown.js";
 import { buildFilePromptSuffix } from "../shared/file-prompt.js";
 import { CommandHandler } from "../operator/command-handler.js";
 import { sendChooseServicePanel } from "../operator/service-control.js";
+import { sendChooseWorkspacePanel } from "../operator/workspace-control.js";
+import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.js";
 import { truncateText } from "../operator/text.js";
 import { StatusReporter } from "./status-reporter.js";
 import { createLogger } from "../shared/log.js";
@@ -30,6 +32,8 @@ export class TurnController {
       runGoalTurn: (args) => this.runGoalTurn(args),
       startNewSession: (args) => this.startNewSession(args),
       switchHarness: (args) => this.switchHarness(args),
+      switchWorkspace: (args) => this.switchWorkspace(args),
+      createWorkspace: (args) => this.createWorkspace(args),
     });
     this.status = new StatusReporter({
       client,
@@ -51,7 +55,28 @@ export class TurnController {
   }
 
   harnessLabel(conversationId) {
-    return this.harnessFor(conversationId)?.displayName ?? "No service";
+    const name = resolveHarnessName(this.store, conversationId);
+    return name ? harnessDisplayName(name) : "No service";
+  }
+
+  workingDirectoryFor(conversationId) {
+    return resolveWorkingDirectory(this.store, conversationId);
+  }
+
+  requireWorkingDirectory(conversationId) {
+    const workingDirectory = this.workingDirectoryFor(conversationId);
+    if (!workingDirectory) {
+      throw new Error(NO_WORKSPACE_MOUNTED);
+    }
+    return workingDirectory;
+  }
+
+  /**
+   * Per-conversation view of the deployment config for helpers that still read
+   * config.workingDirectory (goal RPCs).
+   */
+  configFor(conversationId) {
+    return { ...this.config, workingDirectory: this.workingDirectoryFor(conversationId) };
   }
 
   async sendChooseServicePanel({ conversationId, chatId }) {
@@ -62,6 +87,33 @@ export class TurnController {
       conversationId,
       chatId,
     });
+  }
+
+  async sendChooseWorkspacePanel({ conversationId, chatId }) {
+    await sendChooseWorkspacePanel({
+      client: this.client,
+      store: this.store,
+      activeQueries: this.activeQueries,
+      conversationId,
+      chatId,
+      workspaceRoot: this.config.workspaceRoot,
+    });
+  }
+
+  /**
+   * Service first, then folder. Sends the picker for the first missing layer and
+   * reports whether one was sent, so ingress can stop there.
+   */
+  async sendNextSetupStep({ conversationId, chatId }) {
+    if (!resolveHarnessName(this.store, conversationId)) {
+      await this.sendChooseServicePanel({ conversationId, chatId });
+      return true;
+    }
+    if (!this.workingDirectoryFor(conversationId)) {
+      await this.sendChooseWorkspacePanel({ conversationId, chatId });
+      return true;
+    }
+    return false;
   }
 
   describeSwitchBlocker(conversationId) {
@@ -93,7 +145,35 @@ export class TurnController {
       previous,
       next: harness,
       sessionId: this.store.getSessionId(conversationId) ?? null,
+      workingDirectory: this.workingDirectoryFor(conversationId),
     };
+  }
+
+  async switchWorkspace({ conversationId, target }) {
+    const workingDirectory = await resolveWorkspacePath({ root: this.config.workspaceRoot, candidate: target });
+    const previous = this.workingDirectoryFor(conversationId);
+    if (previous === workingDirectory) {
+      return { switched: false, previous, workingDirectory };
+    }
+    const blocker = this.describeSwitchBlocker(conversationId);
+    if (blocker) {
+      throw new Error(blocker);
+    }
+    this.store.setWorkingDirectory(conversationId, workingDirectory);
+    log.info(`workspace.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${workingDirectory}`);
+    return { switched: true, previous, workingDirectory };
+  }
+
+  async createWorkspace({ conversationId, name }) {
+    const blocker = this.describeSwitchBlocker(conversationId);
+    if (blocker) {
+      throw new Error(blocker);
+    }
+    const workingDirectory = await createWorkspace({ root: this.config.workspaceRoot, name });
+    const previous = this.workingDirectoryFor(conversationId);
+    this.store.setWorkingDirectory(conversationId, workingDirectory);
+    log.info(`workspace.created conversation=${JSON.stringify(conversationId)} path=${workingDirectory}`);
+    return { switched: true, created: true, previous, workingDirectory };
   }
 
   enqueueMessage(conversationId, prompt, front = false) {
@@ -122,9 +202,8 @@ export class TurnController {
     if (!prompt.trim()) {
       return;
     }
-    if (!this.harnessFor(conversationId)) {
-      // Neutral by default: nothing is queued until the operator chooses a service.
-      await this.sendChooseServicePanel({ conversationId, chatId });
+    if (await this.sendNextSetupStep({ conversationId, chatId })) {
+      // Neutral by default: nothing is queued until a service and a folder are chosen.
       return;
     }
     const job = this.store.enqueuePromptJob({
@@ -213,7 +292,7 @@ export class TurnController {
     }
     const sessionId = await harness.startFreshSession({
       threadKey: conversationId,
-      workingDirectory: this.config.workingDirectory,
+      workingDirectory: this.requireWorkingDirectory(conversationId),
     });
     this.store.setSessionId(conversationId, sessionId);
     return sessionId;
@@ -305,7 +384,7 @@ export class TurnController {
       threadKey: conversationId,
       chatId: String(chatId),
       messageId: String(messageId),
-      workingDirectory: this.config.workingDirectory,
+      workingDirectory: this.requireWorkingDirectory(conversationId),
       persistence: this.store,
       activeQueries: this.activeQueries,
       attachedTurn,

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import Database from "better-sqlite3";
 
 import { TurnController } from "../src/codex/turn-controller.js";
-import { NO_SERVICE_MOUNTED, createHarnessRegistry, resolveHarnessName } from "../src/harness/index.js";
+import { NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, createHarnessRegistry, resolveHarnessName } from "../src/harness/index.js";
 import { CLAUDE_HARNESS, CODEX_HARNESS, getDefaultHarness, harnessDisplayName, normalizeHarnessName } from "../src/harness/names.js";
 import { parseCommand } from "../src/operator/command-parser.js";
 import { buildRestartSyntheticText } from "../src/operator/restart-prompts.js";
@@ -20,13 +21,26 @@ import { migrateSqliteSchema } from "../src/persistence/schema.js";
 import { SqliteStore } from "../src/persistence/store.js";
 import { CallbackHandler } from "../src/telegram/callback-handler.js";
 import { MessageHandler } from "../src/telegram/message-handler.js";
+import { listWorkspaceCandidates } from "../src/workspace/policy.js";
 
+/**
+ * Each test gets a SQLite store plus a workspace root holding `repo` (a git
+ * repository), `plain` (a bare folder), a hidden folder, a file and a symlink
+ * that escapes the root.
+ */
 async function withStore(run) {
-  const root = mkdtempSync(join(tmpdir(), "alasio-harness-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "alasio-harness-")));
+  const workspaceRoot = join(root, "workspaces");
+  mkdirSync(join(workspaceRoot, "repo"), { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: join(workspaceRoot, "repo") });
+  mkdirSync(join(workspaceRoot, "plain"));
+  mkdirSync(join(workspaceRoot, ".hidden"));
+  writeFileSync(join(workspaceRoot, "notes.txt"), "not a folder");
+  symlinkSync(root, join(workspaceRoot, "escape"));
   try {
     const store = new SqliteStore(root);
     try {
-      return await run(store, root);
+      return await run(store, { root, workspaceRoot, repo: join(workspaceRoot, "repo"), plain: join(workspaceRoot, "plain") });
     } finally {
       store.close();
     }
@@ -58,7 +72,7 @@ function createFakeHarness(name, { sessionId = `${name}-fresh` } = {}) {
   };
 }
 
-function createRegistry(config = { workingDirectory: "/tmp" }) {
+function createRegistry(config = {}) {
   const codex = createFakeHarness(CODEX_HARNESS);
   const claude = createFakeHarness(CLAUDE_HARNESS);
   return {
@@ -66,6 +80,20 @@ function createRegistry(config = { workingDirectory: "/tmp" }) {
     codex,
     claude,
   };
+}
+
+function createTurnController(store, registry, client = createClient(), config = {}) {
+  return new TurnController({
+    config: { workspaceRoot: "/nonexistent-workspace-root", ...config },
+    client,
+    store,
+    outbox: { enqueueText: () => undefined },
+    activeQueries: new Map(),
+    workflowWaits: new Map(),
+    workflowWakeEvents: new Map(),
+    isStopping: () => false,
+    harnesses: registry,
+  });
 }
 
 function createClient() {
@@ -126,6 +154,8 @@ test("conversations keep one parked session pointer per harness", async () => {
 
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
+    assert.deepEqual(store.listConversationsWithSessions(CODEX_HARNESS), []);
+    store.setWorkingDirectory(conversationId, "/work/a");
     store.setSessionId(conversationId, "codex-session");
     assert.equal(store.getSessionId(conversationId), "codex-session");
 
@@ -140,9 +170,38 @@ test("conversations keep one parked session pointer per harness", async () => {
     assert.equal(store.getSessionId(conversationId), "codex-session");
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-session");
 
-    assert.deepEqual(store.listConversationsWithSessions(CODEX_HARNESS).map((row) => row.session_id), ["codex-session"]);
+    assert.deepEqual(
+      store.listConversationsWithSessions(CODEX_HARNESS).map((row) => [row.session_id, row.working_directory]),
+      [["codex-session", "/work/a"]],
+    );
     assert.deepEqual(store.listConversationsWithSessions(CLAUDE_HARNESS), []);
     assert.throws(() => store.setActiveHarness(conversationId, "gemini"), /Unknown harness/);
+  });
+});
+
+test("switching folders parks both harness session pointers per folder", async () => {
+  await withStore((store) => {
+    const conversationId = store.upsertConversation({ chatId: "15", user: { id: 15 } });
+    assert.equal(store.getWorkingDirectory(conversationId), null);
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
+    store.setWorkingDirectory(conversationId, "/work/a");
+    store.setSessionId(conversationId, "codex-a");
+    store.setHarnessSessionId(conversationId, CLAUDE_HARNESS, "claude-a");
+
+    store.setWorkingDirectory(conversationId, "/work/b");
+    assert.equal(store.getWorkingDirectory(conversationId), "/work/b");
+    assert.equal(store.getSessionId(conversationId), undefined);
+    assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), undefined);
+    store.setSessionId(conversationId, "codex-b");
+
+    store.setWorkingDirectory(conversationId, "/work/a");
+    assert.equal(store.getSessionId(conversationId), "codex-a");
+    assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-a");
+    store.setWorkingDirectory(conversationId, "/work/b");
+    assert.equal(store.getSessionId(conversationId), "codex-b");
+    assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), undefined);
+    assert.throws(() => store.setWorkingDirectory(conversationId, ""), /non-empty path/);
+    assert.throws(() => store.setWorkingDirectory("telegram:nope", "/work/a"), /Unknown conversation/);
   });
 });
 
@@ -217,14 +276,21 @@ test("schema migration adds harness columns to an existing v4 database", () => {
     assert.ok(columns("conversations").has("active_harness"));
     assert.ok(columns("turns").has("harness"));
     assert.ok(columns("prompt_jobs").has("harness"));
-    assert.equal(legacy.prepare("select value from bot_state where key = 'schema_version'").get().value, "6");
+    assert.equal(legacy.prepare("select value from bot_state where key = 'schema_version'").get().value, "7");
     legacy.close();
 
-    const store = new SqliteStore(root, dbPath);
+    const store = new SqliteStore(root, dbPath, { defaultWorkingDirectory: "/legacy/workspace" });
     assert.equal(store.getActiveHarness("telegram:9"), CODEX_HARNESS);
     assert.equal(store.getSessionId("telegram:9"), "legacy-session");
-    assert.equal(store.getActiveHarness(store.upsertConversation({ chatId: "10", user: { id: 10 } })), null);
+    assert.equal(store.getWorkingDirectory("telegram:9"), "/legacy/workspace");
+    const fresh = store.upsertConversation({ chatId: "10", user: { id: 10 } });
+    assert.equal(store.getActiveHarness(fresh), null);
+    assert.equal(store.getWorkingDirectory(fresh), "/legacy/workspace");
     store.close();
+
+    const neutral = new SqliteStore(root, dbPath);
+    assert.equal(neutral.getWorkingDirectory(neutral.upsertConversation({ chatId: "11", user: { id: 11 } })), null);
+    neutral.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -280,6 +346,8 @@ test("schema migration relaxes the v5 active_harness constraint without losing m
     assert.equal(store.getActiveHarness("telegram:11"), CLAUDE_HARNESS);
     assert.equal(store.getSessionId("telegram:11"), "claude-old");
     assert.equal(store.getHarnessSessionId("telegram:11", CODEX_HARNESS), "codex-old");
+    // No WORKING_DIRECTORY configured: previously mounted rows must choose a folder.
+    assert.equal(store.getWorkingDirectory("telegram:11"), null);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -287,13 +355,14 @@ test("schema migration relaxes the v5 active_harness constraint without losing m
 });
 
 test("switching services is refused while a turn is active or prompts are queued", async () => {
-  await withStore(async (store) => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "3", user: { id: 3 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
+    store.setWorkingDirectory(conversationId, paths.repo);
     const activeQueries = new Map();
     const { registry } = createRegistry();
     const turns = new TurnController({
-      config: { workingDirectory: "/tmp" },
+      config: { workspaceRoot: paths.workspaceRoot },
       client: createClient(),
       store,
       outbox: { enqueueText: () => undefined },
@@ -320,33 +389,67 @@ test("switching services is refused while a turn is active or prompts are queued
     store.setPromptJobDisposition(job.id, "cancelled");
 
     const result = await turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS });
-    assert.deepEqual(result, { switched: true, previous: CODEX_HARNESS, next: CLAUDE_HARNESS, sessionId: null });
+    assert.deepEqual(result, { switched: true, previous: CODEX_HARNESS, next: CLAUDE_HARNESS, sessionId: null, workingDirectory: paths.repo });
     assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
     const again = await turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS });
     assert.equal(again.switched, false);
     await assert.rejects(() => turns.switchHarness({ conversationId, harness: "gemini" }), /Unknown service/);
+
+    activeQueries.set(conversationId, { abort: async () => undefined, steer: async () => false });
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "plain" }), /Claude Code is currently working/);
+    await assert.rejects(() => turns.createWorkspace({ conversationId, name: "fresh" }), /Claude Code is currently working/);
+    activeQueries.delete(conversationId);
+    const same = await turns.switchWorkspace({ conversationId, target: "repo" });
+    assert.deepEqual(same, { switched: false, previous: paths.repo, workingDirectory: paths.repo });
+  });
+});
+
+test("workspace policy keeps every folder under the root", async () => {
+  await withStore(async (store, paths) => {
+    const conversationId = store.upsertConversation({ chatId: "16", user: { id: 16 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
+    const { registry } = createRegistry();
+    const turns = createTurnController(store, registry, createClient(), { workspaceRoot: paths.workspaceRoot });
+
+    const byName = await turns.switchWorkspace({ conversationId, target: "repo" });
+    assert.deepEqual(byName, { switched: true, previous: null, workingDirectory: paths.repo });
+    const byAbsolute = await turns.switchWorkspace({ conversationId, target: paths.plain });
+    assert.equal(byAbsolute.workingDirectory, paths.plain);
+    assert.equal(store.getWorkingDirectory(conversationId), paths.plain);
+
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "missing" }), /does not exist under/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "../" }), /outside the workspace root/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "escape" }), /outside the workspace root/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "/etc" }), /outside the workspace root/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "notes.txt" }), /not a directory/);
+    await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "" }), /Folder path is empty/);
+    assert.equal(store.getWorkingDirectory(conversationId), paths.plain);
+
+    await assert.rejects(() => turns.createWorkspace({ conversationId, name: "../oops" }), /Folder names may only use/);
+    await assert.rejects(() => turns.createWorkspace({ conversationId, name: ".hidden" }), /Folder names may only use/);
+    await assert.rejects(() => turns.createWorkspace({ conversationId, name: "repo" }), /already exists/);
+    const created = await turns.createWorkspace({ conversationId, name: "fresh-1" });
+    assert.deepEqual(created, { switched: true, created: true, previous: paths.plain, workingDirectory: join(paths.workspaceRoot, "fresh-1") });
+    assert.equal(store.getWorkingDirectory(conversationId), created.workingDirectory);
+    assert.equal(execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: created.workingDirectory }).toString().trim(), "main");
+
+    const candidates = (await listWorkspaceCandidates(paths.workspaceRoot)).map((candidate) => [candidate.name, candidate.git]);
+    assert.deepEqual(candidates, [["fresh-1", true], ["repo", true], ["plain", false]]);
   });
 });
 
 test("new sessions and active turns are recorded under the active harness", async () => {
-  await withStore(async (store) => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "4", user: { id: 4 } });
     const { registry, claude, codex } = createRegistry();
-    const turns = new TurnController({
-      config: { workingDirectory: "/tmp" },
-      client: createClient(),
-      store,
-      outbox: { enqueueText: () => undefined },
-      activeQueries: new Map(),
-      workflowWaits: new Map(),
-      workflowWakeEvents: new Map(),
-      isStopping: () => false,
-      harnesses: registry,
-    });
+    const turns = createTurnController(store, registry);
     store.setActiveHarness(conversationId, CLAUDE_HARNESS);
+    await assert.rejects(() => turns.startNewSession({ conversationId }), /No folder is mounted/);
+    store.setWorkingDirectory(conversationId, paths.repo);
     const sessionId = await turns.startNewSession({ conversationId });
     assert.equal(sessionId, "claude-fresh");
     assert.equal(claude.calls.length, 1);
+    assert.equal(claude.calls[0][1].workingDirectory, paths.repo);
     assert.equal(codex.calls.length, 0);
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-fresh");
     assert.equal(store.getHarnessSessionId(conversationId, CODEX_HARNESS), undefined);
@@ -509,26 +612,12 @@ test("callback handler rejects panels created under another harness", async () =
   });
 });
 
-function createTurnController(store, registry, client = createClient()) {
-  return new TurnController({
-    config: { workingDirectory: "/tmp" },
-    client,
-    store,
-    outbox: { enqueueText: () => undefined },
-    activeQueries: new Map(),
-    workflowWaits: new Map(),
-    workflowWakeEvents: new Map(),
-    isStopping: () => false,
-    harnesses: registry,
-  });
-}
-
-test("prompts sent before a service is chosen only get the picker and are not queued", async () => {
-  await withStore(async (store) => {
+test("prompts sent before a service and folder are chosen only get the pickers and are not queued", async () => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "12", user: { id: 12 } });
     const client = createClient();
     const { registry, codex, claude } = createRegistry();
-    const turns = createTurnController(store, registry, client);
+    const turns = createTurnController(store, registry, client, { workspaceRoot: paths.workspaceRoot });
 
     await turns.processPrompt({ conversationId, chatId: "12", messageId: "1", text: "hello there", filePaths: [] });
     assert.equal(client.calls.sendMessage.length, 1);
@@ -551,19 +640,49 @@ test("prompts sent before a service is chosen only get the picker and are not qu
     await turns.processPrompt({ conversationId, chatId: "12", messageId: "4", text: "/service claude", filePaths: [] });
     assert.match(client.calls.sendMessage[3][1], /Mounted Claude Code/);
     assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
+    // Service first, then folder: the folder picker follows immediately.
+    assert.match(client.calls.sendMessage[4][1], /Workspace\n\nFolder: none/);
+    assert.match(client.calls.sendMessage[4][1], /No folder is mounted/);
+    assert.deepEqual(
+      client.calls.sendMessage[4][2].reply_markup.inline_keyboard.flat().map((button) => button.text),
+      ["repo", "· plain", "New folder…", "Refresh", "Close"],
+    );
 
-    await turns.processPrompt({ conversationId, chatId: "12", messageId: "5", text: "/sessions new", filePaths: [] });
-    assert.match(client.calls.sendMessage[4][1], /New Claude Code session mounted: claude-f/);
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "5", text: "hello again", filePaths: [] });
+    assert.match(client.calls.sendMessage[5][1], /Folder: none/);
+    assert.equal(store.hasOpenPromptJobs(conversationId), false);
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "6", text: "/sessions new", filePaths: [] });
+    assert.match(client.calls.sendMessage[6][1], /Folder: none/);
+    assert.equal(claude.calls.length, 0);
+
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "7", text: "/workspace escape", filePaths: [] });
+    assert.match(client.calls.sendMessage[7][1], /outside the workspace root/);
+    assert.equal(store.getWorkingDirectory(conversationId), null);
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "8", text: "/workspace repo", filePaths: [] });
+    assert.match(client.calls.sendMessage[8][1], /Mounted repo \(/);
+    assert.match(client.calls.sendMessage[8][1], new RegExp(`Folder: ${paths.repo}`));
+    assert.equal(client.calls.sendMessage[8][2].reply_markup.inline_keyboard[0][0].text, "* repo");
+    assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
+
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "9", text: "/sessions new", filePaths: [] });
+    assert.match(client.calls.sendMessage[9][1], /New Claude Code session mounted: claude-f/);
     assert.equal(claude.calls.length, 1);
     assert.equal(codex.calls.length, 0);
+
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "10", text: "/workspace new made-here", filePaths: [] });
+    assert.match(client.calls.sendMessage[10][1], /Created and mounted made-here/);
+    assert.equal(store.getWorkingDirectory(conversationId), join(paths.workspaceRoot, "made-here"));
+    assert.equal(store.getSessionId(conversationId), undefined);
+    await turns.processPrompt({ conversationId, chatId: "12", messageId: "11", text: "/workspace repo", filePaths: [] });
+    assert.equal(store.getSessionId(conversationId), "claude-fresh");
   });
 });
 
-test("/start offers the picker until a service is mounted", async () => {
-  await withStore(async (store) => {
+test("/start offers the pickers until a service and folder are mounted", async () => {
+  await withStore(async (store, paths) => {
     const client = createClient();
     const { registry } = createRegistry();
-    const turns = createTurnController(store, registry, client);
+    const turns = createTurnController(store, registry, client, { workspaceRoot: paths.workspaceRoot });
     const handler = new MessageHandler({
       authorizer: { isAuthorizedMessage: () => true },
       client,
@@ -578,21 +697,25 @@ test("/start offers the picker until a service is mounted", async () => {
 
     store.setActiveHarness("telegram:13", CODEX_HARNESS);
     await handler.handle({ ...message, message_id: 2 }, 2);
-    assert.equal(client.calls.sendMessage[1][1], "Alasio is ready.");
+    assert.match(client.calls.sendMessage[1][1], /Folder: none/);
+
+    store.setWorkingDirectory("telegram:13", paths.repo);
+    await handler.handle({ ...message, message_id: 3 }, 3);
+    assert.equal(client.calls.sendMessage[2][1], "Alasio is ready.");
   });
 });
 
-test("callbacks other than service controls are refused while nothing is mounted", async () => {
-  await withStore(async (store) => {
+test("callbacks other than service and workspace controls are refused while nothing is mounted", async () => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "14", user: { id: 14 } });
     const actionId = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
     const client = createClient();
     const { registry } = createRegistry();
-    const turns = createTurnController(store, registry, client);
+    const turns = createTurnController(store, registry, client, { workspaceRoot: paths.workspaceRoot });
     const handler = new CallbackHandler({
       authorizer: { isAuthorizedCallbackQuery: () => true },
       client,
-      config: { workingDirectory: "/tmp" },
+      config: { workspaceRoot: paths.workspaceRoot },
       store,
       turns,
       activeQueries: new Map(),
@@ -606,5 +729,17 @@ test("callbacks other than service controls are refused while nothing is mounted
     assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
     assert.match(client.calls.answerCallbackQuery[1][1], /Mounted Codex/);
     assert.match(client.calls.editMessageText[0][2], /Active: Codex/);
+    // Mounting a service chains into the folder picker.
+    assert.match(client.calls.sendMessage[0][1], /Folder: none/);
+
+    const queueAgain = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
+    await handler.handle({ id: "cb-16", data: queueAgain, from: { id: 14 }, message: { chat: { id: 14 }, message_id: 5 } });
+    assert.deepEqual(client.calls.answerCallbackQuery[2], ["cb-16", NO_WORKSPACE_MOUNTED]);
+
+    const pickId = client.calls.sendMessage[0][2].reply_markup.inline_keyboard[0][0].callback_data;
+    await handler.handle({ id: "cb-17", data: pickId, from: { id: 14 }, message: { chat: { id: 14 }, message_id: 6 } });
+    assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
+    assert.match(client.calls.answerCallbackQuery[3][1], /Mounted repo/);
+    assert.match(client.calls.editMessageText[1][2], new RegExp(`Folder: ${paths.repo}`));
   });
 });

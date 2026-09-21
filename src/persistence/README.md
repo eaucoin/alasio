@@ -13,6 +13,8 @@ mindmap
       store translates runtime chat/message terms onto persisted response column names without leaking them upward
       conversations persist a nullable active_harness plus codex_session_id and claude_session_id so getSessionId returns nothing and setSessionId prompt job enqueue and active turn upsert refuse while no service is mounted
       schema v6 relaxes the v5 not-null active_harness constraint by swapping the column and keeps every existing mount while pre-harness rows stay mounted on codex
+      schema v7 adds a nullable conversations.working_directory and a workspace_sessions table keyed by conversation harness and folder so setWorkingDirectory parks the current pointers and restores the chosen folder's own
+      the store takes a state root or explicit dbPath plus an optional defaultWorkingDirectory that pre-mounts new conversations and backfills mounted rows that predate per-conversation folders
       turns and prompt jobs record their admitting harness and restart recovery restores the session pointer of that harness
       callback actions capture expectedHarness beside expectedSessionId so panels rendered under one harness go stale after a switch
       schema version 5 adds the harness columns with additive alter-table migrations

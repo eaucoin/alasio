@@ -11,7 +11,9 @@ mindmap
     harness/
       owns harness names the adapter registry Codex and Claude Code adapters and the shared active-turn interrupt
       claude/ owns the Claude Agent SDK runtime prompt channel event projection session discovery MCP conversion and model overrides
-      the registry resolves one adapter per conversation from the persisted active harness and yields null while nothing is mounted so ingress gates on the service picker instead of a default
+      the registry resolves one adapter per conversation from the persisted active harness and folder and yields null while either is missing so ingress gates on the service then folder pickers instead of a default
+      adapters are created lazily per harness and folder pair because Claude transcript stores and Codex thread cwds are folder scoped
+      workspace owns the folder policy that keeps every Telegram-chosen folder under ALASIO_WORKSPACE_ROOT
     codex/
       owns Codex turn orchestration runtime transport event projection status reporting restart recovery and app-server protocol
       turn-controller and status-reporter are harness-neutral and receive the adapter plus display name per turn

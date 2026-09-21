@@ -1,3 +1,5 @@
+import { resolveHookPort } from "../shared/runtime-constants.js";
+
 const WORKFLOW_WAIT_PATTERNS = [
   { pattern: /gh run watch (\d+)/, waitType: "watch" },
   { pattern: /sleep \d+.*gh run (?:view|list).*?(\d{8,})/, waitType: "poll" },
@@ -16,7 +18,7 @@ export function detectWorkflowWait(command) {
 
 export async function notifyWorkflowWait(sessionId, runId, waitType, command, log = console) {
   try {
-    const response = await fetch("http://localhost:8765/hook/workflow", {
+    const response = await fetch(`http://localhost:${resolveHookPort()}/hook/workflow`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

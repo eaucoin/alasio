@@ -14,9 +14,14 @@ import { SqliteTurnRepository } from "./turn-repository.js";
 import { SqliteUsageRepository } from "./usage-repository.js";
 
 export class SqliteStore {
-  constructor(workingDirectory, dbPath = join(workingDirectory, ".alasio", "alasio.sqlite")) {
-    this.workingDirectory = workingDirectory;
+  /**
+   * @param stateRoot directory whose `.alasio/alasio.sqlite` holds state unless dbPath is given
+   * @param options.defaultWorkingDirectory optional folder pre-mounted on new conversations and
+   *   backfilled onto conversations that predate per-conversation folders
+   */
+  constructor(stateRoot, dbPath = join(stateRoot, ".alasio", "alasio.sqlite"), { defaultWorkingDirectory = null } = {}) {
     this.dbPath = dbPath;
+    this.defaultWorkingDirectory = defaultWorkingDirectory;
     if (!existsSync(dirname(dbPath))) {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
@@ -27,7 +32,7 @@ export class SqliteStore {
     this.db.pragma("busy_timeout = 5000");
     this.migrate();
     this.state = new SqliteStateRepository(this.db);
-    this.conversations = new SqliteConversationRepository(this.db);
+    this.conversations = new SqliteConversationRepository(this.db, { defaultWorkingDirectory });
     this.callbacks = new SqliteCallbackRepository(this.db);
     this.telegramContent = new SqliteTelegramContentRepository(this.db);
     this.turns = new SqliteTurnRepository(this.db, this.conversations);
@@ -43,7 +48,7 @@ export class SqliteStore {
   }
 
   migrate() {
-    migrateSqliteSchema(this.db);
+    migrateSqliteSchema(this.db, { legacyWorkingDirectory: this.defaultWorkingDirectory });
   }
 
   getState(key) {
@@ -84,6 +89,14 @@ export class SqliteStore {
 
   setActiveHarness(threadKey, harness) {
     this.conversations.setActiveHarness(threadKey, harness);
+  }
+
+  getWorkingDirectory(threadKey) {
+    return this.conversations.getWorkingDirectory(threadKey);
+  }
+
+  setWorkingDirectory(threadKey, workingDirectory) {
+    this.conversations.setWorkingDirectory(threadKey, workingDirectory);
   }
 
   getHarnessSessionId(threadKey, harness) {

@@ -210,6 +210,10 @@ test("Telegram app wires the durable outbox into final response delivery", () =>
       telegramBotToken: "test-token",
       allowedUserIds: "",
       workingDirectory: root,
+      workspaceRoot: root,
+      stateDir: join(root, ".alasio"),
+      dbPath: join(root, ".alasio", "alasio.sqlite"),
+      hookPort: 0,
       warmLinkedSessions: false,
     });
     assert.equal(app.turns.status.outbox, app.outbox);

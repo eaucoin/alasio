@@ -1,7 +1,8 @@
-import { NO_SERVICE_MOUNTED, interruptActiveTurn, isHarnessName } from "../harness/index.js";
+import { NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, interruptActiveTurn, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.js";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.js";
 import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.js";
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.js";
+import { handleWorkspaceControlCallback, isWorkspaceControlAction, sendChooseWorkspacePanel } from "../operator/workspace-control.js";
 
 function clientAfterCallbackAck(client) {
   return new Proxy(client, {
@@ -55,8 +56,49 @@ export class CallbackHandler {
       await this.client.answerCallbackQuery(callbackQuery.id, "Missing message context.");
       return;
     }
-    if (!harness && !isServiceControlAction(action.kind)) {
-      await this.client.answerCallbackQuery(callbackQuery.id, NO_SERVICE_MOUNTED);
+    if (isServiceControlAction(action.kind)) {
+      await handleServiceControlCallback({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        action,
+        switchHarness: (args) => this.turns.switchHarness(args),
+        callbackQueryId: callbackQuery.id,
+        chatId,
+        messageId,
+        onMounted: async () => {
+          // Service first, then folder: chain straight into the folder picker.
+          if (!resolveWorkingDirectory(this.store, action.conversationId)) {
+            await sendChooseWorkspacePanel({
+              client: this.client,
+              store: this.store,
+              activeQueries: this.activeQueries,
+              conversationId: action.conversationId,
+              chatId,
+              workspaceRoot: this.config.workspaceRoot,
+            });
+          }
+        },
+      });
+      return;
+    }
+    if (isWorkspaceControlAction(action.kind)) {
+      await handleWorkspaceControlCallback({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        action,
+        workspaceRoot: this.config.workspaceRoot,
+        switchWorkspace: (args) => this.turns.switchWorkspace(args),
+        callbackQueryId: callbackQuery.id,
+        chatId,
+        messageId,
+      });
+      return;
+    }
+    if (!harness) {
+      const reason = resolveHarnessName(this.store, action.conversationId) ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
+      await this.client.answerCallbackQuery(callbackQuery.id, reason);
       return;
     }
     if (isSessionControlAction(action.kind)) {
@@ -71,19 +113,6 @@ export class CallbackHandler {
         activeQueries: this.activeQueries,
         action,
         startNewSession: (args) => this.turns.startNewSession(args),
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-      });
-      return;
-    }
-    if (isServiceControlAction(action.kind)) {
-      await handleServiceControlCallback({
-        client: this.client,
-        store: this.store,
-        activeQueries: this.activeQueries,
-        action,
-        switchHarness: (args) => this.turns.switchHarness(args),
         callbackQueryId: callbackQuery.id,
         chatId,
         messageId,
@@ -134,7 +163,7 @@ export class CallbackHandler {
       }
       await handleGoalControlCallback({
         client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
-        config: this.config,
+        config: this.turns.configFor?.(action.conversationId) ?? this.config,
         store: this.store,
         action,
         callbackQueryId: callbackQuery.id,

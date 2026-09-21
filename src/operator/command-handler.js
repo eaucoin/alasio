@@ -1,7 +1,8 @@
-import { createHarnessRegistry, interruptActiveTurn } from "../harness/index.js";
+import { createHarnessRegistry, interruptActiveTurn, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.js";
 import { parseCommand } from "./command-parser.js";
 import { handleGoalTextCommand } from "./goal-control.js";
 import { handleServiceTextCommand, sendChooseServicePanel } from "./service-control.js";
+import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.js";
 import { sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.js";
 import { truncateText } from "./text.js";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.js";
@@ -11,7 +12,19 @@ function shortSessionId(sessionId) {
 }
 
 export class CommandHandler {
-  constructor({ client, config, store, activeQueries, harnesses = null, runCodexTurn, runGoalTurn, startNewSession, switchHarness = null }) {
+  constructor({
+    client,
+    config,
+    store,
+    activeQueries,
+    harnesses = null,
+    runCodexTurn,
+    runGoalTurn,
+    startNewSession,
+    switchHarness = null,
+    switchWorkspace = null,
+    createWorkspace = null,
+  }) {
     this.client = client;
     this.config = config;
     this.store = store;
@@ -21,6 +34,12 @@ export class CommandHandler {
     this.runGoalTurn = runGoalTurn;
     this.startNewSession = startNewSession;
     this.switchHarness = switchHarness;
+    this.switchWorkspace = switchWorkspace;
+    this.createWorkspace = createWorkspace;
+  }
+
+  configFor(conversationId) {
+    return { ...this.config, workingDirectory: resolveWorkingDirectory(this.store, conversationId) };
   }
 
   harnessFor(conversationId) {
@@ -36,16 +55,18 @@ export class CommandHandler {
   }
 
   async handleCommand({ cmd, conversationId, chatId, messageId }) {
+    const harnessName = resolveHarnessName(this.store, conversationId);
     const harness = this.harnessFor(conversationId);
     const sessions = harness?.sessions;
+    const label = harness?.displayName ?? "The agent";
     if (cmd.type === "stop") {
       if (!this.activeQueries.has(conversationId)) {
         await this.client.sendMessage(chatId, "No active query to stop.");
         return true;
       }
-      const [status] = await this.client.sendMessage(chatId, `Stopping ${harness.displayName}...`);
+      const [status] = await this.client.sendMessage(chatId, `Stopping ${label}...`);
       const interrupted = await interruptActiveTurn(this.activeQueries, conversationId);
-      const text = interrupted ? `${harness.displayName} stopped.` : "No active query to stop.";
+      const text = interrupted ? `${label} stopped.` : "No active query to stop.";
       if (status?.message_id) {
         await this.client.editMessageText(chatId, status.message_id, text, { format: "plain" }).catch(() => undefined);
       } else {
@@ -66,12 +87,54 @@ export class CommandHandler {
         chatId,
         target: cmd.target,
         switchHarness: this.switchHarness,
+        onMounted: async () => {
+          // Service first, then folder: chain straight into the folder picker.
+          if (!resolveWorkingDirectory(this.store, conversationId)) {
+            await sendChooseWorkspacePanel({
+              client: this.client,
+              store: this.store,
+              activeQueries: this.activeQueries,
+              conversationId,
+              chatId,
+              workspaceRoot: this.config.workspaceRoot,
+            });
+          }
+        },
       });
       return true;
     }
-    if (!harness) {
+    if (cmd.type === "workspace") {
+      if (!this.switchWorkspace || !this.createWorkspace) {
+        await this.client.sendMessage(chatId, "Workspace selection is not available in this deployment.");
+        return true;
+      }
+      await handleWorkspaceTextCommand({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        conversationId,
+        chatId,
+        args: cmd.args,
+        workspaceRoot: this.config.workspaceRoot,
+        switchWorkspace: this.switchWorkspace,
+        createWorkspace: this.createWorkspace,
+      });
+      return true;
+    }
+    if (!harnessName) {
       // Every remaining control acts on the mounted service's own sessions or turns.
       await sendChooseServicePanel({ client: this.client, store: this.store, activeQueries: this.activeQueries, conversationId, chatId });
+      return true;
+    }
+    if (!harness) {
+      await sendChooseWorkspacePanel({
+        client: this.client,
+        store: this.store,
+        activeQueries: this.activeQueries,
+        conversationId,
+        chatId,
+        workspaceRoot: this.config.workspaceRoot,
+      });
       return true;
     }
     if (cmd.type === "sessions") {
@@ -108,7 +171,7 @@ export class CommandHandler {
       }
       await handleGoalTextCommand({
         client: this.client,
-        config: this.config,
+        config: this.configFor(conversationId),
         store: this.store,
         conversationId,
         chatId,

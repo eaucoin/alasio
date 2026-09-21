@@ -39,10 +39,8 @@ export class MessageHandler {
     });
 
     if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
-      if (this.turns.harnessFor?.(conversationId)) {
+      if (!(await this.turns.sendNextSetupStep({ conversationId, chatId: message.chat.id }))) {
         await this.client.sendMessage(message.chat.id, "Alasio is ready.");
-      } else {
-        await this.turns.sendChooseServicePanel({ conversationId, chatId: message.chat.id });
       }
       return;
     }

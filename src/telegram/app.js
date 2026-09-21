@@ -1,6 +1,5 @@
 import { TurnController } from "../codex/turn-controller.js";
 import { createHarnessRegistry } from "../harness/index.js";
-import { HOOK_SERVER_PORT } from "../shared/runtime-constants.js";
 import { SqliteStore } from "../persistence/store.js";
 import { Authorizer } from "./authorizer.js";
 import { CallbackHandler } from "./callback-handler.js";
@@ -18,7 +17,7 @@ export class TelegramCodexApp {
   constructor(config) {
     this.config = config;
     this.client = new Client(config.telegramBotToken);
-    this.store = new SqliteStore(config.workingDirectory);
+    this.store = new SqliteStore(config.stateDir, config.dbPath, { defaultWorkingDirectory: config.workingDirectory });
     this.outbox = new TelegramOutbox({ client: this.client, store: this.store, log });
     this.activeQueries = new Map();
     this.workflowWaits = new Map();
@@ -75,8 +74,11 @@ export class TelegramCodexApp {
   async start() {
     const me = await this.client.getMe();
     log.info(`Starting Telegram alasio bot as @${me.username ?? me.id}`);
-    log.info(`  Working directory: ${this.config.workingDirectory}`);
+    log.info(`  State database: ${this.config.dbPath}`);
+    log.info(`  Workspace root: ${this.config.workspaceRoot}`);
+    log.info(`  Default folder: ${this.config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
     log.info(`  Default service: ${this.config.defaultHarness ?? "none (operator chooses with /service)"}`);
+    log.info(`  Hook port: ${this.config.hookPort}`);
     await this.client.deleteWebhook(false);
     await this.configureNativeCommands();
     this.startHookServer();
@@ -115,6 +117,7 @@ export class TelegramCodexApp {
     try {
       await this.client.setMyCommands([
         { command: "service", description: "Switch between Codex and Claude Code" },
+        { command: "workspace", description: "Choose or create the folder to work in" },
         { command: "session", description: "Manage the mounted agent session" },
         { command: "sessions", description: "Browse and mount agent sessions" },
         { command: "goal", description: "View or set the mounted session goal (Codex)" },
@@ -144,23 +147,23 @@ export class TelegramCodexApp {
       return;
     }
     for (const harnessName of this.harnesses.names) {
-      const harness = this.harnesses.get(harnessName);
-      if (!harness.supportsWarmup) {
-        continue;
-      }
       const conversations = this.store.listConversationsWithSessions(harnessName);
       if (conversations.length === 0) {
-        log.info(`No linked ${harness.displayName} sessions to warm`);
+        log.info(`No linked ${harnessName} sessions to warm`);
         continue;
       }
       for (const conversation of conversations) {
         const sessionId = conversation.session_id ?? conversation.codex_session_id;
+        const harness = this.harnesses.getFor(harnessName, conversation.working_directory);
+        if (!harness.supportsWarmup) {
+          break;
+        }
         try {
-          log.info(`Warming ${harness.displayName} session ${sessionId.slice(0, 8)} for ${conversation.id}`);
+          log.info(`Warming ${harness.displayName} session ${sessionId.slice(0, 8)} for ${conversation.id} in ${conversation.working_directory}`);
           await harness.warmSession({
             sessionId,
             threadKey: conversation.id,
-            workingDirectory: this.config.workingDirectory,
+            workingDirectory: conversation.working_directory,
           });
         } catch (error) {
           log.warn(`Failed to warm ${harness.displayName} session for ${conversation.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -171,7 +174,7 @@ export class TelegramCodexApp {
 
   startHookServer() {
     this.hookServer = startWorkflowHookServer({
-      port: HOOK_SERVER_PORT,
+      port: this.config.hookPort,
       store: this.store,
       workflowWaits: this.workflowWaits,
       workflowWakeEvents: this.workflowWakeEvents,

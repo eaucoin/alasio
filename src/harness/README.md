@@ -5,8 +5,8 @@ mindmap
     Names
       names owns the codex and claude identifiers display names spelling normalization and the optional ALASIO_DEFAULT_HARNESS pre-mount which is null by default
     Registry
-      index builds one adapter per harness bound to the alasio working directory and resolves the adapter for a conversation from the persisted active harness
-      resolveHarnessName returns null while nothing is mounted and requireForConversation throws NO_SERVICE_MOUNTED so no caller can coerce a default harness
+      index builds adapters lazily per harness and folder pair and resolves the adapter for a conversation from its persisted active harness and working directory
+      resolveHarnessName and resolveWorkingDirectory return null while nothing is mounted and requireForConversation throws NO_SERVICE_MOUNTED or NO_WORKSPACE_MOUNTED so no caller can coerce a default harness or folder
       interruptActiveTurn aborts whichever harness owns the active query for a thread key
     Adapter contract
       startFreshSession warmSession executeTurn shutdown and a sessions api with listSessions getTotalSessionPages getSessionByNumber getSessionLastMessage listSessionMessages getTotalRewindPages and createForkedSession

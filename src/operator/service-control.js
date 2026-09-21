@@ -107,7 +107,7 @@ export function resolveServiceTarget(target) {
   return null;
 }
 
-export async function handleServiceTextCommand({ client, store, activeQueries, conversationId, chatId, target, switchHarness }) {
+export async function handleServiceTextCommand({ client, store, activeQueries, conversationId, chatId, target, switchHarness, onMounted = null }) {
   if (target) {
     const harness = resolveServiceTarget(target);
     if (!harness) {
@@ -115,13 +115,19 @@ export async function handleServiceTextCommand({ client, store, activeQueries, c
       return;
     }
     let notice;
+    let mounted = false;
     try {
-      notice = describeSwitch(await switchHarness({ conversationId, harness }), harness);
+      const result = await switchHarness({ conversationId, harness });
+      notice = describeSwitch(result, harness);
+      mounted = result.switched;
     } catch (error) {
       notice = error instanceof Error ? error.message : String(error);
     }
     const panel = buildServicePanel({ store, activeQueries, conversationId, notice });
     await client.sendMessage(chatId, panel.text, panel.options);
+    if (mounted && onMounted) {
+      await onMounted();
+    }
     return;
   }
   const panel = buildServicePanel({ store, activeQueries, conversationId });
@@ -147,6 +153,7 @@ export async function handleServiceControlCallback({
   callbackQueryId,
   chatId,
   messageId,
+  onMounted = null,
 }) {
   const kind = action.kind.slice(SERVICE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
@@ -166,8 +173,11 @@ export async function handleServiceControlCallback({
       return;
     }
     let notice;
+    let mounted = false;
     try {
-      notice = describeSwitch(await switchHarness({ conversationId: action.conversationId, harness }), harness);
+      const result = await switchHarness({ conversationId: action.conversationId, harness });
+      notice = describeSwitch(result, harness);
+      mounted = result.switched;
     } catch (error) {
       notice = error instanceof Error ? error.message : String(error);
     }
@@ -178,6 +188,9 @@ export async function handleServiceControlCallback({
       conversationId: action.conversationId,
       notice,
     }));
+    if (mounted && onMounted) {
+      await onMounted();
+    }
     return;
   }
   await client.answerCallbackQuery(callbackQueryId, "Unknown action.");

@@ -1,4 +1,4 @@
-const SCHEMA_VERSION = "6";
+const SCHEMA_VERSION = "7";
 
 const SQLITE_SCHEMA_SQL = `
   create table if not exists bot_state (
@@ -18,9 +18,19 @@ const SQLITE_SCHEMA_SQL = `
     codex_session_id text,
     claude_session_id text,
     active_harness text,
+    working_directory text,
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     unique (transport, chat_id)
+  );
+
+  create table if not exists workspace_sessions (
+    conversation_id text not null references conversations(id) on delete cascade,
+    harness text not null,
+    working_directory text not null,
+    session_id text,
+    updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    primary key (conversation_id, harness, working_directory)
   );
 
   create table if not exists telegram_updates (
@@ -176,7 +186,7 @@ const SQLITE_SCHEMA_SQL = `
     on turns (state, started_at);
 `;
 
-export function migrateSqliteSchema(db) {
+export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) {
     db.exec(SQLITE_SCHEMA_SQL);
     const promptJobColumns = new Set(db.prepare("pragma table_info(prompt_jobs)").all().map((column) => column.name));
     if (!promptJobColumns.has("upstream_completed_at")) {
@@ -207,6 +217,19 @@ export function migrateSqliteSchema(db) {
         alter table conversations drop column active_harness_v5;
         commit;
       `);
+    }
+    if (!conversationColumns.has("working_directory")) {
+      db.exec("alter table conversations add column working_directory text");
+    }
+    if (legacyWorkingDirectory) {
+      // Conversations mounted before folders were per-conversation ran in the
+      // deployment's WORKING_DIRECTORY; keep them there instead of stranding them
+      // behind the folder picker.
+      db.prepare(`
+        update conversations
+        set working_directory = ?
+        where working_directory is null and active_harness is not null
+      `).run(legacyWorkingDirectory);
     }
     const turnColumns = new Set(db.prepare("pragma table_info(turns)").all().map((column) => column.name));
     if (!turnColumns.has("harness")) {

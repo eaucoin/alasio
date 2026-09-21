@@ -6,7 +6,7 @@ import { SqliteStore } from "../persistence/store.js";
 const args = new Set(process.argv.slice(2));
 const config = loadAlasioConfig();
 const client = new Client(config.telegramBotToken);
-const store = new SqliteStore(config.workingDirectory);
+const store = new SqliteStore(config.stateDir, config.dbPath, { defaultWorkingDirectory: config.workingDirectory });
 
 try {
   const me = await client.getMe();

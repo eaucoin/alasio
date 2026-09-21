@@ -7,12 +7,19 @@ mindmap
       `/service` shows the active harness and both parked session pointers and switches with `Use Codex` or `Use Claude Code` buttons or `/service codex` and `/service claude`
       each Telegram conversation has at most one active harness and switching is refused while a turn is active or prompts are queued
       conversations are neutral by default so until the operator mounts a service through `/service` every prompt `/start` and harness-scoped control is answered only with the service picker and nothing is queued
+      the folder is the layer after the service so once a service is mounted `/workspace` must choose or create the folder the harness works in before any prompt is queued and mounting a service chains straight into the folder picker
+      `/workspace` lists top-level folders under `ALASIO_WORKSPACE_ROOT` with git repositories first and `/workspace <name>` mounts one while `/workspace new <name>` creates a git-initialized folder directly under the root
+      every folder chosen from Telegram is canonicalized and must stay under the workspace root so symlink and dot-dot escapes are refused and only existing directories mount
+      sessions belong to one service and one folder so switching folders parks both harness session pointers and restores whichever were parked for the chosen folder and switching is refused while a turn is active or prompts are queued
       sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
       switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
       Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
       Claude Code uses the same MCP server table alasio materializes for Codex so both harnesses expose the same Bayma tool inventory
       `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
       `ALASIO_DEFAULT_HARNESS` is unset by default and optionally pre-mounts codex or claude on newly created conversations so they skip the picker
+      `WORKING_DIRECTORY` is unset by default and optionally pre-mounts one folder on new conversations and on conversations that predate per-conversation folders so existing deployments keep working unchanged
+      `ALASIO_WORKSPACE_ROOT` defaults to the operator home and bounds every folder the picker may list mount or create
+      `ALASIO_STATE_DIR` and `ALASIO_HOOK_PORT` place the SQLite state and the localhost hook server so a second alasio instance never shares a database or port with the first and default to `$WORKING_DIRECTORY/.alasio` else `~/.alasio` and 8765
       `ALASIO_CLAUDE_MODEL` `ALASIO_CLAUDE_EFFORT` and `ALASIO_CLAUDE_BIN` are optional Claude Code overrides and default to the CLI's own configuration
     Telegram DM edge behavior
       ingress maps explicitly authorized private Bot API messages and callbacks to a single operator conversation
@@ -28,7 +35,7 @@ mindmap
       Codex SDK exec transport remains an explicit rollback path for runtime isolation
       Codex sessions materialize required MCP config explicitly instead of trusting ambient CLI state alone
       skill selection and instruction loading constrain tool behavior
-      SQLite content store manages update offsets, conversations, per-harness session pointers, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
+      SQLite content store manages update offsets, conversations, per-harness session pointers, per-folder parked sessions, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
       SQLite Telegram outbox separates Codex completion from rate-limited Bot API delivery
       CI treats Alasio as a Node-native unit target whose semantic source surfaces select exact node:test files in the repository-wide pre-commit gate
     Canonical restart path
@@ -139,8 +146,10 @@ stateDiagram-v2
   UserMistrust --> EventProcessed
   EventProcessed --> CrossHarnessMount: a Codex rollout or Claude transcript is mounted onto the other harness
   CrossHarnessMount --> UserMistrust
-  EventProcessed --> SilentDefaultMount: an unmounted conversation is coerced onto a harness the operator never chose
+  EventProcessed --> SilentDefaultMount: an unmounted conversation is coerced onto a harness or folder the operator never chose
   SilentDefaultMount --> UserMistrust
+  EventProcessed --> RootEscape: a Telegram-chosen folder resolves outside ALASIO_WORKSPACE_ROOT
+  RootEscape --> UserMistrust
   EventProcessed --> ScopedExecution: bounded context and explicit skill boundaries
   EventProcessed --> OneActiveHarness: sessions stay parked per harness and switching waits for idle
   OneActiveHarness --> TrustworthyReplies
