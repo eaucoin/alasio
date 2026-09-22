@@ -27,7 +27,11 @@ import {
 } from "./event-projection.js";
 import { toClaudeMcpServers } from "./mcp.js";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.js";
-import { buildClaudeUserMessage, createPromptChannel } from "./prompt-channel.js";
+import {
+  buildClaudeUserMessage,
+  createPromptChannel,
+  instrumentPromptChannel,
+} from "./prompt-channel.js";
 
 const log = createLogger("claude-runtime");
 
@@ -117,7 +121,7 @@ export async function executeClaudeTurn(params) {
   const pendingResponseId = persistence.createPendingResponse(chatId, messageId, resumeSession);
   persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
   const controller = new AbortController();
-  const channel = createPromptChannel();
+  const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
   // The operator prompt is queued before any await so early steering cannot precede it.
   channel.push(buildClaudeUserMessage(prompt));
   let resolveFinished;
@@ -155,6 +159,9 @@ export async function executeClaudeTurn(params) {
     if (!command) {
       return {};
     }
+    // Timestamped so a cancelled tool call can be lined up against the
+    // transcript and the prompt-channel log.
+    log.info(`bash-hook seen thread=${threadKey} at=${new Date().toISOString()} command=${JSON.stringify(command.slice(0, 120))}`);
     if (isBlockedDbCommand(command)) {
       blockedGuardrailCommand = blockedGuardrailCommand ?? command;
       log.warn("DB guardrail denied a Claude Code Bash command");

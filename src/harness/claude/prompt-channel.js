@@ -72,3 +72,37 @@ export function buildClaudeUserMessage(text) {
     origin: { kind: "human" },
   };
 }
+
+/**
+ * Wrap a prompt channel so every push and end is logged with a millisecond
+ * timestamp.
+ *
+ * New input arriving on the streaming prompt while tool calls are pending is
+ * one of the two ways Claude Code cancels a pending call (the other is an
+ * abort of the query). A cancelled call is answered with Claude Code's
+ * "the user doesn't want to take this action" text, which reads like a
+ * permission denial even under bypassPermissions. Without this log there is
+ * no record on our side of whether the channel moved at all, so a cancelled
+ * call cannot be attributed.
+ */
+export function instrumentPromptChannel(channel, { threadKey, log }) {
+  const at = () => new Date().toISOString();
+  return {
+    ...channel,
+    push(value) {
+      const accepted = channel.push(value);
+      log.info(`prompt-channel push thread=${threadKey} at=${at()} accepted=${accepted}`);
+      return accepted;
+    },
+    end() {
+      const alreadyEnded = channel.ended;
+      channel.end();
+      if (!alreadyEnded) {
+        log.info(`prompt-channel end thread=${threadKey} at=${at()}`);
+      }
+    },
+    get ended() {
+      return channel.ended;
+    },
+  };
+}
