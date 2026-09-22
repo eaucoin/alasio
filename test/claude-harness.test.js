@@ -272,7 +272,7 @@ test("Claude turn persists session identity, tool blocks, and the result as fina
       seenPrompts.push(first.value.message.content);
       yield { type: "system", subtype: "init", session_id: "reserved-1", model: "m" };
       yield assistant([{ type: "text", text: "Thinking out loud." }, { type: "tool_use", id: "t1", name: "Bash", input: { command: "echo hi" } }]);
-      yield { type: "result", subtype: "success", is_error: false, result: "All done.", session_id: "reserved-1", usage: { cache_read_input_tokens: 42 } };
+      yield { type: "result", subtype: "success", is_error: false, result: "All done.", session_id: "reserved-1", usage: { cache_read_input_tokens: 42 }, user_message_uuids: [first.value.uuid] };
       const closing = await iterator.next();
       assert.equal(closing.done, true);
     })();
@@ -301,6 +301,45 @@ test("Claude turn persists session identity, tool blocks, and the result as fina
   assert.deepEqual(result.blockSequence.map((block) => block.type), ["text", "tool", "text"]);
   assert.equal(finalResponseToMarkdown(result.blockSequence), "All done.");
   assert.equal(activeQueries.size, 0);
+});
+
+test("a result from a turn the CLI started itself does not end the operator's turn", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  let channelOpenAfterNotificationResult = null;
+  const queryFactory = ({ prompt }) => {
+    const generator = (async function* run() {
+      const iterator = prompt[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      yield { type: "system", subtype: "init", session_id: "s-7" };
+      // The CLI answers a background task's stop notice before the operator's prompt.
+      yield { type: "result", subtype: "success", is_error: false, result: "Noted the stopped task.", session_id: "s-7" };
+      const pending = iterator.next();
+      channelOpenAfterNotificationResult = await Promise.race([
+        pending.then(() => false),
+        new Promise((resolve) => setTimeout(() => resolve(true), 20)),
+      ]);
+      yield { type: "result", subtype: "success", is_error: false, result: "The real answer.", session_id: "s-7", user_message_uuids: [first.value.uuid] };
+      assert.equal((await pending).done, true);
+    })();
+    generator.close = () => undefined;
+    return generator;
+  };
+  const result = await executeClaudeTurn({
+    prompt: "check now",
+    resumeSession: null,
+    threadKey: "telegram:7",
+    chatId: "7",
+    messageId: "7",
+    workingDirectory: "/work",
+    persistence,
+    activeQueries,
+    sessions: quietSessions,
+    queryFactory,
+  });
+  assert.equal(channelOpenAfterNotificationResult, true, "the notice's result must not close the prompt channel");
+  assert.equal(result.responseCompleted, true);
+  assert.equal(finalResponseToMarkdown(result.blockSequence), "The real answer.");
 });
 
 test("Claude turn interruption is classified as operator control and steering pushes guidance", async () => {
@@ -355,10 +394,11 @@ test("Claude turn interruption is classified as operator control and steering pu
 
 test("Claude turn surfaces failures and non-operator aborts as errors", async () => {
   const persistence = createPersistence();
-  const queryFactory = () => {
+  const queryFactory = ({ prompt }) => {
     const generator = (async function* run() {
+      const first = await prompt[Symbol.asyncIterator]().next();
       yield { type: "system", subtype: "init", session_id: "s-3" };
-      yield { type: "result", subtype: "error_max_turns", is_error: true, errors: ["max turns"], session_id: "s-3" };
+      yield { type: "result", subtype: "error_max_turns", is_error: true, errors: ["max turns"], session_id: "s-3", user_message_uuids: [first.value.uuid] };
     })();
     generator.close = () => undefined;
     return generator;
@@ -382,8 +422,9 @@ test("Claude turn surfaces failures and non-operator aborts as errors", async ()
 test("Bash PreToolUse hook denies forbidden database commands with guardrail guidance", async () => {
   const persistence = createPersistence();
   let hookResult;
-  const queryFactory = ({ options }) => {
+  const queryFactory = ({ prompt, options }) => {
     const generator = (async function* run() {
+      const first = await prompt[Symbol.asyncIterator]().next();
       yield { type: "system", subtype: "init", session_id: "s-4" };
       const [matcher] = options.hooks.PreToolUse;
       assert.equal(matcher.matcher, "Bash");
@@ -400,7 +441,7 @@ test("Bash PreToolUse hook denies forbidden database commands with guardrail gui
         tool_use_id: "t2",
       });
       assert.deepEqual(allowed, {});
-      yield { type: "result", subtype: "success", is_error: false, result: "Skipped the drop.", session_id: "s-4" };
+      yield { type: "result", subtype: "success", is_error: false, result: "Skipped the drop.", session_id: "s-4", user_message_uuids: [first.value.uuid] };
     })();
     generator.close = () => undefined;
     return generator;

@@ -84,6 +84,10 @@ export function buildClaudeUserMessage(text, uuid = randomUUID()) {
  * (`user_message_uuids`, or `user_message_uuid` from older producers). In a
  * resumed session the first result need not be ours: the CLI re-runs a turn a
  * previous worker left interrupted, and stamps that turn's own prompt uuid.
+ * A result that names no prompt at all comes from a turn the CLI started
+ * itself, such as its report that a background task stopped; the pinned SDK
+ * attributes every turn a typed prompt starts.
+ *
  * Ending the prompt channel on a foreign result closes the input stream while
  * our turn is still being planned, and the first tool call the model then
  * makes is cancelled.
@@ -93,18 +97,13 @@ export function promptUuidsAnsweredBy(message, promptUuids) {
   if (ours.size === 0 || !message || message.type !== "result") {
     return [];
   }
-  const uuids = Array.isArray(message.user_message_uuids)
-    ? message.user_message_uuids
-    : [];
-  if (uuids.length > 0) {
-    return uuids.filter((uuid) => ours.has(uuid));
+  if (Array.isArray(message.user_message_uuids)) {
+    return message.user_message_uuids.filter((uuid) => ours.has(uuid));
   }
   if (typeof message.user_message_uuid === "string") {
     return ours.has(message.user_message_uuid) ? [message.user_message_uuid] : [];
   }
-  // An older producer attributes nothing, so the result has to be taken as
-  // answering everything outstanding or the turn would never end.
-  return [...ours];
+  return [];
 }
 
 export function resultAnswersPrompt(message, promptUuids) {
