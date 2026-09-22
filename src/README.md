@@ -33,7 +33,7 @@ mindmap
     policy/
       owns shell command parsing restart command recognition forbidden database command detection and workflow wait detection
     mcp/
-      owns MCP config merging Bayma state-dir materialization stdio preflight checks and repository-specific Breadbutter Python and Rust capability evidence
+      owns bayma the one MCP server alasio provides its launch command per-conversation state directory and readiness check
     workflow/
       owns the localhost hook server that receives CI wait notifications
     shared/

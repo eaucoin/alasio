@@ -17,8 +17,7 @@ import {
   createCommandEventPolicy,
 } from "../../codex/command-event-policy.js";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.js";
-import { buildCodexConfig, getMcpServerCount } from "../../mcp/server-config.js";
-import { preflightConfiguredMcpServers } from "../../mcp/preflight.js";
+import { ensureBaymaReady } from "../../mcp/bayma.js";
 import { createLogger } from "../../shared/log.js";
 import { buildClaudeEnv } from "./env.js";
 import {
@@ -26,7 +25,7 @@ import {
   projectAssistantMessageToItems,
   projectResultMessage,
 } from "./event-projection.js";
-import { toClaudeMcpServers } from "./mcp.js";
+import { claudeMcpServers } from "./mcp.js";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.js";
 import {
   buildClaudeUserMessage,
@@ -73,10 +72,9 @@ export function buildClaudeQueryOptions({
     includePartialMessages: false,
     persistSession: true,
     hooks,
+    mcpServers,
+    strictMcpConfig: true,
   };
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    options.mcpServers = mcpServers;
-  }
   if (resumeSession) {
     if (resumeExists) {
       options.resume = resumeSession;
@@ -203,16 +201,14 @@ export async function executeClaudeTurn(params) {
   try {
     const claudeEnv = buildClaudeEnv();
     turnTimer("env.built");
-    const mcpConfig = await buildCodexConfig(claudeEnv, threadKey);
-    turnTimer("config.built", { mcp_servers: getMcpServerCount(mcpConfig) });
-    await preflightConfiguredMcpServers(claudeEnv, mcpConfig, workingDirectory);
-    turnTimer("mcp.preflight.done");
+    await ensureBaymaReady(claudeEnv);
+    turnTimer("bayma.ready");
     const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const options = buildClaudeQueryOptions({
       workingDirectory,
       modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
       claudeEnv,
-      mcpServers: toClaudeMcpServers(mcpConfig.mcp_servers),
+      mcpServers: claudeMcpServers({ threadKey, env: claudeEnv }),
       resumeSession,
       resumeExists,
       controller,

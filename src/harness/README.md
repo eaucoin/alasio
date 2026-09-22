@@ -15,7 +15,7 @@ mindmap
     Codex adapter
       codex wraps the existing app-server runtime and rollout JSONL session discovery without changing them
     Claude Code adapter
-      claude/runtime runs one Agent SDK query per Telegram prompt with bypassPermissions the claude_code system prompt preset and the shared MCP table
+      claude/runtime runs one Agent SDK query per Telegram prompt with bypassPermissions the claude_code system prompt preset bayma as its only MCP server under strictMcpConfig
       claude/prompt-channel keeps streaming input open so Steer pushes guidance into the live session and the channel ends after the result message
       claude/event-projection maps assistant tool_use blocks onto Codex-shaped items and the SDK result onto the final_answer phase
       claude/sessions reads the SDK project transcript store scoped to the working directory and forks with upToMessageId before the chosen user message

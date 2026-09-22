@@ -14,7 +14,7 @@ mindmap
       sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
       switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
       Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
-      Claude Code uses the same MCP server table alasio materializes for Codex so both harnesses expose the same Bayma tool inventory
+      bayma is the only MCP server either harness sees: alasio pins it as an npm dependency launches it with its own Node and keeps each harness's ambient MCP servers and connectors out
       `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
       `ALASIO_DEFAULT_HARNESS` is unset by default and optionally pre-mounts codex or claude on newly created conversations so they skip the picker
       `WORKING_DIRECTORY` is unset by default and optionally pre-mounts one folder on new conversations and on conversations that predate per-conversation folders so existing deployments keep working unchanged
@@ -33,7 +33,7 @@ mindmap
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency
       Codex SDK exec transport remains an explicit rollback path for runtime isolation
-      Codex sessions materialize required MCP config explicitly instead of trusting ambient CLI state alone
+      Codex threads start and resume with explicit overrides that add bayma and switch off every MCP server in `$CODEX_HOME/config.toml` and the ChatGPT apps connector
       skill selection and instruction loading constrain tool behavior
       SQLite content store manages update offsets, conversations, per-harness session pointers, per-folder parked sessions, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
       SQLite Telegram outbox separates Codex completion from rate-limited Bot API delivery
@@ -60,9 +60,7 @@ mindmap
       operator-triggered restarts use the deployment checkout restart wrapper so outer-shell cutovers persist explicit provenance before systemd stops the unit
       external restarts degrade to explicit unknown provenance instead of falsely attributing them to the user
       tool-pattern guardrails re-enter Codex as internal synthetic user turns instead of fabricating user-visible transport replies
-      MCP stdio preflight and isolated Bayma state dirs prevent silent no-tool sessions caused by shared state contention
-      Unified Bayma REPL preflight additionally proves the monorepo Breadbutter Python and Rust quickstarts in disposable sessions keyed to the skill sources and locks so generic tool inventory cannot masquerade as repository capability
-      service installation and runtime bind Bayma Python to the locked Breadbutter Python 3.12 interpreter instead of the host python3 fallback
+      a once-per-process bayma readiness check and per-harness per-conversation bayma state directories prevent silent no-tool sessions and state-lease contention
       optional startup warmup resumes linked sessions through app-server without creating a new conversation or pruning rollout files
       Telegram New Session creates and mounts a fresh Codex app-server thread instead of only clearing the SQLite session pointer
       Telegram goal objectives with no mounted session create and mount a fresh app-server thread before setting the active goal

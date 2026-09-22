@@ -21,8 +21,8 @@ import {
     MAX_DB_GUARDRAIL_RECOVERY_ATTEMPTS,
     createCommandEventPolicy,
 } from "./command-event-policy.js";
-import { buildCodexConfig, getMcpServerCount } from "../mcp/server-config.js";
-import { preflightConfiguredMcpServers } from "../mcp/preflight.js";
+import { buildCodexThreadConfig } from "./thread-config.js";
+import { ensureBaymaReady } from "../mcp/bayma.js";
 import { createLogger } from "../shared/log.js";
 
 const log = createLogger("codex-runtime");
@@ -34,12 +34,8 @@ function getErrorMessage(error) {
 export async function startFreshCodexSession({ threadKey, workingDirectory }) {
     const startedAt = process.hrtime.bigint();
     const codexEnv = buildCodexEnv();
-    const codexConfig = await buildCodexConfig(codexEnv, threadKey);
-    await preflightConfiguredMcpServers(
-        codexEnv,
-        codexConfig,
-        workingDirectory,
-    );
+    const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+    await ensureBaymaReady(codexEnv);
     const sessionId = await startCodexTransportThread({
         threadKey,
         workingDirectory,
@@ -63,12 +59,8 @@ export async function warmCodexSession({ sessionId, threadKey, workingDirectory 
     }
     const startedAt = process.hrtime.bigint();
     const codexEnv = buildCodexEnv();
-    const codexConfig = await buildCodexConfig(codexEnv, threadKey);
-    await preflightConfiguredMcpServers(
-        codexEnv,
-        codexConfig,
-        workingDirectory,
-    );
+    const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+    await ensureBaymaReady(codexEnv);
     await warmCodexTransportThread({
         sessionId,
         threadKey,
@@ -119,14 +111,10 @@ export async function executeCodexTurn(params) {
     try {
         const codexEnv = buildCodexEnv();
         turnTimer("env.built");
-        const codexConfig = await buildCodexConfig(codexEnv, threadKey);
-        turnTimer("config.built", { mcp_servers: getMcpServerCount(codexConfig) });
-        await preflightConfiguredMcpServers(
-            codexEnv,
-            codexConfig,
-            workingDirectory,
-        );
-        turnTimer("mcp.preflight.done");
+        const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+        turnTimer("config.built");
+        await ensureBaymaReady(codexEnv);
+        turnTimer("bayma.ready");
         const streamParams = {
             resumeSession,
             threadKey,

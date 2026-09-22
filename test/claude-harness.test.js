@@ -8,7 +8,6 @@ import {
   projectResultMessage,
   projectToolUseToItem,
 } from "../src/harness/claude/event-projection.js";
-import { toClaudeMcpServers } from "../src/harness/claude/mcp.js";
 import { buildClaudeUserMessage, createPromptChannel } from "../src/harness/claude/prompt-channel.js";
 import { buildClaudeQueryOptions, executeClaudeTurn } from "../src/harness/claude/runtime.js";
 import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.js";
@@ -71,12 +70,12 @@ test("tool use blocks project into Codex-shaped items", () => {
   });
   assert.equal(projectToolUseToItem({ id: "t2", name: "Edit", input: { file_path: "/x" } }).type, "file_change");
   assert.equal(projectToolUseToItem({ id: "t3", name: "WebSearch", input: {} }).type, "web_search");
-  assert.deepEqual(parseMcpToolName("mcp__bayma_python__run"), { server: "bayma_python", tool: "run" });
-  assert.deepEqual(projectToolUseToItem({ id: "t4", name: "mcp__bayma_python__run", input: { code: "1" } }), {
+  assert.deepEqual(parseMcpToolName("mcp__bayma__exec"), { server: "bayma", tool: "exec" });
+  assert.deepEqual(projectToolUseToItem({ id: "t4", name: "mcp__bayma__exec", input: { code: "1" } }), {
     type: "mcp_tool_call",
     id: "t4",
-    server: "bayma_python",
-    tool: "run",
+    server: "bayma",
+    tool: "exec",
     arguments: { code: "1" },
   });
   const ask = projectToolUseToItem({ id: "t5", name: "AskUserQuestion", input: { questions: [{ header: "Scope" }] } });
@@ -108,19 +107,6 @@ test("result projection separates final answers from failures", () => {
   assert.equal(apiFailure.error, "rate limited");
 });
 
-test("Codex MCP server tables convert to Claude SDK server configs", () => {
-  assert.deepEqual(toClaudeMcpServers({
-    bayma_python: { command: "uv", args: ["run", "bayma"], env: { BAYMA_STATE: "/tmp/x", EMPTY: null } },
-    remote: { url: "https://mcp.example.test/sse" },
-    disabled: { command: "x", enabled: false },
-    broken: { args: ["no-command"] },
-  }), {
-    bayma_python: { type: "stdio", command: "uv", args: ["run", "bayma"], env: { BAYMA_STATE: "/tmp/x" } },
-    remote: { type: "http", url: "https://mcp.example.test/sse" },
-  });
-  assert.deepEqual(toClaudeMcpServers(null), {});
-});
-
 test("query options resume existing sessions and reserve fresh ids", () => {
   const controller = new AbortController();
   const env = { ALASIO_CLAUDE_MODEL: "claude-test", ALASIO_CLAUDE_EFFORT: "high", ALASIO_CLAUDE_BIN: "/opt/claude" };
@@ -131,7 +117,8 @@ test("query options resume existing sessions and reserve fresh ids", () => {
   assert.equal(resumed.effort, "high");
   assert.equal(resumed.pathToClaudeCodeExecutable, "/opt/claude");
   assert.equal(resumed.permissionMode, "bypassPermissions");
-  assert.equal(resumed.mcpServers, undefined);
+  assert.deepEqual(resumed.mcpServers, {});
+  assert.equal(resumed.strictMcpConfig, true);
   const reserved = buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers: { a: { type: "stdio", command: "a" } }, resumeSession: "abc", resumeExists: false, controller, hooks: {}, env: {} });
   assert.equal(reserved.sessionId, "abc");
   assert.equal(reserved.resume, undefined);

@@ -2,51 +2,41 @@
 ```mermaid
 mindmap
   root((mcp))
-    Config
-      server-config owns MCP config loading and merging
-      codex-config-toml owns the narrow MCP table extraction from Codex config.toml
-      bayma-state owns per-thread and per-server Bayma state-dir materialization
-      preflight-state gives each readiness probe ephemeral state separate from the live MCP runtime
-      config output is explicit input to Codex runtime setup
-    Preflight
-      preflight owns stdio readiness checks and cache policy
-      failures should explain which configured tool boundary is unavailable
-      Rust capability provisioning derives the installed Bayma Cargo home from its immutable seed identity and fetches the exact Breadbutter package-set and bridge locks before the offline probe
-      Breadbutter Python and Rust capabilities fingerprint their skill contracts and prove both quickstarts in disposable unified Bayma REPL sessions before caching readiness
+    bayma
+      bayma is the one MCP server alasio gives its agents and serves Bun Python C# and Rust REPL sessions
+      it is a pinned npm dependency run by alasio's own Node from the package's bin with runtimes from the payload its postinstall installs
+      baymaLaunch is the harness-neutral command and each harness adapter turns it into its own MCP config shape
+      each harness and conversation gets its own state directory under the alasio state directory because bayma leases a directory to one server process
+      ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools
+    Harness isolation
+      Claude Code receives bayma alone under strictMcpConfig so user project and claude.ai servers stay out
+      Codex threads receive bayma plus overrides that switch off every server in $CODEX_HOME/config.toml and the apps connector because Codex merges overrides into its ambient config
 ```
 
 ## Preference Atlas
 ```mermaid
 sequenceDiagram
-  participant Runtime as codex/runtime
-  participant Config as server-config
-  participant Check as preflight
-  participant FS as materialized state dir
-  participant Cache as readiness cache
-  Runtime->>Config: build Codex MCP config
-  Config->>FS: create isolated Bayma state for this thread
-  Config-->>Runtime: return explicit server definitions
-  Runtime->>Check: verify configured stdio servers
-  Check->>Check: provision the exact locked Rust graph into Bayma's derived private Cargo home
-  Check->>Check: load monorepo Breadbutter in disposable Bayma Python and Rust states when those repository capabilities exist
-  Check->>Cache: reuse known-good readiness only when inputs match
-  Check-->>Config: report per-server command and startup evidence
-  Check-->>Runtime: return usable or explicit failure evidence
+  participant Runtime as harness runtime
+  participant Bayma as mcp/bayma
+  participant Harness as Codex or Claude Code
+  Runtime->>Bayma: ensure bayma is ready
+  Bayma->>Bayma: start bayma on a throwaway state directory and list its tools once per process
+  Runtime->>Bayma: launch command for this harness and conversation
+  Runtime->>Harness: bayma as the only MCP server with ambient servers excluded
+  Harness->>Bayma: start bayma on the conversation's own state directory
 ```
 
 ## Avoidance Atlas
 ```mermaid
 stateDiagram-v2
   [*] --> MCPSetup
-  MCPSetup --> AmbientState: shared temp or hidden CLI state controls tool availability
-  AmbientState --> NoToolSession
-  NoToolSession --> FalseCapability: Codex appears alive but cannot use expected tools
-  FalseCapability --> OperatorDelay
-  OperatorDelay --> AmbientState
-  MCPSetup --> MaterializedConfig
-  MaterializedConfig --> IsolatedStateDir
-  IsolatedStateDir --> PreflightedServer
-  PreflightedServer --> ExplicitFailure: server startup evidence is not good enough
-  MaterializedConfig --> CheckedTools
-  CheckedTools --> [*]
+  MCPSetup --> AmbientServers: harness adds servers from its own machine configuration
+  AmbientServers --> UnownedTools: agent sees tools alasio never chose
+  MCPSetup --> PathLookup: server resolved from PATH or a global install
+  PathLookup --> VersionDrift
+  MCPSetup --> PinnedBayma
+  PinnedBayma --> ExcludedAmbient
+  ExcludedAmbient --> ReadyCheck
+  ReadyCheck --> ExplicitFailure: bayma does not start or lists no tools
+  ReadyCheck --> [*]
 ```

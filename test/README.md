@@ -6,7 +6,7 @@ mindmap
       authorization tests pin one private operator across message and callback ingress and reject callbacks before consuming stored actions
       harness selection tests pin per-harness parked session pointers schema v5 migration switch refusal while working or queued restart recovery under the owning harness and the /service panel and callbacks
       Claude harness tests pin prompt channel ordering tool_use projection result-as-final-answer interruption classification steering guardrail denial and SDK transcript to session and rewind mapping without spawning Claude Code
-      Breadbutter capability tests pin Bayma Python and Rust classification fingerprint invalidation readiness evidence wait behavior and cleanup after success or failure
+      bayma MCP tests pin the pinned-package launch per-harness per-conversation state directories Claude's bayma-only server table Codex's ambient-server and apps-connector overrides and a real start of the installed bayma
       app-server protocol tests pin notification turn identity across direct nested and item-shaped payloads
       app-server request contracts pin gpt-5.6-sol with high reasoning for thread creation and turn execution
       queue tests assert stale interrupted-turn completions cannot clear or satisfy the active Telegram turn
@@ -35,7 +35,7 @@ mindmap
       restart command tests pin the wrapper and direct systemd command recognition used for restart provenance
       systemd service tests pin descendant OOM containment together with main-process restart recovery
       systemd service tests pin locked Alasio dependency installation before capability doctors and unit activation
-      systemd service tests pin the provisioned Breadbutter Python 3.12 interpreter and Python-plus-Rust Breadbutter doctor across installer and service runtime
+      systemd service tests pin the service's Node runtime OOM containment and restart provenance wiring
     Scope
       tests exercise alasio-local runtime behavior without booting Telegram polling or Codex subprocesses
       fixtures stay inline when the wire shape is the behavior under test
