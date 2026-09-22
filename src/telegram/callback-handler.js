@@ -1,5 +1,6 @@
 import { NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, interruptActiveTurn, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.js";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.js";
+import { handleModelControlCallback, isModelControlAction } from "../operator/model-control.js";
 import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.js";
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.js";
 import { handleWorkspaceControlCallback, isWorkspaceControlAction, sendChooseWorkspacePanel } from "../operator/workspace-control.js";
@@ -54,6 +55,17 @@ export class CallbackHandler {
     const messageId = callbackQuery.message?.message_id;
     if (!chatId || !messageId) {
       await this.client.answerCallbackQuery(callbackQuery.id, "Missing message context.");
+      return;
+    }
+    if (isModelControlAction(action.kind)) {
+      await handleModelControlCallback({
+        client: this.client,
+        store: this.store,
+        action,
+        callbackQueryId: callbackQuery.id,
+        chatId,
+        messageId,
+      });
       return;
     }
     if (isServiceControlAction(action.kind)) {

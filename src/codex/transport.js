@@ -1,3 +1,5 @@
+import { CODEX_HARNESS } from "../harness/names.js";
+import { resolveCodexModelChoice } from "./model.js";
 import { Codex } from "@openai/codex-sdk";
 import { codexAppServerClient, stopCodexAppServer } from "./app-server/client.js";
 import {
@@ -37,6 +39,7 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
     }
     persistence.updatePendingSessionId(pendingResponseId, sessionId);
     persistence.updateActiveTurnSessionId(threadKey, sessionId);
+    const { model, effort } = resolveCodexModelChoice(persistence.getModelChoice?.(threadKey, CODEX_HARNESS) ?? null);
     const turnId = await codexAppServerClient.startTurn({
         threadId: sessionId,
         threadKey,
@@ -44,6 +47,8 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
         cwd: workingDirectory,
         env: codexEnv,
         config: codexConfig,
+        model,
+        effort,
     });
     turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
     return {

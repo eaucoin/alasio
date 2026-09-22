@@ -99,6 +99,18 @@ export class SqliteStore {
     this.conversations.setWorkingDirectory(threadKey, workingDirectory);
   }
 
+  getModelChoice(threadKey, harness) {
+    return this.conversations.getModelChoice(threadKey, harness);
+  }
+
+  setModelChoice(threadKey, harness, choice) {
+    this.conversations.setModelChoice(threadKey, harness, choice);
+  }
+
+  clearModelChoice(threadKey, harness) {
+    this.conversations.clearModelChoice(threadKey, harness);
+  }
+
   getHarnessSessionId(threadKey, harness) {
     return this.conversations.getHarnessSessionId(threadKey, harness);
   }

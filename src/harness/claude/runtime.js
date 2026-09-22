@@ -7,6 +7,7 @@
  * final answer.
  */
 import { randomUUID } from "node:crypto";
+import { CLAUDE_HARNESS } from "../names.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { appendBlock, isVisibleCodexItem, mapItemToBlocks } from "../../codex/event-projection.js";
 import { createTurnTimer } from "../../codex/turn-timing.js";
@@ -60,6 +61,7 @@ export function buildClaudeQueryOptions({
   controller,
   hooks,
   env = process.env,
+  modelChoice = null,
 }) {
   const options = {
     cwd: workingDirectory,
@@ -82,11 +84,11 @@ export function buildClaudeQueryOptions({
       options.sessionId = resumeSession;
     }
   }
-  const model = getClaudeModel(env);
+  const model = getClaudeModel(env, modelChoice);
   if (model) {
     options.model = model;
   }
-  const effort = getClaudeEffort(env);
+  const effort = getClaudeEffort(env, modelChoice);
   if (effort) {
     options.effort = effort;
   }
@@ -208,6 +210,7 @@ export async function executeClaudeTurn(params) {
     const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const options = buildClaudeQueryOptions({
       workingDirectory,
+      modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
       claudeEnv,
       mcpServers: toClaudeMcpServers(mcpConfig.mcp_servers),
       resumeSession,

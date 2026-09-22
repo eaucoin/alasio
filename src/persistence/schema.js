@@ -19,6 +19,10 @@ const SQLITE_SCHEMA_SQL = `
     claude_session_id text,
     active_harness text,
     working_directory text,
+    claude_model text,
+    claude_effort text,
+    codex_model text,
+    codex_effort text,
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     unique (transport, chat_id)
@@ -220,6 +224,14 @@ export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) 
     }
     if (!conversationColumns.has("working_directory")) {
       db.exec("alter table conversations add column working_directory text");
+    }
+    // A model and effort chosen with /model, per harness: each service has its
+    // own catalogue, so a choice made for one never applies to the other. Null
+    // means the harness's pinned default.
+    for (const column of ["claude_model", "claude_effort", "codex_model", "codex_effort"]) {
+      if (!conversationColumns.has(column)) {
+        db.exec(`alter table conversations add column ${column} text`);
+      }
     }
     if (legacyWorkingDirectory) {
       // Conversations mounted before folders were per-conversation ran in the

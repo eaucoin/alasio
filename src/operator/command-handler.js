@@ -1,3 +1,4 @@
+import { sendModelPanel } from "./model-control.js";
 import { createHarnessRegistry, interruptActiveTurn, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.js";
 import { parseCommand } from "./command-parser.js";
 import { handleGoalTextCommand } from "./goal-control.js";
@@ -72,6 +73,10 @@ export class CommandHandler {
       } else {
         await this.client.sendMessage(chatId, text);
       }
+      return true;
+    }
+    if (cmd.type === "model") {
+      await sendModelPanel({ client: this.client, store: this.store, harness, conversationId, chatId });
       return true;
     }
     if (cmd.type === "service") {

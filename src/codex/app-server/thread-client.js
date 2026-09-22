@@ -62,7 +62,7 @@ export class AppServerThreadClient {
     return threadId;
   }
 
-  async startTurn({ threadId, prompt, cwd }) {
+  async startTurn({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT }) {
     const previousTurnId = this.notifications.getCurrentTurnId(threadId);
     if (previousTurnId) {
       this.log.warn(`interrupting leftover app-server turn before starting a new one thread=${threadId.slice(0, 8)} turn=${previousTurnId}`);
@@ -78,8 +78,8 @@ export class AppServerThreadClient {
       threadId,
       input: [{ type: "text", text: prompt, text_elements: [] }],
       cwd,
-      model: ALASIO_CODEX_MODEL,
-      effort: ALASIO_CODEX_REASONING_EFFORT,
+      model,
+      ...(effort ? { effort } : {}),
       approvalPolicy: "never",
       sandboxPolicy: { type: "dangerFullAccess" },
     });
@@ -89,6 +89,19 @@ export class AppServerThreadClient {
     const turnDetail = responseTurnId && turnId !== responseTurnId ? ` response_turn=${responseTurnId}` : "";
     this.log.info(`turn start accepted thread=${threadId.slice(0, 8)} turn=${turnId ?? "unknown"}${turnDetail} ms=${elapsedMs(startedAt).toFixed(1)}`);
     return turnId;
+  }
+
+  /** The models this machine's Codex login can use, as the app-server reports them. */
+  async listModels({ env, cwd }) {
+    await this.rpc.start({ env, cwd });
+    const models = [];
+    let cursor = null;
+    do {
+      const page = await this.rpc.request("model/list", { includeHidden: false, ...(cursor ? { cursor } : {}) });
+      models.push(...(page?.data ?? []));
+      cursor = page?.nextCursor ?? null;
+    } while (cursor);
+    return models;
   }
 
   claimTurn(threadId, turnId) {

@@ -7,6 +7,9 @@ export function parseCommand(text) {
     if (normalized.toLowerCase() === "/session") {
         return { type: "session_panel" };
     }
+    if (normalized.toLowerCase() === "/model") {
+        return { type: "model" };
+    }
     const serviceMatch = /^\/service(?:\s+([a-z][a-z0-9_-]*))?\s*$/i.exec(normalized);
     if (serviceMatch) {
         return { type: "service", target: (serviceMatch[1] || "").toLowerCase() };

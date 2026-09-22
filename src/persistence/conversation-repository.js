@@ -5,6 +5,19 @@ const SESSION_COLUMNS = Object.freeze({
   [CLAUDE_HARNESS]: "claude_session_id",
 });
 
+const MODEL_COLUMNS = {
+  [CLAUDE_HARNESS]: { model: "claude_model", effort: "claude_effort" },
+  [CODEX_HARNESS]: { model: "codex_model", effort: "codex_effort" },
+};
+
+function modelColumns(harness) {
+  const columns = MODEL_COLUMNS[harness];
+  if (!columns) {
+    throw new Error(`Unknown harness: ${String(harness)}`);
+  }
+  return columns;
+}
+
 function sessionColumn(harness) {
   const column = SESSION_COLUMNS[harness];
   if (!column) {
@@ -68,6 +81,40 @@ export class SqliteConversationRepository {
    */
   getWorkingDirectory(threadKey) {
     return this.getConversation(threadKey)?.working_directory ?? null;
+  }
+
+  /**
+   * The model and effort chosen for one harness in this conversation, or null
+   * when none has been chosen and the harness's pinned default applies.
+   */
+  getModelChoice(threadKey, harness) {
+    const { model, effort } = modelColumns(harness);
+    const row = this.getConversation(threadKey);
+    if (!row?.[model]) {
+      return null;
+    }
+    return { model: row[model], effort: row[effort] ?? null };
+  }
+
+  setModelChoice(threadKey, harness, { model, effort = null }) {
+    if (typeof model !== "string" || !model.trim()) {
+      throw new Error("Model must be a non-empty id");
+    }
+    const columns = modelColumns(harness);
+    this.db.prepare(`
+      update conversations
+      set ${columns.model} = ?, ${columns.effort} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      where id = ?
+    `).run(model, effort, threadKey);
+  }
+
+  clearModelChoice(threadKey, harness) {
+    const columns = modelColumns(harness);
+    this.db.prepare(`
+      update conversations
+      set ${columns.model} = null, ${columns.effort} = null, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      where id = ?
+    `).run(threadKey);
   }
 
   /**

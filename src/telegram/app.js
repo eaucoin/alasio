@@ -117,6 +117,7 @@ export class TelegramCodexApp {
     try {
       await this.client.setMyCommands([
         { command: "service", description: "Switch between Codex and Claude" },
+        { command: "model", description: "Choose the model and effort" },
         { command: "workspace", description: "Choose or create the folder to work in" },
         { command: "session", description: "Manage the mounted agent session" },
         { command: "sessions", description: "Browse and mount agent sessions" },

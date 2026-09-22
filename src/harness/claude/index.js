@@ -1,4 +1,6 @@
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.js";
+import { getClaudeEffort, getClaudeModel } from "./model.js";
+import { listClaudeModels } from "./models.js";
 import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.js";
 import { createClaudeSessionApi } from "./sessions.js";
 
@@ -23,6 +25,13 @@ export function createClaudeHarness({ workingDirectory, sessionApi = null }) {
     },
     async executeTurn(params) {
       return await executeClaudeTurn({ ...params, workingDirectory, sessions });
+    },
+    async listModels() {
+      return await listClaudeModels({ workingDirectory });
+    },
+    /** What a turn runs on when no /model choice is stored. */
+    defaultModelChoice() {
+      return { model: getClaudeModel(), effort: getClaudeEffort() };
     },
     shutdown() {
       // Claude Code processes are per-turn; interrupted turns are aborted through activeQueries.

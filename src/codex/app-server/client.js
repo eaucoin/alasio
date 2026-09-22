@@ -64,9 +64,9 @@ export class AppServerClient {
     return await this.threads.startThread({ threadKey, cwd, env, config });
   }
 
-  async startTurn({ threadId, threadKey, prompt, cwd, env, config }) {
+  async startTurn({ threadId, threadKey, prompt, cwd, env, config, model, effort }) {
     try {
-      return await this.threads.startTurn({ threadId, prompt, cwd });
+      return await this.threads.startTurn({ threadId, prompt, cwd, model, effort });
     } catch (error) {
       if (!(error instanceof StaleTurnCleanupError)) {
         throw error;
@@ -74,8 +74,12 @@ export class AppServerClient {
       log.warn(`recycling app-server after stale turn cleanup failure thread=${threadId.slice(0, 8)}`);
       this.stop();
       const resumedThreadId = await this.ensureThread({ threadId, threadKey, cwd, env, config });
-      return await this.threads.startTurn({ threadId: resumedThreadId, prompt, cwd });
+      return await this.threads.startTurn({ threadId: resumedThreadId, prompt, cwd, model, effort });
     }
+  }
+
+  async listModels({ env, cwd }) {
+    return await this.threads.listModels({ env, cwd });
   }
 
   claimTurn(threadId, turnId) {
