@@ -21,28 +21,24 @@ test("alasio service contains descendant OOMs without suppressing main-process r
     service,
     /^Environment="PATH=\/home\/operator\/\.nvm\/versions\/node\/v24\.14\.0\/bin:/m,
   );
-  assert.match(
-    service,
-    /^Environment="BAYMA_PYTHON_BIN=\/home\/operator\/monorepo\/\.agents\/skills\/monorepo-breadbutter\/\.venv\/bin\/python"$/m,
-  );
+  // The MCP launcher unsets the runtime redirect variables before starting a
+  // server, so a unit that exports one is stating something untrue.
+  assert.doesNotMatch(service, /BAYMA_PYTHON_BIN/);
 });
 
 test("alasio installer provisions locked runtime dependencies before capability checks", () => {
   const installer = readFileSync(installerPath, "utf8");
   const runtimeInstallIndex = installer.indexOf('npm ci --prefix "$SCRIPT_DIR"');
   const pythonSyncIndex = installer.indexOf('uv sync \\');
-  const pythonBindingIndex = installer.indexOf('export BAYMA_PYTHON_BIN="${BAYMA_PYTHON_BIN:-$BREADBUTTER_ROOT/.venv/bin/python}"');
   const rustProvisionIndex = installer.indexOf('node "$BREADBUTTER_ROOT/provision-rust-workbench.mjs"');
   const capabilityDoctorIndex = installer.indexOf('npm --prefix "$SCRIPT_DIR" run doctor:breadbutter');
 
   assert.notEqual(runtimeInstallIndex, -1);
   assert.notEqual(pythonSyncIndex, -1);
-  assert.notEqual(pythonBindingIndex, -1);
   assert.notEqual(rustProvisionIndex, -1);
   assert.notEqual(capabilityDoctorIndex, -1);
   assert.ok(runtimeInstallIndex < capabilityDoctorIndex);
-  assert.ok(pythonSyncIndex < pythonBindingIndex);
-  assert.ok(pythonBindingIndex < capabilityDoctorIndex);
+  assert.ok(pythonSyncIndex < capabilityDoctorIndex);
   assert.ok(rustProvisionIndex < capabilityDoctorIndex);
 });
 
