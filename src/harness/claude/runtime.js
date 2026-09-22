@@ -31,7 +31,7 @@ import {
   buildClaudeUserMessage,
   createPromptChannel,
   instrumentPromptChannel,
-  resultAnswersPrompt,
+  promptUuidsAnsweredBy,
 } from "./prompt-channel.js";
 
 const log = createLogger("claude-runtime");
@@ -97,6 +97,9 @@ export function buildClaudeQueryOptions({
   return options;
 }
 
+/** How long a turn keeps its input open for a steered prompt the CLI has not answered. */
+const UNANSWERED_PROMPT_GRACE_MS = 15_000;
+
 export async function executeClaudeTurn(params) {
   const {
     prompt,
@@ -125,6 +128,17 @@ export async function executeClaudeTurn(params) {
   const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
   // The operator prompt is queued before any await so early steering cannot precede it.
   const promptUuids = new Set();
+  let unansweredPromptTimer = null;
+  const scheduleUnansweredPromptEnd = () => {
+    clearTimeout(unansweredPromptTimer);
+    unansweredPromptTimer = setTimeout(() => {
+      log.info(
+        `unanswered prompt grace elapsed thread=${threadKey} pending=${promptUuids.size}`,
+      );
+      channel.end();
+    }, UNANSWERED_PROMPT_GRACE_MS);
+    unansweredPromptTimer.unref?.();
+  };
   const pushPrompt = (text) => {
     const uuid = randomUUID();
     promptUuids.add(uuid);
@@ -233,7 +247,8 @@ export async function executeClaudeTurn(params) {
         continue;
       }
       if (message.type === "result") {
-        if (!resultAnswersPrompt(message, promptUuids)) {
+        const answered = promptUuidsAnsweredBy(message, promptUuids);
+        if (answered.length === 0) {
           // A resumed session re-runs an interrupted turn before ours; its
           // result is not the end of this turn, and closing the channel here
           // would cancel our first tool call.
@@ -267,7 +282,17 @@ export async function executeClaudeTurn(params) {
         if (sessionId && cacheRead !== undefined) {
           persistence.updateSessionUsage(sessionId, { cacheReadInputTokens: cacheRead });
         }
-        channel.end();
+        for (const uuid of answered) {
+          promptUuids.delete(uuid);
+        }
+        if (promptUuids.size === 0) {
+          channel.end();
+        } else {
+          // A steered prompt is still unanswered; keep the input open for it,
+          // but bounded, because a channel the CLI never reads again would
+          // leave the turn waiting for input that is not coming.
+          scheduleUnansweredPromptEnd();
+        }
         continue;
       }
       if (message.type === "auth_status" && message.error) {
@@ -295,6 +320,7 @@ export async function executeClaudeTurn(params) {
       });
     }
   } finally {
+    clearTimeout(unansweredPromptTimer);
     channel.end();
     try {
       activeSdkQuery?.close?.();

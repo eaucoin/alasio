@@ -88,22 +88,27 @@ export function buildClaudeUserMessage(text, uuid = randomUUID()) {
  * our turn is still being planned, and the first tool call the model then
  * makes is cancelled.
  */
-export function resultAnswersPrompt(message, promptUuids) {
+export function promptUuidsAnsweredBy(message, promptUuids) {
   const ours = promptUuids instanceof Set ? promptUuids : new Set([promptUuids]);
   if (ours.size === 0 || !message || message.type !== "result") {
-    return false;
+    return [];
   }
   const uuids = Array.isArray(message.user_message_uuids)
     ? message.user_message_uuids
     : [];
   if (uuids.length > 0) {
-    return uuids.some((uuid) => ours.has(uuid));
+    return uuids.filter((uuid) => ours.has(uuid));
   }
-  // Older producers send only the single uuid; older still send neither, in
-  // which case any result has to be treated as ours or the turn never ends.
-  return typeof message.user_message_uuid === "string"
-    ? ours.has(message.user_message_uuid)
-    : true;
+  if (typeof message.user_message_uuid === "string") {
+    return ours.has(message.user_message_uuid) ? [message.user_message_uuid] : [];
+  }
+  // An older producer attributes nothing, so the result has to be taken as
+  // answering everything outstanding or the turn would never end.
+  return [...ours];
+}
+
+export function resultAnswersPrompt(message, promptUuids) {
+  return promptUuidsAnsweredBy(message, promptUuids).length > 0;
 }
 
 /**

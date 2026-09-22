@@ -207,6 +207,68 @@ test("a result for another turn does not end the prompt channel", async () => {
   );
 });
 
+test("a steered prompt keeps the channel open until its own result arrives", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  const uuids = [];
+  let closedBeforeSteerAnswered = null;
+  const queryFactory = ({ prompt }) => {
+    const generator = (async function* run() {
+      const iterator = prompt[Symbol.asyncIterator]();
+      uuids.push((await iterator.next()).value.uuid);
+      yield { type: "system", subtype: "init", session_id: "s1", model: "m" };
+      // Steer arrives while the turn is running.
+      await activeQueries.get("telegram:1").steer("also do this");
+      uuids.push((await iterator.next()).value.uuid);
+      // The CLI answers only the original prompt first.
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "First answer.",
+        session_id: "s1",
+        user_message_uuid: uuids[0],
+        user_message_uuids: [uuids[0]],
+      };
+      const pending = iterator.next();
+      closedBeforeSteerAnswered = await Promise.race([
+        pending.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 20)),
+      ]);
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Steered answer.",
+        session_id: "s1",
+        user_message_uuid: uuids[1],
+        user_message_uuids: [uuids[1]],
+      };
+      assert.equal((await iterator.next()).done, true);
+    })();
+    generator.close = () => undefined;
+    return generator;
+  };
+  const result = await executeClaudeTurn({
+    prompt: "do it",
+    resumeSession: "s1",
+    threadKey: "telegram:1",
+    chatId: 1,
+    messageId: 2,
+    workingDirectory: "/work",
+    persistence,
+    activeQueries,
+    sessions: { sessionExists: async () => true },
+    queryFactory,
+  });
+  assert.equal(closedBeforeSteerAnswered, false, "the channel stays open for the steered prompt");
+  assert.equal(
+    result.blockSequence.filter((block) => block.type === "text").at(-1)?.content,
+    "Steered answer.",
+    "the newest matching result is the one posted",
+  );
+});
+
 test("Claude turn persists session identity, tool blocks, and the result as final answer", async () => {
   const persistence = createPersistence();
   const activeQueries = new Map();
