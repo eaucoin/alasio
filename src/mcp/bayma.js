@@ -1,11 +1,11 @@
 /**
- * bayma, the one MCP server alasio gives its agents.
+ * bayma, the MCP server alasio itself gives its agents, next to whatever
+ * servers the operator has configured for each harness on this machine.
  *
  * bayma is a pinned npm dependency, so the server alasio launches is the
  * version in package-lock.json, run by alasio's own Node, with runtimes from
- * the payload its postinstall put in place. Nothing is looked up on PATH or
- * read from a harness's ambient configuration. Each harness adapter turns
- * `baymaLaunch` into its own MCP config shape.
+ * the payload its postinstall put in place; nothing is looked up on PATH.
+ * Each harness adapter turns `baymaLaunch` into its own MCP config shape.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";

@@ -14,7 +14,7 @@ mindmap
       sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
       switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
       Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
-      bayma is the only MCP server either harness sees: alasio pins it as an npm dependency launches it with its own Node and keeps each harness's ambient MCP servers and connectors out
+      each harness sees the MCP servers the operator configured for it on this machine plus bayma which alasio pins as an npm dependency and launches with its own Node
       `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
       `ALASIO_DEFAULT_HARNESS` is unset by default and optionally pre-mounts codex or claude on newly created conversations so they skip the picker
       `WORKING_DIRECTORY` is unset by default and optionally pre-mounts one folder on new conversations and on conversations that predate per-conversation folders so existing deployments keep working unchanged
@@ -33,7 +33,7 @@ mindmap
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency
       Codex SDK exec transport remains an explicit rollback path for runtime isolation
-      Codex threads start and resume with explicit overrides that add bayma and switch off every MCP server in `$CODEX_HOME/config.toml` and the ChatGPT apps connector
+      Codex threads start and resume with overrides that add bayma on top of `$CODEX_HOME/config.toml` and Claude Code queries add bayma to the servers Claude Code loads itself
       skill selection and instruction loading constrain tool behavior
       SQLite content store manages update offsets, conversations, per-harness session pointers, per-folder parked sessions, durable prompt jobs, files, streamed blocks, restart provenance, and resumable continuation
       SQLite Telegram outbox separates Codex completion from rate-limited Bot API delivery

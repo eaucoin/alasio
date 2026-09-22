@@ -33,7 +33,7 @@ mindmap
     policy/
       owns shell command parsing restart command recognition forbidden database command detection and workflow wait detection
     mcp/
-      owns bayma the one MCP server alasio provides its launch command per-conversation state directory and readiness check
+      owns bayma the MCP server alasio adds to each harness's own servers its launch command per-conversation state directory and readiness check
     workflow/
       owns the localhost hook server that receives CI wait notifications
     shared/

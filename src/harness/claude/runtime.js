@@ -73,7 +73,6 @@ export function buildClaudeQueryOptions({
     persistSession: true,
     hooks,
     mcpServers,
-    strictMcpConfig: true,
   };
   if (resumeSession) {
     if (resumeExists) {

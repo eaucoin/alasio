@@ -118,7 +118,7 @@ test("query options resume existing sessions and reserve fresh ids", () => {
   assert.equal(resumed.pathToClaudeCodeExecutable, "/opt/claude");
   assert.equal(resumed.permissionMode, "bypassPermissions");
   assert.deepEqual(resumed.mcpServers, {});
-  assert.equal(resumed.strictMcpConfig, true);
+  assert.equal(resumed.strictMcpConfig, undefined);
   const reserved = buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers: { a: { type: "stdio", command: "a" } }, resumeSession: "abc", resumeExists: false, controller, hooks: {}, env: {} });
   assert.equal(reserved.sessionId, "abc");
   assert.equal(reserved.resume, undefined);

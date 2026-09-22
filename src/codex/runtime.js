@@ -34,7 +34,7 @@ function getErrorMessage(error) {
 export async function startFreshCodexSession({ threadKey, workingDirectory }) {
     const startedAt = process.hrtime.bigint();
     const codexEnv = buildCodexEnv();
-    const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
     await ensureBaymaReady(codexEnv);
     const sessionId = await startCodexTransportThread({
         threadKey,
@@ -59,7 +59,7 @@ export async function warmCodexSession({ sessionId, threadKey, workingDirectory 
     }
     const startedAt = process.hrtime.bigint();
     const codexEnv = buildCodexEnv();
-    const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
     await ensureBaymaReady(codexEnv);
     await warmCodexTransportThread({
         sessionId,
@@ -111,7 +111,7 @@ export async function executeCodexTurn(params) {
     try {
         const codexEnv = buildCodexEnv();
         turnTimer("env.built");
-        const codexConfig = await buildCodexThreadConfig({ codexEnv, threadKey });
+        const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
         turnTimer("config.built");
         await ensureBaymaReady(codexEnv);
         turnTimer("bayma.ready");

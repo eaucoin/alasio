@@ -15,8 +15,7 @@
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@openai/codex-sdk": "0.153.3",
     "better-sqlite3": "^12.11.1",
-    "dotenv": "^16.4.0",
-    "smol-toml": "1.7.0"
+    "dotenv": "^16.4.0"
   },
   "overrides": {
     "@hono/node-server": "2.0.11",
