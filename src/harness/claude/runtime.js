@@ -31,6 +31,7 @@ import {
   buildClaudeUserMessage,
   createPromptChannel,
   instrumentPromptChannel,
+  resultAnswersPrompt,
 } from "./prompt-channel.js";
 
 const log = createLogger("claude-runtime");
@@ -123,7 +124,13 @@ export async function executeClaudeTurn(params) {
   const controller = new AbortController();
   const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
   // The operator prompt is queued before any await so early steering cannot precede it.
-  channel.push(buildClaudeUserMessage(prompt));
+  const promptUuids = new Set();
+  const pushPrompt = (text) => {
+    const uuid = randomUUID();
+    promptUuids.add(uuid);
+    return channel.push(buildClaudeUserMessage(text, uuid));
+  };
+  pushPrompt(prompt);
   let resolveFinished;
   const finished = new Promise((resolve) => {
     resolveFinished = resolve;
@@ -138,7 +145,7 @@ export async function executeClaudeTurn(params) {
       if (channel.ended) {
         return false;
       }
-      return channel.push(buildClaudeUserMessage(steerPrompt));
+      return pushPrompt(steerPrompt);
     },
   };
   activeQueries.set(threadKey, activeQuery);
@@ -226,6 +233,15 @@ export async function executeClaudeTurn(params) {
         continue;
       }
       if (message.type === "result") {
+        if (!resultAnswersPrompt(message, promptUuids)) {
+          // A resumed session re-runs an interrupted turn before ours; its
+          // result is not the end of this turn, and closing the channel here
+          // would cancel our first tool call.
+          log.info(
+            `result for another turn ignored thread=${threadKey} uuid=${message.user_message_uuid ?? "none"} resume_reason=${message.resume_reason ?? "none"}`,
+          );
+          continue;
+        }
         const projected = projectResultMessage(message);
         sessionId = message.session_id ?? sessionId;
         if (projected?.ok) {

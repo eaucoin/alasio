@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 /**
  * Pushable async iterable used as the Claude Agent SDK streaming prompt.
  *
@@ -64,13 +66,44 @@ export function createPromptChannel() {
   };
 }
 
-export function buildClaudeUserMessage(text) {
+export function buildClaudeUserMessage(text, uuid = randomUUID()) {
   return {
     type: "user",
+    uuid,
     message: { role: "user", content: text },
     parent_tool_use_id: null,
     origin: { kind: "human" },
   };
+}
+
+/**
+ * Whether a result message answers one of the prompts we pushed (the operator
+ * prompt, plus anything steered into the same turn).
+ *
+ * A result carries the client uuid of the user message its turn consumed
+ * (`user_message_uuids`, or `user_message_uuid` from older producers). In a
+ * resumed session the first result need not be ours: the CLI re-runs a turn a
+ * previous worker left interrupted, and stamps that turn's own prompt uuid.
+ * Ending the prompt channel on a foreign result closes the input stream while
+ * our turn is still being planned, and the first tool call the model then
+ * makes is cancelled.
+ */
+export function resultAnswersPrompt(message, promptUuids) {
+  const ours = promptUuids instanceof Set ? promptUuids : new Set([promptUuids]);
+  if (ours.size === 0 || !message || message.type !== "result") {
+    return false;
+  }
+  const uuids = Array.isArray(message.user_message_uuids)
+    ? message.user_message_uuids
+    : [];
+  if (uuids.length > 0) {
+    return uuids.some((uuid) => ours.has(uuid));
+  }
+  // Older producers send only the single uuid; older still send neither, in
+  // which case any result has to be treated as ours or the turn never ends.
+  return typeof message.user_message_uuid === "string"
+    ? ours.has(message.user_message_uuid)
+    : true;
 }
 
 /**

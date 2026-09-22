@@ -138,6 +138,75 @@ test("query options resume existing sessions and reserve fresh ids", () => {
   assert.deepEqual(Object.keys(reserved.mcpServers), ["a"]);
 });
 
+test("a result for another turn does not end the prompt channel", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  let promptUuid = null;
+  let channelOpenWhenForeignResultSeen = null;
+  const queryFactory = ({ prompt }) => {
+    const generator = (async function* run() {
+      const iterator = prompt[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      promptUuid = first.value.uuid;
+      yield { type: "system", subtype: "init", session_id: "s1", model: "m" };
+      // A resumed session re-runs the turn a previous worker left interrupted;
+      // its result names that turn's prompt, not ours.
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Finished the interrupted turn.",
+        session_id: "s1",
+        user_message_uuid: "someone-elses-turn",
+        user_message_uuids: ["someone-elses-turn"],
+        resume_reason: "interrupted_turn",
+      };
+      // If the channel had been closed on that result, this would never run:
+      // the next read would report done, and a pending tool call would be
+      // cancelled.
+      const pending = iterator.next();
+      channelOpenWhenForeignResultSeen = await Promise.race([
+        pending.then(() => false),
+        new Promise((resolve) => setTimeout(() => resolve(true), 20)),
+      ]);
+      yield assistant([{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo hi" } }]);
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Ours at last.",
+        session_id: "s1",
+        user_message_uuid: promptUuid,
+        user_message_uuids: [promptUuid],
+      };
+      const closing = await iterator.next();
+      assert.equal(closing.done, true);
+    })();
+    generator.close = () => undefined;
+    return generator;
+  };
+  const result = await executeClaudeTurn({
+    prompt: "do it",
+    resumeSession: "s1",
+    threadKey: "telegram:1",
+    chatId: 1,
+    messageId: 2,
+    workingDirectory: "/work",
+    persistence,
+    activeQueries,
+    sessions: { sessionExists: async () => true },
+    queryFactory,
+  });
+  assert.equal(typeof promptUuid, "string", "the pushed prompt carries a client uuid");
+  assert.equal(channelOpenWhenForeignResultSeen, true, "the channel stays open through a foreign result");
+  assert.equal(result.responseCompleted, true);
+  assert.equal(
+    result.blockSequence.filter((block) => block.type === "text").at(-1)?.content,
+    "Ours at last.",
+    "the turn ends on the result that answers our prompt",
+  );
+});
+
 test("Claude turn persists session identity, tool blocks, and the result as final answer", async () => {
   const persistence = createPersistence();
   const activeQueries = new Map();
