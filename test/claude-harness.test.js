@@ -11,6 +11,7 @@ import {
 import { toClaudeMcpServers } from "../src/harness/claude/mcp.js";
 import { buildClaudeUserMessage, createPromptChannel } from "../src/harness/claude/prompt-channel.js";
 import { buildClaudeQueryOptions, executeClaudeTurn } from "../src/harness/claude/runtime.js";
+import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.js";
 import { createClaudeSessionApi } from "../src/harness/claude/sessions.js";
 
 function createPersistence() {
@@ -134,7 +135,9 @@ test("query options resume existing sessions and reserve fresh ids", () => {
   const reserved = buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers: { a: { type: "stdio", command: "a" } }, resumeSession: "abc", resumeExists: false, controller, hooks: {}, env: {} });
   assert.equal(reserved.sessionId, "abc");
   assert.equal(reserved.resume, undefined);
-  assert.equal(reserved.model, undefined);
+  // No override in the environment: the harness pins the model itself.
+  assert.equal(reserved.model, ALASIO_CLAUDE_MODEL);
+  assert.equal(reserved.effort, ALASIO_CLAUDE_EFFORT);
   assert.deepEqual(Object.keys(reserved.mcpServers), ["a"]);
 });
 
