@@ -287,6 +287,11 @@ export async function executeClaudeTurn(params) {
         }
         if (promptUuids.size === 0) {
           channel.end();
+          // The turn is over as far as new messages are concerned. Dropping it
+          // here rather than in `finally` closes the window where a message
+          // arriving during the drain is offered Steer/Swerve choices for a
+          // turn that has already produced its answer.
+          activeQueries.delete(threadKey);
         } else {
           // A steered prompt is still unanswered; keep the input open for it,
           // but bounded, because a channel the CLI never reads again would

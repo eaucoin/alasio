@@ -19,7 +19,6 @@ uv sync \
   --all-extras \
   --frozen
 
-export BAYMA_PYTHON_BIN="${BAYMA_PYTHON_BIN:-$BREADBUTTER_ROOT/.venv/bin/python}"
 node "$BREADBUTTER_ROOT/provision-rust-workbench.mjs"
 
 npm --prefix "$SCRIPT_DIR" run doctor:breadbutter -- \

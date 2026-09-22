@@ -11,7 +11,6 @@ EnvironmentFile=/home/operator/alasio/.env
 Environment="PATH=/home/operator/.nvm/versions/node/v24.14.0/bin:/home/operator/.bun/bin:/home/operator/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin"
 Environment="ALASIO_SERVICE_UNIT=alasio-standalone.service"
 Environment="ALASIO_RESTART_WRAPPER=/home/operator/alasio/restart-alasio-standalone.sh"
-Environment="BAYMA_PYTHON_BIN=/home/operator/monorepo/.agents/skills/monorepo-breadbutter/.venv/bin/python"
 ExecStart=/home/operator/.nvm/versions/node/v24.14.0/bin/node ./src/index.js
 OOMPolicy=continue
 Restart=always

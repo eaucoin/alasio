@@ -7,7 +7,6 @@ mindmap
       EnvironmentFile loads operator credentials from the protected source workspace
       ExecStart binds the installed Node 24 runtime instead of assuming a system-wide /usr/bin/node exists
       PATH exposes the operator-owned Bun installation so repository hooks and generators can resolve both bun and bunx without session-local repair
-      BAYMA_PYTHON_BIN binds Bayma sessions to the locked Breadbutter Python 3.12 environment instead of the older host python3 fallback
       WORKING_DIRECTORY keeps upstream Codex operating in the mutable agent workspace
       OOMPolicy continue contains descendant memory failures instead of stopping the healthy Telegram bridge
       Restart always still recovers main-process exits so containment does not weaken service supervision
