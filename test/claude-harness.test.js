@@ -9,6 +9,7 @@ import {
   projectToolUseToItem,
 } from "../src/harness/claude/event-projection.js";
 import { buildClaudeUserMessage, createPromptChannel } from "../src/harness/claude/prompt-channel.js";
+import { createClaudeLiveSessions } from "../src/harness/claude/live-sessions.js";
 import { buildClaudeQueryOptions, executeClaudeTurn } from "../src/harness/claude/runtime.js";
 import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.js";
 import { createClaudeSessionApi } from "../src/harness/claude/sessions.js";
@@ -19,11 +20,17 @@ function createPersistence() {
     sessionIds: [],
     activeTurnSessionIds: [],
     completed: [],
+    posted: [],
+    pending: [],
     usage: [],
   };
   return {
     state,
-    createPendingResponse: () => "pending-1",
+    createPendingResponse: (chatId, messageId) => {
+      state.pending.push(String(messageId));
+      return `pending-${state.pending.length}`;
+    },
+    markPendingAsPosted: (id) => state.posted.push(id),
     updateActiveTurnPendingResponseId: () => undefined,
     updatePendingSessionId: (_id, sessionId) => state.sessionIds.push(sessionId),
     updateActiveTurnSessionId: (_threadKey, sessionId) => state.activeTurnSessionIds.push(sessionId),
@@ -41,6 +48,20 @@ const quietSessions = {
 
 function assistant(content, extra = {}) {
   return { type: "assistant", message: { role: "assistant", content }, parent_tool_use_id: null, session_id: "s-1", ...extra };
+}
+
+/** One turn on a throwaway live-session registry, closed once the turn returns. */
+async function runClaudeTurn(params) {
+  const liveSessions = createClaudeLiveSessions({
+    workingDirectory: params.workingDirectory,
+    sessions: params.sessions,
+    queryFactory: params.queryFactory,
+  });
+  try {
+    return await executeClaudeTurn({ ...params, liveSessions });
+  } finally {
+    await liveSessions.closeAll("test");
+  }
 }
 
 async function* drainPromptChannel(iterable, seen) {
@@ -175,7 +196,7 @@ test("a result for another turn does not end the prompt channel", async () => {
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "do it",
     resumeSession: "s1",
     threadKey: "telegram:1",
@@ -239,7 +260,7 @@ test("a steered prompt keeps the channel open until its own result arrives", asy
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "do it",
     resumeSession: "s1",
     threadKey: "telegram:1",
@@ -279,7 +300,7 @@ test("Claude turn persists session identity, tool blocks, and the result as fina
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "do it",
     resumeSession: "reserved-1",
     threadKey: "telegram:1",
@@ -325,7 +346,7 @@ test("a result from a turn the CLI started itself does not end the operator's tu
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "check now",
     resumeSession: null,
     threadKey: "telegram:7",
@@ -365,7 +386,7 @@ test("Claude turn interruption is classified as operator control and steering pu
     generator.close = () => undefined;
     return generator;
   };
-  const turn = executeClaudeTurn({
+  const turn = runClaudeTurn({
     prompt: "long task",
     resumeSession: null,
     threadKey: "telegram:2",
@@ -403,7 +424,7 @@ test("Claude turn surfaces failures and non-operator aborts as errors", async ()
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "x",
     resumeSession: null,
     threadKey: "telegram:3",
@@ -446,7 +467,7 @@ test("Bash PreToolUse hook denies forbidden database commands with guardrail gui
     generator.close = () => undefined;
     return generator;
   };
-  const result = await executeClaudeTurn({
+  const result = await runClaudeTurn({
     prompt: "drop it",
     resumeSession: null,
     threadKey: "telegram:4",
@@ -516,31 +537,77 @@ test("Claude session api maps SDK transcripts to alasio session and rewind shape
   assert.equal(await api.sessionExists("old"), false);
 });
 
-test("a CLI that keeps running after the final result is closed so later prompts are not held", async () => {
-  const persistence = createPersistence();
-  const activeQueries = new Map();
-  let closed = 0;
-  let release;
-  const queryFactory = ({ prompt }) => {
+/**
+ * A scriptable stand-in for a long-lived Claude Code process: the test reads
+ * the prompts it receives and decides what it streams back.
+ */
+function createFakeCli() {
+  const outbox = [];
+  let wake = null;
+  const prompts = [];
+  const promptWaiters = [];
+  const state = { created: 0, closed: 0, interrupts: 0, options: [] };
+  function emit(message) {
+    outbox.push(message);
+    wake?.();
+  }
+  function nextPrompt() {
+    if (prompts.length > state.consumed) {
+      return Promise.resolve(prompts[state.consumed++]);
+    }
+    return new Promise((resolve) => promptWaiters.push(resolve));
+  }
+  state.consumed = 0;
+  const queryFactory = ({ prompt, options }) => {
+    state.created += 1;
+    state.options.push(options);
+    let closed = false;
+    (async () => {
+      for await (const message of prompt) {
+        prompts.push(message);
+        const waiter = promptWaiters.shift();
+        if (waiter) {
+          state.consumed += 1;
+          waiter(message);
+        }
+      }
+      closed = true;
+      wake?.();
+    })();
+    options.abortController.signal.addEventListener("abort", () => {
+      closed = true;
+      wake?.();
+    });
     const generator = (async function* run() {
-      const iterator = prompt[Symbol.asyncIterator]();
-      const first = await iterator.next();
-      yield { type: "system", subtype: "init", session_id: "s-1", model: "m" };
-      yield { type: "result", subtype: "success", is_error: false, result: "Answered.", session_id: "s-1", user_message_uuids: [first.value.uuid] };
-      // Background shells keep the CLI alive: nothing more arrives until close().
-      await new Promise((resolve) => {
-        release = resolve;
-      });
-      throw new Error("Claude Code process terminated");
+      while (true) {
+        while (outbox.length > 0) {
+          yield outbox.shift();
+        }
+        if (closed) {
+          return;
+        }
+        await new Promise((resolve) => {
+          wake = resolve;
+        });
+      }
     })();
     generator.close = () => {
-      closed += 1;
-      release?.();
+      state.closed += 1;
+      closed = true;
+      wake?.();
+    };
+    generator.interrupt = async () => {
+      state.interrupts += 1;
     };
     return generator;
   };
-  const started = Date.now();
-  const result = await executeClaudeTurn({
+  return { queryFactory, emit, nextPrompt, prompts, state };
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+function turnParams(persistence, activeQueries, extra = {}) {
+  return {
     prompt: "go",
     resumeSession: "s-1",
     threadKey: "telegram:1",
@@ -549,14 +616,147 @@ test("a CLI that keeps running after the final result is closed so later prompts
     workingDirectory: "/work",
     persistence,
     activeQueries,
-    sessions: quietSessions,
-    queryFactory,
-    postResultDrainMs: 20,
+    ...extra,
+  };
+}
+
+test("background work keeps running after the answer and its report is delivered as its own reply", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  const cli = createFakeCli();
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const events = [];
+  const turn = executeClaudeTurn({
+    ...turnParams(persistence, activeQueries),
+    liveSessions,
+    onBackgroundResponse: () => events.push("background-response"),
+    onIdle: () => events.push("idle"),
   });
-  assert.ok(Date.now() - started < 2000);
-  assert.ok(closed >= 1);
+  const first = await cli.nextPrompt();
+  cli.emit({ type: "system", subtype: "init", session_id: "s-1" });
+  cli.emit(assistant([{ type: "tool_use", id: "t1", name: "Bash", input: { command: "bun run test", run_in_background: true } }]));
+  cli.emit({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "b1", task_type: "local_bash", description: "bun run test" }] });
+  cli.emit({ type: "result", subtype: "success", is_error: false, result: "Tests are running; I'll report back.", session_id: "s-1", user_message_uuids: [first.uuid] });
+  const result = await turn;
   assert.equal(result.responseCompleted, true);
-  assert.equal(result.interrupted, false);
-  assert.equal(finalResponseToMarkdown(result.blockSequence), "Answered.");
+  assert.equal(finalResponseToMarkdown(result.blockSequence), "Tests are running; I'll report back.");
+  assert.equal(cli.state.closed, 0, "the answer does not end the process");
+  assert.equal(activeQueries.size, 0, "the conversation is free once answered");
+
+  // The task settles and Claude Code starts a turn of its own to report it.
+  cli.emit({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+  cli.emit(assistant([{ type: "text", text: "Checking the log." }]));
+  await settle();
+  assert.equal(activeQueries.get("telegram:1")?.cliInitiated, true, "the report holds the conversation busy");
+  cli.emit({ type: "result", subtype: "success", is_error: false, result: "All 212 tests passed.", session_id: "s-1" });
+  await settle();
   assert.equal(activeQueries.size, 0);
+  assert.deepEqual(persistence.state.completed, ["pending-1", "pending-2"]);
+  assert.match(persistence.state.pending[1], /^claude-cli-turn:/);
+  assert.equal(persistence.state.blocks.filter((block) => block.phase === "final_answer").at(-1).content, "All 212 tests passed.");
+  assert.deepEqual(events.filter((event) => event === "background-response"), ["background-response"]);
+  assert.ok(events.includes("idle"));
+  await liveSessions.closeAll("test");
+  assert.equal(cli.state.closed, 1);
+});
+
+test("later prompts on the same session reuse the live process; a new session or model replaces it", async () => {
+  const persistence = createPersistence();
+  let model = null;
+  persistence.getModelChoice = () => model;
+  const activeQueries = new Map();
+  const cli = createFakeCli();
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const answer = async (text) => {
+    const received = await cli.nextPrompt();
+    cli.emit({ type: "result", subtype: "success", is_error: false, result: `re: ${received.message.content}`, session_id: "s-1", user_message_uuids: [received.uuid] });
+    return received;
+  };
+  const run = async (prompt, extra = {}) => {
+    const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries, { prompt, ...extra }), liveSessions });
+    await answer();
+    return await turn;
+  };
+  cli.emit({ type: "system", subtype: "init", session_id: "s-1" });
+  assert.equal(finalResponseToMarkdown((await run("one")).blockSequence), "re: one");
+  assert.equal(finalResponseToMarkdown((await run("two")).blockSequence), "re: two");
+  assert.equal(cli.state.created, 1, "one process served both prompts");
+  assert.equal(cli.state.options[0].resume, "s-1");
+
+  model = { model: "claude-haiku-4-5-20251001", effort: null };
+  await run("three");
+  assert.equal(cli.state.created, 2, "a model change starts a new process");
+  assert.equal(cli.state.closed, 1);
+
+  await run("four", { resumeSession: "s-2" });
+  assert.equal(cli.state.created, 3, "a different mounted session starts a new process");
+  assert.equal(cli.state.options[2].resume, "s-2");
+  await liveSessions.closeAll("test");
+});
+
+test("steering a Claude-started turn is answered in that turn's own reply", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  const cli = createFakeCli();
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  const first = await cli.nextPrompt();
+  cli.emit({ type: "result", subtype: "success", is_error: false, result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] });
+  await turn;
+  cli.emit(assistant([{ type: "text", text: "Build finished, reviewing." }]));
+  await settle();
+  const cliTurn = activeQueries.get("telegram:1");
+  assert.equal(cliTurn.cliInitiated, true);
+  assert.equal(await cliTurn.steer("also summarize warnings"), true);
+  const steered = await cli.nextPrompt();
+  assert.equal(steered.message.content, "also summarize warnings");
+  cli.emit({ type: "result", subtype: "success", is_error: false, result: "Build is green; 3 warnings.", session_id: "s-1", user_message_uuids: [steered.uuid] });
+  await settle();
+  assert.equal(activeQueries.size, 0);
+  assert.equal(persistence.state.completed.at(-1), "pending-2");
+  await liveSessions.closeAll("test");
+});
+
+test("/stop interrupts the turn without killing the process, and the interrupted turn's tail is not a new turn", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  const cli = createFakeCli();
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  const first = await cli.nextPrompt();
+  cli.emit(assistant([{ type: "text", text: "Working..." }]));
+  await settle();
+  await activeQueries.get("telegram:1").abort("Interrupted from Telegram");
+  const result = await turn;
+  assert.equal(result.interrupted, true);
+  assert.equal(cli.state.interrupts, 1);
+  assert.equal(cli.state.closed, 0);
+  // Output the CLI flushes while stopping belongs to the stopped turn.
+  cli.emit(assistant([{ type: "text", text: "(stopping)" }]));
+  await settle();
+  assert.equal(activeQueries.size, 0, "the tail does not open a Claude-started turn");
+  cli.emit({ type: "result", subtype: "error_during_execution", is_error: true, errors: ["interrupted"], session_id: "s-1", user_message_uuids: [first.uuid] });
+  await settle();
+  assert.deepEqual(persistence.state.pending, ["1"], "no reply was created for the tail");
+  await liveSessions.closeAll("test");
+});
+
+test("a Claude Code process that exits mid-turn fails that turn and the next prompt starts a fresh one", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  const cli = createFakeCli();
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  await cli.nextPrompt();
+  cli.state.options[0].abortController.abort("crash");
+  const result = await turn;
+  assert.equal(result.responseCompleted, false);
+  assert.match(result.blockSequence.at(-1).content, /^Error: Claude Code exited before answering/);
+  assert.equal(liveSessions.get("telegram:1"), null);
+  const next = executeClaudeTurn({ ...turnParams(persistence, activeQueries, { prompt: "again" }), liveSessions });
+  const again = await cli.nextPrompt();
+  cli.emit({ type: "result", subtype: "success", is_error: false, result: "Back.", session_id: "s-1", user_message_uuids: [again.uuid] });
+  assert.equal((await next).responseCompleted, true);
+  assert.equal(cli.state.created, 2);
+  await liveSessions.closeAll("test");
 });

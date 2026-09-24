@@ -27,9 +27,10 @@ mindmap
       Telegram media groups are buffered briefly so multi-file sends become one Codex turn
     Runtime control plane
       turn orchestrator coordinates execution and interruption boundaries and resolves the conversation's active harness per turn
-      Claude Code turns are one Agent SDK query per Telegram prompt over the mounted session with streaming input so Steer pushes guidance into the live session
+      each mounted Claude Code session is served by one long-lived Agent SDK process fed through streaming input so every Telegram prompt and Steer is pushed into the same live session and a turn ends on the result that names its prompt
       Claude Code final replies are the SDK result text and intermediate assistant text stays internal commentary
-      once every operator prompt in a Claude Code turn is answered the query is closed after a short drain so background shells the CLI left running cannot hold later queued prompts
+      background shells and agents Claude Code starts keep running after its answer and the turn it starts on its own when they settle holds the conversation busy accepts Steer and is delivered as its own durable reply
+      the live Claude Code process is replaced when the mounted session or model changes and closed at shutdown while /stop interrupts only the current turn
       Claude Code Bash commands pass through a PreToolUse hook that records restart provenance and denies forbidden database commands with the same guardrail guidance
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency

@@ -398,6 +398,16 @@ export class TurnController {
           this.store.markPromptJobUpstreamCompleted(jobId, sessionId, turnId);
         }
       },
+      // A harness that keeps running between prompts (Claude Code background work)
+      // produces replies of its own and frees the conversation when they finish.
+      onBackgroundResponse: () => {
+        this.flushCompletedResponses().catch((error) => {
+          log.warn(`Background response delivery deferred for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      },
+      onIdle: () => {
+        void this.scheduleConversation(conversationId);
+      },
     });
     statusAbortController.abort();
     await statusPromise.catch(() => undefined);

@@ -1,10 +1,14 @@
 /**
  * Claude Code runtime adapter for alasio turns.
  *
- * Mirrors `codex/runtime.js`: one Telegram prompt becomes one Claude Agent SDK
- * query over the mounted session, tool activity is projected into the same
- * persisted response blocks, and the SDK `result` is the only operator-visible
- * final answer.
+ * Each mounted session is served by one long-lived Claude Code process fed
+ * through streaming input (see live-sessions.js), the way the Codex adapter
+ * keeps app-server threads warm. A Telegram prompt is pushed into that
+ * process and its turn ends on the result that names it; tool activity is
+ * projected into the same persisted response blocks, and the SDK `result` is
+ * the only operator-visible final answer. Background work Claude Code starts
+ * keeps running between prompts, and the turns it starts on its own when that
+ * work settles are delivered as their own replies.
  */
 import { randomUUID } from "node:crypto";
 import { CLAUDE_HARNESS } from "../names.js";
@@ -96,284 +100,45 @@ export function buildClaudeQueryOptions({
   return options;
 }
 
-/** How long a turn keeps its input open for a steered prompt the CLI has not answered. */
-const UNANSWERED_PROMPT_GRACE_MS = 15_000;
-/**
- * How long the CLI may keep streaming after the operator's prompts are all
- * answered. Claude Code does not exit while background shells it started are
- * still running, and the prompt worker cannot start the next queued prompt
- * until this turn returns, so the query is closed once this elapses.
- */
-export const POST_RESULT_DRAIN_MS = 10_000;
+/** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
+export const UNANSWERED_PROMPT_GRACE_MS = 15_000;
 
+export function isOperatorInterrupt(reason) {
+  return isIntentionalTurnInterrupt(reason);
+}
+
+export {
+  appendBlock,
+  buildClaudeEnv,
+  buildDbGuardrailFallbackText,
+  buildDbGuardrailSyntheticText,
+  cacheReadTokensFromUsage,
+  claudeMcpServers,
+  createCommandEventPolicy,
+  createTurnTimer,
+  ensureBaymaReady,
+  getErrorMessage,
+  isBlockedDbCommand,
+  isVisibleCodexItem,
+  mapItemToBlocks,
+  projectAssistantMessageToItems,
+  projectResultMessage,
+  promptUuidsAnsweredBy,
+  buildClaudeUserMessage,
+  createPromptChannel,
+  instrumentPromptChannel,
+  query as defaultQueryFactory,
+};
+
+/**
+ * Run one operator prompt on the conversation's live Claude Code process,
+ * starting or replacing that process when the mounted session, folder or
+ * model differs from the one it serves.
+ */
 export async function executeClaudeTurn(params) {
-  const {
-    prompt,
-    resumeSession,
-    threadKey,
-    chatId,
-    messageId,
-    workingDirectory,
-    persistence,
-    activeQueries,
-    onStarted,
-    sessions,
-  } = params;
-  const queryFactory = params.queryFactory ?? query;
-  const turnTimer = createTurnTimer({ threadKey, resumeSession, prompt, log });
-  log.info(`Querying Claude Code (resume=${resumeSession})`);
-  turnTimer("query.start");
-  onStarted?.();
-  const blockSequence = [];
-  let sessionId = resumeSession ?? null;
-  let interrupted = false;
-  let responseCompleted = false;
-  const pendingResponseId = persistence.createPendingResponse(chatId, messageId, resumeSession);
-  persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
-  const controller = new AbortController();
-  const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
-  // The operator prompt is queued before any await so early steering cannot precede it.
-  const promptUuids = new Set();
-  let unansweredPromptTimer = null;
-  let postResultDrainTimer = null;
-  let closedAfterResult = false;
-  const postResultDrainMs = params.postResultDrainMs ?? POST_RESULT_DRAIN_MS;
-  const scheduleUnansweredPromptEnd = () => {
-    clearTimeout(unansweredPromptTimer);
-    unansweredPromptTimer = setTimeout(() => {
-      log.info(
-        `unanswered prompt grace elapsed thread=${threadKey} pending=${promptUuids.size}`,
-      );
-      channel.end();
-    }, UNANSWERED_PROMPT_GRACE_MS);
-    unansweredPromptTimer.unref?.();
-  };
-  const pushPrompt = (text) => {
-    const uuid = randomUUID();
-    promptUuids.add(uuid);
-    return channel.push(buildClaudeUserMessage(text, uuid));
-  };
-  pushPrompt(prompt);
-  let resolveFinished;
-  const finished = new Promise((resolve) => {
-    resolveFinished = resolve;
-  });
-  const activeQuery = {
-    abort: async (reason) => {
-      controller.abort(reason);
-      channel.end();
-      await finished;
-    },
-    steer: async (steerPrompt) => {
-      if (channel.ended) {
-        return false;
-      }
-      return pushPrompt(steerPrompt);
-    },
-  };
-  activeQueries.set(threadKey, activeQuery);
-  const commandPolicy = createCommandEventPolicy({
-    persistence,
-    threadKey,
-    chatId,
-    messageId,
-    controller: { abort: () => undefined },
-    log,
-  });
-  let blockedGuardrailCommand = null;
-  const bashHook = async (input) => {
-    if (input?.hook_event_name !== "PreToolUse") {
-      return {};
-    }
-    const command = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
-    if (!command) {
-      return {};
-    }
-    // Timestamped so a cancelled tool call can be lined up against the
-    // transcript and the prompt-channel log.
-    log.info(`bash-hook seen thread=${threadKey} at=${new Date().toISOString()} command=${JSON.stringify(command.slice(0, 120))}`);
-    if (isBlockedDbCommand(command)) {
-      blockedGuardrailCommand = blockedGuardrailCommand ?? command;
-      log.warn("DB guardrail denied a Claude Code Bash command");
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "deny",
-          permissionDecisionReason: buildDbGuardrailSyntheticText(command),
-        },
-      };
-    }
-    commandPolicy.inspectCommand({ command, sessionId });
-    return {};
-  };
-  let activeSdkQuery = null;
-  try {
-    const claudeEnv = buildClaudeEnv();
-    turnTimer("env.built");
-    await ensureBaymaReady(claudeEnv);
-    turnTimer("bayma.ready");
-    const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
-    const options = buildClaudeQueryOptions({
-      workingDirectory,
-      modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
-      claudeEnv,
-      mcpServers: claudeMcpServers({ threadKey, env: claudeEnv }),
-      resumeSession,
-      resumeExists,
-      controller,
-      hooks: {
-        PreToolUse: [{ matcher: "Bash", hooks: [bashHook] }],
-      },
-    });
-    activeSdkQuery = queryFactory({ prompt: channel.iterable, options });
-    turnTimer("query.created", { mode: resumeSession ? (resumeExists ? "resume" : "reserved") : "start" });
-    let firstEventLogged = false;
-    let firstVisibleItemLogged = false;
-    for await (const message of activeSdkQuery) {
-      if (!firstEventLogged) {
-        firstEventLogged = true;
-        turnTimer("first_event", { event_type: `${message.type}${message.subtype ? `.${message.subtype}` : ""}` });
-      }
-      onStarted?.();
-      if (message.type === "system" && message.subtype === "init") {
-        sessionId = message.session_id ?? sessionId;
-        if (sessionId) {
-          persistence.updatePendingSessionId(pendingResponseId, sessionId);
-          persistence.updateActiveTurnSessionId(threadKey, sessionId);
-        }
-        params.onTransportStarted?.({ sessionId, turnId: null });
-        continue;
-      }
-      if (message.type === "assistant") {
-        for (const item of projectAssistantMessageToItems(message)) {
-          if (!firstVisibleItemLogged && isVisibleCodexItem(item)) {
-            firstVisibleItemLogged = true;
-            turnTimer("first_visible_item", { item_type: item.type });
-          }
-          mapItemToBlocks(item, { blockSequence, persistence, pendingResponseId });
-        }
-        continue;
-      }
-      if (message.type === "result") {
-        const answered = promptUuidsAnsweredBy(message, promptUuids);
-        if (answered.length === 0) {
-          // A resumed session re-runs an interrupted turn before ours; its
-          // result is not the end of this turn, and closing the channel here
-          // would cancel our first tool call.
-          log.info(
-            `result for another turn ignored thread=${threadKey} uuid=${message.user_message_uuid ?? "none"} resume_reason=${message.resume_reason ?? "none"}`,
-          );
-          continue;
-        }
-        const projected = projectResultMessage(message);
-        sessionId = message.session_id ?? sessionId;
-        if (projected?.ok) {
-          turnTimer("turn.completed");
-          if (projected.text?.trim()) {
-            appendBlock(blockSequence, persistence, pendingResponseId, {
-              type: "text",
-              content: projected.text,
-              phase: "final_answer",
-            });
-          }
-          persistence.markPendingResponseComplete(pendingResponseId);
-          responseCompleted = true;
-          params.onTransportCompleted?.({ sessionId, turnId: null });
-        } else {
-          turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
-          appendBlock(blockSequence, persistence, pendingResponseId, {
-            type: "text",
-            content: `Error: ${projected?.error ?? "Claude did not complete"}`,
-          });
-        }
-        const cacheRead = cacheReadTokensFromUsage(projected?.usage);
-        if (sessionId && cacheRead !== undefined) {
-          persistence.updateSessionUsage(sessionId, { cacheReadInputTokens: cacheRead });
-        }
-        for (const uuid of answered) {
-          promptUuids.delete(uuid);
-        }
-        if (promptUuids.size === 0) {
-          channel.end();
-          // The turn is over as far as new messages are concerned. Dropping it
-          // here rather than in `finally` closes the window where a message
-          // arriving during the drain is offered Steer/Swerve choices for a
-          // turn that has already produced its answer.
-          activeQueries.delete(threadKey);
-          if (!postResultDrainTimer) {
-            postResultDrainTimer = setTimeout(() => {
-              log.warn(
-                `closing Claude Code ${postResultDrainMs}ms after the final result thread=${threadKey}; it was still running (typically background shells), which would hold later prompts`,
-              );
-              closedAfterResult = true;
-              try {
-                activeSdkQuery?.close?.();
-              } catch {
-                // Already closed.
-              }
-            }, postResultDrainMs);
-            postResultDrainTimer.unref?.();
-          }
-        } else {
-          // A steered prompt is still unanswered; keep the input open for it,
-          // but bounded, because a channel the CLI never reads again would
-          // leave the turn waiting for input that is not coming.
-          scheduleUnansweredPromptEnd();
-        }
-        continue;
-      }
-      if (message.type === "auth_status" && message.error) {
-        turnTimer("event.error", { error: message.error });
-        appendBlock(blockSequence, persistence, pendingResponseId, {
-          type: "text",
-          content: `Error: ${message.error}`,
-        });
-      }
-    }
-  } catch (err) {
-    const reason = controller.signal.aborted ? controller.signal.reason : err;
-    const errMsg = getErrorMessage(reason);
-    if (closedAfterResult && responseCompleted) {
-      // Our own post-result close; the answer is already delivered.
-      log.info(`Claude Code stream ended after post-result close thread=${threadKey}: ${errMsg}`);
-    } else if (controller.signal.aborted && isIntentionalTurnInterrupt(reason)) {
-      interrupted = true;
-      blockSequence.length = 0;
-      turnTimer("query.interrupted", { reason: errMsg });
-      log.info(`Claude Code turn interrupted by operator control: ${errMsg}`);
-    } else {
-      turnTimer("query.error", { error: errMsg });
-      log.error(`Error querying Claude Code: ${errMsg}`);
-      appendBlock(blockSequence, persistence, pendingResponseId, {
-        type: "text",
-        content: `Error: ${errMsg}`,
-      });
-    }
-  } finally {
-    clearTimeout(unansweredPromptTimer);
-    clearTimeout(postResultDrainTimer);
-    channel.end();
-    try {
-      activeSdkQuery?.close?.();
-    } catch {
-      // The generator may already be closed.
-    }
-    activeQueries.delete(threadKey);
-    resolveFinished?.();
-    turnTimer("query.finished", { guardrail_blocked: Boolean(blockedGuardrailCommand) });
+  const liveSessions = params.liveSessions;
+  if (!liveSessions) {
+    throw new Error("executeClaudeTurn requires the adapter's live session registry");
   }
-  if (blockedGuardrailCommand && !responseCompleted && !interrupted) {
-    appendBlock(blockSequence, persistence, pendingResponseId, {
-      type: "text",
-      content: buildDbGuardrailFallbackText(blockedGuardrailCommand),
-    });
-  }
-  log.info(`turn.done completed=${responseCompleted} interrupted=${interrupted}`);
-  return {
-    blockSequence,
-    sessionId,
-    pendingResponseId,
-    interrupted,
-    responseCompleted,
-  };
+  return await liveSessions.runTurn(params);
 }

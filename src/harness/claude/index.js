@@ -1,15 +1,18 @@
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.js";
 import { getClaudeEffort, getClaudeModel } from "./model.js";
 import { listClaudeModels } from "./models.js";
+import { createClaudeLiveSessions } from "./live-sessions.js";
 import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.js";
 import { createClaudeSessionApi } from "./sessions.js";
 
 /**
  * Claude Code harness adapter. Sessions live in the Claude project transcript
- * store and every turn is a fresh Agent SDK query over the mounted session.
+ * store, and each mounted session is served by one long-lived Claude Code
+ * process that every turn is pushed into.
  */
-export function createClaudeHarness({ workingDirectory, sessionApi = null }) {
+export function createClaudeHarness({ workingDirectory, sessionApi = null, queryFactory = undefined }) {
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory, sessions, queryFactory });
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),
@@ -24,7 +27,7 @@ export function createClaudeHarness({ workingDirectory, sessionApi = null }) {
       return false;
     },
     async executeTurn(params) {
-      return await executeClaudeTurn({ ...params, workingDirectory, sessions });
+      return await executeClaudeTurn({ ...params, workingDirectory, sessions, liveSessions });
     },
     async listModels() {
       return await listClaudeModels({ workingDirectory });
@@ -33,8 +36,12 @@ export function createClaudeHarness({ workingDirectory, sessionApi = null }) {
     defaultModelChoice() {
       return { model: getClaudeModel(), effort: getClaudeEffort() };
     },
+    /** Live processes are replaced on demand; this ends one when its conversation is unmounted. */
+    closeLiveSession(threadKey, reason) {
+      liveSessions.close(threadKey, reason);
+    },
     shutdown() {
-      // Claude Code processes are per-turn; interrupted turns are aborted through activeQueries.
+      return liveSessions.closeAll("shutdown");
     },
   };
 }
