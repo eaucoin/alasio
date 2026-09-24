@@ -98,6 +98,13 @@ export function buildClaudeQueryOptions({
 
 /** How long a turn keeps its input open for a steered prompt the CLI has not answered. */
 const UNANSWERED_PROMPT_GRACE_MS = 15_000;
+/**
+ * How long the CLI may keep streaming after the operator's prompts are all
+ * answered. Claude Code does not exit while background shells it started are
+ * still running, and the prompt worker cannot start the next queued prompt
+ * until this turn returns, so the query is closed once this elapses.
+ */
+export const POST_RESULT_DRAIN_MS = 10_000;
 
 export async function executeClaudeTurn(params) {
   const {
@@ -128,6 +135,9 @@ export async function executeClaudeTurn(params) {
   // The operator prompt is queued before any await so early steering cannot precede it.
   const promptUuids = new Set();
   let unansweredPromptTimer = null;
+  let postResultDrainTimer = null;
+  let closedAfterResult = false;
+  const postResultDrainMs = params.postResultDrainMs ?? POST_RESULT_DRAIN_MS;
   const scheduleUnansweredPromptEnd = () => {
     clearTimeout(unansweredPromptTimer);
     unansweredPromptTimer = setTimeout(() => {
@@ -290,6 +300,20 @@ export async function executeClaudeTurn(params) {
           // arriving during the drain is offered Steer/Swerve choices for a
           // turn that has already produced its answer.
           activeQueries.delete(threadKey);
+          if (!postResultDrainTimer) {
+            postResultDrainTimer = setTimeout(() => {
+              log.warn(
+                `closing Claude Code ${postResultDrainMs}ms after the final result thread=${threadKey}; it was still running (typically background shells), which would hold later prompts`,
+              );
+              closedAfterResult = true;
+              try {
+                activeSdkQuery?.close?.();
+              } catch {
+                // Already closed.
+              }
+            }, postResultDrainMs);
+            postResultDrainTimer.unref?.();
+          }
         } else {
           // A steered prompt is still unanswered; keep the input open for it,
           // but bounded, because a channel the CLI never reads again would
@@ -309,7 +333,10 @@ export async function executeClaudeTurn(params) {
   } catch (err) {
     const reason = controller.signal.aborted ? controller.signal.reason : err;
     const errMsg = getErrorMessage(reason);
-    if (controller.signal.aborted && isIntentionalTurnInterrupt(reason)) {
+    if (closedAfterResult && responseCompleted) {
+      // Our own post-result close; the answer is already delivered.
+      log.info(`Claude Code stream ended after post-result close thread=${threadKey}: ${errMsg}`);
+    } else if (controller.signal.aborted && isIntentionalTurnInterrupt(reason)) {
       interrupted = true;
       blockSequence.length = 0;
       turnTimer("query.interrupted", { reason: errMsg });
@@ -324,6 +351,7 @@ export async function executeClaudeTurn(params) {
     }
   } finally {
     clearTimeout(unansweredPromptTimer);
+    clearTimeout(postResultDrainTimer);
     channel.end();
     try {
       activeSdkQuery?.close?.();

@@ -515,3 +515,48 @@ test("Claude session api maps SDK transcripts to alasio session and rewind shape
   assert.equal(await api.sessionExists("new"), true);
   assert.equal(await api.sessionExists("old"), false);
 });
+
+test("a CLI that keeps running after the final result is closed so later prompts are not held", async () => {
+  const persistence = createPersistence();
+  const activeQueries = new Map();
+  let closed = 0;
+  let release;
+  const queryFactory = ({ prompt }) => {
+    const generator = (async function* run() {
+      const iterator = prompt[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      yield { type: "system", subtype: "init", session_id: "s-1", model: "m" };
+      yield { type: "result", subtype: "success", is_error: false, result: "Answered.", session_id: "s-1", user_message_uuids: [first.value.uuid] };
+      // Background shells keep the CLI alive: nothing more arrives until close().
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      throw new Error("Claude Code process terminated");
+    })();
+    generator.close = () => {
+      closed += 1;
+      release?.();
+    };
+    return generator;
+  };
+  const started = Date.now();
+  const result = await executeClaudeTurn({
+    prompt: "go",
+    resumeSession: "s-1",
+    threadKey: "telegram:1",
+    chatId: "1",
+    messageId: "1",
+    workingDirectory: "/work",
+    persistence,
+    activeQueries,
+    sessions: quietSessions,
+    queryFactory,
+    postResultDrainMs: 20,
+  });
+  assert.ok(Date.now() - started < 2000);
+  assert.ok(closed >= 1);
+  assert.equal(result.responseCompleted, true);
+  assert.equal(result.interrupted, false);
+  assert.equal(finalResponseToMarkdown(result.blockSequence), "Answered.");
+  assert.equal(activeQueries.size, 0);
+});

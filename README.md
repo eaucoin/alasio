@@ -29,6 +29,7 @@ mindmap
       turn orchestrator coordinates execution and interruption boundaries and resolves the conversation's active harness per turn
       Claude Code turns are one Agent SDK query per Telegram prompt over the mounted session with streaming input so Steer pushes guidance into the live session
       Claude Code final replies are the SDK result text and intermediate assistant text stays internal commentary
+      once every operator prompt in a Claude Code turn is answered the query is closed after a short drain so background shells the CLI left running cannot hold later queued prompts
       Claude Code Bash commands pass through a PreToolUse hook that records restart provenance and denies forbidden database commands with the same guardrail guidance
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency
