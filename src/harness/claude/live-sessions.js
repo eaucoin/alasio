@@ -46,6 +46,10 @@ import {
   UNANSWERED_PROMPT_GRACE_MS,
 } from "./runtime.js";
 import { getClaudeEffort, getClaudeModel } from "./model.js";
+import { BAYMA_EXEC_TOOL } from "./runtime.js";
+import { extractShellCommands } from "../../policy/embedded-shell.js";
+import { looksLikeSelfRestartCommand } from "../../policy/restart-command.js";
+import { detectWorkflowWait } from "../../policy/workflow-wait.js";
 import { createLogger } from "../../shared/log.js";
 
 const log = createLogger("claude-live");
@@ -395,16 +399,20 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, queryFact
       onBackgroundResponse: () => undefined,
       notifyIdle: () => undefined,
     };
-    const bashHook = async (input) => {
+    // Bash is disabled, so shell work arrives as code sent to bayma exec; restart
+    // provenance and the database guardrail inspect the commands embedded in it.
+    const execHook = async (input) => {
       if (input?.hook_event_name !== "PreToolUse") {
         return {};
       }
-      const command = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
-      if (!command) {
+      const code = typeof input.tool_input?.code === "string" ? input.tool_input.code : "";
+      const commands = extractShellCommands(code);
+      if (commands.length === 0) {
         return {};
       }
-      log.info(`bash-hook seen thread=${threadKey} at=${new Date().toISOString()} command=${JSON.stringify(command.slice(0, 120))}`);
-      if (isBlockedDbCommand(command)) {
+      log.info(`exec-hook seen thread=${threadKey} at=${new Date().toISOString()} code=${JSON.stringify(code.slice(0, 120))}`);
+      const command = commands.find((candidate) => isBlockedDbCommand(candidate));
+      if (command) {
         if (host.current) {
           host.current.blockedGuardrailCommand = host.current.blockedGuardrailCommand ?? command;
         }
@@ -425,7 +433,11 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, queryFact
         controller: { abort: () => undefined },
         log,
       });
-      policy.inspectCommand({ command, sessionId: host.sessionId });
+      // One call records at most one restart event, so inspect the most telling command.
+      const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
+        ?? commands.find((candidate) => detectWorkflowWait(candidate))
+        ?? commands[0];
+      policy.inspectCommand({ command: primary, sessionId: host.sessionId });
       return {};
     };
     const options = buildClaudeQueryOptions({
@@ -437,7 +449,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, queryFact
       resumeExists,
       controller,
       hooks: {
-        PreToolUse: [{ matcher: "Bash", hooks: [bashHook] }],
+        PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },
     });
     host.sdkQuery = queryFactory({ prompt: channel.iterable, options });

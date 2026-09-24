@@ -55,6 +55,16 @@ export function startFreshClaudeSession({ threadKey }) {
   return sessionId;
 }
 
+/**
+ * Built-in tools removed from the model's context entirely. Shell and file
+ * search go through bayma, which alasio always mounts: its sessions persist,
+ * and a Bun shell there does everything these did.
+ */
+export const CLAUDE_DISALLOWED_TOOLS = Object.freeze(["Bash", "Monitor", "Grep", "Glob"]);
+
+/** The bayma tool that runs code (and so shell commands) in a session. */
+export const BAYMA_EXEC_TOOL = "mcp__bayma__exec";
+
 export function buildClaudeQueryOptions({
   workingDirectory,
   claudeEnv,
@@ -75,6 +85,7 @@ export function buildClaudeQueryOptions({
     systemPrompt: { type: "preset", preset: "claude_code" },
     includePartialMessages: false,
     persistSession: true,
+    disallowedTools: [...CLAUDE_DISALLOWED_TOOLS],
     hooks,
     mcpServers,
   };

@@ -440,28 +440,31 @@ test("Claude turn surfaces failures and non-operator aborts as errors", async ()
   assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: max turns" }]);
 });
 
-test("Bash PreToolUse hook denies forbidden database commands with guardrail guidance", async () => {
+test("Bash, Monitor, Grep and Glob are removed and bayma exec code passes the database guardrail", async () => {
   const persistence = createPersistence();
-  let hookResult;
+  let denied;
+  let allowed;
+  let disallowed;
   const queryFactory = ({ prompt, options }) => {
+    disallowed = options.disallowedTools;
     const generator = (async function* run() {
       const first = await prompt[Symbol.asyncIterator]().next();
       yield { type: "system", subtype: "init", session_id: "s-4" };
       const [matcher] = options.hooks.PreToolUse;
-      assert.equal(matcher.matcher, "Bash");
-      hookResult = await matcher.hooks[0]({
+      assert.equal(options.hooks.PreToolUse.length, 1);
+      assert.equal(matcher.matcher, "mcp__bayma__exec");
+      denied = await matcher.hooks[0]({
         hook_event_name: "PreToolUse",
-        tool_name: "Bash",
-        tool_input: { command: "psql -c 'drop table users'" },
+        tool_name: "mcp__bayma__exec",
+        tool_input: { session_id: "b1", code: 'import { $ } from "bun";\nawait $`psql -c "drop table users"`' },
         tool_use_id: "t1",
       });
-      const allowed = await matcher.hooks[0]({
+      allowed = await matcher.hooks[0]({
         hook_event_name: "PreToolUse",
-        tool_name: "Bash",
-        tool_input: { command: "ls" },
+        tool_name: "mcp__bayma__exec",
+        tool_input: { session_id: "b1", code: "await $`ls -la`" },
         tool_use_id: "t2",
       });
-      assert.deepEqual(allowed, {});
       yield { type: "result", subtype: "success", is_error: false, result: "Skipped the drop.", session_id: "s-4", user_message_uuids: [first.value.uuid] };
     })();
     generator.close = () => undefined;
@@ -479,10 +482,47 @@ test("Bash PreToolUse hook denies forbidden database commands with guardrail gui
     sessions: quietSessions,
     queryFactory,
   });
-  assert.equal(hookResult.hookSpecificOutput.permissionDecision, "deny");
-  assert.match(hookResult.hookSpecificOutput.permissionDecisionReason, /.+/);
+  assert.deepEqual(disallowed, ["Bash", "Monitor", "Grep", "Glob"]);
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(denied.hookSpecificOutput.permissionDecisionReason, /.+/);
+  assert.deepEqual(allowed, {});
   assert.equal(result.responseCompleted, true);
   assert.equal(finalResponseToMarkdown(result.blockSequence), "Skipped the drop.");
+});
+
+test("a restart through a Bun shell in bayma exec records self-induced provenance once", async () => {
+  const persistence = createPersistence();
+  const restarts = [];
+  persistence.recordRestartEvent = (event) => restarts.push(event);
+  const queryFactory = ({ prompt, options }) => {
+    const generator = (async function* run() {
+      const first = await prompt[Symbol.asyncIterator]().next();
+      yield { type: "system", subtype: "init", session_id: "s-5" };
+      await options.hooks.PreToolUse[0].hooks[0]({
+        hook_event_name: "PreToolUse",
+        tool_name: "mcp__bayma__exec",
+        tool_input: { session_id: "b1", code: "await $`./restart-alasio-standalone.sh`" },
+        tool_use_id: "t1",
+      });
+      yield { type: "result", subtype: "success", is_error: false, result: "Restarting.", session_id: "s-5", user_message_uuids: [first.value.uuid] };
+    })();
+    generator.close = () => undefined;
+    return generator;
+  };
+  await runClaudeTurn({
+    prompt: "restart yourself",
+    resumeSession: null,
+    threadKey: "telegram:5",
+    chatId: "5",
+    messageId: "5",
+    workingDirectory: "/work",
+    persistence,
+    activeQueries: new Map(),
+    sessions: quietSessions,
+    queryFactory,
+  });
+  assert.equal(restarts.length, 1);
+  assert.equal(restarts[0].cause, "self_induced");
 });
 
 test("Claude session api maps SDK transcripts to alasio session and rewind shapes", async () => {

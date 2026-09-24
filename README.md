@@ -31,7 +31,8 @@ mindmap
       Claude Code final replies are the SDK result text and intermediate assistant text stays internal commentary
       background shells and agents Claude Code starts keep running after its answer and the turn it starts on its own when they settle holds the conversation busy accepts Steer and is delivered as its own durable reply
       the live Claude Code process is replaced when the mounted session or model changes and closed at shutdown while /stop interrupts only the current turn
-      Claude Code Bash commands pass through a PreToolUse hook that records restart provenance and denies forbidden database commands with the same guardrail guidance
+      Claude Code runs without the built-in Bash Monitor Grep and Glob tools which are removed from the model's context so shell work and file search go through bayma
+      code sent to bayma exec passes a PreToolUse hook that recovers embedded shell commands from Bun shell templates spawn and exec calls and bare command lines then records restart provenance and denies forbidden database commands with the same guardrail guidance
       Codex app-server boundary keeps linked Codex threads warm across Telegram turns
       linked-session warmup is opt-in so service startup and polling are not blocked by Codex resume latency
       Codex SDK exec transport remains an explicit rollback path for runtime isolation

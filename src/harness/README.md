@@ -21,7 +21,7 @@ mindmap
       claude/event-projection maps assistant tool_use blocks onto Codex-shaped items and the SDK result onto the final_answer phase
       claude/sessions reads the SDK project transcript store scoped to the working directory and forks with upToMessageId before the chosen user message
       fresh Claude sessions are reserved ids passed as sessionId on the first query and resumed with resume afterwards
-      Bash PreToolUse hooks reuse command-event-policy for restart provenance and deny forbidden database commands with guardrail guidance
+      Bash Monitor Grep and Glob are disallowed so bayma exec is Claude's only shell and a PreToolUse hook on it reuses command-event-policy on the shell commands policy/embedded-shell recovers from the code
 ```
 
 ## Preference Atlas
