@@ -35,6 +35,8 @@ test("bayma runs from its pinned image, after any bayma still stopping on its st
     ["--cap-add", "CHECKPOINT_RESTORE"],
     ["--cap-add", "SYS_PTRACE"],
     ["--security-opt", "seccomp=unconfined"],
+    ["--security-opt", "apparmor=unconfined"],
+    ["--volume", "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket"],
     ["--volume", "/home:/home"],
     ["--volume", "/tmp:/tmp"],
     ["--volume", "/var/run/docker.sock:/var/run/docker.sock"],

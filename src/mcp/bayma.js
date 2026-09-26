@@ -6,7 +6,8 @@
  * own through the host's Docker. Its container keeps what alasio's keeps (see
  * container/run.sh), so its REPL sessions can do what alasio's agents can: the
  * same user, /home and /tmp at the same paths, the host's network, Docker,
- * Tailscale, Stripe, and Google Cloud, and the environment it is given. It
+ * Tailscale, Stripe, Google Cloud, and systemd, and the environment it is
+ * given. It
  * keeps its own processes, though, which is what lets bayma snapshot idle
  * REPL sessions as it stops and restore them whole in the next container.
  * Each harness adapter turns `baymaLaunch` into its own MCP config shape.
@@ -52,6 +53,12 @@ const HOST_MOUNTS = [
   "/usr/bin/tailscale:/usr/bin/tailscale:ro",
   "/usr/bin/stripe:/usr/bin/stripe:ro",
   "/usr/lib/google-cloud-sdk:/usr/lib/google-cloud-sdk:ro",
+  // The host's systemd, which restart-alasio-standalone.sh restarts alasio
+  // through, and the host's systemctl to reach it with.
+  "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket",
+  "/run/systemd:/run/systemd:ro",
+  "/usr/bin/systemctl:/usr/bin/systemctl:ro",
+  "/usr/lib/x86_64-linux-gnu/systemd:/usr/lib/x86_64-linux-gnu/systemd:ro",
 ];
 
 // What bayma's container needs of its own: the image's PATH, which finds
@@ -102,6 +109,10 @@ function stdioCommand(stateDir, env) {
       "SYS_PTRACE",
       "--security-opt",
       "seccomp=unconfined",
+      // As alasio's own container: Docker's AppArmor profile keeps a container
+      // off the host's D-Bus, and so from its systemd.
+      "--security-opt",
+      "apparmor=unconfined",
       ...HOST_MOUNTS.flatMap((mount) => ["--volume", mount]),
       ...environment,
       BAYMA_IMAGE,
