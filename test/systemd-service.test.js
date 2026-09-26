@@ -62,6 +62,6 @@ test("standalone unit runs the bot in its container, stopped through the contain
   assert.match(service, /^Restart=always$/m);
   assert.match(run, /--rm --init --name "\$NAME"/);
   assert.match(run, /--network host --pid host --ipc host/);
-  assert.match(run, /--volume "\$HOME:\$HOME"/);
+  assert.match(run, /--volume \/home:\/home /);
   assert.match(run, /--volume \/run\/dbus\/system_bus_socket:\/run\/dbus\/system_bus_socket/);
 });

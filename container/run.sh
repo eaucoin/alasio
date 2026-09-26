@@ -2,7 +2,7 @@
 # alasio-standalone.service's ExecStart: runs the bot in the alasio-standalone
 # image with what it has on the host itself, so moving it into a container
 # changes nothing it or its agents can do:
-#   - the same user, home directory (at the same path), and /tmp, so files,
+#   - the same user, /home (at the same path), and /tmp, so files,
 #     tools, tmux sockets, and state are the host's
 #   - the host's network, processes, and IPC, so ports, localhost services,
 #     and process signals are as before
@@ -30,7 +30,7 @@ exec /usr/bin/docker run --rm --init --name "$NAME" \
   --volume /etc/passwd:/etc/passwd:ro \
   --volume /etc/group:/etc/group:ro \
   --volume /etc/localtime:/etc/localtime:ro \
-  --volume "$HOME:$HOME" \
+  --volume /home:/home \
   --volume /tmp:/tmp \
   --volume /var/run/docker.sock:/var/run/docker.sock \
   --volume /usr/bin/docker:/usr/bin/docker:ro \
