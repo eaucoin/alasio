@@ -7,6 +7,7 @@ mindmap
       it is a pinned npm dependency run by alasio's own Node from the package's bin with runtimes from the payload its postinstall installs
       baymaLaunch is the harness-neutral command and each harness adapter turns it into its own MCP config shape
       each harness and conversation gets its own state directory under the alasio state directory because bayma leases a directory to one server process
+      sessions are checkpointed rather than bayma's default ephemeral which deletes them when the server stops so they outlive a alasio restart as suspended sessions
       ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools
     Operator servers
       each harness also loads the MCP servers the operator configured for it on this machine just as it would in a terminal
@@ -35,6 +36,8 @@ stateDiagram-v2
   PathLookup --> VersionDrift
   MCPSetup --> SharedState: conversations share one bayma state directory
   SharedState --> LeaseConflict
+  MCPSetup --> EphemeralSessions: bayma launched with its default durability
+  EphemeralSessions --> SessionsLostOnRestart
   MCPSetup --> PinnedBayma
   PinnedBayma --> ReadyCheck
   ReadyCheck --> ExplicitFailure: bayma does not start or lists no tools

@@ -65,6 +65,7 @@ mindmap
       external restarts degrade to explicit unknown provenance instead of falsely attributing them to the user
       tool-pattern guardrails re-enter Codex as internal synthetic user turns instead of fabricating user-visible transport replies
       a once-per-process bayma readiness check and per-harness per-conversation bayma state directories prevent silent no-tool sessions and state-lease contention
+      bayma sessions are checkpointed so they outlive a alasio restart as suspended sessions that resume with their history and what their code checkpointed
       optional startup warmup resumes linked sessions through app-server without creating a new conversation or pruning rollout files
       Telegram New Session creates and mounts a fresh Codex app-server thread instead of only clearing the SQLite session pointer
       Telegram goal objectives with no mounted session create and mount a fresh app-server thread before setting the active goal

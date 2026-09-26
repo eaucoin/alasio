@@ -34,10 +34,16 @@ function sanitizePathToken(value) {
   return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
 }
 
+/**
+ * Sessions are checkpointed rather than bayma's default, ephemeral, which
+ * deletes them when the server stops, so a alasio restart would take every
+ * session with it. A checkpointed session outlives the server as suspended,
+ * with its history, and resumes with what its code checkpointed.
+ */
 function stdioCommand(stateDir) {
   return {
     command: process.execPath,
-    args: [resolveBaymaBin(), "mcp-stdio", "--state-dir", stateDir],
+    args: [resolveBaymaBin(), "mcp-stdio", "--default-durability", "checkpointed", "--state-dir", stateDir],
   };
 }
 
@@ -47,8 +53,8 @@ function stdioCommand(stateDir) {
  * bayma leases its state directory to a single server process, and a Codex
  * thread keeps its server alive after the conversation switches to Claude, so
  * the directory is keyed by harness as well as conversation. It lives under
- * alasio's state directory and is stable across restarts, where the previous
- * process's sessions read back as closed history.
+ * alasio's state directory and is stable across restarts, so the next server
+ * finds the previous one's sessions there.
  */
 export function baymaLaunch({ harness, threadKey, env = process.env }) {
   return stdioCommand(join(
