@@ -14,7 +14,7 @@ mindmap
       sessions are owned by one harness so the Sessions New Session Rewind and resume controls only ever enumerate and mount the active harness's own session store
       switching parks the current harness session pointer and re-activates the other harness's parked pointer instead of translating sessions across harnesses
       Claude Code turns inherit the local `claude` login so the operator's Claude Code account is used without an API key
-      each harness sees the MCP servers the operator configured for it on this machine plus bayma which alasio pins as an npm dependency and launches with its own Node
+      each harness sees the MCP servers the operator configured for it on this machine plus bayma which alasio runs from its image pinned by digest as a container beside its own with the same access to the host
       `/goal` remains Codex-only because Claude Code has no thread goal primitive and the command says so while Claude Code is active
       `ALASIO_DEFAULT_HARNESS` is unset by default and optionally pre-mounts codex or claude on newly created conversations so they skip the picker
       `WORKING_DIRECTORY` is unset by default and optionally pre-mounts one folder on new conversations and on conversations that predate per-conversation folders so existing deployments keep working unchanged
@@ -65,7 +65,7 @@ mindmap
       external restarts degrade to explicit unknown provenance instead of falsely attributing them to the user
       tool-pattern guardrails re-enter Codex as internal synthetic user turns instead of fabricating user-visible transport replies
       a once-per-process bayma readiness check and per-harness per-conversation bayma state directories prevent silent no-tool sessions and state-lease contention
-      bayma sessions are checkpointed so they outlive a alasio restart as suspended sessions that resume with their history and what their code checkpointed
+      bayma sessions are checkpointed so they outlive a alasio restart restored whole from the process snapshot bayma takes as it stops or otherwise resumed with their history and what their code checkpointed
       optional startup warmup resumes linked sessions through app-server without creating a new conversation or pruning rollout files
       Telegram New Session creates and mounts a fresh Codex app-server thread instead of only clearing the SQLite session pointer
       Telegram goal objectives with no mounted session create and mount a fresh app-server thread before setting the active goal

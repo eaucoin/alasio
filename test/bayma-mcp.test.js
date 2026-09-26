@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,25 +9,48 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import { buildCodexThreadConfig } from "../src/codex/thread-config.js";
 import { claudeMcpServers } from "../src/harness/claude/mcp.js";
-import { baymaLaunch, ensureBaymaReady } from "../src/mcp/bayma.js";
+import { BAYMA_IMAGE, baymaLaunch, ensureBaymaReady } from "../src/mcp/bayma.js";
 
 const env = { ALASIO_STATE_DIR: "/state" };
 
-test("bayma launches from the pinned package with alasio's own Node", () => {
+test("bayma runs from its pinned image, after any bayma still stopping on its state directory", () => {
   const { command, args } = baymaLaunch({ harness: "claude", threadKey: "telegram:1", env });
-  assert.equal(command, process.execPath);
-  assert.match(args[0], /node_modules\/@bayma-repl\/bayma\/dist\/bayma\.js$/u);
-  assert.ok(existsSync(args[0]));
-  assert.deepEqual(args.slice(1), [
+  assert.equal(command, "/bin/sh");
+  assert.equal(args[0], "-c");
+  assert.match(args[1], /docker wait .*exec docker run --label "alasio\.bayma\.state-dir=\$0" "\$@"$/u);
+  assert.equal(args[2], "/state/bayma/claude/telegram-1");
+  const run = args.slice(3);
+  assert.match(BAYMA_IMAGE, /^ghcr\.io\/eaucoin\/bayma:[\d.]+@sha256:[0-9a-f]{64}$/u);
+  assert.deepEqual(run.slice(run.indexOf(BAYMA_IMAGE)), [
+    BAYMA_IMAGE,
     "mcp-stdio",
     "--default-durability",
     "checkpointed",
     "--state-dir",
     "/state/bayma/claude/telegram-1",
   ]);
+  for (const flag of [
+    ["--user", `${process.getuid()}:${process.getgid()}`],
+    ["--network", "host"],
+    ["--cap-add", "CHECKPOINT_RESTORE"],
+    ["--cap-add", "SYS_PTRACE"],
+    ["--security-opt", "seccomp=unconfined"],
+    ["--volume", "/home:/home"],
+    ["--volume", "/tmp:/tmp"],
+    ["--volume", "/var/run/docker.sock:/var/run/docker.sock"],
+  ]) {
+    assert.ok(
+      run.some((value, index) => value === flag[0] && run[index + 1] === flag[1]),
+      `${flag.join(" ")} is passed`,
+    );
+  }
+  // Its sessions keep alasio's environment, but not the image's own settings.
+  assert.ok(run.some((value, index) => value === "--env" && run[index + 1] === "ALASIO_STATE_DIR"));
+  const passed = baymaLaunch({ harness: "claude", threadKey: "telegram:1", env: { ...env, PATH: "/x", BAYMA_PAYLOAD_DIR: "/y" } }).args;
+  assert.ok(!passed.includes("PATH") && !passed.includes("BAYMA_PAYLOAD_DIR"));
 });
 
-test("a session outlives its bayma server and resumes with what it checkpointed", async () => {
+test("a session outlives its bayma server and comes back whole in the next one", async () => {
   const stateEnv = { ...process.env, ALASIO_STATE_DIR: await mkdtemp(join(tmpdir(), "alasio-bayma-durability-")) };
   let client;
   const connect = async () => {
@@ -56,7 +78,9 @@ test("a session outlives its bayma server and resumes with what it checkpointed"
       name: "exec",
       arguments: { session_id: sessionId, code: "JSON.stringify([$checkpoint.kept, typeof lost])" },
     });
-    assert.equal(resumed.structuredContent.result_text, JSON.stringify(JSON.stringify([42, "undefined"])));
+    // Its process was snapshotted as the server stopped, so even what it never
+    // checkpointed is still there.
+    assert.equal(resumed.structuredContent.result_text, JSON.stringify(JSON.stringify([42, "number"])));
   } finally {
     await client?.close();
     await rm(stateEnv.ALASIO_STATE_DIR, { recursive: true, force: true });
@@ -74,7 +98,7 @@ test("alasio adds bayma to Claude Code's servers", () => {
   const servers = claudeMcpServers({ threadKey: "telegram:1", env });
   assert.deepEqual(Object.keys(servers), ["bayma"]);
   assert.equal(servers.bayma.type, "stdio");
-  assert.equal(servers.bayma.command, process.execPath);
+  assert.equal(servers.bayma.command, "/bin/sh");
 });
 
 test("Codex threads add bayma and leave the operator's servers and apps connector on", () => {
@@ -88,6 +112,6 @@ test("Codex threads add bayma and leave the operator's servers and apps connecto
   assert.equal(config.features, undefined);
 });
 
-test("the installed bayma starts and serves its tools", async () => {
+test("bayma's image starts and serves its tools", async () => {
   await ensureBaymaReady(process.env);
 });

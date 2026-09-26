@@ -35,6 +35,11 @@ fi
 echo "Building the $IMAGE image the bot runs in..."
 docker build --pull --tag "$IMAGE" "$SCRIPT_DIR/container"
 
+# Pulled now, so no agent's first turn waits on it.
+BAYMA_IMAGE="$(cd "$SCRIPT_DIR" && node --input-type=module --eval 'import { BAYMA_IMAGE } from "./src/mcp/bayma.js"; console.log(BAYMA_IMAGE)')"
+echo "Pulling bayma's image, $BAYMA_IMAGE..."
+docker pull "$BAYMA_IMAGE"
+
 sudo install -m 0644 "$UNIT_SOURCE" "/etc/systemd/system/$UNIT_NAME"
 # Passwordless restart of this one unit so ./restart-alasio-standalone.sh works from inside the bot.
 sudo install -m 0644 "$POLKIT_SOURCE" "$POLKIT_TARGET"

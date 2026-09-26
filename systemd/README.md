@@ -11,7 +11,7 @@ mindmap
       OOMPolicy continue contains descendant memory failures instead of stopping the healthy Telegram bridge
       Restart always still recovers main-process exits so containment does not weaken service supervision
     Installation
-      install-alasio-service.sh installs the Alasio runtime from its committed npm lock which also installs bayma's runtime payload
+      install-alasio-service.sh installs the Alasio runtime from its committed npm lock
       install-alasio-service.sh installs enables and reloads the canonical unit
       restart-alasio-operator.sh remains the normal provenance-aware restart path
 ```

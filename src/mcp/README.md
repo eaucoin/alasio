@@ -4,10 +4,12 @@ mindmap
   root((mcp))
     bayma
       bayma is the MCP server alasio itself provides and serves Bun Python C# and Rust REPL sessions
-      it is a pinned npm dependency run by alasio's own Node from the package's bin with runtimes from the payload its postinstall installs
+      it runs from its image pinned by digest as a container beside alasio's own through the host's Docker with the same user paths network and host tools as alasio's container
+      its container keeps its own processes so bayma snapshots idle REPL sessions as it stops and restores them whole in the next container
+      a bayma starting on a state directory waits for the one still stopping on it to finish its snapshots
       baymaLaunch is the harness-neutral command and each harness adapter turns it into its own MCP config shape
       each harness and conversation gets its own state directory under the alasio state directory because bayma leases a directory to one server process
-      sessions are checkpointed rather than bayma's default ephemeral which deletes them when the server stops so they outlive a alasio restart as suspended sessions
+      sessions are checkpointed stated explicitly so they always outlive a alasio restart
       ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools
     Operator servers
       each harness also loads the MCP servers the operator configured for it on this machine just as it would in a terminal
@@ -32,11 +34,13 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> MCPSetup
-  MCPSetup --> PathLookup: bayma resolved from PATH or a global install
-  PathLookup --> VersionDrift
+  MCPSetup --> UnpinnedImage: bayma run from a tag without its digest or from anywhere but its image
+  UnpinnedImage --> VersionDrift
+  MCPSetup --> SharedPidNamespace: bayma's container sharing the host's processes
+  SharedPidNamespace --> SnapshotsCannotRestore
   MCPSetup --> SharedState: conversations share one bayma state directory
   SharedState --> LeaseConflict
-  MCPSetup --> EphemeralSessions: bayma launched with its default durability
+  MCPSetup --> EphemeralSessions: bayma launched with ephemeral durability
   EphemeralSessions --> SessionsLostOnRestart
   MCPSetup --> PinnedBayma
   PinnedBayma --> ReadyCheck
