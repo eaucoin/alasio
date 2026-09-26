@@ -1,7 +1,8 @@
 [Unit]
-Description=Alasio Telegram Bot (standalone checkout)
-After=network-online.target
+Description=Alasio Telegram Bot (standalone checkout, in a container)
+After=network-online.target docker.service
 Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
@@ -11,7 +12,11 @@ EnvironmentFile=/home/operator/alasio/.env
 Environment="PATH=/home/operator/.nvm/versions/node/v24.14.0/bin:/home/operator/.bun/bin:/home/operator/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin"
 Environment="ALASIO_SERVICE_UNIT=alasio-standalone.service"
 Environment="ALASIO_RESTART_WRAPPER=/home/operator/alasio/restart-alasio-standalone.sh"
-ExecStart=/home/operator/.nvm/versions/node/v24.14.0/bin/node ./src/index.js
+# A container left behind by a stop that did not finish would hold the name.
+ExecStartPre=-/usr/bin/docker rm --force alasio-standalone
+ExecStart=/home/operator/alasio/container/run.sh /home/operator/.nvm/versions/node/v24.14.0/bin/node ./src/index.js
+# SIGTERM reaches the bot through the container's init, as it did the bot itself.
+ExecStop=/usr/bin/docker stop --timeout 25 alasio-standalone
 OOMPolicy=continue
 Restart=always
 RestartSec=5

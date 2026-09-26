@@ -4,7 +4,9 @@
 # Mirrors restart-alasio-operator.sh for the standalone checkout: records an
 # operator_induced restart event for every active turn in this bot's own
 # SQLite state (ALASIO_STATE_DIR from ./.env), then restarts the unit through
-# the NOPASSWD sudoers rule that install-alasio-standalone-service.sh provisions.
+# the polkit rule that install-alasio-standalone-service.sh provisions. That
+# works from the host and from inside the bot's container, whose systemctl
+# reaches the host's systemd over the system D-Bus.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +19,7 @@ fi
 STATE_DIR="${ALASIO_STATE_DIR:-$HOME/.alasio}"
 DB_PATH="$STATE_DIR/alasio.sqlite"
 
-RESTART_COMMAND="sudo -n systemctl restart $UNIT_NAME"
+RESTART_COMMAND="systemctl restart $UNIT_NAME"
 RESTART_TIMESTAMP="$(date +%s)"
 
 (
@@ -66,11 +68,8 @@ console.log(`Recorded operator_induced restart events for ${recorded} active tur
 NODE
 )
 
-# The sudoers rule only covers the restart command itself, so probe with that
-# exact command (sudo -l) rather than `sudo -n true`, which it does not permit.
-if ! sudo -n -l /usr/bin/systemctl restart "$UNIT_NAME" >/dev/null 2>&1; then
-  echo "sudo needs a password; run ./install-alasio-standalone-service.sh once to provision the NOPASSWD restart rule." >&2
+# --no-ask-password: without the polkit rule, fail rather than prompt.
+if ! systemctl --no-ask-password restart "$UNIT_NAME"; then
+  echo "systemd refused the restart; run ./install-alasio-standalone-service.sh once to provision the polkit restart rule." >&2
   exit 1
 fi
-
-eval "$RESTART_COMMAND"
