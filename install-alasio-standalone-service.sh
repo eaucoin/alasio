@@ -40,6 +40,11 @@ BAYMA_IMAGE="$(cd "$SCRIPT_DIR" && node --input-type=module --eval 'import { BAY
 echo "Pulling bayma's image, $BAYMA_IMAGE..."
 docker pull "$BAYMA_IMAGE"
 
+# The Neon stack Claude Code's transcripts are kept in; alasio brings it up
+# itself on every start, so this only saves its first start the downloads.
+echo "Pulling the images of alasio's Neon stack..."
+(cd "$SCRIPT_DIR" && node --input-type=module --eval 'import "dotenv/config"; import { loadAlasioConfig } from "./src/config.js"; import { pullNeon } from "./src/neon/stack.js"; await pullNeon({ stateDir: loadAlasioConfig().stateDir });')
+
 sudo install -m 0644 "$UNIT_SOURCE" "/etc/systemd/system/$UNIT_NAME"
 # Passwordless restart of this one unit so ./restart-alasio-standalone.sh works from inside the bot.
 sudo install -m 0644 "$POLKIT_SOURCE" "$POLKIT_TARGET"

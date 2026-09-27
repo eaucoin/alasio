@@ -1,0 +1,334 @@
+# alasio's Neon: Neon's open-source storage engine on SeaweedFS, on this
+# machine. neon/control/setup.js renders compose.env and every service's
+# configuration under ${ALASIO_NEON_DIR} before this starts; src/neon/stack.js
+# runs both. Everything listens on the stack's private network; only the
+# compute is published, on 127.0.0.1. See neon/README.md.
+
+x-neon: &neon
+  image: neondatabase/neon:release-9129@sha256:166022a72bf9983eba96d061d794f4740edbd4c3301e66202c1180acce9a323c
+  user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+x-safekeeper: &safekeeper
+  <<: *neon
+  environment:
+    AWS_ACCESS_KEY_ID: ${NEON_S3_ACCESS_KEY}
+    AWS_SECRET_ACCESS_KEY: ${NEON_S3_SECRET_KEY}
+    REMOTE_STORAGE: ${NEON_SAFEKEEPER_REMOTE_STORAGE}
+  depends_on:
+    seaweedfs-init:
+      condition: service_completed_successfully
+    storage-broker:
+      condition: service_started
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
+    interval: 5s
+    timeout: 5s
+    retries: 12
+    start_period: 10s
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command:
+      - server
+      - -ip=seaweedfs
+      - -ip.bind=0.0.0.0
+      - -dir=/data
+      - -volume.max=0
+      - -master.volumeSizeLimitMB=1024
+      - -master.defaultReplication=000
+      - -master.telemetry=false
+      - -volume.minFreeSpace=5GiB
+      - -filer
+      - -s3
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -s3.allowDeleteBucketNotEmpty=false
+      - -s3.autoCreateBucket=false
+    volumes:
+      - ${ALASIO_NEON_DIR}/seaweedfs/data:/data
+      - ${ALASIO_NEON_DIR}/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Idempotent: a bucket collection on one volume, writes fsynced, the bucket,
+  # and versioning (Neon's time-travel recovery needs it).
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: "no"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        shell() { printf '%s\n' "$$1" | weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888; }
+        shell 'fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1 -fsync -apply'
+        shell 's3.bucket.list' | grep -qw neon || shell 's3.bucket.create -name neon'
+        shell 's3.bucket.versioning -name neon -enable'
+        shell 's3.bucket.versioning -name neon' | grep -qi enabled
+
+  # Idempotent: old versions of Neon's objects expire a week after they are
+  # replaced, as Neon's own point-in-time window does.
+  seaweedfs-lifecycle-init:
+    <<: *neon
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${NEON_S3_ADMIN_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${NEON_S3_ADMIN_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      HOME: /tmp
+    entrypoint:
+      - aws
+      - s3api
+      - --endpoint-url
+      - http://seaweedfs:8333
+      - put-bucket-lifecycle-configuration
+      - --bucket
+      - neon
+      - --lifecycle-configuration
+      - '{"Rules":[{"ID":"expire-noncurrent","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":7},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+
+  # SeaweedFS runs lifecycle rules only when asked: a pass every six hours.
+  seaweedfs-lifecycle:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_signal: SIGKILL
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while :; do
+          printf 's3.lifecycle.run-shard -shards 0-15 -s3 seaweedfs:8333 -runtime 10m\n' | weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888
+          sleep 21600
+        done
+    depends_on:
+      seaweedfs-lifecycle-init:
+        condition: service_completed_successfully
+
+  controller-db:
+    image: postgres:17-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_USER: storage_controller
+      POSTGRES_PASSWORD: ${CONTROLLER_DB_PASSWORD}
+      POSTGRES_DB: storage_controller
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${ALASIO_NEON_DIR}/controller-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "storage_controller", "-d", "storage_controller"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  storage-broker:
+    <<: *neon
+    command: ["storage_broker", "--listen-addr=0.0.0.0:50051"]
+
+  storage-controller:
+    <<: *neon
+    environment:
+      DATABASE_URL: postgresql://storage_controller:${CONTROLLER_DB_PASSWORD}@controller-db:5432/storage_controller
+      PAGESERVER_JWT_TOKEN: ${PAGESERVER_JWT_TOKEN}
+      SAFEKEEPER_JWT_TOKEN: ${SAFEKEEPER_JWT_TOKEN}
+      CONTROL_PLANE_JWT_TOKEN: ${CONTROL_PLANE_JWT_TOKEN}
+      PEER_JWT_TOKEN: ${PEER_JWT_TOKEN}
+    entrypoint: ["/bin/sh", "-c"]
+    # Strict mode: every secret set, three safekeepers per timeline.
+    command:
+      - >-
+        PUBLIC_KEY="$$(cat /keys/auth_public_key.pem)"
+        exec storage_controller
+        --listen 0.0.0.0:1234
+        --control-plane-url http://neon-control:8080
+        --timelines-onto-safekeepers
+        --timeline-safekeeper-count 3
+    volumes:
+      - ${ALASIO_NEON_DIR}/keys:/keys:ro
+    depends_on:
+      controller-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  safekeeper-1:
+    <<: *safekeeper
+    command: &safekeeper-command
+      - /bin/sh
+      - -c
+      - >-
+        exec safekeeper -D /data --id "$$SAFEKEEPER_ID"
+        --listen-pg 0.0.0.0:5454 --advertise-pg "safekeeper-$$SAFEKEEPER_ID:5454"
+        --listen-http 0.0.0.0:7676
+        --availability-zone "az-safekeeper-$$SAFEKEEPER_ID"
+        --broker-endpoint http://storage-broker:50051
+        --remote-storage "$$REMOTE_STORAGE"
+        --pg-auth-public-key-path /keys/auth_public_key.pem
+        --pg-tenant-only-auth-public-key-path /keys/auth_public_key.pem
+        --http-auth-public-key-path /keys/auth_public_key.pem
+        --auth-token-path /keys/safekeeper_peer_token
+    environment:
+      AWS_ACCESS_KEY_ID: ${NEON_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${NEON_S3_SECRET_KEY}
+      REMOTE_STORAGE: ${NEON_SAFEKEEPER_REMOTE_STORAGE}
+      SAFEKEEPER_ID: "1"
+    volumes:
+      - ${ALASIO_NEON_DIR}/safekeeper-1:/data
+      - ${ALASIO_NEON_DIR}/keys:/keys:ro
+
+  safekeeper-2:
+    <<: *safekeeper
+    command: *safekeeper-command
+    environment:
+      AWS_ACCESS_KEY_ID: ${NEON_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${NEON_S3_SECRET_KEY}
+      REMOTE_STORAGE: ${NEON_SAFEKEEPER_REMOTE_STORAGE}
+      SAFEKEEPER_ID: "2"
+    volumes:
+      - ${ALASIO_NEON_DIR}/safekeeper-2:/data
+      - ${ALASIO_NEON_DIR}/keys:/keys:ro
+
+  safekeeper-3:
+    <<: *safekeeper
+    command: *safekeeper-command
+    environment:
+      AWS_ACCESS_KEY_ID: ${NEON_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${NEON_S3_SECRET_KEY}
+      REMOTE_STORAGE: ${NEON_SAFEKEEPER_REMOTE_STORAGE}
+      SAFEKEEPER_ID: "3"
+    volumes:
+      - ${ALASIO_NEON_DIR}/safekeeper-3:/data
+      - ${ALASIO_NEON_DIR}/keys:/keys:ro
+
+  pageserver:
+    <<: *neon
+    command: ["pageserver", "-D", "/data/.neon"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${NEON_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${NEON_S3_SECRET_KEY}
+      # What it presents to the safekeepers it streams WAL from.
+      NEON_AUTH_TOKEN: ${SAFEKEEPER_JWT_TOKEN}
+    volumes:
+      - ${ALASIO_NEON_DIR}/pageserver:/data/.neon
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+      storage-broker:
+        condition: service_started
+      storage-controller:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/v1/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  neon-control:
+    image: node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    command: ["node", "/app/service.js"]
+    environment:
+      CONTROLLER_URL: http://storage-controller:1234
+    volumes:
+      - ${ALASIO_NEON_CONTROL_SOURCE}:/app:ro
+      - ${ALASIO_NEON_DIR}/secrets:/secrets:ro
+      - ${ALASIO_NEON_DIR}/keys:/keys:ro
+      - ${ALASIO_NEON_DIR}/control:/state
+    depends_on:
+      storage-controller:
+        condition: service_healthy
+      pageserver:
+        condition: service_healthy
+      safekeeper-1:
+        condition: service_healthy
+      safekeeper-2:
+        condition: service_healthy
+      safekeeper-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 5s
+      retries: 100
+
+  # A logical dump of alasio's database every day, the last fourteen kept:
+  # restorable into any Postgres, whatever becomes of the stack.
+  backup:
+    image: neondatabase/compute-node-v17:release-compute-9073@sha256:ed6a613231d7026b4df8b00563444b9f33745370a3b3f0a2183e723f460ba974
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_signal: SIGKILL
+    environment:
+      PGPASSWORD: ${ALASIO_DATABASE_PASSWORD}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        umask 077
+        while :; do
+          stamp=$$(date -u +%Y%m%dT%H%M%SZ)
+          if pg_dump --host=compute --port=55433 --username=alasio --dbname=alasio \
+               --format=custom --file="/backups/alasio-$$stamp.dump.partial"; then
+            mv "/backups/alasio-$$stamp.dump.partial" "/backups/alasio-$$stamp.dump"
+            ls -1t /backups/alasio-*.dump | tail -n +15 | xargs -r rm --
+          else
+            rm -f "/backups/alasio-$$stamp.dump.partial"
+          fi
+          sleep 86400
+        done
+    volumes:
+      - ${ALASIO_NEON_DIR}/backups:/backups
+    depends_on:
+      compute:
+        condition: service_healthy
+
+  compute:
+    image: neondatabase/compute-node-v17:release-compute-9073@sha256:ed6a613231d7026b4df8b00563444b9f33745370a3b3f0a2183e723f460ba974
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command:
+      - --pgdata
+      - /var/db/postgres/compute
+      - --connstr
+      - postgresql://cloud_admin@localhost:55433/postgres
+      - --pgbin
+      - /usr/local/bin/postgres
+      - --compute-id
+      - alasio
+      - --config
+      - /config/config.json
+    volumes:
+      - ${ALASIO_NEON_DIR}/control/compute:/config:ro
+    ports:
+      - "127.0.0.1:${ALASIO_NEON_COMPUTE_PORT}:55433"
+    depends_on:
+      neon-control:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s

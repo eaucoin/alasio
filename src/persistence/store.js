@@ -83,6 +83,10 @@ export class SqliteStore {
     return this.conversations.listConversationsWithSessions(harness);
   }
 
+  listHarnessSessionReferences(harness) {
+    return this.conversations.listHarnessSessionReferences(harness);
+  }
+
   getActiveHarness(threadKey) {
     return this.conversations.getActiveHarness(threadKey);
   }

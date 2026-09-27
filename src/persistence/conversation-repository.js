@@ -77,6 +77,29 @@ export class SqliteConversationRepository {
   }
 
   /**
+   * Every session of a harness alasio points at, with the folder it runs in:
+   * each conversation's mounted one, the ones parked per folder, and those of
+   * active turns. Distinct by session.
+   */
+  listHarnessSessionReferences(harness) {
+    const column = sessionColumn(harness);
+    return this.db.prepare(`
+      select session_id as sessionId, min(working_directory) as workingDirectory from (
+        select ${column} as session_id, working_directory from conversations
+        where ${column} is not null and ${column} <> '' and working_directory is not null
+        union
+        select session_id, working_directory from workspace_sessions
+        where harness = ? and session_id is not null and session_id <> ''
+        union
+        select turns.session_id, conversations.working_directory from turns
+        join conversations on conversations.id = turns.conversation_id
+        where turns.harness = ? and turns.session_id is not null and turns.session_id <> ''
+          and conversations.working_directory is not null
+      ) group by session_id
+    `).all(harness, harness);
+  }
+
+  /**
    * Folder the conversation's harness runs in, or null until one is chosen.
    */
   getWorkingDirectory(threadKey) {

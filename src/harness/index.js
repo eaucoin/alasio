@@ -52,7 +52,7 @@ const FACTORIES = {
  * (test doubles) stand in for every folder of their harness but still require
  * a mounted folder so gating behaves the same as production.
  */
-export function createHarnessRegistry({ config = {}, overrides = {} } = {}) {
+export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null } = {}) {
   const adapters = new Map();
   const getFor = (name, workingDirectory) => {
     if (!isHarnessName(name)) {
@@ -67,7 +67,7 @@ export function createHarnessRegistry({ config = {}, overrides = {} } = {}) {
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore });
       adapters.set(key, adapter);
     }
     return adapter;

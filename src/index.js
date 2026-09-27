@@ -1,13 +1,19 @@
 import "dotenv/config";
 import { loadAlasioConfig } from "./config.js";
+import { startNeon } from "./neon/stack.js";
 import { createLogger } from "./shared/log.js";
 import { TelegramCodexApp } from "./telegram/app.js";
 
 const log = createLogger("index");
 const config = loadAlasioConfig();
-const app = new TelegramCodexApp(config);
+let neon = null;
+let app = null;
 
 async function main() {
+  // Claude Code's transcripts are kept in alasio's Neon, which runs before
+  // anything is served.
+  neon = await startNeon({ stateDir: config.stateDir });
+  app = new TelegramCodexApp({ ...config, sessionStore: neon.store });
   await app.start();
   log.info("Telegram Alasio bot is running");
 }
@@ -15,7 +21,8 @@ async function main() {
 async function shutdown(signal) {
   log.info(`Received ${signal}, shutting down...`);
   try {
-    await app.stop();
+    await app?.stop();
+    await neon?.close();
   } catch (error) {
     log.error(`Error during shutdown: ${error}`);
   }

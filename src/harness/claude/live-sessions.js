@@ -63,7 +63,7 @@ function describeTasks(tasks) {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
-export function createClaudeLiveSessions({ workingDirectory, sessions, queryFactory = defaultQueryFactory } = {}) {
+export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, queryFactory = defaultQueryFactory } = {}) {
   const hosts = new Map();
 
   function closeHost(host, reason) {
@@ -325,6 +325,10 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, queryFact
           }
           continue;
         }
+        if (message.type === "system" && message.subtype === "mirror_error") {
+          // The store missed a batch; startup reconciliation fills it in.
+          log.warn(`transcript mirror dropped a batch thread=${host.threadKey}: ${message.error ?? JSON.stringify(message).slice(0, 300)}`);
+        }
         if (message.type === "system" && message.subtype === "background_tasks_changed") {
           host.backgroundTasks = Array.isArray(message.tasks) ? message.tasks : [];
           log.info(`background-tasks thread=${host.threadKey} live=${host.backgroundTasks.length}${host.backgroundTasks.length ? ` ${JSON.stringify(describeTasks(host.backgroundTasks))}` : ""}`);
@@ -448,6 +452,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, queryFact
       resumeSession,
       resumeExists,
       controller,
+      sessionStore,
       hooks: {
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },

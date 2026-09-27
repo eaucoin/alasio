@@ -10,7 +10,7 @@ mindmap
       filenames omit telegram prefixes because the directory supplies that context
     harness/
       owns harness names the adapter registry Codex and Claude Code adapters and the shared active-turn interrupt
-      claude/ owns the Claude Agent SDK runtime prompt channel event projection session discovery MCP conversion and model overrides
+      claude/ owns the Claude Agent SDK runtime prompt channel event projection session discovery MCP conversion model overrides and the session store that keeps its transcripts in Neon
       the registry resolves one adapter per conversation from the persisted active harness and folder and yields null while either is missing so ingress gates on the service then folder pickers instead of a default
       adapters are created lazily per harness and folder pair because Claude transcript stores and Codex thread cwds are folder scoped
       workspace owns the folder policy that keeps every Telegram-chosen folder under ALASIO_WORKSPACE_ROOT
@@ -34,6 +34,8 @@ mindmap
       owns shell command parsing restart command recognition forbidden database command detection and workflow wait detection
     mcp/
       owns bayma the MCP server alasio adds to each harness's own servers its image launch command per-conversation state directory and readiness check
+    neon/
+      owns bringing up alasio's Neon stack from neon/compose.yml before the app starts and the pool alasio keeps to its compute
     workflow/
       owns the localhost hook server that receives CI wait notifications
     shared/
@@ -41,6 +43,7 @@ mindmap
     Persistence
       state belongs under the configured alasio data directory rather than ad hoc JSON files
       SQLite schema is canonical DDL for the local content database
+      Claude Code transcripts are the one thing kept in Neon rather than SQLite because the Agent SDK's SessionStore is the interface they are mirrored through
       table-group repositories stay behind persistence/store.js
 ```
 

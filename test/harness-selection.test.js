@@ -205,6 +205,38 @@ test("switching folders parks both harness session pointers per folder", async (
   });
 });
 
+test("every session a harness is pointed at is listed with its folder, once", async () => {
+  await withStore((store) => {
+    const parked = store.upsertConversation({ chatId: "16", user: { id: 16 } });
+    store.setActiveHarness(parked, CLAUDE_HARNESS);
+    store.setWorkingDirectory(parked, "/work/a");
+    store.setSessionId(parked, "claude-a");
+    store.setWorkingDirectory(parked, "/work/b");
+    store.setSessionId(parked, "claude-b");
+
+    const live = store.upsertConversation({ chatId: "17", user: { id: 17 } });
+    store.setActiveHarness(live, CLAUDE_HARNESS);
+    store.setWorkingDirectory(live, "/work/c");
+    store.upsertActiveTurn({ conversationId: live, chatId: "17", messageId: "1", sessionId: null, prompt: "hi" });
+    store.updateActiveTurnSessionId(live, "claude-live");
+
+    const codex = store.upsertConversation({ chatId: "18", user: { id: 18 } });
+    store.setActiveHarness(codex, CODEX_HARNESS);
+    store.setWorkingDirectory(codex, "/work/d");
+    store.setSessionId(codex, "codex-d");
+
+    assert.deepEqual(
+      store.listHarnessSessionReferences(CLAUDE_HARNESS).sort((x, y) => x.sessionId.localeCompare(y.sessionId)),
+      [
+        { sessionId: "claude-a", workingDirectory: "/work/a" },
+        { sessionId: "claude-b", workingDirectory: "/work/b" },
+        { sessionId: "claude-live", workingDirectory: "/work/c" },
+      ],
+    );
+    assert.deepEqual(store.listHarnessSessionReferences(CODEX_HARNESS), [{ sessionId: "codex-d", workingDirectory: "/work/d" }]);
+  });
+});
+
 test("callback actions capture the active harness generation", async () => {
   await withStore((store) => {
     const conversationId = store.upsertConversation({ chatId: "2", user: { id: 2 } });

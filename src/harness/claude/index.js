@@ -7,12 +7,13 @@ import { createClaudeSessionApi } from "./sessions.js";
 
 /**
  * Claude Code harness adapter. Sessions live in the Claude project transcript
- * store, and each mounted session is served by one long-lived Claude Code
- * process that every turn is pushed into.
+ * store, mirrored to alasio's Neon through `sessionStore` when one is given,
+ * and each mounted session is served by one long-lived Claude Code process
+ * that every turn is pushed into.
  */
-export function createClaudeHarness({ workingDirectory, sessionApi = null, queryFactory = undefined }) {
-  const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory });
-  const liveSessions = createClaudeLiveSessions({ workingDirectory, sessions, queryFactory });
+export function createClaudeHarness({ workingDirectory, sessionStore = null, sessionApi = null, queryFactory = undefined }) {
+  const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory, store: sessionStore });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory, sessions, sessionStore, queryFactory });
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),

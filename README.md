@@ -20,6 +20,7 @@ mindmap
       `WORKING_DIRECTORY` is unset by default and optionally pre-mounts one folder on new conversations and on conversations that predate per-conversation folders so existing deployments keep working unchanged
       `ALASIO_WORKSPACE_ROOT` defaults to the operator home and bounds every folder the picker may list mount or create
       `ALASIO_STATE_DIR` and `ALASIO_HOOK_PORT` place the SQLite state and the localhost hook server so a second alasio instance never shares a database or port with the first and default to `$WORKING_DIRECTORY/.alasio` else `~/.alasio` and 8765
+      the Neon stack's data and secrets live under `$ALASIO_STATE_DIR/neon` and its compose project `alasio-neon` and compute port 55433 are one per machine
       `ALASIO_CLAUDE_MODEL` `ALASIO_CLAUDE_EFFORT` and `ALASIO_CLAUDE_BIN` are optional Claude Code overrides and default to the CLI's own configuration
     Telegram DM edge behavior
       ingress maps explicitly authorized private Bot API messages and callbacks to a single operator conversation
@@ -48,7 +49,7 @@ mindmap
       `.env.example` documents the standalone environment and `.env` stays mode 0600 and untracked because it holds the bot token
       the standalone bot restarts with `./restart-alasio-standalone.sh` from `/home/operator/alasio` which records operator_induced provenance in its own state directory before restarting `alasio-standalone.service`
       `alasio-standalone.service` runs the bot in the `alasio-standalone` container that `container/Dockerfile` builds and `container/run.sh` starts with the host's user, `/home` at the same path (including Homebrew in `/home/linuxbrew`), `/tmp`, network, processes, IPC, Docker, and the environment systemd gives the unit, so the container changes nothing the bot or its agents can do except that host root is out of reach
-      `install-alasio-standalone-service.sh` builds that image and installs `systemd/alasio-standalone.rules` as a polkit rule scoped to restarting that one unit so the bot can restart itself without a password, from inside its container through the host's system D-Bus
+      `install-alasio-standalone-service.sh` pulls bayma's image and the Neon stack's images builds that image and installs `systemd/alasio-standalone.rules` as a polkit rule scoped to restarting that one unit so the bot can restart itself without a password, from inside its container through the host's system D-Bus
       the standalone unit sets `ALASIO_SERVICE_UNIT` and `ALASIO_RESTART_WRAPPER` so post-restart prompts name the standalone unit and wrapper instead of the deployment checkout paths
       self-restart detection treats `restart-alasio-standalone.sh` and `systemctl restart alasio-standalone.service` as self-induced the same way as the deployment wrapper
       Normal restarts run from the deployment checkout with `./restart-alasio-operator.sh`
@@ -90,6 +91,10 @@ mindmap
       one outbox identity per terminal response makes live handoff and restart recovery converge on the same delivery
       observable action to reply consistency prevents fabricated completion signals
       Codex-native compaction remains the source of truth for long conversations
+      Claude Code transcripts are kept durably in alasio's own Neon a local docker compose project `alasio-neon` of Neon's storage engine on SeaweedFS S3 that alasio brings up before serving and that neon/README.md describes
+      every entry Claude Code writes is mirrored into Neon and a transcript lost from the operator's Claude home is written back from Neon before its session is listed or resumed
+      at startup alasio imports every Claude session it points at into Neon then adds only what the mirror missed
+      Neon's safekeepers seaweedfs versioning and a daily local pg_dump survive crashes and lost service directories on this machine's one disk
     Historical emphasis
       recent changes prioritized restart recovery, Codex-native compaction, and truthful status messaging
       service prompt/hook integration aims for deterministic operational handoffs

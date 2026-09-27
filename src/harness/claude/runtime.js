@@ -37,6 +37,7 @@ import {
   instrumentPromptChannel,
   promptUuidsAnsweredBy,
 } from "./prompt-channel.js";
+import { mirrorOnly } from "./session-store.js";
 
 const log = createLogger("claude-runtime");
 
@@ -75,6 +76,7 @@ export function buildClaudeQueryOptions({
   hooks,
   env = process.env,
   modelChoice = null,
+  sessionStore = null,
 }) {
   const options = {
     cwd: workingDirectory,
@@ -89,6 +91,13 @@ export function buildClaudeQueryOptions({
     hooks,
     mcpServers,
   };
+  // Every transcript write is mirrored to the store as it is written, not at
+  // the end of a turn, which can run for hours; a resume still runs from the
+  // local transcript in the real Claude home (see session-store.js).
+  if (sessionStore) {
+    options.sessionStore = mirrorOnly(sessionStore);
+    options.sessionStoreFlush = "eager";
+  }
   if (resumeSession) {
     if (resumeExists) {
       options.resume = resumeSession;

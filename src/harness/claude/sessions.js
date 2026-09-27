@@ -5,12 +5,18 @@ import {
   getSessionMessages,
   listSessions as listSdkSessions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { createLogger } from "../../shared/log.js";
 import { SESSIONS_PER_PAGE } from "../../shared/runtime-constants.js";
+import { ensureLocalTranscript } from "./transcripts.js";
+
+const log = createLogger("claude-sessions");
 
 /**
- * Claude Code session discovery over the SDK's canonical project transcript
- * store (`~/.claude/projects/<cwd-slug>/`). Sessions are scoped to the alasio
- * working directory so the Telegram operator only sees this workspace.
+ * Claude Code session discovery, scoped to the alasio working directory so the
+ * Telegram operator only sees this workspace. With a session store (alasio's
+ * Neon, see session-store.js) the SDK's helpers read the store, the durable
+ * copy; without one, or while it cannot be reached, the local transcripts
+ * under `~/.claude/projects/<cwd-slug>/`.
  */
 function truncateSessionText(text, maxChars = 40, suffix = "...") {
   const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
@@ -55,15 +61,32 @@ function dateLabel(epochMs) {
   return new Date(value).toISOString().slice(0, 10);
 }
 
-export function createClaudeSessionApi({ workingDirectory, sdk = { listSessions: listSdkSessions, getSessionMessages, forkSession, getSessionInfo } }) {
+export function createClaudeSessionApi({
+  workingDirectory,
+  store = null,
+  sdk = { listSessions: listSdkSessions, getSessionMessages, forkSession, getSessionInfo },
+}) {
+  const local = { dir: workingDirectory };
+
+  /** Runs an SDK helper against the store, or the local files without one. */
+  async function fromStore(what, call) {
+    if (!store) return call(local);
+    try {
+      return await call({ ...local, sessionStore: store });
+    } catch (error) {
+      log.warn(`${what} fell back to local transcripts: ${error instanceof Error ? error.message : String(error)}`);
+      return call(local);
+    }
+  }
+
   async function listAll() {
-    const sessions = await sdk.listSessions({ dir: workingDirectory });
+    const sessions = await fromStore("listing sessions", (options) => sdk.listSessions(options));
     return [...sessions].sort((a, b) => Number(b.lastModified ?? 0) - Number(a.lastModified ?? 0));
   }
 
   async function readMessages(sessionId) {
     try {
-      return await sdk.getSessionMessages(sessionId, { dir: workingDirectory });
+      return await fromStore("reading a session", (options) => sdk.getSessionMessages(sessionId, options));
     } catch {
       return [];
     }
@@ -141,10 +164,9 @@ export function createClaudeSessionApi({ workingDirectory, sdk = { listSessions:
         return randomUUID();
       }
       try {
-        const forked = await sdk.forkSession(sessionId, {
-          dir: workingDirectory,
-          upToMessageId: messages[targetIndex - 1].uuid,
-        });
+        const forked = await fromStore("forking a session", (options) =>
+          sdk.forkSession(sessionId, { ...options, upToMessageId: messages[targetIndex - 1].uuid }),
+        );
         return forked?.sessionId ?? null;
       } catch {
         return null;
@@ -155,8 +177,17 @@ export function createClaudeSessionApi({ workingDirectory, sdk = { listSessions:
       if (!sessionId) {
         return false;
       }
+      // A resume runs from the local transcript: write it back from the
+      // store first if it is gone.
+      if (store) {
+        try {
+          if (await ensureLocalTranscript(store, sessionId)) return true;
+        } catch (error) {
+          log.warn(`could not check the store for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       try {
-        return Boolean(await sdk.getSessionInfo(sessionId, { dir: workingDirectory }));
+        return Boolean(await sdk.getSessionInfo(sessionId, local));
       } catch {
         return false;
       }

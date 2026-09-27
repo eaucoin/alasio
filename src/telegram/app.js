@@ -1,5 +1,7 @@
 import { TurnController } from "../codex/turn-controller.js";
+import { adoptTranscripts } from "../harness/claude/transcripts.js";
 import { createHarnessRegistry } from "../harness/index.js";
+import { CLAUDE_HARNESS } from "../harness/names.js";
 import { SqliteStore } from "../persistence/store.js";
 import { Authorizer } from "./authorizer.js";
 import { CallbackHandler } from "./callback-handler.js";
@@ -29,7 +31,7 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
-    this.harnesses = config.harnesses ?? createHarnessRegistry({ config });
+    this.harnesses = config.harnesses ?? createHarnessRegistry({ config, sessionStore: config.sessionStore ?? null });
     this.turns = new TurnController({
       config: this.config,
       client: this.client,
@@ -86,6 +88,7 @@ export class TelegramCodexApp {
     await this.turns.flushCompletedResponses();
     this.outbox.start();
     await this.mediaGroups.flushDue();
+    await this.adoptClaudeTranscripts();
     await this.turns.recoverInterruptedTurns();
     this.turns.resumePendingPrompts();
     this.poller.start();
@@ -93,6 +96,20 @@ export class TelegramCodexApp {
     this.warmLinkedSessions().catch((error) => {
       log.warn(`Linked Codex session warmup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  }
+
+  /**
+   * Brings every Claude session alasio points at into the session store before
+   * any turn resumes one: imported whole the first time, then reconciled.
+   */
+  async adoptClaudeTranscripts() {
+    const sessionStore = this.config.sessionStore;
+    if (!sessionStore) {
+      return;
+    }
+    const sessions = this.store.listHarnessSessionReferences(CLAUDE_HARNESS);
+    log.info(`  Session store: adopting ${sessions.length} Claude session(s)`);
+    await adoptTranscripts({ store: sessionStore, sessions });
   }
 
   async stop() {

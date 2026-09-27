@@ -149,6 +149,19 @@ test("query options resume existing sessions and reserve fresh ids", () => {
   assert.deepEqual(Object.keys(reserved.mcpServers), ["a"]);
 });
 
+test("with a session store, a query mirrors every transcript write as it is written but resumes from the local transcript", async () => {
+  const appended = [];
+  const store = { append: async (key, entries) => appended.push([key, entries]), load: async () => [{ type: "user" }] };
+  const options = buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers: {}, resumeSession: "abc", resumeExists: true, controller: new AbortController(), hooks: {}, env: {}, sessionStore: store });
+  assert.equal(options.persistSession, true);
+  assert.equal(options.sessionStoreFlush, "eager");
+  await options.sessionStore.append({ projectKey: "p", sessionId: "abc" }, [{ type: "user" }]);
+  assert.equal(appended.length, 1);
+  assert.equal(await options.sessionStore.load({ projectKey: "p", sessionId: "abc" }), null);
+  const withoutStore = buildClaudeQueryOptions({ workingDirectory: "/w", claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {}, env: {} });
+  assert.equal(withoutStore.sessionStore, undefined);
+});
+
 test("a result for another turn does not end the prompt channel", async () => {
   const persistence = createPersistence();
   const activeQueries = new Map();
@@ -575,6 +588,48 @@ test("Claude session api maps SDK transcripts to alasio session and rewind shape
   assert.equal(await api.createForkedSession("new", "missing"), null);
   assert.equal(await api.sessionExists("new"), true);
   assert.equal(await api.sessionExists("old"), false);
+});
+
+test("Claude session api reads the session store, and falls back to local transcripts when it cannot", async () => {
+  const calls = [];
+  let storeUp = true;
+  const store = {
+    // Holds no transcripts; unreachable once storeUp is false.
+    async projectKeyOf() {
+      if (!storeUp) throw new Error("store unreachable");
+      return null;
+    },
+  };
+  const api = createClaudeSessionApi({
+    workingDirectory: "/work",
+    store,
+    sdk: {
+      async listSessions(options) {
+        calls.push(["list", Boolean(options.sessionStore)]);
+        if (options.sessionStore && !storeUp) throw new Error("store unreachable");
+        return [{ sessionId: "kept", lastModified: 1, summary: "Kept" }];
+      },
+      async getSessionMessages() {
+        return [];
+      },
+      async forkSession() {
+        return null;
+      },
+      async getSessionInfo(sessionId, options) {
+        calls.push(["info", Boolean(options.sessionStore)]);
+        return sessionId === "local-only" ? { sessionId } : undefined;
+      },
+    },
+  });
+  // Listing reads the store.
+  assert.equal(await api.getSessionByNumber(1), "kept");
+  assert.deepEqual(calls.splice(0), [["list", true]]);
+  // With the store unreachable, listing and existence fall back to the local transcripts.
+  storeUp = false;
+  assert.equal(await api.getSessionByNumber(1), "kept");
+  assert.deepEqual(calls.splice(0), [["list", true], ["list", false]]);
+  assert.equal(await api.sessionExists("local-only"), true);
+  assert.deepEqual(calls.splice(0), [["info", false]]);
 });
 
 /**
