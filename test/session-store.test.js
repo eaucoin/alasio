@@ -8,7 +8,7 @@ import { after, before, describe, test } from "node:test";
 import { forkSession, getSessionMessages, importSessionToStore, listSessions } from "@anthropic-ai/claude-agent-sdk";
 import pg from "pg";
 
-import { NeonSessionStore, mirrorOnly } from "../src/harness/claude/session-store.js";
+import { NeonSessionStore, docOf, mirrorOnly } from "../src/harness/claude/session-store.js";
 import { dockerAvailable, startPostgres } from "./support/postgres.js";
 import { E, KEY, expectEntries, sessionStoreConformance } from "./support/session-store-conformance.js";
 
@@ -38,6 +38,14 @@ after(async () => {
 
 sessionStoreConformance(makeStore, { skip });
 
+test("an entry's doc replaces only what jsonb cannot hold, in keys and values alike", () => {
+  const half = "😀".slice(0, 1);
+  assert.deepEqual(
+    docOf({ type: "user", [`k\u0000${half}`]: ["a\u0000b", `x${half}`, "whole 😀", String.raw`writes \u0000`, 7, null, true] }),
+    { type: "user", "k\ufffd\ufffd": ["a\ufffdb", "x\ufffd", "whole 😀", String.raw`writes \u0000`, 7, null, true] },
+  );
+});
+
 describe("alasio's session store", { skip }, () => {
   test("an entry re-delivered after a retried append is kept once; entries without a uuid are kept as appended", async () => {
     const store = await makeStore();
@@ -59,6 +67,54 @@ describe("alasio's session store", { skip }, () => {
     assert.equal(JSON.stringify(loaded), JSON.stringify(entry));
     const [summary] = await store.listSessionSummaries("proj");
     assert.equal(summary.sessionId, "sess");
+  });
+
+  test("each entry has a jsonb doc for SQL, which leaves the entry exactly as written", async () => {
+    const store = await makeStore();
+    const schema = `test_${process.pid}_${schemas}`;
+    const nul = { z: 1, type: "user", uuid: "u1", out: "a\u0000b" };
+    const halfEmoji = { type: "user", uuid: "u2", out: `cut ${"😀".slice(0, 1)}` };
+    const whole = { type: "user", uuid: "u3", out: "whole 😀" };
+    await store.append(KEY, [nul, halfEmoji, whole]);
+
+    const loaded = await store.load(KEY);
+    assert.deepEqual(loaded.map((entry) => JSON.stringify(entry)), [nul, halfEmoji, whole].map((entry) => JSON.stringify(entry)));
+    const { rows } = await pool.query(`select doc->>'type' as type, doc->>'out' as out from ${schema}.entries order by seq`);
+    assert.deepEqual(rows, [
+      { type: "user", out: "a\ufffdb" },
+      { type: "user", out: "cut \ufffd" },
+      { type: "user", out: "whole 😀" },
+    ]);
+  });
+
+  test("an entry that only writes about those escapes gets a doc with its text unchanged", async () => {
+    const store = await makeStore();
+    const schema = `test_${process.pid}_${schemas}`;
+    // The text \u0000 and \ud83d, and a backslash just before a real NUL: in
+    // the entry's JSON, each escape is preceded by an escaped backslash.
+    const writing = { type: "assistant", uuid: "w1", out: String.raw`jsonb rejects \u0000 and a lone \ud83d` };
+    const backslashNul = { type: "assistant", uuid: "w2", out: "a\\\u0000b" };
+    await store.append(KEY, [writing, backslashNul]);
+    const { rows } = await pool.query(`select doc->>'out' as out from ${schema}.entries order by seq`);
+    assert.deepEqual(rows, [{ out: writing.out }, { out: "a\\\ufffdb" }]);
+  });
+
+  test("a doc Postgres will not take as jsonb becomes null rather than an error", async () => {
+    await makeStore();
+    const schema = `test_${process.pid}_${schemas}`;
+    // Valid JSON, but past the range of jsonb's numbers.
+    const { rows } = await pool.query(`select ${schema}.as_doc($1) as doc`, ['{"n":1e1000000}']);
+    assert.deepEqual(rows, [{ doc: null }]);
+  });
+
+  test("rows stored before doc existed get theirs when the schema is ensured", async () => {
+    const store = await makeStore();
+    const schema = `test_${process.pid}_${schemas}`;
+    await store.append(KEY, [E("user", { uuid: "u1" })]);
+    await pool.query(`alter table ${schema}.entries drop column doc`);
+    await store.ensureSchema();
+    const { rows } = await pool.query(`select doc->>'uuid' as uuid from ${schema}.entries`);
+    assert.deepEqual(rows, [{ uuid: "u1" }]);
   });
 
   test("a batch beyond one insert's parameter limit keeps its order", async () => {

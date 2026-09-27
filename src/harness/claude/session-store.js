@@ -13,6 +13,12 @@
  * \u0000 a tool's binary output can carry, and reorders keys). An entry
  * the SDK re-delivers after a retried append carries the same uuid and is
  * kept once; entries without a uuid are kept as appended.
+ *
+ * Postgres's JSON operators fail on any entry holding a NUL or half a
+ * surrogate pair, so each row also has `doc`, a `jsonb` copy of its entry
+ * for SQL to query, with those characters as U+FFFD. It is written with the
+ * entry and never read here. Where Postgres will not take even that as
+ * `jsonb`, `doc` is null and the entry is stored all the same.
  */
 import { foldSessionSummary } from "@anthropic-ai/claude-agent-sdk";
 
@@ -29,8 +35,11 @@ create table if not exists ${SCHEMA}.entries (
   uuid text,
   entry json not null,
   -- milliseconds since the epoch, alasio's clock, as the SDK's mtimes are
-  mtime bigint not null
+  mtime bigint not null,
+  doc jsonb
 );
+-- Tables made before doc existed.
+alter table ${SCHEMA}.entries add column if not exists doc jsonb;
 create unique index if not exists entries_uuid
   on ${SCHEMA}.entries (project_key, session_id, subpath, uuid) where uuid is not null;
 create index if not exists entries_key on ${SCHEMA}.entries (project_key, session_id, subpath, seq);
@@ -42,12 +51,40 @@ create table if not exists ${SCHEMA}.summaries (
   data json not null,
   primary key (project_key, session_id)
 );
+
+-- JSON text as jsonb, or null where Postgres will not take it, such as past
+-- jsonb's size limit: a doc that cannot be made never fails its entry.
+create or replace function ${SCHEMA}.as_doc(doc text) returns jsonb
+language plpgsql immutable parallel safe as $$
+begin
+  return doc::jsonb;
+exception when others then
+  return null;
+end $$;
 `;
 
 /** Postgres's bind-parameter limit, over the four each row takes. */
 const ROWS_PER_INSERT = 5000;
 
 const subpathOf = (key) => key.subpath ?? "";
+
+/** Rows given their doc at a time, for rows stored before doc existed. */
+const DOCS_PER_UPDATE = 500;
+
+/**
+ * An entry as its doc: the same JSON, with every NUL and every surrogate
+ * without its other half, in keys and values alike, as U+FFFD, which is all
+ * that keeps jsonb from taking it. Text that only writes about those escapes
+ * is left as it is.
+ */
+export function docOf(value) {
+  if (typeof value === "string") return value.replaceAll("\0", "\ufffd").toWellFormed();
+  if (Array.isArray(value)) return value.map(docOf);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [docOf(name), docOf(item)]));
+  }
+  return value;
+}
 
 export class NeonSessionStore {
   #pool;
@@ -62,9 +99,24 @@ export class NeonSessionStore {
     this.#schema = schema;
   }
 
-  /** Creates the tables if they are missing. Idempotent. */
+  /** Creates the tables if they are missing, and fills in any missing doc. Idempotent. */
   async ensureSchema() {
     await this.#pool.query(ddl(this.#schema));
+    // Rows stored before doc existed, and any whose doc Postgres would not
+    // take before, which it is offered once more.
+    for (let after = 0; ; ) {
+      const { rows } = await this.#pool.query(
+        `select seq, entry from ${this.#schema}.entries where doc is null and seq > $1 order by seq limit $2`,
+        [after, DOCS_PER_UPDATE],
+      );
+      if (rows.length === 0) return;
+      await this.#pool.query(
+        `update ${this.#schema}.entries as e set doc = ${this.#schema}.as_doc(d.doc)
+         from unnest($1::bigint[], $2::text[]) as d(seq, doc) where e.seq = d.seq`,
+        [rows.map((row) => row.seq), rows.map((row) => JSON.stringify(docOf(row.entry)))],
+      );
+      after = rows.at(-1).seq;
+    }
   }
 
   async append(key, entries) {
@@ -77,9 +129,9 @@ export class NeonSessionStore {
       for (let start = 0; start < entries.length; start += ROWS_PER_INSERT) {
         const batch = entries.slice(start, start + ROWS_PER_INSERT);
         const { rows } = await client.query(
-          `insert into ${this.#schema}.entries (project_key, session_id, subpath, uuid, entry, mtime)
-           select $1, $2, $3, u, e, $4
-           from unnest($5::text[], $6::json[]) with ordinality as t(u, e, n)
+          `insert into ${this.#schema}.entries (project_key, session_id, subpath, uuid, entry, mtime, doc)
+           select $1, $2, $3, u, e, $4, ${this.#schema}.as_doc(d)
+           from unnest($5::text[], $6::json[], $7::text[]) with ordinality as t(u, e, d, n)
            order by n
            on conflict (project_key, session_id, subpath, uuid) where uuid is not null do nothing
            returning entry`,
@@ -90,6 +142,7 @@ export class NeonSessionStore {
             mtime,
             batch.map((entry) => (typeof entry.uuid === "string" ? entry.uuid : null)),
             batch.map((entry) => JSON.stringify(entry)),
+            batch.map((entry) => JSON.stringify(docOf(entry))),
           ],
         );
         inserted.push(...rows.map((row) => row.entry));

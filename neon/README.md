@@ -28,6 +28,7 @@ mindmap
       durability is one disk so the safekeeper quorum and S3 versioning survive process crashes and a lost service directory but not the loss of the machine's disk and backups are local too
     Operations
       state `docker compose --project-name alasio-neon --file neon/compose.yml --env-file <state>/neon/compose.env ps` and swap `ps` for `logs <service>` `restart <service>` `stop` or `up --detach --wait`
+      transcripts are queried in SQL through claude_sessions.entries.doc the jsonb copy of each entry since Postgres's JSON operators fail on the entry column wherever an entry holds a NUL or half a surrogate pair
       a restore takes the newest dump from backups into any Postgres 17 with `pg_restore --clean --if-exists` and alasio needs only its `claude_sessions` schema
       a safekeeper whose directory is lost is repaired by neon-control within thirty seconds of starting again by pulling the timeline from a peer
       a past moment is read by asking the pageserver's `get_lsn_by_timestamp` for its LSN and starting a second compute from the same spec with mode Static at that LSN and no safekeepers as neon/test/stack.test.js does

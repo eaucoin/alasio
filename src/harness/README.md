@@ -21,6 +21,7 @@ mindmap
       claude/event-projection maps assistant tool_use blocks onto Codex-shaped items and the SDK result onto the final_answer phase
       claude/sessions reads the SDK project transcript store scoped to the working directory and forks with upToMessageId before the chosen user message
       claude/session-store is NeonSessionStore the Agent SDK SessionStore on alasio's Neon keeping every transcript entry in order keyed by project session and subpath with entries re-delivered after a retried append kept once by uuid and session summaries folded in the same transaction
+      entries are stored as json so each keeps its exact text and every row also gets doc a jsonb copy for SQL to query written with the entry from the parsed entry with only real NULs and unpaired surrogates as U+FFFD and null rather than a failed append where Postgres will not take it
       the durable copy of a Claude transcript is the store and the JSONL under the operator's Claude home is a cache Claude Code keeps working from
       each query gets mirrorOnly of the store with eager flushing so the SDK mirrors every entry into it as it is written rather than at the end of a turn while resuming stays on the local transcript because an SDK resume from a store runs without the operator's skills memory and plugins
       a failed mirror write surfaces as a mirror_error system message which live-sessions logs and adoption repairs at the next start
