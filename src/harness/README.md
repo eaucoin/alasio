@@ -27,6 +27,7 @@ mindmap
       a failed mirror write surfaces as a mirror_error system message which live-sessions logs and adoption repairs at the next start
       claude/transcripts writes a transcript missing locally back from the store main transcript last and atomically with its subagents and their metadata before any session api call or resume and adoptTranscripts imports every session alasio points at into the store at startup then only adds the entries it lacks
       session panels read the store when one is configured and fall back to the local transcripts if it fails
+      claude/search indexes the store's entries into passages for full-text trigram and embedding search off the SDK's path as its own README describes
       fresh Claude sessions are reserved ids passed as sessionId on the first query and resumed with resume afterwards
       Bash Monitor Grep and Glob are disallowed so bayma exec is Claude's only shell and a PreToolUse hook on it reuses command-event-policy on the shell commands policy/embedded-shell recovers from the code
 ```

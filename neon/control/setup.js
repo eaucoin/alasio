@@ -13,10 +13,11 @@
  *   safekeeper-{1,2,3}/ their data
  *   control/            neon-control's record of what it bootstrapped, and the compute's spec
  *   backups/            daily logical dumps of alasio's database
+ *   models/             pgrag's model files, for the compute (src/neon/models.js)
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { generateKeyPair, signToken } from "./jwt.js";
@@ -29,6 +30,7 @@ export const BUCKET = "neon";
 export const DEFAULT_COMPUTE_PORT = 55433;
 
 const CONTROL_DIR = dirname(fileURLToPath(import.meta.url));
+const MODELS_DIR = resolve(CONTROL_DIR, "..", "models");
 export const COMPOSE_FILE = resolve(CONTROL_DIR, "..", "compose.yml");
 
 /** Where the stack keeps everything, under alasio's state directory. */
@@ -48,6 +50,7 @@ export function neonLayout(stateDir) {
     safekeeper: (id) => join(root, `safekeeper-${id}`),
     control: join(root, "control"),
     backups: join(root, "backups"),
+    models: join(root, "models"),
     databaseUrlFile: join(root, "secrets", "alasio-database-url"),
   };
 }
@@ -111,6 +114,22 @@ function toml(value) {
  */
 function remoteStorage(prefix) {
   return `{ endpoint="http://seaweedfs:8333", bucket_name="${BUCKET}", bucket_region="us-east-1", prefix_in_bucket="${prefix}" }`;
+}
+
+/**
+ * A digest of the stack's own code, neon-control's and the model server's.
+ * The services that run it, and the compute whose spec neon-control writes,
+ * carry it in their environment, so compose recreates them when the code
+ * changes rather than keep running the old.
+ */
+export function codeRevision(dirs = [CONTROL_DIR, MODELS_DIR]) {
+  const hash = createHash("sha256");
+  for (const dir of dirs) {
+    for (const name of readdirSync(dir).filter((file) => file.endsWith(".js")).sort()) {
+      hash.update(`${basename(dir)}/${name}`).update("\0").update(readFileSync(join(dir, name))).update("\0");
+    }
+  }
+  return hash.digest("hex").slice(0, 16);
 }
 
 /** Renders every service's configuration from the secrets. */
@@ -182,11 +201,14 @@ function renderConfig(layout, secrets, { computePort }) {
 
   for (const id of SAFEKEEPER_IDS) mkdirSync(layout.safekeeper(id), { recursive: true });
   mkdirSync(layout.backups, { recursive: true });
+  mkdirSync(layout.models, { recursive: true });
   mkdirSync(join(layout.control, "compute"), { recursive: true });
 
   const env = {
     ALASIO_NEON_DIR: layout.root,
     ALASIO_NEON_CONTROL_SOURCE: CONTROL_DIR,
+    ALASIO_NEON_MODELS_SOURCE: MODELS_DIR,
+    ALASIO_NEON_CODE_REVISION: codeRevision(),
     ALASIO_NEON_COMPUTE_PORT: String(computePort),
     ALASIO_NEON_UID: String(process.getuid()),
     ALASIO_NEON_GID: String(process.getgid()),

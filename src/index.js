@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { loadAlasioConfig } from "./config.js";
+import { startTranscriptSearch } from "./harness/claude/search/index.js";
 import { startNeon } from "./neon/stack.js";
 import { createLogger } from "./shared/log.js";
 import { TelegramCodexApp } from "./telegram/app.js";
@@ -8,6 +9,7 @@ const log = createLogger("index");
 const config = loadAlasioConfig();
 let neon = null;
 let app = null;
+let search = null;
 
 async function main() {
   // Claude Code's transcripts are kept in alasio's Neon, which runs before
@@ -16,12 +18,15 @@ async function main() {
   app = new TelegramCodexApp({ ...config, sessionStore: neon.store });
   await app.start();
   log.info("Telegram Alasio bot is running");
+  // Once the bot serves: the indexer's first pass reads every stored entry.
+  search = startTranscriptSearch({ pool: neon.pool });
 }
 
 async function shutdown(signal) {
   log.info(`Received ${signal}, shutting down...`);
   try {
     await app?.stop();
+    await search?.close();
     await neon?.close();
   } catch (error) {
     log.error(`Error during shutdown: ${error}`);

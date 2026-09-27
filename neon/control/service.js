@@ -192,12 +192,16 @@ function writeSpec(record) {
           setting("port", COMPUTE_PORT, "integer"),
           setting("max_connections", 100, "integer"),
           setting("shared_buffers", "128MB", "string"),
+          // Building the search indexes over alasio's transcripts, HNSW's above all.
+          setting("maintenance_work_mem", "256MB", "string"),
           setting("password_encryption", "scram-sha-256", "enum"),
           // Durability is the safekeepers': a commit waits for their quorum,
           // and the compute's own disk is rebuilt on every start.
           setting("fsync", "off", "bool"),
           setting("synchronous_standby_names", "walproposer", "string"),
-          setting("shared_preload_libraries", "neon", "string"),
+          // pgrag's embedding and reranking models each run in a background
+          // worker, started only for a library preloaded here.
+          setting("shared_preload_libraries", "neon,rag_bge_small_en_v15,rag_jina_reranker_v1_tiny_en", "string"),
           setting("wal_level", "replica", "enum"),
           setting("wal_log_hints", "off", "bool"),
           setting("wal_keep_size", 0, "integer"),

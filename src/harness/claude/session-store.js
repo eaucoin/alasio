@@ -63,7 +63,7 @@ exception when others then
 end $$;
 `;
 
-/** Postgres's bind-parameter limit, over the four each row takes. */
+/** Rows one insert takes, so that a large append, an import's, is a few statements of bounded size. */
 const ROWS_PER_INSERT = 5000;
 
 const subpathOf = (key) => key.subpath ?? "";
@@ -72,13 +72,20 @@ const subpathOf = (key) => key.subpath ?? "";
 const DOCS_PER_UPDATE = 500;
 
 /**
- * An entry as its doc: the same JSON, with every NUL and every surrogate
- * without its other half, in keys and values alike, as U+FFFD, which is all
- * that keeps jsonb from taking it. Text that only writes about those escapes
- * is left as it is.
+ * Text as Postgres can hold it, in `text` or in `jsonb`: NUL and any
+ * surrogate without its other half as U+FFFD.
+ */
+export function storable(text) {
+  return text.replaceAll("\0", "\ufffd").toWellFormed();
+}
+
+/**
+ * An entry as its doc: the same JSON, with every string storable (keys and
+ * values alike), which is all that keeps jsonb from taking it. Text that only
+ * writes about those escapes is left as it is.
  */
 export function docOf(value) {
-  if (typeof value === "string") return value.replaceAll("\0", "\ufffd").toWellFormed();
+  if (typeof value === "string") return storable(value);
   if (Array.isArray(value)) return value.map(docOf);
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([name, item]) => [docOf(name), docOf(item)]));

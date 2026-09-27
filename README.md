@@ -49,7 +49,7 @@ mindmap
       `.env.example` documents the standalone environment and `.env` stays mode 0600 and untracked because it holds the bot token
       the standalone bot restarts with `./restart-alasio-standalone.sh` from `/home/operator/alasio` which records operator_induced provenance in its own state directory before restarting `alasio-standalone.service`
       `alasio-standalone.service` runs the bot in the `alasio-standalone` container that `container/Dockerfile` builds and `container/run.sh` starts with the host's user, `/home` at the same path (including Homebrew in `/home/linuxbrew`), `/tmp`, network, processes, IPC, Docker, and the environment systemd gives the unit, so the container changes nothing the bot or its agents can do except that host root is out of reach
-      `install-alasio-standalone-service.sh` pulls bayma's image and the Neon stack's images builds that image and installs `systemd/alasio-standalone.rules` as a polkit rule scoped to restarting that one unit so the bot can restart itself without a password, from inside its container through the host's system D-Bus
+      `install-alasio-standalone-service.sh` pulls bayma's image and the Neon stack's images and fetches pgrag's models builds that image and installs `systemd/alasio-standalone.rules` as a polkit rule scoped to restarting that one unit so the bot can restart itself without a password, from inside its container through the host's system D-Bus
       the standalone unit sets `ALASIO_SERVICE_UNIT` and `ALASIO_RESTART_WRAPPER` so post-restart prompts name the standalone unit and wrapper instead of the deployment checkout paths
       self-restart detection treats `restart-alasio-standalone.sh` and `systemctl restart alasio-standalone.service` as self-induced the same way as the deployment wrapper
       Normal restarts run from the deployment checkout with `./restart-alasio-operator.sh`
@@ -91,6 +91,7 @@ mindmap
       one outbox identity per terminal response makes live handoff and restart recovery converge on the same delivery
       observable action to reply consistency prevents fabricated completion signals
       Codex-native compaction remains the source of truth for long conversations
+      Claude Code transcripts are searchable by words substrings and meaning through claude_sessions.search which alasio keeps indexed in the background with pgrag's local embedding model
       Claude Code transcripts are kept durably in alasio's own Neon a local docker compose project `alasio-neon` of Neon's storage engine on SeaweedFS S3 that alasio brings up before serving and that neon/README.md describes
       every entry Claude Code writes is mirrored into Neon and a transcript lost from the operator's Claude home is written back from Neon before its session is listed or resumed
       at startup alasio imports every Claude session it points at into Neon then adds only what the mirror missed

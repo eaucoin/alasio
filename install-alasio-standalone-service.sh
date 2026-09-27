@@ -42,7 +42,7 @@ docker pull "$BAYMA_IMAGE"
 
 # The Neon stack Claude Code's transcripts are kept in; alasio brings it up
 # itself on every start, so this only saves its first start the downloads.
-echo "Pulling the images of alasio's Neon stack..."
+echo "Pulling the images of alasio's Neon stack and pgrag's models..."
 (cd "$SCRIPT_DIR" && node --input-type=module --eval 'import "dotenv/config"; import { loadAlasioConfig } from "./src/config.js"; import { pullNeon } from "./src/neon/stack.js"; await pullNeon({ stateDir: loadAlasioConfig().stateDir });')
 
 sudo install -m 0644 "$UNIT_SOURCE" "/etc/systemd/system/$UNIT_NAME"

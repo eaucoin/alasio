@@ -17,6 +17,7 @@ import pg from "pg";
 import { COMPOSE_FILE, DEFAULT_COMPUTE_PORT, setupNeon } from "../../neon/control/setup.js";
 import { NeonSessionStore } from "../harness/claude/session-store.js";
 import { createLogger } from "../shared/log.js";
+import { ensurePgragModels } from "./models.js";
 
 const log = createLogger("neon");
 const run = promisify(execFile);
@@ -31,10 +32,11 @@ export function composeCommand(layout, project = NEON_PROJECT) {
   return ["compose", "--project-name", project, "--file", COMPOSE_FILE, "--env-file", layout.composeEnv];
 }
 
-/** Pulls every image the stack runs, so its first start waits on none. */
+/** Pulls every image the stack runs and fetches pgrag's models, so its first start waits on neither. */
 export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
   const layout = setupNeon(stateDir);
   await run("docker", [...composeCommand(layout, project), "pull", "--quiet"], { maxBuffer: 16 * 1024 * 1024 });
+  await ensurePgragModels(layout.models);
 }
 
 /**
@@ -43,6 +45,12 @@ export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
  */
 export async function startNeon({ stateDir, project = NEON_PROJECT, computePort = DEFAULT_COMPUTE_PORT }) {
   const layout = setupNeon(stateDir, { computePort });
+  // Only embedding and reranking need the models, so the stack comes up
+  // without them; the compute fetches them whenever they are there.
+  await ensurePgragModels(layout.models).then(
+    (fetched) => fetched && log.info("fetched pgrag's models"),
+    (error) => log.warn(`pgrag's models are unavailable, so search runs without embeddings: ${error.message}`),
+  );
   log.info(`bringing up ${project}`);
   await run("docker", [...composeCommand(layout, project), "up", "--detach", "--wait", "--wait-timeout", String(STACK_UP_TIMEOUT_SECONDS)], {
     maxBuffer: 16 * 1024 * 1024,
