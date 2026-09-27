@@ -15,8 +15,7 @@ mindmap
       safekeeper-1 safekeeper-2 and safekeeper-3 are the WAL quorum so a commit returns once two of them have it and each offloads WAL to seaweedfs
       pageserver serves pages to the compute from WAL and layer files it uploads to seaweedfs and registers itself with the controller from metadata.json
       neon-control is the control plane a Node service in control/service.js that registers the safekeepers creates the tenant and timeline once writes the compute's spec and every thirty seconds rebuilds any safekeeper that lost its timeline from a healthy peer
-      compute is Postgres with the neon extension started by compute_ctl from that spec holding the `alasio` database and role and preloading pgrag's embedding and reranking libraries whose background workers load their models on first use
-      pgrag-models serves pgrag's two ONNX models to the compute under the host name Neon's image fetches them from inside Neon's own cluster and src/neon/models.js fetches them once from the pgrag v0.1.2 release Neon builds from checked against Neon's pinned checksum and each model's own
+      compute is Postgres with the neon extension started by compute_ctl from that spec holding the `alasio` database and role
       backup writes a pg_dump of the `alasio` database every day into backups and keeps the last fourteen
     Security
       control/setup.js makes every secret once on first start under the alasio state directory and renders every service's configuration from them on every start
@@ -35,12 +34,12 @@ mindmap
       a restore takes the newest dump from backups into any Postgres 17 with `pg_restore --clean --if-exists` and alasio needs only its `claude_sessions` schema
       a safekeeper whose directory is lost is repaired by neon-control within thirty seconds of starting again by pulling the timeline from a peer
       a past moment is read by asking the pageserver's `get_lsn_by_timestamp` for its LSN and starting a second compute from the same spec with mode Static at that LSN and no safekeepers as neon/test/stack.test.js does
-      a change to neon-control's or pgrag-models' code changes ALASIO_NEON_CODE_REVISION in compose.env so the next start recreates those services and the compute whose spec neon-control writes
+      a change to neon-control's code changes ALASIO_NEON_CONTROL_REVISION in compose.env so the next start recreates neon-control and the compute whose spec it writes
       an upgrade moves every Neon image to one newer release together then runs `npm run test:neon` before alasio runs it because Neon publishes no compatibility promise for self-hosting
       the cost of owning it is that Neon's hosted control plane is replaced by neon-control so a Neon release that changes the storage controller's safekeeper or compute APIs needs neon-control changed with it
     Tests
       `npm run test:neon` brings a throwaway stack up from nothing through startNeon runs the session store conformance suite on its compute and proves nothing committed is lost through a full stop and start and through a SIGKILL of the pageserver a safekeeper the compute the storage controller or seaweedfs mid-write
-      it also proves pgrag embeds and reranks on the compute so search finds a passage by meaning alone and that a code change recreates exactly the services running the stack's code
+      it also proves that a change to neon-control's code recreates exactly neon-control and the compute
       it also proves a safekeeper that lost its disk is rebuilt garbage the pageserver collects is deleted only after the controller validates it the daily dump restores and the database reads as it was at a past moment
 ```
 

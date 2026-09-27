@@ -4,7 +4,6 @@ import { after, before, describe, test } from "node:test";
 import pg from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.js";
-import { embedBatch } from "../src/harness/claude/search/embedder.js";
 import { startTranscriptSearch } from "../src/harness/claude/search/index.js";
 import { SETTLE_MS, collectOrphans, indexBatch, settle } from "../src/harness/claude/search/indexer.js";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.js";
@@ -160,19 +159,8 @@ describe("searching", { skip }, () => {
   });
 });
 
-describe("embedding", { skip }, () => {
-  test("without pgrag's model nothing is embedded or marked, and search goes on by words", async () => {
-    const { schema, store, q, indexAll } = await makeSearch();
-    await store.append(key("a"), [answer("a1", "Embeddings wait for the model.")]);
-    await indexAll();
-    assert.equal(await embedBatch(pool, schema), null);
-    assert.deepEqual(await q("select count(*)::int as n from S.embeddings"), [{ n: 0 }]);
-    assert.equal((await q("select kind from S.search('embeddings')"))[0].kind, "assistant.text");
-  });
-});
-
-describe("the search loops", { skip }, () => {
-  test("index what is appended while they run, and stop when closed", async () => {
+describe("the indexer", { skip }, () => {
+  test("indexes what is appended while it runs, and stops when closed", async () => {
     const { schema, store, q } = await makeSearch();
     const search = startTranscriptSearch({ pool, schema });
     try {
@@ -187,7 +175,7 @@ describe("the search loops", { skip }, () => {
     } finally {
       const closing = Date.now();
       await search.close();
-      assert.ok(Date.now() - closing < 5_000, "close does not wait out a loop's sleep");
+      assert.ok(Date.now() - closing < 5_000, "close does not wait out its sleep");
     }
   });
 });

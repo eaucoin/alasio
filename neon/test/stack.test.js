@@ -16,9 +16,6 @@ import { promisify } from "node:util";
 import pg from "pg";
 
 import { NeonSessionStore } from "../../src/harness/claude/session-store.js";
-import { embedBatch } from "../../src/harness/claude/search/embedder.js";
-import { indexBatch } from "../../src/harness/claude/search/indexer.js";
-import { ensureSearchSchema } from "../../src/harness/claude/search/schema.js";
 import { composeCommand, startNeon } from "../../src/neon/stack.js";
 import { dockerAvailable } from "../../test/support/postgres.js";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.js";
@@ -164,41 +161,7 @@ sessionStoreConformance(
 );
 
 describe("alasio's Neon stack", { skip }, () => {
-  test("finds transcript passages by meaning with pgrag's models, and reranks them", async () => {
-    const schema = "search_on_neon";
-    const store = new NeonSessionStore(neon.pool, { schema });
-    await store.ensureSchema();
-    await ensureSearchSchema(neon.pool, schema);
-    const said = (uuid, text) => ({ type: "assistant", uuid, timestamp: "2026-09-27T01:00:00Z", message: { content: [{ type: "text", text }] } });
-    await store.append({ projectKey: "-work", sessionId: "s" }, [
-      said("a1", "Every commit waits until two of the three safekeepers have it."),
-      said("a2", "The daily dump is kept for fourteen days."),
-      said("a3", "Bananas ripen faster beside apples."),
-    ]);
-    while ((await indexBatch(neon.pool, schema)) > 0);
-    // The compute fetches the model from pgrag-models on first use.
-    for (let handled; (handled = await embedBatch(neon.pool, schema)) !== 0; ) assert.notEqual(handled, null, "pgrag's model is available");
-    const rows = (text, values) => neon.pool.query(text, values).then((result) => result.rows);
-    assert.deepEqual(await rows(`select count(embedding)::int as n from ${schema}.embeddings`), [{ n: 3 }]);
-
-    // No word in common with the passage it should find: only meaning connects them.
-    const question = "how many replicas must acknowledge a write";
-    const words = (text) => new Set(text.toLowerCase().match(/[a-z]+/gu));
-    assert.deepEqual([...words(question)].filter((word) => words("Every commit waits until two of the three safekeepers have it.").has(word)), []);
-    const [top] = await rows(`select snippet from ${schema}.search($1)`, [question]);
-    assert.match(top.snippet, /safekeepers/u);
-    // The reranker is small: asked plainly, it puts the passage that answers first.
-    const fruit = "which fruit ripens other fruit";
-    const reranked = await rows(
-      `select r.snippet, r.score, rag_jina_reranker_v1_tiny_en.rerank_distance($1, p.text) as distance
-       from ${schema}.search($1, rerank => true) r join ${schema}.passages p on p.id = r.passage_id`,
-      [fruit],
-    );
-    assert.match(reranked[0].snippet, /Bananas/u);
-    for (const row of reranked) assert.ok(Math.abs(row.score + row.distance) < 1e-4, "a reranked score is the reranker's distance, negated");
-  });
-
-  test("recreates the services that run the stack's own code when that code changes, and only them", async () => {
+  test("recreates neon-control and the compute when neon-control's code changes, and nothing else", async () => {
     const services = async () =>
       Object.fromEntries(
         (await run("docker", ["ps", "--filter", `label=com.docker.compose.project=${project}`, "--format", '{{.Label "com.docker.compose.service"}} {{.ID}}']))
@@ -206,7 +169,7 @@ describe("alasio's Neon stack", { skip }, () => {
       );
     const before = await services();
     const env = readFileSync(layout.composeEnv, "utf8");
-    writeFileSync(layout.composeEnv, env.replace(/^ALASIO_NEON_CODE_REVISION=.*$/mu, "ALASIO_NEON_CODE_REVISION='changed'"));
+    writeFileSync(layout.composeEnv, env.replace(/^ALASIO_NEON_CONTROL_REVISION=.*$/mu, "ALASIO_NEON_CONTROL_REVISION='changed'"));
     try {
       await up();
     } finally {
@@ -214,7 +177,7 @@ describe("alasio's Neon stack", { skip }, () => {
     }
     const after = await services();
     const recreated = Object.keys(after).filter((service) => after[service] !== before[service]).sort();
-    assert.deepEqual(recreated, ["compute", "neon-control", "pgrag-models"]);
+    assert.deepEqual(recreated, ["compute", "neon-control"]);
     assert.deepEqual(await query("select 1 as ok"), [{ ok: 1 }]);
     await start();
   });

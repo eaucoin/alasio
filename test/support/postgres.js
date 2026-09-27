@@ -1,7 +1,7 @@
 /**
- * A throwaway Postgres for tests: Postgres 17 with pgvector, as alasio's Neon
- * compute has them, pinned, on a random local port, removed when stopped.
- * Tests that need one skip where Docker is not available.
+ * A throwaway Postgres for tests: the controller database's pinned image, on
+ * a random local port, removed when stopped. Tests that need one skip where
+ * Docker is not available.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import pg from "pg";
 
 const run = promisify(execFile);
-const IMAGE = "pgvector/pgvector:0.8.0-pg17@sha256:40b404964359299eefdd5f8518facf1886c562848cf4de13b6eaf91cb70c2b87";
+const IMAGE = "postgres:17-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652";
 
 export function dockerAvailable() {
   try {

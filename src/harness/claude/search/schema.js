@@ -1,41 +1,17 @@
 /**
  * Where transcript search lives: beside the session store's entries, in the
- * same schema, and written only by the indexer and embedder here, never on
- * the SDK's path.
+ * same schema, and written only by the indexer here, never on the SDK's path.
  *
  * - passages: each distinct text once, with its words (`tsvector`: English
  *   for prose, as written otherwise) and its trigrams indexed;
  * - occurrences: every place a passage is written, with the entry's session,
  *   time, and kind, going with the entry when the SDK deletes it;
  * - indexed: the entries the indexer has read, whatever they held;
- * - embeddings: pgrag's bge-small-en-v1.5 embedding of a passage, where it
- *   was asked for one, indexed for nearest neighbours;
  * - search(): the one way in, from any SQL client.
  */
 
-/** Kinds embedded for search by meaning: the conversation, and the calls it made. */
-export const EMBEDDED_KINDS = [
-  "user.text",
-  "assistant.text",
-  "assistant.thinking",
-  "assistant.tool_use",
-  "queue-operation",
-  "summary",
-  "ai-title",
-  "custom-title",
-  "last-prompt",
-];
-
 export const searchDdl = (SCHEMA) => `
 create extension if not exists pg_trgm;
-create extension if not exists vector;
--- pgrag's models are Neon's; elsewhere, search goes on by words alone.
-do $$ begin
-  create extension if not exists rag_bge_small_en_v15;
-  create extension if not exists rag_jina_reranker_v1_tiny_en;
-exception when others then
-  null;
-end $$;
 
 create table if not exists ${SCHEMA}.passages (
   id bigint generated always as identity primary key,
@@ -66,13 +42,6 @@ create table if not exists ${SCHEMA}.indexed (
   seq bigint primary key references ${SCHEMA}.entries (seq) on delete cascade
 );
 
-create table if not exists ${SCHEMA}.embeddings (
-  passage_id bigint primary key references ${SCHEMA}.passages (id) on delete cascade,
-  -- null where the model could not embed the passage, which is then not asked again
-  embedding vector(384)
-);
-create index if not exists embeddings_nearest on ${SCHEMA}.embeddings using hnsw (embedding vector_cosine_ops);
-
 -- How far the indexer has read: every entry up to this seq is indexed.
 create table if not exists ${SCHEMA}.search_state (
   name text primary key,
@@ -94,37 +63,17 @@ language sql immutable parallel safe as $$
   end
 $$;
 
--- The query's embedding, or null where pgrag's model is not to be had.
-create or replace function ${SCHEMA}.query_meaning(query text) returns vector
-language plpgsql volatile as $$
-begin
-  return rag_bge_small_en_v15.embedding_for_query(query);
-exception when others then
-  return null;
-end $$;
-
--- The reranker's distance from the query to each text, or null where it is not to be had.
-create or replace function ${SCHEMA}.rerank_distances(query text, texts text[]) returns real[]
-language plpgsql volatile as $$
-begin
-  return rag_jina_reranker_v1_tiny_en.rerank_distance(query, texts);
-exception when others then
-  return null;
-end $$;
-
--- Passages matching q, best first: by their words, by their trigrams (typos
--- and substrings), and by meaning where embeddings are to be had, fused by
--- reciprocal rank and weighted by kind; with rerank, reordered by the
--- reranker. Each passage is reported once, at its most telling occurrence the
--- filters allow, with how often it occurs. Scores order results, nothing more.
+-- Passages matching q, best first: by their words and by their trigrams
+-- (typos and substrings), fused by reciprocal rank and weighted by kind. Each
+-- passage is reported once, at its most telling occurrence the filters allow,
+-- with how often it occurs. Scores order results, nothing more.
 create or replace function ${SCHEMA}.search(
   q text,
   only_kinds text[] default null,
   only_sessions text[] default null,
   since timestamptz default null,
   until timestamptz default null,
-  max_results integer default 20,
-  rerank boolean default false
+  max_results integer default 20
 ) returns table (
   passage_id bigint,
   kind text,
@@ -135,7 +84,7 @@ create or replace function ${SCHEMA}.search(
   score double precision,
   snippet text
 )
-language sql volatile as $$
+language sql stable as $$
   with
   allowed as not materialized (
     select o.* from ${SCHEMA}.occurrences o
@@ -146,9 +95,6 @@ language sql volatile as $$
   ),
   words as materialized (
     select websearch_to_tsquery('english', q) || websearch_to_tsquery('simple', q) as query
-  ),
-  meaning as materialized (
-    select ${SCHEMA}.query_meaning(q) as v
   ),
   by_words as (
     select p.id, row_number() over (order by ts_rank_cd(p.words, w.query) desc) as rank
@@ -162,26 +108,9 @@ language sql volatile as $$
     where length(q) >= 3 and q <% p.text and exists (select 1 from allowed a where a.passage_id = p.id)
     order by rank limit 60
   ),
-  nearest as (
-    select e.passage_id, e.embedding <=> (select v from meaning) as distance
-    from ${SCHEMA}.embeddings e
-    where (select v from meaning) is not null and e.embedding is not null
-    order by e.embedding <=> (select v from meaning)
-    limit 200
-  ),
-  by_meaning as (
-    select n.passage_id as id, row_number() over (order by n.distance) as rank
-    from nearest n
-    where exists (select 1 from allowed a where a.passage_id = n.passage_id)
-    order by rank limit 60
-  ),
   fused as (
     select r.id, sum(1.0 / (60 + r.rank)) as rrf
-    from (
-      select id, rank from by_words
-      union all select id, rank from by_trigrams
-      union all select id, rank from by_meaning
-    ) r
+    from (select id, rank from by_words union all select id, rank from by_trigrams) r
     group by r.id
   ),
   best as (
@@ -191,29 +120,18 @@ language sql volatile as $$
     from allowed a
     join fused f on f.id = a.passage_id
     order by a.passage_id, ${SCHEMA}.kind_weight(a.kind) desc, a.at desc nulls last
-  ),
-  ranked as (
-    select b.*, f.rrf * ${SCHEMA}.kind_weight(b.kind) as fused_score, p.text, p.prose
-    from fused f
-    join best b on b.passage_id = f.id
-    join ${SCHEMA}.passages p on p.id = f.id
-    order by fused_score desc
-    limit case when rerank then greatest(max_results, 30) else max_results end
-  ),
-  reranking as (
-    select
-      case when rerank then ${SCHEMA}.rerank_distances(q, array_agg(r.text order by r.fused_score desc)) end as distances,
-      array_agg(r.passage_id order by r.fused_score desc) as ids
-    from ranked r
   )
   select
-    r.passage_id, r.kind, r.session_id, r.subpath, r.at, r.occurrences,
-    coalesce(-x.distances[array_position(x.ids, r.passage_id)], r.fused_score) as score,
+    b.passage_id, b.kind, b.session_id, b.subpath, b.at, b.occurrences,
+    f.rrf * ${SCHEMA}.kind_weight(b.kind) as score,
     ts_headline(
-      case when r.prose then 'english'::regconfig else 'simple'::regconfig end,
-      r.text, w.query, 'MaxWords=35, MinWords=15, MaxFragments=2'
+      case when p.prose then 'english'::regconfig else 'simple'::regconfig end,
+      p.text, w.query, 'MaxWords=35, MinWords=15, MaxFragments=2'
     ) as snippet
-  from ranked r, reranking x, words w
+  from fused f
+  join best b on b.passage_id = f.id
+  join ${SCHEMA}.passages p on p.id = f.id
+  cross join words w
   order by score desc
   limit max_results
 $$;

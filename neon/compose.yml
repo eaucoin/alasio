@@ -251,8 +251,8 @@ services:
     command: ["node", "/app/service.js"]
     environment:
       CONTROLLER_URL: http://storage-controller:1234
-      # Recreates this service when the stack's code changes; see setup.js.
-      ALASIO_NEON_CODE_REVISION: ${ALASIO_NEON_CODE_REVISION}
+      # Recreates this service when its code changes; see setup.js.
+      ALASIO_NEON_CONTROL_REVISION: ${ALASIO_NEON_CONTROL_REVISION}
     volumes:
       - ${ALASIO_NEON_CONTROL_SOURCE}:/app:ro
       - ${ALASIO_NEON_DIR}/secrets:/secrets:ro
@@ -274,30 +274,6 @@ services:
       interval: 3s
       timeout: 5s
       retries: 100
-
-  # pgrag's model files, for the compute to fetch as Neon's own cluster would
-  # serve them: see models/serve.js and src/neon/models.js. The compute fetches
-  # them only on first use, so it does not wait for this service to start.
-  pgrag-models:
-    image: node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
-    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
-    restart: unless-stopped
-    command: ["node", "/app/serve.js"]
-    environment:
-      # Recreates this service when the stack's code changes; see setup.js.
-      ALASIO_NEON_CODE_REVISION: ${ALASIO_NEON_CODE_REVISION}
-    volumes:
-      - ${ALASIO_NEON_MODELS_SOURCE}:/app:ro
-      - ${ALASIO_NEON_DIR}/models:/models:ro
-    networks:
-      default:
-        aliases:
-          - pg-ext-s3-gateway.pg-ext-s3-gateway.svc.cluster.local
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
-      interval: 3s
-      timeout: 5s
-      retries: 20
 
   # A logical dump of alasio's database every day, the last fourteen kept:
   # restorable into any Postgres, whatever becomes of the stack.
@@ -346,8 +322,8 @@ services:
       - --config
       - /config/config.json
     environment:
-      # Recreates the compute when the stack's code, neon-control's spec above all, changes.
-      ALASIO_NEON_CODE_REVISION: ${ALASIO_NEON_CODE_REVISION}
+      # Recreates the compute when neon-control, which writes its spec, changes.
+      ALASIO_NEON_CONTROL_REVISION: ${ALASIO_NEON_CONTROL_REVISION}
     volumes:
       - ${ALASIO_NEON_DIR}/control/compute:/config:ro
     ports:
