@@ -13,11 +13,12 @@ import { BAYMA_IMAGE, baymaLaunch, ensureBaymaReady } from "../src/mcp/bayma.js"
 
 const env = { ALASIO_STATE_DIR: "/state" };
 
-test("bayma runs from its pinned image, after any bayma still stopping on its state directory", () => {
+test("bayma runs from its pinned image, after stopping any bayma still on its state directory", () => {
   const { command, args } = baymaLaunch({ harness: "claude", threadKey: "telegram:1", env });
   assert.equal(command, "/bin/sh");
   assert.equal(args[0], "-c");
-  assert.match(args[1], /docker wait .*exec docker run --label "alasio\.bayma\.state-dir=\$0" "\$@"$/u);
+  assert.match(args[1], /docker stop .*exec docker run --label "alasio\.bayma\.state-dir=\$0" "\$@"$/u);
+  assert.doesNotMatch(args[1], /docker wait/u);
   assert.equal(args[2], "/state/bayma/claude/telegram-1");
   const run = args.slice(3);
   assert.match(BAYMA_IMAGE, /^ghcr\.io\/eaucoin\/bayma:[\d.]+@sha256:[0-9a-f]{64}$/u);
@@ -116,4 +117,31 @@ test("Codex threads add bayma and leave the operator's servers and apps connecto
 
 test("bayma's image starts and serves its tools", async () => {
   await ensureBaymaReady(process.env);
+});
+
+test("a bayma left running on the state directory is stopped, not waited on, before the next starts", async () => {
+  const bin = await mkdtemp(join(tmpdir(), "alasio-fake-docker-"));
+  try {
+    const calls = join(bin, "calls");
+    const { writeFile, readFile, chmod } = await import("node:fs/promises");
+    // ps reports an orphan on this state directory; wait would hang forever.
+    await writeFile(join(bin, "docker"), `#!/bin/sh
+echo "$*" >> "${calls}"
+case "$1" in
+  ps) echo orphan-1 ;;
+  wait) sleep 3600 ;;
+esac
+`);
+    await chmod(join(bin, "docker"), 0o755);
+    const { command, args } = baymaLaunch({ harness: "claude", threadKey: "telegram:1", env });
+    const { execFileSync } = await import("node:child_process");
+    execFileSync(command, args, { env: { PATH: `${bin}:/usr/bin:/bin` }, timeout: 10_000 });
+    const lines = (await readFile(calls, "utf8")).trim().split("\n");
+    assert.match(lines[0], /^ps --quiet --filter label=alasio\.bayma\.state-dir=\/state\/bayma\/claude\/telegram-1$/u);
+    assert.equal(lines[1], "stop orphan-1");
+    assert.match(lines[2], /^run --label alasio\.bayma\.state-dir=\/state\/bayma\/claude\/telegram-1 /u);
+    assert.equal(lines.length, 3);
+  } finally {
+    await rm(bin, { recursive: true, force: true });
+  }
 });

@@ -65,9 +65,16 @@ const HOST_MOUNTS = [
 // CRIU and bayma's runtimes, and bayma's own settings.
 const OWN_VARIABLE = /^(PATH|HOSTNAME|BAYMA_.*)$/u;
 
-// A bayma stopping snapshots its REPL sessions and holds its state directory
-// until it has; the next one on that directory waits for it, then starts.
-const WAIT_THEN_RUN = `ids=$(docker ps --quiet --filter "label=${STATE_LABEL}=$0"); [ -z "$ids" ] || docker wait $ids >/dev/null; exec docker run --label "${STATE_LABEL}=$0" "$@"`;
+// A bayma snapshots its REPL sessions as it stops and holds its state
+// directory until it has, so the next one on that directory stops any bayma
+// still running there, then starts. Stopping rather than waiting matters: a
+// bayma whose alasio went away without closing its input never exits on its
+// own, and waiting on it left every later Claude session without bayma.
+// `docker stop` sends the same SIGTERM a normal shutdown does, so the old
+// bayma snapshots and exits (and one already stopping is simply waited for);
+// past docker's grace period it is killed and its sessions resume from their
+// histories instead of the snapshot.
+const STOP_THEN_RUN = `ids=$(docker ps --quiet --filter "label=${STATE_LABEL}=$0"); [ -z "$ids" ] || docker stop $ids >/dev/null; exec docker run --label "${STATE_LABEL}=$0" "$@"`;
 
 const log = createLogger("bayma");
 
@@ -90,7 +97,7 @@ function stdioCommand(stateDir, env) {
     command: "/bin/sh",
     args: [
       "-c",
-      WAIT_THEN_RUN,
+      STOP_THEN_RUN,
       stateDir,
       "--interactive",
       "--rm",
