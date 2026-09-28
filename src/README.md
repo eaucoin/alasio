@@ -3,7 +3,7 @@
 mindmap
   root((alasio source))
     Root entrypoint
-      config owns alasio environment loading and index starts the Telegram Codex app
+      config owns alasio environment loading and index starts Neon the Telegram Codex app the rollout mirror and transcript search
       root stays intentionally thin so source domains do not collapse back into one flat namespace
     telegram/
       owns Bot API polling lifecycle authorization callbacks file downloads message projection Markdown-safe response rendering text splitting media-group buffering and durable outbox delivery
@@ -15,7 +15,7 @@ mindmap
       adapters are created lazily per harness and folder pair because Claude transcript stores and Codex thread cwds are folder scoped
       workspace owns the folder policy that keeps every Telegram-chosen folder under ALASIO_WORKSPACE_ROOT
     codex/
-      owns Codex turn orchestration runtime transport event projection status reporting restart recovery and app-server protocol
+      owns Codex turn orchestration runtime transport event projection status reporting restart recovery app-server protocol the Codex session api and rollouts/ which keeps Codex's rollout files in Neon
       turn-controller and status-reporter are harness-neutral and receive the adapter plus display name per turn
       model owns the configured Codex model and reasoning effort shared by app-server and exec transports
       app-server/ splits protocol-heavy transport mechanics into explicit smaller modules
@@ -24,8 +24,6 @@ mindmap
     operator/
       owns operator command parsing command execution Telegram-native session goal and service control panels session reply formatting restart prompts and shared operator-facing text helpers
       session panels render through the active harness adapter's session api so Codex rollouts and Claude transcripts never mix
-    sessions/
-      owns Codex rollout JSONL discovery session listing and rewind forking
     persistence/
       owns SQLite schema store facade and table-group repositories for callbacks conversations prompt jobs responses outbox restarts state Telegram content turns and usage
       conversations carry an active harness plus one parked session pointer per harness and turns and prompt jobs record their admitting harness
@@ -43,7 +41,7 @@ mindmap
     Persistence
       state belongs under the configured alasio data directory rather than ad hoc JSON files
       SQLite schema is canonical DDL for the local content database
-      Claude Code transcripts are the one thing kept in Neon rather than SQLite because the Agent SDK's SessionStore is the interface they are mirrored through
+      Claude Code transcripts and Codex rollouts are kept in Neon rather than SQLite as the durable copies of the harnesses' own sessions the transcripts through the Agent SDK's SessionStore and the rollouts as opaque files
       table-group repositories stay behind persistence/store.js
 ```
 

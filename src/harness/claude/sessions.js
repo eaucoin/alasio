@@ -7,6 +7,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../shared/log.js";
 import { SESSIONS_PER_PAGE } from "../../shared/runtime-constants.js";
+import { dateLabel, sessionLabel } from "../../shared/session-labels.js";
 import { ensureLocalTranscript } from "./transcripts.js";
 
 const log = createLogger("claude-sessions");
@@ -18,17 +19,6 @@ const log = createLogger("claude-sessions");
  * copy; without one, or while it cannot be reached, the local transcripts
  * under `~/.claude/projects/<cwd-slug>/`.
  */
-function truncateSessionText(text, maxChars = 40, suffix = "...") {
-  const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxChars) {
-    return normalized;
-  }
-  if (maxChars <= suffix.length) {
-    return suffix.slice(0, maxChars);
-  }
-  return `${normalized.slice(0, maxChars - suffix.length).trimEnd()}${suffix}`;
-}
-
 function textFromMessageContent(content) {
   if (typeof content === "string") {
     return content;
@@ -51,14 +41,6 @@ function isOperatorUserMessage(entry) {
     return false;
   }
   return Boolean(textFromMessageContent(content).trim());
-}
-
-function dateLabel(epochMs) {
-  const value = Number(epochMs);
-  if (!Number.isFinite(value) || value <= 0) {
-    return "-";
-  }
-  return new Date(value).toISOString().slice(0, 10);
 }
 
 export function createClaudeSessionApi({
@@ -99,7 +81,7 @@ export function createClaudeSessionApi({
       return all.slice(startIdx, startIdx + SESSIONS_PER_PAGE).map((session) => ({
         uuid: session.sessionId,
         timestamp: dateLabel(session.lastModified),
-        label: truncateSessionText(session.customTitle || session.summary || session.firstPrompt || session.sessionId, 40),
+        label: sessionLabel(session.customTitle || session.summary || session.firstPrompt || session.sessionId),
       }));
     },
 

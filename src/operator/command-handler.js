@@ -221,7 +221,7 @@ export class CommandHandler {
         await this.client.sendMessage(chatId, `Message ${cmd.index} not found. Use !rewind to see available points.`);
         return true;
       }
-      const forkedId = await sessions.createForkedSession(sessionId, target.uuid);
+      const forkedId = await sessions.createForkedSession(sessionId, target.uuid, { threadKey: conversationId });
       if (!forkedId) {
         await this.client.sendMessage(chatId, "Failed to create forked session.");
         return true;

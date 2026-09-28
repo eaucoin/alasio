@@ -30,7 +30,8 @@ export async function startPostgres() {
     IMAGE,
   ]);
   const id = stdout.trim();
-  const stop = () => run("docker", ["rm", "--force", id]).catch(() => {});
+  // --volumes: the image's data volume goes with it, rather than being left behind.
+  const stop = () => run("docker", ["rm", "--force", "--volumes", id]).catch(() => {});
   try {
     const { stdout: port } = await run("docker", ["port", id, "5432/tcp"]);
     const url = `postgresql://postgres:${password}@${port.trim().split("\n")[0]}/postgres`;

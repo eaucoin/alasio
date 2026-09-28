@@ -7,6 +7,7 @@ import { buildCodexEnv } from "./env.js";
 import { appendBlock, isVisibleCodexItem, mapItemToBlocks } from "./event-projection.js";
 import {
     canWarmCodexSession,
+    forkCodexTransportThread,
     openAttachedCodexEventStream,
     openCodexEventStream,
     startCodexTransportThread,
@@ -46,6 +47,21 @@ export async function startFreshCodexSession({ threadKey, workingDirectory }) {
         `new_session.started total_ms=${elapsedMs(startedAt).toFixed(1)} thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`,
     );
     return sessionId;
+}
+
+/** A new thread holding a session's history before one of its turns: rewind. */
+export async function forkCodexSession({ sessionId, beforeTurnId, threadKey, workingDirectory }) {
+    const codexEnv = buildCodexEnv();
+    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
+    await ensureBaymaReady(codexEnv);
+    return await forkCodexTransportThread({
+        sessionId,
+        beforeTurnId,
+        threadKey,
+        workingDirectory,
+        codexEnv,
+        codexConfig,
+    });
 }
 
 function isIntentionalTurnInterrupt(error) {

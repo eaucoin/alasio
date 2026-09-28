@@ -32,13 +32,16 @@ export class AppServerRpcClient {
   async startInner({ env, cwd }) {
     this.stop();
     const startedAt = process.hrtime.bigint();
-    this.process = startAppServerProcess({
+    // A process stopped or replaced may still report its exit, late: only
+    // the current one's events count.
+    const started = startAppServerProcess({
       cwd,
       env,
-      onLine: (line) => this.handleLine(line),
-      onExit: (code, signal) => this.handleExit(code, signal),
-      onError: (error) => this.handleSpawnError(error),
+      onLine: (line) => this.process === started && this.handleLine(line),
+      onExit: (code, signal) => this.process === started && this.handleExit(code, signal),
+      onError: (error) => this.process === started && this.handleSpawnError(error),
     });
+    this.process = started;
     const init = await this.request("initialize", {
       clientInfo: {
         name: "alasio_telegram",

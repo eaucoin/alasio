@@ -78,6 +78,18 @@ export class AppServerClient {
     }
   }
 
+  async forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config }) {
+    return await this.threads.forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config });
+  }
+
+  async listThreads({ env, cwd }) {
+    return await this.threads.listThreads({ env, cwd });
+  }
+
+  async listTurns({ threadId, env, cwd }) {
+    return await this.threads.listTurns({ threadId, env, cwd });
+  }
+
   async listModels({ env, cwd }) {
     return await this.threads.listModels({ env, cwd });
   }

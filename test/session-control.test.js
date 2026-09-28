@@ -55,6 +55,16 @@ function createStore() {
   };
 }
 
+function createHarness(sessions = {}) {
+  return {
+    displayName: "Codex",
+    sessions: {
+      getSessionLastMessage: async () => null,
+      ...sessions,
+    },
+  };
+}
+
 test("new-session callback starts and mounts a fresh session", async () => {
   const client = createClient();
   const store = createStore();
@@ -63,6 +73,7 @@ test("new-session callback starts and mounts a fresh session", async () => {
   await handleSessionControlCallback({
     client,
     store,
+    harness: createHarness(),
     activeQueries: new Map(),
     action: { kind: "control:new", conversationId: "conversation-1", payload: {} },
     startNewSession: async (args) => {
@@ -78,4 +89,36 @@ test("new-session callback starts and mounts a fresh session", async () => {
   assert.deepEqual(startCalls, [{ conversationId: "conversation-1" }]);
   assert.deepEqual(client.calls.answerCallbackQuery[0], ["callback-1", "New session mounted: fresh-se."]);
   assert.match(client.calls.editMessageText[0][2], /Session: fresh-se/);
+});
+
+test("rewind forks before the chosen message for the conversation and mounts the fork", async () => {
+  const client = createClient();
+  const store = createStore();
+  const forkCalls = [];
+  const harness = createHarness({
+    listSessionMessages: async () => [
+      { index: -1, timestamp: "", text: "second", uuid: "turn-2" },
+      { index: -2, timestamp: "", text: "first", uuid: "turn-1" },
+    ],
+    createForkedSession: async (...args) => {
+      forkCalls.push(args);
+      return "forked-session";
+    },
+  });
+
+  await handleSessionControlCallback({
+    client,
+    store,
+    harness,
+    activeQueries: new Map(),
+    action: { kind: "control:rewind_fork", conversationId: "conversation-1", payload: { sessionId: "source-session", index: -1 } },
+    startNewSession: async () => assert.fail("a rewind starts no new session"),
+    callbackQueryId: "callback-1",
+    chatId: 123,
+    messageId: 456,
+  });
+
+  assert.deepEqual(forkCalls, [["source-session", "turn-2", { threadKey: "conversation-1" }]]);
+  assert.equal(store.getSessionId("conversation-1"), "forked-session");
+  assert.deepEqual(client.calls.answerCallbackQuery[0], ["callback-1", "Fork mounted."]);
 });

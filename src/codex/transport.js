@@ -145,6 +145,18 @@ export async function startCodexTransportThread({ threadKey, workingDirectory, c
     });
 }
 
+/** Forks through the app-server under either transport: the fork is a rollout like any other, which exec resumes too. */
+export async function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig }) {
+    return await codexAppServerClient.forkThread({
+        threadId: sessionId,
+        beforeTurnId,
+        threadKey,
+        cwd: workingDirectory,
+        env: codexEnv,
+        config: codexConfig,
+    });
+}
+
 export async function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig }) {
     return await codexAppServerClient.ensureThread({
         threadId: sessionId,

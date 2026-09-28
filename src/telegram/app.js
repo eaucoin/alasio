@@ -1,7 +1,9 @@
+import { codexHome } from "../codex/env.js";
+import { restoreRollouts } from "../codex/rollouts/restore.js";
 import { TurnController } from "../codex/turn-controller.js";
 import { adoptTranscripts } from "../harness/claude/transcripts.js";
 import { createHarnessRegistry } from "../harness/index.js";
-import { CLAUDE_HARNESS } from "../harness/names.js";
+import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.js";
 import { SqliteStore } from "../persistence/store.js";
 import { Authorizer } from "./authorizer.js";
 import { CallbackHandler } from "./callback-handler.js";
@@ -31,7 +33,11 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
-    this.harnesses = config.harnesses ?? createHarnessRegistry({ config, sessionStore: config.sessionStore ?? null });
+    this.harnesses = config.harnesses ?? createHarnessRegistry({
+      config,
+      sessionStore: config.sessionStore ?? null,
+      rolloutStore: config.rolloutStore ?? null,
+    });
     this.turns = new TurnController({
       config: this.config,
       client: this.client,
@@ -89,6 +95,7 @@ export class TelegramCodexApp {
     this.outbox.start();
     await this.mediaGroups.flushDue();
     await this.adoptClaudeTranscripts();
+    await this.restoreCodexRollouts();
     await this.turns.recoverInterruptedTurns();
     this.turns.resumePendingPrompts();
     this.poller.start();
@@ -110,6 +117,20 @@ export class TelegramCodexApp {
     const sessions = this.store.listHarnessSessionReferences(CLAUDE_HARNESS);
     log.info(`  Session store: adopting ${sessions.length} Claude session(s)`);
     await adoptTranscripts({ store: sessionStore, sessions });
+  }
+
+  /**
+   * Writes back from the rollout store every Codex rollout file a thread alasio
+   * points at needs and this machine lacks, before any turn resumes one.
+   */
+  async restoreCodexRollouts() {
+    const rolloutStore = this.config.rolloutStore;
+    if (!rolloutStore) {
+      return;
+    }
+    const threadIds = this.store.listHarnessSessionReferences(CODEX_HARNESS).map(({ sessionId }) => sessionId);
+    const written = await restoreRollouts({ store: rolloutStore, threadIds, home: codexHome() });
+    log.info(`  Rollout store: ${threadIds.length} Codex thread(s), ${written.length} rollout file(s) written back`);
   }
 
   async stop() {

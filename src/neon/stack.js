@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import pg from "pg";
 
 import { COMPOSE_FILE, DEFAULT_COMPUTE_PORT, setupNeon } from "../../neon/control/setup.js";
+import { NeonRolloutStore } from "../codex/rollouts/store.js";
 import { NeonSessionStore } from "../harness/claude/session-store.js";
 import { createLogger } from "../shared/log.js";
 
@@ -38,7 +39,8 @@ export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
 }
 
 /**
- * Brings the stack up and connects to it. Returns `{ pool, store, close }`.
+ * Brings the stack up and connects to it. Returns `{ pool, store, rollouts, close }`:
+ * `store` keeps Claude Code's transcripts, `rollouts` Codex's rollout files.
  * `project` and `computePort` exist for tests, which run their own stack.
  */
 export async function startNeon({ stateDir, project = NEON_PROJECT, computePort = DEFAULT_COMPUTE_PORT }) {
@@ -59,10 +61,13 @@ export async function startNeon({ stateDir, project = NEON_PROJECT, computePort 
   pool.on("error", (error) => log.warn(`idle database connection lost: ${error.message}`));
   const store = new NeonSessionStore(pool);
   await store.ensureSchema();
+  const rollouts = new NeonRolloutStore(pool);
+  await rollouts.ensureSchema();
   log.info(`${project} is up`);
   return {
     pool,
     store,
+    rollouts,
     close: () => pool.end(),
   };
 }

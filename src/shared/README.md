@@ -9,6 +9,7 @@ mindmap
       ids owns runtime UUID generation
       log owns scoped logger construction
       runtime-constants owns constants shared across domains
+      session-labels owns the session panels' one-line labels and dates for both harnesses' session apis
 ```
 
 ## Preference Atlas

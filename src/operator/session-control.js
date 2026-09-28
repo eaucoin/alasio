@@ -1,22 +1,6 @@
-import { createCodexHarness } from "../harness/codex.js";
 import { interruptActiveTurn } from "../harness/index.js";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.js";
 import { truncateText } from "./text.js";
-
-let fallbackHarness = null;
-
-/**
- * Session panels are rendered for the conversation's active harness. Callers
- * that predate harness selection receive the Codex adapter so existing
- * behavior is unchanged.
- */
-function resolveHarness(harness) {
-  if (harness) {
-    return harness;
-  }
-  fallbackHarness = fallbackHarness ?? createCodexHarness({ workingDirectory: process.env.WORKING_DIRECTORY ?? process.cwd() });
-  return fallbackHarness;
-}
 
 const CONTROL_KIND_PREFIX = "control:";
 
@@ -79,8 +63,7 @@ async function buildMountedSummary(store, harness, conversationId) {
   ];
 }
 
-export async function buildSessionsPanel({ store, harness: harnessInput, conversationId, page = 1 }) {
-  const harness = resolveHarness(harnessInput);
+export async function buildSessionsPanel({ store, harness, conversationId, page = 1 }) {
   const mountedSessionId = store.getSessionId(conversationId);
   const totalPages = await harness.sessions.getTotalSessionPages();
   const safePage = normalizePage(page, totalPages);
@@ -132,8 +115,7 @@ export async function buildSessionsPanel({ store, harness: harnessInput, convers
   };
 }
 
-export async function buildCurrentSessionPanel({ store, harness: harnessInput, activeQueries, conversationId }) {
-  const harness = resolveHarness(harnessInput);
+export async function buildCurrentSessionPanel({ store, harness, activeQueries, conversationId }) {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return {
@@ -303,7 +285,7 @@ export async function sendCurrentSessionPanel({ client, store, harness, activeQu
 export async function handleSessionControlCallback({
   client,
   store,
-  harness: harnessInput,
+  harness,
   activeQueries,
   action,
   startNewSession,
@@ -311,7 +293,6 @@ export async function handleSessionControlCallback({
   chatId,
   messageId,
 }) {
-  const harness = resolveHarness(harnessInput);
   const kind = action.kind.slice(CONTROL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   let panel = null;
@@ -363,7 +344,9 @@ export async function handleSessionControlCallback({
   } else if (kind === "rewind_fork") {
     const messages = await harness.sessions.listSessionMessages(payload.sessionId);
     const target = messages.find((message) => message.index === payload.index);
-    const forkedId = target ? await harness.sessions.createForkedSession(payload.sessionId, target.uuid) : null;
+    const forkedId = target
+      ? await harness.sessions.createForkedSession(payload.sessionId, target.uuid, { threadKey: action.conversationId })
+      : null;
     if (forkedId) {
       store.setSessionId(action.conversationId, forkedId);
       notice = "Fork mounted.";

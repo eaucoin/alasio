@@ -308,7 +308,7 @@ describe("alasio's Neon stack", { skip }, () => {
       }
       assert.equal(count, 100);
     } finally {
-      await run("docker", ["rm", "--force", name]).catch(() => {});
+      await run("docker", ["rm", "--force", "--volumes", name]).catch(() => {});
       rmSync(specDir, { recursive: true, force: true });
     }
   });

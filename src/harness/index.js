@@ -50,9 +50,10 @@ const FACTORIES = {
  * Registry of harness adapters. Adapters are bound to one folder, so one is
  * created lazily per (harness, working directory) pair and cached; overrides
  * (test doubles) stand in for every folder of their harness but still require
- * a mounted folder so gating behaves the same as production.
+ * a mounted folder so gating behaves the same as production. `sessionStore`
+ * keeps Claude Code's transcripts and `rolloutStore` Codex's rollouts.
  */
-export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null } = {}) {
+export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null, rolloutStore = null } = {}) {
   const adapters = new Map();
   const getFor = (name, workingDirectory) => {
     if (!isHarnessName(name)) {
@@ -67,7 +68,7 @@ export function createHarnessRegistry({ config = {}, overrides = {}, sessionStor
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory, sessionStore });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore, rolloutStore });
       adapters.set(key, adapter);
     }
     return adapter;

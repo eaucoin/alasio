@@ -12,7 +12,10 @@ mindmap
     Client
       client owns the public app-server facade used by transport
       rpc-client owns JSON-RPC request response pending timers and server request replies
-      thread-client owns Codex thread resume start turn start interrupt and goal calls
+      rpc-client heeds only the current process's lines exit and errors so a stopped process reporting its exit late cannot fail the requests of the one started after it
+      thread-client owns Codex thread resume start fork turn start interrupt and goal calls and the thread turn and model lists every page of which it reads
+      thread-client starts resumes and forks every thread with one set of overrides model approval sandbox and alasio's config
+      thread-client lists the threads the Codex CLI editors and both alasio transports record and leaves sub-agent threads out
       notification-queue owns turn notification buffering waiter cleanup alias-aware active-turn identity and stale same-thread pruning
       protocol recognizes app-server camelCase and snake_case thread or turn ids across params event and item shapes
       protocol classifies high-volume app-server progress and delta notifications separately from stale turn events

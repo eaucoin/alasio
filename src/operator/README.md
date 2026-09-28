@@ -33,7 +33,7 @@ sequenceDiagram
   participant Sessions as sessions
   participant Client as telegram/client
   Telegram->>Handler: command text
-  Handler->>Sessions: inspect mount fork or preview Codex rollout state
+  Handler->>Sessions: inspect mount fork or preview the active harness's sessions
   Handler-->>Client: send bounded operator-readable reply
   Telegram->>Handler: inline keyboard callback
   Handler-->>Client: edit the same control-panel message with the next session view

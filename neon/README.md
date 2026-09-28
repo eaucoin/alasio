@@ -3,7 +3,7 @@
 mindmap
   root((neon))
     What it is
-      alasio's own Neon is Neon's open-source storage engine run on this machine as the docker compose project `alasio-neon` described by compose.yml and it keeps Claude Code's transcripts
+      alasio's own Neon is Neon's open-source storage engine run on this machine as the docker compose project `alasio-neon` described by compose.yml and it keeps Claude Code's transcripts and Codex's rollout files
       it is frozen at neon release-9129 and compute release-compute-9073 on Postgres 17.5 with every image pinned by digest so nothing about it changes unless alasio changes it
       src/neon/stack.js brings it up before alasio serves anything and Docker's restart policies keep every service running across crashes and reboots
       everything talks on the stack's private network and only the compute is published on 127.0.0.1 port 55433
@@ -31,7 +31,8 @@ mindmap
       state `docker compose --project-name alasio-neon --file neon/compose.yml --env-file <state>/neon/compose.env ps` and swap `ps` for `logs <service>` `restart <service>` `stop` or `up --detach --wait`
       transcripts are searched with claude_sessions.search which src/harness/claude/search describes
       transcripts are queried in SQL through claude_sessions.entries.doc the jsonb copy of each entry since Postgres's JSON operators fail on the entry column wherever an entry holds a NUL or half a surrogate pair
-      a restore takes the newest dump from backups into any Postgres 17 with `pg_restore --clean --if-exists` and alasio needs only its `claude_sessions` schema
+      Codex's rollout files are kept byte for byte in codex_sessions.rollouts and codex_sessions.rollout_chunks which src/codex/rollouts describes
+      a restore takes the newest dump from backups into any Postgres 17 with `pg_restore --clean --if-exists` and alasio needs only its `claude_sessions` and `codex_sessions` schemas
       a safekeeper whose directory is lost is repaired by neon-control within thirty seconds of starting again by pulling the timeline from a peer
       a past moment is read by asking the pageserver's `get_lsn_by_timestamp` for its LSN and starting a second compute from the same spec with mode Static at that LSN and no safekeepers as neon/test/stack.test.js does
       a change to neon-control's code changes ALASIO_NEON_CONTROL_REVISION in compose.env so the next start recreates neon-control and the compute whose spec it writes
@@ -59,7 +60,7 @@ sequenceDiagram
   Control->>Storage: register safekeepers and create the tenant and timeline once
   Control->>Control: record them in bootstrap.json and write the compute spec
   Compose->>Compute: start from the spec once neon-control is healthy
-  Alasio->>Compute: connect as alasio and ensure the claude_sessions schema
+  Alasio->>Compute: connect as alasio and ensure the claude_sessions and codex_sessions schemas
 ```
 
 ## Avoidance Atlas
