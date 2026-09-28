@@ -1,6 +1,6 @@
 /**
- * One pass of the mirror: every rollout file whose size or place changed
- * since the store last kept it is kept again. Codex only appends to a
+ * Mirroring a rollout file: one whose size or place changed since the store
+ * last kept it is kept again. Codex only appends to a
  * rollout, so a file that grew with the same first line gets only its new
  * bytes; any other change, as when Codex's migration rewrites a file, gets
  * all of them. A file moved by archiving only has its place updated.
@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
 import { join } from "node:path";
 
-import { listRolloutFiles, parseRolloutName } from "./files.js";
+import { parseRolloutName } from "./files.js";
 
 /** How much of a file one read for its first line takes. */
 const HEAD_READ_BYTES = 64 * 1024;
@@ -60,53 +60,50 @@ function historyBaseOf(head) {
 }
 
 /**
- * Mirrors what changed under `home` into `store`. `known` maps each name the
- * store keeps to its `{ path, size, headDigest }`, as `store.list()` gives
- * them, and is kept up to date. Returns how many files it mirrored.
+ * Mirrors one rollout file, as files.js gives it, into `store`. `known` maps
+ * each name the store keeps to its `{ path, size, headDigest }`, as
+ * `store.list()` gives them, and is kept up to date. Returns whether any of
+ * its bytes were mirrored.
  */
-export async function mirrorRollouts({ store, home, known }) {
-  let mirrored = 0;
-  for (const file of listRolloutFiles(home)) {
-    if (file.compressed) continue;
-    const kept = known.get(file.name);
-    if (kept?.size === file.size) {
-      if (kept.path !== file.path) {
-        await store.move(file.name, file.path);
-        kept.path = file.path;
-      }
-      continue;
+export async function mirrorRollout({ store, home, known, file }) {
+  if (file.compressed) return false;
+  const kept = known.get(file.name);
+  if (kept?.size === file.size) {
+    if (kept.path !== file.path) {
+      await store.move(file.name, file.path);
+      kept.path = file.path;
     }
-    let handle;
-    try {
-      handle = await open(join(home, file.path), "r");
-    } catch (error) {
-      // Moved or removed since it was listed: the next pass sees where.
-      if (error.code === "ENOENT") continue;
-      throw error;
-    }
-    try {
-      const head = await readHead(handle);
-      if (!head) continue;
-      const headDigest = createHash("sha256").update(head).digest("hex");
-      const start = kept && file.size > kept.size && kept.headDigest === headDigest ? kept.size : 0;
-      const bytes = await readRange(handle, start, file.size);
-      // Shorter than it was listed: rewritten meanwhile, and seen again next pass.
-      if (start + bytes.length !== file.size) continue;
-      const rollout = {
-        name: file.name,
-        path: file.path,
-        ...parseRolloutName(file.name),
-        historyBase: historyBaseOf(head),
-        size: file.size,
-        headDigest,
-        modifiedMs: file.modifiedMs,
-      };
-      await store.save(rollout, { start, bytes });
-      known.set(file.name, { path: file.path, size: file.size, headDigest });
-      mirrored += 1;
-    } finally {
-      await handle.close();
-    }
+    return false;
   }
-  return mirrored;
+  let handle;
+  try {
+    handle = await open(join(home, file.path), "r");
+  } catch (error) {
+    // Moved or removed since it was listed: it is seen where it went.
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  try {
+    const head = await readHead(handle);
+    if (!head) return false;
+    const headDigest = createHash("sha256").update(head).digest("hex");
+    const start = kept && file.size > kept.size && kept.headDigest === headDigest ? kept.size : 0;
+    const bytes = await readRange(handle, start, file.size);
+    // Shorter than it was listed: rewritten meanwhile, and seen again.
+    if (start + bytes.length !== file.size) return false;
+    const rollout = {
+      name: file.name,
+      path: file.path,
+      ...parseRolloutName(file.name),
+      historyBase: historyBaseOf(head),
+      size: file.size,
+      headDigest,
+      modifiedMs: file.modifiedMs,
+    };
+    await store.save(rollout, { start, bytes });
+    known.set(file.name, { path: file.path, size: file.size, headDigest });
+    return true;
+  } finally {
+    await handle.close();
+  }
 }

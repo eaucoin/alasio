@@ -96,7 +96,7 @@ mindmap
       Claude Code transcripts are kept durably in alasio's own Neon a local docker compose project `alasio-neon` of Neon's storage engine on SeaweedFS S3 that alasio brings up before serving and that neon/README.md describes
       every entry Claude Code writes is mirrored into Neon and a transcript lost from the operator's Claude home is written back from Neon before its session is listed or resumed
       at startup alasio imports every Claude session it points at into Neon then adds only what the mirror missed
-      every Codex rollout file is mirrored into Neon byte for byte within two seconds of changing and a thread alasio points at whose files this machine lacks is written back from Neon at startup and before it is resumed or forked with the files its history starts in
+      every Codex rollout file is mirrored into Neon byte for byte as the kernel reports each write to it and a Codex turn's reply is final only once its thread is in Neon and a thread alasio points at whose files this machine lacks is written back from Neon at startup and before it is resumed or forked with the files its history starts in
       Codex's session panels read the app-server's own thread and turn lists and rewind is Codex's own fork before a turn so alasio reads and writes none of Codex's formats
       Neon's safekeepers seaweedfs versioning and a daily local pg_dump survive crashes and lost service directories on this machine's one disk
     Historical emphasis

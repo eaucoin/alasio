@@ -13,10 +13,11 @@ mindmap
       createForkedSession takes the conversation as threadKey since the fork becomes that conversation's session
       supportsGoals supportsWarmup and supportsSteer let operator controls hide or refuse features a harness lacks
       executeTurn returns the same blockSequence sessionId pendingResponseId interrupted and responseCompleted shape for every harness
-      the registry hands each adapter the store its harness keeps sessions in sessionStore for Claude Code and rolloutStore for Codex
+      the registry hands each adapter where its harness's sessions are kept sessionStore for Claude Code and codexRollouts for Codex
     Codex adapter
       codex wraps the app-server runtime with codex/sessions as its sessions api
-      with a rollout store codex writes back a thread's missing rollout files from Neon before resuming warming or forking it and logs rather than fails when the store cannot be read
+      with codexRollouts codex writes back a thread's missing rollout files from Neon before resuming warming or forking it and logs rather than fails when Neon cannot be read
+      with codexRollouts each turn's thread is flushed to Neon before the turn's response is marked complete through the runtime's beforeResponseComplete
     Claude Code adapter
       claude/runtime builds the Agent SDK options with bypassPermissions the claude_code system prompt preset and bayma added to the MCP servers Claude Code loads from the operator's configuration
       claude/live-sessions keeps one Claude Code process per conversation for as long as its session and model stay mounted and routes each result to the operator turn it names or to a turn Claude Code started itself

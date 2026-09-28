@@ -14,18 +14,25 @@ mindmap
       each row records the file's place thread id rollout id history base size first-line digest and modification time which Codex dates the thread by
       lineage follows history_base transitively in one recursive query so a thread's files and every file its history starts in come together
     Mirror
-      index starts the mirror loop beside transcript search once the bot serves and each pass stats every rollout file and copies what changed within two seconds
+      index is startCodexRollouts which src/index.js starts right after Neon so no turn runs unmirrored and which offers restore flush and close
+      the kernel reports each write to sessions and archived_sessions through recursive fs.watch and the file is mirrored within milliseconds including in day folders made later
+      while a rollout directory does not exist yet as in a new Codex home the home itself is watched for it so alasio never makes directories in Codex's home
+      a check every thirty seconds mirrors whatever no report covered such as changes made while alasio was down and restarts any watch that failed and a change it finds that was written over five seconds before is logged as one no watch reported
+      every write to the store goes through one queue so two changes to one file are never mirrored at once
       a file that grew with the same first line gets only its new bytes as one more chunk since Codex only appends to a rollout
       any other change such as Codex's migration rewriting a file gets all its bytes again and a file moved by archiving only has its place updated
-      a file without a whole first line yet waits for the next pass and a file shorter than it was listed is read again next pass
-      the mirror is off Codex's path so a failing pass is logged once retried every minute and catches up on everything after
+      a file without a whole first line yet waits for its next write and a file shorter than it was listed is read again
+      the mirror is off Codex's path so a failure is logged once and the next check catches up on everything
+    Turn completion
+      flush mirrors one thread's files through the same queue and the Codex adapter awaits it before a turn's response is marked complete so any reply the operator can see is already in Neon
+      a flush that fails or takes over five seconds is logged and the reply goes on without it rather than waiting on Neon
     Restore
       restore writes back every file a thread alasio points at needs that this machine lacks byte for byte where it was with its modification time and through a partial file renamed into place
       telegram/app restores every Codex thread alasio points at before any turn at startup and the Codex adapter restores a thread before it is resumed warmed or forked
       a file present here or present compressed is never touched and a thread nobody points at is never written back so deleting a thread locally sticks
       one file that cannot be written back is logged and the rest still are
     Limits
-      durability lags the mirror's two seconds
+      Codex writes a file before alasio can copy it so a turn still running can lag the disk by the milliseconds a report and an insert take
       Codex's goals queued prompts and memories live in its other SQLite databases and are not kept
       files Codex's optional compression has compressed are not mirrored and keep the copy made before
       after a restore onto a fresh Codex index a thread's rewind points appear once it has been resumed and a fork's or revert's list only the turns of its own file
@@ -40,9 +47,11 @@ sequenceDiagram
   participant Mirror as rollouts/index and mirror
   participant Store as NeonRolloutStore
   participant Restore as rollouts/restore
+  participant Adapter as harness/codex
   Codex->>Home: append to a thread's rollout
-  Mirror->>Home: stat every rollout file each pass
+  Home-->>Mirror: the kernel reports the write
   Mirror->>Store: keep the new bytes or all of them
+  Adapter->>Mirror: flush the turn's thread before its response is complete
   Restore->>Store: lineage of the threads alasio points at
   Restore->>Home: write back what is missing whole
   Codex->>Home: rebuild its indexes from the files
@@ -58,6 +67,9 @@ stateDiagram-v2
   WrittenIndexes --> BreaksOnUpgrade
   KeepingThreads --> ResurrectedThreads: every stored thread is written back
   ResurrectedThreads --> OperatorMistrust
+  KeepingThreads --> PolledCopies: files copied only on a timer
+  PolledCopies --> RepliesAheadOfNeon: the operator sees a reply Neon does not hold yet
+  RepliesAheadOfNeon --> OperatorMistrust
   KeepingThreads --> OpaqueFiles: files kept and written back byte for byte
   OpaqueFiles --> CodexRebuilds: Codex rebuilds its indexes itself
   CodexRebuilds --> [*]

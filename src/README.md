@@ -3,7 +3,7 @@
 mindmap
   root((alasio source))
     Root entrypoint
-      config owns alasio environment loading and index starts Neon the Telegram Codex app the rollout mirror and transcript search
+      config owns alasio environment loading and index starts Neon Codex's rollout mirror the Telegram Codex app and transcript search
       root stays intentionally thin so source domains do not collapse back into one flat namespace
     telegram/
       owns Bot API polling lifecycle authorization callbacks file downloads message projection Markdown-safe response rendering text splitting media-group buffering and durable outbox delivery

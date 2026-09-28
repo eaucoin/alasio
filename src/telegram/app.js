@@ -1,5 +1,3 @@
-import { codexHome } from "../codex/env.js";
-import { restoreRollouts } from "../codex/rollouts/restore.js";
 import { TurnController } from "../codex/turn-controller.js";
 import { adoptTranscripts } from "../harness/claude/transcripts.js";
 import { createHarnessRegistry } from "../harness/index.js";
@@ -36,7 +34,7 @@ export class TelegramCodexApp {
     this.harnesses = config.harnesses ?? createHarnessRegistry({
       config,
       sessionStore: config.sessionStore ?? null,
-      rolloutStore: config.rolloutStore ?? null,
+      codexRollouts: config.codexRollouts ?? null,
     });
     this.turns = new TurnController({
       config: this.config,
@@ -120,16 +118,16 @@ export class TelegramCodexApp {
   }
 
   /**
-   * Writes back from the rollout store every Codex rollout file a thread alasio
-   * points at needs and this machine lacks, before any turn resumes one.
+   * Writes back from Neon every Codex rollout file a thread alasio points at
+   * needs and this machine lacks, before any turn resumes one.
    */
   async restoreCodexRollouts() {
-    const rolloutStore = this.config.rolloutStore;
-    if (!rolloutStore) {
+    const codexRollouts = this.config.codexRollouts;
+    if (!codexRollouts) {
       return;
     }
     const threadIds = this.store.listHarnessSessionReferences(CODEX_HARNESS).map(({ sessionId }) => sessionId);
-    const written = await restoreRollouts({ store: rolloutStore, threadIds, home: codexHome() });
+    const written = await codexRollouts.restore(threadIds);
     log.info(`  Rollout store: ${threadIds.length} Codex thread(s), ${written.length} rollout file(s) written back`);
   }
 

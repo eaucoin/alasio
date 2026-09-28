@@ -9,6 +9,7 @@ mindmap
       accepted prompts are serialized per conversation through durable SQLite prompt jobs
       status-reporter owns operator progress and final response delivery
       runtime exposes fresh app-server thread creation for Telegram New Session and no-session goal bootstrap paths
+      runtime awaits the caller's beforeResponseComplete once a turn completes and before its response is marked complete so nothing delivers a reply first
       runtime forks a session before one of its turns for rewind through the app-server's thread/fork loaded with the same overrides as a resume under either transport
     Sessions boundary
       sessions is the Codex session panels' api read from the app-server's thread/list scoped to the working directory and thread/turns/list so alasio reads and writes none of Codex's files for them

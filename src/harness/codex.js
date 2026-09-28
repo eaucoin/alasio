@@ -5,9 +5,8 @@ import {
   warmCodexSession,
 } from "../codex/runtime.js";
 import { codexAppServerClient } from "../codex/app-server/client.js";
-import { buildCodexEnv, codexHome } from "../codex/env.js";
+import { buildCodexEnv } from "../codex/env.js";
 import { resolveCodexModelChoice } from "../codex/model.js";
-import { restoreRollouts } from "../codex/rollouts/restore.js";
 import { createCodexSessionApi } from "../codex/sessions.js";
 import { createLogger } from "../shared/log.js";
 import { CODEX_HARNESS, harnessDisplayName } from "./names.js";
@@ -30,19 +29,31 @@ function toModelOption(model) {
   };
 }
 
+const errorText = (error) => (error instanceof Error ? error.message : String(error));
+
 /**
  * Codex harness adapter over the app-server runtime, with its sessions as the
- * app-server reports them. With a rollout store (alasio's Neon, see
+ * app-server reports them. With Codex's rollouts kept in Neon (see
  * codex/rollouts/), a thread's rollout files missing here are written back
- * before it is resumed or forked.
+ * before it is resumed or forked, and a turn's thread is mirrored before its
+ * response is final.
  */
-export function createCodexHarness({ workingDirectory, rolloutStore = null }) {
+export function createCodexHarness({ workingDirectory, codexRollouts = null }) {
   async function ensureRollouts(sessionId) {
-    if (!rolloutStore || !sessionId) return;
+    if (!codexRollouts || !sessionId) return;
     try {
-      await restoreRollouts({ store: rolloutStore, threadIds: [sessionId], home: codexHome() });
+      await codexRollouts.restore([sessionId]);
     } catch (error) {
-      log.warn(`could not check the rollout store for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      log.warn(`could not check Neon for the rollouts of ${sessionId}: ${errorText(error)}`);
+    }
+  }
+
+  async function flushRollouts(sessionId) {
+    if (!codexRollouts || !sessionId) return;
+    try {
+      await codexRollouts.flush(sessionId);
+    } catch (error) {
+      log.warn(`the turn's response goes on before ${sessionId} was mirrored: ${errorText(error)}`);
     }
   }
 
@@ -62,7 +73,7 @@ export function createCodexHarness({ workingDirectory, rolloutStore = null }) {
     },
     async executeTurn(params) {
       await ensureRollouts(params.resumeSession);
-      return await executeCodexTurn({ ...params, workingDirectory });
+      return await executeCodexTurn({ ...params, workingDirectory, beforeResponseComplete: flushRollouts });
     },
     async listModels() {
       const models = await codexAppServerClient.listModels({ env: buildCodexEnv(), cwd: workingDirectory });

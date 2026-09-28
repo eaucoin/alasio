@@ -196,6 +196,9 @@ export async function executeCodexTurn(params) {
                     break;
                 case "turn.completed":
                     turnTimer("turn.completed");
+                    // Nothing delivers a response before it is complete.
+                    await params.beforeResponseComplete?.(sessionId);
+                    turnTimer("before_response_complete.done");
                     persistence.markPendingResponseComplete(pendingResponseId);
                     responseCompleted = true;
                     params.onTransportCompleted?.({ sessionId, turnId: streamed.turnId });

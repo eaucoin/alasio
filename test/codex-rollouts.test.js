@@ -7,7 +7,8 @@ import { after, before, describe, test } from "node:test";
 import pg from "pg";
 
 import { listRolloutFiles, parseRolloutName } from "../src/codex/rollouts/files.js";
-import { mirrorRollouts } from "../src/codex/rollouts/mirror.js";
+import { startCodexRollouts } from "../src/codex/rollouts/index.js";
+import { mirrorRollout } from "../src/codex/rollouts/mirror.js";
 import { restoreRollouts } from "../src/codex/rollouts/restore.js";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.js";
 import { dockerAvailable, startPostgres } from "./support/postgres.js";
@@ -77,7 +78,14 @@ describe("the rollout store", { skip }, () => {
     const home = mkdtempSync(join(tmpdir(), "alasio-rollouts-"));
     homes.push(home);
     const known = new Map();
-    const pass = () => mirrorRollouts({ store, home, known });
+    /** Mirrors every file, as the check does. Returns how many had bytes mirrored. */
+    const pass = async () => {
+      let mirrored = 0;
+      for (const file of listRolloutFiles(home)) {
+        if (await mirrorRollout({ store, home, known, file })) mirrored += 1;
+      }
+      return mirrored;
+    };
     const write = (path, text) => {
       mkdirSync(dirname(join(home, path)), { recursive: true });
       writeFileSync(join(home, path), text);
@@ -161,6 +169,55 @@ describe("the rollout store", { skip }, () => {
     assert.equal(existsSync(join(fresh, other)), false);
     assert.deepEqual(await restoreRollouts({ store, threadIds: [THREAD_B], home: fresh }), []);
     assert.deepEqual(await restoreRollouts({ store, threadIds: [], home: fresh }), []);
+  });
+
+  test("a change is mirrored as it is written, long before the half-minute check, in a new home and day folders made later too", async () => {
+    const { store, home, write } = await makeMirror();
+    const rollouts = startCodexRollouts({ store, home });
+    // Codex makes sessions/ with a new home's first thread, after the mirror started.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    write(join(DAY, fileName(THREAD_A)), meta(THREAD_A));
+    try {
+      const mirrored = async (name, path) => {
+        const deadline = Date.now() + 3_000;
+        while (Date.now() < deadline) {
+          const kept = (await store.list()).find((row) => row.name === name);
+          if (kept && kept.size === statSync(join(home, path)).size) return (await store.read(name)).equals(read(home, path));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        return false;
+      };
+      assert.ok(await mirrored(fileName(THREAD_A), join(DAY, fileName(THREAD_A))));
+      appendFileSync(join(home, DAY, fileName(THREAD_A)), '{"type":"turn"}\n');
+      assert.ok(await mirrored(fileName(THREAD_A), join(DAY, fileName(THREAD_A))));
+      const nextDay = join("sessions/2026/09/29", fileName(THREAD_B));
+      write(nextDay, meta(THREAD_B));
+      assert.ok(await mirrored(fileName(THREAD_B), nextDay));
+    } finally {
+      await rollouts.close();
+    }
+  });
+
+  test("flush mirrors a thread's files before it returns, and restore writes them back", async () => {
+    const { store, home, write } = await makeMirror();
+    mkdirSync(join(home, DAY), { recursive: true });
+    const rollouts = startCodexRollouts({ store, home });
+    try {
+      write(join(DAY, fileName(THREAD_A)), `${meta(THREAD_A)}{"turn":1}\n`);
+      write(join(DAY, fileName(THREAD_A, REVISION)), meta(THREAD_A, THREAD_A));
+      await rollouts.flush(THREAD_A);
+      assert.deepEqual((await store.list()).map(({ name }) => name).sort(), [fileName(THREAD_A), fileName(THREAD_A, REVISION)].sort());
+      const fresh = mkdtempSync(join(tmpdir(), "alasio-rollouts-"));
+      homes.push(fresh);
+      const restored = startCodexRollouts({ store, home: fresh });
+      try {
+        assert.equal((await restored.restore([THREAD_A])).length, 2);
+      } finally {
+        await restored.close();
+      }
+    } finally {
+      await rollouts.close();
+    }
   });
 
   test("restore leaves a file present, or present compressed, as it is", async () => {

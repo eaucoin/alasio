@@ -18,7 +18,7 @@ import pg from "pg";
 import { AppServerClient } from "../src/codex/app-server/client.js";
 import { buildCodexEnv } from "../src/codex/env.js";
 import { listRolloutFiles } from "../src/codex/rollouts/files.js";
-import { mirrorRollouts } from "../src/codex/rollouts/mirror.js";
+import { startCodexRollouts } from "../src/codex/rollouts/index.js";
 import { restoreRollouts } from "../src/codex/rollouts/restore.js";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.js";
 import { createCodexSessionApi } from "../src/codex/sessions.js";
@@ -125,6 +125,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
   let database;
   let pool;
   let client;
+  let rollouts;
   const savedCodexHome = process.env.CODEX_HOME;
 
   before(async () => {
@@ -135,6 +136,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
   });
 
   after(async () => {
+    await rollouts?.close();
     client?.stop();
     await pool?.end();
     await database?.stop();
@@ -167,9 +169,27 @@ describe("Codex sessions through the app-server", { skip }, () => {
       },
     });
 
+    // Mirrored from the start, as alasio does.
+    const home = process.env.CODEX_HOME;
+    const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });
+    await store.ensureSchema();
+    rollouts = startCodexRollouts({ store, home });
+    /** Whether the store holds exactly what a thread's files hold now. */
+    const heldExactly = async (id) => {
+      const files = listRolloutFiles(home).filter((file) => file.name.includes(id));
+      for (const file of files) {
+        if (!(await store.read(file.name)).equals(readFileSync(join(home, file.path)))) return false;
+      }
+      return files.length > 0;
+    };
+
     const threadId = await client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: {} });
-    await runTurn(threadId, "remember the heron", workingDirectory);
-    await runTurn(threadId, "and now the crane", workingDirectory);
+    for (const prompt of ["remember the heron", "and now the crane"]) {
+      await runTurn(threadId, prompt, workingDirectory);
+      // What Codex wrote by the turn's end is all in the store once a flush returns.
+      await rollouts.flush(threadId);
+      assert.ok(await heldExactly(threadId));
+    }
 
     assert.equal(await sessions.getTotalSessionPages(), 1);
     const [listed] = await sessions.listSessions(1);
@@ -192,15 +212,14 @@ describe("Codex sessions through the app-server", { skip }, () => {
     assert.deepEqual(forks, ["conversation-1"]);
     assert.equal(await sessions.createForkedSession(threadId, "no-such-turn", { threadKey: "conversation-1" }), null);
 
-    // The store keeps every file.
-    const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });
-    await store.ensureSchema();
-    const home = process.env.CODEX_HOME;
-    const known = new Map();
-    await mirrorRollouts({ store, home, known });
+    // The fork is mirrored too, unasked: the watcher reports its file.
+    const deadline = Date.now() + 3_000;
+    while (!(await heldExactly(forkedId)) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(await heldExactly(forkedId));
     const files = listRolloutFiles(home);
     assert.equal(files.length, 2);
     const originals = new Map(files.map((file) => [file.path, { bytes: readFileSync(join(home, file.path)), modifiedMs: file.modifiedMs }]));
+    await rollouts.close();
 
     // Lose everything: the files, and every index Codex made from them.
     client.stop();
