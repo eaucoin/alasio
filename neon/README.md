@@ -7,6 +7,7 @@ mindmap
       it is frozen at neon release-9129 and compute release-compute-9073 on Postgres 17.5 with every image pinned by digest so nothing about it changes unless alasio changes it
       src/neon/stack.js brings it up before alasio serves anything and Docker's restart policies keep every service running across crashes and reboots
       everything talks on the stack's private network and only the compute is published on 127.0.0.1 port 55433
+      that network's Linux bridge is named alasio-neon0 for alasio's own stack and a name derived from the project for a test stack so the host firewall rule letting session hosts reach the alasio gateway names an interface that outlives the network being recreated
     Services
       seaweedfs is the S3 Neon stores into with one bucket `neon` versioned and fsynced on one volume and seaweedfs-init makes that idempotently on every start and also makes the unversioned `sessions` bucket the session-filesystem volumes' data lives in
       seaweedfs-lifecycle-init expires replaced object versions after seven days as Neon's own point-in-time window does and seaweedfs-lifecycle runs that rule every six hours because SeaweedFS applies lifecycle rules only when asked

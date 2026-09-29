@@ -32,6 +32,10 @@ export const BUCKET = "neon";
 // process points its ALASIO_SANDBOX_*_FILE knobs at (see src/sandbox/config.js).
 export const BUCKET_SESSIONS = "sessions";
 export const DEFAULT_COMPUTE_PORT = 55433;
+// The Linux bridge the stack's network gets, named rather than Docker's br-<id> so a
+// host firewall rule for session hosts reaching the alasio gateway survives the network
+// being recreated. A test stack running alongside gets its own (stack.js).
+export const DEFAULT_BRIDGE = "alasio-neon0";
 
 const CONTROL_DIR = dirname(fileURLToPath(import.meta.url));
 export const COMPOSE_FILE = resolve(CONTROL_DIR, "..", "compose.yml");
@@ -157,7 +161,7 @@ export function controlRevision(dir = CONTROL_DIR) {
 }
 
 /** Renders every service's configuration from the secrets. */
-function renderConfig(layout, secrets, { computePort }) {
+function renderConfig(layout, secrets, { computePort, bridgeName }) {
   const privateKeyPem = readFileSync(layout.privateKey, "utf8");
   const token = (scope, tenantId) => signToken(privateKeyPem, scope, tenantId);
 
@@ -245,6 +249,7 @@ function renderConfig(layout, secrets, { computePort }) {
     ALASIO_NEON_CONTROL_SOURCE: CONTROL_DIR,
     ALASIO_NEON_CONTROL_REVISION: controlRevision(),
     ALASIO_NEON_COMPUTE_PORT: String(computePort),
+    ALASIO_NEON_BRIDGE: bridgeName,
     ALASIO_NEON_UID: String(process.getuid()),
     ALASIO_NEON_GID: String(process.getgid()),
     NEON_S3_ACCESS_KEY: secrets.s3.neon.accessKey,
@@ -276,10 +281,13 @@ function renderConfig(layout, secrets, { computePort }) {
  * Makes the stack's secrets if it has none, and renders its configuration.
  * Returns the layout.
  */
-export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT } = {}) {
+export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT, bridgeName = DEFAULT_BRIDGE } = {}) {
+  if (!/^[A-Za-z0-9_.-]{1,15}$/.test(bridgeName)) {
+    throw new Error(`bridge name must be 1 to 15 of [A-Za-z0-9_.-] (a Linux interface name), got ${JSON.stringify(bridgeName)}`);
+  }
   const layout = neonLayout(stateDir);
   mkdirSync(layout.root, { recursive: true });
   const secrets = ensureSecrets(layout);
-  renderConfig(layout, secrets, { computePort });
+  renderConfig(layout, secrets, { computePort, bridgeName });
   return layout;
 }

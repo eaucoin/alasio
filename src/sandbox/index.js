@@ -83,6 +83,14 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       sessionHostImage: config.host.sessionHostImage,
     },
   });
+  // Where session hosts reach the gateway: the configured address, else the network's
+  // own gateway (the host's address on that bridge), looked up when the gateway starts
+  // so a network Docker recreates on another subnet needs no configuration change.
+  const gatewayAddress = { ip: config.gateway.ip, port: config.gateway.port };
+  const gatewayUrl = () => {
+    if (!gatewayAddress.ip) throw new Error("the session gateway's address is not known until startGateway() has run");
+    return `http://${gatewayAddress.ip}:${gatewayAddress.port}`;
+  };
   const host = new SessionHost({
     docker,
     config: {
@@ -94,7 +102,7 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       pidsLimit: config.host.pidsLimit,
       hostPublicIp: config.host.hostPublicIp,
       metadataPasswordFile: config.metadata.passwordFile,
-      gateway: { ip: config.gateway.ip, port: config.gateway.port },
+      gateway: gatewayAddress,
     },
   });
   // A ChatGPT login (openaiChatgptFile) takes precedence over an API-key file: Codex's
@@ -118,20 +126,33 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
     },
   });
 
-  const gatewayUrl = `http://${config.gateway.ip}:${config.gateway.port}`;
-
+  let closeGateway = null;
   return {
     enabled: true,
     engine,
     volumes,
     host,
     gateway,
-    gatewayUrl,
+    get gatewayUrl() {
+      return gatewayUrl();
+    },
 
     /** Start the credential gateway; the app calls this once at startup. */
     async startGateway() {
-      const { port } = await gateway.listen(config.gateway.port);
-      log.info(`session filesystems enabled; gateway on ${config.gateway.port} (bound ${port})`);
+      if (!gatewayAddress.ip) {
+        const { stdout } = await docker.cli(["network", "inspect", config.host.network, "--format", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"]);
+        gatewayAddress.ip = stdout.trim().split(/\s+/).find((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip)) ?? null;
+        if (!gatewayAddress.ip) throw new Error(`could not find an IPv4 gateway on docker network ${config.host.network}`);
+      }
+      const { port, close } = await gateway.listen(config.gateway.port);
+      closeGateway = close;
+      log.info(`session filesystems enabled; gateway on ${port}, reached by session hosts at ${gatewayUrl()}`);
+    },
+
+    /** Stop the credential gateway listening; a no-op when it never started. */
+    async stopGateway() {
+      await closeGateway?.();
+      closeGateway = null;
     },
 
     /**
@@ -149,10 +170,10 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
         volumes.markFormatted(volumeId);
       }
       const bearer = gateway.issueBearer(volumeId);
-      await host.writeAgentEnv(volumeId, buildEnv({ bearer, gatewayUrl }));
+      await host.writeAgentEnv(volumeId, buildEnv({ bearer, gatewayUrl: gatewayUrl() }));
       return {
         bearer,
-        gatewayUrl,
+        gatewayUrl: gatewayUrl(),
         baymaHttpUrl: "http://127.0.0.1:7290/mcp",
         execCommand: (argv, env) => host.execCommand(volumeId, argv, env),
         spawn: (argv, env) => host.spawn(volumeId, argv, env),

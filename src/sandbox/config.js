@@ -52,7 +52,8 @@ export function loadSandboxConfig(env = process.env) {
       hostPublicIp: env.ALASIO_SANDBOX_HOST_PUBLIC_IP?.trim() || null,
     },
     gateway: {
-      ip: required(env, "ALASIO_SANDBOX_GATEWAY_IP"),
+      // Optional: unset, the gateway address is the network's own gateway (index.js).
+      ip: env.ALASIO_SANDBOX_GATEWAY_IP?.trim() || null,
       port: int("ALASIO_SANDBOX_GATEWAY_PORT", 8080),
       // The upstreams and login tokens. A missing token leaves the gateway live but
       // answering 503 until the operator supplies one (gateway.js); it is not required.

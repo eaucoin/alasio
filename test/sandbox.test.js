@@ -8,6 +8,7 @@ import { sandboxClaudeEnv, sandboxMcpServers } from "../src/harness/claude/sandb
 import { sandboxCodexConfig, sandboxCodexEnv, sandboxCodexSpawnProcess } from "../src/codex/sandbox.js";
 import { startCodexTransportThread } from "../src/codex/transport.js";
 import { SessionGateway } from "../src/sandbox/gateway.js";
+import { createSandbox } from "../src/sandbox/index.js";
 import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.js";
@@ -210,6 +211,35 @@ test("the gateway sends a ChatGPT login to the Codex backend path with its accou
   assert.equal(seen.at(-1).path, "/backend-api/codex/responses"); // the backend's own path
   assert.equal(seen.at(-1).auth, "Bearer chatgpt-access-token"); // the real login, not the bearer
   assert.equal(seen.at(-1).accountId, "acct-1");
+});
+
+test("without a configured address, session hosts reach the gateway at their network's own gateway", async () => {
+  const calls = [];
+  const docker = {
+    cli: async (args) => {
+      calls.push(args);
+      return { stdout: "172.31.0.1 \n", stderr: "" };
+    },
+  };
+  const sandbox = createSandbox({
+    config: {
+      metadata: { url: "redis://valkey:6379", databases: 16, passwordFile: "/dev/null" },
+      s3: { endpoint: "http://seaweedfs:8333", bucket: "sessions", accessKey: "k", secretKey: "s" },
+      host: { network: "alasio-neon_default", agentImage: "a", sessionHostImage: "h", memoryMb: 1, cpus: 1, pidsLimit: 1, cacheMb: 1, hostPublicIp: null },
+      gateway: { ip: null, port: 0, anthropicUpstream: "http://127.0.0.1:1", openaiUpstream: "http://127.0.0.1:1" },
+    },
+    store: { sessionVolumes: {} },
+    docker,
+  });
+  assert.throws(() => sandbox.gatewayUrl, /not known until startGateway/);
+  await sandbox.startGateway();
+  try {
+    assert.deepEqual(calls[0].slice(0, 3), ["network", "inspect", "alasio-neon_default"]);
+    assert.equal(sandbox.gatewayUrl, "http://172.31.0.1:0");
+    assert.equal(sandbox.host.config.gateway.ip, "172.31.0.1"); // what a session host's firewall allows
+  } finally {
+    await sandbox.stopGateway();
+  }
 });
 
 test("the gateway returns 503 until a model login is configured, mechanism still live", async () => {

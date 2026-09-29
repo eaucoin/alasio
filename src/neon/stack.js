@@ -9,12 +9,13 @@
  * sure they are up, as each alasio start does.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 import pg from "pg";
 
-import { COMPOSE_FILE, DEFAULT_COMPUTE_PORT, setupNeon } from "../../neon/control/setup.js";
+import { COMPOSE_FILE, DEFAULT_BRIDGE, DEFAULT_COMPUTE_PORT, setupNeon } from "../../neon/control/setup.js";
 import { NeonRolloutStore } from "../codex/rollouts/store.js";
 import { NeonSessionStore } from "../harness/claude/session-store.js";
 import { createLogger } from "../shared/log.js";
@@ -23,6 +24,15 @@ const log = createLogger("neon");
 const run = promisify(execFile);
 
 export const NEON_PROJECT = "alasio-neon";
+
+/**
+ * The bridge a project's network gets: the stable name for alasio's own stack, and one
+ * derived from the project for any other (a test stack), since two bridges cannot share
+ * a name and Linux caps interface names at fifteen characters.
+ */
+export function neonBridgeName(project) {
+  return project === NEON_PROJECT ? DEFAULT_BRIDGE : `qn${createHash("sha256").update(project).digest("hex").slice(0, 12)}`;
+}
 
 /** How long the whole stack may take to come up healthy, from nothing. */
 const STACK_UP_TIMEOUT_SECONDS = 600;
@@ -34,7 +44,7 @@ export function composeCommand(layout, project = NEON_PROJECT) {
 
 /** Pulls every image the stack runs, so its first start waits on none. */
 export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
-  const layout = setupNeon(stateDir);
+  const layout = setupNeon(stateDir, { bridgeName: neonBridgeName(project) });
   await run("docker", [...composeCommand(layout, project), "pull", "--quiet"], { maxBuffer: 16 * 1024 * 1024 });
 }
 
@@ -44,7 +54,7 @@ export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
  * `project` and `computePort` exist for tests, which run their own stack.
  */
 export async function startNeon({ stateDir, project = NEON_PROJECT, computePort = DEFAULT_COMPUTE_PORT }) {
-  const layout = setupNeon(stateDir, { computePort });
+  const layout = setupNeon(stateDir, { computePort, bridgeName: neonBridgeName(project) });
   log.info(`bringing up ${project}`);
   // --remove-orphans: a service no longer in compose.yml goes with the next start.
   await run("docker", [...composeCommand(layout, project), "up", "--detach", "--wait", "--remove-orphans", "--wait-timeout", String(STACK_UP_TIMEOUT_SECONDS)], {

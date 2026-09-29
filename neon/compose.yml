@@ -371,3 +371,11 @@ services:
       timeout: 5s
       retries: 60
       start_period: 20s
+
+networks:
+  # The stack's private network, on a named Linux bridge (setup.js DEFAULT_BRIDGE for
+  # alasio's own stack) so the host firewall rule that lets session hosts reach the alasio
+  # gateway names an interface that outlives the network being recreated.
+  default:
+    driver_opts:
+      com.docker.network.bridge.name: ${ALASIO_NEON_BRIDGE}
