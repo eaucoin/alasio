@@ -46,6 +46,25 @@ function oauthTokenFromFile(path) {
   };
 }
 
+/**
+ * The access token and account id from a local `codex` ChatGPT login (auth.json's
+ * `tokens`), read fresh each call so a token Codex refreshes on disk is picked up; null
+ * when absent, unreadable, or not a ChatGPT login.
+ */
+function chatgptLoginFromFile(path) {
+  return () => {
+    try {
+      const tokens = JSON.parse(readFileSync(path, "utf8"))?.tokens;
+      const credential = tokens?.access_token;
+      if (typeof credential !== "string" || !credential) return null;
+      const headers = typeof tokens.account_id === "string" && tokens.account_id ? { "chatgpt-account-id": tokens.account_id } : {};
+      return { credential, headers };
+    } catch {
+      return null;
+    }
+  };
+}
+
 export function createSandbox({ config, store, docker = createDocker() } = {}) {
   if (!config) return null;
   const engine = createMetadataEngine(config.metadata);
@@ -78,6 +97,15 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       gateway: { ip: config.gateway.ip, port: config.gateway.port },
     },
   });
+  // A ChatGPT login (openaiChatgptFile) takes precedence over an API-key file: Codex's
+  // /v1/responses is served by the ChatGPT Codex backend under /backend-api/codex.
+  const openai = config.gateway.openaiChatgptFile
+    ? {
+        upstream: config.gateway.chatgptUpstream,
+        credentialSource: chatgptLoginFromFile(config.gateway.openaiChatgptFile),
+        rewritePath: (path) => path.replace(/^\/v1(?=\/|$)/, "/backend-api/codex"),
+      }
+    : { upstream: config.gateway.openaiUpstream, credentialSource: tokenFromFile(config.gateway.openaiTokenFile) };
   // A subscription OAuth login (anthropicOAuthFile) takes precedence over an API-key file
   // and is injected as a Bearer; either is read fresh per request, neither is copied.
   const anthropic = config.gateway.anthropicOAuthFile
@@ -86,7 +114,7 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
   const gateway = new SessionGateway({
     providers: {
       anthropic,
-      openai: { upstream: config.gateway.openaiUpstream, credentialSource: tokenFromFile(config.gateway.openaiTokenFile) },
+      openai,
     },
   });
 

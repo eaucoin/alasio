@@ -36,10 +36,21 @@ const PROVIDER_SPECS = {
     },
   },
   openai: {
-    allow: [/^\/v1\/responses(?:\?|$)/, /^\/v1\/chat\/completions(?:\?|$)/],
+    allow: [/^\/v1\/responses(?:\?|$)/, /^\/v1\/chat\/completions(?:\?|$)/, /^\/v1\/models(?:\?|$)/],
     inject: (headers, credential) => { delete headers["x-api-key"]; headers.authorization = `Bearer ${credential}`; },
   },
 };
+
+/**
+ * A credential source returns the credential as a string, or `{ credential, headers }`
+ * when the login also needs headers of its own (a ChatGPT login's account id).
+ */
+function resolveCredential(source) {
+  const value = source();
+  if (!value) return { credential: null, headers: {} };
+  if (typeof value === "string") return { credential: value, headers: {} };
+  return { credential: value.credential ?? null, headers: value.headers ?? {} };
+}
 
 const bearerOf = (req) =>
   (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "") || (req.headers["x-api-key"] ?? "");
@@ -58,7 +69,16 @@ export class SessionGateway {
     this.providers = Object.entries(providers).map(([name, p]) => {
       const spec = PROVIDER_SPECS[name];
       if (!spec) throw new Error(`unknown gateway provider: ${name}`);
-      return { name, spec, upstream: new URL(p.upstream), credentialSource: p.credentialSource, oauth: p.oauth ?? false };
+      return {
+        name,
+        spec,
+        upstream: new URL(p.upstream),
+        credentialSource: p.credentialSource,
+        oauth: p.oauth ?? false,
+        // Maps the path the harness calls to the upstream's own (a ChatGPT login's
+        // Responses API lives under /backend-api/codex rather than /v1).
+        rewritePath: p.rewritePath ?? ((path) => path),
+      };
     });
     this.newBearer = newBearer;
   }
@@ -82,18 +102,20 @@ export class SessionGateway {
     if (!this.#bearers.has(bearerOf(req))) { res.writeHead(401).end("unknown session bearer"); return; }
     const provider = this.providers.find((p) => p.spec.allow.some((re) => re.test(req.url)));
     if (!provider) { res.writeHead(403).end("path not allowed"); return; }
-    const credential = provider.credentialSource();
+    const { credential, headers: loginHeaders } = resolveCredential(provider.credentialSource);
     if (!credential) { res.writeHead(503).end(`${provider.name} login not configured`); return; }
     const headers = { ...req.headers, host: provider.upstream.host };
     delete headers["x-api-key"];
     delete headers.authorization;
     provider.spec.inject(headers, credential, provider.oauth);
+    Object.assign(headers, loginHeaders);
+    const path = provider.rewritePath(req.url);
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const client = provider.upstream.protocol === "https:" ? httpsClient : httpClient;
       const upstreamReq = client.request(
-        { hostname: provider.upstream.hostname, port: provider.upstream.port, path: req.url, method: req.method, headers },
+        { hostname: provider.upstream.hostname, port: provider.upstream.port, path, method: req.method, headers },
         (up) => { res.writeHead(up.statusCode ?? 502, up.headers); up.pipe(res); },
       );
       upstreamReq.on("error", (e) => { res.writeHead(502).end(String(e.message)); });

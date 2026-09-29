@@ -121,7 +121,12 @@ let upstreamPort;
 const seen = [];
 before(async () => {
   upstream = createServer((req, res) => {
-    seen.push({ path: req.url, apiKey: req.headers["x-api-key"] ?? null, auth: req.headers.authorization ?? null });
+    seen.push({
+      path: req.url,
+      apiKey: req.headers["x-api-key"] ?? null,
+      auth: req.headers.authorization ?? null,
+      accountId: req.headers["chatgpt-account-id"] ?? null,
+    });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
   });
@@ -186,6 +191,25 @@ test("the gateway injects a subscription OAuth login as a Bearer, not an x-api-k
   assert.equal((await call(gw, { path: "/v1/messages", bearer })).status, 200);
   assert.equal(seen.at(-1).auth, "Bearer oauth-access-token"); // the OAuth token as a Bearer
   assert.equal(seen.at(-1).apiKey, null); // never as x-api-key
+});
+
+test("the gateway sends a ChatGPT login to the Codex backend path with its account id", async () => {
+  const gw = new SessionGateway({
+    providers: {
+      openai: {
+        upstream: `http://127.0.0.1:${upstreamPort}`,
+        credentialSource: () => ({ credential: "chatgpt-access-token", headers: { "chatgpt-account-id": "acct-1" } }),
+        rewritePath: (path) => path.replace(/^\/v1(?=\/|$)/, "/backend-api/codex"),
+      },
+    },
+    newBearer: () => "bearer-chatgpt",
+  });
+  const bearer = gw.issueBearer("session-chatgpt");
+  seen.length = 0;
+  assert.equal((await call(gw, { path: "/v1/responses", bearer })).status, 200);
+  assert.equal(seen.at(-1).path, "/backend-api/codex/responses"); // the backend's own path
+  assert.equal(seen.at(-1).auth, "Bearer chatgpt-access-token"); // the real login, not the bearer
+  assert.equal(seen.at(-1).accountId, "acct-1");
 });
 
 test("the gateway returns 503 until a model login is configured, mechanism still live", async () => {

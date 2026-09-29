@@ -63,6 +63,10 @@ export function loadSandboxConfig(env = process.env) {
       anthropicOAuthFile: env.ALASIO_SANDBOX_ANTHROPIC_OAUTH_FILE?.trim() || null,
       openaiUpstream: env.ALASIO_SANDBOX_OPENAI_UPSTREAM?.trim() || "https://api.openai.com",
       openaiTokenFile: env.ALASIO_SANDBOX_OPENAI_TOKEN_FILE?.trim() || null,
+      // A ChatGPT login instead of an API key: the local `codex` auth.json, read live and
+      // sent to the ChatGPT Codex backend with its account id (index.js, gateway.js).
+      openaiChatgptFile: env.ALASIO_SANDBOX_OPENAI_CHATGPT_FILE?.trim() || null,
+      chatgptUpstream: env.ALASIO_SANDBOX_CHATGPT_UPSTREAM?.trim() || "https://chatgpt.com",
     },
   };
 }

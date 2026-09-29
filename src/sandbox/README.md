@@ -22,6 +22,7 @@ mindmap
       gateway is the credential boundary and the one network peer a sandboxed agent always reaches it holds the real login issues a revocable per-session bearer allows only the providers API paths and swaps the bearer for the credential
       a bearer is not a credential valid only here only for its session and revoked when the session ends so a leaked or echoed bearer is worthless which is why the gateway not credential masking is the design
       one address serves both providers by path Claude Code messages Codex responses and a provider whose login is unset answers 503 while validation and the path allowlist stay live
+      a login is an API key or the local subscription login read live on every request and never copied the claude OAuth token goes out as a Bearer and the codex ChatGPT token goes to the ChatGPT Codex backend under /backend-api/codex with its account id
     Harness adapters
       a folder workspace runs the CLI on the host unchanged a session-filesystem workspace runs it inside the sandbox in /workspace on the gateway with bayma reached over http not launched as a process
       Claude Code runs through the SDK's spawnClaudeCodeProcess hook in harness/claude/sandbox so the host binary path is dropped and claude runs inside
