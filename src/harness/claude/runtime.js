@@ -30,6 +30,7 @@ import {
   projectResultMessage,
 } from "./event-projection.js";
 import { claudeMcpServers } from "./mcp.js";
+import { sandboxSpawn } from "./sandbox.js";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.js";
 import {
   buildClaudeUserMessage,
@@ -95,7 +96,8 @@ export function buildClaudeQueryOptions({
     mcpServers,
   };
   if (sandboxSession) {
-    options.spawnClaudeCodeProcess = sandboxSession.spawn;
+    // Run `claude` inside the sandbox; the SDK's host binary path is dropped.
+    options.spawnClaudeCodeProcess = sandboxSpawn(sandboxSession);
   }
   // Every transcript write is mirrored to the store as it is written, not at
   // the end of a turn, which can run for hours; a resume still runs from the

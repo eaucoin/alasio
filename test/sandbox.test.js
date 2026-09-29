@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { after, before, test } from "node:test";
 
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.js";
-import { sandboxClaudeEnv, sandboxMcpServers, sandboxSpawn } from "../src/harness/claude/sandbox.js";
+import { sandboxClaudeEnv, sandboxMcpServers } from "../src/harness/claude/sandbox.js";
 import { SessionGateway } from "../src/sandbox/gateway.js";
 import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
@@ -59,7 +59,7 @@ test("Claude runs in /workspace inside the sandbox, on the gateway, with bayma o
   const session = { spawn: (argv, e) => { spawned.push({ argv, e }); return { pid: 1 }; }, baymaHttpUrl: "http://127.0.0.1:7290/mcp" };
   const opts = buildClaudeQueryOptions({
     workingDirectory: "sessionfs:fs-abc123", claudeEnv: env, mcpServers: sandboxMcpServers(session.baymaHttpUrl),
-    controller: new AbortController(), hooks: {}, sandboxSession: { spawn: sandboxSpawn(session), baymaHttpUrl: session.baymaHttpUrl },
+    controller: new AbortController(), hooks: {}, sandboxSession: session,
   });
   assert.equal(opts.cwd, "/workspace"); // not the sentinel, not the host
   assert.equal(typeof opts.spawnClaudeCodeProcess, "function");
