@@ -174,6 +174,20 @@ test("the gateway swaps a per-session bearer for the real credential and gates p
   assert.equal((await call(gw, { path: "/v1/messages", bearer })).status, 401); // revoked
 });
 
+test("the gateway injects a subscription OAuth login as a Bearer, not an x-api-key", async () => {
+  const gw = new SessionGateway({
+    providers: {
+      anthropic: { upstream: `http://127.0.0.1:${upstreamPort}`, credentialSource: () => "oauth-access-token", oauth: true },
+    },
+    newBearer: () => "bearer-oauth",
+  });
+  const bearer = gw.issueBearer("session-oauth");
+  seen.length = 0;
+  assert.equal((await call(gw, { path: "/v1/messages", bearer })).status, 200);
+  assert.equal(seen.at(-1).auth, "Bearer oauth-access-token"); // the OAuth token as a Bearer
+  assert.equal(seen.at(-1).apiKey, null); // never as x-api-key
+});
+
 test("the gateway returns 503 until a model login is configured, mechanism still live", async () => {
   const gw = new SessionGateway({
     providers: { openai: { upstream: `http://127.0.0.1:${upstreamPort}`, credentialSource: () => null } }, // login not configured yet (stubbed)

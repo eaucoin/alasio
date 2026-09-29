@@ -29,6 +29,23 @@ function tokenFromFile(path) {
   };
 }
 
+/**
+ * The access token from a local `claude` credentials JSON (`claudeAiOauth.accessToken`),
+ * read fresh each call so a token Claude Code refreshes on disk is picked up; null when
+ * absent or unreadable. The real login is never copied, only sourced at request time.
+ */
+function oauthTokenFromFile(path) {
+  return () => {
+    if (!path) return null;
+    try {
+      const token = JSON.parse(readFileSync(path, "utf8"))?.claudeAiOauth?.accessToken;
+      return typeof token === "string" && token ? token : null;
+    } catch {
+      return null;
+    }
+  };
+}
+
 export function createSandbox({ config, store, docker = createDocker() } = {}) {
   if (!config) return null;
   const engine = createMetadataEngine(config.metadata);
@@ -61,9 +78,14 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       gateway: { ip: config.gateway.ip, port: config.gateway.port },
     },
   });
+  // A subscription OAuth login (anthropicOAuthFile) takes precedence over an API-key file
+  // and is injected as a Bearer; either is read fresh per request, neither is copied.
+  const anthropic = config.gateway.anthropicOAuthFile
+    ? { upstream: config.gateway.anthropicUpstream, credentialSource: oauthTokenFromFile(config.gateway.anthropicOAuthFile), oauth: true }
+    : { upstream: config.gateway.anthropicUpstream, credentialSource: tokenFromFile(config.gateway.anthropicTokenFile) };
   const gateway = new SessionGateway({
     providers: {
-      anthropic: { upstream: config.gateway.anthropicUpstream, credentialSource: tokenFromFile(config.gateway.anthropicTokenFile) },
+      anthropic,
       openai: { upstream: config.gateway.openaiUpstream, credentialSource: tokenFromFile(config.gateway.openaiTokenFile) },
     },
   });

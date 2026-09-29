@@ -58,6 +58,9 @@ export function loadSandboxConfig(env = process.env) {
       // answering 503 until the operator supplies one (gateway.js); it is not required.
       anthropicUpstream: env.ALASIO_SANDBOX_ANTHROPIC_UPSTREAM?.trim() || "https://api.anthropic.com",
       anthropicTokenFile: env.ALASIO_SANDBOX_ANTHROPIC_TOKEN_FILE?.trim() || null,
+      // A subscription login instead of an API key: the local `claude` credentials JSON,
+      // read live so its refreshes are picked up and injected as a Bearer (gateway.js).
+      anthropicOAuthFile: env.ALASIO_SANDBOX_ANTHROPIC_OAUTH_FILE?.trim() || null,
       openaiUpstream: env.ALASIO_SANDBOX_OPENAI_UPSTREAM?.trim() || "https://api.openai.com",
       openaiTokenFile: env.ALASIO_SANDBOX_OPENAI_TOKEN_FILE?.trim() || null,
     },

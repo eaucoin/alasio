@@ -27,7 +27,13 @@ const log = createLogger("session-gateway");
 const PROVIDER_SPECS = {
   anthropic: {
     allow: [/^\/api\/hello$/, /^\/v1\/messages(?:\?|$)/, /^\/v1\/messages\/count_tokens(?:\?|$)/],
-    inject: (headers, credential) => { delete headers.authorization; headers["x-api-key"] = credential; },
+    // An API key travels as x-api-key; a subscription OAuth token (from the local
+    // `claude` login) travels as a Bearer, the shape Claude Code itself already sends,
+    // so its anthropic-beta oauth header passes through unchanged.
+    inject: (headers, credential, oauth) => {
+      if (oauth) { delete headers["x-api-key"]; headers.authorization = `Bearer ${credential}`; }
+      else { delete headers.authorization; headers["x-api-key"] = credential; }
+    },
   },
   openai: {
     allow: [/^\/v1\/responses(?:\?|$)/, /^\/v1\/chat\/completions(?:\?|$)/],
@@ -52,7 +58,7 @@ export class SessionGateway {
     this.providers = Object.entries(providers).map(([name, p]) => {
       const spec = PROVIDER_SPECS[name];
       if (!spec) throw new Error(`unknown gateway provider: ${name}`);
-      return { name, spec, upstream: new URL(p.upstream), credentialSource: p.credentialSource };
+      return { name, spec, upstream: new URL(p.upstream), credentialSource: p.credentialSource, oauth: p.oauth ?? false };
     });
     this.newBearer = newBearer;
   }
@@ -81,7 +87,7 @@ export class SessionGateway {
     const headers = { ...req.headers, host: provider.upstream.host };
     delete headers["x-api-key"];
     delete headers.authorization;
-    provider.spec.inject(headers, credential);
+    provider.spec.inject(headers, credential, provider.oauth);
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
