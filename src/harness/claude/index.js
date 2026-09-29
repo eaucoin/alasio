@@ -11,9 +11,9 @@ import { createClaudeSessionApi } from "./sessions.js";
  * and each mounted session is served by one long-lived Claude Code process
  * that every turn is pushed into.
  */
-export function createClaudeHarness({ workingDirectory, sessionStore = null, sessionApi = null, queryFactory = undefined }) {
+export function createClaudeHarness({ workingDirectory, sessionStore = null, sandbox = null, sessionApi = null, queryFactory = undefined }) {
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory, store: sessionStore });
-  const liveSessions = createClaudeLiveSessions({ workingDirectory, sessions, sessionStore, queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory, sessions, sessionStore, sandbox, queryFactory });
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),

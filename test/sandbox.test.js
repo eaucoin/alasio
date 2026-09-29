@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { after, before, test } from "node:test";
 
+import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.js";
+import { sandboxClaudeEnv, sandboxMcpServers, sandboxSpawn } from "../src/harness/claude/sandbox.js";
 import { SessionGateway } from "../src/sandbox/gateway.js";
 import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
@@ -42,6 +44,33 @@ test("the redis metadata engine builds per-volume URLs and rejects others", () =
   assert.throws(() => engine.metaUrl(4096), /out of range/);
   assert.throws(() => createMetadataEngine({ url: "postgres://pg/db", databases: 16 }), /unsupported/);
   assert.throws(() => createMetadataEngine({ url: "redis://x", databases: 1 }), /databases count/);
+});
+
+test("Claude runs in /workspace inside the sandbox, on the gateway, with bayma over http", () => {
+  const env = sandboxClaudeEnv({ bearer: "bearer-1", gatewayUrl: "http://10.0.0.9:8080" });
+  assert.equal(env.ANTHROPIC_BASE_URL, "http://10.0.0.9:8080");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "bearer-1");
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/home/agent/.claude");
+  assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+  assert.ok(!("ANTHROPIC_API_KEY" in env)); // no host secret carried in
+  assert.deepEqual(sandboxMcpServers("http://127.0.0.1:7290/mcp"), { bayma: { type: "http", url: "http://127.0.0.1:7290/mcp" } });
+
+  const spawned = [];
+  const session = { spawn: (argv, e) => { spawned.push({ argv, e }); return { pid: 1 }; }, baymaHttpUrl: "http://127.0.0.1:7290/mcp" };
+  const opts = buildClaudeQueryOptions({
+    workingDirectory: "sessionfs:fs-abc123", claudeEnv: env, mcpServers: sandboxMcpServers(session.baymaHttpUrl),
+    controller: new AbortController(), hooks: {}, sandboxSession: { spawn: sandboxSpawn(session), baymaHttpUrl: session.baymaHttpUrl },
+  });
+  assert.equal(opts.cwd, "/workspace"); // not the sentinel, not the host
+  assert.equal(typeof opts.spawnClaudeCodeProcess, "function");
+  opts.spawnClaudeCodeProcess({ args: ["--print", "hi"], env: { CLAUDE_CODE_ENTRYPOINT: "sdk" } });
+  assert.deepEqual(spawned[0].argv, ["claude", "--print", "hi"]); // host binary path dropped, runs `claude` inside
+  assert.equal(spawned[0].e.CLAUDE_CODE_ENTRYPOINT, "sdk"); // per-spawn env forwarded
+
+  // A folder workspace keeps the host path and no in-sandbox spawn.
+  const folderOpts = buildClaudeQueryOptions({ workingDirectory: "/home/operator/proj", claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {} });
+  assert.equal(folderOpts.cwd, "/home/operator/proj");
+  assert.equal(folderOpts.spawnClaudeCodeProcess, undefined);
 });
 
 // A stand-in upstream that records the credential each request arrived with, so the

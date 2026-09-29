@@ -72,13 +72,39 @@ export class SessionHost {
     await this.docker.cli(["exec", "-i", sessionHostName(volumeId), "sh", "-c", "cat > /run/agent-env"], { input: lines });
   }
 
-  /** The argv to spawn the harness inside the sandbox; the caller owns the child (the SDK, the app-server). */
-  execCommand(volumeId, argv) {
-    return this.docker.spawnArgs(["exec", "-i", sessionHostName(volumeId), "agent-exec", ...argv]);
+  /**
+   * The argv to spawn the harness inside the sandbox; the caller owns the child (the
+   * SDK, the app-server). `env` is applied to the process inside the sandbox (agent-exec
+   * forwards it), for the harness's per-spawn variables on top of the session's base env.
+   */
+  execCommand(volumeId, argv, env = {}) {
+    const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+    return this.docker.spawnArgs(["exec", "-i", ...envArgs, sessionHostName(volumeId), "agent-exec", ...argv]);
+  }
+
+  /** Spawn the harness inside the sandbox as a long-lived child the caller owns (e.g. the SDK). */
+  spawn(volumeId, argv, env = {}) {
+    const { args } = this.execCommand(volumeId, argv, env);
+    return this.docker.spawn(args, { stdio: ["pipe", "pipe", "pipe"] });
   }
 
   isRunning(volumeId) {
     return this.docker.isRunning(sessionHostName(volumeId));
+  }
+
+  /**
+   * Whether Claude Code's transcript for `sessionId` exists inside the sandbox. The
+   * working directory is always /workspace, so the SDK writes it to a fixed path; alasio
+   * uses this to decide resume vs a fresh id, without writing anything to the host.
+   */
+  async transcriptExists(volumeId, sessionId) {
+    const path = `/home/agent/.claude/projects/-workspace/${sessionId}.jsonl`;
+    try {
+      await this.docker.cli(["exec", sessionHostName(volumeId), "agent-exec", "sh", "-c", `test -f ${path}`]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Stop the session host; its entrypoint checkpoints the sandbox and unmounts the volume. */

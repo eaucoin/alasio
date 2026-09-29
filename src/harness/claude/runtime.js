@@ -77,9 +77,12 @@ export function buildClaudeQueryOptions({
   env = process.env,
   modelChoice = null,
   sessionStore = null,
+  sandboxSession = null,
 }) {
   const options = {
-    cwd: workingDirectory,
+    // A session filesystem runs the CLI inside its gVisor sandbox, where the working
+    // directory is /workspace and the process is spawned through the sandbox (E5).
+    cwd: sandboxSession ? "/workspace" : workingDirectory,
     env: claudeEnv,
     abortController: controller,
     permissionMode: "bypassPermissions",
@@ -91,6 +94,9 @@ export function buildClaudeQueryOptions({
     hooks,
     mcpServers,
   };
+  if (sandboxSession) {
+    options.spawnClaudeCodeProcess = sandboxSession.spawn;
+  }
   // Every transcript write is mirrored to the store as it is written, not at
   // the end of a turn, which can run for hours; a resume still runs from the
   // local transcript in the real Claude home (see session-store.js).

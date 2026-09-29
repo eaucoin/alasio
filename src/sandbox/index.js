@@ -100,7 +100,14 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       }
       const bearer = gateway.issueBearer(volumeId);
       await host.writeAgentEnv(volumeId, buildEnv({ bearer, gatewayUrl }));
-      return { execCommand: (argv) => host.execCommand(volumeId, argv) };
+      return {
+        bearer,
+        gatewayUrl,
+        baymaHttpUrl: "http://127.0.0.1:7290/mcp",
+        execCommand: (argv, env) => host.execCommand(volumeId, argv, env),
+        spawn: (argv, env) => host.spawn(volumeId, argv, env),
+        transcriptExists: (sessionId) => host.transcriptExists(volumeId, sessionId),
+      };
     },
 
     /** A turn or session ended: revoke its bearer, and optionally stop the host (checkpointing it). */

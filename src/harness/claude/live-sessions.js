@@ -20,6 +20,8 @@
 import { randomUUID } from "node:crypto";
 
 import { CLAUDE_HARNESS } from "../names.js";
+import { parseWorkspace } from "../../workspace/kind.js";
+import { sandboxClaudeEnv, sandboxMcpServers } from "./sandbox.js";
 import {
   appendBlock,
   buildClaudeEnv,
@@ -63,8 +65,10 @@ function describeTasks(tasks) {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
-export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, queryFactory = defaultQueryFactory } = {}) {
+export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, sandbox = null, queryFactory = defaultQueryFactory } = {}) {
   const hosts = new Map();
+  const workspace = parseWorkspace(workingDirectory);
+  const sandboxVolumeId = sandbox && workspace?.kind === "sessionfs" ? workspace.volumeId : null;
 
   function closeHost(host, reason) {
     if (host.closed) {
@@ -375,9 +379,25 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
 
   async function startHost(params, key) {
     const { threadKey, resumeSession, persistence } = params;
-    const claudeEnv = buildClaudeEnv();
-    await ensureBaymaReady(claudeEnv);
-    const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
+    // A session filesystem runs Claude Code and bayma inside its gVisor sandbox; a
+    // folder runs them on the host as before.
+    let sandboxSession = null;
+    let claudeEnv;
+    let mcpServers;
+    let resumeExists;
+    if (sandboxVolumeId) {
+      sandboxSession = await sandbox.ensureSession(sandboxVolumeId, sandboxClaudeEnv);
+      claudeEnv = sandboxClaudeEnv({ bearer: sandboxSession.bearer, gatewayUrl: sandboxSession.gatewayUrl });
+      mcpServers = sandboxMcpServers(sandboxSession.baymaHttpUrl);
+      // bayma is the sandbox's init; nothing to ensure on the host. Resume is decided
+      // from the transcript on the volume, not the host home.
+      resumeExists = resumeSession ? await sandboxSession.transcriptExists(resumeSession) : false;
+    } else {
+      claudeEnv = buildClaudeEnv();
+      await ensureBaymaReady(claudeEnv);
+      mcpServers = claudeMcpServers({ threadKey, env: claudeEnv });
+      resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
+    }
     const controller = new AbortController();
     const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
     const host = {
@@ -448,11 +468,12 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
       workingDirectory,
       modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
       claudeEnv,
-      mcpServers: claudeMcpServers({ threadKey, env: claudeEnv }),
+      mcpServers,
       resumeSession,
       resumeExists,
       controller,
       sessionStore,
+      sandboxSession,
       hooks: {
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },
