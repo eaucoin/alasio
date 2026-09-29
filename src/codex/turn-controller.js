@@ -6,6 +6,8 @@ import { CommandHandler } from "../operator/command-handler.js";
 import { sendChooseServicePanel } from "../operator/service-control.js";
 import { sendChooseWorkspacePanel } from "../operator/workspace-control.js";
 import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.js";
+import { sessionFsWorkspace } from "../workspace/kind.js";
+import { newVolumeId } from "../sandbox/names.js";
 import { truncateText } from "../operator/text.js";
 import { StatusReporter } from "./status-reporter.js";
 import { createLogger } from "../shared/log.js";
@@ -13,7 +15,8 @@ import { createLogger } from "../shared/log.js";
 const log = createLogger("codex-turn-controller");
 
 export class TurnController {
-  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null }) {
+  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null, sandbox = null }) {
+    this.sandbox = sandbox;
     this.config = config;
     this.client = client;
     this.store = store;
@@ -34,6 +37,7 @@ export class TurnController {
       switchHarness: (args) => this.switchHarness(args),
       switchWorkspace: (args) => this.switchWorkspace(args),
       createWorkspace: (args) => this.createWorkspace(args),
+      sandboxEnabled: this.sandboxEnabled,
     });
     this.status = new StatusReporter({
       client,
@@ -97,6 +101,7 @@ export class TurnController {
       conversationId,
       chatId,
       workspaceRoot: this.config.workspaceRoot,
+      sandboxEnabled: this.sandboxEnabled,
     });
   }
 
@@ -173,6 +178,34 @@ export class TurnController {
     const previous = this.workingDirectoryFor(conversationId);
     this.store.setWorkingDirectory(conversationId, workingDirectory);
     log.info(`workspace.created conversation=${JSON.stringify(conversationId)} path=${workingDirectory}`);
+    return { switched: true, created: true, previous, workingDirectory };
+  }
+
+  /** Whether this deployment offers session filesystems (the sandbox is configured). */
+  get sandboxEnabled() {
+    return Boolean(this.sandbox);
+  }
+
+  /**
+   * Create and mount a new, empty session filesystem with the chosen internet mode.
+   * The workspace is the sentinel `sessionfs:<volumeId>` (src/workspace/kind.js), so it
+   * parks and restores like any other workspace; its volume and sandbox come up when a
+   * turn first needs them.
+   */
+  async createSessionWorkspace({ conversationId, netMode }) {
+    if (!this.sandbox) {
+      throw new Error("Session filesystems are not enabled on this deployment.");
+    }
+    const blocker = this.describeSwitchBlocker(conversationId);
+    if (blocker) {
+      throw new Error(blocker);
+    }
+    const volumeId = newVolumeId();
+    this.sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none");
+    const workingDirectory = sessionFsWorkspace(volumeId);
+    const previous = this.workingDirectoryFor(conversationId);
+    this.store.setWorkingDirectory(conversationId, workingDirectory);
+    log.info(`workspace.created.sessionfs conversation=${JSON.stringify(conversationId)} volume=${volumeId} net=${netMode}`);
     return { switched: true, created: true, previous, workingDirectory };
   }
 

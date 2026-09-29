@@ -50,6 +50,7 @@ export class TelegramCodexApp {
       workflowWakeEvents: this.workflowWakeEvents,
       isStopping: () => this.isStopping,
       harnesses: this.harnesses,
+      sandbox: this.sandbox,
     });
     this.callbacks = new CallbackHandler({
       authorizer: this.authorizer,

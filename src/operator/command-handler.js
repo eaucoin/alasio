@@ -25,6 +25,7 @@ export class CommandHandler {
     switchHarness = null,
     switchWorkspace = null,
     createWorkspace = null,
+    sandboxEnabled = false,
   }) {
     this.client = client;
     this.config = config;
@@ -37,6 +38,7 @@ export class CommandHandler {
     this.switchHarness = switchHarness;
     this.switchWorkspace = switchWorkspace;
     this.createWorkspace = createWorkspace;
+    this.sandboxEnabled = sandboxEnabled;
   }
 
   configFor(conversationId) {
@@ -102,6 +104,7 @@ export class CommandHandler {
               conversationId,
               chatId,
               workspaceRoot: this.config.workspaceRoot,
+              sandboxEnabled: this.sandboxEnabled,
             });
           }
         },
@@ -123,6 +126,7 @@ export class CommandHandler {
         workspaceRoot: this.config.workspaceRoot,
         switchWorkspace: this.switchWorkspace,
         createWorkspace: this.createWorkspace,
+        sandboxEnabled: this.sandboxEnabled,
       });
       return true;
     }
@@ -139,6 +143,7 @@ export class CommandHandler {
         conversationId,
         chatId,
         workspaceRoot: this.config.workspaceRoot,
+        sandboxEnabled: this.sandboxEnabled,
       });
       return true;
     }

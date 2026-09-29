@@ -102,6 +102,8 @@ export class CallbackHandler {
         action,
         workspaceRoot: this.config.workspaceRoot,
         switchWorkspace: (args) => this.turns.switchWorkspace(args),
+        createSessionWorkspace: (args) => this.turns.createSessionWorkspace(args),
+        sandboxEnabled: this.turns.sandboxEnabled,
         callbackQueryId: callbackQuery.id,
         chatId,
         messageId,

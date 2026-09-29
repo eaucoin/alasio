@@ -43,7 +43,7 @@ function pairs(items) {
  * root (git repositories first) as buttons; anything beyond the button cap is
  * still reachable with `/workspace <name>`.
  */
-export async function buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice = "" }) {
+export async function buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }) {
   const current = resolveWorkingDirectory(store, conversationId);
   const working = activeQueries?.has?.(conversationId) ?? false;
   let candidates = [];
@@ -80,6 +80,9 @@ export async function buildWorkspacePanel({ store, activeQueries, conversationId
     "use",
     { path: candidate.path },
   )));
+  if (sandboxEnabled) {
+    keyboard.push([createButton(store, conversationId, "New empty workspace…", "sessionfs")]);
+  }
   keyboard.push([
     createButton(store, conversationId, "New folder…", "new"),
     createButton(store, conversationId, "Refresh", "refresh"),
@@ -94,8 +97,8 @@ export async function buildWorkspacePanel({ store, activeQueries, conversationId
 /**
  * Reply used whenever a prompt or control arrives before a folder is mounted.
  */
-export async function sendChooseWorkspacePanel({ client, store, activeQueries, conversationId, chatId, workspaceRoot }) {
-  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE });
+export async function sendChooseWorkspacePanel({ client, store, activeQueries, conversationId, chatId, workspaceRoot, sandboxEnabled = false }) {
+  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE, sandboxEnabled });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -144,6 +147,7 @@ export async function handleWorkspaceTextCommand({
   workspaceRoot,
   switchWorkspace,
   createWorkspace,
+  sandboxEnabled = false,
 }) {
   const parsed = parseWorkspaceArgs(args);
   let notice = "";
@@ -152,7 +156,7 @@ export async function handleWorkspaceTextCommand({
   } else if (parsed.action === "create") {
     notice = await applyWorkspaceChange(() => createWorkspace({ conversationId, name: parsed.name }));
   }
-  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice });
+  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -173,6 +177,8 @@ export async function handleWorkspaceControlCallback({
   action,
   workspaceRoot,
   switchWorkspace,
+  createSessionWorkspace = null,
+  sandboxEnabled = false,
   callbackQueryId,
   chatId,
   messageId,
@@ -180,6 +186,37 @@ export async function handleWorkspaceControlCallback({
   const kind = action.kind.slice(WORKSPACE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   const conversationId = action.conversationId;
+  const panel = (notice) => buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
+  if (kind === "sessionfs") {
+    // Offer the internet choice before creating the empty workspace.
+    await client.answerCallbackQuery(callbackQueryId, "Choose internet access.");
+    await editPanel(client, chatId, messageId, {
+      text: [
+        "New empty workspace",
+        "",
+        "An isolated, empty filesystem in a sandbox that sees nothing of the host.",
+        "Choose its internet access:",
+        "",
+        "· No internet — only the model is reachable.",
+        "· Full internet — the public internet is reachable (never the host or other sessions).",
+      ].join("\n"),
+      options: { format: "plain", reply_markup: { inline_keyboard: [[
+        createButton(store, conversationId, "No internet", "sessionfs_create", { net: "none" }),
+        createButton(store, conversationId, "Full internet", "sessionfs_create", { net: "full" }),
+      ], [createButton(store, conversationId, "Back", "refresh")]] } },
+    });
+    return;
+  }
+  if (kind === "sessionfs_create") {
+    if (!createSessionWorkspace) {
+      await client.answerCallbackQuery(callbackQueryId, "Session filesystems are not enabled.");
+      return;
+    }
+    const notice = await applyWorkspaceChange(() => createSessionWorkspace({ conversationId, netMode: payload.net === "full" ? "full" : "none" }));
+    await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
+    await editPanel(client, chatId, messageId, await panel(notice));
+    return;
+  }
   if (kind === "close") {
     await client.answerCallbackQuery(callbackQueryId, "Closed.");
     try {
@@ -196,7 +233,7 @@ export async function handleWorkspaceControlCallback({
   }
   if (kind === "refresh") {
     await client.answerCallbackQuery(callbackQueryId, "Refreshed.");
-    await editPanel(client, chatId, messageId, await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot }));
+    await editPanel(client, chatId, messageId, await panel(""));
     return;
   }
   if (kind === "use") {
@@ -206,7 +243,7 @@ export async function handleWorkspaceControlCallback({
     }
     const notice = await applyWorkspaceChange(() => switchWorkspace({ conversationId, target: payload.path }));
     await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
-    await editPanel(client, chatId, messageId, await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice }));
+    await editPanel(client, chatId, messageId, await panel(notice));
     return;
   }
   await client.answerCallbackQuery(callbackQueryId, "Unknown action.");
