@@ -1,5 +1,6 @@
 import { TurnController } from "../codex/turn-controller.js";
 import { adoptTranscripts } from "../harness/claude/transcripts.js";
+import { createSandbox } from "../sandbox/index.js";
 import { createHarnessRegistry } from "../harness/index.js";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.js";
 import { SqliteStore } from "../persistence/store.js";
@@ -31,10 +32,13 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
+    // Session filesystems, off unless configured (createSandbox returns null then).
+    this.sandbox = config.sandbox ?? createSandbox({ config: config.sandboxConfig ?? null, store: this.store });
     this.harnesses = config.harnesses ?? createHarnessRegistry({
       config,
       sessionStore: config.sessionStore ?? null,
       codexRollouts: config.codexRollouts ?? null,
+      sandbox: this.sandbox,
     });
     this.turns = new TurnController({
       config: this.config,
@@ -85,7 +89,11 @@ export class TelegramCodexApp {
     log.info(`  Default folder: ${this.config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
     log.info(`  Default service: ${this.config.defaultHarness ?? "none (operator chooses with /service)"}`);
     log.info(`  Hook port: ${this.config.hookPort}`);
+    log.info(`  Session filesystems: ${this.sandbox ? "enabled" : "off (set ALASIO_SANDBOX_ENABLED=1 to offer them)"}`);
     await this.client.deleteWebhook(false);
+    if (this.sandbox) {
+      await this.sandbox.startGateway();
+    }
     await this.configureNativeCommands();
     this.startHookServer();
     this.turns.reconcilePersistentState();

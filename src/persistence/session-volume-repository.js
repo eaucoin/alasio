@@ -14,7 +14,7 @@ export class SqliteSessionVolumeRepository {
    * Reserve the lowest free namespace in `[first, first+count)` for a new volume and
    * record it, atomically. Throws if the volume already exists or no namespace is free.
    */
-  reserveVolume(volumeId, first, count) {
+  reserveVolume(volumeId, first, count, netMode = "none") {
     const reserve = this.db.transaction(() => {
       if (this.db.prepare("select 1 from session_volumes where id = ?").get(volumeId)) {
         throw new Error(`session volume already exists: ${volumeId}`);
@@ -27,15 +27,16 @@ export class SqliteSessionVolumeRepository {
         if (!used.has(candidate)) { dbIndex = candidate; break; }
       }
       if (dbIndex < 0) throw new Error("no free session-filesystem metadata namespace (raise the metadata databases limit)");
-      this.db.prepare("insert into session_volumes (id, db_index, formatted) values (?, ?, 0)").run(volumeId, dbIndex);
+      this.db.prepare("insert into session_volumes (id, db_index, formatted, net_mode) values (?, ?, 0, ?)")
+        .run(volumeId, dbIndex, netMode === "full" ? "full" : "none");
       return { dbIndex };
     });
     return reserve();
   }
 
   getVolume(volumeId) {
-    const row = this.db.prepare("select id, db_index, formatted from session_volumes where id = ?").get(volumeId);
-    return row ? { volumeId: row.id, dbIndex: row.db_index, formatted: row.formatted === 1 } : null;
+    const row = this.db.prepare("select id, db_index, formatted, net_mode from session_volumes where id = ?").get(volumeId);
+    return row ? { volumeId: row.id, dbIndex: row.db_index, formatted: row.formatted === 1, netMode: row.net_mode } : null;
   }
 
   setVolumeFormatted(volumeId, formatted) {

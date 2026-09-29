@@ -29,11 +29,14 @@ export class SessionVolumeManager {
     this.config = config;
   }
 
-  /** Reserve a namespace and record a new, empty volume. It is formatted on first start. */
-  create(volumeId) {
-    const { dbIndex } = this.store.reserveVolume(volumeId, this.engine.firstNamespace, this.engine.namespaceCount);
-    log.info(`created session volume ${volumeId} in metadata namespace ${dbIndex}`);
-    return { volumeId, dbIndex };
+  /**
+   * Reserve a namespace and record a new, empty volume with its internet mode
+   * ("none" or "full"). It is formatted on first start.
+   */
+  create(volumeId, netMode = "none") {
+    const { dbIndex } = this.store.reserveVolume(volumeId, this.engine.firstNamespace, this.engine.namespaceCount, netMode);
+    log.info(`created session volume ${volumeId} (${netMode} internet) in metadata namespace ${dbIndex}`);
+    return { volumeId, dbIndex, netMode };
   }
 
   /**

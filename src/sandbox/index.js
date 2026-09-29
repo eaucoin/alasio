@@ -68,16 +68,45 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
     },
   });
 
+  const gatewayUrl = `http://${config.gateway.ip}:${config.gateway.port}`;
+
   return {
     enabled: true,
     engine,
     volumes,
     host,
     gateway,
+    gatewayUrl,
+
     /** Start the credential gateway; the app calls this once at startup. */
     async startGateway() {
       const { port } = await gateway.listen(config.gateway.port);
       log.info(`session filesystems enabled; gateway on ${config.gateway.port} (bound ${port})`);
+    },
+
+    /**
+     * Make sure the session host for `volumeId` is running and ready for a harness,
+     * creating the volume on first use and starting the container if it is down, then
+     * issue a fresh gateway bearer and write the harness's env inside the sandbox.
+     * `buildEnv({ bearer, gatewayUrl })` returns the env the harness runs with (where
+     * the bearer goes is the harness's business). Returns `execCommand(argv)`, the argv
+     * to spawn the harness inside the sandbox.
+     */
+    async ensureSession(volumeId, buildEnv) {
+      const record = store.sessionVolumes.getVolume(volumeId) ?? volumes.create(volumeId);
+      if (!(await host.isRunning(volumeId))) {
+        await host.start(volumeId, { mountEnv: volumes.mountEnv(volumeId), netMode: record.netMode ?? "none" });
+        volumes.markFormatted(volumeId);
+      }
+      const bearer = gateway.issueBearer(volumeId);
+      await host.writeAgentEnv(volumeId, buildEnv({ bearer, gatewayUrl }));
+      return { execCommand: (argv) => host.execCommand(volumeId, argv) };
+    },
+
+    /** A turn or session ended: revoke its bearer, and optionally stop the host (checkpointing it). */
+    async releaseSession(volumeId, { stop = false } = {}) {
+      gateway.revokeSession(volumeId);
+      if (stop) await host.stop(volumeId);
     },
   };
 }

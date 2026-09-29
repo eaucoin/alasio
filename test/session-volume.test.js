@@ -34,10 +34,12 @@ test("the volume repository reserves the lowest free namespace, uniquely, until 
   repo.deleteVolume("fs-aaa"); // frees index 1
   assert.deepEqual(repo.reserveVolume("fs-ccc", 1, 2), { dbIndex: 1 }); // lowest free reused
   assert.throws(() => repo.reserveVolume("fs-ddd", 1, 2), /no free session-filesystem/); // 1,2 taken
-  assert.deepEqual(repo.getVolume("fs-bbb"), { volumeId: "fs-bbb", dbIndex: 2, formatted: false });
+  assert.deepEqual(repo.getVolume("fs-bbb"), { volumeId: "fs-bbb", dbIndex: 2, formatted: false, netMode: "none" });
   repo.setVolumeFormatted("fs-bbb", true);
   assert.equal(repo.getVolume("fs-bbb").formatted, true);
   assert.deepEqual(repo.listVolumes().map((v) => v.volumeId).sort(), ["fs-bbb", "fs-ccc"]);
+  repo.reserveVolume("fs-full", 5, 2, "full");
+  assert.equal(repo.getVolume("fs-full").netMode, "full"); // internet mode round-trips
 });
 
 test("the volume manager records a volume and builds its mount env, formatting only until formatted", () => {

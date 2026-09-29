@@ -45,6 +45,9 @@ const SQLITE_SCHEMA_SQL = `
     id text primary key,
     db_index integer not null unique,
     formatted integer not null default 0,
+    -- the internet the agent gets: 'none' (only the gateway) or 'full' (the public
+    -- internet); chosen when the workspace is created and fixed for its life.
+    net_mode text not null default 'none',
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   );
 

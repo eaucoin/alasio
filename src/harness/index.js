@@ -53,7 +53,7 @@ const FACTORIES = {
  * a mounted folder so gating behaves the same as production. `sessionStore`
  * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts.
  */
-export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null, codexRollouts = null } = {}) {
+export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null, codexRollouts = null, sandbox = null } = {}) {
   const adapters = new Map();
   const getFor = (name, workingDirectory) => {
     if (!isHarnessName(name)) {
@@ -68,7 +68,7 @@ export function createHarnessRegistry({ config = {}, overrides = {}, sessionStor
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox });
       adapters.set(key, adapter);
     }
     return adapter;
