@@ -23,6 +23,7 @@ import {
     createCommandEventPolicy,
 } from "./command-event-policy.js";
 import { buildCodexThreadConfig } from "./thread-config.js";
+import { sandboxCodexConfig, sandboxCodexEnv } from "./sandbox.js";
 import { ensureBaymaReady } from "../mcp/bayma.js";
 import { createLogger } from "../shared/log.js";
 
@@ -32,16 +33,37 @@ function getErrorMessage(error) {
     return error instanceof Error ? error.message : String(error);
 }
 
-export async function startFreshCodexSession({ threadKey, workingDirectory }) {
-    const startedAt = process.hrtime.bigint();
+/**
+ * What a turn runs against: a folder workspace uses the shared app-server, the
+ * local Codex env, and the operator's bayma launch; a session-filesystem
+ * workspace uses its own sandboxed app-server (client), works in `/workspace`,
+ * and reaches models only through the gateway. bayma runs inside the sandbox as
+ * an HTTP server there, so its local readiness is not awaited.
+ */
+async function codexScope({ workingDirectory, threadKey, codexSession }) {
+    if (codexSession) {
+        return {
+            cwd: "/workspace",
+            codexEnv: sandboxCodexEnv({ bearer: codexSession.bearer }),
+            codexConfig: sandboxCodexConfig({ gatewayUrl: codexSession.gatewayUrl, baymaHttpUrl: codexSession.baymaHttpUrl }),
+            client: codexSession.client,
+        };
+    }
     const codexEnv = buildCodexEnv();
     const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
     await ensureBaymaReady(codexEnv);
+    return { cwd: workingDirectory, codexEnv, codexConfig, client: undefined };
+}
+
+export async function startFreshCodexSession({ threadKey, workingDirectory, codexSession = null }) {
+    const startedAt = process.hrtime.bigint();
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
     const sessionId = await startCodexTransportThread({
         threadKey,
-        workingDirectory,
+        workingDirectory: cwd,
         codexEnv,
         codexConfig,
+        client,
     });
     log.info(
         `new_session.started total_ms=${elapsedMs(startedAt).toFixed(1)} thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`,
@@ -50,17 +72,16 @@ export async function startFreshCodexSession({ threadKey, workingDirectory }) {
 }
 
 /** A new thread holding a session's history before one of its turns: rewind. */
-export async function forkCodexSession({ sessionId, beforeTurnId, threadKey, workingDirectory }) {
-    const codexEnv = buildCodexEnv();
-    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
-    await ensureBaymaReady(codexEnv);
+export async function forkCodexSession({ sessionId, beforeTurnId, threadKey, workingDirectory, codexSession = null }) {
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
     return await forkCodexTransportThread({
         sessionId,
         beforeTurnId,
         threadKey,
-        workingDirectory,
+        workingDirectory: cwd,
         codexEnv,
         codexConfig,
+        client,
     });
 }
 
@@ -69,20 +90,19 @@ function isIntentionalTurnInterrupt(error) {
     return message === "Interrupted from Telegram" || message === "Telegram swerve";
 }
 
-export async function warmCodexSession({ sessionId, threadKey, workingDirectory }) {
+export async function warmCodexSession({ sessionId, threadKey, workingDirectory, codexSession = null }) {
     if (!sessionId || !canWarmCodexSession()) {
         return false;
     }
     const startedAt = process.hrtime.bigint();
-    const codexEnv = buildCodexEnv();
-    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
-    await ensureBaymaReady(codexEnv);
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
     await warmCodexTransportThread({
         sessionId,
         threadKey,
-        workingDirectory,
+        workingDirectory: cwd,
         codexEnv,
         codexConfig,
+        client,
     });
     log.info(`warm_session.done total_ms=${elapsedMs(startedAt).toFixed(1)} thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`);
     return true;
@@ -91,7 +111,7 @@ export function shutdownCodexRuntime() {
     stopCodexTransport();
 }
 export async function executeCodexTurn(params) {
-    const { prompt, resumeSession, threadKey, chatId, messageId, workingDirectory, persistence, activeQueries, onStarted, } = params;
+    const { prompt, resumeSession, threadKey, chatId, messageId, workingDirectory, persistence, activeQueries, onStarted, codexSession = null, } = params;
     const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
     const turnTimer = createTurnTimer({ threadKey, resumeSession, prompt, log });
     log.info(`Querying Codex (resume=${resumeSession})`);
@@ -125,16 +145,13 @@ export async function executeCodexTurn(params) {
         log,
     });
     try {
-        const codexEnv = buildCodexEnv();
+        const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
         turnTimer("env.built");
-        const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
-        turnTimer("config.built");
-        await ensureBaymaReady(codexEnv);
         turnTimer("bayma.ready");
         const streamParams = {
             resumeSession,
             threadKey,
-            workingDirectory,
+            workingDirectory: cwd,
             codexEnv,
             codexConfig,
             prompt,
@@ -143,6 +160,7 @@ export async function executeCodexTurn(params) {
             codexFactory: params.codexFactory,
             controller,
             turnTimer,
+            client,
         };
         const streamed = params.attachedTurn
             ? await openAttachedCodexEventStream({
@@ -158,6 +176,7 @@ export async function executeCodexTurn(params) {
                 sessionId,
                 turnId: streamed.turnId,
                 prompt: steerPrompt,
+                client,
             });
         }
         let firstEventLogged = false;

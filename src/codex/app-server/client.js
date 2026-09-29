@@ -35,7 +35,7 @@ function summarizeMethodCounts(counts) {
 }
 
 export class AppServerClient {
-  constructor() {
+  constructor({ spawnProcess } = {}) {
     this.notifications = new AppServerNotificationQueue({
       log,
     });
@@ -43,6 +43,7 @@ export class AppServerClient {
       log,
       onNotification: (message) => this.notifications.observe(message),
       onFailure: (error) => this.notifications.fail(error),
+      spawnProcess,
     });
     this.threads = new AppServerThreadClient({
       rpc: this.rpc,

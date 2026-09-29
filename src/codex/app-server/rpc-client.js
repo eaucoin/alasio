@@ -5,10 +5,14 @@ const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const START_TIMEOUT_MS = 20 * 1000;
 
 export class AppServerRpcClient {
-  constructor({ log, onNotification, onFailure }) {
+  constructor({ log, onNotification, onFailure, spawnProcess = startAppServerProcess }) {
     this.log = log;
     this.onNotification = onNotification;
     this.onFailure = onFailure;
+    // How the app-server process is created. The default spawns the local codex
+    // binary; a session-filesystem client injects one that runs `codex app-server`
+    // inside the volume's gVisor sandbox over `docker exec` (see codex/sandbox.js).
+    this.spawnProcess = spawnProcess;
     this.process = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -34,7 +38,7 @@ export class AppServerRpcClient {
     const startedAt = process.hrtime.bigint();
     // A process stopped or replaced may still report its exit, late: only
     // the current one's events count.
-    const started = startAppServerProcess({
+    const started = this.spawnProcess({
       cwd,
       env,
       onLine: (line) => this.process === started && this.handleLine(line),

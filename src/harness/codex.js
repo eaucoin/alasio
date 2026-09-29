@@ -7,7 +7,9 @@ import {
 import { codexAppServerClient } from "../codex/app-server/client.js";
 import { buildCodexEnv } from "../codex/env.js";
 import { resolveCodexModelChoice } from "../codex/model.js";
+import { createSandboxCodexClient, sandboxCodexEnv } from "../codex/sandbox.js";
 import { createCodexSessionApi } from "../codex/sessions.js";
+import { parseWorkspace } from "../workspace/kind.js";
 import { createLogger } from "../shared/log.js";
 import { CODEX_HARNESS, harnessDisplayName } from "./names.js";
 
@@ -38,9 +40,31 @@ const errorText = (error) => (error instanceof Error ? error.message : String(er
  * before it is resumed or forked, and a turn's thread is mirrored before its
  * response is final.
  */
-export function createCodexHarness({ workingDirectory, codexRollouts = null }) {
+export function createCodexHarness({ workingDirectory, codexRollouts = null, sandbox = null }) {
+  const workspace = parseWorkspace(workingDirectory);
+  const sandboxed = Boolean(sandbox?.enabled) && workspace?.kind === "sessionfs";
+
+  // A session-filesystem workspace runs Codex inside its gVisor sandbox: one
+  // app-server per volume, spawned through the session host, on the gateway.
+  // Resolved once and reused across the conversation's turns, like the shared
+  // app-server is for folder workspaces. Folder workspaces resolve to null and
+  // keep the shared, local app-server untouched.
+  let codexSessionPromise = null;
+  async function resolveCodexSession() {
+    if (!sandboxed) return null;
+    if (!codexSessionPromise) {
+      codexSessionPromise = (async () => {
+        const session = await sandbox.ensureSession(workspace.volumeId, sandboxCodexEnv);
+        return { ...session, client: createSandboxCodexClient(session) };
+      })();
+    }
+    return await codexSessionPromise;
+  }
+
   async function ensureRollouts(sessionId) {
-    if (!codexRollouts || !sessionId) return;
+    // A sandbox session keeps its rollouts on its own durable volume, not in the
+    // host's Codex home, so the Neon mirror does not apply to it.
+    if (!codexRollouts || !sessionId || sandboxed) return;
     try {
       await codexRollouts.restore([sessionId]);
     } catch (error) {
@@ -49,7 +73,7 @@ export function createCodexHarness({ workingDirectory, codexRollouts = null }) {
   }
 
   async function flushRollouts(sessionId) {
-    if (!codexRollouts || !sessionId) return;
+    if (!codexRollouts || !sessionId || sandboxed) return;
     try {
       await codexRollouts.flush(sessionId);
     } catch (error) {
@@ -65,26 +89,35 @@ export function createCodexHarness({ workingDirectory, codexRollouts = null }) {
     supportsSteer: true,
     sessions: createCodexSessionApi({ workingDirectory, beforeFork: ensureRollouts }),
     async startFreshSession({ threadKey }) {
-      return await startFreshCodexSession({ threadKey, workingDirectory });
+      return await startFreshCodexSession({ threadKey, workingDirectory, codexSession: await resolveCodexSession() });
     },
     async warmSession({ sessionId, threadKey }) {
       await ensureRollouts(sessionId);
-      return await warmCodexSession({ sessionId, threadKey, workingDirectory });
+      return await warmCodexSession({ sessionId, threadKey, workingDirectory, codexSession: await resolveCodexSession() });
     },
     async executeTurn(params) {
       await ensureRollouts(params.resumeSession);
-      return await executeCodexTurn({ ...params, workingDirectory, beforeResponseComplete: flushRollouts });
+      return await executeCodexTurn({ ...params, workingDirectory, beforeResponseComplete: flushRollouts, codexSession: await resolveCodexSession() });
     },
     async listModels() {
-      const models = await codexAppServerClient.listModels({ env: buildCodexEnv(), cwd: workingDirectory });
+      const codexSession = await resolveCodexSession();
+      const client = codexSession?.client ?? codexAppServerClient;
+      const env = codexSession ? sandboxCodexEnv({ bearer: codexSession.bearer }) : buildCodexEnv();
+      const cwd = codexSession ? "/workspace" : workingDirectory;
+      const models = await client.listModels({ env, cwd });
       return models.filter((model) => !model.hidden).map(toModelOption);
     },
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice() {
       return resolveCodexModelChoice(null);
     },
-    shutdown() {
+    async shutdown() {
       shutdownCodexRuntime();
+      if (codexSessionPromise) {
+        const session = await codexSessionPromise.catch(() => null);
+        session?.client?.stop();
+        await sandbox.releaseSession(workspace.volumeId, { stop: true }).catch(() => {});
+      }
     },
   };
 }

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { PassThrough } from "node:stream";
 import { after, before, test } from "node:test";
 
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.js";
 import { sandboxClaudeEnv, sandboxMcpServers } from "../src/harness/claude/sandbox.js";
+import { sandboxCodexConfig, sandboxCodexEnv, sandboxCodexSpawnProcess } from "../src/codex/sandbox.js";
+import { startCodexTransportThread } from "../src/codex/transport.js";
 import { SessionGateway } from "../src/sandbox/gateway.js";
 import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
@@ -71,6 +74,44 @@ test("Claude runs in /workspace inside the sandbox, on the gateway, with bayma o
   const folderOpts = buildClaudeQueryOptions({ workingDirectory: "/home/operator/proj", claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {} });
   assert.equal(folderOpts.cwd, "/home/operator/proj");
   assert.equal(folderOpts.spawnClaudeCodeProcess, undefined);
+});
+
+test("Codex runs its own app-server inside the sandbox, on the gateway, with bayma over http", async () => {
+  const env = sandboxCodexEnv({ bearer: "bearer-2" });
+  assert.equal(env.CODEX_HOME, "/home/agent/.codex");
+  assert.equal(env.HOME, "/home/agent");
+  assert.equal(env.ALASIO_GATEWAY_TOKEN, "bearer-2"); // the bearer, under the provider's env_key
+  assert.ok(!("ANTHROPIC_API_KEY" in env) && !("OPENAI_API_KEY" in env)); // no host secret carried in
+
+  const config = sandboxCodexConfig({ gatewayUrl: "http://10.0.0.9:8080", baymaHttpUrl: "http://127.0.0.1:7290/mcp" });
+  assert.equal(config.model_provider, "gateway");
+  assert.equal(config.model_providers.gateway.base_url, "http://10.0.0.9:8080/v1");
+  assert.equal(config.model_providers.gateway.env_key, "ALASIO_GATEWAY_TOKEN");
+  assert.equal(config.model_providers.gateway.wire_api, "responses");
+  assert.deepEqual(config.mcp_servers.bayma, { url: "http://127.0.0.1:7290/mcp" });
+
+  // The spawn runs `codex app-server` inside the sandbox over the session's own spawn,
+  // wiring the app-server's stdout to readline; the host binary path is never used.
+  const stdout = new PassThrough();
+  const spawned = [];
+  const child = { stdout, stderr: new PassThrough(), on() {}, kill() {} };
+  const session = { spawn: (argv, e) => { spawned.push({ argv, e }); return child; } };
+  const lines = [];
+  const proc = sandboxCodexSpawnProcess(session)({ cwd: "/workspace", env, onLine: (l) => lines.push(l), onExit: () => {}, onError: () => {} });
+  assert.deepEqual(spawned[0].argv, ["codex", "app-server", "--disable", "plugins", "--listen", "stdio://"]);
+  assert.equal(spawned[0].e.ALASIO_GATEWAY_TOKEN, "bearer-2");
+  stdout.write("hello\n");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(lines, ["hello"]); // the app-server's stdout is read line by line
+  assert.equal(typeof proc.stop, "function");
+
+  // The transport routes to the per-session client and its /workspace cwd, not the singleton.
+  const calls = [];
+  const fakeClient = { startThread: async (a) => { calls.push(a); return "thread-9"; } };
+  const threadId = await startCodexTransportThread({ threadKey: "k", workingDirectory: "/workspace", codexEnv: env, codexConfig: config, client: fakeClient });
+  assert.equal(threadId, "thread-9");
+  assert.equal(calls[0].cwd, "/workspace");
+  assert.equal(calls[0].env.ALASIO_GATEWAY_TOKEN, "bearer-2");
 });
 
 // A stand-in upstream that records the credential each request arrived with, so the

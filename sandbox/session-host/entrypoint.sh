@@ -43,7 +43,11 @@ META_PASSWORD="$(cat "${META_PASSWORD_FILE:?}")" GOMEMLIMIT=256MiB \
   --cache-size "${JFS_CACHE_MB:-1024}" --buffer-size 100 \
   --log /tmp/juicefs.log "$JFS_META" /mnt/session
 mkdir -p /mnt/session/workspace /mnt/session/home
-chown 1000:1000 /mnt/session/workspace /mnt/session/home
+# The agent home holds each harness's config directory. Codex refuses to start its
+# app-server when CODEX_HOME does not exist, so the skeleton is created up front (Claude
+# and bayma create theirs lazily, but are made here too for a consistent, plain home).
+mkdir -p /mnt/session/home/.codex /mnt/session/home/.claude /mnt/session/home/.bayma
+chown -R 1000:1000 /mnt/session/workspace /mnt/session/home
 stamp mounted
 
 # --- 2. The agent's network ---------------------------------------------------

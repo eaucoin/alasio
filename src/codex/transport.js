@@ -18,10 +18,10 @@ export function stopCodexTransport() {
     stopCodexAppServer();
 }
 
-async function createAppServerStream({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, controller, turnTimer, }) {
+async function createAppServerStream({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, controller, turnTimer, client = codexAppServerClient, }) {
     let sessionId = resumeSession;
     if (resumeSession) {
-        sessionId = await codexAppServerClient.ensureThread({
+        sessionId = await client.ensureThread({
             threadId: resumeSession,
             threadKey,
             cwd: workingDirectory,
@@ -30,7 +30,7 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
         });
     }
     else {
-        sessionId = await codexAppServerClient.startThread({
+        sessionId = await client.startThread({
             threadKey,
             cwd: workingDirectory,
             env: codexEnv,
@@ -40,7 +40,7 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
     persistence.updatePendingSessionId(pendingResponseId, sessionId);
     persistence.updateActiveTurnSessionId(threadKey, sessionId);
     const { model, effort } = resolveCodexModelChoice(persistence.getModelChoice?.(threadKey, CODEX_HARNESS) ?? null);
-    const turnId = await codexAppServerClient.startTurn({
+    const turnId = await client.startTurn({
         threadId: sessionId,
         threadKey,
         prompt,
@@ -54,22 +54,22 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
     return {
         sessionId,
         turnId,
-        events: codexAppServerClient.eventsForTurn(sessionId, turnId, controller.signal),
+        events: client.eventsForTurn(sessionId, turnId, controller.signal),
     };
 }
 
-async function createAttachedAppServerStream({ sessionId, turnId, persistence, pendingResponseId, controller, turnTimer, threadKey, }) {
+async function createAttachedAppServerStream({ sessionId, turnId, persistence, pendingResponseId, controller, turnTimer, threadKey, client = codexAppServerClient, }) {
     if (!sessionId || !turnId) {
         throw new Error("Cannot attach to a Codex goal turn without both session and turn ids");
     }
     persistence.updatePendingSessionId(pendingResponseId, sessionId);
     persistence.updateActiveTurnSessionId(threadKey, sessionId);
-    codexAppServerClient.claimTurn(sessionId, turnId);
+    client.claimTurn(sessionId, turnId);
     turnTimer("app_server.goal_turn.attached", { turn_id: turnId });
     return {
         sessionId,
         turnId,
-        events: codexAppServerClient.eventsForTurn(sessionId, turnId, controller.signal),
+        events: client.eventsForTurn(sessionId, turnId, controller.signal),
     };
 }
 
@@ -125,19 +125,19 @@ export async function openAttachedCodexEventStream(params) {
     return await createAttachedAppServerStream(params);
 }
 
-export async function steerCodexTransportTurn({ sessionId, turnId, prompt }) {
+export async function steerCodexTransportTurn({ sessionId, turnId, prompt, client = codexAppServerClient }) {
     if (CODEX_TRANSPORT === "exec") {
         throw new Error("Steering active Codex turns requires the app-server transport");
     }
-    await codexAppServerClient.steerTurn({ threadId: sessionId, turnId, prompt });
+    await client.steerTurn({ threadId: sessionId, turnId, prompt });
     return true;
 }
 
-export async function startCodexTransportThread({ threadKey, workingDirectory, codexEnv, codexConfig }) {
+export async function startCodexTransportThread({ threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }) {
     if (CODEX_TRANSPORT === "exec") {
         throw new Error("Starting an empty Codex session requires the app-server transport");
     }
-    return await codexAppServerClient.startThread({
+    return await client.startThread({
         threadKey,
         cwd: workingDirectory,
         env: codexEnv,
@@ -146,8 +146,8 @@ export async function startCodexTransportThread({ threadKey, workingDirectory, c
 }
 
 /** Forks through the app-server under either transport: the fork is a rollout like any other, which exec resumes too. */
-export async function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig }) {
-    return await codexAppServerClient.forkThread({
+export async function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }) {
+    return await client.forkThread({
         threadId: sessionId,
         beforeTurnId,
         threadKey,
@@ -157,8 +157,8 @@ export async function forkCodexTransportThread({ sessionId, beforeTurnId, thread
     });
 }
 
-export async function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig }) {
-    return await codexAppServerClient.ensureThread({
+export async function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }) {
+    return await client.ensureThread({
         threadId: sessionId,
         threadKey,
         cwd: workingDirectory,
