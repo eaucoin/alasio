@@ -8,8 +8,9 @@ mindmap
       src/neon/stack.js brings it up before alasio serves anything and Docker's restart policies keep every service running across crashes and reboots
       everything talks on the stack's private network and only the compute is published on 127.0.0.1 port 55433
     Services
-      seaweedfs is the S3 Neon stores into with one bucket `neon` versioned and fsynced on one volume and seaweedfs-init makes that idempotently on every start
+      seaweedfs is the S3 Neon stores into with one bucket `neon` versioned and fsynced on one volume and seaweedfs-init makes that idempotently on every start and also makes the unversioned `sessions` bucket the session-filesystem volumes' data lives in
       seaweedfs-lifecycle-init expires replaced object versions after seven days as Neon's own point-in-time window does and seaweedfs-lifecycle runs that rule every six hours because SeaweedFS applies lifecycle rules only when asked
+      valkey is the JuiceFS metadata engine for session filesystems (session-fs-research E12) append-only durable and noeviction with one logical DB per volume reached as valkey:6379 by the session hosts that join this project's network and it is idle unless ALASIO_SANDBOX_ENABLED is set — src/sandbox is the subsystem that uses it
       storage-broker carries timeline state between safekeepers and the pageserver
       storage-controller runs in strict mode on its own Postgres controller-db places the tenant and puts every timeline on three safekeepers and validates every deletion the pageserver makes
       safekeeper-1 safekeeper-2 and safekeeper-3 are the WAL quorum so a commit returns once two of them have it and each offloads WAL to seaweedfs
@@ -21,9 +22,10 @@ mindmap
       control/setup.js makes every secret once on first start under the alasio state directory and renders every service's configuration from them on every start
       the services authenticate to each other with EdDSA JWTs signed by one key whose private half only the host keeps in `neon/secrets` mode 0700
       alasio reaches the compute as role `alasio` with a SCRAM password from `neon/secrets/alasio-database-url`
-      Neon writes to seaweedfs with credentials limited to the `neon` bucket and only the lifecycle setup uses the admin identity
+      Neon writes to seaweedfs with credentials limited to the `neon` bucket and only the lifecycle setup uses the admin identity and the session filesystems write with a third identity limited to the `sessions` bucket
+      the session-filesystem secrets are made here too the Valkey password which is its requirepass and a file the session hosts read and the `sessions` S3 key and secret as files the alasio process points its ALASIO_SANDBOX_S3_*_FILE knobs at
     State
-      everything lives under `<ALASIO_STATE_DIR>/neon` with secrets keys compose.env seaweedfs controller-db pageserver safekeeper-1 to 3 control and backups
+      everything lives under `<ALASIO_STATE_DIR>/neon` with secrets keys compose.env seaweedfs controller-db pageserver safekeeper-1 to 3 control backups and valkey
       control/bootstrap.json records the tenant the timeline and which safekeepers hold it at which generation and is what makes bootstrapping idempotent
       the stack shares the machine's disk and degrades as it fills: SeaweedFS stops accepting writes with less than 5 GiB free so layer uploads and WAL offload stall until space is freed while the pageserver past 80% use evicts local layers it can fetch again from S3 and a test stack from npm run test:neon needs a few GB of its own
       durability is one disk so the safekeeper quorum and S3 versioning survive process crashes and a lost service directory but not the loss of the machine's disk and backups are local too

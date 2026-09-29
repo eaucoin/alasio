@@ -77,6 +77,9 @@ services:
         shell 's3.bucket.list' | grep -qw neon || shell 's3.bucket.create -name neon'
         shell 's3.bucket.versioning -name neon -enable'
         shell 's3.bucket.versioning -name neon' | grep -qi enabled
+        # The session-filesystem volumes' data bucket. No versioning: JuiceFS keeps its
+        # own consistency, and versioned object churn would only bloat the store.
+        shell 's3.bucket.list' | grep -qw sessions || shell 's3.bucket.create -name sessions'
 
   # Idempotent: old versions of Neon's objects expire a week after they are
   # replaced, as Neon's own point-in-time window does.
@@ -118,6 +121,37 @@ services:
     depends_on:
       seaweedfs-lifecycle-init:
         condition: service_completed_successfully
+
+  # JuiceFS metadata for the session-filesystem volumes (session-fs-research E12): one
+  # logical Valkey DB per volume, durable via append-only file, and noeviction so a full
+  # store fails writes loudly rather than silently dropping a live filesystem's metadata.
+  # Reached as valkey:6379 by the session hosts that join this project's network.
+  valkey:
+    image: valkey/valkey:8-alpine@sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command:
+      - valkey-server
+      - --dir
+      - /data
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+      - --databases
+      - "4096"
+      - --requirepass
+      - ${SANDBOX_METADATA_PASSWORD}
+    volumes:
+      - ${ALASIO_NEON_DIR}/valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${SANDBOX_METADATA_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   controller-db:
     image: postgres:17-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652

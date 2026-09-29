@@ -35,6 +35,15 @@ fi
 echo "Building the $IMAGE image the bot runs in..."
 docker build --pull --tag "$IMAGE" "$SCRIPT_DIR/container"
 
+# Session filesystems, when enabled, run agents inside gVisor sandboxes on two images
+# (alasio/session-host and alasio/agent). Built only when the feature is on, since the
+# build fetches gVisor and JuiceFS. The Valkey and "sessions" bucket come up with the
+# Neon stack on every start.
+if grep -qE '^ALASIO_SANDBOX_ENABLED=1' "$SCRIPT_DIR/.env"; then
+  echo "Session filesystems are enabled; building the sandbox images..."
+  "$SCRIPT_DIR/sandbox/build.sh"
+fi
+
 # Pulled now, so no agent's first turn waits on it.
 BAYMA_IMAGE="$(cd "$SCRIPT_DIR" && node --input-type=module --eval 'import { BAYMA_IMAGE } from "./src/mcp/bayma.js"; console.log(BAYMA_IMAGE)')"
 echo "Pulling bayma's image, $BAYMA_IMAGE..."

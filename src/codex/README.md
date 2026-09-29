@@ -30,6 +30,8 @@ mindmap
       thread-config owns the overrides every thread starts and resumes with which add bayma to the MCP servers in the operator's Codex config
       model selects gpt-5.6-sol with high reasoning for both app-server and exec transports so new resumed and steered continuation turns use one operator-selected authority
       app-server/ owns the long-lived stdio JSON-RPC process, thread RPCs, notification queue, and protocol mapping as separate concepts
+      the app-server process spawn is injectable so a folder workspace spawns the local codex binary and a session-filesystem workspace gets its own per-volume client whose process runs codex app-server inside the gVisor sandbox over the session's own spawn
+      sandbox owns that session-filesystem path its env with the gateway bearer under the provider env_key its thread config whose only model provider is the gateway with bayma over http and the spawn that reaches inside runtime routes a turn to the per-volume client and /workspace when the harness resolves a sandbox session
       command-event-policy owns command-stream side effects such as restart provenance, workflow wait pings, and DB guardrail aborts
     Projection boundary
       event-projection converts Codex stream items into persisted response blocks

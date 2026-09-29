@@ -26,6 +26,11 @@ export const PAGESERVER_ID = 1;
 export const DATABASE = "alasio";
 export const ROLE = "alasio";
 export const BUCKET = "neon";
+// The session-filesystem subsystem shares this stack's SeaweedFS (its own bucket) and
+// adds a Valkey for JuiceFS metadata. Session hosts join this compose project's network
+// and reach both by service name; the secrets below are materialised as files the alasio
+// process points its ALASIO_SANDBOX_*_FILE knobs at (see src/sandbox/config.js).
+export const BUCKET_SESSIONS = "sessions";
 export const DEFAULT_COMPUTE_PORT = 55433;
 
 const CONTROL_DIR = dirname(fileURLToPath(import.meta.url));
@@ -49,6 +54,10 @@ export function neonLayout(stateDir) {
     control: join(root, "control"),
     backups: join(root, "backups"),
     databaseUrlFile: join(root, "secrets", "alasio-database-url"),
+    valkey: join(root, "valkey"),
+    sandboxMetadataPasswordFile: join(root, "secrets", "sandbox-metadata-password"),
+    sandboxS3KeyFile: join(root, "secrets", "sandbox-s3-key"),
+    sandboxS3SecretFile: join(root, "secrets", "sandbox-s3-secret"),
   };
 }
 
@@ -89,9 +98,11 @@ function ensureSecrets(layout) {
           s3: {
             neon: { accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() },
             admin: { accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() },
+            sessions: { accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() },
           },
           controllerDbPassword: secret(),
           alasioPassword: secret(),
+          sandboxMetadataPassword: secret(),
         },
         null,
         2,
@@ -151,6 +162,11 @@ function renderConfig(layout, secrets, { computePort }) {
             credentials: [secrets.s3.admin],
             actions: ["Admin", "Read", "List", "Tagging", "Write"],
           },
+          {
+            name: "sessions",
+            credentials: [secrets.s3.sessions],
+            actions: [`Read:${BUCKET_SESSIONS}`, `List:${BUCKET_SESSIONS}`, `Tagging:${BUCKET_SESSIONS}`, `Write:${BUCKET_SESSIONS}`],
+          },
         ],
       },
       null,
@@ -197,6 +213,14 @@ function renderConfig(layout, secrets, { computePort }) {
   mkdirSync(layout.backups, { recursive: true });
   mkdirSync(join(layout.control, "compute"), { recursive: true });
 
+  // Valkey's data, and the session-filesystem secrets as files. The metadata password
+  // is Valkey's requirepass (through compose.env) and, as a file, what session hosts
+  // read; the S3 keys as files back the alasio process's ALASIO_SANDBOX_S3_*_FILE knobs.
+  mkdirSync(layout.valkey, { recursive: true });
+  writePrivate(layout.sandboxMetadataPasswordFile, secrets.sandboxMetadataPassword);
+  writePrivate(layout.sandboxS3KeyFile, secrets.s3.sessions.accessKey);
+  writePrivate(layout.sandboxS3SecretFile, secrets.s3.sessions.secretKey);
+
   const env = {
     ALASIO_NEON_DIR: layout.root,
     ALASIO_NEON_CONTROL_SOURCE: CONTROL_DIR,
@@ -211,6 +235,7 @@ function renderConfig(layout, secrets, { computePort }) {
     ALASIO_DATABASE_PASSWORD: secrets.alasioPassword,
     NEON_SAFEKEEPER_REMOTE_STORAGE: remoteStorage("safekeeper"),
     CONTROLLER_DB_PASSWORD: secrets.controllerDbPassword,
+    SANDBOX_METADATA_PASSWORD: secrets.sandboxMetadataPassword,
     PAGESERVER_JWT_TOKEN: token("pageserverapi"),
     SAFEKEEPER_JWT_TOKEN: token("safekeeperdata"),
     CONTROL_PLANE_JWT_TOKEN: token("admin"),
