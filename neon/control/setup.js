@@ -78,7 +78,12 @@ function writePublic(path, content) {
   writeFileSync(path, content, { mode: 0o644 });
 }
 
-/** The stack's secrets: made on first run, then only ever read. */
+/**
+ * The stack's secrets: made on first run and then only added to, never rotated. Each
+ * secret has a maker, and any absent from an existing secrets.json is filled in and the
+ * file rewritten, so a deployment that predates a new secret (the session-filesystem
+ * ones, say) gains it on the next start without disturbing the rest.
+ */
 function ensureSecrets(layout) {
   mkdirSync(layout.secrets, { recursive: true, mode: 0o700 });
   chmodSync(layout.secrets, 0o700);
@@ -88,28 +93,42 @@ function ensureSecrets(layout) {
     mkdirSync(layout.keys, { recursive: true });
     writePublic(layout.publicKey, publicKeyPem);
   }
-  if (!existsSync(layout.secretsFile)) {
-    writePrivate(
-      layout.secretsFile,
-      JSON.stringify(
-        {
-          tenantId: hexId(),
-          timelineId: hexId(),
-          s3: {
-            neon: { accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() },
-            admin: { accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() },
-            sessions: { accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() },
-          },
-          controllerDbPassword: secret(),
-          alasioPassword: secret(),
-          sandboxMetadataPassword: secret(),
-        },
-        null,
-        2,
-      ) + "\n",
-    );
+  const makers = {
+    tenantId: () => hexId(),
+    timelineId: () => hexId(),
+    s3: () => ({
+      neon: { accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() },
+      admin: { accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() },
+      sessions: { accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() },
+    }),
+    controllerDbPassword: () => secret(),
+    alasioPassword: () => secret(),
+    sandboxMetadataPassword: () => secret(),
+  };
+  const s3Makers = {
+    neon: () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() }),
+    admin: () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() }),
+    sessions: () => ({ accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() }),
+  };
+  const existing = existsSync(layout.secretsFile) ? JSON.parse(readFileSync(layout.secretsFile, "utf8")) : {};
+  let changed = false;
+  for (const [key, make] of Object.entries(makers)) {
+    if (existing[key] === undefined) {
+      existing[key] = make();
+      changed = true;
+    }
   }
-  return JSON.parse(readFileSync(layout.secretsFile, "utf8"));
+  // s3 gained a member (sessions) after some deployments were made; backfill within it.
+  for (const [name, make] of Object.entries(s3Makers)) {
+    if (existing.s3[name] === undefined) {
+      existing.s3[name] = make();
+      changed = true;
+    }
+  }
+  if (changed) {
+    writePrivate(layout.secretsFile, JSON.stringify(existing, null, 2) + "\n");
+  }
+  return existing;
 }
 
 function toml(value) {
