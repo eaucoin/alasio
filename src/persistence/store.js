@@ -7,6 +7,7 @@ import { SqliteResponseRepository } from "./response-repository.js";
 import { SqliteOutboxRepository } from "./outbox-repository.js";
 import { SqlitePromptJobRepository } from "./prompt-job-repository.js";
 import { SqliteRestartRepository } from "./restart-repository.js";
+import { SqliteSessionVolumeRepository } from "./session-volume-repository.js";
 import { migrateSqliteSchema } from "./schema.js";
 import { SqliteStateRepository } from "./state-repository.js";
 import { SqliteTelegramContentRepository } from "./telegram-content-repository.js";
@@ -41,6 +42,7 @@ export class SqliteStore {
     this.promptJobs = new SqlitePromptJobRepository(this.db);
     this.restarts = new SqliteRestartRepository(this.db);
     this.usage = new SqliteUsageRepository(this.db);
+    this.sessionVolumes = new SqliteSessionVolumeRepository(this.db);
   }
 
   close() {

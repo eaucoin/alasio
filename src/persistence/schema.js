@@ -37,6 +37,17 @@ const SQLITE_SCHEMA_SQL = `
     primary key (conversation_id, harness, working_directory)
   );
 
+  -- Session filesystems: one JuiceFS volume per session, with its metadata namespace
+  -- (a Valkey DB index, unique) and whether it has been formatted. The workspace a
+  -- conversation points at stays in conversations.working_directory as the sentinel
+  -- 'sessionfs:<id>' (src/workspace/kind.js); this table holds only mount/destroy state.
+  create table if not exists session_volumes (
+    id text primary key,
+    db_index integer not null unique,
+    formatted integer not null default 0,
+    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );
+
   create table if not exists telegram_updates (
     update_id integer primary key,
     payload_json text not null,
