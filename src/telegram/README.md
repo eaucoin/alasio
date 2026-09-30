@@ -22,6 +22,12 @@ mindmap
       markdown owns Telegram HTML rendering for Codex Markdown plus plaintext fallback safety
       message owns Telegram update to alasio message/file projection
       text owns Telegram-safe message splitting
+    Rich replies
+      final responses go as Bot API 10.1 rich messages which render tables headings lists and code natively in parts of about 30k characters while status lines and panels stay Telegram HTML
+      rich-markdown escapes what Telegram's rich Markdown would read that the agent did not mean dollar as a formula pipes as a spoiler equals as a highlight and angle brackets as a tag it then drops leaving code as written
+      rich-media places each file an agent shows with image syntax and a local path as a media block below its block or a collage when one block shows several and identifies files by their bytes
+      client uploads a part's media with its rich message in one request and when Telegram rejects the part sends its text the classic way and its media as photos videos or albums silently
+      outbox deletes a reply's media copies once it is sent
 ```
 
 ## Preference Atlas

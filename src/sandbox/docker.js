@@ -10,9 +10,12 @@ const execFileAsync = promisify(execFile);
 
 export function createDocker(run = execFileAsync) {
   return {
-    /** Run a docker command to completion; returns `{ stdout, stderr }`, throws on non-zero. */
-    async cli(args, { input } = {}) {
-      const child = run("docker", args, { maxBuffer: 16 * 1024 * 1024 });
+    /**
+     * Run a docker command to completion; returns `{ stdout, stderr }`, throws on non-zero.
+     * `encoding: "buffer"` returns the output as bytes (a file read out of a container).
+     */
+    async cli(args, { input, encoding, maxBuffer = 16 * 1024 * 1024 } = {}) {
+      const child = run("docker", args, { maxBuffer, ...(encoding ? { encoding } : {}) });
       if (input !== undefined && child.child?.stdin) {
         child.child.stdin.end(input);
       }

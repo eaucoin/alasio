@@ -31,6 +31,7 @@ import {
 } from "./event-projection.js";
 import { claudeMcpServers } from "./mcp.js";
 import { sandboxSpawn } from "./sandbox.js";
+import { REPLY_INSTRUCTIONS } from "../reply-instructions.js";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.js";
 import {
   buildClaudeUserMessage,
@@ -88,7 +89,7 @@ export function buildClaudeQueryOptions({
     abortController: controller,
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
-    systemPrompt: { type: "preset", preset: "claude_code" },
+    systemPrompt: { type: "preset", preset: "claude_code", append: REPLY_INSTRUCTIONS },
     includePartialMessages: false,
     persistSession: true,
     disallowedTools: [...CLAUDE_DISALLOWED_TOOLS],

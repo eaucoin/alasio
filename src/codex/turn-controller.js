@@ -9,6 +9,7 @@ import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.js";
 import { sessionFsWorkspace } from "../workspace/kind.js";
 import { newVolumeId } from "../sandbox/names.js";
 import { truncateText } from "../operator/text.js";
+import { ReplyMedia } from "./reply-media.js";
 import { StatusReporter } from "./status-reporter.js";
 import { createLogger } from "../shared/log.js";
 
@@ -46,6 +47,18 @@ export class TurnController {
       workflowWaits,
       workflowWakeEvents,
       log,
+      // Media a response shows are copied under the state directory until delivered.
+      replyMedia: config?.stateDir
+        ? new ReplyMedia({
+          stateDir: config.stateDir,
+          workspaceForChat: (chatId) => {
+            const conversation = store.getConversationByChatId(chatId);
+            return conversation ? this.workingDirectoryFor(conversation.id) : null;
+          },
+          sandbox,
+          log,
+        })
+        : null,
     });
     this.recovery = new RestartRecovery({ store });
   }

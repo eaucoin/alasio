@@ -34,6 +34,8 @@ mindmap
       claude/search indexes the store's entries into passages for full-text and trigram search off the SDK's path as its own README describes
       fresh Claude sessions are reserved ids passed as sessionId on the first query and resumed with resume afterwards
       Bash Monitor Grep and Glob are disallowed so bayma exec is Claude's only shell and a PreToolUse hook on it reuses command-event-policy on the shell commands policy/embedded-shell recovers from the code
+    Reply instructions
+      reply-instructions is what alasio tells every agent about its replies beyond the harness's own prompt how to show the operator an image or video with image syntax and a local path appended to Claude Code's system prompt and given to Codex as developer instructions after the operator's own
     Session filesystems
       the registry hands each adapter the sandbox and a folder workspace runs exactly as before while a session-filesystem workspace runs the CLI inside its gVisor sandbox in /workspace on the credential gateway with a revocable per-session bearer and bayma over http
       the Claude Code adapter routes through the SDK's spawnClaudeCodeProcess hook harness/claude/sandbox and skips the local bayma readiness since bayma is the session host's own http server

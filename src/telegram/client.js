@@ -8,6 +8,7 @@ import { setDefaultAutoSelectFamily } from "node:net";
 import { pipeline } from "node:stream/promises";
 import { renderTelegramHtml } from "./markdown.js";
 import { splitRichMarkdown, toRichMarkdown } from "./rich-markdown.js";
+import { mediaIdsIn, withoutMediaLines } from "./rich-media.js";
 import { splitTelegramText } from "./text.js";
 
 // Telegram publishes IPv6 answers, but the admin server only has a working IPv4
@@ -28,6 +29,12 @@ function buildTextPayload(chatId, text, options) {
     payload.parse_mode = "HTML";
   }
   return payload;
+}
+
+/** The Bot API input media type for a prepared media item. */
+function telegramMediaType(item) {
+  if (item.animation) return "animation";
+  return item.kind === "photo" ? "photo" : "video";
 }
 
 function shouldRetryAsPlainText(error, options) {
@@ -65,12 +72,37 @@ export class Client {
   }
 
   async call(method, payload = {}, options = {}) {
+    return await this.request(method, () => ({
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }), options);
+  }
+
+  /**
+   * A call with files: `fields` are sent as form fields (objects JSON-encoded, as the Bot
+   * API reads them) and each of `files` (`{ name, path }`) as an upload, referenced from
+   * the fields as `attach://<name>`.
+   */
+  async callMultipart(method, fields, files, options = {}) {
+    return await this.request(method, () => {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(fields)) {
+        if (value === undefined) continue;
+        form.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+      }
+      for (const file of files) {
+        form.append(file.name, new Blob([readFileSync(file.path)]), basename(file.path));
+      }
+      return { body: form };
+    }, options);
+  }
+
+  async request(method, makeBody, options = {}) {
     const maxRateLimitRetries = options.rateLimitRetries ?? 3;
     for (let attempt = 0; ; attempt += 1) {
       const response = await fetch(`${this.apiBase}/${method}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        ...makeBody(),
         signal: options.signal,
       });
       const data = await response.json().catch(() => null);
@@ -160,25 +192,79 @@ export class Client {
   }
 
   /**
-   * Each part goes as a rich message; a part Telegram rejects as a request (HTTP 400: a
+   * Each part goes as a rich message, uploading the media it shows (`options.media`, see
+   * telegram/rich-media.js) with it. A part Telegram rejects as a request (HTTP 400: a
    * construct it will not take, or a limit the estimate missed) goes the classic way
-   * instead, so a response is never lost to its formatting.
+   * instead, its media following as photos, videos, or an album, so a response is never
+   * lost to its formatting.
    */
   async sendRichParts(chatId, text, options) {
-    const { format: _format, ...telegramOptions } = options;
+    const { format: _format, media = [], mediaDir: _mediaDir, ...telegramOptions } = options;
+    const byId = new Map(media.map((item) => [item.id, item]));
     const sent = [];
     for (const part of splitRichMarkdown(text || " ")) {
+      const partMedia = [...new Set(mediaIdsIn(part))].map((id) => byId.get(id)).filter(Boolean);
       try {
-        sent.push(await this.call("sendRichMessage", {
-          chat_id: chatId,
-          rich_message: { markdown: toRichMarkdown(part) || " " },
-          ...telegramOptions,
-        }));
+        sent.push(await this.sendRichPart(chatId, part, partMedia, telegramOptions));
       } catch (error) {
         if (error?.status !== 400) {
           throw error;
         }
-        sent.push(...await this.sendTextChunks(chatId, part, { ...telegramOptions, format: "markdown" }));
+        sent.push(...await this.sendTextChunks(chatId, withoutMediaLines(part), { ...telegramOptions, format: "markdown" }));
+        sent.push(...await this.sendMediaClassic(chatId, partMedia));
+      }
+    }
+    return sent;
+  }
+
+  async sendRichPart(chatId, part, partMedia, telegramOptions) {
+    const richMessage = { markdown: toRichMarkdown(part) || " " };
+    if (!partMedia.length) {
+      return await this.call("sendRichMessage", { chat_id: chatId, rich_message: richMessage, ...telegramOptions });
+    }
+    richMessage.media = partMedia.map((item) => ({ id: item.id, media: { type: telegramMediaType(item), media: `attach://${item.id}` } }));
+    return await this.callMultipart(
+      "sendRichMessage",
+      { chat_id: chatId, rich_message: richMessage, ...telegramOptions },
+      partMedia.map((item) => ({ name: item.id, path: item.file })),
+    );
+  }
+
+  /**
+   * Media sent as their own messages (the fallback): one as a photo, video, or animation,
+   * several as albums of up to ten, silently, since the text before them notified. A file
+   * Telegram will not take as media goes as a document.
+   */
+  async sendMediaClassic(chatId, items) {
+    const sent = [];
+    const single = async (item) => {
+      const type = telegramMediaType(item);
+      const method = { photo: "sendPhoto", video: "sendVideo", animation: "sendAnimation" }[type];
+      try {
+        return await this.callMultipart(method, { chat_id: chatId, [type]: `attach://${item.id}`, disable_notification: true }, [{ name: item.id, path: item.file }]);
+      } catch (error) {
+        if (error?.status !== 400) throw error;
+        return await this.callMultipart("sendDocument", { chat_id: chatId, document: `attach://${item.id}`, disable_notification: true }, [{ name: item.id, path: item.file }]);
+      }
+    };
+    // Albums take photos and videos; an animation goes alone.
+    const albumable = items.filter((item) => !item.animation);
+    for (const item of items.filter((item) => item.animation)) sent.push(await single(item));
+    for (let i = 0; i < albumable.length; i += 10) {
+      const group = albumable.slice(i, i + 10);
+      if (group.length === 1) {
+        sent.push(await single(group[0]));
+        continue;
+      }
+      try {
+        sent.push(...await this.callMultipart(
+          "sendMediaGroup",
+          { chat_id: chatId, media: group.map((item) => ({ type: item.kind, media: `attach://${item.id}` })), disable_notification: true },
+          group.map((item) => ({ name: item.id, path: item.file })),
+        ));
+      } catch (error) {
+        if (error?.status !== 400) throw error;
+        for (const item of group) sent.push(await single(item));
       }
     }
     return sent;

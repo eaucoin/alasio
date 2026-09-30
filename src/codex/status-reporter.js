@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { sleep } from "../shared/async.js";
 import { finalResponseToMarkdown } from "./response-markdown.js";
 import { formatDuration } from "../shared/human-time.js";
@@ -27,7 +28,7 @@ export function workingStatusHtml({ harnessName, startedAtMs, workflowWait = nul
 }
 
 export class StatusReporter {
-  constructor({ client, store, outbox, workflowWaits, workflowWakeEvents, log }) {
+  constructor({ client, store, outbox, workflowWaits, workflowWakeEvents, log, replyMedia = null }) {
     if (!outbox) {
       throw new Error("StatusReporter requires a Telegram outbox");
     }
@@ -37,6 +38,25 @@ export class StatusReporter {
     this.workflowWaits = workflowWaits;
     this.workflowWakeEvents = workflowWakeEvents;
     this.log = log;
+    // Resolves the media a response shows (codex/reply-media.js); without it, responses
+    // go as rich text only.
+    this.replyMedia = replyMedia;
+  }
+
+  /**
+   * Queue a final response for delivery, with any media it shows copied alongside. A
+   * failure to prepare the media never holds the response back: it goes as text.
+   */
+  async enqueueFinalResponse({ chatId, text, pendingResponseId }) {
+    let prepared = { text, options: FINAL_RESPONSE_OPTIONS };
+    if (this.replyMedia) {
+      try {
+        prepared = await this.replyMedia.prepare({ chatId, text, key: pendingResponseId ?? randomUUID() });
+      } catch (error) {
+        this.log.warn(`Reply media could not be prepared; sending the response as text: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    this.outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
   }
 
   async postStatusUpdates({ chatId, signal, sessionId, onStatusMessageCreated, harnessName = "Codex" }) {
@@ -91,7 +111,7 @@ export class StatusReporter {
       }
       return;
     }
-    this.outbox.enqueueText({ chatId, text: trimmedResponse, options: FINAL_RESPONSE_OPTIONS, pendingResponseId });
+    await this.enqueueFinalResponse({ chatId, text: trimmedResponse, pendingResponseId });
   }
 
   async finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, statusText = null, harnessName = "Codex" }) {
@@ -109,7 +129,7 @@ export class StatusReporter {
     for (const completed of completedResponses) {
       const response = finalResponseToMarkdown(completed.blocks);
       if (response.trim()) {
-        this.outbox.enqueueText({ chatId: completed.chatId, text: response, options: FINAL_RESPONSE_OPTIONS, pendingResponseId: completed.id });
+        await this.enqueueFinalResponse({ chatId: completed.chatId, text: response, pendingResponseId: completed.id });
       } else {
         this.store.markPendingAsPosted(completed.id);
       }

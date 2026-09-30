@@ -186,6 +186,16 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       };
     },
 
+    /**
+     * A file from a session's sandbox, as its agent sees it (see SessionHost.readFile):
+     * `{ bytes }` or `{ note }`. Only a running session is read; one is running while
+     * its turns deliver their responses.
+     */
+    async readFile(volumeId, path, maxBytes) {
+      if (!(await host.isRunning(volumeId))) return { note: "the session is not running" };
+      return await host.readFile(volumeId, path, maxBytes);
+    },
+
     /** A turn or session ended: revoke its bearer, and optionally stop the host (checkpointing it). */
     async releaseSession(volumeId, { stop = false } = {}) {
       gateway.revokeSession(volumeId);

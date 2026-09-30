@@ -6,11 +6,16 @@
  * alongside them.
  */
 import { CODEX_HARNESS } from "../harness/names.js";
+import { withReplyInstructions } from "../harness/reply-instructions.js";
 import { BAYMA_SERVER_NAME, BAYMA_STARTUP_TIMEOUT_MS, baymaLaunch } from "../mcp/bayma.js";
+import { operatorDeveloperInstructions } from "./config-toml.js";
+import { codexHome } from "./env.js";
 
 export function buildCodexThreadConfig({ codexEnv, threadKey }) {
   return {
     project_doc_max_bytes: 32768,
+    // An override replaces the config's own, so the operator's are kept, then alasio's.
+    developer_instructions: withReplyInstructions(operatorDeveloperInstructions(codexHome(codexEnv))),
     mcp_servers: {
       [BAYMA_SERVER_NAME]: {
         ...baymaLaunch({ harness: CODEX_HARNESS, threadKey, env: codexEnv }),

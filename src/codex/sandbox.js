@@ -13,6 +13,7 @@
  * against `codex app-server` inside the sandbox.
  */
 import { createInterface } from "node:readline";
+import { REPLY_INSTRUCTIONS } from "../harness/reply-instructions.js";
 import { AppServerClient } from "./app-server/client.js";
 
 /** Where Codex keeps its state inside the sandbox: on the session volume, owned by the agent user. */
@@ -44,6 +45,7 @@ export function sandboxCodexEnv({ bearer }) {
 export function sandboxCodexConfig({ gatewayUrl, baymaHttpUrl }) {
   return {
     project_doc_max_bytes: 32768,
+    developer_instructions: REPLY_INSTRUCTIONS,
     model_provider: "gateway",
     model_providers: {
       gateway: {

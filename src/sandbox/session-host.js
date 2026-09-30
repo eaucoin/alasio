@@ -9,6 +9,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { createLogger } from "../shared/log.js";
+import { overLimitNote } from "../telegram/rich-media.js";
 import { sessionHostName } from "./names.js";
 
 const log = createLogger("session-host");
@@ -106,6 +107,29 @@ export class SessionHost {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * A file as the sandboxed agent sees it: `{ bytes }`, or `{ note }` saying why not.
+   * The read runs inside the sandbox as the agent, so the path (relative to /workspace,
+   * symlinks included) reaches only what the agent itself can, never the host. Files
+   * over `maxBytes` are not read.
+   */
+  async readFile(volumeId, path, maxBytes) {
+    const script = 'f="$1"; [ -f "$f" ] || exit 3; s=$(stat -L -c %s -- "$f") || exit 3; [ "$s" -le "$2" ] || { printf %s "$s" >&2; exit 4; }; exec cat -- "$f"';
+    try {
+      const { stdout } = await this.docker.cli(
+        ["exec", sessionHostName(volumeId), "agent-exec", "sh", "-c", script, "sh", path, String(maxBytes)],
+        { encoding: "buffer", maxBuffer: maxBytes + 1024 * 1024 },
+      );
+      return { bytes: stdout };
+    } catch (error) {
+      if (error?.code === 3) return { note: "file not found" };
+      if (error?.code === 4) {
+        return { note: overLimitNote(Number(String(error.stderr ?? "").trim()), maxBytes) };
+      }
+      throw error;
     }
   }
 

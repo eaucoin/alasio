@@ -1,3 +1,5 @@
+import { rmSync } from "node:fs";
+
 const DEFAULT_RETRY_MS = 10_000;
 const MAX_RETRY_MS = 5 * 60_000;
 
@@ -46,6 +48,10 @@ export class TelegramOutbox {
       try {
         await this.client.sendMessage(item.chat_id, item.text, item.options);
         this.store.markOutboxSent(item.id);
+        // The copies of the media a reply showed (codex/reply-media.js) are its own.
+        if (item.options?.mediaDir) {
+          rmSync(item.options.mediaDir, { recursive: true, force: true });
+        }
       } catch (error) {
         const retryAfterMs = Number(error?.retryAfterMs) || 0;
         const exponentialMs = Math.min(DEFAULT_RETRY_MS * (2 ** Math.min(item.attempts, 5)), MAX_RETRY_MS);

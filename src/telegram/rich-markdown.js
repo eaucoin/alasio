@@ -12,6 +12,8 @@
  * literally there).
  */
 
+import { MEDIA_LINE } from "./rich-media.js";
+
 /** Rich messages hold 32768 characters; this leaves room for the escapes. */
 export const RICH_MESSAGE_MAX_CHARS = 30_000;
 /** Rich messages hold 500 blocks (rows, list items, paragraphs, ...); this bounds a part's lines. */
@@ -74,7 +76,10 @@ function escapeLine(line) {
   return out;
 }
 
-/** The agent's Markdown with the syntax it did not mean escaped, ready for `rich_message.markdown`. */
+/**
+ * The agent's Markdown with the syntax it did not mean escaped, ready for
+ * `rich_message.markdown`. Media lines alasio placed itself (rich-media.js) pass through.
+ */
 export function toRichMarkdown(markdown) {
   let fence = null;
   return String(markdown)
@@ -85,7 +90,8 @@ export function toRichMarkdown(markdown) {
         return line;
       }
       fence = openingFence(line);
-      return fence ? line : escapeLine(line);
+      if (fence || MEDIA_LINE.test(line)) return line;
+      return escapeLine(line);
     })
     .join("\n");
 }
