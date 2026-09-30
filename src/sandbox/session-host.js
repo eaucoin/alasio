@@ -1,11 +1,10 @@
 /**
- * A session host: the privileged container alasio starts per session-filesystem session
+ * A session host: the privileged container alasio starts per session filesystem
  * (sandbox/session-host/). It mounts the volume, builds the agent's network, and runs
- * the agent, its harness, and bayma inside one gVisor sandbox whose root is the agent
- * image. alasio adds the harness later with `docker exec agent-exec` (which runs
- * `runsc exec` into the sandbox), so the harness speaks its stdio protocol to alasio as
- * it does today; the credential is a per-session gateway bearer written into the
- * sandbox's env, never a real login (session-fs-research E5, E8).
+ * bayma and every process the agent starts inside one gVisor sandbox whose root is the
+ * agent image. The harness is not in it: Claude Code and Codex run in alasio and reach the
+ * sandbox only through bayma, over `connect` (see ./bayma-forward.js). So no model login
+ * and no harness state is ever inside a session (session-fs-research E5, E8).
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { createLogger } from "../shared/log.js";
@@ -26,13 +25,10 @@ export class SessionHost {
   /** The `docker run` argv for a session host on `volumeId`, given its mount env. Pure, for tests. */
   runArgs(volumeId, { mountEnv, netMode }) {
     const c = this.config;
-    const gateway = c.gateway ?? {};
     const env = {
       ...mountEnv,
       META_PASSWORD_FILE: c.metadataPasswordFile,
       NET_MODE: netMode === "full" ? "full" : "none",
-      GATEWAY_IP: gateway.ip ?? "",
-      GATEWAY_PORT: gateway.port ? String(gateway.port) : "",
       HOST_PUBLIC_IP: c.hostPublicIp ?? "",
       // A stop checkpoints the sandbox onto the volume, and the next start restores it,
       // so the agent's processes and bayma's REPL sessions come back as they were.
@@ -52,9 +48,9 @@ export class SessionHost {
   }
 
   /**
-   * Start the session host and wait until its sandbox is ready. Any earlier container of
-   * the name is removed first; its checkpoint, if it left one, is on the volume, where
-   * the new container restores it.
+   * Start the session host and wait until bayma answers inside its sandbox. Any earlier
+   * container of the name is removed first; its checkpoint, if it left one, is on the
+   * volume, where the new container restores it.
    */
   async start(volumeId, { mountEnv, netMode }) {
     const name = sessionHostName(volumeId);
@@ -75,48 +71,19 @@ export class SessionHost {
     throw new Error(`session host ${name} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
   }
 
-  /** Write the env the harness runs with inside the sandbox (the gateway bearer, CODEX_HOME, ...). */
-  async writeAgentEnv(volumeId, vars) {
-    const lines = Object.entries(vars).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
-    await this.docker.cli(["exec", "-i", sessionHostName(volumeId), "sh", "-c", "cat > /run/agent-env"], { input: lines });
-  }
-
-  /**
-   * The argv to spawn the harness inside the sandbox; the caller owns the child (the
-   * SDK, the app-server). `env` is applied to the process inside the sandbox, for the
-   * harness's per-spawn variables on top of the session's base env. agent-exec forwards
-   * only the names listed in AGENT_EXEC_VARS, never the session host's own environment.
-   */
-  execCommand(volumeId, argv, env = {}) {
-    const names = Object.keys(env);
-    const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
-    if (names.length > 0) envArgs.push("-e", `AGENT_EXEC_VARS=${names.join(",")}`);
-    return this.docker.spawnArgs(["exec", "-i", ...envArgs, sessionHostName(volumeId), "agent-exec", ...argv]);
-  }
-
-  /** Spawn the harness inside the sandbox as a long-lived child the caller owns (e.g. the SDK). */
-  spawn(volumeId, argv, env = {}) {
-    const { args } = this.execCommand(volumeId, argv, env);
-    return this.docker.spawn(args, { stdio: ["pipe", "pipe", "pipe"] });
-  }
-
   isRunning(volumeId) {
     return this.docker.isRunning(sessionHostName(volumeId));
   }
 
   /**
-   * Whether Claude Code's transcript for `sessionId` exists inside the sandbox. The
-   * working directory is always /workspace, so the SDK writes it to a fixed path; alasio
-   * uses this to decide resume vs a fresh id, without writing anything to the host.
+   * A connection to `port` on the sandbox's own loopback, as a child process whose stdin
+   * and stdout are its two directions (`agent-connect`, made from inside as the agent).
+   * The caller owns the child; it exits when either side closes.
    */
-  async transcriptExists(volumeId, sessionId) {
-    const path = `/home/agent/.claude/projects/-workspace/${sessionId}.jsonl`;
-    try {
-      await this.docker.cli(["exec", sessionHostName(volumeId), "agent-exec", "sh", "-c", `test -f ${path}`]);
-      return true;
-    } catch {
-      return false;
-    }
+  connect(volumeId, port) {
+    return this.docker.spawn(["exec", "-i", sessionHostName(volumeId), "agent-connect", String(port)], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
   }
 
   /**

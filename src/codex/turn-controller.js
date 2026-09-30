@@ -88,14 +88,6 @@ export class TurnController {
     return workingDirectory;
   }
 
-  /**
-   * Per-conversation view of the deployment config for helpers that still read
-   * config.workingDirectory (goal RPCs).
-   */
-  configFor(conversationId) {
-    return { ...this.config, workingDirectory: this.workingDirectoryFor(conversationId) };
-  }
-
   async sendChooseServicePanel({ conversationId, chatId }) {
     await sendChooseServicePanel({
       client: this.client,

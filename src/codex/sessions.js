@@ -33,27 +33,36 @@ function answerOf(turn) {
 }
 
 /**
- * `client` answers the app-server's thread lists, and `fork` makes a rewind's
- * thread; both default to alasio's, tests pass their own. `beforeFork` runs
- * first with the thread forked from, for the rollout store to write back any
- * file of it missing here.
+ * The app-server and directory a folder workspace's threads are listed from: the shared
+ * app-server, in the folder itself.
+ */
+export function folderListingScope(workingDirectory) {
+  return async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client: codexAppServerClient });
+}
+
+/**
+ * `listingScope()` gives the app-server and directory the threads are listed from
+ * (`{ cwd, codexEnv, client }`), and `fork` makes a rewind's thread; both default to
+ * a folder workspace's, and a session filesystem's harness passes its own. `beforeFork`
+ * runs first with the thread forked from, for the rollout store to write back any file
+ * of it missing here.
  */
 export function createCodexSessionApi({
   workingDirectory,
-  client = codexAppServerClient,
+  listingScope = folderListingScope(workingDirectory),
   fork = forkCodexSession,
   beforeFork = async () => {},
 }) {
-  const scope = () => ({ env: buildCodexEnv(), cwd: workingDirectory });
-
   async function listAll() {
-    return await client.listThreads(scope());
+    const { cwd, codexEnv, client } = await listingScope();
+    return await client.listThreads({ env: codexEnv, cwd });
   }
 
   /** A thread's turns, newest first; none for a thread Codex cannot read. */
   async function turnsOf(sessionId) {
     try {
-      return await client.listTurns({ threadId: sessionId, ...scope() });
+      const { cwd, codexEnv, client } = await listingScope();
+      return await client.listTurns({ threadId: sessionId, env: codexEnv, cwd });
     } catch (error) {
       log.warn(`could not list the turns of ${sessionId}: ${errorText(error)}`);
       return [];

@@ -374,8 +374,9 @@ services:
 
 networks:
   # The stack's private network, on a named Linux bridge (setup.js DEFAULT_BRIDGE for
-  # alasio's own stack) so the host firewall rule that lets session hosts reach the alasio
-  # gateway names an interface that outlives the network being recreated.
+  # alasio's own stack) rather than Docker's br-<id>, so host tooling and firewall rules
+  # can name the interface the stack and its session hosts share across the network
+  # being recreated.
   default:
     driver_opts:
       com.docker.network.bridge.name: ${ALASIO_NEON_BRIDGE}

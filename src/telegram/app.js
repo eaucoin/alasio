@@ -1,6 +1,8 @@
 import { TurnController } from "../codex/turn-controller.js";
+import { createSessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.js";
 import { adoptTranscripts } from "../harness/claude/transcripts.js";
 import { createSandbox } from "../sandbox/index.js";
+import { parseWorkspace } from "../workspace/kind.js";
 import { createHarnessRegistry } from "../harness/index.js";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.js";
 import { SqliteStore } from "../persistence/store.js";
@@ -32,13 +34,18 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
-    // Session filesystems, off unless configured (createSandbox returns null then).
-    this.sandbox = config.sandbox ?? createSandbox({ config: config.sandboxConfig ?? null, store: this.store });
+    // Session filesystems, off unless configured (createSandbox returns null then), with
+    // the Codex app-server that serves them.
+    this.sandbox = config.sandbox ?? createSandbox({ config: config.sandboxConfig ?? null, store: this.store, stateDir: config.stateDir });
+    this.sessionFsCodex = config.sessionFsCodex
+      ?? (this.sandbox ? createSessionFsCodex({ home: sessionFsCodexHome(config.stateDir) }) : null);
     this.harnesses = config.harnesses ?? createHarnessRegistry({
       config,
       sessionStore: config.sessionStore ?? null,
       codexRollouts: config.codexRollouts ?? null,
       sandbox: this.sandbox,
+      sessionFsCodex: this.sessionFsCodex,
+      sessionFsCodexRollouts: config.sessionFsCodexRollouts ?? null,
     });
     this.turns = new TurnController({
       config: this.config,
@@ -92,9 +99,6 @@ export class TelegramCodexApp {
     log.info(`  Hook port: ${this.config.hookPort}`);
     log.info(`  Session filesystems: ${this.sandbox ? "enabled" : "off (set ALASIO_SANDBOX_ENABLED=1 to offer them)"}`);
     await this.client.deleteWebhook(false);
-    if (this.sandbox) {
-      await this.sandbox.startGateway();
-    }
     await this.configureNativeCommands();
     this.startHookServer();
     this.turns.reconcilePersistentState();
@@ -121,9 +125,22 @@ export class TelegramCodexApp {
     if (!sessionStore) {
       return;
     }
-    const sessions = this.store.listHarnessSessionReferences(CLAUDE_HARNESS);
+    const sessions = this.store.listHarnessSessionReferences(CLAUDE_HARNESS)
+      .map(({ sessionId, workingDirectory }) => ({ sessionId, workingDirectory: this.harnessDirectoryOf(workingDirectory) }))
+      .filter(({ workingDirectory }) => workingDirectory);
     log.info(`  Session store: adopting ${sessions.length} Claude session(s)`);
     await adoptTranscripts({ store: sessionStore, sessions });
+  }
+
+  /**
+   * The directory a workspace's harness runs in: a folder itself, or a session
+   * filesystem's harness directory; null for a session filesystem this deployment does
+   * not enable.
+   */
+  harnessDirectoryOf(workingDirectory) {
+    const workspace = parseWorkspace(workingDirectory);
+    if (workspace?.kind !== "sessionfs") return workingDirectory;
+    return this.sandbox?.harnessDirectory(workspace.volumeId) ?? null;
   }
 
   /**
@@ -131,13 +148,17 @@ export class TelegramCodexApp {
    * needs and this machine lacks, before any turn resumes one.
    */
   async restoreCodexRollouts() {
-    const codexRollouts = this.config.codexRollouts;
-    if (!codexRollouts) {
-      return;
+    const references = this.store.listHarnessSessionReferences(CODEX_HARNESS);
+    // Each thread goes back to the Codex home it runs from: the operator's for a folder,
+    // the session-filesystem app-server's for a session filesystem.
+    for (const [rollouts, sessionFs] of [[this.config.codexRollouts, false], [this.config.sessionFsCodexRollouts, true]]) {
+      if (!rollouts) continue;
+      const threadIds = references
+        .filter(({ workingDirectory }) => (parseWorkspace(workingDirectory)?.kind === "sessionfs") === sessionFs)
+        .map(({ sessionId }) => sessionId);
+      const written = await rollouts.restore(threadIds);
+      log.info(`  Rollout store${sessionFs ? " (session filesystems)" : ""}: ${threadIds.length} Codex thread(s), ${written.length} rollout file(s) written back`);
     }
-    const threadIds = this.store.listHarnessSessionReferences(CODEX_HARNESS).map(({ sessionId }) => sessionId);
-    const written = await codexRollouts.restore(threadIds);
-    log.info(`  Rollout store: ${threadIds.length} Codex thread(s), ${written.length} rollout file(s) written back`);
   }
 
   async stop() {
@@ -154,7 +175,9 @@ export class TelegramCodexApp {
       this.hookServer = null;
     }
     await this.poller.stop();
-    this.harnesses.shutdownAll();
+    await this.harnesses.shutdownAll();
+    await this.sessionFsCodex?.stop();
+    await this.sandbox?.close();
     this.store.close();
   }
 

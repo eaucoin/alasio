@@ -30,7 +30,7 @@ import {
   projectResultMessage,
 } from "./event-projection.js";
 import { claudeMcpServers } from "./mcp.js";
-import { sandboxSpawn } from "./sandbox.js";
+import { sessionFsQueryOptions } from "./sessionfs.js";
 import { REPLY_INSTRUCTIONS } from "../reply-instructions.js";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.js";
 import {
@@ -79,12 +79,10 @@ export function buildClaudeQueryOptions({
   env = process.env,
   modelChoice = null,
   sessionStore = null,
-  sandboxSession = null,
+  sessionFsBayma = null,
 }) {
   const options = {
-    // A session filesystem runs the CLI inside its gVisor sandbox, where the working
-    // directory is /workspace and the process is spawned through the sandbox (E5).
-    cwd: sandboxSession ? "/workspace" : workingDirectory,
+    cwd: workingDirectory,
     env: claudeEnv,
     abortController: controller,
     permissionMode: "bypassPermissions",
@@ -96,9 +94,11 @@ export function buildClaudeQueryOptions({
     hooks,
     mcpServers,
   };
-  if (sandboxSession) {
-    // Run `claude` inside the sandbox; the SDK's host binary path is dropped.
-    options.spawnClaudeCodeProcess = sandboxSpawn(sandboxSession);
+  // A session filesystem's CLI keeps only the tools that stay off this machine, and
+  // reaches its workspace through bayma alone (sessionfs.js).
+  if (sessionFsBayma) {
+    delete options.disallowedTools;
+    Object.assign(options, sessionFsQueryOptions(sessionFsBayma));
   }
   // Every transcript write is mirrored to the store as it is written, not at
   // the end of a turn, which can run for hours; a resume still runs from the

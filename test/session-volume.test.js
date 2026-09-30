@@ -75,13 +75,13 @@ test("destroy runs a throwaway juicefs destroy and forgets the volume", async ()
   await manager.destroy("fs-gone01"); // idempotent: no record, no throw
 });
 
-test("the session host run args carry the mount env, the isolation flags, and the gateway", () => {
+test("the session host run args carry the mount env and the isolation flags, and connections are made from inside", () => {
+  const spawned = [];
   const host = new SessionHost({
-    docker: { spawnArgs: (args) => ({ command: "docker", args }) },
+    docker: { spawn: (args, options) => { spawned.push({ args, options }); return { args }; } },
     config: {
       network: "alasio-sessions", agentImage: "alasio/agent", sessionHostImage: "alasio/session-host",
-      memoryMb: 2048, cpus: 2, pidsLimit: 512, hostPublicIp: "203.0.113.5",
-      metadataPasswordFile: "/run/valkey-pw", gateway: { ip: "10.0.0.9", port: 8080 },
+      memoryMb: 2048, cpus: 2, pidsLimit: 512, hostPublicIp: "203.0.113.5", metadataPasswordFile: "/run/valkey-pw",
     },
   });
   const args = host.runArgs("fs-work01", { mountEnv: { JFS_META: "redis://v/1", JFS_NAME: "fs-work01" }, netMode: "full" });
@@ -91,15 +91,12 @@ test("the session host run args carry the mount env, the isolation flags, and th
   assert.ok(s.includes("type=image,source=alasio/agent,target=/agent-root"));
   assert.ok(s.includes("--pids-limit 512") && s.includes("--memory 2048m"));
   assert.ok(s.includes("JFS_META=redis://v/1"));
-  assert.ok(s.includes("NET_MODE=full") && s.includes("GATEWAY_IP=10.0.0.9") && s.includes("GATEWAY_PORT=8080"));
-  assert.ok(s.includes("HOST_PUBLIC_IP=203.0.113.5") && s.includes("CHECKPOINT_ON_STOP=1"));
+  assert.ok(s.includes("NET_MODE=full") && s.includes("HOST_PUBLIC_IP=203.0.113.5"));
+  assert.ok(s.includes("CHECKPOINT_ON_STOP=1") && s.includes("RESTORE=1"));
+  assert.ok(!s.includes("GATEWAY")); // the sandbox reaches no model gateway: no harness runs in it
   assert.ok(args.at(-1) === "alasio/session-host");
-  const cmd = host.execCommand("fs-work01", ["claude", "--version"]);
-  assert.deepEqual(cmd, { command: "docker", args: ["exec", "-i", "alasio-session-fs-work01", "agent-exec", "claude", "--version"] });
-  // Per-spawn env is named for agent-exec, which forwards nothing else of the host's env.
-  const withEnv = host.execCommand("fs-work01", ["codex"], { CODEX_HOME: "/home/agent/.codex", TOKEN: "t" });
-  assert.deepEqual(withEnv.args, [
-    "exec", "-i", "-e", "CODEX_HOME=/home/agent/.codex", "-e", "TOKEN=t", "-e", "AGENT_EXEC_VARS=CODEX_HOME,TOKEN",
-    "alasio-session-fs-work01", "agent-exec", "codex",
-  ]);
+  // A connection to a port on the sandbox's own loopback is a docker exec of agent-connect.
+  host.connect("fs-work01", 7290);
+  assert.deepEqual(spawned[0].args, ["exec", "-i", "alasio-session-fs-work01", "agent-connect", "7290"]);
+  assert.deepEqual(spawned[0].options.stdio, ["pipe", "pipe", "ignore"]);
 });

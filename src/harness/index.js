@@ -51,9 +51,18 @@ const FACTORIES = {
  * created lazily per (harness, working directory) pair and cached; overrides
  * (test doubles) stand in for every folder of their harness but still require
  * a mounted folder so gating behaves the same as production. `sessionStore`
- * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts.
+ * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts; `sandbox`,
+ * `sessionFsCodex` and `sessionFsCodexRollouts` serve session-filesystem workspaces.
  */
-export function createHarnessRegistry({ config = {}, overrides = {}, sessionStore = null, codexRollouts = null, sandbox = null } = {}) {
+export function createHarnessRegistry({
+  config = {},
+  overrides = {},
+  sessionStore = null,
+  codexRollouts = null,
+  sandbox = null,
+  sessionFsCodex = null,
+  sessionFsCodexRollouts = null,
+} = {}) {
   const adapters = new Map();
   const getFor = (name, workingDirectory) => {
     if (!isHarnessName(name)) {
@@ -68,7 +77,7 @@ export function createHarnessRegistry({ config = {}, overrides = {}, sessionStor
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox, sessionFsCodex, sessionFsCodexRollouts });
       adapters.set(key, adapter);
     }
     return adapter;
@@ -101,14 +110,10 @@ export function createHarnessRegistry({ config = {}, overrides = {}, sessionStor
       }
       return adapter;
     },
-    shutdownAll() {
-      for (const adapter of [...new Set([...adapters.values(), ...Object.values(overrides)])]) {
-        try {
-          adapter.shutdown();
-        } catch {
-          // Shutdown is best-effort per harness.
-        }
-      }
+    /** Shut every adapter down, each best-effort, and wait for all of them. */
+    async shutdownAll() {
+      const all = [...new Set([...adapters.values(), ...Object.values(overrides)])];
+      await Promise.allSettled(all.map(async (adapter) => await adapter.shutdown()));
     },
   };
 }

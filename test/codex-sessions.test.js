@@ -104,7 +104,7 @@ test("sessions are labelled by name, else first prompt; turns without a prompt a
       return [turn("t3", null, "continued on its own"), turn("t2", "second", null), turn("t1", "first", "answered")];
     },
   };
-  const sessions = createCodexSessionApi({ workingDirectory: "/work", client });
+  const sessions = createCodexSessionApi({ workingDirectory: "/work", listingScope: async () => ({ cwd: "/work", codexEnv: {}, client }) });
   assert.deepEqual(await sessions.listSessions(1), [
     { uuid: "named", timestamp: "2026-09-21", label: "Named thread" },
     { uuid: "prompted", timestamp: "-", label: "a first prompt that is well over fort..." },
@@ -162,7 +162,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
     const forks = [];
     const sessions = createCodexSessionApi({
       workingDirectory,
-      client,
+      listingScope: async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client }),
       fork: async ({ sessionId, beforeTurnId, threadKey }) => {
         forks.push(threadKey);
         return await client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: {} });

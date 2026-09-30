@@ -15,6 +15,7 @@ mindmap
       lineage follows history_base transitively in one recursive query so a thread's files and every file its history starts in come together
     Mirror
       index is startCodexRollouts which src/index.js starts right after Neon so no turn runs unmirrored and which offers restore flush and close
+      src/index.js starts one for the operator's Codex home into codex_sessions and when session filesystems are on one for the session-filesystem Codex home into codex_sessionfs_sessions so each thread is restored into the home it runs from
       the kernel reports each write to sessions and archived_sessions through recursive fs.watch and the file is mirrored within milliseconds including in day folders made later
       while a rollout directory does not exist yet as in a new Codex home the home itself is watched for it so alasio never makes directories in Codex's home
       a check every thirty seconds mirrors whatever no report covered such as changes made while alasio was down and restarts any watch that failed and a change it finds that was written over five seconds before is logged as one no watch reported

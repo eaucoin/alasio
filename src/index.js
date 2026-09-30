@@ -2,6 +2,8 @@ import "dotenv/config";
 import { loadAlasioConfig } from "./config.js";
 import { codexHome } from "./codex/env.js";
 import { startCodexRollouts } from "./codex/rollouts/index.js";
+import { NeonRolloutStore, SESSION_FS_SCHEMA } from "./codex/rollouts/store.js";
+import { sessionFsCodexHome } from "./codex/sessionfs.js";
 import { startTranscriptSearch } from "./harness/claude/search/index.js";
 import { loadSandboxConfig } from "./sandbox/config.js";
 import { startNeon } from "./neon/stack.js";
@@ -14,6 +16,7 @@ let neon = null;
 let app = null;
 let search = null;
 let codexRollouts = null;
+let sessionFsCodexRollouts = null;
 
 async function main() {
   // Claude Code's transcripts and Codex's rollouts are kept in alasio's Neon,
@@ -22,8 +25,15 @@ async function main() {
   neon = await startNeon({ stateDir: config.stateDir });
   codexRollouts = startCodexRollouts({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are off unless
-  // configured; the app builds the subsystem from this with its own store.
-  app = new TelegramCodexApp({ ...config, sessionStore: neon.store, codexRollouts, sandboxConfig: loadSandboxConfig() });
+  // configured; the app builds the subsystem from this with its own store. Their Codex
+  // runs from a home of its own, mirrored the same way into a schema of its own.
+  const sandboxConfig = loadSandboxConfig();
+  if (sandboxConfig) {
+    const store = new NeonRolloutStore(neon.pool, { schema: SESSION_FS_SCHEMA });
+    await store.ensureSchema();
+    sessionFsCodexRollouts = startCodexRollouts({ store, home: sessionFsCodexHome(config.stateDir) });
+  }
+  app = new TelegramCodexApp({ ...config, sessionStore: neon.store, codexRollouts, sessionFsCodexRollouts, sandboxConfig });
   await app.start();
   log.info("Telegram Alasio bot is running");
   // Once the bot serves: the indexer's first pass reads every stored entry.
@@ -35,6 +45,7 @@ async function shutdown(signal) {
   try {
     await app?.stop();
     await codexRollouts?.close();
+    await sessionFsCodexRollouts?.close();
     await search?.close();
     await neon?.close();
   } catch (error) {

@@ -41,10 +41,6 @@ export class CommandHandler {
     this.sandboxEnabled = sandboxEnabled;
   }
 
-  configFor(conversationId) {
-    return { ...this.config, workingDirectory: resolveWorkingDirectory(this.store, conversationId) };
-  }
-
   harnessFor(conversationId) {
     return this.harnesses.forConversation(this.store, conversationId);
   }
@@ -181,7 +177,7 @@ export class CommandHandler {
       }
       await handleGoalTextCommand({
         client: this.client,
-        config: this.configFor(conversationId),
+        goalApi: harness.goals,
         store: this.store,
         conversationId,
         chatId,

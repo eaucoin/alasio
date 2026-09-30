@@ -9,6 +9,8 @@
  */
 
 export const DEFAULT_SCHEMA = "codex_sessions";
+/** Where the session-filesystem Codex home's rollouts are kept (codex/sessionfs.js). */
+export const SESSION_FS_SCHEMA = "codex_sessionfs_sessions";
 
 const ddl = (SCHEMA) => `
 create schema if not exists ${SCHEMA};

@@ -20,8 +20,6 @@
 import { randomUUID } from "node:crypto";
 
 import { CLAUDE_HARNESS } from "../names.js";
-import { parseWorkspace } from "../../workspace/kind.js";
-import { sandboxClaudeEnv, sandboxMcpServers } from "./sandbox.js";
 import {
   appendBlock,
   buildClaudeEnv,
@@ -65,10 +63,13 @@ function describeTasks(tasks) {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
-export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, sandbox = null, queryFactory = defaultQueryFactory } = {}) {
+/**
+ * `workingDirectory` is where the CLI runs: a folder workspace itself, or a session
+ * filesystem's harness directory, when `sessionFsBayma()` gives the workspace's bayma
+ * endpoint (starting its session host) and the CLI is confined to it (sessionfs.js).
+ */
+export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, sessionFsBayma = null, queryFactory = defaultQueryFactory } = {}) {
   const hosts = new Map();
-  const workspace = parseWorkspace(workingDirectory);
-  const sandboxVolumeId = sandbox && workspace?.kind === "sessionfs" ? workspace.volumeId : null;
 
   function closeHost(host, reason) {
     if (host.closed) {
@@ -377,32 +378,20 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
     settleOnExit(host, exitError);
   }
 
-  async function startHost(params, key) {
+  async function startHost(params, key, bayma) {
     const { threadKey, resumeSession, persistence } = params;
-    // A session filesystem runs Claude Code and bayma inside its gVisor sandbox; a
-    // folder runs them on the host as before.
-    let sandboxSession = null;
-    let claudeEnv;
-    let mcpServers;
-    let resumeExists;
-    if (sandboxVolumeId) {
-      sandboxSession = await sandbox.ensureSession(sandboxVolumeId, sandboxClaudeEnv);
-      claudeEnv = sandboxClaudeEnv({ bearer: sandboxSession.bearer, gatewayUrl: sandboxSession.gatewayUrl });
-      mcpServers = sandboxMcpServers(sandboxSession.baymaHttpUrl);
-      // bayma is the sandbox's init; nothing to ensure on the host. Resume is decided
-      // from the transcript on the volume, not the host home.
-      resumeExists = resumeSession ? await sandboxSession.transcriptExists(resumeSession) : false;
-    } else {
-      claudeEnv = buildClaudeEnv();
-      await ensureBaymaReady(claudeEnv);
-      mcpServers = claudeMcpServers({ threadKey, env: claudeEnv });
-      resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
-    }
+    const claudeEnv = buildClaudeEnv();
+    // A session filesystem's bayma runs in its sandbox, reached through its forward; a
+    // folder's is launched here for the conversation.
+    if (!bayma) await ensureBaymaReady(claudeEnv);
+    const mcpServers = bayma ? undefined : claudeMcpServers({ threadKey, env: claudeEnv });
+    const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
     const host = {
       threadKey,
       key,
+      baymaUrl: bayma?.url ?? null,
       sessionId: resumeSession ?? null,
       channel,
       controller,
@@ -473,7 +462,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
       resumeExists,
       controller,
       sessionStore,
-      sandboxSession,
+      sessionFsBayma: bayma,
       hooks: {
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },
@@ -492,14 +481,18 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
    */
   async function hostFor(params) {
     const key = modelKey(params.persistence, params.threadKey);
+    // A session filesystem's host is made sure of before every turn, not only when the
+    // process starts: the process outlives turns, and its session host may have stopped
+    // in between. Its bayma is reached through the same forward either way.
+    const bayma = sessionFsBayma ? await sessionFsBayma() : null;
     const existing = hosts.get(params.threadKey);
     if (existing && !existing.closed) {
-      if (params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key) {
+      if (params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null)) {
         return existing;
       }
-      closeHost(existing, "mounted session or model changed");
+      closeHost(existing, "mounted session, model, or workspace door changed");
     }
-    const host = await startHost(params, key);
+    const host = await startHost(params, key, bayma);
     hosts.set(params.threadKey, host);
     return host;
   }

@@ -10,8 +10,8 @@ export class AppServerRpcClient {
     this.onNotification = onNotification;
     this.onFailure = onFailure;
     // How the app-server process is created. The default spawns the local codex
-    // binary; a session-filesystem client injects one that runs `codex app-server`
-    // inside the volume's gVisor sandbox over `docker exec` (see codex/sandbox.js).
+    // binary; the session-filesystem client injects one that runs it in its own Codex
+    // home's directory (see codex/sessionfs.js).
     this.spawnProcess = spawnProcess;
     this.process = null;
     this.nextId = 1;

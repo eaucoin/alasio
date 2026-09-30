@@ -32,9 +32,10 @@ export const BUCKET = "neon";
 // process points its ALASIO_SANDBOX_*_FILE knobs at (see src/sandbox/config.js).
 export const BUCKET_SESSIONS = "sessions";
 export const DEFAULT_COMPUTE_PORT = 55433;
-// The Linux bridge the stack's network gets, named rather than Docker's br-<id> so a
-// host firewall rule for session hosts reaching the alasio gateway survives the network
-// being recreated. A test stack running alongside gets its own (stack.js).
+// The Linux bridge the stack's network gets, named rather than Docker's br-<id> so host
+// tooling and firewall rules can name the interface the stack and its session hosts
+// share across the network being recreated. A test stack running alongside gets its
+// own (stack.js).
 export const DEFAULT_BRIDGE = "alasio-neon0";
 
 const CONTROL_DIR = dirname(fileURLToPath(import.meta.url));

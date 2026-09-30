@@ -23,7 +23,7 @@ import {
     createCommandEventPolicy,
 } from "./command-event-policy.js";
 import { buildCodexThreadConfig } from "./thread-config.js";
-import { sandboxCodexConfig, sandboxCodexEnv } from "./sandbox.js";
+import { codexAppServerClient } from "./app-server/client.js";
 import { ensureBaymaReady } from "../mcp/bayma.js";
 import { createLogger } from "../shared/log.js";
 
@@ -34,30 +34,27 @@ function getErrorMessage(error) {
 }
 
 /**
- * What a turn runs against: a folder workspace uses the shared app-server, the
- * local Codex env, and the operator's bayma launch; a session-filesystem
- * workspace uses its own sandboxed app-server (client), works in `/workspace`,
- * and reaches models only through the gateway. bayma runs inside the sandbox as
- * an HTTP server there, so its local readiness is not awaited.
+ * What a folder workspace's turns run against: the shared app-server, the operator's
+ * Codex env, and their bayma launch. A scope is `{ cwd, codexEnv, codexConfig, client }`.
  */
-async function codexScope({ workingDirectory, threadKey, codexSession }) {
-    if (codexSession) {
-        return {
-            cwd: "/workspace",
-            codexEnv: sandboxCodexEnv({ bearer: codexSession.bearer }),
-            codexConfig: sandboxCodexConfig({ gatewayUrl: codexSession.gatewayUrl, baymaHttpUrl: codexSession.baymaHttpUrl }),
-            client: codexSession.client,
-        };
-    }
+export async function folderCodexScope({ workingDirectory, threadKey }) {
     const codexEnv = buildCodexEnv();
     const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
     await ensureBaymaReady(codexEnv);
-    return { cwd: workingDirectory, codexEnv, codexConfig, client: undefined };
+    return { cwd: workingDirectory, codexEnv, codexConfig, client: codexAppServerClient };
 }
 
-export async function startFreshCodexSession({ threadKey, workingDirectory, codexSession = null }) {
+/**
+ * The scope a call runs against: `scope()`, when the harness gives one (a session
+ * filesystem's, from ./sessionfs.js), else the folder workspace's.
+ */
+async function codexScope({ workingDirectory, threadKey, scope }) {
+    return scope ? await scope() : await folderCodexScope({ workingDirectory, threadKey });
+}
+
+export async function startFreshCodexSession({ threadKey, workingDirectory, scope = null }) {
     const startedAt = process.hrtime.bigint();
-    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, scope });
     const sessionId = await startCodexTransportThread({
         threadKey,
         workingDirectory: cwd,
@@ -72,8 +69,8 @@ export async function startFreshCodexSession({ threadKey, workingDirectory, code
 }
 
 /** A new thread holding a session's history before one of its turns: rewind. */
-export async function forkCodexSession({ sessionId, beforeTurnId, threadKey, workingDirectory, codexSession = null }) {
-    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
+export async function forkCodexSession({ sessionId, beforeTurnId, threadKey, workingDirectory, scope = null }) {
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, scope });
     return await forkCodexTransportThread({
         sessionId,
         beforeTurnId,
@@ -90,12 +87,12 @@ function isIntentionalTurnInterrupt(error) {
     return message === "Interrupted from Telegram" || message === "Telegram swerve";
 }
 
-export async function warmCodexSession({ sessionId, threadKey, workingDirectory, codexSession = null }) {
+export async function warmCodexSession({ sessionId, threadKey, workingDirectory, scope = null }) {
     if (!sessionId || !canWarmCodexSession()) {
         return false;
     }
     const startedAt = process.hrtime.bigint();
-    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
+    const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, scope });
     await warmCodexTransportThread({
         sessionId,
         threadKey,
@@ -111,7 +108,7 @@ export function shutdownCodexRuntime() {
     stopCodexTransport();
 }
 export async function executeCodexTurn(params) {
-    const { prompt, resumeSession, threadKey, chatId, messageId, workingDirectory, persistence, activeQueries, onStarted, codexSession = null, } = params;
+    const { prompt, resumeSession, threadKey, chatId, messageId, workingDirectory, persistence, activeQueries, onStarted, scope = null, } = params;
     const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
     const turnTimer = createTurnTimer({ threadKey, resumeSession, prompt, log });
     log.info(`Querying Codex (resume=${resumeSession})`);
@@ -145,7 +142,7 @@ export async function executeCodexTurn(params) {
         log,
     });
     try {
-        const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, codexSession });
+        const { cwd, codexEnv, codexConfig, client } = await codexScope({ workingDirectory, threadKey, scope });
         turnTimer("env.built");
         turnTimer("bayma.ready");
         const streamParams = {

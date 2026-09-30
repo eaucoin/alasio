@@ -14,7 +14,7 @@ mindmap
       runtime awaits the caller's beforeResponseComplete once a turn completes and before its response is marked complete so nothing delivers a reply first
       runtime forks a session before one of its turns for rewind through the app-server's thread/fork loaded with the same overrides as a resume under either transport
     Sessions boundary
-      sessions is the Codex session panels' api read from the app-server's thread/list scoped to the working directory and thread/turns/list so alasio reads and writes none of Codex's files for them
+      sessions is the Codex session panels' api read from the app-server's thread/list scoped to the working directory and thread/turns/list so alasio reads and writes none of Codex's files for them through a listing scope the harness gives which is the shared app-server for a folder and the session-filesystem one for a session filesystem
       sessions are labelled by thread name else first prompt and each turn with an operator prompt is a rewind point whose uuid is the turn id
       rollouts/ keeps every rollout file in alasio's Neon byte for byte and writes back what a thread alasio points at needs as its own README describes
       runtime can attach to an app-server goal-created turn and persist it like an ordinary Telegram-started turn
@@ -32,8 +32,10 @@ mindmap
       thread-config owns the overrides every thread starts and resumes with which add bayma to the MCP servers in the operator's Codex config
       model selects gpt-5.6-sol with high reasoning for both app-server and exec transports so new resumed and steered continuation turns use one operator-selected authority
       app-server/ owns the long-lived stdio JSON-RPC process, thread RPCs, notification queue, and protocol mapping as separate concepts
-      the app-server process spawn is injectable so a folder workspace spawns the local codex binary and a session-filesystem workspace gets its own per-volume client whose process runs codex app-server inside the gVisor sandbox over the session's own spawn
-      sandbox owns that session-filesystem path its env with the gateway bearer under the provider env_key its thread config whose only model provider is the gateway with bayma over http and the spawn that reaches inside runtime routes a turn to the per-volume client and /workspace when the harness resolves a sandbox session
+      runtime runs every call against a scope cwd env config and client which it builds for a folder from the shared app-server and which a session filesystem's harness passes in
+      sessionfs is Codex for session filesystems one app-server for all of them run here with a Codex home of alasio's own so none of the operator's configuration reaches an isolated workspace and with no environment at all so it registers no shell apply_patch or view_image by construction since thread resume and fork carry no environments field
+      its per-thread config gives the workspace's bayma forward as the bayma MCP server with the forward's bearer and alasio's instructions and a thread runs in the workspace's harness directory which keeps each workspace's threads apart
+      login-relay is how that home uses the operator's Codex login without a copy that would refresh on its own and invalidate theirs a loopback relay taking only the app-server's bearer and the model API's paths and sending each request on with the login read fresh from the operator's auth.json a ChatGPT login to the Codex backend with its account id and an API key to the OpenAI API
       command-event-policy owns command-stream side effects such as restart provenance, workflow wait pings, and DB guardrail aborts
     Projection boundary
       event-projection converts Codex stream items into persisted response blocks

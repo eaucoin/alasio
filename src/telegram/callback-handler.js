@@ -177,7 +177,7 @@ export class CallbackHandler {
       }
       await handleGoalControlCallback({
         client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
-        config: this.turns.configFor?.(action.conversationId) ?? this.config,
+        goalApi: harness.goals,
         store: this.store,
         action,
         callbackQueryId: callbackQuery.id,

@@ -8,5 +8,6 @@ COPY gvisor/ /opt/gvisor/
 COPY juicefs /usr/local/bin/juicefs
 COPY entrypoint.sh /usr/local/bin/session-host
 COPY agent-exec.sh /usr/local/bin/agent-exec
-RUN chmod +x /usr/local/bin/session-host /usr/local/bin/agent-exec /opt/gvisor/runsc
+COPY agent-connect.sh /usr/local/bin/agent-connect
+RUN chmod +x /usr/local/bin/session-host /usr/local/bin/agent-exec /usr/local/bin/agent-connect /opt/gvisor/runsc
 ENTRYPOINT ["/usr/local/bin/session-host"]

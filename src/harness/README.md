@@ -11,7 +11,7 @@ mindmap
     Adapter contract
       startFreshSession warmSession executeTurn shutdown and a sessions api with listSessions getTotalSessionPages getSessionByNumber getSessionLastMessage listSessionMessages getTotalRewindPages and createForkedSession
       createForkedSession takes the conversation as threadKey since the fork becomes that conversation's session
-      supportsGoals supportsWarmup and supportsSteer let operator controls hide or refuse features a harness lacks
+      supportsGoals supportsWarmup and supportsSteer let operator controls hide or refuse features a harness lacks and a harness that supports goals offers them as goals read set clear and waitForTurnId over its own app-server
       executeTurn returns the same blockSequence sessionId pendingResponseId interrupted and responseCompleted shape for every harness
       the registry hands each adapter where its harness's sessions are kept sessionStore for Claude Code and codexRollouts for Codex
     Codex adapter
@@ -37,9 +37,11 @@ mindmap
     Reply instructions
       reply-instructions is what alasio tells every agent about its replies beyond the harness's own prompt how to show the operator an image or video with image syntax and a local path appended to Claude Code's system prompt and given to Codex as developer instructions after the operator's own
     Session filesystems
-      the registry hands each adapter the sandbox and a folder workspace runs exactly as before while a session-filesystem workspace runs the CLI inside its gVisor sandbox in /workspace on the credential gateway with a revocable per-session bearer and bayma over http
-      the Claude Code adapter routes through the SDK's spawnClaudeCodeProcess hook harness/claude/sandbox and skips the local bayma readiness since bayma is the session host's own http server
-      the Codex adapter resolves one sandbox app-server per volume codex/sandbox reused across the conversation's turns and skips the Neon rollout mirror because the volume itself is durable
+      the registry hands each adapter the sandbox the session-filesystem Codex and its rollout mirror and a folder workspace runs exactly as before
+      a session-filesystem workspace's harness runs here in the workspace's harness directory an empty one of its own and reaches the workspace only through its bayma forward so every session api reads that directory's sessions and a thread's work starts the session host while lists goals and models do not
+      the Claude Code adapter keeps the operator's login and Claude home so resume the Neon mirror adoption and search work as ever and claude/sessionfs confines it with a tools allowlist of subagents web search and the task list no setting sources strict MCP config and bayma as the one MCP server since web fetch would reach this machine's loopback
+      the Codex adapter runs on the session-filesystem app-server codex/sessionfs with the workspace's bayma per thread and its rollouts mirrored from that app-server's own home
+      workspace-instructions tells an agent in a session filesystem that its workspace is /workspace on an isolated machine reached through bayma and that its harness's directory holds nothing of its own
 ```
 
 ## Preference Atlas

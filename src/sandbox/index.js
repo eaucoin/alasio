@@ -1,71 +1,31 @@
 /**
  * The session-filesystem subsystem, assembled from configuration (config.js): the
- * metadata engine, the volume manager, the session-host launcher, and the credential
- * gateway. Off unless configured; `createSandbox` returns null then, and callers treat
- * a null sandbox as "session filesystems are unavailable, offer only folders".
+ * metadata engine, the volume manager, the session-host launcher, and the forwards that
+ * carry harnesses to bayma inside each session. Off unless configured; `createSandbox`
+ * returns null then, and callers treat a null sandbox as "session filesystems are
+ * unavailable, offer only folders".
+ *
+ * A session is the workspace only. The harness runs in alasio with its own login and
+ * state, and reaches the session through one door, bayma (./bayma-forward.js), so the
+ * sandbox holds no credential and, in "none" mode, reaches nothing at all.
  *
  * The pieces and the evidence behind them live in session-fs-research; the atlas is in
  * ./README.md.
  */
-import { readFileSync } from "node:fs";
-import { createLogger } from "../shared/log.js";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { startBaymaForward, SANDBOX_BAYMA_PORT } from "./bayma-forward.js";
 import { createDocker } from "./docker.js";
-import { SessionGateway } from "./gateway.js";
 import { createMetadataEngine } from "./metadata-engine.js";
 import { SessionHost } from "./session-host.js";
+import { assertValidVolumeId } from "./names.js";
 import { SessionVolumeManager } from "./volume.js";
 
-const log = createLogger("sandbox");
-
-/** A credential read fresh from its file each call, so a token added while running is picked up; null when absent. */
-function tokenFromFile(path) {
-  return () => {
-    if (!path) return null;
-    try {
-      return readFileSync(path, "utf8").trim() || null;
-    } catch {
-      return null;
-    }
-  };
-}
-
 /**
- * The access token from a local `claude` credentials JSON (`claudeAiOauth.accessToken`),
- * read fresh each call so a token Claude Code refreshes on disk is picked up; null when
- * absent or unreadable. The real login is never copied, only sourced at request time.
+ * `stateDir` is alasio's state directory, under which each session's harness directory
+ * lives (`harnessDirectory`).
  */
-function oauthTokenFromFile(path) {
-  return () => {
-    if (!path) return null;
-    try {
-      const token = JSON.parse(readFileSync(path, "utf8"))?.claudeAiOauth?.accessToken;
-      return typeof token === "string" && token ? token : null;
-    } catch {
-      return null;
-    }
-  };
-}
-
-/**
- * The access token and account id from a local `codex` ChatGPT login (auth.json's
- * `tokens`), read fresh each call so a token Codex refreshes on disk is picked up; null
- * when absent, unreadable, or not a ChatGPT login.
- */
-function chatgptLoginFromFile(path) {
-  return () => {
-    try {
-      const tokens = JSON.parse(readFileSync(path, "utf8"))?.tokens;
-      const credential = tokens?.access_token;
-      if (typeof credential !== "string" || !credential) return null;
-      const headers = typeof tokens.account_id === "string" && tokens.account_id ? { "chatgpt-account-id": tokens.account_id } : {};
-      return { credential, headers };
-    } catch {
-      return null;
-    }
-  };
-}
-
-export function createSandbox({ config, store, docker = createDocker() } = {}) {
+export function createSandbox({ config, store, stateDir, docker = createDocker(), startForward = startBaymaForward } = {}) {
   if (!config) return null;
   const engine = createMetadataEngine(config.metadata);
   const volumes = new SessionVolumeManager({
@@ -83,14 +43,6 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       sessionHostImage: config.host.sessionHostImage,
     },
   });
-  // Where session hosts reach the gateway: the configured address, else the network's
-  // own gateway (the host's address on that bridge), looked up when the gateway starts
-  // so a network Docker recreates on another subnet needs no configuration change.
-  const gatewayAddress = { ip: config.gateway.ip, port: config.gateway.port };
-  const gatewayUrl = () => {
-    if (!gatewayAddress.ip) throw new Error("the session gateway's address is not known until startGateway() has run");
-    return `http://${gatewayAddress.ip}:${gatewayAddress.port}`;
-  };
   const host = new SessionHost({
     docker,
     config: {
@@ -102,88 +54,66 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       pidsLimit: config.host.pidsLimit,
       hostPublicIp: config.host.hostPublicIp,
       metadataPasswordFile: config.metadata.passwordFile,
-      gateway: gatewayAddress,
-    },
-  });
-  // A ChatGPT login (openaiChatgptFile) takes precedence over an API-key file: Codex's
-  // /v1/responses is served by the ChatGPT Codex backend under /backend-api/codex.
-  const openai = config.gateway.openaiChatgptFile
-    ? {
-        upstream: config.gateway.chatgptUpstream,
-        credentialSource: chatgptLoginFromFile(config.gateway.openaiChatgptFile),
-        rewritePath: (path) => path.replace(/^\/v1(?=\/|$)/, "/backend-api/codex"),
-      }
-    : { upstream: config.gateway.openaiUpstream, credentialSource: tokenFromFile(config.gateway.openaiTokenFile) };
-  // A subscription OAuth login (anthropicOAuthFile) takes precedence over an API-key file
-  // and is injected as a Bearer; either is read fresh per request, neither is copied.
-  const anthropic = config.gateway.anthropicOAuthFile
-    ? { upstream: config.gateway.anthropicUpstream, credentialSource: oauthTokenFromFile(config.gateway.anthropicOAuthFile), oauth: true }
-    : { upstream: config.gateway.anthropicUpstream, credentialSource: tokenFromFile(config.gateway.anthropicTokenFile) };
-  const gateway = new SessionGateway({
-    providers: {
-      anthropic,
-      openai,
     },
   });
 
-  let closeGateway = null;
+  // Per volume, the start in flight (so two harnesses asking at once share one start
+  // rather than race a second `docker run` against it) and the forward to its bayma.
+  const starting = new Map();
+  const forwards = new Map();
+
+  async function ensureRunning(volumeId) {
+    const record = store.sessionVolumes.getVolume(volumeId) ?? volumes.create(volumeId);
+    if (await host.isRunning(volumeId)) return;
+    await host.start(volumeId, { mountEnv: volumes.mountEnv(volumeId), netMode: record.netMode ?? "none" });
+    volumes.markFormatted(volumeId);
+  }
+
+  function forwardFor(volumeId) {
+    if (!forwards.has(volumeId)) {
+      const forward = startForward({ connect: () => host.connect(volumeId, SANDBOX_BAYMA_PORT) });
+      forward.catch(() => forwards.delete(volumeId));
+      forwards.set(volumeId, forward);
+    }
+    return forwards.get(volumeId);
+  }
+
+  async function closeForward(volumeId) {
+    const forward = forwards.get(volumeId);
+    forwards.delete(volumeId);
+    await (await forward?.catch(() => null))?.close();
+  }
+
   return {
     enabled: true,
     engine,
     volumes,
     host,
-    gateway,
-    get gatewayUrl() {
-      return gatewayUrl();
-    },
 
-    /** Start the credential gateway; the app calls this once at startup. */
-    async startGateway() {
-      if (!gatewayAddress.ip) {
-        const { stdout } = await docker.cli(["network", "inspect", config.host.network, "--format", "{{range .IPAM.Config}}{{.Gateway}} {{end}}"]);
-        gatewayAddress.ip = stdout.trim().split(/\s+/).find((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip)) ?? null;
-        if (!gatewayAddress.ip) throw new Error(`could not find an IPv4 gateway on docker network ${config.host.network}`);
-      }
-      // Listen only where session hosts reach it, not on every interface: the gateway
-      // holds the model logins, so it is no business of any other network, whatever
-      // the host's firewall allows.
-      const { port, close } = await gateway.listen(config.gateway.port, gatewayAddress.ip);
-      closeGateway = close;
-      // The port bound, which differs from the configured one only when that is 0.
-      gatewayAddress.port = port;
-      log.info(`session filesystems enabled; gateway on ${port}, reached by session hosts at ${gatewayUrl()}`);
-    },
-
-    /** Stop the credential gateway listening; a no-op when it never started. */
-    async stopGateway() {
-      await closeGateway?.();
-      closeGateway = null;
+    /**
+     * The directory on this machine a session's harness runs in: empty, the session's
+     * own, and none of the workspace's (which is only in the sandbox). Its path keys the
+     * harness's sessions to the workspace (Claude Code's project, Codex's thread list).
+     */
+    harnessDirectory(volumeId) {
+      const directory = join(stateDir, "sessionfs", "workspaces", assertValidVolumeId(volumeId));
+      mkdirSync(directory, { recursive: true });
+      return directory;
     },
 
     /**
-     * Make sure the session host for `volumeId` is running and ready for a harness,
-     * creating the volume on first use and starting the container if it is down, then
-     * issue a fresh gateway bearer and write the harness's env inside the sandbox.
-     * `buildEnv({ bearer, gatewayUrl })` returns the env the harness runs with (where
-     * the bearer goes is the harness's business). Returns `execCommand(argv)`, the argv
-     * to spawn the harness inside the sandbox.
+     * Make sure the session host for `volumeId` is running and bayma answers inside it,
+     * creating the volume on first use and starting the container if it is down (a host
+     * that survived a alasio restart is adopted as it is). Returns `{ bayma: { url,
+     * headers } }`: the MCP endpoint a harness reaches the session through.
      */
-    async ensureSession(volumeId, buildEnv) {
-      const record = store.sessionVolumes.getVolume(volumeId) ?? volumes.create(volumeId);
-      if (!(await host.isRunning(volumeId))) {
-        await host.start(volumeId, { mountEnv: volumes.mountEnv(volumeId), netMode: record.netMode ?? "none" });
-        volumes.markFormatted(volumeId);
+    async ensureSession(volumeId) {
+      if (!starting.has(volumeId)) {
+        starting.set(volumeId, ensureRunning(volumeId).finally(() => starting.delete(volumeId)));
       }
-      const bearer = gateway.issueBearer(volumeId);
-      await host.writeAgentEnv(volumeId, buildEnv({ bearer, gatewayUrl: gatewayUrl() }));
-      return {
-        bearer,
-        gatewayUrl: gatewayUrl(),
-        baymaHttpUrl: "http://127.0.0.1:7290/mcp",
-        execCommand: (argv, env) => host.execCommand(volumeId, argv, env),
-        spawn: (argv, env) => host.spawn(volumeId, argv, env),
-        transcriptExists: (sessionId) => host.transcriptExists(volumeId, sessionId),
-      };
+      await starting.get(volumeId);
+      const { url, headers } = await forwardFor(volumeId);
+      return { bayma: { url, headers } };
     },
 
     /**
@@ -196,10 +126,13 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       return await host.readFile(volumeId, path, maxBytes);
     },
 
-    /** A turn or session ended: revoke its bearer, and optionally stop the host (checkpointing it). */
-    async releaseSession(volumeId, { stop = false } = {}) {
-      gateway.revokeSession(volumeId);
-      if (stop) await host.stop(volumeId);
+    /**
+     * alasio is shutting down: close every forward. Session hosts keep running, with the
+     * agent's processes and bayma's REPL sessions, for the next alasio to adopt; nothing of
+     * the harness is in them to lose.
+     */
+    async close() {
+      await Promise.all([...forwards.keys()].map(closeForward));
     },
   };
 }

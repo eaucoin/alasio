@@ -26,10 +26,6 @@ export function createDocker(run = execFileAsync) {
       const { stdout } = await execFileAsync("docker", ["ps", "--quiet", "--filter", `name=^${name}$`, "--filter", "status=running"]);
       return stdout.trim() !== "";
     },
-    /** The argv to spawn a process, for a caller that manages the child itself (the harness). */
-    spawnArgs(args) {
-      return { command: "docker", args };
-    },
     /** Spawn a long-lived docker process the caller owns (returns a ChildProcess). */
     spawn(args, options = {}) {
       return spawn("docker", args, options);

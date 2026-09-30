@@ -1,17 +1,8 @@
-import { codexAppServerClient } from "../codex/app-server/client.js";
-import { buildCodexEnv } from "../codex/env.js";
 import { truncateText } from "./text.js";
 
 const GOAL_KIND_PREFIX = "goal:";
 const UNFINISHED_STATUSES = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited"]);
 const GOAL_TURN_WAIT_MS = 5 * 1000;
-
-const defaultGoalApi = {
-  read: readGoal,
-  set: setGoal,
-  clear: clearGoal,
-  waitForTurnId: waitForGoalTurnId,
-};
 
 function goalKind(kind) {
   return `${GOAL_KIND_PREFIX}${kind}`;
@@ -254,36 +245,6 @@ export function buildClearGoalConfirmationPanel({ store, conversationId, goal })
   };
 }
 
-function goalRpcArgs(config, threadId) {
-  return {
-    threadId,
-    cwd: config.workingDirectory,
-    env: buildCodexEnv(),
-  };
-}
-
-async function readGoal({ config, threadId }) {
-  const response = await codexAppServerClient.getGoal(goalRpcArgs(config, threadId));
-  return response?.goal ?? null;
-}
-
-async function setGoal({ config, threadId, objective, status }) {
-  const response = await codexAppServerClient.setGoal({
-    ...goalRpcArgs(config, threadId),
-    objective,
-    status,
-  });
-  return response?.goal ?? null;
-}
-
-async function clearGoal({ config, threadId }) {
-  return await codexAppServerClient.clearGoal(goalRpcArgs(config, threadId));
-}
-
-async function waitForGoalTurnId(sessionId) {
-  return await codexAppServerClient.waitForTurnId(sessionId, GOAL_TURN_WAIT_MS);
-}
-
 function buildGoalTurnPrompt(goal) {
   return [
     "Continue working toward this Codex goal.",
@@ -292,11 +253,11 @@ function buildGoalTurnPrompt(goal) {
   ].join("\n");
 }
 
-async function ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, runGoalTurn, goalApi = defaultGoalApi }) {
+async function ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, runGoalTurn, goalApi }) {
   if (!runGoalTurn || goal?.status !== "active") {
     return false;
   }
-  const turnId = await goalApi.waitForTurnId(sessionId);
+  const turnId = await goalApi.waitForTurnId(sessionId, GOAL_TURN_WAIT_MS);
   return await runGoalTurn({
     conversationId,
     chatId,
@@ -307,19 +268,19 @@ async function ensureGoalTurn({ conversationId, chatId, messageId, sessionId, go
   });
 }
 
-async function setFreshObjectiveGoal({ config, sessionId, objective, currentGoal, goalApi }) {
+async function setFreshObjectiveGoal({ sessionId, objective, currentGoal, goalApi }) {
   if (currentGoal) {
-    await goalApi.clear({ config, threadId: sessionId });
+    await goalApi.clear({ threadId: sessionId });
   }
-  return await goalApi.set({ config, threadId: sessionId, objective, status: "active" });
+  return await goalApi.set({ threadId: sessionId, objective, status: "active" });
 }
 
-async function buildGoalPanelFromState({ config, store, conversationId, turnState = null, goalApi = defaultGoalApi }) {
+async function buildGoalPanelFromState({ store, conversationId, turnState = null, goalApi }) {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return buildNoMountedGoalPanel({ store, conversationId });
   }
-  const goal = await goalApi.read({ config, threadId: sessionId });
+  const goal = await goalApi.read({ threadId: sessionId });
   if (!isUnfinishedGoal(goal)) {
     return buildNoActiveGoalPanel({ store, conversationId, sessionId });
   }
@@ -357,10 +318,9 @@ async function sendKnownGoalPanel({ client, store, conversationId, chatId, sessi
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-export async function sendGoalPanel({ client, config, store, conversationId, chatId, isTurnActive = false, goalApi = defaultGoalApi }) {
+export async function sendGoalPanel({ client, store, conversationId, chatId, isTurnActive = false, goalApi }) {
   try {
     const panel = await buildGoalPanelFromState({
-      config,
       store,
       conversationId,
       turnState: isTurnActive ? "working" : "idle",
@@ -374,7 +334,6 @@ export async function sendGoalPanel({ client, config, store, conversationId, cha
 
 export async function handleGoalTextCommand({
   client,
-  config,
   store,
   conversationId,
   chatId,
@@ -384,12 +343,12 @@ export async function handleGoalTextCommand({
   stopActiveTurn,
   startNewSession,
   isTurnActive = false,
-  goalApi = defaultGoalApi,
+  goalApi,
 }) {
   let sessionId = store.getSessionId(conversationId);
   const trimmed = String(args ?? "").trim();
   if (!trimmed) {
-    await sendGoalPanel({ client, config, store, conversationId, chatId, isTurnActive, goalApi });
+    await sendGoalPanel({ client, store, conversationId, chatId, isTurnActive, goalApi });
     return true;
   }
 
@@ -404,29 +363,29 @@ export async function handleGoalTextCommand({
       sessionId = await startNewSession({ conversationId });
     }
     if (control === "clear") {
-      await goalApi.clear({ config, threadId: sessionId });
+      await goalApi.clear({ threadId: sessionId });
       await stopActiveTurn?.();
-      await sendGoalPanel({ client, config, store, conversationId, chatId, isTurnActive: false, goalApi });
+      await sendGoalPanel({ client, store, conversationId, chatId, isTurnActive: false, goalApi });
       return true;
     }
     if (control === "pause") {
-      const currentGoal = await goalApi.read({ config, threadId: sessionId });
+      const currentGoal = await goalApi.read({ threadId: sessionId });
       if (!isUnfinishedGoal(currentGoal)) {
-        await sendGoalPanel({ client, config, store, conversationId, chatId, isTurnActive, goalApi });
+        await sendGoalPanel({ client, store, conversationId, chatId, isTurnActive, goalApi });
         return true;
       }
-      const goal = await goalApi.set({ config, threadId: sessionId, status: "paused" });
+      const goal = await goalApi.set({ threadId: sessionId, status: "paused" });
       await stopActiveTurn?.();
       await sendKnownGoalPanel({ client, store, conversationId, chatId, sessionId, goal, turnState: "idle" });
       return true;
     }
     if (control === "resume") {
-      const currentGoal = await goalApi.read({ config, threadId: sessionId });
+      const currentGoal = await goalApi.read({ threadId: sessionId });
       if (!isUnfinishedGoal(currentGoal)) {
-        await sendGoalPanel({ client, config, store, conversationId, chatId, isTurnActive, goalApi });
+        await sendGoalPanel({ client, store, conversationId, chatId, isTurnActive, goalApi });
         return true;
       }
-      const goal = await goalApi.set({ config, threadId: sessionId, status: "active" });
+      const goal = await goalApi.set({ threadId: sessionId, status: "active" });
       if (await ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, runGoalTurn, goalApi })) {
         return true;
       }
@@ -438,14 +397,14 @@ export async function handleGoalTextCommand({
       return true;
     }
 
-    const currentGoal = await goalApi.read({ config, threadId: sessionId });
+    const currentGoal = await goalApi.read({ threadId: sessionId });
     if (shouldConfirmBeforeReplacing(currentGoal)) {
       const panel = buildReplaceGoalPanel({ store, conversationId, currentGoal, objective: trimmed });
       await client.sendMessage(chatId, panel.text, panel.options);
       return true;
     }
 
-    const goal = await setFreshObjectiveGoal({ config, sessionId, objective: trimmed, currentGoal, goalApi });
+    const goal = await setFreshObjectiveGoal({ sessionId, objective: trimmed, currentGoal, goalApi });
     if (await ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, runGoalTurn, goalApi })) {
       return true;
     }
@@ -459,7 +418,6 @@ export async function handleGoalTextCommand({
 
 export async function handleGoalControlCallback({
   client,
-  config,
   store,
   action,
   callbackQueryId,
@@ -468,7 +426,7 @@ export async function handleGoalControlCallback({
   runGoalTurn,
   stopActiveTurn,
   isTurnActive = false,
-  goalApi = defaultGoalApi,
+  goalApi,
 }) {
   const kind = action.kind.slice(GOAL_KIND_PREFIX.length);
   const sessionId = store.getSessionId(action.conversationId);
@@ -497,7 +455,6 @@ export async function handleGoalControlCallback({
     if (kind === "show") {
       await client.answerCallbackQuery(callbackQueryId);
       const panel = await buildGoalPanelFromState({
-        config,
         store,
         conversationId: action.conversationId,
         turnState: isTurnActive ? "working" : "idle",
@@ -507,21 +464,21 @@ export async function handleGoalControlCallback({
       return;
     }
     if (kind === "pause") {
-      const goal = await goalApi.set({ config, threadId: sessionId, status: "paused" });
+      const goal = await goalApi.set({ threadId: sessionId, status: "paused" });
       await stopActiveTurn?.();
       panel = buildPanelForKnownGoal({ store, conversationId: action.conversationId, sessionId, goal, turnState: "idle" });
       await client.answerCallbackQuery(callbackQueryId, "Paused.");
     } else if (kind === "resume") {
-      goalToRun = await goalApi.set({ config, threadId: sessionId, status: "active" });
+      goalToRun = await goalApi.set({ threadId: sessionId, status: "active" });
       panel = buildPanelForKnownGoal({ store, conversationId: action.conversationId, sessionId, goal: goalToRun, turnState: "starting" });
       await client.answerCallbackQuery(callbackQueryId, "Starting.");
     } else if (kind === "replace") {
-      await goalApi.clear({ config, threadId: sessionId });
-      goalToRun = await goalApi.set({ config, threadId: sessionId, objective: payload.objective, status: "active" });
+      await goalApi.clear({ threadId: sessionId });
+      goalToRun = await goalApi.set({ threadId: sessionId, objective: payload.objective, status: "active" });
       panel = buildPanelForKnownGoal({ store, conversationId: action.conversationId, sessionId, goal: goalToRun, turnState: "starting" });
       await client.answerCallbackQuery(callbackQueryId, "Starting.");
     } else if (kind === "clear_confirm") {
-      const goal = await goalApi.read({ config, threadId: sessionId });
+      const goal = await goalApi.read({ threadId: sessionId });
       const panel = goal
         ? buildClearGoalConfirmationPanel({ store, conversationId: action.conversationId, goal })
         : buildNoActiveGoalPanel({ store, conversationId: action.conversationId, sessionId });
@@ -529,7 +486,7 @@ export async function handleGoalControlCallback({
       await editPanel(client, chatId, messageId, panel);
       return;
     } else if (kind === "clear") {
-      await goalApi.clear({ config, threadId: sessionId });
+      await goalApi.clear({ threadId: sessionId });
       await stopActiveTurn?.();
       panel = buildNoActiveGoalPanel({ store, conversationId: action.conversationId, sessionId });
       await client.answerCallbackQuery(callbackQueryId, "Cleared.");
@@ -539,7 +496,6 @@ export async function handleGoalControlCallback({
     }
 
     panel ??= await buildGoalPanelFromState({
-      config,
       store,
       conversationId: action.conversationId,
       turnState: isTurnActive ? "working" : "idle",

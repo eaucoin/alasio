@@ -2,6 +2,3 @@
 node_modules/
 sandbox/session-host/gvisor/
 sandbox/session-host/juicefs
-sandbox/agent/claude
-sandbox/agent/codex
-sandbox/agent/codex-code-mode-host

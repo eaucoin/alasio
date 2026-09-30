@@ -1,7 +1,9 @@
 #!/bin/bash
 # The session host's entrypoint. It mounts the session's JuiceFS volume, builds the
-# agent a network namespace with the chosen internet mode, and runs the agent, its
-# harness, and bayma inside one gVisor sandbox whose root is the agent image.
+# agent a network namespace with the chosen internet mode, and runs bayma and every
+# process the agent starts inside one gVisor sandbox whose root is the agent image. The
+# harness (Claude Code, Codex) runs outside, in alasio, and reaches the workspace only
+# through bayma, over `agent-connect` (see src/sandbox/bayma-forward.js).
 #
 # The boundary is gVisor: an escape from it lands in this privileged container, exactly
 # where an escape from a host-installed gVisor would land, so nesting costs no strength
@@ -12,8 +14,7 @@
 #   JFS_FORMAT          1 to `juicefs format` first (JFS_NAME, JFS_STORAGE, JFS_BUCKET,
 #                       and ACCESS_KEY/SECRET_KEY for the object store)
 #   JFS_CACHE_MB        JuiceFS data cache bound (default 1024)
-#   NET_MODE            none (the gateway only) or full (the public internet)
-#   GATEWAY_IP, GATEWAY_PORT   the one address the agent may always reach
+#   NET_MODE            none (nothing at all) or full (the public internet)
 #   HOST_PUBLIC_IP      the host's own public address, always dropped in full mode
 #   AGENT_IMAGE_ROOT    where the read-only agent image is mounted (default /agent-root)
 #   BAYMA_HTTP_PORT     the port bayma serves inside the sandbox (default 7290)
@@ -22,7 +23,7 @@
 #   CHECKPOINT_DIR      where the checkpoint image lives (default /mnt/session/.checkpoint:
 #                       on the volume, so the next container finds it, and outside the
 #                       workspace and home the sandbox binds, so the agent never sees it)
-# It prints `session-host ready <ms>` once the sandbox runs, then waits for SIGTERM.
+# It prints `session-host ready <ms>` once bayma answers, then waits for SIGTERM.
 set -euo pipefail
 
 T0=$(date +%s%3N)
@@ -61,11 +62,9 @@ META_PASSWORD="$(cat "${META_PASSWORD_FILE:?}")" GOMEMLIMIT=256MiB \
   --cache-size "${JFS_CACHE_MB:-1024}" --buffer-size 100 \
   --log /tmp/juicefs.log "$JFS_META" /mnt/session
 mkdir -p /mnt/session/workspace /mnt/session/home
-# The agent home holds each harness's config directory. Codex refuses to start its
-# app-server when CODEX_HOME does not exist, so the skeleton is created up front (Claude
-# and bayma create theirs lazily, but are made here too for a consistent, plain home).
-mkdir -p /mnt/session/home/.codex /mnt/session/home/.claude /mnt/session/home/.bayma \
-  /mnt/session/home/.local/share/bayma
+# bayma keeps its state in the agent's home; it would create these lazily, but they are
+# made here so the chown below hands them to the agent.
+mkdir -p /mnt/session/home/.bayma /mnt/session/home/.local/share/bayma
 # bayma's toolbelt is installed in the agent image (sandbox/agent/Dockerfile); link it in
 # rather than let bayma copy ~25k files onto the volume at every new session's start. A
 # directory an earlier copy left is moved aside at once and deleted in the background.
@@ -80,9 +79,8 @@ for stale in "$toolbelt".stale.*; do
 done
 # Only what this script made is handed to the agent: a recursive chown would walk the
 # whole volume at every start.
-chown 1000:1000 /mnt/session/workspace /mnt/session/home /mnt/session/home/.codex \
-  /mnt/session/home/.claude /mnt/session/home/.bayma /mnt/session/home/.local \
-  /mnt/session/home/.local/share /mnt/session/home/.local/share/bayma
+chown 1000:1000 /mnt/session/workspace /mnt/session/home /mnt/session/home/.bayma \
+  /mnt/session/home/.local /mnt/session/home/.local/share /mnt/session/home/.local/share/bayma
 chown -h 1000:1000 "$toolbelt"
 stamp mounted
 
@@ -111,9 +109,8 @@ iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
 ip6tables -P FORWARD DROP 2>/dev/null || true
 ip6tables -P INPUT DROP 2>/dev/null || true
-if [ -n "${GATEWAY_IP:-}" ]; then
-  iptables -A FORWARD -s 10.200.0.2 -d "$GATEWAY_IP" -p tcp --dport "${GATEWAY_PORT:?}" -j ACCEPT
-fi
+# In "none" mode nothing is accepted beyond this point: the agent reaches no address at
+# all. It needs none, since no model login or harness lives in the sandbox.
 if [ "${NET_MODE:-none}" = full ]; then
   for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 \
              127.0.0.0/8 224.0.0.0/4 0.0.0.0/8 ${HOST_PUBLIC_IP:+$HOST_PUBLIC_IP/32}; do
@@ -129,8 +126,8 @@ stamp network
 # --- 3. The sandbox -----------------------------------------------------------
 mkdir -p /bundle "$CKPT" && cd /bundle
 # The sandbox's init is tini running bayma's HTTP MCP server, so it reaps orphans and
-# survives checkpoint/restore (E6). The harness (Claude Code, Codex) is added later
-# with `runsc exec`. bayma serves on loopback inside the agent's namespace.
+# survives checkpoint/restore (E6). bayma serves on the sandbox's own loopback, which
+# nothing outside reaches except through `agent-connect`.
 /opt/gvisor/runsc spec
 jq --arg root "$AGENT_ROOT" --arg port "$BAYMA_PORT" '
     .root = {path: $root, readonly: true}
@@ -181,10 +178,9 @@ if [ "$restored" = 0 ]; then
 fi
 stamp "$([ "$restored" = 1 ] && echo restored || echo sandbox)"
 
-# Ready means ready for a harness. Claude Code and Codex connect to bayma once, as they
-# start, and carry on without it if it is not answering yet, so the host is not ready
-# until bayma answers MCP inside the sandbox; if it never does, fail loudly.
-BAYMA_PROBE='fetch("http://127.0.0.1:7290/mcp",{method:"POST",headers:{"content-type":"application/json",accept:"application/json, text/event-stream"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"session-host",version:"0"}}})}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))'
+# Ready means bayma answers MCP inside the sandbox: it is the workspace's only door, and a
+# harness connects to it as it starts, so a host whose bayma never answers fails loudly.
+BAYMA_PROBE='fetch("http://127.0.0.1:'"$BAYMA_PORT"'/mcp",{method:"POST",headers:{"content-type":"application/json",accept:"application/json, text/event-stream"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"session-host",version:"0"}}})}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))'
 bayma_deadline=$(( $(date +%s) + ${BAYMA_READY_TIMEOUT_S:-90} ))
 until "${RUNSC[@]}" exec --user 1000:1000 --env HOME=/home/agent \
     --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

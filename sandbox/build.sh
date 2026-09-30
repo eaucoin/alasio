@@ -1,12 +1,11 @@
 #!/bin/bash
 # Builds the two session-filesystem images (see sandbox/README.md):
 #   alasio/session-host  gVisor + JuiceFS + the entrypoint
-#   alasio/agent         bayma's image + the Claude Code and Codex CLIs
-# It fetches gVisor and JuiceFS pinned by checksum, and copies the CLIs from alasio's
-# node_modules. Run from anywhere; the installer calls it. No host install results.
+#   alasio/agent         bayma's image, run as the unprivileged agent
+# It fetches gVisor and JuiceFS pinned by checksum. Run from anywhere; the installer
+# calls it. No host install results.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-ALASIO=$(cd "$HERE/.." && pwd)
 GVISOR_RELEASE=${GVISOR_RELEASE:-release-20260921.0}
 JUICEFS_VERSION=${JUICEFS_VERSION:-1.4.1}
 ARCH=x86_64
@@ -35,15 +34,8 @@ tar -xzf "$tmp/j.tgz" -C "$tmp" juicefs
 install -m755 "$tmp/juicefs" "$sh/juicefs"
 rm -rf "$tmp"
 
-echo "sandbox: copying the Claude Code and Codex CLIs from node_modules"
-ag=$HERE/agent
-cp "$ALASIO/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude" "$ag/claude"
-vendor="$ALASIO/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin"
-cp "$vendor/codex" "$ag/codex"
-cp "$vendor/codex-code-mode-host" "$ag/codex-code-mode-host"
-
 echo "sandbox: building alasio/session-host"
 docker build -t alasio/session-host "$sh"
 echo "sandbox: building alasio/agent"
-docker build -t alasio/agent "$ag"
+docker build -t alasio/agent "$HERE/agent"
 echo "sandbox: images built"

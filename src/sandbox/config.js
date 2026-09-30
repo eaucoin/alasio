@@ -1,7 +1,7 @@
 /**
  * Configuration for session filesystems, read from the environment. The feature is off
  * unless `ALASIO_SANDBOX_ENABLED=1`, so a deployment without the Valkey, the S3 bucket,
- * the built images, and a model-login token behaves exactly as before. `loadSandboxConfig`
+ * and the built images behaves exactly as before. `loadSandboxConfig`
  * returns null when off, and throws with the missing key named when on but incomplete,
  * so a half-configured deployment fails loudly at startup rather than mid-session.
  */
@@ -50,24 +50,6 @@ export function loadSandboxConfig(env = process.env) {
       pidsLimit: int("ALASIO_SANDBOX_PIDS", 512),
       cacheMb: int("ALASIO_SANDBOX_CACHE_MB", 1024),
       hostPublicIp: env.ALASIO_SANDBOX_HOST_PUBLIC_IP?.trim() || null,
-    },
-    gateway: {
-      // Optional: unset, the gateway address is the network's own gateway (index.js).
-      ip: env.ALASIO_SANDBOX_GATEWAY_IP?.trim() || null,
-      port: int("ALASIO_SANDBOX_GATEWAY_PORT", 8080),
-      // The upstreams and login tokens. A missing token leaves the gateway live but
-      // answering 503 until the operator supplies one (gateway.js); it is not required.
-      anthropicUpstream: env.ALASIO_SANDBOX_ANTHROPIC_UPSTREAM?.trim() || "https://api.anthropic.com",
-      anthropicTokenFile: env.ALASIO_SANDBOX_ANTHROPIC_TOKEN_FILE?.trim() || null,
-      // A subscription login instead of an API key: the local `claude` credentials JSON,
-      // read live so its refreshes are picked up and injected as a Bearer (gateway.js).
-      anthropicOAuthFile: env.ALASIO_SANDBOX_ANTHROPIC_OAUTH_FILE?.trim() || null,
-      openaiUpstream: env.ALASIO_SANDBOX_OPENAI_UPSTREAM?.trim() || "https://api.openai.com",
-      openaiTokenFile: env.ALASIO_SANDBOX_OPENAI_TOKEN_FILE?.trim() || null,
-      // A ChatGPT login instead of an API key: the local `codex` auth.json, read live and
-      // sent to the ChatGPT Codex backend with its account id (index.js, gateway.js).
-      openaiChatgptFile: env.ALASIO_SANDBOX_OPENAI_CHATGPT_FILE?.trim() || null,
-      chatgptUpstream: env.ALASIO_SANDBOX_CHATGPT_UPSTREAM?.trim() || "https://chatgpt.com",
     },
   };
 }

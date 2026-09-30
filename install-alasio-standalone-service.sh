@@ -35,24 +35,13 @@ fi
 echo "Building the $IMAGE image the bot runs in..."
 docker build --pull --tag "$IMAGE" "$SCRIPT_DIR/container"
 
-# Session filesystems, when enabled, run agents inside gVisor sandboxes on two images
-# (alasio/session-host and alasio/agent). Built only when the feature is on, since the
-# build fetches gVisor and JuiceFS. The Valkey and "sessions" bucket come up with the
+# Session filesystems, when enabled, keep each workspace inside a gVisor sandbox, on two
+# images (alasio/session-host and alasio/agent). Built only when the feature is on, since
+# the build fetches gVisor and JuiceFS. The Valkey and "sessions" bucket come up with the
 # Neon stack on every start.
 if grep -qE '^ALASIO_SANDBOX_ENABLED=1' "$SCRIPT_DIR/.env"; then
   echo "Session filesystems are enabled; building the sandbox images..."
   "$SCRIPT_DIR/sandbox/build.sh"
-  # Session hosts reach the credential gateway, which alasio serves on the host, from the
-  # Neon stack's network. A host firewall that drops inbound traffic by default (ufw's
-  # does) would drop that too, so allow the gateway port on that network's bridge alone;
-  # the bridge's name is fixed (neon/control/setup.js DEFAULT_BRIDGE) so this rule
-  # outlives the network being recreated.
-  GATEWAY_PORT="$(sed -n 's/^ALASIO_SANDBOX_GATEWAY_PORT=//p' "$SCRIPT_DIR/.env" | tail -n 1)"
-  GATEWAY_PORT="${GATEWAY_PORT:-8080}"
-  if command -v ufw >/dev/null && sudo ufw status | grep -q '^Status: active'; then
-    echo "Allowing session hosts to reach the gateway on port $GATEWAY_PORT through ufw..."
-    sudo ufw allow in on alasio-neon0 to any port "$GATEWAY_PORT" proto tcp comment 'alasio session gateway'
-  fi
 fi
 
 # Pulled now, so no agent's first turn waits on it.
