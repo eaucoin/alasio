@@ -7,6 +7,7 @@ import { mkdtempSync } from "node:fs";
 import { setDefaultAutoSelectFamily } from "node:net";
 import { pipeline } from "node:stream/promises";
 import { renderTelegramHtml } from "./markdown.js";
+import { splitRichMarkdown, toRichMarkdown } from "./rich-markdown.js";
 import { splitTelegramText } from "./text.js";
 
 // Telegram publishes IPv6 answers, but the admin server only has a working IPv4
@@ -128,23 +129,59 @@ export class Client {
     }, { signal });
   }
 
+  /**
+   * Send text. `format` is "markdown" (the default: a Markdown subset as Telegram HTML),
+   * "plain", or "rich": Markdown as Telegram rich messages, which render tables, headings,
+   * lists, and code natively, in parts of up to ~30k characters.
+   */
   async sendMessage(chatId, text, options = {}) {
     return await this.enqueueOutbound(async () => {
-      const chunks = splitTelegramText(text);
-      const sent = [];
-      for (const chunk of chunks) {
-        const payload = buildTextPayload(chatId, chunk, options);
-        try {
-          sent.push(await this.call("sendMessage", payload));
-        } catch (error) {
-          if (!shouldRetryAsPlainText(error, options)) {
-            throw error;
-          }
-          sent.push(await this.call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" })));
-        }
+      if (options.format === "rich") {
+        return await this.sendRichParts(chatId, text, options);
       }
-      return sent;
+      return await this.sendTextChunks(chatId, text, options);
     });
+  }
+
+  async sendTextChunks(chatId, text, options) {
+    const sent = [];
+    for (const chunk of splitTelegramText(text)) {
+      const payload = buildTextPayload(chatId, chunk, options);
+      try {
+        sent.push(await this.call("sendMessage", payload));
+      } catch (error) {
+        if (!shouldRetryAsPlainText(error, options)) {
+          throw error;
+        }
+        sent.push(await this.call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" })));
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * Each part goes as a rich message; a part Telegram rejects as a request (HTTP 400: a
+   * construct it will not take, or a limit the estimate missed) goes the classic way
+   * instead, so a response is never lost to its formatting.
+   */
+  async sendRichParts(chatId, text, options) {
+    const { format: _format, ...telegramOptions } = options;
+    const sent = [];
+    for (const part of splitRichMarkdown(text || " ")) {
+      try {
+        sent.push(await this.call("sendRichMessage", {
+          chat_id: chatId,
+          rich_message: { markdown: toRichMarkdown(part) || " " },
+          ...telegramOptions,
+        }));
+      } catch (error) {
+        if (error?.status !== 400) {
+          throw error;
+        }
+        sent.push(...await this.sendTextChunks(chatId, part, { ...telegramOptions, format: "markdown" }));
+      }
+    }
+    return sent;
   }
 
   async editMessageText(chatId, messageId, text, options = {}) {
