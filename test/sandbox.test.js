@@ -218,7 +218,7 @@ test("without a configured address, session hosts reach the gateway at their net
   const docker = {
     cli: async (args) => {
       calls.push(args);
-      return { stdout: "172.31.0.1 \n", stderr: "" };
+      return { stdout: "127.0.0.9 \n", stderr: "" }; // a loopback address, so the gateway can bind it
     },
   };
   const sandbox = createSandbox({
@@ -235,9 +235,13 @@ test("without a configured address, session hosts reach the gateway at their net
   await sandbox.startGateway();
   try {
     assert.deepEqual(calls[0].slice(0, 3), ["network", "inspect", "alasio-neon_default"]);
-    assert.match(sandbox.gatewayUrl, /^http:\/\/172\.31\.0\.1:[1-9]\d*$/); // the port bound, not the 0 asked for
+    assert.match(sandbox.gatewayUrl, /^http:\/\/127\.0\.0\.9:[1-9]\d*$/); // the port bound, not the 0 asked for
     assert.notEqual(sandbox.host.config.gateway.port, 0);
-    assert.equal(sandbox.host.config.gateway.ip, "172.31.0.1"); // what a session host's firewall allows
+    assert.equal(sandbox.host.config.gateway.ip, "127.0.0.9"); // what a session host's firewall allows
+    // It listens there, and only there.
+    assert.equal((await fetch(`${sandbox.gatewayUrl}/v1/messages`, { method: "POST", body: "{}" })).status, 401);
+    const port = sandbox.host.config.gateway.port;
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", body: "{}" }));
   } finally {
     await sandbox.stopGateway();
   }

@@ -144,7 +144,10 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
         gatewayAddress.ip = stdout.trim().split(/\s+/).find((ip) => /^\d+\.\d+\.\d+\.\d+$/.test(ip)) ?? null;
         if (!gatewayAddress.ip) throw new Error(`could not find an IPv4 gateway on docker network ${config.host.network}`);
       }
-      const { port, close } = await gateway.listen(config.gateway.port);
+      // Listen only where session hosts reach it, not on every interface: the gateway
+      // holds the model logins, so it is no business of any other network, whatever
+      // the host's firewall allows.
+      const { port, close } = await gateway.listen(config.gateway.port, gatewayAddress.ip);
       closeGateway = close;
       // The port bound, which differs from the configured one only when that is 0.
       gatewayAddress.port = port;
