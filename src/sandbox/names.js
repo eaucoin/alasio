@@ -6,11 +6,12 @@
  */
 
 /**
- * JuiceFS requires a volume name of 3–63 characters from `[A-Za-z0-9-]` (verified in
- * juicefs format; see session-fs-research E12/E1). alasio generates ids that already
- * satisfy this, and this guards against any that would not.
+ * JuiceFS requires a volume name of 3–63 characters from `[a-z0-9-]` that starts and
+ * ends with a letter or digit (verified against `juicefs format` 1.4.1, which rejects
+ * `fs-Foo1` and `fs-abc-` although its message says "alphabet"). alasio generates ids
+ * that already satisfy this, and this guards against any that would not.
  */
-const VOLUME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{2,62}$/;
+const VOLUME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
 export function isValidVolumeId(volumeId) {
   return typeof volumeId === "string" && VOLUME_ID_PATTERN.test(volumeId);
@@ -18,7 +19,7 @@ export function isValidVolumeId(volumeId) {
 
 export function assertValidVolumeId(volumeId) {
   if (!isValidVolumeId(volumeId)) {
-    throw new Error(`invalid session volume id: ${JSON.stringify(volumeId)} (need 3–63 chars of [A-Za-z0-9-])`);
+    throw new Error(`invalid session volume id: ${JSON.stringify(volumeId)} (need 3–63 chars of [a-z0-9-], starting and ending with a letter or digit)`);
   }
   return volumeId;
 }

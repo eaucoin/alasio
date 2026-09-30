@@ -13,13 +13,17 @@ import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.js";
 
-test("volume ids are validated to JuiceFS's 3-63 char rule", () => {
+test("volume ids are validated to JuiceFS's volume-name rule", () => {
   assert.equal(isValidVolumeId("fs-1a2b3c4d5e"), true);
   assert.equal(isValidVolumeId("abc"), true);
+  assert.equal(isValidVolumeId(`${"a".repeat(63)}`), true);
   assert.equal(isValidVolumeId("ab"), false); // too short
+  assert.equal(isValidVolumeId(`${"a".repeat(64)}`), false); // too long
   assert.equal(isValidVolumeId("has_underscore"), false);
   assert.equal(isValidVolumeId("has.dot"), false);
-  assert.equal(isValidVolumeId(`${"a".repeat(64)}`), false); // too long
+  assert.equal(isValidVolumeId("fs-Foo1"), false); // JuiceFS rejects uppercase
+  assert.equal(isValidVolumeId("fs-abc-"), false); // and a trailing hyphen
+  assert.equal(isValidVolumeId("-abc"), false);
   assert.throws(() => assertValidVolumeId("no"), /invalid session volume id/);
   const id = newVolumeId(() => "1a2b3c4d-5e6f-7a8b-9c0d-e1f2a3b4c5d6");
   assert.ok(isValidVolumeId(id), id);
