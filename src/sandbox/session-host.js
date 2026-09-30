@@ -34,8 +34,10 @@ export class SessionHost {
       GATEWAY_IP: gateway.ip ?? "",
       GATEWAY_PORT: gateway.port ? String(gateway.port) : "",
       HOST_PUBLIC_IP: c.hostPublicIp ?? "",
+      // A stop checkpoints the sandbox onto the volume, and the next start restores it,
+      // so the agent's processes and bayma's REPL sessions come back as they were.
       CHECKPOINT_ON_STOP: "1",
-      RESTORE: "1", // restore a prior checkpoint if one exists; a fresh volume has none
+      RESTORE: "1",
     };
     return [
       "run", "--detach", "--name", sessionHostName(volumeId),
@@ -49,7 +51,11 @@ export class SessionHost {
     ];
   }
 
-  /** Start the session host and wait until its sandbox is ready. */
+  /**
+   * Start the session host and wait until its sandbox is ready. Any earlier container of
+   * the name is removed first; its checkpoint, if it left one, is on the volume, where
+   * the new container restores it.
+   */
   async start(volumeId, { mountEnv, netMode }) {
     const name = sessionHostName(volumeId);
     await this.docker.cli(["rm", "--force", name]).catch(() => {});

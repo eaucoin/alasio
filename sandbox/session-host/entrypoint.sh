@@ -17,18 +17,36 @@
 #   HOST_PUBLIC_IP      the host's own public address, always dropped in full mode
 #   AGENT_IMAGE_ROOT    where the read-only agent image is mounted (default /agent-root)
 #   BAYMA_HTTP_PORT     the port bayma serves inside the sandbox (default 7290)
-#   RESTORE             1 to `runsc restore` a prior checkpoint from CHECKPOINT_DIR
-#   CHECKPOINT_DIR      where a checkpoint image is read and written (default /checkpoint)
-# It prints `session-host ready <ms>` once the sandbox runs, then waits; SIGTERM tears
-# down, checkpointing first when CHECKPOINT_ON_STOP=1.
+#   RESTORE             1 to `runsc restore` the checkpoint in CHECKPOINT_DIR, if any
+#   CHECKPOINT_ON_STOP  1 to checkpoint the sandbox into CHECKPOINT_DIR on SIGTERM
+#   CHECKPOINT_DIR      where the checkpoint image lives (default /mnt/session/.checkpoint:
+#                       on the volume, so the next container finds it, and outside the
+#                       workspace and home the sandbox binds, so the agent never sees it)
+# It prints `session-host ready <ms>` once the sandbox runs, then waits for SIGTERM.
 set -euo pipefail
 
 T0=$(date +%s%3N)
 stamp() { echo "session-host $1 $(( $(date +%s%3N) - T0 ))ms" >&2; }
 AGENT_ROOT=${AGENT_IMAGE_ROOT:-/agent-root}
 BAYMA_PORT=${BAYMA_HTTP_PORT:-7290}
-CKPT=${CHECKPOINT_DIR:-/checkpoint}
+CKPT=${CHECKPOINT_DIR:-/mnt/session/.checkpoint}
 RUNSC=(/opt/gvisor/runsc --root /run/runsc)
+
+# Tear down whatever has come up so far, so a stop during startup unmounts cleanly too.
+# The sandbox is checkpointed only once it runs; a checkpoint from an earlier stop is
+# never overwritten by a failed one (runsc writes it in place, so a partial image would
+# only fail its restore, which falls back to a fresh start).
+teardown() {
+  if [ "${CHECKPOINT_ON_STOP:-0}" = 1 ] && "${RUNSC[@]}" state session >/dev/null 2>&1; then
+    "${RUNSC[@]}" checkpoint --image-path "$CKPT" --compression flate-best-speed session 2>>/tmp/checkpoint.log \
+      && echo "session-host checkpointed" >&2 || echo "session-host checkpoint failed (see /tmp/checkpoint.log)" >&2
+  fi
+  "${RUNSC[@]}" kill session KILL 2>/dev/null || true
+  "${RUNSC[@]}" delete --force session 2>/dev/null || true
+  juicefs umount /mnt/session 2>/dev/null || true
+  exit 0
+}
+trap teardown TERM INT
 
 # --- 1. The volume ------------------------------------------------------------
 mkdir -p /mnt/session
@@ -141,13 +159,27 @@ restore_network() {
   ip netns exec agent ip addr add 10.200.0.2/30 dev agent0 2>/dev/null || true
   ip netns exec agent ip route add default via 10.200.0.1 2>/dev/null || true
 }
+# A checkpoint is restored once: it is removed as soon as the sandbox is back, so a later
+# start after a crash (which leaves no fresh checkpoint) never rolls the agent's
+# processes back to a stale one while its files have moved on. One that cannot be
+# restored (an agent image or runsc from another build) is dropped for a fresh start;
+# the files on the volume are the same either way.
+restored=0
 if [ "${RESTORE:-0}" = 1 ] && [ -f "$CKPT/checkpoint.img" ]; then
   restore_network
-  "${RUNSC[@]}" --network=sandbox --ignore-cgroups restore --image-path "$CKPT" session
-else
+  if "${RUNSC[@]}" --network=sandbox --ignore-cgroups restore --detach --image-path "$CKPT" session 2>/tmp/restore.log; then
+    restored=1
+  else
+    echo "session-host restore failed, starting fresh:" >&2
+    cat /tmp/restore.log >&2
+    "${RUNSC[@]}" delete --force session 2>/dev/null || true
+  fi
+  rm -rf "${CKPT:?}"/*
+fi
+if [ "$restored" = 0 ]; then
   "${RUNSC[@]}" --network=sandbox --ignore-cgroups run --detach session
 fi
-stamp sandbox
+stamp "$([ "$restored" = 1 ] && echo restored || echo sandbox)"
 
 # Ready means ready for a harness. Claude Code and Codex connect to bayma once, as they
 # start, and carry on without it if it is not answering yet, so the host is not ready
@@ -167,15 +199,4 @@ done
 stamp bayma
 echo "session-host ready $(( $(date +%s%3N) - T0 ))"
 
-teardown() {
-  if [ "${CHECKPOINT_ON_STOP:-0}" = 1 ]; then
-    "${RUNSC[@]}" checkpoint --image-path "$CKPT" --compression flate-best-speed session 2>>/tmp/checkpoint.log \
-      && echo "session-host checkpointed" >&2 || echo "session-host checkpoint failed (see /tmp/checkpoint.log)" >&2
-  fi
-  "${RUNSC[@]}" kill session KILL 2>/dev/null || true
-  "${RUNSC[@]}" delete --force session 2>/dev/null || true
-  juicefs umount /mnt/session 2>/dev/null || true
-  exit 0
-}
-trap teardown TERM INT
 while :; do sleep 3600 & wait $!; done
