@@ -12,7 +12,9 @@ import { createLogger } from "../shared/log.js";
 import { sessionHostName } from "./names.js";
 
 const log = createLogger("session-host");
-const READY_TIMEOUT_MS = 60_000;
+// Covers the entrypoint's own wait for bayma (BAYMA_READY_TIMEOUT_S, 90s) and the mount,
+// network, and sandbox before it, so a host that is slow but coming up is not given up on.
+const READY_TIMEOUT_MS = 150_000;
 
 export class SessionHost {
   constructor({ docker, config }) {

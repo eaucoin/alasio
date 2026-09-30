@@ -235,7 +235,8 @@ test("without a configured address, session hosts reach the gateway at their net
   await sandbox.startGateway();
   try {
     assert.deepEqual(calls[0].slice(0, 3), ["network", "inspect", "alasio-neon_default"]);
-    assert.equal(sandbox.gatewayUrl, "http://172.31.0.1:0");
+    assert.match(sandbox.gatewayUrl, /^http:\/\/172\.31\.0\.1:[1-9]\d*$/); // the port bound, not the 0 asked for
+    assert.notEqual(sandbox.host.config.gateway.port, 0);
     assert.equal(sandbox.host.config.gateway.ip, "172.31.0.1"); // what a session host's firewall allows
   } finally {
     await sandbox.stopGateway();

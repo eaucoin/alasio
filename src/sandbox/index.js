@@ -146,6 +146,8 @@ export function createSandbox({ config, store, docker = createDocker() } = {}) {
       }
       const { port, close } = await gateway.listen(config.gateway.port);
       closeGateway = close;
+      // The port bound, which differs from the configured one only when that is 0.
+      gatewayAddress.port = port;
       log.info(`session filesystems enabled; gateway on ${port}, reached by session hosts at ${gatewayUrl()}`);
     },
 

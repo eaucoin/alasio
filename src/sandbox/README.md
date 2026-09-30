@@ -28,6 +28,8 @@ mindmap
       Claude Code runs through the SDK's spawnClaudeCodeProcess hook in harness/claude/sandbox so the host binary path is dropped and claude runs inside
       Codex runs its own app-server per volume in codex/sandbox the app-server process spawn is injectable and the sandbox one runs codex app-server over the session's own spawn with the gateway as its only model provider reached with the bearer under the provider env_key
       the session host makes the agent home's config skeleton up front because Codex refuses to start when CODEX_HOME does not yet exist
+      a session host is ready only once bayma answers MCP inside the sandbox because Claude Code and Codex connect to it once as they start and carry on without it otherwise
+      bayma's toolbelt is installed in the agent image by bayma's own installer and each home links to it because copying its 25k files onto a volume took minutes at every new session's start
 ```
 
 ## Preference Atlas

@@ -46,8 +46,26 @@ mkdir -p /mnt/session/workspace /mnt/session/home
 # The agent home holds each harness's config directory. Codex refuses to start its
 # app-server when CODEX_HOME does not exist, so the skeleton is created up front (Claude
 # and bayma create theirs lazily, but are made here too for a consistent, plain home).
-mkdir -p /mnt/session/home/.codex /mnt/session/home/.claude /mnt/session/home/.bayma
-chown -R 1000:1000 /mnt/session/workspace /mnt/session/home
+mkdir -p /mnt/session/home/.codex /mnt/session/home/.claude /mnt/session/home/.bayma \
+  /mnt/session/home/.local/share/bayma
+# bayma's toolbelt is installed in the agent image (sandbox/agent/Dockerfile); link it in
+# rather than let bayma copy ~25k files onto the volume at every new session's start. A
+# directory an earlier copy left is moved aside at once and deleted in the background.
+toolbelt=/mnt/session/home/.local/share/bayma/toolbelt
+if [ ! -L "$toolbelt" ]; then
+  [ -e "$toolbelt" ] && mv "$toolbelt" "$toolbelt.stale.$(date +%s%N)"
+  ln -s /opt/bayma-data/bayma/toolbelt "$toolbelt"
+fi
+# Any copy moved aside, now or by a start whose background delete was cut short.
+for stale in "$toolbelt".stale.*; do
+  [ -e "$stale" ] && (rm -rf "$stale" &)
+done
+# Only what this script made is handed to the agent: a recursive chown would walk the
+# whole volume at every start.
+chown 1000:1000 /mnt/session/workspace /mnt/session/home /mnt/session/home/.codex \
+  /mnt/session/home/.claude /mnt/session/home/.bayma /mnt/session/home/.local \
+  /mnt/session/home/.local/share /mnt/session/home/.local/share/bayma
+chown -h 1000:1000 "$toolbelt"
 stamp mounted
 
 # --- 2. The agent's network ---------------------------------------------------
@@ -130,6 +148,23 @@ else
   "${RUNSC[@]}" --network=sandbox --ignore-cgroups run --detach session
 fi
 stamp sandbox
+
+# Ready means ready for a harness. Claude Code and Codex connect to bayma once, as they
+# start, and carry on without it if it is not answering yet, so the host is not ready
+# until bayma answers MCP inside the sandbox; if it never does, fail loudly.
+BAYMA_PROBE='fetch("http://127.0.0.1:7290/mcp",{method:"POST",headers:{"content-type":"application/json",accept:"application/json, text/event-stream"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-06-18",capabilities:{},clientInfo:{name:"session-host",version:"0"}}})}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))'
+bayma_deadline=$(( $(date +%s) + ${BAYMA_READY_TIMEOUT_S:-90} ))
+until "${RUNSC[@]}" exec --user 1000:1000 --env HOME=/home/agent \
+    --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    session node -e "$BAYMA_PROBE" >/dev/null 2>&1; do
+  if [ "$(date +%s)" -ge "$bayma_deadline" ]; then
+    echo "session-host: bayma did not answer within ${BAYMA_READY_TIMEOUT_S:-90}s" >&2
+    "${RUNSC[@]}" ps session >&2 || true
+    exit 1
+  fi
+  sleep 0.5
+done
+stamp bayma
 echo "session-host ready $(( $(date +%s%3N) - T0 ))"
 
 teardown() {
