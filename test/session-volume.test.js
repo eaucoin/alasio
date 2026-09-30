@@ -96,4 +96,10 @@ test("the session host run args carry the mount env, the isolation flags, and th
   assert.ok(args.at(-1) === "alasio/session-host");
   const cmd = host.execCommand("fs-work01", ["claude", "--version"]);
   assert.deepEqual(cmd, { command: "docker", args: ["exec", "-i", "alasio-session-fs-work01", "agent-exec", "claude", "--version"] });
+  // Per-spawn env is named for agent-exec, which forwards nothing else of the host's env.
+  const withEnv = host.execCommand("fs-work01", ["codex"], { CODEX_HOME: "/home/agent/.codex", TOKEN: "t" });
+  assert.deepEqual(withEnv.args, [
+    "exec", "-i", "-e", "CODEX_HOME=/home/agent/.codex", "-e", "TOKEN=t", "-e", "AGENT_EXEC_VARS=CODEX_HOME,TOKEN",
+    "alasio-session-fs-work01", "agent-exec", "codex",
+  ]);
 });

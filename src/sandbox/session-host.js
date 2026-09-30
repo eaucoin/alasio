@@ -77,11 +77,14 @@ export class SessionHost {
 
   /**
    * The argv to spawn the harness inside the sandbox; the caller owns the child (the
-   * SDK, the app-server). `env` is applied to the process inside the sandbox (agent-exec
-   * forwards it), for the harness's per-spawn variables on top of the session's base env.
+   * SDK, the app-server). `env` is applied to the process inside the sandbox, for the
+   * harness's per-spawn variables on top of the session's base env. agent-exec forwards
+   * only the names listed in AGENT_EXEC_VARS, never the session host's own environment.
    */
   execCommand(volumeId, argv, env = {}) {
+    const names = Object.keys(env);
     const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+    if (names.length > 0) envArgs.push("-e", `AGENT_EXEC_VARS=${names.join(",")}`);
     return this.docker.spawnArgs(["exec", "-i", ...envArgs, sessionHostName(volumeId), "agent-exec", ...argv]);
   }
 
