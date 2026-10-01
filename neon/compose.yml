@@ -81,8 +81,11 @@ services:
         # own consistency, and versioned object churn would only bloat the store.
         shell 's3.bucket.list' | grep -qw sessions || shell 's3.bucket.create -name sessions'
 
-  # Idempotent: old versions of Neon's objects expire a week after they are
-  # replaced, as Neon's own point-in-time window does.
+  # Idempotent: old versions of the pageserver's objects expire a week after
+  # they are replaced, as Neon's own point-in-time window does. The safekeepers'
+  # expire after a day, the least S3 allows: each safekeeper re-uploads the WAL
+  # segment it is still writing, whole, as it grows, and nothing reads the copies
+  # it replaces, which kept for a week came to over 15 GB.
   seaweedfs-lifecycle-init:
     <<: *neon
     restart: "no"
@@ -100,7 +103,7 @@ services:
       - --bucket
       - neon
       - --lifecycle-configuration
-      - '{"Rules":[{"ID":"expire-noncurrent","Status":"Enabled","Filter":{"Prefix":""},"NoncurrentVersionExpiration":{"NoncurrentDays":7},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+      - '{"Rules":[{"ID":"expire-noncurrent","Status":"Enabled","Filter":{"Prefix":"pageserver/"},"NoncurrentVersionExpiration":{"NoncurrentDays":7},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}},{"ID":"expire-noncurrent-wal","Status":"Enabled","Filter":{"Prefix":"safekeeper/"},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
     depends_on:
       seaweedfs-init:
         condition: service_completed_successfully
