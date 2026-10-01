@@ -509,14 +509,17 @@ test("restart recovery restores the interrupted turn's own harness session", asy
       timestamp: 99,
     });
     const [turn] = store.getActiveTurns();
-    const job = store.stageRestartRecovery({ turn, prompt: buildRestartSyntheticText("self_induced", turn.harness) });
+    // An empty environment gives the defaults even when the tests themselves
+    // run under a unit, such as alasio-standalone.service, that overrides them.
+    const job = store.stageRestartRecovery({ turn, prompt: buildRestartSyntheticText("self_induced", turn.harness, {}) });
     assert.equal(job.harness, CLAUDE_HARNESS);
-    assert.match(job.prompt, /You are Claude, connected through `alasio.service`/);
+    assert.match(job.prompt, /You are Claude, connected through `alasio\.service`/);
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-1");
     assert.equal(store.getHarnessSessionId(conversationId, CODEX_HARNESS), undefined);
-    assert.match(buildRestartSyntheticText("operator_induced"), /You are Codex/);
-    assert.match(buildRestartSyntheticText("operator_induced"), /connected through `alasio\.service`/);
-    assert.match(buildRestartSyntheticText("operator_induced"), /bots\/alasio\/restart-alasio-operator\.sh`; from that directory use `\.\/restart-alasio-operator\.sh`/);
+    const operator = buildRestartSyntheticText("operator_induced", undefined, {});
+    assert.match(operator, /You are Codex/);
+    assert.match(operator, /connected through `alasio\.service`/);
+    assert.match(operator, /bots\/alasio\/restart-alasio-operator\.sh`; from that directory use `\.\/restart-alasio-operator\.sh`/);
     const standaloneEnv = { ALASIO_SERVICE_UNIT: "alasio-standalone.service", ALASIO_RESTART_WRAPPER: "/home/operator/alasio/restart-alasio-standalone.sh" };
     const standalone = buildRestartSyntheticText("self_induced", CLAUDE_HARNESS, standaloneEnv);
     assert.match(standalone, /You are Claude, connected through `alasio-standalone\.service`/);
