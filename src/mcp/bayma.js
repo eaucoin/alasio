@@ -25,7 +25,7 @@ import { createLogger } from "../shared/log.js";
 export const BAYMA_SERVER_NAME = "bayma";
 
 export const BAYMA_IMAGE =
-  "ghcr.io/eaucoin/bayma:0.7.0@sha256:88f473c02f861712299e3b2d69674b6c114b8a07959f2ac4cd5dc525ad334c38";
+  "ghcr.io/eaucoin/bayma:0.8.0@sha256:a2e321998792183579357a6ad5a84834c8b1f572420a323a5ab440d920705556";
 
 /**
  * A server that follows one on the same state directory waits for it to

@@ -3,7 +3,7 @@
 # runs here: Claude Code and Codex run in alasio and reach the sandbox only through
 # bayma. The agent runs as the unprivileged user `agent`; /workspace and /home/agent are
 # bound from the session's JuiceFS volume at run time.
-ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.7.0
+ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.8.0@sha256:a2e321998792183579357a6ad5a84834c8b1f572420a323a5ab440d920705556
 FROM ${BAYMA_IMAGE}
 RUN usermod --login agent --home /home/agent --move-home ubuntu \
  && groupmod --new-name agent ubuntu \
