@@ -21,7 +21,7 @@ import { join } from "node:path";
 
 import { resolveStateDir } from "../config.js";
 import { createLogger } from "../shared/log.js";
-import { inSpan } from "../telemetry/index.js";
+import { conversationTelemetryEnv, inSpan } from "../telemetry/index.js";
 
 export const BAYMA_SERVER_NAME = "bayma";
 
@@ -143,10 +143,18 @@ function stdioCommand(stateDir, env) {
  * finds the previous one's sessions there.
  */
 export function baymaLaunch({ harness, threadKey, env = process.env }) {
-  return stdioCommand(
-    join(resolveStateDir(env), "bayma", sanitizePathToken(harness), sanitizePathToken(threadKey)),
-    env,
-  );
+  // bayma exports its own telemetry where alasio exports its, labelled with the
+  // conversation, from settings the MCP config gives the command explicitly: the env
+  // it is launched from holds none of alasio's (telemetry/config.js), and Codex hands
+  // its servers an allowlist of the rest.
+  const telemetry = conversationTelemetryEnv({ conversationId: threadKey });
+  return {
+    ...stdioCommand(
+      join(resolveStateDir(env), "bayma", sanitizePathToken(harness), sanitizePathToken(threadKey)),
+      { ...env, ...telemetry },
+    ),
+    ...(Object.keys(telemetry).length > 0 ? { env: telemetry } : {}),
+  };
 }
 
 async function checkBayma(env) {

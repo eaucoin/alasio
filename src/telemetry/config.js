@@ -81,6 +81,33 @@ export function sharedResourceAttributes(env = process.env) {
   return shared.length ? shared.join(",") : null;
 }
 
+/**
+ * The standard variables that have a process serving one conversation, Claude Code
+ * or bayma, export each signal alasio exports where alasio exports it, and no other:
+ * each exported signal's exporter, endpoint, protocol, and headers, every other
+ * signal's exporter none, and the deployment's resource attributes with the
+ * conversation's. Nothing when alasio exports nothing.
+ */
+export function conversationTelemetryEnv({ conversationId }, env = process.env) {
+  const telemetry = resolveTelemetry(env);
+  if (!telemetryEnabled(telemetry)) return {};
+  const settings = {
+    OTEL_RESOURCE_ATTRIBUTES: [sharedResourceAttributes(env), `alasio.conversation.id=${encodeURIComponent(conversationId)}`]
+      .filter(Boolean)
+      .join(","),
+  };
+  for (const signal of SIGNALS) {
+    const upper = signal.toUpperCase();
+    const exporter = telemetry[signal];
+    settings[`OTEL_${upper}_EXPORTER`] = exporter ? "otlp" : "none";
+    if (!exporter) continue;
+    settings[`OTEL_EXPORTER_OTLP_${upper}_ENDPOINT`] = exporter.endpoint;
+    settings[`OTEL_EXPORTER_OTLP_${upper}_PROTOCOL`] = exporter.protocol;
+    if (exporter.headers) settings[`OTEL_EXPORTER_OTLP_${upper}_HEADERS`] = exporter.headers;
+  }
+  return settings;
+}
+
 /** The standard `key=value,key=value` header list as an object, values URL-decoded. */
 export function parseHeaders(headers) {
   if (!headers) return {};

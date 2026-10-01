@@ -6,7 +6,16 @@
 import { context, INVALID_SPAN_CONTEXT, metrics, propagation, ROOT_CONTEXT, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 
 export { SpanKind } from "@opentelemetry/api";
-export { parseHeaders, resolveTelemetry, sharedResourceAttributes, SIGNALS, signalHeaders, telemetryEnabled, withoutTelemetry } from "./config.js";
+export {
+  conversationTelemetryEnv,
+  parseHeaders,
+  resolveTelemetry,
+  sharedResourceAttributes,
+  SIGNALS,
+  signalHeaders,
+  telemetryEnabled,
+  withoutTelemetry,
+} from "./config.js";
 
 const tracer = trace.getTracer("alasio");
 
