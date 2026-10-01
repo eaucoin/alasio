@@ -6,6 +6,7 @@ mindmap
       store is the only persistence surface imported by transport/runtime code
       schema is canonical DDL for the local SQLite content database
       prompt jobs checkpoint upstream start and completion independently from Telegram delivery state
+      prompt jobs and outbox entries keep the W3C traceparent they were queued in so the turn or delivery that runs later joins that trace
       restart provenance active-turn retirement and deterministic continuation enqueue commit in one SQLite transaction
       response blocks carry an explicit terminal marker written only from upstream terminal turn events
       terminal response recovery reconstructs all blocks only after that marker exists

@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { generateKeyPair } from "../neon/control/jwt.js";
 import { controlRevision, DEFAULT_BRIDGE, neonLayout, setupNeon } from "../neon/control/setup.js";
-import { NEON_PROJECT, neonBridgeName } from "../src/neon/stack.js";
+import { NEON_PROJECT, neonBridgeName, neonTelemetry } from "../src/neon/stack.js";
 
 function withDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), "alasio-neon-setup-"));
@@ -80,5 +80,31 @@ test("a deployment made before a secret existed gains it on the next setup, keep
     const again = readFileSync(layout.secretsFile, "utf8");
     setupNeon(dir);
     assert.equal(readFileSync(layout.secretsFile, "utf8"), again); // then stable
+  });
+});
+
+test("the stack's telemetry collector runs only with an endpoint, and is recreated when its configuration changes", () => {
+  assert.equal(neonTelemetry({}), null);
+  assert.deepEqual(
+    neonTelemetry({ ALASIO_NEON_OTLP_ENDPOINT: "http://collector:4318", OTEL_EXPORTER_OTLP_HEADERS: "authorization=Bearer%20x" }),
+    { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } },
+  );
+  withDir((dir) => {
+    const layout = setupNeon(dir);
+    assert.match(readFileSync(layout.composeEnv, "utf8"), /^COMPOSE_PROFILES=''$/m);
+    assert.equal(existsSync(layout.otelCollectorConfig), false);
+
+    setupNeon(dir, { otlp: { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } } });
+    const composeEnv = readFileSync(layout.composeEnv, "utf8");
+    assert.match(composeEnv, /^COMPOSE_PROFILES='telemetry'$/m);
+    const revision = composeEnv.match(/^ALASIO_NEON_TELEMETRY_REVISION='(\w+)'$/m)[1];
+    const config = JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8"));
+    assert.equal(statSync(layout.otelCollectorConfig).mode & 0o777, 0o600); // it holds the backend's headers
+    assert.deepEqual(config.exporters.otlphttp, { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } });
+    const targets = config.receivers.prometheus.config.scrape_configs.flatMap((job) => job.static_configs[0].targets);
+    assert.deepEqual(targets, ["pageserver:9898", "safekeeper-1:7676", "safekeeper-2:7676", "safekeeper-3:7676", "storage-controller:1234", "storage-broker:50051", "compute:3080", "seaweedfs:9327"]);
+
+    setupNeon(dir, { otlp: { endpoint: "http://elsewhere:4318", headers: {} } });
+    assert.notEqual(readFileSync(layout.composeEnv, "utf8").match(/^ALASIO_NEON_TELEMETRY_REVISION='(\w+)'$/m)[1], revision);
   });
 });

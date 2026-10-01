@@ -7,8 +7,12 @@ mindmap
       turn-controller owns prompt orchestration queueing delegation and harness resolution and is shared by the Codex and Claude Code adapters
       turn-controller owns service switching and refuses it while a turn is active or prompt jobs are open
       accepted prompts are serialized per conversation through durable SQLite prompt jobs
+      each turn is the span alasio.turn continuing the trace of the update that queued its prompt from the traceparent its prompt job keeps restarts included and its outcome labels it and alasio.turn.duration beside alasio.turn.active and alasio.prompt.wait
+      messages queued while a turn ran run after it as a turn and a trace of their own so neither turn's duration holds the other
+      turn-timing logs each turn's timeline in its harness records it as events of the turn's span and measures the first visible output as alasio.turn.first_output
       status-reporter owns operator progress and final response delivery its status line stating its start as a relative date-time the Telegram app keeps current
       reply-media resolves the files a final response shows with image syntax against the conversation's workspace reading a session filesystem's through its sandbox so a path reaches only what the agent can and copies them under the state directory until delivered
+      env hands Codex alasio's environment without alasio's telemetry settings and the app-server gets settings of its own from app-server/telemetry
       config-toml reads the operator's own developer instructions from their Codex config so alasio's are added after them rather than replacing them
       runtime exposes fresh app-server thread creation for Telegram New Session and no-session goal bootstrap paths
       runtime awaits the caller's beforeResponseComplete once a turn completes and before its response is marked complete so nothing delivers a reply first

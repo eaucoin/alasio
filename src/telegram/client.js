@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { setDefaultAutoSelectFamily } from "node:net";
 import { pipeline } from "node:stream/promises";
+import { rpcCall } from "../telemetry/index.js";
 import { renderTelegramHtml } from "./markdown.js";
 import { splitRichMarkdown, toRichMarkdown } from "./rich-markdown.js";
 import { mediaIdsIn, withoutMediaLines } from "./rich-media.js";
@@ -29,6 +30,10 @@ function buildTextPayload(chatId, text, options) {
     payload.parse_mode = "HTML";
   }
   return payload;
+}
+
+function jsonBody(payload) {
+  return { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
 }
 
 /** The Bot API input media type for a prepared media item. */
@@ -72,10 +77,7 @@ export class Client {
   }
 
   async call(method, payload = {}, options = {}) {
-    return await this.request(method, () => ({
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }), options);
+    return await this.request(method, () => jsonBody(payload), options);
   }
 
   /**
@@ -97,7 +99,17 @@ export class Client {
     }, options);
   }
 
+  /** A Bot API call, as a client span and a duration named by its method. */
   async request(method, makeBody, options = {}) {
+    return await rpcCall({ system: "telegram", service: "telegram", method }, (span) => this.send(method, makeBody, options, span));
+  }
+
+  /**
+   * Posts `method` to the Bot API, waiting out and retrying the rate limits it reports.
+   * The URL holds the bot token, so only the method, never the URL, reaches the call's
+   * `span`, if it has one.
+   */
+  async send(method, makeBody, options = {}, span = null) {
     const maxRateLimitRetries = options.rateLimitRetries ?? 3;
     for (let attempt = 0; ; attempt += 1) {
       const response = await fetch(`${this.apiBase}/${method}`, {
@@ -105,6 +117,7 @@ export class Client {
         ...makeBody(),
         signal: options.signal,
       });
+      span?.setAttribute("http.response.status_code", response.status);
       const data = await response.json().catch(() => null);
       if (response.ok && data?.ok) {
         return data.result;
@@ -113,6 +126,7 @@ export class Client {
       if (!error.retryAfterMs || attempt >= maxRateLimitRetries) {
         throw error;
       }
+      span?.addEvent("rate_limited", { "telegram.retry_after_ms": error.retryAfterMs });
       await new Promise((resolve, reject) => {
         let onAbort;
         const finish = () => {
@@ -153,12 +167,12 @@ export class Client {
     return this.call("setChatMenuButton", { menu_button: menuButton });
   }
 
+  /**
+   * A long poll: it lasts as long as Telegram has nothing to deliver, which says nothing
+   * of the Bot API's latency, so it is sent without a span or a duration.
+   */
   async getUpdates({ offset, timeout = 50, allowedUpdates = ["message", "callback_query"], signal } = {}) {
-    return this.call("getUpdates", {
-      offset,
-      timeout,
-      allowed_updates: allowedUpdates,
-    }, { signal });
+    return this.send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { signal });
   }
 
   /**

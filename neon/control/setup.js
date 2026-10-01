@@ -63,6 +63,47 @@ export function neonLayout(stateDir) {
     sandboxMetadataPasswordFile: join(root, "secrets", "sandbox-metadata-password"),
     sandboxS3KeyFile: join(root, "secrets", "sandbox-s3-key"),
     sandboxS3SecretFile: join(root, "secrets", "sandbox-s3-secret"),
+    otelCollectorConfig: join(root, "otel-collector.yaml"),
+  };
+}
+
+/** What the telemetry collector scrapes, by the service name its metrics carry. */
+const SCRAPE_TARGETS = {
+  pageserver: ["pageserver:9898"],
+  safekeeper: SAFEKEEPER_IDS.map((id) => `safekeeper-${id}:7676`),
+  "storage-controller": ["storage-controller:1234"],
+  "storage-broker": ["storage-broker:50051"],
+  compute: ["compute:3080"],
+  seaweedfs: ["seaweedfs:9327"],
+};
+
+/**
+ * The telemetry collector's configuration (JSON, which is YAML): each service's
+ * Prometheus metrics, scraped every 30s, sent to `otlp.endpoint` as OTLP over HTTP
+ * with `otlp.headers`.
+ */
+function collectorConfig(otlp) {
+  return {
+    receivers: {
+      prometheus: {
+        config: {
+          scrape_configs: Object.entries(SCRAPE_TARGETS).map(([job, targets]) => ({
+            job_name: job,
+            scrape_interval: "30s",
+            static_configs: [{ targets }],
+          })),
+        },
+      },
+    },
+    processors: {
+      resource: { attributes: [{ key: "service.namespace", value: "alasio-neon", action: "upsert" }] },
+      batch: {},
+    },
+    exporters: { otlphttp: { endpoint: otlp.endpoint, headers: otlp.headers } },
+    service: {
+      telemetry: { metrics: { level: "none" } },
+      pipelines: { metrics: { receivers: ["prometheus"], processors: ["resource", "batch"], exporters: ["otlphttp"] } },
+    },
   };
 }
 
@@ -162,7 +203,7 @@ export function controlRevision(dir = CONTROL_DIR) {
 }
 
 /** Renders every service's configuration from the secrets. */
-function renderConfig(layout, secrets, { computePort, bridgeName }) {
+function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
   const privateKeyPem = readFileSync(layout.privateKey, "utf8");
   const token = (scope, tenantId) => signToken(privateKeyPem, scope, tenantId);
 
@@ -245,7 +286,16 @@ function renderConfig(layout, secrets, { computePort, bridgeName }) {
   writePrivate(layout.sandboxS3KeyFile, secrets.s3.sessions.accessKey);
   writePrivate(layout.sandboxS3SecretFile, secrets.s3.sessions.secretKey);
 
+  // The telemetry collector runs only with somewhere to send to; its configuration can
+  // hold the backend's credentials (headers), so it is private.
+  const collector = otlp ? JSON.stringify(collectorConfig(otlp), null, 2) + "\n" : null;
+  if (collector) {
+    writePrivate(layout.otelCollectorConfig, collector);
+  }
+
   const env = {
+    COMPOSE_PROFILES: collector ? "telemetry" : "",
+    ALASIO_NEON_TELEMETRY_REVISION: collector ? createHash("sha256").update(collector).digest("hex").slice(0, 16) : "",
     ALASIO_NEON_DIR: layout.root,
     ALASIO_NEON_CONTROL_SOURCE: CONTROL_DIR,
     ALASIO_NEON_CONTROL_REVISION: controlRevision(),
@@ -280,15 +330,16 @@ function renderConfig(layout, secrets, { computePort, bridgeName }) {
 
 /**
  * Makes the stack's secrets if it has none, and renders its configuration.
- * Returns the layout.
+ * `otlp` (`{ endpoint, headers }`, or null) is where the stack's telemetry goes, as
+ * the stack's network reaches it. Returns the layout.
  */
-export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT, bridgeName = DEFAULT_BRIDGE } = {}) {
+export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT, bridgeName = DEFAULT_BRIDGE, otlp = null } = {}) {
   if (!/^[A-Za-z0-9_.-]{1,15}$/.test(bridgeName)) {
     throw new Error(`bridge name must be 1 to 15 of [A-Za-z0-9_.-] (a Linux interface name), got ${JSON.stringify(bridgeName)}`);
   }
   const layout = neonLayout(stateDir);
   mkdirSync(layout.root, { recursive: true });
   const secrets = ensureSecrets(layout);
-  renderConfig(layout, secrets, { computePort, bridgeName });
+  renderConfig(layout, secrets, { computePort, bridgeName, otlp });
   return layout;
 }

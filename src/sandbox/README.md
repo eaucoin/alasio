@@ -15,7 +15,7 @@ mindmap
       volume reserves a namespace and records a volume creation only reserves and records the format happens on first session-host start and destroy runs juicefs destroy and purges the S3 prefix in a throwaway container since destroy alone orphans objects when metadata is gone
       one volume per session never shared because JuiceFS's control file reaches a whole volume
     Session host and sandbox
-      session-host builds the docker run for the privileged per-session container waits until bayma answers inside it reads a file as the agent and connects to a port on the sandbox's own loopback through agent-connect
+      session-host builds the docker run for the privileged per-session container waits until bayma answers inside it as the span alasio.session_host.start with an event for each step its entrypoint stamps reads a file as the agent and connects to a port on the sandbox's own loopback through agent-connect
       ensureSession starts a host once for callers that ask together and adopts one already running so a session host outlives a alasio restart with its processes and bayma's REPL sessions
       docker is the one place these modules touch Docker so the rest take a small faked-in-tests interface
       the boundary is gVisor inside the session host an escape lands in the privileged container exactly where a host-installed gVisor escape would

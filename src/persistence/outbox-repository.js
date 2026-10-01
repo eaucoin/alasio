@@ -6,16 +6,16 @@ export class SqliteOutboxRepository {
     this.conversations = conversationRepository;
   }
 
-  enqueueText({ chatId, text, options = {}, pendingResponseId = null }) {
+  enqueueText({ chatId, text, options = {}, pendingResponseId = null, traceparent = null }) {
     const conversationId = this.conversations.getConversationByChatId(chatId)?.id ?? null;
     const id = newId();
     const enqueue = this.db.transaction(() => {
       const inserted = this.db.prepare(`
         insert into telegram_outbox
-          (id, conversation_id, chat_id, kind, text, options_json, pending_response_id, state, available_at)
-        values (?, ?, ?, 'text', ?, ?, ?, 'pending', ?)
+          (id, conversation_id, chat_id, kind, text, options_json, pending_response_id, state, traceparent, available_at)
+        values (?, ?, ?, 'text', ?, ?, ?, 'pending', ?, ?)
         on conflict (pending_response_id) where pending_response_id is not null do nothing
-      `).run(id, conversationId, String(chatId), text, JSON.stringify(options), pendingResponseId, Date.now() / 1000);
+      `).run(id, conversationId, String(chatId), text, JSON.stringify(options), pendingResponseId, traceparent, Date.now() / 1000);
       if (pendingResponseId) {
         this.db.prepare("update response_blocks set posted = 1 where pending_response_id = ?").run(pendingResponseId);
       }

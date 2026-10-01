@@ -8,6 +8,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { createLogger } from "../shared/log.js";
+import { inSpan } from "../telemetry/index.js";
 import { overLimitNote } from "../telegram/rich-media.js";
 import { sessionHostName } from "./names.js";
 
@@ -50,25 +51,34 @@ export class SessionHost {
   /**
    * Start the session host and wait until bayma answers inside its sandbox. Any earlier
    * container of the name is removed first; its checkpoint, if it left one, is on the
-   * volume, where the new container restores it.
+   * volume, where the new container restores it. The start is the span
+   * `alasio.session_host.start`, with an event for each step the entrypoint stamps.
    */
   async start(volumeId, { mountEnv, netMode }) {
     const name = sessionHostName(volumeId);
-    await this.docker.cli(["rm", "--force", name]).catch(() => {});
-    await this.docker.cli(this.runArgs(volumeId, { mountEnv, netMode }));
-    const deadline = Date.now() + READY_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      const { stdout } = await this.docker.cli(["logs", name]).catch(() => ({ stdout: "" }));
-      if (/session-host ready/.test(stdout)) {
-        log.info(`session host ${name} ready`);
-        return;
+    await inSpan("alasio.session_host.start", { attributes: { "alasio.volume.id": volumeId, "alasio.sandbox.net_mode": netMode } }, async (span) => {
+      await this.docker.cli(["rm", "--force", name]).catch(() => {});
+      await this.docker.cli(this.runArgs(volumeId, { mountEnv, netMode }));
+      const runAt = Date.now();
+      const deadline = runAt + READY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        const { stdout, stderr = "" } = await this.docker.cli(["logs", name]).catch(() => ({ stdout: "" }));
+        if (/session-host ready/.test(stdout)) {
+          // Each step is stamped with the time since the entrypoint began, just after
+          // `docker run` returned.
+          for (const [, step, ms] of stderr.matchAll(/^session-host (\w+) (\d+)ms$/gmu)) {
+            span.addEvent(step, runAt + Number(ms));
+          }
+          log.info(`session host ${name} ready`);
+          return;
+        }
+        if (!(await this.docker.isRunning(name))) {
+          throw new Error(`session host ${name} exited before becoming ready:\n${stdout.slice(-2000)}`);
+        }
+        await sleep(200);
       }
-      if (!(await this.docker.isRunning(name))) {
-        throw new Error(`session host ${name} exited before becoming ready:\n${stdout.slice(-2000)}`);
-      }
-      await sleep(200);
-    }
-    throw new Error(`session host ${name} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
+      throw new Error(`session host ${name} did not become ready within ${READY_TIMEOUT_MS / 1000}s`);
+    });
   }
 
   isRunning(volumeId) {

@@ -1,3 +1,4 @@
+import { rpcCall, traceCarrier } from "../../telemetry/index.js";
 import { elapsedMs, startAppServerProcess } from "./process.js";
 import { serverRequestResponse } from "./protocol.js";
 
@@ -140,16 +141,24 @@ export class AppServerRpcClient {
     this.process.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
+  /**
+   * A request, as a client span named by its method. The request carries the span's
+   * trace context, so what the app-server does for it joins alasio's trace.
+   */
   request(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
-    const id = this.nextId;
-    this.nextId += 1;
-    this.write({ id, method, params });
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Codex app-server request timed out: ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+    return rpcCall({ system: "jsonrpc", service: "codex", method }, (span) => {
+      const id = this.nextId;
+      this.nextId += 1;
+      span.setAttribute("rpc.jsonrpc.request_id", String(id));
+      const trace = traceCarrier();
+      this.write({ id, method, params, ...(trace ? { trace } : {}) });
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`Codex app-server request timed out: ${method}`));
+        }, timeoutMs);
+        this.pending.set(id, { resolve, reject, timer });
+      });
     });
   }
 

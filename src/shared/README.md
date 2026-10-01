@@ -7,7 +7,7 @@ mindmap
       file-prompt owns attachment prompt suffix rendering
       human-time owns duration text
       ids owns runtime UUID generation
-      log owns scoped logger construction
+      log owns scoped loggers that write each line to the console and as a log record of its scope in the active trace
       runtime-constants owns constants shared across domains
       session-labels owns the session panels' one-line labels and dates for both harnesses' session apis
 ```

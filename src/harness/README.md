@@ -21,6 +21,8 @@ mindmap
     Claude Code adapter
       claude/runtime builds the Agent SDK options with bypassPermissions the claude_code system prompt preset and bayma added to the MCP servers Claude Code loads from the operator's configuration
       claude/live-sessions keeps one Claude Code process per conversation for as long as its session and model stay mounted and routes each result to the operator turn it names or to a turn Claude Code started itself
+      claude/env hands Claude Code alasio's environment without alasio's telemetry settings and claude/telemetry gives the process its own each signal alasio exports with the conversation as a resource attribute
+      claude/live-sessions starts each process outside the trace of the turn that starts it since the process outlives that turn so Claude Code's traces are its own and are found from a turn by session id
       claude/prompt-channel is the open streaming input that operator prompts and Steer are pushed into and it only ends when the live process is closed
       claude/event-projection maps assistant tool_use blocks onto Codex-shaped items and the SDK result onto the final_answer phase
       claude/sessions reads the SDK project transcript store scoped to the working directory and forks with upToMessageId before the chosen user message

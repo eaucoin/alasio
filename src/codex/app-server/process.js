@@ -5,6 +5,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { getCodexBinaryOverride } from "../../config.js";
 import { appServerLog as log } from "./log.js";
+import { codexTelemetryArgs, codexTelemetryEnv } from "./telemetry.js";
 
 function codexBinPath() {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -20,9 +21,9 @@ export function startAppServerProcess({ cwd, env, onLine, onExit, onError }) {
   if (!existsSync(binPath)) {
     throw new Error(`Codex binary not found at ${binPath}`);
   }
-  const child = spawn(binPath, ["app-server", "--disable", "plugins", "--listen", "stdio://"], {
+  const child = spawn(binPath, ["app-server", "--disable", "plugins", ...codexTelemetryArgs(), "--listen", "stdio://"], {
     cwd,
-    env,
+    env: { ...env, ...codexTelemetryEnv() },
     stdio: ["pipe", "pipe", "pipe"],
   });
   child.stderr?.on("data", (data) => {

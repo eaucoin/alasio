@@ -49,6 +49,8 @@ services:
       - -s3.config=/etc/seaweedfs/s3.json
       - -s3.allowDeleteBucketNotEmpty=false
       - -s3.autoCreateBucket=false
+      # Prometheus metrics, for the telemetry collector below.
+      - -metricsPort=9327
     volumes:
       - ${ALASIO_NEON_DIR}/seaweedfs/data:/data
       - ${ALASIO_NEON_DIR}/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -375,6 +377,21 @@ services:
       timeout: 5s
       retries: 60
       start_period: 20s
+
+  # The stack's telemetry, run only when ALASIO_NEON_OTLP_ENDPOINT gives it somewhere to
+  # go (setup.js turns this profile on): it scrapes the Prometheus metrics every Neon
+  # service and SeaweedFS serve on this network and sends them on as OTLP.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    profiles: [telemetry]
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      # Recreates the collector when its configuration changes; see setup.js.
+      ALASIO_NEON_TELEMETRY_REVISION: ${ALASIO_NEON_TELEMETRY_REVISION}
+    volumes:
+      - ${ALASIO_NEON_DIR}/otel-collector.yaml:/etc/otelcol/config.yaml:ro
 
 networks:
   # The stack's private network, on a named Linux bridge (setup.js DEFAULT_BRIDGE for

@@ -15,6 +15,7 @@ import { UpdatePoller } from "./update-poller.js";
 import { TelegramOutbox } from "./outbox.js";
 import { startWorkflowHookServer } from "../workflow/hook-server.js";
 import { createLogger } from "../shared/log.js";
+import { inSpan, SpanKind } from "../telemetry/index.js";
 
 const log = createLogger("telegram-app");
 
@@ -251,20 +252,35 @@ export class TelegramCodexApp {
     });
   }
 
+  /**
+   * Each update starts a trace of its own, which everything it leads to joins: the
+   * turn its prompt queues, however much later it runs, and the reply's delivery.
+   */
   async processUpdate(update) {
     this.store.recordTelegramUpdate(update);
-    try {
-      if (update.callback_query) {
-        this.callbacks.handle(update.callback_query).catch((error) => {
-          log.error(`Failed to process callback ${update.callback_query.id}: ${error instanceof Error ? error.message : String(error)}`);
-        });
-      } else if (update.message) {
-        await this.messages.handle(update.message, update.update_id);
+    const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+    await inSpan("alasio.update", {
+      kind: SpanKind.CONSUMER,
+      parent: null,
+      attributes: {
+        "telegram.update.id": update.update_id,
+        "telegram.update.type": update.callback_query ? "callback_query" : "message",
+        ...(chatId === undefined ? {} : { "telegram.chat.id": String(chatId) }),
+      },
+    }, async () => {
+      try {
+        if (update.callback_query) {
+          this.callbacks.handle(update.callback_query).catch((error) => {
+            log.error(`Failed to process callback ${update.callback_query.id}: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        } else if (update.message) {
+          await this.messages.handle(update.message, update.update_id);
+        }
+        this.store.markTelegramUpdateProcessed(update.update_id);
+      } catch (error) {
+        log.error(`Failed to process update ${update.update_id}: ${error}`);
+        throw error;
       }
-      this.store.markTelegramUpdateProcessed(update.update_id);
-    } catch (error) {
-      log.error(`Failed to process update ${update.update_id}: ${error}`);
-      throw error;
-    }
+    });
   }
 }

@@ -6,6 +6,8 @@ mindmap
       startNeon renders the stack's configuration through neon/control/setup.js brings the `alasio-neon` compose project up and waits until every service is healthy leaving services already running alone and removing any no longer in compose.yml
       it then opens one pg pool to the compute ensures the schemas of the Claude session store and the Codex rollout store and returns the pool the store the rollouts and close
       an idle connection the compute drops when it restarts is logged and replaced on the next checkout instead of crashing alasio
+      bringing the stack up is the span alasio.neon.start
+      neonTelemetry reads ALASIO_NEON_OTLP_ENDPOINT where the stack's own collector sends its metrics as the stack's network reaches it with the headers alasio's metrics go with and with it unset a collector an earlier start left running is stopped
       pullNeon pulls every image of the stack so install-alasio-standalone-service.sh can spare the first start the downloads
       project and computePort are parameters only so tests can run a stack of their own beside alasio's
     Boundary

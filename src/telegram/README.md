@@ -8,6 +8,8 @@ mindmap
       authorizer owns private-chat identity explicit allowlist bootstrap-user and callback access
       callback-handler owns queue discard swerve session-control and goal-control callback actions with shared active-turn status
       outbox owns durable final-response delivery retries and Telegram rate-limit backoff
+      app makes each update the root span alasio.update of a trace that the turn its prompt queues and the reply's delivery join
+      outbox keeps the traceparent a reply is queued in so its delivery is the span alasio.delivery of that trace and measures alasio.delivery.lag and alasio.outbox.pending
       app validates outbox composition at construction and retries completed response handoff during normal uptime
       recovery timers ignore active response streams and hand off only terminal final-answer output
       callback ingress reauthorizes the private sender before consuming an action and acknowledges long controls before app-server work so Telegram buttons remain responsive
@@ -16,6 +18,7 @@ mindmap
       media-group-buffer owns multi-file grouping timers and due flush recovery
     Bot API
       client owns raw Telegram HTTP calls file downloads and message chunking
+      client makes each Bot API call a client span named telegram slash its method that never carries the URL and with it the bot token and leaves the getUpdates long poll unmeasured since its length is Telegram's wait
       client pins Node Bot API networking to IPv4-first without family autoselection because this host has no usable IPv6 route
       client also owns bot command and menu-button registration for the native session and goal control entrypoints
       client serializes outbound calls and honors Bot API retry-after responses

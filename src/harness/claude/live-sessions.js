@@ -51,6 +51,8 @@ import { extractShellCommands } from "../../policy/embedded-shell.js";
 import { looksLikeSelfRestartCommand } from "../../policy/restart-command.js";
 import { detectWorkflowWait } from "../../policy/workflow-wait.js";
 import { createLogger } from "../../shared/log.js";
+import { outsideTraces } from "../../telemetry/index.js";
+import { claudeTelemetryEnv } from "./telemetry.js";
 
 const log = createLogger("claude-live");
 
@@ -456,7 +458,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
     const options = buildClaudeQueryOptions({
       workingDirectory,
       modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
-      claudeEnv,
+      claudeEnv: { ...claudeEnv, ...claudeTelemetryEnv({ conversationId: threadKey }) },
       mcpServers,
       resumeSession,
       resumeExists,
@@ -467,9 +469,13 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },
     });
-    host.sdkQuery = queryFactory({ prompt: channel.iterable, options });
     host.mode = resumeSession ? (resumeExists ? "resume" : "reserved") : "start";
-    host.loop = consume(host);
+    // The process outlives the turn that starts it, so it starts outside that turn's
+    // trace: Claude Code's traces are its own, found from a turn by its session id.
+    outsideTraces(() => {
+      host.sdkQuery = queryFactory({ prompt: channel.iterable, options });
+      host.loop = consume(host);
+    });
     log.info(`started thread=${threadKey} session=${String(host.sessionId).slice(0, 8)} mode=${host.mode}`);
     return host;
   }
@@ -499,7 +505,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
 
   async function runTurn(params) {
     const { prompt, threadKey, chatId, messageId, persistence, activeQueries, onStarted } = params;
-    const turnTimer = createTurnTimer({ threadKey, resumeSession: params.resumeSession, prompt, log });
+    const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt, log });
     log.info(`Querying Claude Code (resume=${params.resumeSession})`);
     turnTimer("query.start");
     onStarted?.();

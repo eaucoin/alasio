@@ -6,12 +6,14 @@ mindmap
       process owns Codex app-server subprocess startup stdout reading and shutdown
       process disables plugins before app-server initialization so plugin skills and bundled capabilities are not loaded into Alasio
       log owns the app-server logging prefix
+      telemetry exports Codex's own logs traces and metrics where alasio exports its through -c otel overrides one per signal alasio exports with the deployment's resource attributes and leaves a signal alasio does not export to the operator's config.toml
     Protocol
       protocol converts app-server notifications into SDK-shaped alasio events
       protocol answers server-side approval or elicitation requests conservatively
     Client
       client owns the public app-server facade used by transport
       rpc-client owns JSON-RPC request response pending timers and server request replies
+      rpc-client makes each request a client span named codex slash its method and sends the span's trace context in the request's trace field so what the app-server does for it joins alasio's trace
       rpc-client heeds only the current process's lines exit and errors so a stopped process reporting its exit late cannot fail the requests of the one started after it
       thread-client owns Codex thread resume start fork turn start interrupt and goal calls and the thread turn and model lists every page of which it reads
       thread-client starts resumes and forks every thread with one set of overrides model approval sandbox and alasio's config

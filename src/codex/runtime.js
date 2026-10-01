@@ -26,6 +26,7 @@ import { buildCodexThreadConfig } from "./thread-config.js";
 import { codexAppServerClient } from "./app-server/client.js";
 import { ensureBaymaReady } from "../mcp/bayma.js";
 import { createLogger } from "../shared/log.js";
+import { CODEX_HARNESS } from "../harness/names.js";
 
 const log = createLogger("codex-runtime");
 
@@ -110,7 +111,7 @@ export function shutdownCodexRuntime() {
 export async function executeCodexTurn(params) {
     const { prompt, resumeSession, threadKey, chatId, messageId, workingDirectory, persistence, activeQueries, onStarted, scope = null, } = params;
     const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
-    const turnTimer = createTurnTimer({ threadKey, resumeSession, prompt, log });
+    const turnTimer = createTurnTimer({ harness: CODEX_HARNESS, threadKey, resumeSession, prompt, log });
     log.info(`Querying Codex (resume=${resumeSession})`);
     turnTimer("query.start");
     onStarted?.();

@@ -1,14 +1,21 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { withoutTelemetry } from "../telemetry/index.js";
+
 /** Where Codex keeps its state, as Codex resolves it: `$CODEX_HOME`, else `~/.codex`. */
 export function codexHome(env = process.env) {
   return env.CODEX_HOME || join(env.HOME || homedir(), ".codex");
 }
 
+/**
+ * The environment Codex runs with: alasio's own, but for alasio's telemetry settings,
+ * which would relabel or redirect Codex's and reach every command Codex runs; the
+ * app-server gets telemetry settings of its own (./app-server/telemetry.js).
+ */
 export function buildCodexEnv() {
   const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(withoutTelemetry(process.env))) {
     if (typeof value === "string") {
       env[key] = value;
     }

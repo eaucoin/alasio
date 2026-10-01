@@ -308,7 +308,9 @@ test("schema migration adds harness columns to an existing v4 database", () => {
     assert.ok(columns("conversations").has("active_harness"));
     assert.ok(columns("turns").has("harness"));
     assert.ok(columns("prompt_jobs").has("harness"));
-    assert.equal(legacy.prepare("select value from bot_state where key = 'schema_version'").get().value, "7");
+    assert.ok(columns("prompt_jobs").has("traceparent"));
+    assert.ok(columns("telegram_outbox").has("traceparent"));
+    assert.equal(legacy.prepare("select value from bot_state where key = 'schema_version'").get().value, "8");
     legacy.close();
 
     const store = new SqliteStore(root, dbPath, { defaultWorkingDirectory: "/legacy/workspace" });

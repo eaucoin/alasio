@@ -21,6 +21,7 @@ import { join } from "node:path";
 
 import { resolveStateDir } from "../config.js";
 import { createLogger } from "../shared/log.js";
+import { inSpan } from "../telemetry/index.js";
 
 export const BAYMA_SERVER_NAME = "bayma";
 
@@ -175,7 +176,7 @@ let readiness = null;
  * next turn.
  */
 export function ensureBaymaReady(env) {
-  readiness ??= checkBayma(env).catch((error) => {
+  readiness ??= inSpan("alasio.bayma.check", {}, () => checkBayma(env)).catch((error) => {
     readiness = null;
     throw new Error(`bayma is unavailable: ${error instanceof Error ? error.message : String(error)}`);
   });

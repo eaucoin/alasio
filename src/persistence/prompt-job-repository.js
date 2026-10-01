@@ -10,17 +10,17 @@ export class SqlitePromptJobRepository {
     this.db = db;
   }
 
-  enqueue({ conversationId, chatId, messageId, prompt, filePaths = [], state = "pending", priority = 0, harness = null }) {
+  enqueue({ conversationId, chatId, messageId, prompt, filePaths = [], state = "pending", priority = 0, harness = null, traceparent = null }) {
     if (!isHarnessName(harness)) {
       throw new Error(`Cannot queue a prompt for ${conversationId}: no service is mounted`);
     }
     const id = newId();
     this.db.prepare(`
       insert into prompt_jobs
-        (id, conversation_id, chat_id, message_id, prompt, file_paths_json, harness, state, priority, created_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, conversation_id, chat_id, message_id, prompt, file_paths_json, harness, state, priority, traceparent, created_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       on conflict(conversation_id, message_id) do nothing
-    `).run(id, conversationId, String(chatId), String(messageId), prompt, JSON.stringify(filePaths), harness, state, priority, Date.now() / 1000);
+    `).run(id, conversationId, String(chatId), String(messageId), prompt, JSON.stringify(filePaths), harness, state, priority, traceparent, Date.now() / 1000);
     return mapRow(this.db.prepare("select * from prompt_jobs where conversation_id = ? and message_id = ?").get(conversationId, String(messageId)));
   }
 

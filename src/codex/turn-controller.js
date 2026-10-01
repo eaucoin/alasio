@@ -12,8 +12,22 @@ import { truncateText } from "../operator/text.js";
 import { ReplyMedia } from "./reply-media.js";
 import { StatusReporter } from "./status-reporter.js";
 import { createLogger } from "../shared/log.js";
+import { currentSpan, currentTraceparent, inSpan, meter } from "../telemetry/index.js";
 
 const log = createLogger("codex-turn-controller");
+
+const turnDuration = meter.createHistogram("alasio.turn.duration", {
+  description: "Time from a turn starting to its reply being queued for delivery, by harness and outcome",
+  unit: "s",
+});
+const activeTurns = meter.createUpDownCounter("alasio.turn.active", {
+  description: "Turns running now, by harness",
+  unit: "{turn}",
+});
+const promptWait = meter.createHistogram("alasio.prompt.wait", {
+  description: "Time a queued prompt waited for its conversation to be free, restarts included",
+  unit: "s",
+});
 
 export class TurnController {
   constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null, sandbox = null }) {
@@ -251,6 +265,7 @@ export class TurnController {
       prompt,
       filePaths,
       state: this.activeQueries.has(conversationId) ? "awaiting_choice" : "pending",
+      traceparent: currentTraceparent(),
     });
     if (job.state === "awaiting_choice") {
       await this.askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: effectiveText });
@@ -281,6 +296,7 @@ export class TurnController {
       if (job.harness && job.harness !== activeHarness) {
         log.warn(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
       }
+      promptWait.record(job.started_at - job.created_at, { "alasio.harness": activeHarness });
       try {
         const completed = await this.runCodexTurn({
           conversationId,
@@ -288,6 +304,7 @@ export class TurnController {
           messageId: job.message_id,
           prompt: job.prompt,
           jobId: job.id,
+          traceparent: job.traceparent,
         });
         if (this.isStopping()) {
           return;
@@ -355,7 +372,7 @@ export class TurnController {
     });
   }
 
-  async runCodexTurn({ conversationId, chatId, messageId, prompt, jobId = null }) {
+  async runCodexTurn({ conversationId, chatId, messageId, prompt, jobId = null, traceparent }) {
     const existingSession = this.store.getSessionId(conversationId);
     return await this.runCodexTurnWithSession({
       conversationId,
@@ -365,6 +382,7 @@ export class TurnController {
       existingSession: existingSession ?? null,
       attachedTurn: null,
       jobId,
+      traceparent,
     });
   }
 
@@ -388,8 +406,65 @@ export class TurnController {
     return true;
   }
 
-  async runCodexTurnWithSession({ conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }) {
-    const harness = this.requireHarness(conversationId);
+  /**
+   * Runs a turn, then the messages queued while it ran, as a turn of their own. The
+   * turn is the span `alasio.turn`, continuing `traceparent` when given (a queued
+   * prompt's; null for a trace of its own) and the active span otherwise; its outcome
+   * labels it and its duration.
+   */
+  async runCodexTurnWithSession({ traceparent, ...turn }) {
+    const harness = this.requireHarness(turn.conversationId);
+    const labels = { "alasio.harness": harness.name };
+    const startedAt = performance.now();
+    let outcome = "failed";
+    activeTurns.add(1, labels);
+    let result;
+    try {
+      result = await inSpan("alasio.turn", {
+        parent: traceparent,
+        attributes: {
+          ...labels,
+          "alasio.conversation.id": turn.conversationId,
+          "telegram.chat.id": String(turn.chatId),
+          ...(turn.jobId ? { "alasio.prompt_job.id": turn.jobId } : {}),
+          ...(turn.existingSession ? { "alasio.session.id": turn.existingSession } : {}),
+        },
+      }, async (span) => {
+        try {
+          const settled = await this.runTurn(harness, turn);
+          outcome = settled.outcome;
+          return settled.result;
+        } finally {
+          span.setAttribute("alasio.turn.outcome", outcome);
+        }
+      });
+    } finally {
+      activeTurns.add(-1, labels);
+      turnDuration.record((performance.now() - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
+    }
+    if (outcome === "stopped") {
+      return result;
+    }
+    const queued = this.queuedMessages.get(turn.conversationId);
+    if (queued && queued.length > 0) {
+      this.queuedMessages.delete(turn.conversationId);
+      await this.runCodexTurn({
+        conversationId: turn.conversationId,
+        chatId: turn.chatId,
+        messageId: turn.messageId,
+        prompt: queued.join("\n\n---\n\n"),
+        traceparent: null,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * One turn through `harness`, from its status message to its reply: `{ outcome,
+   * result }`, where `result` is whether the response completed (undefined while
+   * alasio stops) and `outcome` one of completed, incomplete, interrupted, or stopped.
+   */
+  async runTurn(harness, { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }) {
     if (attachedTurn && !harness.supportsGoals) {
       throw new Error(`${harness.displayName} does not support attached goal turns.`);
     }
@@ -459,26 +534,17 @@ export class TurnController {
       } else {
         log.info(`Leaving active turn ${conversationId} for post-restart recovery because the service is stopping`);
       }
-      return;
+      return { outcome: "stopped", result: undefined };
     }
     if (newSessionId && !existingSession) {
       this.store.setSessionId(conversationId, newSessionId);
+      currentSpan().setAttribute("alasio.session.id", newSessionId);
     }
     if (interrupted) {
       await this.status.finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, harnessName: harness.displayName });
       this.store.clearActiveTurn(conversationId, pendingResponseId);
       this.store.clearRestartEvent(conversationId);
-      const queued = this.queuedMessages.get(conversationId);
-      if (queued && queued.length > 0) {
-        this.queuedMessages.delete(conversationId);
-        await this.runCodexTurn({
-          conversationId,
-          chatId,
-          messageId,
-          prompt: queued.join("\n\n---\n\n"),
-        });
-      }
-      return false;
+      return { outcome: "interrupted", result: false };
     }
     if (!responseCompleted) {
       await this.status.finishWithoutResponse({
@@ -500,17 +566,7 @@ export class TurnController {
         this.store.clearRestartEvent(conversationId);
       }
     }
-    const queued = this.queuedMessages.get(conversationId);
-    if (queued && queued.length > 0) {
-      this.queuedMessages.delete(conversationId);
-      await this.runCodexTurn({
-        conversationId,
-        chatId,
-        messageId,
-        prompt: queued.join("\n\n---\n\n"),
-      });
-    }
-    return responseCompleted;
+    return { outcome: responseCompleted ? "completed" : "incomplete", result: responseCompleted };
   }
 
   async flushCompletedResponses() {

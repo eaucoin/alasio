@@ -99,6 +99,14 @@ mindmap
       every Codex rollout file is mirrored into Neon byte for byte as the kernel reports each write to it and a Codex turn's reply is final only once its thread is in Neon and a thread alasio points at whose files this machine lacks is written back from Neon at startup and before it is resumed or forked with the files its history starts in
       Codex's session panels read the app-server's own thread and turn lists and rewind is Codex's own fork before a turn so alasio reads and writes none of Codex's formats
       Neon's safekeepers seaweedfs versioning and a daily local pg_dump survive crashes and lost service directories on this machine's one disk
+    Telemetry
+      alasio exports OpenTelemetry traces metrics and logs over OTLP to whatever backend the standard OTEL_* variables name and with no endpoint set it exports nothing and loads no SDK
+      OTEL_EXPORTER_OTLP_ENDPOINT in .env is all it takes and per-signal endpoints headers protocol OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES work as the OpenTelemetry specification says
+      a Telegram update is the root of a trace that the turn its prompt queues and the reply's delivery join however long the prompt waits and Telegram and Codex app-server calls Postgres queries bayma's check and session-host starts are spans in it
+      alasio's metrics cover turns by harness and outcome time to first output prompt waits reply delivery lag the outbox Bot API and app-server call latency the pg pool and the Node runtime
+      Claude Code and Codex export their own telemetry to the same place under their own service names Codex's traces continuing alasio's turn and Claude Code's carrying the conversation and found by session id
+      ALASIO_NEON_OTLP_ENDPOINT sends the Neon stack's metrics through a collector on the stack's own network to an endpoint that network reaches
+      alasio's spans and metrics carry ids rather than prompts or replies while its log lines are exported as written to the journal and each harness keeps prompts out of its telemetry unless the operator opts in through that harness's own settings such as OTEL_LOG_USER_PROMPTS for Claude Code or otel.log_user_prompt in Codex's config.toml
     Historical emphasis
       recent changes prioritized restart recovery, Codex-native compaction, and truthful status messaging
       service prompt/hook integration aims for deterministic operational handoffs

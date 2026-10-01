@@ -10,7 +10,8 @@ mindmap
       baymaLaunch is the harness-neutral command and each harness adapter turns it into its own MCP config shape
       each harness and conversation gets its own state directory under the alasio state directory because bayma leases a directory to one server process
       sessions are checkpointed stated explicitly so they always outlive a alasio restart
-      ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools
+      ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools as the span alasio.bayma.check
+      a bayma launch passes on only the environment its harness is given and that holds none of alasio's telemetry settings so none reach a REPL session
     Operator servers
       each harness also loads the MCP servers the operator configured for it on this machine just as it would in a terminal
       Claude Code loads user and project .mcp.json servers and claude.ai connectors and Codex loads $CODEX_HOME/config.toml servers and the apps connector

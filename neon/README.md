@@ -19,6 +19,7 @@ mindmap
       neon-control is the control plane a Node service in control/service.js that registers the safekeepers creates the tenant and timeline once writes the compute's spec and every thirty seconds rebuilds any safekeeper that lost its timeline from a healthy peer
       compute is Postgres with the neon extension started by compute_ctl from that spec holding the `alasio` database and role
       backup writes a pg_dump of the `alasio` database every day into backups and keeps the last fourteen
+      otel-collector runs only when ALASIO_NEON_OTLP_ENDPOINT is set which turns on the compose profile telemetry and scrapes every thirty seconds the Prometheus metrics the pageserver safekeepers storage controller storage broker compute_ctl and seaweedfs serve on the stack's network sending them as OTLP over HTTP to that endpoint as the stack's network reaches it with service.namespace alasio-neon and each service's name
     Security
       control/setup.js makes every secret once on first start under the alasio state directory and renders every service's configuration from them on every start
       the services authenticate to each other with EdDSA JWTs signed by one key whose private half only the host keeps in `neon/secrets` mode 0700
@@ -26,7 +27,7 @@ mindmap
       Neon writes to seaweedfs with credentials limited to the `neon` bucket and only the lifecycle setup uses the admin identity and the session filesystems write with a third identity limited to the `sessions` bucket
       the session-filesystem secrets are made here too the Valkey password which is its requirepass and a file the session hosts read and the `sessions` S3 key and secret as files the alasio process points its ALASIO_SANDBOX_S3_*_FILE knobs at
     State
-      everything lives under `<ALASIO_STATE_DIR>/neon` with secrets keys compose.env seaweedfs controller-db pageserver safekeeper-1 to 3 control backups and valkey
+      everything lives under `<ALASIO_STATE_DIR>/neon` with secrets keys compose.env seaweedfs controller-db pageserver safekeeper-1 to 3 control backups valkey and otel-collector.yaml mode 0600 since it can hold the telemetry backend's credentials
       control/bootstrap.json records the tenant the timeline and which safekeepers hold it at which generation and is what makes bootstrapping idempotent
       the stack shares the machine's disk and degrades as it fills: SeaweedFS stops accepting writes with less than 5 GiB free so layer uploads and WAL offload stall until space is freed while the pageserver past 80% use evicts local layers it can fetch again from S3 and a test stack from npm run test:neon needs a few GB of its own
       durability is one disk so the safekeeper quorum and S3 versioning survive process crashes and a lost service directory but not the loss of the machine's disk and backups are local too

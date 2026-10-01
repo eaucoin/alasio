@@ -3,7 +3,7 @@
 mindmap
   root((alasio source))
     Root entrypoint
-      config owns alasio environment loading and index starts Neon Codex's rollout mirror the Telegram Codex app and transcript search
+      config owns alasio environment loading and index starts telemetry before anything else loads and then main which starts Neon Codex's rollout mirror the Telegram Codex app and transcript search
       root stays intentionally thin so source domains do not collapse back into one flat namespace
     telegram/
       owns Bot API polling lifecycle authorization callbacks file downloads message projection Markdown-safe response rendering text splitting media-group buffering and durable outbox delivery
@@ -36,6 +36,9 @@ mindmap
       owns bringing up alasio's Neon stack from neon/compose.yml before the app starts and the pool alasio keeps to its compute
     workflow/
       owns the localhost hook server that receives CI wait notifications
+    telemetry/
+      owns OpenTelemetry for alasio configured from the standard OTEL_* variables alone the SDK started before the service loads and the spans calls and context hand-offs the rest of alasio records through
+      keeps alasio's own telemetry settings out of the harnesses' environments which get settings of their own from harness/claude/telemetry and codex/app-server/telemetry
     shared/
       owns cross-domain helpers for async timing file prompt suffixes duration text ids scoped logging and runtime constants
     Persistence

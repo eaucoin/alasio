@@ -1,4 +1,4 @@
-const SCHEMA_VERSION = "7";
+const SCHEMA_VERSION = "8";
 
 const SQLITE_SCHEMA_SQL = `
   create table if not exists bot_state (
@@ -159,6 +159,8 @@ const SQLITE_SCHEMA_SQL = `
     attempts integer not null default 0,
     available_at real not null,
     last_error text,
+    -- the W3C traceparent of the turn whose reply this is, so its delivery joins that trace
+    traceparent text,
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     sent_at text
   );
@@ -179,6 +181,9 @@ const SQLITE_SCHEMA_SQL = `
     upstream_started_at real,
     upstream_completed_at real,
     last_error text,
+    -- the W3C traceparent of the update that queued the prompt, so its turn joins that
+    -- trace however long it waits, restarts included
+    traceparent text,
     created_at real not null,
     started_at real,
     completed_at real,
@@ -212,6 +217,12 @@ export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) 
     }
     if (!promptJobColumns.has("harness")) {
       db.exec("alter table prompt_jobs add column harness text not null default 'codex'");
+    }
+    if (!promptJobColumns.has("traceparent")) {
+      db.exec("alter table prompt_jobs add column traceparent text");
+    }
+    if (!db.prepare("pragma table_info(telegram_outbox)").all().some((column) => column.name === "traceparent")) {
+      db.exec("alter table telegram_outbox add column traceparent text");
     }
     const conversationColumnInfo = db.prepare("pragma table_info(conversations)").all();
     const conversationColumns = new Set(conversationColumnInfo.map((column) => column.name));

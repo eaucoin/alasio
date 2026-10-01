@@ -19,6 +19,7 @@ import { COMPOSE_FILE, DEFAULT_BRIDGE, DEFAULT_COMPUTE_PORT, setupNeon } from ".
 import { NeonRolloutStore } from "../codex/rollouts/store.js";
 import { NeonSessionStore } from "../harness/claude/session-store.js";
 import { createLogger } from "../shared/log.js";
+import { inSpan, parseHeaders, signalHeaders } from "../telemetry/index.js";
 
 const log = createLogger("neon");
 const run = promisify(execFile);
@@ -42,9 +43,19 @@ export function composeCommand(layout, project = NEON_PROJECT) {
   return ["compose", "--project-name", project, "--file", COMPOSE_FILE, "--env-file", layout.composeEnv];
 }
 
+/**
+ * Where the stack's telemetry goes: `ALASIO_NEON_OTLP_ENDPOINT`, an OTLP/HTTP endpoint
+ * as the stack's own network reaches it (alasio's endpoint is as this machine reaches
+ * it), with the headers alasio's metrics go with; null for nowhere.
+ */
+export function neonTelemetry(env = process.env) {
+  const endpoint = env.ALASIO_NEON_OTLP_ENDPOINT?.trim();
+  return endpoint ? { endpoint, headers: parseHeaders(signalHeaders(env, "metrics")) } : null;
+}
+
 /** Pulls every image the stack runs, so its first start waits on none. */
 export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
-  const layout = setupNeon(stateDir, { bridgeName: neonBridgeName(project) });
+  const layout = setupNeon(stateDir, { bridgeName: neonBridgeName(project), otlp: neonTelemetry() });
   await run("docker", [...composeCommand(layout, project), "pull", "--quiet"], { maxBuffer: 16 * 1024 * 1024 });
 }
 
@@ -54,25 +65,34 @@ export async function pullNeon({ stateDir, project = NEON_PROJECT }) {
  * `project` and `computePort` exist for tests, which run their own stack.
  */
 export async function startNeon({ stateDir, project = NEON_PROJECT, computePort = DEFAULT_COMPUTE_PORT }) {
-  const layout = setupNeon(stateDir, { computePort, bridgeName: neonBridgeName(project) });
+  const otlp = neonTelemetry();
+  const layout = setupNeon(stateDir, { computePort, bridgeName: neonBridgeName(project), otlp });
   log.info(`bringing up ${project}`);
-  // --remove-orphans: a service no longer in compose.yml goes with the next start.
-  await run("docker", [...composeCommand(layout, project), "up", "--detach", "--wait", "--remove-orphans", "--wait-timeout", String(STACK_UP_TIMEOUT_SECONDS)], {
-    maxBuffer: 16 * 1024 * 1024,
+  const { pool, store, rollouts } = await inSpan("alasio.neon.start", { attributes: { "alasio.neon.project": project } }, async () => {
+    // --remove-orphans: a service no longer in compose.yml goes with the next start.
+    await run("docker", [...composeCommand(layout, project), "up", "--detach", "--wait", "--remove-orphans", "--wait-timeout", String(STACK_UP_TIMEOUT_SECONDS)], {
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (!otlp) {
+      // A service of a profile no longer on is left running by `up`; telemetry turned
+      // off stops its collector here.
+      await run("docker", [...composeCommand(layout, project), "--profile", "telemetry", "rm", "--stop", "--force", "otel-collector"]);
+    }
+    const pool = new pg.Pool({
+      connectionString: readFileSync(layout.databaseUrlFile, "utf8").trim(),
+      max: 8,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 30_000,
+    });
+    // An idle connection dies with the compute when it restarts; the pool
+    // replaces it on the next checkout.
+    pool.on("error", (error) => log.warn(`idle database connection lost: ${error.message}`));
+    const store = new NeonSessionStore(pool);
+    await store.ensureSchema();
+    const rollouts = new NeonRolloutStore(pool);
+    await rollouts.ensureSchema();
+    return { pool, store, rollouts };
   });
-  const pool = new pg.Pool({
-    connectionString: readFileSync(layout.databaseUrlFile, "utf8").trim(),
-    max: 8,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 30_000,
-  });
-  // An idle connection dies with the compute when it restarts; the pool
-  // replaces it on the next checkout.
-  pool.on("error", (error) => log.warn(`idle database connection lost: ${error.message}`));
-  const store = new NeonSessionStore(pool);
-  await store.ensureSchema();
-  const rollouts = new NeonRolloutStore(pool);
-  await rollouts.ensureSchema();
   log.info(`${project} is up`);
   return {
     pool,
