@@ -26,7 +26,7 @@ import { conversationTelemetryEnv, inSpan } from "../telemetry/index.js";
 export const BAYMA_SERVER_NAME = "bayma";
 
 export const BAYMA_IMAGE =
-  "ghcr.io/eaucoin/bayma:0.8.0@sha256:a2e321998792183579357a6ad5a84834c8b1f572420a323a5ab440d920705556";
+  "ghcr.io/eaucoin/bayma:0.9.0@sha256:97c6546fbb9c303d51f1010ea89eae413228ba4625a25a30bd25eac332178a35";
 
 /**
  * A server that follows one on the same state directory waits for it to
