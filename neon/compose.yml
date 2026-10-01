@@ -108,7 +108,8 @@ services:
       seaweedfs-init:
         condition: service_completed_successfully
 
-  # SeaweedFS runs lifecycle rules only when asked: a pass every six hours.
+  # SeaweedFS runs lifecycle rules only when asked: a pass every six hours. It
+  # deletes through the S3 server's gRPC port, its HTTP port plus 10000.
   seaweedfs-lifecycle:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
@@ -118,7 +119,7 @@ services:
     command:
       - |
         while :; do
-          printf 's3.lifecycle.run-shard -shards 0-15 -s3 seaweedfs:8333 -runtime 10m\n' | weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888
+          printf 's3.lifecycle.run-shard -shards 0-15 -s3 seaweedfs:18333 -runtime 10m\n' | weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888
           sleep 21600
         done
     depends_on:
