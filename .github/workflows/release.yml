@@ -8,8 +8,6 @@ on:
 permissions:
   contents: write
   packages: write
-  id-token: write
-  attestations: write
 
 env:
   REGISTRY: ghcr.io/eaucoin
@@ -52,21 +50,6 @@ jobs:
             # The next image's build needs the room this one took.
             docker image rm "$REGISTRY/$name:$VERSION" >/dev/null
           done
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/alasio
-          subject-digest: ${{ steps.images.outputs.alasio }}
-          push-to-registry: true
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/alasio-agent
-          subject-digest: ${{ steps.images.outputs.alasio_agent }}
-          push-to-registry: true
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/alasio-lake
-          subject-digest: ${{ steps.images.outputs.alasio_lake }}
-          push-to-registry: true
       - name: Pin the chart to the images just published, by digest
         env:
           ALASIO: ${{ steps.images.outputs.alasio }}
@@ -79,20 +62,13 @@ jobs:
             .images.lake.tag = strenv(VERSION) | .images.lake.digest = strenv(LAKE)
           ' charts/alasio/values.yaml
           git diff charts/alasio/values.yaml
-      - id: chart
-        name: Package and push the chart
+      - name: Package and push the chart
         run: |
           echo "${{ github.token }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
           helm dependency build charts/alasio
           helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
           helm package charts/alasio --destination dist
-          helm push "dist/alasio-$VERSION.tgz" "oci://$REGISTRY/charts" 2>&1 | tee push.log
-          echo "digest=$(grep -o 'sha256:[0-9a-f]\{64\}' push.log | head -1)" >>"$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.REGISTRY }}/charts/alasio
-          subject-digest: ${{ steps.chart.outputs.digest }}
-          push-to-registry: true
+          helm push "dist/alasio-$VERSION.tgz" "oci://$REGISTRY/charts"
       # Tolerates a re-run over an existing release.
       - run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
