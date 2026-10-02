@@ -73,11 +73,10 @@ kubectl --namespace alasio create secret generic alasio-telegram --from-literal=
 # single machine, is off there.
 placement=()
 if (( agents >= 2 )); then
-  node() { echo "k3d-$name-$1"; }
   placement=(
-    --set-string "neon.nodeSelector.kubernetes\\.io/hostname=$(node server-0)"
-    --set-string "sessions.nodeSelector.kubernetes\\.io/hostname=$(node agent-0)"
-    --set-string "alasio.nodeSelector.kubernetes\\.io/hostname=$(node agent-1)"
+    --set-string "neon.nodeSelector.kubernetes\\.io/hostname=k3d-$name-server-0"
+    --set-string "sessions.nodeSelector.kubernetes\\.io/hostname=k3d-$name-agent-0"
+    --set-string "alasio.nodeSelector.kubernetes\\.io/hostname=k3d-$name-agent-1"
     --set "host.enabled=false"
   )
 else
