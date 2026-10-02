@@ -9,7 +9,8 @@
     "start": "node ./src/index.js",
     "doctor:telegram": "node ./src/telegram/doctor.js",
     "test": "node --test test/*.test.js",
-    "test:neon": "node --test --test-timeout=1800000 neon/test/*.test.js",
+    "test:neon": "node --test --test-timeout=1800000 neon/test/stack.test.js",
+    "test:neon:kube": "node --test --test-concurrency=1 --test-timeout=1800000 neon/test/kube-stack.test.js",
     "lake": "node ./src/neon/lake-query.js"
   },
   "dependencies": {

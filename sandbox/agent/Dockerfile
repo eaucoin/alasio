@@ -5,6 +5,8 @@
 # bound from the session's JuiceFS volume at run time.
 ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.10.0@sha256:d06080edb45b4929173fd58cf1f56dd1d9b94b0aa40e243097a6030623d26d2a
 FROM ${BAYMA_IMAGE}
+LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
+      org.opencontainers.image.description="alasio's session sandboxes: bayma, run as the unprivileged agent"
 RUN usermod --login agent --home /home/agent --move-home ubuntu \
  && groupmod --new-name agent ubuntu \
  && mkdir -p /workspace /home/agent \

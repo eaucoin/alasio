@@ -3,6 +3,8 @@
 # base is glibc Debian because DuckDB's Node bindings are built for glibc. Built by
 # alasio as alasio-neon-lake:<revision of this directory> (src/neon/stack.js).
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
+LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
+      org.opencontainers.image.description="alasio's analytics lake: DuckLake loaded from alasio's Neon"
 
 WORKDIR /opt/lake
 COPY package.json package-lock.json ./
