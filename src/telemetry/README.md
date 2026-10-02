@@ -23,11 +23,11 @@ mindmap
     Children
       withoutTelemetry keeps alasio's OTEL_* settings and any TRACEPARENT from the environments of Claude Code Codex and bayma because they would relabel or redirect the harnesses' own telemetry and reach every command an agent runs
       each harness gets explicit settings of its own instead in its own dialect harness/claude/telemetry for Claude Code and codex/app-server/telemetry for Codex
-      conversationTelemetryEnv is the standard variables that have a process serving one conversation export each signal alasio exports labelled with the conversation which Claude Code's settings build on and mcp/bayma hands bayma through its MCP config
+      conversationTelemetryEnv is the standard variables that have a process serving one conversation export each signal alasio exports labelled with the conversation which Claude Code's settings build on and mcp/bayma sets in a folder conversation's bayma Sandbox
       sharedResourceAttributes passes the operator's deployment attributes on to the harnesses without service.name which is alasio's
-      forward exports OTLP requests something else encoded as they are to each signal's endpoint with its headers timeout compression and TLS files and retries them as OpenTelemetry's exporters retry so what alasio relays from session sandboxes goes where alasio's own telemetry goes and is sent as it is
+      forward exports OTLP requests something else encoded as they are to each signal's endpoint with its headers timeout compression and TLS files and retries them as OpenTelemetry's exporters retry so what sandbox/telemetry-receiver takes from session sandboxes goes where alasio's own telemetry goes and is sent as it is
       forward sends with tracing suppressed so alasio's HTTP instrumentation never traces an export and a signal alasio exports over gRPC is not forwarded because bayma exports over HTTP only
-      the Neon stack's collector is configured from ALASIO_NEON_OTLP_ENDPOINT because its endpoint is reached from the stack's own network see neon/README.md
+      the chart sets the standard variables for alasio from its telemetry values and configures the Neon stack's collector and compute_ctl from the same endpoint see charts/alasio/README.md and neon/README.md
 ```
 
 ## Preference Atlas

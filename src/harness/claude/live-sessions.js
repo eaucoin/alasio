@@ -395,7 +395,7 @@ export function createClaudeLiveSessions({
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
     // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
-    // own, launched by the CLI on Docker and a Sandbox of its own on Kubernetes.
+    // own, in a host-profile Sandbox of its own.
     const mcpServers = bayma
       ? undefined
       : claudeMcpServers(await folderBayma({ threadKey }));

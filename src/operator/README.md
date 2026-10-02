@@ -23,6 +23,7 @@ mindmap
       session-replies formats session and rewind listings for Telegram
       text owns truncation and compact command-list formatting
       restart-prompts owns synthetic continuation prompts after service restarts and names the harness that owned the interrupted turn
+      restart-prompts names alasio as the Kubernetes Deployment ALASIO_DEPLOYMENT in namespace ALASIO_NAMESPACE which the chart sets and states `kubectl -n <namespace> rollout restart deployment/<deployment>` as the documented restart rather than deleting alasio's pod
 ```
 
 ## Preference Atlas

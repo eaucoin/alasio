@@ -7,6 +7,9 @@ mindmap
       symlinks are followed before the containment check so a link that escapes the root is rejected
       listWorkspaceCandidates returns top level folders under the root with git repositories first and hidden entries skipped
       createWorkspace makes one git initialized folder directly under the root from a constrained name and refuses names that already exist
+    Kinds
+      kind parses the one working_directory string a conversation carries as a folder an absolute path in alasio's filesystem or a session filesystem the sentinel `sessionfs:<volumeId>` so every place that tells them apart asks it rather than testing the prefix
+      a folder is the machine's own only under the chart's host profile which mounts what the operator chose into alasio and sets ALASIO_WORKSPACE_ROOT from host.workspaceRoot when it is given
     Boundaries
       only turn-controller switchWorkspace and createWorkspace call the policy so every mounted folder passed to a harness came through it
       WORKING_DIRECTORY is operator configuration and is trusted as a pre-mount without going through the root check

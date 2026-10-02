@@ -28,7 +28,7 @@ mindmap
       flush mirrors one thread's files through the same queue and the Codex adapter awaits it before a turn's response is marked complete so any reply the operator can see is already in Neon
       a flush that fails or takes over five seconds is logged and the reply goes on without it rather than waiting on Neon
     Restore
-      restore writes back every file a thread alasio points at needs that this machine lacks byte for byte where it was with its modification time and through a partial file renamed into place
+      restore writes back every file a thread alasio points at needs that its Codex home lacks byte for byte where it was with its modification time and through a partial file renamed into place
       telegram/app restores every Codex thread alasio points at before any turn at startup and the Codex adapter restores a thread before it is resumed warmed or forked
       a file present here or present compressed is never touched and a thread nobody points at is never written back so deleting a thread locally sticks
       one file that cannot be written back is logged and the rest still are

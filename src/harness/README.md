@@ -20,6 +20,7 @@ mindmap
       with codexRollouts each turn's thread is flushed to Neon before the turn's response is marked complete through the runtime's beforeResponseComplete
     Claude Code adapter
       claude/runtime builds the Agent SDK options with bypassPermissions the claude_code system prompt preset and bayma added to the MCP servers Claude Code loads from the operator's configuration
+      claude/live-sessions gives a folder conversation's process its host bayma from mcp/bayma as an http MCP server once it answers and makes sure of a session filesystem's Sandbox before every turn since the process outlives turns and the Sandbox may have been suspended between them
       claude/live-sessions keeps one Claude Code process per conversation for as long as its session and model stay mounted and routes each result to the operator turn it names or to a turn Claude Code started itself
       claude/env hands Claude Code alasio's environment without alasio's telemetry settings and claude/telemetry gives the process its own each signal alasio exports with the conversation as a resource attribute
       claude/live-sessions starts each process outside the trace of the turn that starts it since the process outlives that turn so Claude Code's traces are its own and are found from a turn by session id
@@ -39,9 +40,9 @@ mindmap
     Reply instructions
       reply-instructions is what alasio tells every agent about its replies beyond the harness's own prompt how to show the operator an image or video with image syntax and a local path appended to Claude Code's system prompt and given to Codex as developer instructions after the operator's own
     Session filesystems
-      the registry hands each adapter the sandbox the session-filesystem Codex and its rollout mirror and a folder workspace runs exactly as before
-      a session-filesystem workspace's harness runs here in the workspace's harness directory an empty one of its own and reaches the workspace only through its bayma forward so every session api reads that directory's sessions and a thread's work starts the session host while lists goals and models do not
-      the Claude Code adapter keeps the operator's login and Claude home so resume the Neon mirror adoption and search work as ever and claude/sessionfs confines it with a tools allowlist of subagents web search and the task list no setting sources strict MCP config and bayma as the one MCP server since web fetch would reach this machine's loopback
+      the registry hands each adapter the sandbox the session-filesystem Codex and its rollout mirror and a folder workspace gets neither and runs in its folder with its conversation's host bayma
+      a session-filesystem workspace's harness runs in alasio in the workspace's harness directory an empty one of its own and reaches the workspace only through its Sandbox's bayma with the session's token so every session api reads that directory's sessions and a thread's work brings the Sandbox up while lists goals and models do not
+      the Claude Code adapter keeps alasio's login and Claude home so resume the Neon mirror adoption and search work as in a folder and claude/sessionfs confines it with a tools allowlist of subagents web search and the task list no setting sources strict MCP config and bayma as the one MCP server since web fetch would run in alasio's pod and reach its loopback
       the Codex adapter runs on the session-filesystem app-server codex/sessionfs with the workspace's bayma per thread and its rollouts mirrored from that app-server's own home
       workspace-instructions tells an agent in a session filesystem that its workspace is /workspace on an isolated machine reached through bayma and that its harness's directory holds nothing of its own
 ```

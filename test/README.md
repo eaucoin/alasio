@@ -11,11 +11,14 @@ mindmap
       codex runtime tests pin a turn's response marked complete only after beforeResponseComplete finishes
       codex session tests pin the session api's labels rewind points and unreadable threads and run the real app-server against a local stand-in for the Responses API with no login and no model through listing messages last answer and fork before a turn with its files mirrored from the start and exactly held after each turn's flush then lose the whole Codex home restore the fork and prove its next turn carries the history before the rewound turn and not after
       transcript tests pin writing a missing transcript back with its subagents and metadata leaving a local one alone and adoption importing a session whole then adding only what the mirror dropped
-      search tests pin passage extraction by rule from each entry shape the indexer's batches settled mark and deletion cascade and search by words trigrams kind weighting and filters against a throwaway Postgres and neon-setup tests pin the control revision
-      neon/test runs the same conformance cases on a real Neon stack and its crash disk-loss garbage-collection backup and point-in-time cases through `npm run test:neon`
-      bayma MCP tests pin the pinned-package launch per-harness per-conversation state directories the bayma entry each harness adds beside the operator's own servers and a real start of the installed bayma
-      sandbox telemetry tests run the real telemetry drain as a process and pin what it takes holds drops and greets each reader with and the relay reading it as agent-connect does through a stand-in OTLP server with resources stamped what does not parse dropped a frame after a lone greeting relayed a drain that comes back reread and a host without one given up on and otlp-resource tests stamp requests OpenTelemetry's own SDK and serializers made for every signal in both encodings and read them back with protobufjs as an independent decoder and telemetry-forward tests pin each signal's endpoint headers compression retries and timeout
-      lake tests run the real DuckDB the analytics lake runs against a throwaway Postgres written through alasio's own stores with the lake role's grants made as production makes them and pin typed entries kept whole messages counted once with their final usage tool calls paired with results deletions and late commits followed batches whole when a load is cut short JSON DuckDB cannot read kept and flagged rollout lines loaded as completed with rewrites moves and removals followed both Codex homes the model rebuilt on a version change maintenance recorded the loader's retries and health read-only queries and no reads with the lake off while neon-setup tests pin the lake's provisioning profile scrape target image revision and SeaweedFS recreated when its identities change
+      search tests pin passage extraction by rule from each entry shape the indexer's batches settled mark and deletion cascade and search by words trigrams kind weighting and filters against a throwaway Postgres
+      neon/test runs the same conformance cases on the chart's Neon in an installed release with its crash volume-loss garbage-collection backup point-in-time and lake cases through `npm run test:neon`
+      bayma MCP tests pin a folder conversation's bayma as a host Sandbox with its own state directory and telemetry one per harness and conversation none without the host profile and the http bayma entry each harness adds beside the operator's own servers
+      kube-sandboxes tests pin the deployment's templates checked at startup tokens naming their Sandbox and compared whole every Sandbox serving bayma with its token from a Secret it owns readiness only for the current generation ensure making resuming sharing and giving up with a reason a session's labels DNS egress gate and telemetry settings the egress gate against a reachable and an unreachable API server reading a session's files as its agent through exec and the receiver taking a session's OTLP with its token only rate-bounded and stamped
+      otlp-resource tests stamp requests OpenTelemetry's own SDK and serializers made for every signal in both encodings and read them back with protobufjs as an independent decoder and telemetry-forward tests pin each signal's endpoint headers compression retries and timeout
+      sandbox tests pin volume ids as DNS labels the two workspace kinds the session-filesystem Claude Code's tools and Codex home and each session's harness directory under the state directory
+      lake tests run the real DuckDB the analytics lake runs against a throwaway Postgres written through alasio's own stores with the lake role's grants made as production makes them and pin typed entries kept whole messages counted once with their final usage tool calls paired with results deletions and late commits followed batches whole when a load is cut short JSON DuckDB cannot read kept and flagged rollout lines loaded as completed with rewrites moves and removals followed both Codex homes the model rebuilt on a version change maintenance recorded the loader's retries and health read-only queries and no reads with the lake off
+      neon-setup tests pin the stack's setup configuration secrets made once and every service's rendered from them on each run a root predating a secret completed without losing the rest and an external object store's credentials used with no SeaweedFS identities made
       app-server protocol tests pin notification turn identity across direct nested and item-shaped payloads
       app-server request contracts pin gpt-5.6-sol with high reasoning for thread creation and turn execution
       queue tests assert stale interrupted-turn completions cannot clear or satisfy the active Telegram turn
@@ -41,14 +44,15 @@ mindmap
       goal-control tests assert active goal controls use the normal concurrent-turn decision surface while Codex is working
       session-control tests assert New Session callbacks create and mount fresh app-server sessions and rewind forks for the conversation and mounts the fork
       command parser tests pin Telegram-native slash forms for session and goal controls
-      restart command tests pin the wrapper and direct systemd command recognition used for restart provenance
-      systemd service tests pin descendant OOM containment together with main-process restart recovery
-      systemd service tests pin locked Alasio dependency installation before capability doctors and unit activation
-      systemd service tests pin the service's Node runtime OOM containment and restart provenance wiring
+      restart command tests pin a rollout restart of alasio's own Deployment however it is spelled the release's Deployment name other rollouts and commands left alone and a rollout of alasio among others as a near miss
+    Chart tests
+      `helm unittest charts/alasio` runs charts/alasio/tests whose alasio security and neon suites pin one alasio at a time its volume and templates the host profile sessions under gVisor or the default runtime Pod Security NetworkPolicies RBAC and Neon's rendering as charts/alasio/README.md describes
+    End to end
+      test/e2e/run.sh builds the images creates a k3d cluster with gVisor installs the chart with stand-ins for Telegram and OTLP and runs test/e2e/alasio.test.mjs then `npm run test:neon` as test/e2e/README.md describes
     Scope
       tests exercise alasio-local runtime behavior without booting Telegram polling or Codex subprocesses
       fixtures stay inline when the wire shape is the behavior under test
-      CI runs affected files through the built-in Node test API and preserves normalized target-plus-file evidence without substituting Bun semantics
+      `npm test` runs every test/*.test.js through node --test and needs no cluster while CI runs it the chart tests and the end-to-end run on demand
 ```
 
 ## Preference Atlas

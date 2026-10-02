@@ -19,7 +19,8 @@ mindmap
     Bot API
       client owns raw Telegram HTTP calls file downloads and message chunking
       client makes each Bot API call a client span named telegram slash its method that never carries the URL and with it the bot token and leaves the getUpdates long poll unmeasured since its length is Telegram's wait
-      client pins Node Bot API networking to IPv4-first without family autoselection because this host has no usable IPv6 route
+      client talks to Telegram's own Bot API server unless TELEGRAM_API_ROOT names another such as a self-hosted telegram-bot-api or the end-to-end tests' stand-in
+      client pins Node Bot API networking to IPv4-first without family autoselection so calls never wait on an IPv6 route the network lacks
       client also owns bot command and menu-button registration for the native session and goal control entrypoints
       client serializes outbound calls and honors Bot API retry-after responses
       markdown owns Telegram HTML rendering for Codex Markdown plus plaintext fallback safety

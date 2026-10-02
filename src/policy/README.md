@@ -5,7 +5,8 @@ mindmap
     Shell parsing
       shell-command owns quoted and single-token shell command unwrapping tokenization and executable resolution
     Runtime policies
-      restart-command detects self-restart commands and records provenance
+      restart-command recognises an agent restarting alasio as `kubectl rollout restart` of alasio's own Deployment ALASIO_DEPLOYMENT or alasio as deployment/name deploy/name or deployment name with kubectl by any path flags anywhere and one shell wrapper unwrapped and records it as self-induced provenance
+      a rollout restart that names alasio's Deployment among other targets is a near miss logged as a warning rather than recorded
       db-guardrail detects forbidden local database operations and returns recovery prompts
       workflow-wait detects CI workflow wait commands and emits hook notifications
 ```

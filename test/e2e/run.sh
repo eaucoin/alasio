@@ -17,7 +17,23 @@ port=5050
 work=$(mktemp -d)
 export KUBECONFIG=$work/kubeconfig
 
+# What the cluster was doing, when something did not come up.
+diagnose() {
+  echo "::group::cluster state"
+  kubectl get nodes -o wide || true
+  kubectl get pods --all-namespaces -o wide || true
+  kubectl get events --all-namespaces --sort-by=.lastTimestamp | tail -60 || true
+  for pod in $(kubectl get pods --all-namespaces --no-headers 2>/dev/null | awk '$3 !~ /^([0-9]+)\/\1$/ && $4 != "Completed" {print $1 "/" $2}'); do
+    echo "--- $pod"
+    kubectl --namespace "${pod%%/*}" describe pod "${pod#*/}" | tail -25 || true
+    kubectl --namespace "${pod%%/*}" logs "${pod#*/}" --all-containers --tail 40 || true
+  done
+  echo "::endgroup::"
+}
+
 cleanup() {
+  status=$?
+  [[ $status -ne 0 ]] && diagnose
   if [[ "${KEEP:-}" != 1 ]]; then
     k3d cluster delete "$name" >/dev/null 2>&1 || true
     k3d registry delete "k3d-$registry" >/dev/null 2>&1 || true
@@ -50,14 +66,10 @@ kubectl --namespace alasio create secret generic alasio-telegram --from-literal=
 images=k3d-$registry:$port
 helm dependency build "$root/charts/alasio" >/dev/null
 helm install alasio "$root/charts/alasio" --namespace alasio --wait --timeout 20m \
+  --values "$root/test/e2e/values.yaml" \
   --set-string "images.alasio.repository=$images/alasio,images.alasio.tag=e2e" \
   --set-string "images.agent.repository=$images/alasio-agent,images.agent.tag=e2e" \
-  --set-string "images.lake.repository=$images/alasio-lake,images.lake.tag=e2e" \
-  --set-string "alasio.telegram.existingSecret=alasio-telegram" \
-  --set-string "alasio.env.TELEGRAM_API_ROOT=http://telegram.alasio-test.svc:8081" \
-  --set-string "telemetry.otlpEndpoint=http://otlp.alasio-test.svc:4318" \
-  --set-string "neon.safekeepers.storage.size=2Gi,neon.pageserver.storage.size=5Gi" \
-  --set-string "objectStore.bundled.storage.size=10Gi,sessions.storage.size=1Gi"
+  --set-string "images.lake.repository=$images/alasio-lake,images.lake.tag=e2e"
 
 cd "$root"
 ALASIO_E2E_TELEMETRY=1 node --test --test-concurrency=1 --test-timeout=1800000 test/e2e/alasio.test.mjs

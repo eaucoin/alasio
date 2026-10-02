@@ -33,12 +33,12 @@ mindmap
     Transport boundary
       transport chooses app-server or exec execution without leaking that choice upward
       both transports disable Codex plugin loading at process startup while retaining repository user and built-in skills
-      thread-config owns the overrides every thread starts and resumes with which add bayma to the MCP servers in the operator's Codex config
+      thread-config owns the overrides every folder thread starts and resumes with which add the conversation's host bayma over HTTP with its bearer to the MCP servers in the operator's Codex config
       model selects gpt-5.6-sol with high reasoning for both app-server and exec transports so new resumed and steered continuation turns use one operator-selected authority
       app-server/ owns the long-lived stdio JSON-RPC process, thread RPCs, notification queue, and protocol mapping as separate concepts
       runtime runs every call against a scope cwd env config and client which it builds for a folder from the shared app-server and which a session filesystem's harness passes in
       sessionfs is Codex for session filesystems one app-server for all of them run here with a Codex home of alasio's own so none of the operator's configuration reaches an isolated workspace and with no environment at all so it registers no shell apply_patch or view_image by construction since thread resume and fork carry no environments field
-      its per-thread config gives the workspace's bayma forward as the bayma MCP server with the forward's bearer and alasio's instructions and a thread runs in the workspace's harness directory which keeps each workspace's threads apart
+      its per-thread config gives the session's Sandbox bayma as the bayma MCP server with the session's bearer token and alasio's instructions and a thread runs in the workspace's harness directory which keeps each workspace's threads apart
       login-relay is how that home uses the operator's Codex login without a copy that would refresh on its own and invalidate theirs a loopback relay taking only the app-server's bearer and the model API's paths and sending each request on with the login read fresh from the operator's auth.json a ChatGPT login to the Codex backend with its account id and an API key to the OpenAI API
       command-event-policy owns command-stream side effects such as restart provenance, workflow wait pings, and DB guardrail aborts
     Projection boundary

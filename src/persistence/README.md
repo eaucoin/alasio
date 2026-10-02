@@ -20,6 +20,7 @@ mindmap
       turns and prompt jobs record their admitting harness and restart recovery restores the session pointer of that harness
       callback actions capture expectedHarness beside expectedSessionId so panels rendered under one harness go stale after a switch
       schema version 5 adds the harness columns with additive alter-table migrations
+      a session filesystem is carried only as the `sessionfs:<volumeId>` working directory since its Sandbox keeps its own state and the schema drops any session_volumes table
     Repositories
       table-group repositories own callbacks conversations prompt jobs responses Telegram outbox restarts state Telegram content turns and usage
       repository names keep Sqlite where the storage adapter is part of the contract

@@ -14,9 +14,9 @@
  *   operator's login is used without being copied here.
  *
  * Per thread, sent with every start, resume, fork, and turn (Codex merges it over
- * config.toml): the workspace's bayma forward as the `bayma` MCP server, and alasio's
- * instructions. A thread runs in the workspace's harness directory on this machine,
- * which keeps each workspace's thread list apart.
+ * config.toml): the workspace's bayma, at its Sandbox with its token, as the `bayma` MCP
+ * server, and alasio's instructions. A thread runs in the workspace's harness directory
+ * in alasio, which keeps each workspace's thread list apart.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

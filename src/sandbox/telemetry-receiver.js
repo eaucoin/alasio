@@ -1,14 +1,14 @@
 /**
- * bayma's telemetry from session sandboxes on Kubernetes, received over OTLP/HTTP and
- * exported where alasio exports its own . A
- * sandbox's one permitted egress in "none" mode is this receiver's port on alasio's pod,
- * and bayma inside exports here directly with its Sandbox's token as the bearer.
+ * bayma's telemetry from session sandboxes, received over OTLP/HTTP and exported where
+ * alasio exports its own. A session's one permitted egress without internet is this
+ * receiver's port on alasio's pod, and bayma inside exports here directly with its
+ * Sandbox's token as the bearer.
  *
- * What arrives is untrusted, since anything in the sandbox can send it: the token says
- * which session sent it, each request's
- * resources are stamped with what alasio knows about that session in place of what they
- * say, a request that does not parse is dropped, and each session is held to a byte
- * rate, past which it is answered 429 so its exporter backs off and retries.
+ * What arrives is untrusted, since anything in the session can send it: the token says
+ * which session sent it, each request's resources are stamped with what alasio knows
+ * about that session in place of what they say, a request that does not parse is
+ * dropped, and each session is held to a byte rate, past which it is answered 429 so
+ * its exporter backs off and retries.
  */
 import { createServer } from "node:http";
 import { promisify } from "node:util";

@@ -3,17 +3,19 @@
 mindmap
   root((mcp))
     bayma
-      bayma is the MCP server alasio itself provides and serves Bun Python C# and Rust REPL sessions
-      it runs from its image pinned by digest as a container beside alasio's own through the host's Docker with the same user paths network and host tools as alasio's container
-      its container keeps its own processes so bayma snapshots idle REPL sessions as it stops and restores them whole in the next container
-      a bayma starting on a state directory waits for the one still stopping on it to finish its snapshots
-      baymaLaunch is the harness-neutral command and each harness adapter turns it into its own MCP config shape
-      each harness and conversation gets its own state directory under the alasio state directory because bayma leases a directory to one server process
-      sessions are checkpointed stated explicitly so they always outlive a alasio restart
-      ensureBaymaReady proves once per process against a throwaway state directory that bayma starts and lists tools as the span alasio.bayma.check
-      a bayma launch passes on the environment its harness is given which holds none of alasio's telemetry settings and adds as its MCP config's env the settings that have bayma export its own telemetry where alasio exports its labelled with the conversation which bayma itself keeps from its REPL sessions
+      bayma is the MCP server alasio itself provides and serves REPL sessions in the language runtimes its image carries
+      a session filesystem's bayma is its Sandbox's own which src/sandbox brings up and this module serves folder workspaces
+      a folder workspace's bayma is a Sandbox per conversation and harness in the host namespace made through kube/sandboxes from the deployment's host template the operator's opt-in to agents that work on the machine's own files
+      the host template runs bayma's own image pinned by digest as the operator's user in their home with what the operator mounts from the node and checkpointed durability with what it needs to snapshot its REPL sessions as it stops and restore them whole as it starts so they outlive its pod
+      alasio adds only what is per conversation bayma's state directory under the template's stateRoot keyed by harness and conversation and the conversation's telemetry settings
+      the state directory is keyed by harness as well as conversation because bayma leases it to one server and a Codex thread keeps its server alive after the conversation switches to Claude Code
+      the Sandbox is named bayma- and a hash of harness and conversation with the conversation in an annotation and the harness and workload folder in labels
+      folderBaymaServer resolves the server once it answers over its Service with the Sandbox's token as an http server with url and headers in Claude Code's MCP config shape and codex/thread-config turns it into Codex's
+      a deployment without the host profile has no folder bayma and a folder turn fails saying the deployment offers no folder workspaces
+      a harness waits up to a minute for bayma as it starts since a conversation's first turn makes its Sandbox and one that was suspended resumes restoring its REPL sessions
+      bayma exports its own telemetry where alasio exports labelled with the conversation from conversationTelemetryEnv which bayma itself keeps from its REPL sessions
     Operator servers
-      each harness also loads the MCP servers the operator configured for it on this machine just as it would in a terminal
+      each harness also loads the MCP servers configured for it in alasio's home just as it would in a terminal which under the host profile is the operator's own home
       Claude Code loads user and project .mcp.json servers and claude.ai connectors and Codex loads $CODEX_HOME/config.toml servers and the apps connector
       alasio does not copy servers between harnesses and does not check or isolate the operator's servers
 ```
@@ -23,28 +25,29 @@ mindmap
 sequenceDiagram
   participant Runtime as harness runtime
   participant Bayma as mcp/bayma
+  participant Kube as kube/sandboxes
   participant Harness as Codex or Claude Code
-  Runtime->>Bayma: ensure bayma is ready
-  Bayma->>Bayma: start bayma on a throwaway state directory and list its tools once per process
-  Runtime->>Bayma: launch command for this harness and conversation
+  Runtime->>Bayma: folderBaymaServer(harness, threadKey)
+  Bayma->>Kube: ensure the conversation's host Sandbox with its state directory and telemetry
+  Kube-->>Bayma: url and bearer once bayma answers
+  Bayma-->>Runtime: an http MCP server
   Runtime->>Harness: add bayma to the harness's own MCP configuration
-  Harness->>Bayma: start bayma on the conversation's own state directory
+  Harness->>Kube: MCP over HTTP to the Sandbox's Service with its token
 ```
 
 ## Avoidance Atlas
 ```mermaid
 stateDiagram-v2
   [*] --> MCPSetup
-  MCPSetup --> UnpinnedImage: bayma run from a tag without its digest or from anywhere but its image
+  MCPSetup --> UnpinnedImage: bayma run from a tag without its digest
   UnpinnedImage --> VersionDrift
-  MCPSetup --> SharedPidNamespace: bayma's container sharing the host's processes
-  SharedPidNamespace --> SnapshotsCannotRestore
-  MCPSetup --> SharedState: conversations share one bayma state directory
+  MCPSetup --> SharedState: conversations or harnesses share one bayma state directory
   SharedState --> LeaseConflict
-  MCPSetup --> EphemeralSessions: bayma launched with ephemeral durability
+  MCPSetup --> EphemeralSessions: folder bayma without checkpointed durability or the capabilities to snapshot
   EphemeralSessions --> SessionsLostOnRestart
-  MCPSetup --> PinnedBayma
-  PinnedBayma --> ReadyCheck
-  ReadyCheck --> ExplicitFailure: bayma does not start or lists no tools
-  ReadyCheck --> [*]
+  MCPSetup --> UnreadyServer: a harness given bayma before it answers
+  UnreadyServer --> SilentNoToolSession
+  MCPSetup --> SandboxPerConversation
+  SandboxPerConversation --> AnswersWithToken
+  AnswersWithToken --> [*]
 ```

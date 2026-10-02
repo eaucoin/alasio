@@ -3,10 +3,10 @@
  * string alasio already threads through conversations, parked sessions, and the harness
  * registry, so the whole of that plumbing keeps working unchanged:
  *
- * - a **folder**: an absolute host path (today's behaviour), a trusted session with the
- *   host's own access;
+ * - a **folder**: an absolute path on the machine the deployment's host profile mounts,
+ *   a trusted workspace with the operator's own access;
  * - a **session filesystem**: the sentinel `sessionfs:<volumeId>`, an empty isolated
- *   volume in a gVisor sandbox (see ../sandbox/ and session-fs-research).
+ *   volume in a sandboxed Sandbox of its own (see ../sandbox/).
  *
  * Every place that must tell them apart parses the string here rather than testing the
  * prefix itself, so the vocabulary lives in one module.

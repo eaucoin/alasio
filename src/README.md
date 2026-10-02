@@ -3,7 +3,7 @@
 mindmap
   root((alasio source))
     Root entrypoint
-      config owns alasio environment loading and index starts telemetry before anything else loads and then main which starts Neon Codex's rollout mirror the Telegram Codex app and transcript search
+      config owns alasio environment loading and index starts telemetry before anything else loads and then main which checks the deployment's workspace templates connects to Neon and starts Codex's rollout mirror the Telegram Codex app and transcript search
       root stays intentionally thin so source domains do not collapse back into one flat namespace
     telegram/
       owns Bot API polling lifecycle authorization callbacks file downloads message projection Markdown-safe response rendering text splitting media-group buffering and durable outbox delivery
@@ -31,9 +31,13 @@ mindmap
     policy/
       owns shell command parsing restart command recognition forbidden database command detection and workflow wait detection
     mcp/
-      owns bayma the MCP server alasio adds to each harness's own servers its image launch command per-conversation state directory and readiness check
+      owns bayma the MCP server alasio adds to each harness's own servers and in a folder workspace the host Sandbox per conversation and harness that serves it with its own state directory
+    kube/
+      owns alasio's one Kubernetes API client the workspace templates the chart renders and agent-sandbox Sandboxes with their bearer tokens which sandbox/ and mcp/ make workspaces from
+    sandbox/
+      owns session filesystems as Sandboxes confined by Pod Security NetworkPolicy DNS and an egress gate and the OTLP receiver that stamps and exports their bayma's telemetry
     neon/
-      owns bringing up alasio's Neon stack from neon/compose.yml before the app starts and the pool alasio keeps to its compute
+      owns the connection alasio keeps to the Neon its chart runs the lake's role and reads and `npm run lake` through kubectl exec
     workflow/
       owns the localhost hook server that receives CI wait notifications
     telemetry/
