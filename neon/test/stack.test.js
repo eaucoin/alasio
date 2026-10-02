@@ -145,20 +145,41 @@ function writer(table) {
   return { committed, stop: async () => ((stopping = true), await done) };
 }
 
-/** A pod of the stack's own, labelled so the stack's NetworkPolicy admits it, run to completion. */
-async function runPod(name, spec, { timeout = "300s" } = {}) {
-  const pod = {
+/** Applies `object`, as `kubectl apply` reads it. */
+async function apply(object) {
+  const child = spawn("kubectl", ["--namespace", NAMESPACE, "apply", "-f", "-"], { stdio: ["pipe", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(JSON.stringify(object));
+  const code = await new Promise((resolve) => child.on("exit", resolve));
+  if (code !== 0) throw new Error(`kubectl apply exited ${code}: ${stderr}`);
+}
+
+/**
+ * A pod of the stack's own, labelled so the stack's NetworkPolicy admits it, run to
+ * completion: its logs. One that fails, or does not finish within `timeoutMs`, fails
+ * with its logs and its last events.
+ */
+async function runPod(name, spec, { timeoutMs = 300_000 } = {}) {
+  await apply({
     apiVersion: "v1",
     kind: "Pod",
     metadata: { name, labels: { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon", "app.kubernetes.io/component": "neon-test" } },
     spec: { restartPolicy: "Never", securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } }, ...spec },
-  };
-  const child = spawn("kubectl", ["--namespace", NAMESPACE, "apply", "-f", "-"]);
-  child.stdin.end(JSON.stringify(pod));
-  await new Promise((resolve, reject) => child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`kubectl apply exited ${code}`)))));
+  });
   try {
-    await kubectl("wait", `pod/${name}`, "--for=jsonpath={.status.phase}=Succeeded", `--timeout=${timeout}`);
-    return await kubectl("logs", name, "--all-containers");
+    const deadline = Date.now() + timeoutMs;
+    let phase = "";
+    while (Date.now() < deadline && !["Succeeded", "Failed"].includes(phase)) {
+      await sleep(2000);
+      phase = (await kubectl("get", "pod", name, "-o", "jsonpath={.status.phase}")).trim();
+    }
+    const logs = await kubectl("logs", name, "--all-containers").catch((error) => error.message);
+    if (phase !== "Succeeded") {
+      const events = await kubectl("describe", "pod", name).catch(() => "");
+      throw new Error(`pod ${name} ended ${phase || "unstarted"}:\n${logs}\n${events.split("\n").slice(-15).join("\n")}`);
+    }
+    return logs;
   } finally {
     await kubectl("delete", "pod", name, "--wait=false").catch(() => {});
   }
@@ -279,8 +300,15 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
   test("backs alasio's database up to the object store, as a dump any Postgres restores", async () => {
     const job = `backup-${Date.now()}`;
     await kubectl("create", "job", job, `--from=cronjob/${neonName("backup")}`);
-    await kubectl("wait", `job/${job}`, "--for=condition=Complete", "--timeout=600s");
-    await kubectl("delete", "job", job, "--wait=false");
+    try {
+      await kubectl("wait", `job/${job}`, "--for=condition=Complete", "--timeout=600s");
+    } catch (error) {
+      const logs = await kubectl("logs", `job/${job}`, "--all-containers").catch(() => "");
+      const store = await kubectl("logs", `statefulset/${FULL}-seaweedfs`, "-c", "seaweedfs", "--tail=30").catch(() => "");
+      throw new Error(`${error.message}\n${logs}\nthe object store:\n${store}`);
+    } finally {
+      await kubectl("delete", "job", job, "--wait=false").catch(() => {});
+    }
     const s3 = (await kubectl("get", `cronjob/${neonName("backup")}`, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name==\"S3_ENDPOINT\")].value}")).trim();
     const bucket = (await kubectl("get", `cronjob/${neonName("backup")}`, "-o", "jsonpath={.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name==\"BUCKET\")].value}")).trim();
     const listing = await runPod(`restore-${Date.now()}`, {
@@ -335,9 +363,7 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     config.spec.safekeeper_connstrings = [];
     delete config.spec.safekeepers_generation;
     const name = `static-${Date.now()}`;
-    const child = spawn("kubectl", ["--namespace", NAMESPACE, "create", "configmap", name, "--from-file=config.json=/dev/stdin"]);
-    child.stdin.end(JSON.stringify(config));
-    await new Promise((resolve) => child.on("exit", resolve));
+    await apply({ apiVersion: "v1", kind: "ConfigMap", metadata: { name }, data: { "config.json": JSON.stringify(config) } });
     try {
       const count = await runPod(name, {
         securityContext: { fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },

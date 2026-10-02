@@ -73,7 +73,7 @@ spec:
             - -master.volumeSizeLimitMB=1024
             - -master.defaultReplication=000
             - -master.telemetry=false
-            - -volume.minFreeSpace=5GiB
+            - -volume.minFreeSpace={{ .Values.objectStore.bundled.minFreeSpace }}
             - -filer
             - -s3
             - -s3.config=/etc/seaweedfs/s3.json

@@ -67,10 +67,27 @@ kubectl --namespace alasio-test rollout status deployment/telegram-stub deployme
 kubectl create namespace alasio
 kubectl --namespace alasio create secret generic alasio-telegram --from-literal=token=123:e2e --from-literal=allowedUserIds=1001
 
+# On several nodes, each pulls the images its own pods run, so the heavy ones are placed
+# once each: Neon and its object store on the server, sessions on one agent and alasio on
+# another, which still crosses nodes everywhere alasio reaches. The host profile, for a
+# single machine, is off there.
+placement=()
+if (( agents >= 2 )); then
+  node() { echo "k3d-$name-$1"; }
+  placement=(
+    --set-string "neon.nodeSelector.kubernetes\\.io/hostname=$(node server-0)"
+    --set-string "sessions.nodeSelector.kubernetes\\.io/hostname=$(node agent-0)"
+    --set-string "alasio.nodeSelector.kubernetes\\.io/hostname=$(node agent-1)"
+    --set "host.enabled=false"
+  )
+else
+  export ALASIO_E2E_HOST=1
+fi
+
 images=k3d-$registry:$port
 helm dependency build "$root/charts/alasio" >/dev/null
 helm install alasio "$root/charts/alasio" --namespace alasio --wait --timeout 20m \
-  --values "$root/test/e2e/values.yaml" \
+  --values "$root/test/e2e/values.yaml" "${placement[@]}" \
   --set-string "images.alasio.repository=$images/alasio,images.alasio.tag=e2e" \
   --set-string "images.agent.repository=$images/alasio-agent,images.agent.tag=e2e" \
   --set-string "images.lake.repository=$images/alasio-lake,images.lake.tag=e2e"

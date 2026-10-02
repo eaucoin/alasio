@@ -39,6 +39,8 @@ neon:
 objectStore:
   bundled:
     storage: { size: 10Gi }
+    # A runner's disk is mostly images; the store needs only a little of what is left.
+    minFreeSpace: 1GiB
     resources: { requests: { cpu: 20m, memory: 128Mi } }
 lake:
   resources: { requests: { cpu: 20m, memory: 256Mi } }

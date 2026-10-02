@@ -248,6 +248,7 @@
             "enabled": { "type": "boolean" },
             "image": { "$ref": "#/definitions/image" },
             "storage": { "$ref": "#/definitions/storage" },
+            "minFreeSpace": { "type": "string", "pattern": "^[0-9]+(KiB|MiB|GiB|TiB)$" },
             "resources": { "$ref": "#/definitions/resources" }
           }
         },

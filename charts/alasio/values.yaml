@@ -293,6 +293,9 @@ objectStore:
     storage:
       size: 100Gi
       storageClassName: ""
+    # The disk it leaves free: below this it writes nothing new, so the volume it shares
+    # never fills.
+    minFreeSpace: 5GiB
     resources:
       requests:
         cpu: 100m

@@ -185,15 +185,13 @@ describe("alasio on Kubernetes", { skip }, () => {
     assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
   });
 
-  test("a folder conversation's bayma works on the machine as the operator, in their home", async () => {
+  test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !process.env.ALASIO_E2E_HOST && "the release has no host profile" }, async () => {
     const { url, seen } = await inAlasio("./folder-bayma.mjs");
     assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
     assert.deepEqual(seen, { uid: 1000, home: "/work" });
-    // One node shares its /tmp between alasio and the folder's bayma, as a machine does.
-    if (process.env.AGENTS === "0" || !process.env.AGENTS) {
-      const proof = await kubectl(NAMESPACE, "exec", `deployment/${FULL}`, "-c", "alasio", "--", "cat", "/work/e2e-folder-proof");
-      assert.equal(proof, "written by 1000");
-    }
+    // The node's /tmp is shared between alasio and the folder's bayma, as a machine's is.
+    const proof = await kubectl(NAMESPACE, "exec", `deployment/${FULL}`, "-c", "alasio", "--", "cat", "/work/e2e-folder-proof");
+    assert.equal(proof, "written by 1000");
   });
 
   test("alasio comes back from a rollout restart with its conversation's workspace", async () => {
