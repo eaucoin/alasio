@@ -51,6 +51,9 @@ services:
       - -s3.autoCreateBucket=false
       # Prometheus metrics, for the telemetry collector below.
       - -metricsPort=9327
+    environment:
+      # Recreates SeaweedFS when its S3 identities change: it reads them only as it starts.
+      ALASIO_NEON_S3_REVISION: ${ALASIO_NEON_S3_REVISION}
     volumes:
       - ${ALASIO_NEON_DIR}/seaweedfs/data:/data
       - ${ALASIO_NEON_DIR}/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -377,6 +380,59 @@ services:
       timeout: 5s
       retries: 60
       start_period: 20s
+
+  # The analytics lake (lake/README.md), run only when ALASIO_LAKE_ENABLED is set (setup.js
+  # turns this profile on): Claude Code's transcripts and Codex's rollouts, loaded from
+  # the compute into DuckLake, its catalog in the compute's `lake` database and its
+  # Parquet files in the `lake` bucket. lake-init makes the bucket, idempotently,
+  # unversioned since DuckLake never changes a file it wrote.
+  lake-init:
+    image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    profiles: [lake]
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: "no"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        shell() { printf '%s\n' "$1" | weed shell -master=seaweedfs:9333 -filer=seaweedfs:8888; }
+        shell 's3.bucket.list' | grep -qw lake || shell 's3.bucket.create -name lake'
+
+  # The lake's loader, built from lake/ by alasio (src/neon/stack.js) and tagged with the
+  # revision of what it is built from, so a change to it is a new image; never pulled.
+  lake:
+    image: ${ALASIO_NEON_LAKE_IMAGE}
+    build: ./lake
+    pull_policy: never
+    profiles: [lake]
+    user: "${ALASIO_NEON_UID}:${ALASIO_NEON_GID}"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 1536m
+    environment:
+      LAKE_DATABASE_HOST: compute
+      LAKE_DATABASE_PORT: "55433"
+      LAKE_DATABASE_PASSWORD: ${LAKE_DATABASE_PASSWORD}
+      LAKE_DATA_PATH: s3://lake/
+      LAKE_S3_ENDPOINT: http://seaweedfs:8333
+      LAKE_S3_KEY: ${LAKE_S3_ACCESS_KEY}
+      LAKE_S3_SECRET: ${LAKE_S3_SECRET_KEY}
+      HOME: /tmp
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+      compute:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9464/healthz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
 
   # The stack's telemetry, run only when ALASIO_NEON_OTLP_ENDPOINT gives it somewhere to
   # go (setup.js turns this profile on): it scrapes the Prometheus metrics every Neon

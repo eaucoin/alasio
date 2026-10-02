@@ -1,8 +1,8 @@
 /**
  * alasio's Neon, as alasio runs it: a throwaway stack brought up from nothing
- * through startNeon, then crashed, restarted, and made to lose a disk, with
- * nothing committed lost. Needs Docker and the stack's images; slow (about
- * ten minutes). `npm run test:neon`.
+ * through startNeon, with the analytics lake on, then crashed, restarted, and
+ * made to lose a disk, with nothing committed lost. Needs Docker and the stack's
+ * images; slow (about ten minutes). `npm run test:neon`.
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -61,9 +61,13 @@ async function up() {
   }
 }
 
-async function start() {
-  await neon?.close();
-  neon = await startNeon({ stateDir, project, computePort });
+/** Starts alasio's side of the stack, with the analytics lake on as alasio runs it here. */
+async function start({ lake = true } = {}) {
+  // Forgotten before it is closed, so a start that fails leaves nothing to close twice.
+  const previous = neon;
+  neon = null;
+  await previous?.close();
+  neon = await startNeon({ stateDir, project, computePort, lake });
 }
 
 /** A query on a connection of its own, which survives the stack restarting. */
@@ -145,8 +149,10 @@ before(async () => {
 });
 
 after(async () => {
-  await neon?.close();
-  if (!skip) await compose("down", "--volumes", "--remove-orphans").catch(() => {});
+  // Whatever state the tests left, the throwaway stack goes.
+  await neon?.close().catch(() => {});
+  // Every profile's services, the lake's included whether or not the last start turned it on.
+  if (!skip) await compose("--profile", "*", "down", "--volumes", "--remove-orphans").catch(() => {});
   rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -310,6 +316,82 @@ describe("alasio's Neon stack", { skip }, () => {
     } finally {
       await run("docker", ["rm", "--force", "--volumes", name]).catch(() => {});
       rmSync(specDir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A read-only query of the lake, run in its container as `npm run lake` runs one. */
+async function lakeQuery(sql) {
+  const { stdout } = await run("docker", ["exec", container("lake"), "node", "src/query.js", "--format", "json", sql], { maxBuffer: 64 * 1024 * 1024 });
+  return stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+/** Waits until `check` holds, a load of the lake being what makes it so. */
+async function untilLoaded(check, what) {
+  const deadline = Date.now() + 180_000;
+  let last;
+  while (Date.now() < deadline) {
+    last = await check().catch((error) => error);
+    if (last === true) return;
+    await sleep(2000);
+  }
+  assert.fail(`the lake never ${what}: ${last instanceof Error ? last.message : last}`);
+}
+
+describe("alasio's analytics lake", { skip }, () => {
+  const KEY = { projectKey: "-stack-test", sessionId: "22222222-2222-4222-8222-222222222222" };
+  const entry = (n) => ({ type: "user", uuid: `stack-${n}`, timestamp: new Date(1790000000000 + n).toISOString(), message: { role: "user", content: `entry ${n}` } });
+  const sourceCount = async () => (await query("select count(*)::int as n from claude_sessions.entries"))[0].n;
+  const lakeCounts = async () => (await lakeQuery("select count(*) as n, count(distinct seq) as seqs from claude.entries"))[0];
+
+  test("loads what alasio's stores hold, as it starts and as it runs", async () => {
+    await neon.store.append(KEY, Array.from({ length: 50 }, (_, n) => entry(n)));
+    const line = `${JSON.stringify({ timestamp: new Date().toISOString(), type: "session_meta", payload: { id: "thread-s" } })}\n`;
+    await neon.rollouts.save(
+      { name: "rollout-stack.jsonl", path: "sessions/rollout-stack.jsonl", threadId: "thread-s", rolloutId: "thread-s", historyBase: null, size: Buffer.byteLength(line), headDigest: "h", modifiedMs: Date.now() },
+      { start: 0, bytes: Buffer.from(line) },
+    );
+    await run("docker", ["restart", container("lake")]); // a load as it starts
+    const expected = await sourceCount();
+    await untilLoaded(async () => Number((await lakeCounts()).n) === expected, `held all ${expected} entries`);
+    assert.deepEqual(await lakeQuery("select type, thread_id from codex.lines"), [{ type: "session_meta", thread_id: "thread-s" }]);
+  });
+
+  test("keeps every entry exactly once through its loader being killed mid-load", async () => {
+    await neon.store.append(KEY, Array.from({ length: 20_000 }, (_, n) => entry(1000 + n)));
+    await run("docker", ["restart", container("lake")]);
+    await sleep(1500);
+    await run("docker", ["kill", "--signal", "KILL", container("lake")]);
+    await up();
+    const expected = await sourceCount();
+    await untilLoaded(async () => {
+      const { n, seqs } = await lakeCounts();
+      return Number(n) === expected && Number(seqs) === expected;
+    }, `held each of ${expected} entries exactly once`);
+  });
+
+  test("answers queries read-only", async () => {
+    await assert.rejects(lakeQuery("delete from claude.entries"), /read-only|read only/iu);
+    assert.ok(Number((await lakeCounts()).n) > 0);
+  });
+
+  test("turned off, stops, and its role reads none of alasio's data", async () => {
+    await start({ lake: false });
+    try {
+      const { stdout } = await compose("--profile", "lake", "ps", "--all", "--format", "{{.Service}}", "lake");
+      assert.equal(stdout.trim(), "");
+      const password = JSON.parse(readFileSync(layout.secretsFile, "utf8")).lakePassword;
+      const lake = new pg.Client({ host: "127.0.0.1", port: computePort, user: "lake", password, database: "alasio" });
+      await lake.connect();
+      try {
+        // A member of no role, so not of neon_superuser, which reads every table.
+        assert.deepEqual(await query("select count(*)::int as n from pg_auth_members where member = 'lake'::regrole"), [{ n: 0 }]);
+        await assert.rejects(lake.query("select count(*) from claude_sessions.entries"), /permission denied/u);
+      } finally {
+        await lake.end();
+      }
+    } finally {
+      await start();
     }
   });
 });

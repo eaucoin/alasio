@@ -99,6 +99,7 @@ mindmap
       every Codex rollout file is mirrored into Neon byte for byte as the kernel reports each write to it and a Codex turn's reply is final only once its thread is in Neon and a thread alasio points at whose files this machine lacks is written back from Neon at startup and before it is resumed or forked with the files its history starts in
       Codex's session panels read the app-server's own thread and turn lists and rewind is Codex's own fork before a turn so alasio reads and writes none of Codex's formats
       Neon's safekeepers seaweedfs versioning and a daily local pg_dump survive crashes and lost service directories on this machine's one disk
+      with ALASIO_LAKE_ENABLED=1 an analytics lake on the same stack holds every Claude Code transcript entry and Codex rollout line as typed rows in DuckLake whose compute is stateless and whose catalog and files live in the stack's compute and SeaweedFS and `npm run lake -- "<SQL>"` queries it read-only as neon/lake/README.md describes
     Telemetry
       alasio exports OpenTelemetry traces metrics and logs over OTLP to whatever backend the standard OTEL_* variables name and with no endpoint set it exports nothing and loads no SDK
       OTEL_EXPORTER_OTLP_ENDPOINT in .env is all it takes and per-signal endpoints headers protocol OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES work as the OpenTelemetry specification says

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { generateKeyPair } from "../neon/control/jwt.js";
-import { controlRevision, DEFAULT_BRIDGE, neonLayout, setupNeon } from "../neon/control/setup.js";
+import { controlRevision, DEFAULT_BRIDGE, lakeRevision, neonLayout, setupNeon } from "../neon/control/setup.js";
 import { NEON_PROJECT, neonBridgeName, neonTelemetry } from "../src/neon/stack.js";
 
 function withDir(fn) {
@@ -74,6 +74,7 @@ test("a deployment made before a secret existed gains it on the next setup, keep
     setupNeon(dir);
     const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
     assert.ok(secrets.s3.sessions.accessKey && secrets.sandboxMetadataPassword); // gained
+    assert.ok(secrets.s3.lake.accessKey && secrets.lakePassword);
     assert.deepEqual(secrets.s3.neon, old.s3.neon); // kept
     assert.equal(secrets.alasioPassword, "q");
     assert.equal(secrets.tenantId, "t");
@@ -106,5 +107,63 @@ test("the stack's telemetry collector runs only with an endpoint, and is recreat
 
     setupNeon(dir, { otlp: { endpoint: "http://elsewhere:4318", headers: {} } });
     assert.notEqual(readFileSync(layout.composeEnv, "utf8").match(/^ALASIO_NEON_TELEMETRY_REVISION='(\w+)'$/m)[1], revision);
+  });
+});
+
+const envValue = (layout, name) => readFileSync(layout.composeEnv, "utf8").match(new RegExp(`^${name}='(.*)'$`, "m"))?.[1];
+
+test("the analytics lake's role, database password, and storage identity exist whether or not it runs", () => {
+  withDir((dir) => {
+    const layout = setupNeon(dir);
+    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
+    const s3 = JSON.parse(readFileSync(join(layout.seaweedfs, "s3.json"), "utf8"));
+    const lake = s3.identities.find((identity) => identity.name === "lake");
+    assert.deepEqual(lake.actions, ["Read:lake", "List:lake", "Tagging:lake", "Write:lake"]); // its bucket alone
+    assert.deepEqual(lake.credentials, [secrets.s3.lake]);
+    assert.equal(envValue(layout, "LAKE_DATABASE_PASSWORD"), secrets.lakePassword);
+    assert.equal(envValue(layout, "LAKE_S3_ACCESS_KEY"), secrets.s3.lake.accessKey);
+    assert.equal(envValue(layout, "LAKE_S3_SECRET_KEY"), secrets.s3.lake.secretKey);
+    assert.match(envValue(layout, "ALASIO_NEON_LAKE_IMAGE"), /^alasio-neon-lake:[0-9a-f]{16}$/);
+    assert.equal(envValue(layout, "COMPOSE_PROFILES"), ""); // but it does not run
+  });
+});
+
+test("the lake runs only when on, its metrics scraped with the stack's", () => {
+  withDir((dir) => {
+    const layout = setupNeon(dir, { lake: true });
+    assert.equal(envValue(layout, "COMPOSE_PROFILES"), "lake");
+    setupNeon(dir, { lake: true, otlp: { endpoint: "http://collector:4318", headers: {} } });
+    assert.equal(envValue(layout, "COMPOSE_PROFILES"), "telemetry,lake");
+    const config = JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8"));
+    const jobs = Object.fromEntries(config.receivers.prometheus.config.scrape_configs.map((job) => [job.job_name, job.static_configs[0].targets]));
+    assert.deepEqual(jobs.lake, ["lake:9464"]);
+    setupNeon(dir, { otlp: { endpoint: "http://collector:4318", headers: {} } });
+    assert.equal(JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8")).receivers.prometheus.config.scrape_configs.some((job) => job.job_name === "lake"), false);
+  });
+});
+
+test("the lake's image revision changes with what it is built from, and only with it", () => {
+  withDir((dir) => {
+    mkdirSync(join(dir, "src"));
+    for (const name of ["Dockerfile", ".dockerignore", "package.json", "package-lock.json", "src/service.js"]) writeFileSync(join(dir, name), name);
+    const before = lakeRevision(dir);
+    writeFileSync(join(dir, "README.md"), "not built from");
+    assert.equal(lakeRevision(dir), before);
+    writeFileSync(join(dir, "src", "service.js"), "changed");
+    assert.notEqual(lakeRevision(dir), before);
+  });
+});
+
+test("SeaweedFS is recreated when its S3 identities change, and only then", () => {
+  withDir((dir) => {
+    const layout = setupNeon(dir);
+    const revision = envValue(layout, "ALASIO_NEON_S3_REVISION");
+    setupNeon(dir, { lake: true });
+    assert.equal(envValue(layout, "ALASIO_NEON_S3_REVISION"), revision);
+    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
+    secrets.s3.lake.secretKey = "rotated";
+    writeFileSync(layout.secretsFile, JSON.stringify(secrets));
+    setupNeon(dir);
+    assert.notEqual(envValue(layout, "ALASIO_NEON_S3_REVISION"), revision);
   });
 });

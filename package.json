@@ -9,7 +9,8 @@
     "start": "node ./src/index.js",
     "doctor:telegram": "node ./src/telegram/doctor.js",
     "test": "node --test test/*.test.js",
-    "test:neon": "node --test --test-timeout=1800000 neon/test/*.test.js"
+    "test:neon": "node --test --test-timeout=1800000 neon/test/*.test.js",
+    "lake": "node ./src/neon/lake-query.js"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.280",
@@ -33,6 +34,7 @@
     "fast-uri": "3.1.4"
   },
   "devDependencies": {
+    "@duckdb/node-api": "1.5.6-r.1",
     "@opentelemetry/otlp-transformer": "^0.222.0",
     "@opentelemetry/sdk-logs": "^0.222.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",

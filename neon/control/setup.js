@@ -31,6 +31,10 @@ export const BUCKET = "neon";
 // and reach both by service name; the secrets below are materialised as files the alasio
 // process points its ALASIO_SANDBOX_*_FILE knobs at (see src/sandbox/config.js).
 export const BUCKET_SESSIONS = "sessions";
+// The analytics lake (neon/lake/README.md) keeps its Parquet files in a bucket of its
+// own, and its catalog in a database of its own on the compute, both as role `lake`,
+// which alasio makes (src/neon/lake.js) with the password made here.
+export const BUCKET_LAKE = "lake";
 export const DEFAULT_COMPUTE_PORT = 55433;
 // The Linux bridge the stack's network gets, named rather than Docker's br-<id> so host
 // tooling and firewall rules can name the interface the stack and its session hosts
@@ -40,6 +44,7 @@ export const DEFAULT_BRIDGE = "alasio-neon0";
 
 const CONTROL_DIR = dirname(fileURLToPath(import.meta.url));
 export const COMPOSE_FILE = resolve(CONTROL_DIR, "..", "compose.yml");
+const LAKE_DIR = resolve(CONTROL_DIR, "..", "lake");
 
 /** Where the stack keeps everything, under alasio's state directory. */
 export function neonLayout(stateDir) {
@@ -63,6 +68,7 @@ export function neonLayout(stateDir) {
     sandboxMetadataPasswordFile: join(root, "secrets", "sandbox-metadata-password"),
     sandboxS3KeyFile: join(root, "secrets", "sandbox-s3-key"),
     sandboxS3SecretFile: join(root, "secrets", "sandbox-s3-secret"),
+    lakePasswordFile: join(root, "secrets", "lake-database-password"),
     otelCollectorConfig: join(root, "otel-collector.yaml"),
   };
 }
@@ -77,17 +83,21 @@ const SCRAPE_TARGETS = {
   seaweedfs: ["seaweedfs:9327"],
 };
 
+/** The lake's metrics, scraped too while it runs. */
+const LAKE_SCRAPE_TARGET = { lake: ["lake:9464"] };
+
 /**
  * The telemetry collector's configuration (JSON, which is YAML): each service's
  * Prometheus metrics, scraped every 30s, sent to `otlp.endpoint` as OTLP over HTTP
  * with `otlp.headers`.
  */
-function collectorConfig(otlp) {
+function collectorConfig(otlp, { lake }) {
+  const jobs = { ...SCRAPE_TARGETS, ...(lake ? LAKE_SCRAPE_TARGET : {}) };
   return {
     receivers: {
       prometheus: {
         config: {
-          scrape_configs: Object.entries(SCRAPE_TARGETS).map(([job, targets]) => ({
+          scrape_configs: Object.entries(jobs).map(([job, targets]) => ({
             job_name: job,
             scrape_interval: "30s",
             static_configs: [{ targets }],
@@ -146,15 +156,18 @@ function ensureSecrets(layout) {
       neon: { accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() },
       admin: { accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() },
       sessions: { accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() },
+      lake: { accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() },
     }),
     controllerDbPassword: () => secret(),
     alasioPassword: () => secret(),
     sandboxMetadataPassword: () => secret(),
+    lakePassword: () => secret(),
   };
   const s3Makers = {
     neon: () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() }),
     admin: () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() }),
     sessions: () => ({ accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() }),
+    lake: () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() }),
   };
   const existing = existsSync(layout.secretsFile) ? JSON.parse(readFileSync(layout.secretsFile, "utf8")) : {};
   let changed = false;
@@ -164,7 +177,7 @@ function ensureSecrets(layout) {
       changed = true;
     }
   }
-  // s3 gained a member (sessions) after some deployments were made; backfill within it.
+  // s3 gained members (sessions, lake) after some deployments were made; backfill within it.
   for (const [name, make] of Object.entries(s3Makers)) {
     if (existing.s3[name] === undefined) {
       existing.s3[name] = make();
@@ -202,8 +215,37 @@ export function controlRevision(dir = CONTROL_DIR) {
   return hash.digest("hex").slice(0, 16);
 }
 
+/** What the lake's image is built from, relative to its directory. */
+function lakeImageInputs(dir) {
+  return [
+    "Dockerfile",
+    ".dockerignore",
+    "package.json",
+    "package-lock.json",
+    ...readdirSync(join(dir, "src")).filter((file) => file.endsWith(".js")).sort().map((file) => `src/${file}`),
+  ];
+}
+
+/**
+ * A digest of what the lake's image is built from. The image is tagged with it
+ * (alasio-neon-lake:<revision>), so a change to the lake builds a new image and
+ * compose replaces the running one with it.
+ */
+export function lakeRevision(dir = LAKE_DIR) {
+  const hash = createHash("sha256");
+  for (const name of lakeImageInputs(dir)) {
+    hash.update(name).update("\0").update(readFileSync(join(dir, name))).update("\0");
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+/** The lake's image, as compose names it. */
+export function lakeImage(dir = LAKE_DIR) {
+  return `alasio-neon-lake:${lakeRevision(dir)}`;
+}
+
 /** Renders every service's configuration from the secrets. */
-function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
+function renderConfig(layout, secrets, { computePort, bridgeName, otlp, lake }) {
   const privateKeyPem = readFileSync(layout.privateKey, "utf8");
   const token = (scope, tenantId) => signToken(privateKeyPem, scope, tenantId);
 
@@ -231,6 +273,11 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
             name: "sessions",
             credentials: [secrets.s3.sessions],
             actions: [`Read:${BUCKET_SESSIONS}`, `List:${BUCKET_SESSIONS}`, `Tagging:${BUCKET_SESSIONS}`, `Write:${BUCKET_SESSIONS}`],
+          },
+          {
+            name: "lake",
+            credentials: [secrets.s3.lake],
+            actions: [`Read:${BUCKET_LAKE}`, `List:${BUCKET_LAKE}`, `Tagging:${BUCKET_LAKE}`, `Write:${BUCKET_LAKE}`],
           },
         ],
       },
@@ -285,17 +332,22 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
   writePrivate(layout.sandboxMetadataPasswordFile, secrets.sandboxMetadataPassword);
   writePrivate(layout.sandboxS3KeyFile, secrets.s3.sessions.accessKey);
   writePrivate(layout.sandboxS3SecretFile, secrets.s3.sessions.secretKey);
+  // The lake's database password, as a file alasio sets role `lake`'s password from.
+  writePrivate(layout.lakePasswordFile, secrets.lakePassword);
 
   // The telemetry collector runs only with somewhere to send to; its configuration can
   // hold the backend's credentials (headers), so it is private.
-  const collector = otlp ? JSON.stringify(collectorConfig(otlp), null, 2) + "\n" : null;
+  const collector = otlp ? JSON.stringify(collectorConfig(otlp, { lake }), null, 2) + "\n" : null;
   if (collector) {
     writePrivate(layout.otelCollectorConfig, collector);
   }
 
   const env = {
-    COMPOSE_PROFILES: collector ? "telemetry" : "",
+    COMPOSE_PROFILES: [collector && "telemetry", lake && "lake"].filter(Boolean).join(","),
     ALASIO_NEON_TELEMETRY_REVISION: collector ? createHash("sha256").update(collector).digest("hex").slice(0, 16) : "",
+    // SeaweedFS reads its identities only as it starts; it is recreated when they change.
+    ALASIO_NEON_S3_REVISION: createHash("sha256").update(readFileSync(join(layout.seaweedfs, "s3.json"))).digest("hex").slice(0, 16),
+    ALASIO_NEON_LAKE_IMAGE: lakeImage(),
     ALASIO_NEON_DIR: layout.root,
     ALASIO_NEON_CONTROL_SOURCE: CONTROL_DIR,
     ALASIO_NEON_CONTROL_REVISION: controlRevision(),
@@ -311,6 +363,9 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
     NEON_SAFEKEEPER_REMOTE_STORAGE: remoteStorage("safekeeper"),
     CONTROLLER_DB_PASSWORD: secrets.controllerDbPassword,
     SANDBOX_METADATA_PASSWORD: secrets.sandboxMetadataPassword,
+    LAKE_DATABASE_PASSWORD: secrets.lakePassword,
+    LAKE_S3_ACCESS_KEY: secrets.s3.lake.accessKey,
+    LAKE_S3_SECRET_KEY: secrets.s3.lake.secretKey,
     PAGESERVER_JWT_TOKEN: token("pageserverapi"),
     SAFEKEEPER_JWT_TOKEN: token("safekeeperdata"),
     CONTROL_PLANE_JWT_TOKEN: token("admin"),
@@ -331,15 +386,15 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp }) {
 /**
  * Makes the stack's secrets if it has none, and renders its configuration.
  * `otlp` (`{ endpoint, headers }`, or null) is where the stack's telemetry goes, as
- * the stack's network reaches it. Returns the layout.
+ * the stack's network reaches it; `lake` runs the analytics lake. Returns the layout.
  */
-export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT, bridgeName = DEFAULT_BRIDGE, otlp = null } = {}) {
+export function setupNeon(stateDir, { computePort = DEFAULT_COMPUTE_PORT, bridgeName = DEFAULT_BRIDGE, otlp = null, lake = false } = {}) {
   if (!/^[A-Za-z0-9_.-]{1,15}$/.test(bridgeName)) {
     throw new Error(`bridge name must be 1 to 15 of [A-Za-z0-9_.-] (a Linux interface name), got ${JSON.stringify(bridgeName)}`);
   }
   const layout = neonLayout(stateDir);
   mkdirSync(layout.root, { recursive: true });
   const secrets = ensureSecrets(layout);
-  renderConfig(layout, secrets, { computePort, bridgeName, otlp });
+  renderConfig(layout, secrets, { computePort, bridgeName, otlp, lake });
   return layout;
 }

@@ -1,0 +1,11 @@
+{
+  "name": "alasio-neon-lake",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "alasio's analytics lake: Claude Code's transcripts and Codex's rollouts, typed, in DuckLake on the Neon stack",
+  "dependencies": {
+    "@duckdb/node-api": "1.5.6-r.1",
+    "pg": "8.23.0"
+  }
+}
