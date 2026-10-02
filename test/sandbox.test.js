@@ -177,6 +177,7 @@ function fakeSandbox({ running = new Set() } = {}) {
     },
     store,
     stateDir,
+    env: {}, // no telemetry, whatever the environment running the tests exports
     docker,
     startForward: async ({ connect }) => {
       const forward = { connect, url: `http://127.0.0.1:${40000 + forwards.length}/mcp`, headers: { Authorization: "Bearer t" }, closed: false, close: async () => { forward.closed = true; } };

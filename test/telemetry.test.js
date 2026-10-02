@@ -13,6 +13,11 @@ import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-tr
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
 // load (as src/index.js does) receives it. Here it keeps everything in memory.
+// The tests set the telemetry variables they mean; none come from the environment that
+// runs them.
+for (const name of Object.keys(process.env)) {
+  if (/^(OTEL_.*|TRACEPARENT|TRACESTATE)$/u.test(name)) delete process.env[name];
+}
 class CollectingReader extends MetricReader {
   async onForceFlush() {}
   async onShutdown() {}
