@@ -41,6 +41,15 @@ jobs:
         # One node, and a server with two agents, so the stack and sessions spread.
         agents: [0, 2]
     steps:
+      # The cluster holds Neon's images and the agent image, bayma's with every runtime
+      # it serves, unpacked: far more disk than a runner starts with free, so the
+      # software it comes with that this job does not use goes first.
+      - run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az
+          docker system prune --all --force
+          df -h /
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -48,9 +57,6 @@ jobs:
           cache: npm
       - run: npm ci
       - uses: ./.github/actions/kube-tools
-      # bayma's image, which the agent image is built on, takes more disk than a
-      # runner starts with free.
-      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
       - run: test/e2e/run.sh
         env:
           AGENTS: ${{ matrix.agents }}

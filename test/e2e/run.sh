@@ -44,11 +44,15 @@ trap cleanup EXIT
 
 k3d registry list -o json | grep -q "\"k3d-$registry\"" || k3d registry create "$registry" --port "$port"
 
-# The images, pushed where the cluster pulls them from, as a release publishes them.
+# The images, pushed where the cluster pulls them from, as a release publishes them, and
+# then dropped here, with what they were built from: the cluster keeps its own copies.
 for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake"; do
   repository=${image%%:*}
   docker build --quiet --tag "localhost:$port/$repository:e2e" "$root/${image#*:}"
   docker push --quiet "localhost:$port/$repository:e2e"
+  docker image rm "localhost:$port/$repository:e2e" >/dev/null
+  docker image prune --all --force >/dev/null
+  docker builder prune --all --force >/dev/null
 done
 
 KUBECONFIG_OUT=$KUBECONFIG AGENTS=$agents "$root/deploy/k3d/cluster.sh" "$name" --registry-use "k3d-$registry:$port"
