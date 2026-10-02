@@ -1,0 +1,88 @@
+{{- $name := include "alasio.fullname" . -}}
+# alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and
+# reads files from sessions through exec, in the namespaces it owns, and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "alasio") | nindent 4 }}
+{{- $namespaces := list -}}
+{{- if .Values.sessions.enabled }}{{ $namespaces = append $namespaces (include "alasio.sessionsNamespace" .) }}{{ end -}}
+{{- if .Values.host.enabled }}{{ $namespaces = append $namespaces (include "alasio.hostNamespace" .) }}{{ end -}}
+{{- range $namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" $ "component" "alasio") | nindent 4 }}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" $ "component" "alasio") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+{{- end }}
+{{- if .Values.host.enabled }}
+---
+# Folder workspaces' bayma: the operator's agents, which may restart alasio as they
+# would restart it on the machine, by rolling out its Deployment, and do nothing else
+# with the cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "host-agent") }}
+  namespace: {{ include "alasio.hostNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "folder-bayma") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "restart") }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "folder-bayma") | nindent 4 }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [{{ $name }}]
+    verbs: [get, patch]
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "restart") }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "folder-bayma") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "alasio.componentName" (dict "root" . "component" "host-agent") }}
+    namespace: {{ include "alasio.hostNamespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "alasio.componentName" (dict "root" . "component" "restart") }}
+{{- end }}

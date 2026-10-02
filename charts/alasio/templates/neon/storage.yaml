@@ -1,0 +1,358 @@
+{{- if .Values.neon.enabled -}}
+{{- $neon := include "alasio.image" (dict "image" .Values.neon.image "root" .) -}}
+{{- $broker := include "alasio.neonName" (dict "root" . "component" "storage-broker") -}}
+{{- $controller := include "alasio.neonName" (dict "root" . "component" "storage-controller") -}}
+{{- $controllerDb := include "alasio.neonName" (dict "root" . "component" "controller-db") -}}
+{{- $control := include "alasio.neonName" (dict "root" . "component" "control") -}}
+{{- $safekeeper := include "alasio.neonName" (dict "root" . "component" "safekeeper") -}}
+{{- $pageserver := include "alasio.neonName" (dict "root" . "component" "pageserver") -}}
+# The storage controller's own Postgres.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $controllerDb }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-controller-db") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-controller-db") | nindent 4 }}
+  ports:
+    - { name: postgres, port: 5432 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $controllerDb }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-controller-db") | nindent 4 }}
+spec:
+  serviceName: {{ $controllerDb }}
+  replicas: 1
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-controller-db") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-controller-db") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ include "alasio.image" (dict "image" .Values.neon.controllerDbImage "root" .) }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: POSTGRES_USER, value: storage_controller }
+            - { name: POSTGRES_DB, value: storage_controller }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          envFrom:
+            - secretRef:
+                name: {{ include "alasio.neonName" (dict "root" . "component" "controller-db") }}
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, storage_controller, -d, storage_controller]
+            periodSeconds: 5
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.controllerDb.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+      volumes:
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec: {{- include "alasio.claimSpec" .Values.neon.controllerDb.storage | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $broker }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-broker") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-storage-broker") | nindent 4 }}
+  ports:
+    - { name: grpc, port: 50051 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $broker }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-broker") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-storage-broker") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-broker") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      containers:
+        - name: storage-broker
+          image: {{ $neon }}
+          imagePullPolicy: IfNotPresent
+          command: [storage_broker, --listen-addr=0.0.0.0:50051]
+          ports:
+            - { name: grpc, containerPort: 50051 }
+          readinessProbe:
+            tcpSocket: { port: grpc }
+            periodSeconds: 5
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.storageBroker.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $controller }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-controller") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-storage-controller") | nindent 4 }}
+  ports:
+    - { name: http, port: 1234 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $controller }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-controller") | nindent 4 }}
+spec:
+  replicas: 1
+  # One controller at a time: it leads the storage it controls.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-storage-controller") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-storage-controller") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      initContainers:
+        - name: wait-for-controller-db
+          image: {{ include "alasio.image" (dict "image" .Values.neon.controllerDbImage "root" .) }}
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c, 'until pg_isready -h "$0" -U storage_controller; do sleep 2; done', {{ $controllerDb | quote }}]
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      containers:
+        - name: storage-controller
+          image: {{ $neon }}
+          imagePullPolicy: IfNotPresent
+          # Strict mode: every secret set, each timeline on as many safekeepers as there are.
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              PUBLIC_KEY="$(cat /keys/auth_public_key.pem)"
+              exec storage_controller
+              --listen 0.0.0.0:1234
+              --control-plane-url http://{{ $control }}:8080
+              --timelines-onto-safekeepers
+              --timeline-safekeeper-count {{ .Values.neon.safekeepers.replicas }}
+          envFrom:
+            - secretRef:
+                name: {{ include "alasio.neonName" (dict "root" . "component" "storage-controller") }}
+          ports:
+            - { name: http, containerPort: 1234 }
+          readinessProbe:
+            httpGet: { path: /status, port: http }
+            periodSeconds: 5
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.storageController.resources | nindent 12 }}
+          volumeMounts:
+            - name: keys
+              mountPath: /keys
+              readOnly: true
+      volumes:
+        - name: keys
+          secret:
+            secretName: {{ include "alasio.neonName" (dict "root" . "component" "storage-controller") }}
+            items:
+              - { key: auth_public_key.pem, path: auth_public_key.pem }
+---
+# The safekeepers: a timeline's WAL, each on its own volume, at stable names neon-control
+# registers them by. Their names resolve before they are ready, as the controller needs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $safekeeper }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-safekeeper") | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-safekeeper") | nindent 4 }}
+  ports:
+    - { name: pg, port: 5454 }
+    - { name: http, port: 7676 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $safekeeper }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-safekeeper") | nindent 4 }}
+spec:
+  serviceName: {{ $safekeeper }}
+  replicas: {{ .Values.neon.safekeepers.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-safekeeper") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-safekeeper") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      {{- if .Values.objectStore.bundled.enabled }}
+      initContainers: {{- include "alasio.waitForObjectStore" . | nindent 8 }}
+      {{- end }}
+      # Apart where the cluster has room: a quorum survives a node, or a zone.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-safekeeper") | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-safekeeper") | nindent 14 }}
+      containers:
+        - name: safekeeper
+          image: {{ $neon }}
+          imagePullPolicy: IfNotPresent
+          # Its id is its ordinal plus one; each is its own availability zone, so each
+          # timeline is placed on distinct safekeepers.
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              SAFEKEEPER_ID=$((POD_INDEX + 1)) &&
+              exec safekeeper -D /data --id "$SAFEKEEPER_ID"
+              --listen-pg 0.0.0.0:5454 --advertise-pg "$POD_NAME.{{ $safekeeper }}.$POD_NAMESPACE.svc.cluster.local:5454"
+              --listen-http 0.0.0.0:7676
+              --availability-zone "az-safekeeper-$SAFEKEEPER_ID"
+              --broker-endpoint http://{{ $broker }}:50051
+              --remote-storage "$REMOTE_STORAGE"
+              --pg-auth-public-key-path /keys/auth_public_key.pem
+              --pg-tenant-only-auth-public-key-path /keys/auth_public_key.pem
+              --http-auth-public-key-path /keys/auth_public_key.pem
+              --auth-token-path /keys/safekeeper_peer_token
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_INDEX
+              valueFrom: { fieldRef: { fieldPath: "metadata.labels['apps.kubernetes.io/pod-index']" } }
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "safekeeper") }}, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "safekeeper") }}, key: AWS_SECRET_ACCESS_KEY } }
+            - name: REMOTE_STORAGE
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "safekeeper") }}, key: REMOTE_STORAGE } }
+          ports:
+            - { name: pg, containerPort: 5454 }
+            - { name: http, containerPort: 7676 }
+          readinessProbe:
+            httpGet: { path: /v1/status, port: http }
+            periodSeconds: 5
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.safekeepers.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: keys, mountPath: /keys, readOnly: true }
+      volumes:
+        - name: keys
+          secret:
+            secretName: {{ include "alasio.neonName" (dict "root" . "component" "safekeeper") }}
+            defaultMode: 0440
+            items:
+              - { key: auth_public_key.pem, path: auth_public_key.pem }
+              - { key: safekeeper_peer_token, path: safekeeper_peer_token }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec: {{- include "alasio.claimSpec" .Values.neon.safekeepers.storage | nindent 8 }}
+---
+# The pageserver: pages served from layers it keeps in the object store, its volume a
+# cache. It registers itself with the controller by the name in its metadata.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $pageserver }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-pageserver") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-pageserver") | nindent 4 }}
+  ports:
+    - { name: pg, port: 6400 }
+    - { name: http, port: 9898 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $pageserver }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-pageserver") | nindent 4 }}
+spec:
+  serviceName: {{ $pageserver }}
+  replicas: 1
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-pageserver") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-pageserver") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: config
+          image: {{ $neon }}
+          imagePullPolicy: IfNotPresent
+          # Its configuration, rendered by the stack's setup, into its working directory.
+          command: [/bin/sh, -c, 'cp /config/pageserver.toml /config/identity.toml /config/metadata.json /config/auth_public_key.pem /data/.neon/']
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data/.neon }
+            - { name: config, mountPath: /config, readOnly: true }
+        {{- include "alasio.waitFor" (dict "root" . "name" "storage-controller" "url" (printf "http://%s:1234/status" $controller)) | nindent 8 }}
+        {{- include "alasio.waitForObjectStore" . | nindent 8 }}
+      containers:
+        - name: pageserver
+          image: {{ $neon }}
+          imagePullPolicy: IfNotPresent
+          command: [pageserver, -D, /data/.neon]
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "pageserver") }}, key: AWS_ACCESS_KEY_ID } }
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "pageserver") }}, key: AWS_SECRET_ACCESS_KEY } }
+            - name: NEON_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ include "alasio.neonName" (dict "root" . "component" "pageserver") }}, key: NEON_AUTH_TOKEN } }
+          ports:
+            - { name: pg, containerPort: 6400 }
+            - { name: http, containerPort: 9898 }
+          readinessProbe:
+            httpGet: { path: /v1/status, port: http }
+            periodSeconds: 5
+          securityContext: {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.pageserver.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data/.neon }
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "alasio.neonName" (dict "root" . "component" "pageserver") }}
+            items:
+              - { key: pageserver.toml, path: pageserver.toml }
+              - { key: identity.toml, path: identity.toml }
+              - { key: metadata.json, path: metadata.json }
+              - { key: auth_public_key.pem, path: auth_public_key.pem }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec: {{- include "alasio.claimSpec" .Values.neon.pageserver.storage | nindent 8 }}
+{{- end }}

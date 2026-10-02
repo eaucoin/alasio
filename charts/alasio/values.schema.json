@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "alasio chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": { "type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": { "$ref": "#/definitions/quantities" },
+        "limits": { "$ref": "#/definitions/quantities" }
+      }
+    },
+    "quantities": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number"] }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size"],
+      "properties": {
+        "size": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$" },
+        "storageClassName": { "type": "string" }
+      }
+    },
+    "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+    "secretName": { "type": "string", "pattern": "^(|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)$" },
+    "id": { "type": "integer", "minimum": 0 },
+    "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" },
+    "env": { "type": "object", "additionalProperties": { "type": "string" } }
+  },
+  "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "global": { "type": "object" },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "alasio": { "$ref": "#/definitions/image" },
+        "agent": { "$ref": "#/definitions/image" },
+        "lake": { "$ref": "#/definitions/image" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "$ref": "#/definitions/secretName" } },
+    "alasio": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "telegram": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["existingSecret"],
+          "properties": { "existingSecret": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" } }
+        },
+        "defaultHarness": { "enum": ["", "claude", "codex"] },
+        "claude": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "$ref": "#/definitions/secretName" },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": { "$ref": "#/definitions/storage/properties/size" },
+            "storageClassName": { "type": "string" },
+            "existingClaim": { "type": "string" }
+          }
+        },
+        "env": { "$ref": "#/definitions/env" },
+        "envFrom": { "type": "array", "items": { "type": "object" } },
+        "resources": { "$ref": "#/definitions/resources" },
+        "runAsUser": { "$ref": "#/definitions/id" },
+        "runAsGroup": { "$ref": "#/definitions/id" },
+        "supplementalGroups": { "type": "array", "items": { "$ref": "#/definitions/id" } },
+        "nodeSelector": { "$ref": "#/definitions/nodeSelector" },
+        "tolerations": { "$ref": "#/definitions/tolerations" },
+        "affinity": { "$ref": "#/definitions/affinity" }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "otlpEndpoint": { "type": "string", "pattern": "^(|https?://.+)$" },
+        "otlpProtocol": { "enum": ["http/protobuf", "http/json", "grpc"] },
+        "headersSecret": { "$ref": "#/definitions/secretName" },
+        "headersKey": { "type": "string", "minLength": 1 },
+        "resourceAttributes": { "type": "string" },
+        "receiverPort": { "type": "integer", "minimum": 1024, "maximum": 65535 }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "$ref": "#/definitions/namespace" },
+        "createNamespace": { "type": "boolean" },
+        "runtimeClassName": { "type": "string" },
+        "storage": { "$ref": "#/definitions/storage" },
+        "resources": { "$ref": "#/definitions/resources" },
+        "egressGate": { "type": "boolean" },
+        "fullModeNameservers": { "type": "array", "minItems": 1, "maxItems": 3, "items": { "type": "string", "format": "ipv4" } },
+        "blockedCidrs": { "type": "array", "items": { "type": "string", "pattern": "^[0-9.]+/[0-9]{1,2}$" } },
+        "nodeSelector": { "$ref": "#/definitions/nodeSelector" },
+        "tolerations": { "$ref": "#/definitions/tolerations" }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "namespace": { "$ref": "#/definitions/namespace" },
+        "createNamespace": { "type": "boolean" },
+        "baymaImage": { "$ref": "#/definitions/image" },
+        "uid": { "$ref": "#/definitions/id" },
+        "gid": { "$ref": "#/definitions/id" },
+        "supplementalGroups": { "type": "array", "items": { "$ref": "#/definitions/id" } },
+        "home": { "type": "string", "pattern": "^/" },
+        "stateRoot": { "type": "string", "pattern": "^/" },
+        "mounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "hostPath", "mountPath"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+              "hostPath": { "type": "string", "pattern": "^/" },
+              "mountPath": { "type": "string", "pattern": "^/" },
+              "readOnly": { "type": "boolean" },
+              "type": { "enum": ["", "Directory", "DirectoryOrCreate", "File", "FileOrCreate", "Socket", "CharDevice", "BlockDevice"] }
+            }
+          }
+        },
+        "workspaceRoot": { "type": "string", "pattern": "^(|/.*)$" },
+        "alasioHome": { "type": "boolean" },
+        "env": { "$ref": "#/definitions/env" },
+        "resources": { "$ref": "#/definitions/resources" }
+      }
+    },
+    "neon": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "external": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "existingSecret": { "$ref": "#/definitions/secretName" } }
+        },
+        "image": { "$ref": "#/definitions/image" },
+        "computeImage": { "$ref": "#/definitions/image" },
+        "controllerDbImage": { "$ref": "#/definitions/image" },
+        "runAsUser": { "$ref": "#/definitions/id" },
+        "runAsGroup": { "$ref": "#/definitions/id" },
+        "safekeepers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "replicas": { "type": "integer", "minimum": 1, "maximum": 7 },
+            "storage": { "$ref": "#/definitions/storage" },
+            "resources": { "$ref": "#/definitions/resources" }
+          }
+        },
+        "pageserver": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "storage": { "$ref": "#/definitions/storage" }, "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "storageController": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "storageBroker": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "controllerDb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "storage": { "$ref": "#/definitions/storage" }, "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "storage": { "$ref": "#/definitions/storage" }, "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "compute": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "resources": { "$ref": "#/definitions/resources" } }
+        },
+        "backup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "schedule": { "type": "string", "minLength": 9 },
+            "keep": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "collector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": { "$ref": "#/definitions/image" },
+            "otlpEndpoint": { "type": "string", "pattern": "^(|https?://.+)$" },
+            "resources": { "$ref": "#/definitions/resources" }
+          }
+        },
+        "nodeSelector": { "$ref": "#/definitions/nodeSelector" },
+        "tolerations": { "$ref": "#/definitions/tolerations" }
+      }
+    },
+    "objectStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bundled": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": { "$ref": "#/definitions/image" },
+            "storage": { "$ref": "#/definitions/storage" },
+            "resources": { "$ref": "#/definitions/resources" }
+          }
+        },
+        "external": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": { "type": "string", "pattern": "^(|https?://.+)$" },
+            "region": { "type": "string", "minLength": 1 },
+            "existingSecret": { "$ref": "#/definitions/secretName" }
+          }
+        },
+        "buckets": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "neon": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" },
+            "lake": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" },
+            "backups": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" }
+          }
+        }
+      }
+    },
+    "lake": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "resources": { "$ref": "#/definitions/resources" }
+      }
+    },
+    "networkPolicies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "agent-sandbox": { "type": "object" }
+  }
+}

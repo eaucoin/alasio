@@ -1,0 +1,43 @@
+# The OTLP stand-in (otlp-sink.mjs) as the e2e tests run it in the cluster:
+# kubectl create configmap otlp-sink --from-file=otlp-sink.mjs first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otlp
+spec:
+  selector: { app: otlp-sink }
+  ports:
+    - { name: http, port: 4318 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otlp-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: otlp-sink }
+  template:
+    metadata:
+      labels: { app: otlp-sink }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sink
+          image: node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
+          command: [node, /sink/otlp-sink.mjs, "4318"]
+          ports:
+            - { containerPort: 4318 }
+          readinessProbe:
+            httpGet: { path: /control/exports, port: 4318 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: sink, mountPath: /sink }
+      volumes:
+        - name: sink
+          configMap: { name: otlp-sink }

@@ -1,18 +1,28 @@
 /**
  * neon-control: alasio's small stand-in for Neon's control plane, the one part
- * of Neon that is not open source. Runs as a container of the stack.
+ * of Neon that is not open source. Runs as a service of the stack.
  *
  * On start it bootstraps what the storage services need and cannot do
  * themselves, idempotently: registers the safekeepers with the storage
  * controller, waits for the pageserver to register, creates alasio's tenant and
- * timeline once, and writes the compute's spec. It then answers the storage
- * controller's compute hooks, and reports healthy once the compute can start.
+ * timeline once, and makes the compute's spec. It then answers the storage
+ * controller's compute hooks and serves the compute its spec, and reports
+ * healthy once the compute can start.
  *
- * Environment: CONTROLLER_URL. Mounts: /secrets (secrets.json, the signing
- * key), /keys (the public key), /state (its record, and the compute's spec).
+ * The compute gets its spec either way Neon's compute_ctl takes one: from the
+ * file written under /state (`--config`, as the Docker stack runs it), or over
+ * HTTP from `GET /compute/api/v2/computes/<id>/spec` (`--control-plane-uri`,
+ * as the Kubernetes stack runs it), with the compute's token as its bearer.
+ *
+ * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
+ * the order of their ids, comma-separated (safekeeper-1,2,3 unless set); and
+ * NEON_PAGESERVER_HOST (pageserver unless set). Mounts: /secrets (secrets.json,
+ * the signing key), /keys (the public key), /state (its record, and the
+ * compute's spec).
  */
-import { readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 
 import { publicJwks, signToken, verifyToken } from "./jwt.js";
 import { scramVerifier } from "./scram.js";
@@ -20,9 +30,12 @@ import { scramVerifier } from "./scram.js";
 const CONTROLLER_URL = process.env.CONTROLLER_URL ?? "http://storage-controller:1234";
 const PG_VERSION = 17;
 const COMPUTE_PORT = 55433;
-const SAFEKEEPERS = [1, 2, 3].map((id) => ({ id, host: `safekeeper-${id}`, pgPort: 5454, httpPort: 7676 }));
+const SAFEKEEPER_HOSTS = (process.env.NEON_SAFEKEEPER_HOSTS ?? "safekeeper-1,safekeeper-2,safekeeper-3").split(",").map((host) => host.trim());
+const SAFEKEEPERS = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
+const PAGESERVER_HOST = process.env.NEON_PAGESERVER_HOST ?? "pageserver";
 const RECORD = "/state/bootstrap.json";
 const SPEC = "/state/compute/config.json";
+const COMPUTE_ID = "alasio";
 
 const secrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
 const privateKeyPem = readFileSync("/secrets/auth_private_key.pem", "utf8");
@@ -175,10 +188,12 @@ function setting(name, value, vartype) {
   return { name, value: String(value), vartype };
 }
 
+let computeConfig = null;
+
 /** The compute's spec: alasio's role and database on alasio's timeline. */
 function writeSpec(record) {
   const hostOf = (id) => SAFEKEEPERS.find((sk) => sk.id === id).host;
-  writeAtomically(SPEC, {
+  computeConfig = {
     spec: {
       format_version: 1.0,
       suspend_timeout_seconds: -1,
@@ -213,13 +228,15 @@ function writeSpec(record) {
       tenant_id: record.tenantId,
       timeline_id: record.timelineId,
       mode: "Primary",
-      pageserver_connstring: "postgresql://no_user@pageserver:6400",
+      pageserver_connstring: `postgresql://no_user@${PAGESERVER_HOST}:6400`,
       safekeepers_generation: record.safekeepers.generation,
       safekeeper_connstrings: record.safekeepers.ids.map((id) => `${hostOf(id)}:5454`),
       storage_auth_token: signToken(privateKeyPem, "tenant", record.tenantId),
     },
     compute_ctl_config: { jwks: publicJwks(publicKeyPem) },
-  });
+  };
+  mkdirSync("/state/compute", { recursive: true });
+  writeAtomically(SPEC, computeConfig);
   log("compute spec written");
 }
 
@@ -246,9 +263,30 @@ function authorized(request) {
   return Boolean(token && verifyToken(publicKeyPem, token));
 }
 
+/** Whether the request carries the compute's token, which only the compute is given. */
+function fromCompute(request) {
+  const presented = Buffer.from(request.headers.authorization ?? "");
+  const expected = Buffer.from(`Bearer ${secrets.computeControlToken}`);
+  return Boolean(secrets.computeControlToken) && presented.length === expected.length && timingSafeEqual(presented, expected);
+}
+
 const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/healthz") {
     response.writeHead(ready ? 200 : 503).end(ready ? "ready\n" : "bootstrapping\n");
+    return;
+  }
+  if (request.method === "GET" && request.url === `/compute/api/v2/computes/${COMPUTE_ID}/spec`) {
+    if (!fromCompute(request)) {
+      response.writeHead(401).end();
+      return;
+    }
+    // Until bootstrapped there is no spec yet; compute_ctl retries, and then
+    // its container is restarted.
+    if (!computeConfig) {
+      response.writeHead(503).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ...computeConfig, status: "attached" }));
     return;
   }
   if (request.method === "PUT" && (request.url === "/notify-attach" || request.url === "/notify-safekeepers")) {

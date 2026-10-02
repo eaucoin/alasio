@@ -1,0 +1,332 @@
+# alasio: a Telegram bot that runs Claude Code and Codex in workspaces it gives them.
+# Every value here is checked against values.schema.json at install and upgrade.
+#
+# What runs, by default: alasio itself (one replica: one Telegram poller, one SQLite
+# writer); a workspace per session filesystem as an agent-sandbox Sandbox in its own
+# namespace under gVisor; Neon (Postgres on object storage) as alasio's database; the
+# DuckLake analytics lake; and SeaweedFS as the object store. Secrets are referenced,
+# never inlined, and images are pinned by digest.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The images the chart publishes with each release. A release pins each by digest.
+# pullPolicy applies to these; every other image is pinned by digest and pulled only
+# when absent.
+images:
+  alasio:
+    repository: ghcr.io/eaucoin/alasio
+    tag: ""        # the chart's appVersion when empty
+    digest: ""
+  agent:
+    repository: ghcr.io/eaucoin/alasio-agent
+    tag: ""
+    digest: ""
+  lake:
+    repository: ghcr.io/eaucoin/alasio-lake
+    tag: ""
+    digest: ""
+  pullPolicy: IfNotPresent
+
+# For private registries: Secrets of type kubernetes.io/dockerconfigjson, in the
+# release's namespace and in the sessions and host namespaces.
+imagePullSecrets: []
+
+alasio:
+  # The bot's Telegram token and who may use it: a Secret with keys `token` and
+  # `allowedUserIds` (comma-separated Telegram user ids).
+  telegram:
+    existingSecret: ""
+
+  # The harness a new conversation uses: claude or codex. Empty leaves alasio's default.
+  defaultHarness: ""
+
+  # Claude Code's login: a Secret whose key holds a long-lived token from
+  # `claude setup-token`, given to Claude Code as CLAUDE_CODE_OAUTH_TOKEN. Empty means
+  # Claude Code finds its login in alasio's home (the host profile, or a login made in
+  # the pod).
+  claude:
+    existingSecret: ""
+    key: token
+
+  # alasio's home and state: a volume of its own, which keeps the SQLite state, the
+  # harnesses' homes (Claude Code's ~/.claude, Codex's ~/.codex) and their sessions.
+  # With the host profile's `alasioHome`, the operator's own home is used instead.
+  persistence:
+    size: 20Gi
+    storageClassName: ""
+    existingClaim: ""
+
+  # Extra environment variables and Secrets for alasio.
+  env: {}
+  envFrom: []
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 8Gi
+
+  # alasio runs as this user. With the host profile it should be the operator's, so
+  # files it and the agents make on the machine are theirs.
+  runAsUser: 1000
+  runAsGroup: 1000
+  supplementalGroups: []
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Where alasio, its harnesses, bayma, the lake and Neon's collector export telemetry,
+# with OpenTelemetry's standard variables. Nothing is exported when empty.
+telemetry:
+  otlpEndpoint: ""
+  otlpProtocol: http/protobuf
+  # A Secret whose key holds OTEL_EXPORTER_OTLP_HEADERS (key=value,... pairs).
+  headersSecret: ""
+  headersKey: headers
+  resourceAttributes: ""
+  # The port alasio receives session sandboxes' telemetry on, through its own Service.
+  receiverPort: 4318
+
+# Session filesystems: an empty, isolated workspace per session, a Sandbox under a
+# sandboxing runtime in a namespace of its own, enforcing Pod Security "restricted".
+sessions:
+  enabled: true
+  namespace: alasio-sessions
+  createNamespace: true
+  # The RuntimeClass sessions run under: gVisor by default. Empty runs them under the
+  # cluster's default runtime, which is a weaker boundary.
+  runtimeClassName: gvisor
+  # The workspace volume each session gets.
+  storage:
+    size: 10Gi
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # Hold each session's pod until NetworkPolicy confines it. A cluster that does not
+  # enforce NetworkPolicy then never starts a session; turn this off only on a
+  # cluster where that is understood.
+  egressGate: true
+  # The resolvers sessions with internet access use.
+  fullModeNameservers: [1.1.1.1, 8.8.8.8]
+  # What sessions with internet access may not reach: private, link-local, carrier-grade
+  # NAT, loopback, multicast and reserved ranges, so the cluster and its network stay
+  # out of reach.
+  blockedCidrs:
+    - 0.0.0.0/8
+    - 10.0.0.0/8
+    - 100.64.0.0/10
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 224.0.0.0/4
+    - 240.0.0.0/4
+  nodeSelector: {}
+  tolerations: []
+
+# The host profile: folder workspaces, in which the agents work on the machine's own
+# files, as the operator's user, with what the operator mounts from the node. It is
+# privileged by nature, off by default, and for single-node clusters the operator owns.
+host:
+  enabled: false
+  namespace: alasio-host
+  createNamespace: true
+  # bayma's image for folder workspaces: bayma itself, which the mounts give the
+  # machine's tools.
+  baymaImage:
+    repository: ghcr.io/eaucoin/bayma
+    tag: 0.10.0
+    digest: sha256:d06080edb45b4929173fd58cf1f56dd1d9b94b0aa40e243097a6030623d26d2a
+  # The operator's user and home, which alasio and each folder's bayma run as and in.
+  uid: 1000
+  gid: 1000
+  supplementalGroups: []
+  home: /home/operator
+  # Where the folder workspaces' bayma keeps its state, as the pods see it; under a
+  # mount below, so it outlives each pod.
+  stateRoot: /home/operator/.alasio/bayma
+  # What alasio and each folder's bayma mount from the node: [{ name, hostPath,
+  # mountPath, readOnly, type }]. The operator's home at least.
+  mounts: []
+  # Folder workspaces are created under this directory, a path of the mounts.
+  workspaceRoot: ""
+  # alasio's own home is the operator's (host.home, through the mounts) rather than
+  # its volume, so the harnesses use the operator's logins and sessions.
+  alasioHome: true
+  # Environment for each folder's bayma (PATH, say).
+  env: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 8Gi
+
+# Neon, alasio's database: Postgres whose storage is safekeepers and a pageserver on
+# object storage, run here by the chart.
+neon:
+  enabled: true
+  # With neon.enabled false, the database alasio uses: a Secret with `url` (alasio's
+  # role) and `lake-password` (the lake's role's password, which alasio sets).
+  external:
+    existingSecret: ""
+  image:
+    repository: neondatabase/neon
+    tag: release-9129
+    digest: sha256:166022a72bf9983eba96d061d794f4740edbd4c3301e66202c1180acce9a323c
+  computeImage:
+    repository: neondatabase/compute-node-v17
+    tag: release-compute-9073
+    digest: sha256:ed6a613231d7026b4df8b00563444b9f33745370a3b3f0a2183e723f460ba974
+  controllerDbImage:
+    repository: postgres
+    tag: 17-bookworm
+    digest: sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+  # Neon's services run as this user, which owns their volumes.
+  runAsUser: 1000
+  runAsGroup: 1000
+  safekeepers:
+    # A timeline's WAL is on three safekeepers, a quorum of two acknowledging each
+    # commit. They spread across nodes and zones where the cluster has them.
+    replicas: 3
+    storage:
+      size: 20Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+  pageserver:
+    storage:
+      size: 50Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 4Gi
+  storageController:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  storageBroker:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+  controllerDb:
+    storage:
+      size: 2Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  control:
+    storage:
+      size: 100Mi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+  compute:
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 4Gi
+  # A logical dump of alasio's database to the object store, the last `keep` kept.
+  backup:
+    enabled: true
+    schedule: "17 3 * * *"
+    keep: 14
+  # The stack's own metrics (Neon's services and SeaweedFS), scraped by a collector
+  # and sent where `telemetry.otlpEndpoint` says, when it says anywhere.
+  collector:
+    enabled: true
+    image:
+      repository: otel/opentelemetry-collector-contrib
+      tag: 0.161.0
+      digest: sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    # Where the collector sends to, when not telemetry.otlpEndpoint.
+    otlpEndpoint: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+
+# The object store Neon, the lake and backups keep their data in.
+objectStore:
+  # SeaweedFS, run here by the chart.
+  bundled:
+    enabled: true
+    image:
+      repository: chrislusf/seaweedfs
+      tag: "4.47"
+      digest: sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    storage:
+      size: 100Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
+  # Or an S3-compatible store of the operator's, with bundled.enabled false: its
+  # endpoint, region and buckets, and a Secret with `accessKey` and `secretKey`.
+  external:
+    endpoint: ""
+    region: us-east-1
+    existingSecret: ""
+  buckets:
+    neon: neon
+    lake: lake
+    backups: backups
+
+# The analytics lake: every transcript entry and rollout line, loaded from Neon into
+# DuckLake, its catalog in Neon and its Parquet files in the object store.
+lake:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1536Mi
+
+# NetworkPolicies confining sessions, folder workspaces' bayma and Neon. They need a
+# cluster that enforces NetworkPolicy, as session filesystems do.
+networkPolicies:
+  enabled: true
+
+# agent-sandbox's Sandbox API and controller, which alasio's workspaces are. Install it
+# with one release per cluster; turn it off where the cluster already has it.
+agent-sandbox:
+  enabled: true

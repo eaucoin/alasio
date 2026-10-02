@@ -1,0 +1,67 @@
+{{- if and .Values.lake.enabled .Values.neon.enabled -}}
+{{- $name := include "alasio.componentName" (dict "root" . "component" "lake") -}}
+# The analytics lake (neon/lake/README.md): every transcript entry and rollout line,
+# loaded from alasio's database into DuckLake, as role `lake`, which alasio makes. Query it
+# with `kubectl exec deploy/<release>-lake -- node src/query.js "<SQL>"`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "lake") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "lake") | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9464 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "lake") | nindent 4 }}
+spec:
+  replicas: 1
+  # One loader: two would race each other's loads.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "lake") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "lake") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: lake
+          image: {{ include "alasio.image" (dict "image" .Values.images.lake "root" .) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - { name: LAKE_DATABASE_HOST, value: {{ include "alasio.neonName" (dict "root" . "component" "compute") | quote }} }
+            - { name: LAKE_DATABASE_PORT, value: "55433" }
+            - { name: LAKE_DATA_PATH, value: {{ printf "s3://%s/" .Values.objectStore.buckets.lake | quote }} }
+            - { name: LAKE_S3_ENDPOINT, value: {{ include "alasio.s3Endpoint" . | quote }} }
+            - { name: HOME, value: /tmp }
+          envFrom:
+            - secretRef:
+                name: {{ include "alasio.componentName" (dict "root" . "component" "lake") }}
+          ports:
+            - { name: metrics, containerPort: 9464 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          securityContext:
+            {{- include "alasio.restrictedContainer" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          resources: {{- toYaml .Values.lake.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi
+{{- end }}

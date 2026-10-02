@@ -88,8 +88,11 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
       count("refused", { reason: "unauthenticated" });
       return [401];
     }
-    const encoding = ENCODINGS[(request.headers["content-type"] ?? "").split(";")[0].trim()];
+    const type = (request.headers["content-type"] ?? "").split(";")[0].trim();
+    const encoding = ENCODINGS[type];
     if (!encoding) return [415];
+    // A full success, in the request's own encoding: an empty message, or an empty object.
+    const ok = [200, { "content-type": type }, encoding === "json" ? "{}" : ""];
     let body = await readBody(request, MAX_BODY_BYTES);
     const wait = limiter.take(volumeId, body.length);
     if (wait > 0) {
@@ -104,7 +107,7 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
       }
     }
     // A signal alasio does not export is accepted and let go, as the exporter expects.
-    if (!forwarder.protocols[signal]) return [200];
+    if (!forwarder.protocols[signal]) return ok;
     let stamped;
     try {
       stamped = stampResources(signal, encoding, body, stampFor(volumeId));
@@ -118,14 +121,13 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
     if (!result.ok && !failing) log.warn(`exporting sessions' ${signal} failed: ${result.error}`);
     else if (result.ok && failing) log.info("exporting sessions' telemetry recovered");
     failing = !result.ok;
-    return [200];
+    return ok;
   }
 
   const server = createServer((request, response) => {
     handle(request).then(
-      ([status, headers = {}]) => {
-        // An empty JSON object is a full success in either encoding's response.
-        response.writeHead(status, { "content-type": "application/json", ...headers }).end(status === 200 ? "{}" : "");
+      ([status, headers = {}, body = ""]) => {
+        response.writeHead(status, headers).end(body);
       },
       (error) => {
         const status = error.status ?? 500;

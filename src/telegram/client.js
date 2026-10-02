@@ -59,14 +59,22 @@ export class TelegramApiError extends Error {
   }
 }
 
+/**
+ * The Bot API server alasio talks to: Telegram's own unless TELEGRAM_API_ROOT names
+ * another, such as a self-hosted telegram-bot-api server or a test's stand-in.
+ */
+export function telegramApiRoot(env = process.env) {
+  return (env.TELEGRAM_API_ROOT?.trim() || "https://api.telegram.org").replace(/\/+$/u, "");
+}
+
 export class Client {
-  constructor(token) {
+  constructor(token, { apiRoot = telegramApiRoot() } = {}) {
     if (!token) {
       throw new Error("TELEGRAM_BOT_TOKEN is required");
     }
     this.token = token;
-    this.apiBase = `https://api.telegram.org/bot${token}`;
-    this.fileBase = `https://api.telegram.org/file/bot${token}`;
+    this.apiBase = `${apiRoot}/bot${token}`;
+    this.fileBase = `${apiRoot}/file/bot${token}`;
     this.outboundTail = Promise.resolve();
   }
 

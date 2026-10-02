@@ -1,0 +1,86 @@
+{{- $endpoint := .Values.neon.collector.otlpEndpoint | default .Values.telemetry.otlpEndpoint -}}
+{{- if and .Values.neon.enabled .Values.neon.collector.enabled $endpoint -}}
+{{- $name := include "alasio.neonName" (dict "root" . "component" "collector") -}}
+{{- $seaweedfs := include "alasio.componentName" (dict "root" . "component" "seaweedfs") -}}
+{{- $safekeeper := include "alasio.neonName" (dict "root" . "component" "safekeeper") -}}
+{{- $targets := dict
+  "pageserver" (list (printf "%s:9898" (include "alasio.neonName" (dict "root" . "component" "pageserver"))))
+  "storage-controller" (list (printf "%s:1234" (include "alasio.neonName" (dict "root" . "component" "storage-controller"))))
+  "storage-broker" (list (printf "%s:50051" (include "alasio.neonName" (dict "root" . "component" "storage-broker"))))
+  "compute" (list (printf "%s:3080" (include "alasio.neonName" (dict "root" . "component" "compute"))))
+-}}
+{{- $safekeepers := list -}}
+{{- range $index := until (int .Values.neon.safekeepers.replicas) -}}
+{{- $safekeepers = append $safekeepers (printf "%s-%d.%s:7676" $safekeeper $index $safekeeper) -}}
+{{- end -}}
+{{- $_ := set $targets "safekeeper" $safekeepers -}}
+{{- if .Values.objectStore.bundled.enabled }}{{ $_ := set $targets "seaweedfs" (list (printf "%s:9327" $seaweedfs)) }}{{ end -}}
+{{- if .Values.lake.enabled }}{{ $_ := set $targets "lake" (list (printf "%s:9464" (include "alasio.componentName" (dict "root" . "component" "lake")))) }}{{ end -}}
+{{- $jobs := list -}}
+{{- range $job, $hosts := $targets -}}
+{{- $jobs = append $jobs (dict "job_name" $job "scrape_interval" "30s" "static_configs" (list (dict "targets" $hosts))) -}}
+{{- end -}}
+{{- $exporter := dict "endpoint" $endpoint -}}
+{{- if .Values.telemetry.headersSecret }}{{ $_ := set $exporter "headers" "${file:/etc/otelcol/headers/headers.yaml}" }}{{ end -}}
+{{- $config := dict
+  "receivers" (dict "prometheus" (dict "config" (dict "scrape_configs" $jobs)))
+  "processors" (dict "resource" (dict "attributes" (list (dict "key" "service.namespace" "value" "alasio-neon" "action" "upsert"))) "batch" (dict))
+  "exporters" (dict "otlphttp" $exporter)
+  "service" (dict
+    "telemetry" (dict "metrics" (dict "level" "none"))
+    "pipelines" (dict "metrics" (dict "receivers" (list "prometheus") "processors" (list "resource" "batch") "exporters" (list "otlphttp"))))
+-}}
+# The stack's telemetry: every Neon service's, SeaweedFS's and the lake's Prometheus
+# metrics, scraped and sent on as OTLP where the deployment's telemetry goes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-collector") | nindent 4 }}
+data:
+  config.yaml: {{ toPrettyJson $config | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-collector") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-collector") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-collector") | nindent 8 }}
+      annotations:
+        checksum/config: {{ toJson $config | sha256sum }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      containers:
+        - name: collector
+          image: {{ include "alasio.image" (dict "image" .Values.neon.collector.image "root" .) }}
+          imagePullPolicy: IfNotPresent
+          args: [--config=/etc/otelcol/config.yaml]
+          securityContext:
+            {{- include "alasio.restrictedContainer" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          resources: {{- toYaml .Values.neon.collector.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol, readOnly: true }
+            {{- if .Values.telemetry.headersSecret }}
+            - { name: headers, mountPath: /etc/otelcol/headers, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        {{- if .Values.telemetry.headersSecret }}
+        # The exporter's headers: a YAML map, under the key telemetry.headersKey + ".yaml"
+        # in the headers Secret, since the collector takes headers as a map.
+        - name: headers
+          secret:
+            secretName: {{ .Values.telemetry.headersSecret }}
+            items:
+              - { key: {{ printf "%s.yaml" .Values.telemetry.headersKey }}, path: headers.yaml }
+        {{- end }}
+{{- end }}

@@ -1,0 +1,153 @@
+{{- if .Values.networkPolicies.enabled -}}
+{{- $alasio := include "alasio.selectorLabels" (dict "root" . "component" "alasio") -}}
+{{- $fromAlasio := printf "namespaceSelector:\n  matchLabels:\n    kubernetes.io/metadata.name: %s\npodSelector:\n  matchLabels:\n%s" .Release.Namespace ($alasio | indent 4) -}}
+{{- if .Values.sessions.enabled }}
+# Sessions: nothing in or out but what follows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ include "alasio.sessionsNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "session") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# alasio, and only alasio, reaches each session's bayma.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bayma-from-alasio
+  namespace: {{ include "alasio.sessionsNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "session") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      alasio.dev/workload: session
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- $fromAlasio | nindent 10 }}
+      ports:
+        - { protocol: TCP, port: 7290 }
+---
+# Every session may send its telemetry to alasio's receiver: the one egress of a
+# session without internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-to-alasio
+  namespace: {{ include "alasio.sessionsNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "session") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      alasio.dev/workload: session
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - {{- $fromAlasio | nindent 10 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.telemetry.receiverPort }} }
+---
+# A session with internet reaches the public internet, and none of the cluster's or
+# its network's private addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: full-internet
+  namespace: {{ include "alasio.sessionsNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "session") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      alasio.dev/workload: session
+      alasio.dev/net-mode: full
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {{- toYaml .Values.sessions.blockedCidrs | nindent 14 }}
+{{- end }}
+{{- if .Values.host.enabled }}
+---
+# Folder workspaces' bayma is reached by alasio alone; what it reaches is the machine's.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bayma-from-alasio
+  namespace: {{ include "alasio.hostNamespace" . }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "folder-bayma") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- $fromAlasio | nindent 10 }}
+      ports:
+        - { protocol: TCP, port: 7290 }
+{{- end }}
+---
+# alasio takes no connections but sessions' telemetry.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "alasio") }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "alasio") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- $alasio | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    {{- if .Values.sessions.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "alasio.sessionsNamespace" . }}
+          podSelector:
+            matchLabels:
+              alasio.dev/workload: session
+      ports:
+        - { protocol: TCP, port: {{ .Values.telemetry.receiverPort }} }
+    {{- end }}
+{{- if .Values.neon.enabled }}
+---
+# Neon's services, the object store, the lake and their jobs reach each other, and
+# nothing else reaches them but what follows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "neon") }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "neon") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      alasio.dev/stack: neon
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              alasio.dev/stack: neon
+---
+# alasio reaches the compute, its database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "alasio.componentName" (dict "root" . "component" "neon-compute") }}
+  labels: {{- include "alasio.componentLabels" (dict "root" . "component" "neon") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-compute") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- $alasio | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 55433 }
+{{- end }}
+{{- end }}

@@ -135,20 +135,13 @@ function writePublic(path, content) {
 }
 
 /**
- * The stack's secrets: made on first run and then only added to, never rotated. Each
- * secret has a maker, and any absent from an existing secrets.json is filled in and the
- * file rewritten, so a deployment that predates a new secret (the session-filesystem
- * ones, say) gains it on the next start without disturbing the rest.
+ * The stack's secrets, `existing` completed: made on first run and then only added to,
+ * never rotated. Each secret has a maker, and any absent is filled in, so a deployment
+ * that predates a new secret (the session-filesystem ones, say) gains it on the next
+ * start without disturbing the rest. Returns `{ secrets, changed }`.
  */
-function ensureSecrets(layout) {
-  mkdirSync(layout.secrets, { recursive: true, mode: 0o700 });
-  chmodSync(layout.secrets, 0o700);
-  if (!existsSync(layout.privateKey)) {
-    const { privateKeyPem, publicKeyPem } = generateKeyPair();
-    writePrivate(layout.privateKey, privateKeyPem);
-    mkdirSync(layout.keys, { recursive: true });
-    writePublic(layout.publicKey, publicKeyPem);
-  }
+export function completeSecrets(existing = {}) {
+  const secrets = structuredClone(existing);
   const makers = {
     tenantId: () => hexId(),
     timelineId: () => hexId(),
@@ -162,6 +155,7 @@ function ensureSecrets(layout) {
     alasioPassword: () => secret(),
     sandboxMetadataPassword: () => secret(),
     lakePassword: () => secret(),
+    computeControlToken: () => secret(),
   };
   const s3Makers = {
     neon: () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() }),
@@ -169,25 +163,39 @@ function ensureSecrets(layout) {
     sessions: () => ({ accessKey: `sessions${hexId().slice(0, 12)}`, secretKey: secret() }),
     lake: () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() }),
   };
-  const existing = existsSync(layout.secretsFile) ? JSON.parse(readFileSync(layout.secretsFile, "utf8")) : {};
   let changed = false;
   for (const [key, make] of Object.entries(makers)) {
-    if (existing[key] === undefined) {
-      existing[key] = make();
+    if (secrets[key] === undefined) {
+      secrets[key] = make();
       changed = true;
     }
   }
   // s3 gained members (sessions, lake) after some deployments were made; backfill within it.
   for (const [name, make] of Object.entries(s3Makers)) {
-    if (existing.s3[name] === undefined) {
-      existing.s3[name] = make();
+    if (secrets.s3[name] === undefined) {
+      secrets.s3[name] = make();
       changed = true;
     }
   }
-  if (changed) {
-    writePrivate(layout.secretsFile, JSON.stringify(existing, null, 2) + "\n");
+  return { secrets, changed };
+}
+
+/** The stack's secrets on this machine: made once under `layout`, then completed. */
+function ensureSecrets(layout) {
+  mkdirSync(layout.secrets, { recursive: true, mode: 0o700 });
+  chmodSync(layout.secrets, 0o700);
+  if (!existsSync(layout.privateKey)) {
+    const { privateKeyPem, publicKeyPem } = generateKeyPair();
+    writePrivate(layout.privateKey, privateKeyPem);
+    mkdirSync(layout.keys, { recursive: true });
+    writePublic(layout.publicKey, publicKeyPem);
   }
-  return existing;
+  const existing = existsSync(layout.secretsFile) ? JSON.parse(readFileSync(layout.secretsFile, "utf8")) : {};
+  const { secrets, changed } = completeSecrets(existing);
+  if (changed) {
+    writePrivate(layout.secretsFile, JSON.stringify(secrets, null, 2) + "\n");
+  }
+  return secrets;
 }
 
 function toml(value) {
@@ -198,8 +206,48 @@ function toml(value) {
  * Neon's S3 settings as a TOML inline table, double-quoted so it can travel
  * through compose.env's single-quoted values unchanged.
  */
-function remoteStorage(prefix) {
-  return `{ endpoint="http://seaweedfs:8333", bucket_name="${BUCKET}", bucket_region="us-east-1", prefix_in_bucket="${prefix}" }`;
+export function remoteStorage(prefix, { endpoint = "http://seaweedfs:8333", bucket = BUCKET, region = "us-east-1" } = {}) {
+  return `{ endpoint="${endpoint}", bucket_name="${bucket}", bucket_region="${region}", prefix_in_bucket="${prefix}" }`;
+}
+
+/** SeaweedFS's S3 identities: each of Neon, the lake and session volumes on its own bucket, and an admin. */
+export function s3Identities(secrets) {
+  const bucket = (name) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
+  return {
+    identities: [
+      { name: "neon", credentials: [secrets.s3.neon], actions: bucket(BUCKET) },
+      { name: "admin", credentials: [secrets.s3.admin], actions: ["Admin", "Read", "List", "Tagging", "Write"] },
+      { name: "sessions", credentials: [secrets.s3.sessions], actions: bucket(BUCKET_SESSIONS) },
+      { name: "lake", credentials: [secrets.s3.lake], actions: bucket(BUCKET_LAKE) },
+    ],
+  };
+}
+
+/**
+ * The pageserver's configuration: where the broker and the storage controller are, its
+ * remote storage, and the token it calls the controller with. Its key is read from
+ * `publicKeyPath`.
+ */
+export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath, storage }) {
+  return [
+    `broker_endpoint=${toml(brokerUrl)}`,
+    `pg_distrib_dir=${toml("/usr/local/")}`,
+    `listen_pg_addr=${toml("0.0.0.0:6400")}`,
+    `listen_http_addr=${toml("0.0.0.0:9898")}`,
+    `availability_zone=${toml("az-pageserver")}`,
+    `control_plane_api=${toml(`${controllerUrl}/upcall/v1/`)}`,
+    `control_plane_api_token=${toml(token)}`,
+    `http_auth_type='NeonJWT'`,
+    `pg_auth_type='NeonJWT'`,
+    `auth_validation_public_key_path=${toml(publicKeyPath)}`,
+    `remote_storage=${storage}`,
+    "",
+  ].join("\n");
+}
+
+/** How the storage controller and computes reach the pageserver at `host`; it registers itself with these. */
+export function pageserverMetadata(host) {
+  return JSON.stringify({ host, port: 6400, http_host: host, http_port: 9898, availability_zone_id: "az-pageserver" }) + "\n";
 }
 
 /**
@@ -254,37 +302,7 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp, lake }) 
   writePrivate(join(layout.keys, "safekeeper_peer_token"), token("safekeeperdata"));
 
   mkdirSync(join(layout.seaweedfs, "data"), { recursive: true });
-  writePrivate(
-    join(layout.seaweedfs, "s3.json"),
-    JSON.stringify(
-      {
-        identities: [
-          {
-            name: "neon",
-            credentials: [secrets.s3.neon],
-            actions: [`Read:${BUCKET}`, `List:${BUCKET}`, `Tagging:${BUCKET}`, `Write:${BUCKET}`],
-          },
-          {
-            name: "admin",
-            credentials: [secrets.s3.admin],
-            actions: ["Admin", "Read", "List", "Tagging", "Write"],
-          },
-          {
-            name: "sessions",
-            credentials: [secrets.s3.sessions],
-            actions: [`Read:${BUCKET_SESSIONS}`, `List:${BUCKET_SESSIONS}`, `Tagging:${BUCKET_SESSIONS}`, `Write:${BUCKET_SESSIONS}`],
-          },
-          {
-            name: "lake",
-            credentials: [secrets.s3.lake],
-            actions: [`Read:${BUCKET_LAKE}`, `List:${BUCKET_LAKE}`, `Tagging:${BUCKET_LAKE}`, `Write:${BUCKET_LAKE}`],
-          },
-        ],
-      },
-      null,
-      2,
-    ) + "\n",
-  );
+  writePrivate(join(layout.seaweedfs, "s3.json"), JSON.stringify(s3Identities(secrets), null, 2) + "\n");
 
   mkdirSync(layout.controllerDb, { recursive: true });
 
@@ -293,32 +311,16 @@ function renderConfig(layout, secrets, { computePort, bridgeName, otlp, lake }) 
   writePublic(join(layout.pageserver, "auth_public_key.pem"), readFileSync(layout.publicKey, "utf8"));
   // How the storage controller and computes reach this pageserver; it
   // registers itself with these on every start.
-  writePublic(
-    join(layout.pageserver, "metadata.json"),
-    JSON.stringify({
-      host: "pageserver",
-      port: 6400,
-      http_host: "pageserver",
-      http_port: 9898,
-      availability_zone_id: "az-pageserver",
-    }) + "\n",
-  );
+  writePublic(join(layout.pageserver, "metadata.json"), pageserverMetadata("pageserver"));
   writePrivate(
     join(layout.pageserver, "pageserver.toml"),
-    [
-      `broker_endpoint=${toml("http://storage-broker:50051")}`,
-      `pg_distrib_dir=${toml("/usr/local/")}`,
-      `listen_pg_addr=${toml("0.0.0.0:6400")}`,
-      `listen_http_addr=${toml("0.0.0.0:9898")}`,
-      `availability_zone=${toml("az-pageserver")}`,
-      `control_plane_api=${toml("http://storage-controller:1234/upcall/v1/")}`,
-      `control_plane_api_token=${toml(token("generations_api"))}`,
-      `http_auth_type='NeonJWT'`,
-      `pg_auth_type='NeonJWT'`,
-      `auth_validation_public_key_path=${toml("/data/.neon/auth_public_key.pem")}`,
-      `remote_storage=${remoteStorage("pageserver")}`,
-      "",
-    ].join("\n"),
+    pageserverToml({
+      brokerUrl: "http://storage-broker:50051",
+      controllerUrl: "http://storage-controller:1234",
+      token: token("generations_api"),
+      publicKeyPath: "/data/.neon/auth_public_key.pem",
+      storage: remoteStorage("pageserver"),
+    }),
   );
 
   for (const id of SAFEKEEPER_IDS) mkdirSync(layout.safekeeper(id), { recursive: true });

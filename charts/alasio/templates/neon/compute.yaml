@@ -1,0 +1,256 @@
+{{- if .Values.neon.enabled -}}
+{{- $control := include "alasio.neonName" (dict "root" . "component" "control") -}}
+{{- $compute := include "alasio.neonName" (dict "root" . "component" "compute") -}}
+{{- $safekeeper := include "alasio.neonName" (dict "root" . "component" "safekeeper") -}}
+{{- $hosts := list -}}
+{{- range $index := until (int .Values.neon.safekeepers.replicas) -}}
+{{- $hosts = append $hosts (printf "%s-%d.%s.%s.svc.cluster.local" $safekeeper $index $safekeeper $.Release.Namespace) -}}
+{{- end -}}
+# neon-control: alasio's stand-in for Neon's control plane (neon/control/service.js). It
+# bootstraps the tenant and timeline, serves the compute its spec, answers the storage
+# controller's hooks, and repairs a safekeeper that lost its disk. Its record of what it
+# bootstrapped is on a volume of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $control }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-control") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-control") | nindent 4 }}
+  ports:
+    - { name: http, port: 8080 }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $control }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-control") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec: {{- include "alasio.claimSpec" .Values.neon.control.storage | nindent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $control }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-control") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-control") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-control") | nindent 8 }}
+    spec:
+      {{- include "alasio.neonPodSpec" . | nindent 6 }}
+      containers:
+        - name: neon-control
+          image: {{ include "alasio.image" (dict "image" .Values.images.alasio "root" .) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: [node, /opt/alasio/neon/control/service.js]
+          env:
+            - { name: CONTROLLER_URL, value: {{ printf "http://%s:1234" (include "alasio.neonName" (dict "root" . "component" "storage-controller")) | quote }} }
+            - { name: NEON_SAFEKEEPER_HOSTS, value: {{ join "," $hosts | quote }} }
+            - { name: NEON_PAGESERVER_HOST, value: {{ include "alasio.neonName" (dict "root" . "component" "pageserver") | quote }} }
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 3
+          securityContext:
+            {{- include "alasio.restrictedContainer" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          resources: {{- toYaml .Values.neon.control.resources | nindent 12 }}
+          volumeMounts:
+            - { name: state, mountPath: /state }
+            - { name: root, mountPath: /secrets, readOnly: true }
+            - { name: keys, mountPath: /keys, readOnly: true }
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ $control }}
+        - name: root
+          secret:
+            secretName: {{ include "alasio.neonName" (dict "root" . "component" "root") }}
+            defaultMode: 0440
+            items:
+              - { key: secrets.json, path: secrets.json }
+              - { key: auth_private_key.pem, path: auth_private_key.pem }
+        - name: keys
+          secret:
+            secretName: {{ include "alasio.neonName" (dict "root" . "component" "root") }}
+            items:
+              - { key: auth_public_key.pem, path: auth_public_key.pem }
+---
+# The compute: Postgres on alasio's timeline, one primary, its own disk rebuilt from the
+# safekeepers and pageserver on every start. It fetches its spec from neon-control.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $compute }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-compute") | nindent 4 }}
+spec:
+  selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-compute") | nindent 4 }}
+  ports:
+    - { name: postgres, port: 55433 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $compute }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-compute") | nindent 4 }}
+spec:
+  replicas: 1
+  # Never two primaries on one timeline.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-compute") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-compute") | nindent 8 }}
+    spec:
+      {{- include "alasio.imagePullSecrets" . | nindent 6 }}
+      # The compute image runs as its own postgres user.
+      securityContext:
+        fsGroup: {{ .Values.neon.runAsGroup }}
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.neon.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.neon.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      initContainers: {{- include "alasio.waitFor" (dict "root" . "name" "neon-control" "url" (printf "http://%s:8080/healthz" $control)) | nindent 8 }}
+      containers:
+        - name: compute
+          image: {{ include "alasio.image" (dict "image" .Values.neon.computeImage "root" .) }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --pgdata
+            - /var/db/postgres/compute
+            - --connstr
+            - postgresql://cloud_admin@localhost:55433/postgres
+            - --pgbin
+            - /usr/local/bin/postgres
+            - --compute-id
+            - alasio
+            - --control-plane-uri
+            - http://{{ $control }}:8080
+          env:
+            - name: NEON_CONTROL_PLANE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "alasio.neonName" (dict "root" . "component" "compute") }}
+                  key: NEON_CONTROL_PLANE_TOKEN
+            # compute_ctl traces to OTLP, to localhost unless told otherwise: where the
+            # deployment's telemetry goes, or nowhere.
+            {{- if .Values.telemetry.otlpEndpoint }}
+            - { name: OTEL_SERVICE_NAME, value: compute_ctl }
+            {{- include "alasio.otelEnv" . | nindent 12 }}
+            {{- else }}
+            - { name: OTEL_SDK_DISABLED, value: "true" }
+            {{- end }}
+          ports:
+            - { name: postgres, containerPort: 55433 }
+            - { name: http, containerPort: 3080 }
+          readinessProbe:
+            exec:
+              command: [pg_isready, -h, 127.0.0.1, -p, "55433", -U, cloud_admin, -d, postgres]
+            periodSeconds: 5
+          securityContext:
+            {{- include "alasio.restrictedContainer" . | nindent 12 }}
+          resources: {{- toYaml .Values.neon.compute.resources | nindent 12 }}
+          volumeMounts:
+            - { name: pgdata, mountPath: /var/db/postgres }
+      volumes:
+        - name: pgdata
+          emptyDir: {}
+{{- if .Values.neon.backup.enabled }}
+---
+# A logical dump of alasio's database, restorable into any Postgres whatever becomes of
+# the stack, to the object store's backups bucket; the last `keep` are kept.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "alasio.neonName" (dict "root" . "component" "backup") }}
+  labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-backup") | nindent 4 }}
+spec:
+  schedule: {{ .Values.neon.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels: {{- include "alasio.stackLabels" (dict "root" . "component" "neon-backup") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          {{- include "alasio.neonPodSpec" . | nindent 10 }}
+          initContainers:
+            - name: dump
+              image: {{ include "alasio.image" (dict "image" .Values.neon.computeImage "root" .) }}
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                # A new pod's NetworkPolicy may apply a moment after it starts, so the
+                # compute is waited for rather than given up on at the first refusal.
+                - until pg_isready --quiet --host="$0" --port=55433; do sleep 2; done && pg_dump --host="$0" --port=55433 --username=alasio --dbname=alasio --format=custom --file=/backup/alasio.dump
+                - {{ $compute }}
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "alasio.databaseSecret" . }}
+                      key: password
+              securityContext: {{- include "alasio.restrictedContainer" . | nindent 16 }}
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits: { memory: 1Gi }
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+          containers:
+            - name: upload
+              image: {{ include "alasio.image" (dict "image" .Values.neon.image "root" .) }}
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  s3() { aws s3 --endpoint-url "$S3_ENDPOINT" "$@"; }
+                  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+                  s3 cp /backup/alasio.dump "s3://$BUCKET/alasio-$stamp.dump"
+                  s3 ls "s3://$BUCKET/" | awk '{print $4}' | grep '^alasio-.*\.dump$' | sort -r | tail -n +$((KEEP + 1)) \
+                    | while read -r old; do s3 rm "s3://$BUCKET/$old"; done
+              env:
+                - { name: S3_ENDPOINT, value: {{ include "alasio.s3Endpoint" . | quote }} }
+                - { name: BUCKET, value: {{ .Values.objectStore.buckets.backups | quote }} }
+                - { name: KEEP, value: {{ .Values.neon.backup.keep | quote }} }
+                - { name: AWS_DEFAULT_REGION, value: {{ .Values.objectStore.external.region | quote }} }
+                - { name: HOME, value: /tmp }
+              envFrom:
+                - secretRef:
+                    name: {{ include "alasio.neonName" (dict "root" . "component" "s3-admin") }}
+              securityContext: {{- include "alasio.restrictedContainer" . | nindent 16 }}
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 512Mi }
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: backup
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}
+{{- end }}
+{{- end }}

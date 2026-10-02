@@ -413,6 +413,11 @@ test("the receiver takes a session's OTLP with its token only, stamped with what
 
     const response = await post("/v1/traces", { gzip: true });
     assert.equal(response.status, 200);
+    // A full success, as the exporter decodes it: an empty protobuf message.
+    assert.equal(response.headers.get("content-type"), "application/x-protobuf");
+    assert.equal((await response.arrayBuffer()).byteLength, 0);
+    const json = await post("/v1/logs", { type: "application/json", body: Buffer.from("{}") });
+    assert.equal(await json.text(), "{}");
     assert.equal(exported.length, 1);
     const text = exported[0].body.toString("latin1");
     assert.match(text, /fs-abc123/u);

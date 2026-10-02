@@ -30,6 +30,7 @@ export function isStatus(error, code) {
  *
  * - `read(apiVersion, kind, namespace, name)`: the object, or null when there is none.
  * - `create(object)`: the created object; throws with `code` 409 when it exists.
+ * - `replace(object)`: replaces it whole, at its `metadata.resourceVersion`.
  * - `patch(apiVersion, kind, namespace, name, patch)`: a JSON merge patch.
  * - `remove(apiVersion, kind, namespace, name)`: deletes it, with its dependents in the
  *   background; one already gone is not an error.
@@ -53,6 +54,10 @@ export function createKubeClient({ kubeConfig = loadKubeConfig() } = {}) {
 
     async create(object) {
       return await objects.create(object);
+    },
+
+    async replace(object) {
+      return await objects.replace(object);
     },
 
     async patch(apiVersion, kind, namespace, name, patch) {
