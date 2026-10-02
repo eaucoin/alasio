@@ -43,7 +43,9 @@ jobs:
         run: |
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake"; do
             name=${image%%:*}
-            docker build --tag "$REGISTRY/$name:$VERSION" "${image#*:}"
+            docker build --tag "$REGISTRY/$name:$VERSION" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.version=$VERSION" "${image#*:}"
             docker push "$REGISTRY/$name:$VERSION"
             digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
             echo "${name//-/_}=${digest#*@}" >>"$GITHUB_OUTPUT"
