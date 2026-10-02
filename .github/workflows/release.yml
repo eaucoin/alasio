@@ -1,0 +1,102 @@
+name: release
+
+# On demand only, from the version tag being released: publishes alasio's images and its
+# chart, which pins them by digest, to GitHub's container registry.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  REGISTRY: ghcr.io/eaucoin
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # The images and chart take the tag's version, so a run from a branch stops first.
+      - run: |
+          [[ "$GITHUB_REF" == refs/tags/v* ]] ||
+            { echo "::error::Run the release from a v* tag, not $GITHUB_REF"; exit 1; }
+      - uses: actions/checkout@v4
+      - name: The tag, package.json and the chart agree on the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(jq -r .version package.json)" = "$version"
+          test "$(yq .version charts/alasio/Chart.yaml)" = "$version"
+          test "$(yq .appVersion charts/alasio/Chart.yaml)" = "$version"
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+      - uses: ./.github/actions/kube-tools
+      # bayma's image, which the agent image is built on, takes more disk than a
+      # runner starts with free.
+      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: images
+        name: Build and push the images, recording their digests
+        run: |
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake"; do
+            name=${image%%:*}
+            docker build --tag "$REGISTRY/$name:$VERSION" "${image#*:}"
+            docker push "$REGISTRY/$name:$VERSION"
+            digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
+            echo "${name//-/_}=${digest#*@}" >>"$GITHUB_OUTPUT"
+            # The next image's build needs the room this one took.
+            docker image rm "$REGISTRY/$name:$VERSION" >/dev/null
+          done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio
+          subject-digest: ${{ steps.images.outputs.alasio }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio-agent
+          subject-digest: ${{ steps.images.outputs.alasio_agent }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio-lake
+          subject-digest: ${{ steps.images.outputs.alasio_lake }}
+          push-to-registry: true
+      - name: Pin the chart to the images just published, by digest
+        env:
+          ALASIO: ${{ steps.images.outputs.alasio }}
+          AGENT: ${{ steps.images.outputs.alasio_agent }}
+          LAKE: ${{ steps.images.outputs.alasio_lake }}
+        run: |
+          yq -i '
+            .images.alasio.tag = strenv(VERSION) | .images.alasio.digest = strenv(ALASIO) |
+            .images.agent.tag = strenv(VERSION) | .images.agent.digest = strenv(AGENT) |
+            .images.lake.tag = strenv(VERSION) | .images.lake.digest = strenv(LAKE)
+          ' charts/alasio/values.yaml
+          git diff charts/alasio/values.yaml
+      - id: chart
+        name: Package and push the chart
+        run: |
+          echo "${{ github.token }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm dependency build charts/alasio
+          helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
+          helm package charts/alasio --destination dist
+          helm push "dist/alasio-$VERSION.tgz" "oci://$REGISTRY/charts" 2>&1 | tee push.log
+          echo "digest=$(grep -o 'sha256:[0-9a-f]\{64\}' push.log | head -1)" >>"$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/charts/alasio
+          subject-digest: ${{ steps.chart.outputs.digest }}
+          push-to-registry: true
+      # Tolerates a re-run over an existing release.
+      - run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" "dist/alasio-$VERSION.tgz" --title "alasio $VERSION" --generate-notes \
+              --notes "Install: helm install alasio oci://$REGISTRY/charts/alasio --version $VERSION"
+        env:
+          GH_TOKEN: ${{ github.token }}

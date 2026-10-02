@@ -1,0 +1,56 @@
+name: ci
+
+# On demand only, as an end-to-end run builds every image and brings a cluster up.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  chart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/kube-tools
+      - run: helm dependency build charts/alasio
+      - run: helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
+      - run: helm lint charts/alasio --strict --values charts/alasio/ci/host-values.yaml
+      - run: helm lint charts/agent-sandbox --strict
+      - run: helm unittest charts/alasio
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # One node, and a server with two agents, so the stack and sessions spread.
+        agents: [0, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - uses: ./.github/actions/kube-tools
+      # bayma's image, which the agent image is built on, takes more disk than a
+      # runner starts with free.
+      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - run: test/e2e/run.sh
+        env:
+          AGENTS: ${{ matrix.agents }}
