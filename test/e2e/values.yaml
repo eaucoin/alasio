@@ -9,6 +9,17 @@ alasio:
   resources: { requests: { cpu: 50m, memory: 256Mi } }
 telemetry:
   otlpEndpoint: http://otlp.alasio-test.svc:4318
+# The host profile, on the node's /tmp as the operator's home, which any user may write.
+host:
+  enabled: true
+  uid: 1000
+  gid: 1000
+  home: /work
+  stateRoot: /work/.alasio/bayma
+  workspaceRoot: /work
+  mounts:
+    - { name: work, hostPath: /tmp, mountPath: /work, type: Directory }
+  resources: { requests: { cpu: 20m, memory: 128Mi } }
 sessions:
   storage: { size: 1Gi }
   resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { cpu: "1", memory: 1Gi } }

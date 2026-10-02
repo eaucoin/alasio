@@ -100,16 +100,18 @@ const inSession = (volumeId, code) => kubectl(SESSIONS, "exec", volumeId, "-c", 
 const probe = (target) => `fetch(${JSON.stringify(target)},{signal:AbortSignal.timeout(5000)}).then(r=>console.log("open"),e=>console.log("blocked"))`;
 const tcp = (host, port) => `const s=require("net").connect({host:${host},port:${port},timeout:3000});s.on("connect",()=>{console.log("open");process.exit()});s.on("timeout",()=>{console.log("blocked");process.exit()});s.on("error",()=>{console.log("blocked");process.exit()})`;
 
-/** Runs test/e2e/session-roundtrip.mjs in alasio's pod, with alasio's code and ServiceAccount. */
-async function roundtrip(volumeId) {
-  const child = spawn("kubectl", ["--namespace", NAMESPACE, "exec", "-i", `deployment/${FULL}`, "-c", "alasio", "--", "sh", "-c", 'cd /opt/alasio && node --input-type=module - "$0"', volumeId]);
-  child.stdin.end(readFileSync(new URL("./session-roundtrip.mjs", import.meta.url)));
+/** Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its last line, parsed. */
+async function inAlasio(script, ...args) {
+  const child = spawn("kubectl", ["--namespace", NAMESPACE, "exec", "-i", `deployment/${FULL}`, "-c", "alasio", "--", "sh", "-c", 'cd /opt/alasio && node --input-type=module - "$@"', "node", ...args]);
+  child.stdin.end(readFileSync(new URL(script, import.meta.url)));
   let stdout = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   const code = await new Promise((resolve) => child.on("exit", resolve));
   assert.equal(code, 0, stdout);
   return JSON.parse(stdout.trim().split("\n").at(-1));
 }
+
+const roundtrip = (volumeId) => inAlasio("./session-roundtrip.mjs", volumeId);
 
 before(async () => {
   if (skip) return;
@@ -181,6 +183,17 @@ describe("alasio on Kubernetes", { skip }, () => {
       await sleep(3000);
     }
     assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
+  });
+
+  test("a folder conversation's bayma works on the machine as the operator, in their home", async () => {
+    const { url, seen } = await inAlasio("./folder-bayma.mjs");
+    assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
+    assert.deepEqual(seen, { uid: 1000, home: "/work" });
+    // One node shares its /tmp between alasio and the folder's bayma, as a machine does.
+    if (process.env.AGENTS === "0" || !process.env.AGENTS) {
+      const proof = await kubectl(NAMESPACE, "exec", `deployment/${FULL}`, "-c", "alasio", "--", "cat", "/work/e2e-folder-proof");
+      assert.equal(proof, "written by 1000");
+    }
   });
 
   test("alasio comes back from a rollout restart with its conversation's workspace", async () => {
