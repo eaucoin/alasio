@@ -40,12 +40,23 @@ async function secret(name, key) {
   return Buffer.from(await kubectl("get", "secret", name, "-o", `jsonpath={.data.${key.replaceAll(".", "\\.")}}`), "base64").toString("utf8");
 }
 
+/**
+ * A port free on this machine, below the range outgoing connections take theirs from
+ * (32768 up, on Linux), so none takes it while the forward on it is down.
+ */
 async function freePort() {
-  const server = createServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
+  for (;;) {
+    const port = 20000 + Math.floor(Math.random() * 12000);
+    const server = createServer();
+    const free = await new Promise((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(port, "127.0.0.1", () => resolve(true));
+    });
+    if (free) {
+      await new Promise((resolve) => server.close(resolve));
+      return port;
+    }
+  }
 }
 
 /**
@@ -56,9 +67,13 @@ function computeForward(port) {
   let child = null;
   let stopped = false;
   const start = () => {
-    child = spawn("kubectl", ["--namespace", NAMESPACE, "port-forward", `service/${neonName("compute")}`, `${port}:55433`], { stdio: "ignore" });
-    child.on("exit", () => {
-      if (!stopped) setTimeout(start, 1000);
+    child = spawn("kubectl", ["--namespace", NAMESPACE, "port-forward", `service/${neonName("compute")}`, `${port}:55433`], { stdio: ["ignore", "ignore", "pipe"] });
+    let said = "";
+    child.stderr.on("data", (chunk) => { said = String(chunk).trim() || said; });
+    child.on("exit", (code) => {
+      if (stopped) return;
+      console.error(`# the forward to the compute exited ${code}${said ? `: ${said}` : ""}; starting it again`);
+      setTimeout(start, 1000);
     });
   };
   start();
@@ -156,16 +171,18 @@ async function apply(object) {
 }
 
 /**
- * A pod of the stack's own, labelled so the stack's NetworkPolicy admits it, run to
- * completion: its logs. One that fails, or does not finish within `timeoutMs`, fails
- * with its logs and its last events.
+ * A pod of the stack's own, labelled so the stack's NetworkPolicy admits it and placed
+ * where the stack runs, whose nodes hold its images already, run to completion: its logs.
+ * One that fails, or does not finish within `timeoutMs`, fails with its logs and its
+ * last events.
  */
 async function runPod(name, spec, { timeoutMs = 300_000 } = {}) {
+  const nodeSelector = JSON.parse((await kubectl("get", `deployment/${neonName("compute")}`, "-o", "jsonpath={.spec.template.spec.nodeSelector}")).trim() || "{}");
   await apply({
     apiVersion: "v1",
     kind: "Pod",
     metadata: { name, labels: { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon", "app.kubernetes.io/component": "neon-test" } },
-    spec: { restartPolicy: "Never", securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } }, ...spec },
+    spec: { restartPolicy: "Never", nodeSelector, securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } }, ...spec },
   });
   try {
     const deadline = Date.now() + timeoutMs;
