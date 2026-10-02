@@ -1,11 +1,11 @@
 /**
  * bayma's telemetry from session sandboxes on Kubernetes, received over OTLP/HTTP and
- * exported where alasio exports its own (decision 010 of the Kubernetes design). A
+ * exported where alasio exports its own . A
  * sandbox's one permitted egress in "none" mode is this receiver's port on alasio's pod,
  * and bayma inside exports here directly with its Sandbox's token as the bearer.
  *
- * What arrives is untrusted, exactly as what alasio read from the Docker sandboxes'
- * drain was (../telemetry.js): the token says which session sent it, each request's
+ * What arrives is untrusted, since anything in the sandbox can send it: the token says
+ * which session sent it, each request's
  * resources are stamped with what alasio knows about that session in place of what they
  * say, a request that does not parse is dropped, and each session is held to a byte
  * rate, past which it is answered 429 so its exporter backs off and retries.
@@ -14,16 +14,16 @@ import { createServer } from "node:http";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
-import { createLogger } from "../../shared/log.js";
-import { meter, SIGNALS } from "../../telemetry/index.js";
-import { MalformedRequest, stampResources } from "../otlp-resource.js";
+import { createLogger } from "../shared/log.js";
+import { meter, SIGNALS } from "../telemetry/index.js";
+import { MalformedRequest, stampResources } from "./otlp-resource.js";
 
 const log = createLogger("sandbox-telemetry-receiver");
 const gunzipAsync = promisify(gunzip);
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
-// As the drain's relay: far beyond what bayma records, and a bound on what anything
-// else in a sandbox can push through alasio.
+// Far beyond what bayma records, and a bound on what anything else in a sandbox can push
+// through alasio.
 const RATE_BYTES_PER_SECOND = 128 * 1024;
 const BURST_BYTES = 16 * 1024 * 1024;
 const ENCODINGS = { "application/x-protobuf": "protobuf", "application/json": "json" };
@@ -72,7 +72,7 @@ function readBody(request, limit) {
 /**
  * Serves OTLP/HTTP on `port`. `authenticate(token)` resolves the session (its volume
  * id) a bearer token belongs to, or null; `forwarder` exports
- * (../../telemetry/forward.js); `stampFor(volumeId)` is what that session's resources
+ * (../telemetry/forward.js); `stampFor(volumeId)` is what that session's resources
  * are stamped with. Resolves `{ port, close() }` once listening.
  */
 export async function startTelemetryReceiver({ port, host = "0.0.0.0", authenticate, forwarder, stampFor, limiter = createRateLimiter() }) {

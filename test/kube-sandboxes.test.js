@@ -10,7 +10,7 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
 import { exitCodeOf } from "../src/kube/client.js";
-import { getRuntime, loadKubeTemplates } from "../src/kube/config.js";
+import { loadKubeTemplates } from "../src/kube/config.js";
 import {
   createSandboxes,
   newToken,
@@ -20,9 +20,8 @@ import {
   tokenSandboxName,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.js";
-import { hostBaymaManifest, hostBaymaName } from "../src/mcp/bayma-kubernetes.js";
-import { createKubernetesSandbox, EGRESS_GATE_SCRIPT, sessionSandboxManifest } from "../src/sandbox/kubernetes/index.js";
-import { createRateLimiter, startTelemetryReceiver } from "../src/sandbox/kubernetes/telemetry-receiver.js";
+import { createSandbox, EGRESS_GATE_SCRIPT, sessionSandboxManifest } from "../src/sandbox/index.js";
+import { createRateLimiter, startTelemetryReceiver } from "../src/sandbox/telemetry-receiver.js";
 
 const SANDBOX = ["agents.x-k8s.io/v1beta1", "Sandbox"];
 
@@ -113,12 +112,6 @@ function fakeBayma(kube, namespace) {
     return new Response(null, { status: headers.Authorization === `Bearer ${token}` ? 400 : 401 });
   };
 }
-
-test("the runtime is docker unless ALASIO_RUNTIME names kubernetes, and nothing else", () => {
-  assert.equal(getRuntime({}), "docker");
-  assert.equal(getRuntime({ ALASIO_RUNTIME: "kubernetes" }), "kubernetes");
-  assert.throws(() => getRuntime({ ALASIO_RUNTIME: "nomad" }), /ALASIO_RUNTIME must be one of docker, kubernetes/);
-});
 
 test("the deployment's templates are checked as alasio starts", () => {
   const env = { ALASIO_KUBE_TEMPLATES: "/t.json" };
@@ -300,7 +293,7 @@ test("a session on Kubernetes is made when created, and its files are read as it
       return { exitCode: 0, stdout: Buffer.from("hello"), stderr: "" };
     },
   });
-  const sandbox = createKubernetesSandbox({
+  const sandbox = createSandbox({
     templates: { sessions: profile() },
     stateDir: "/tmp/alasio-kube-test",
     env: {},
@@ -332,28 +325,7 @@ test("a session on Kubernetes is made when created, and its files are read as it
 });
 
 test("without a sessions template there are no session filesystems", () => {
-  assert.equal(createKubernetesSandbox({ templates: { host: profile() }, stateDir: "/tmp", kube: fakeKube() }), null);
-});
-
-test("a folder conversation's bayma is a host Sandbox with its own state directory and telemetry", () => {
-  const host = { ...profile(), namespace: "alasio-host", stateRoot: "/home/op/.alasio/bayma" };
-  const sandbox = hostBaymaManifest({
-    harness: "claude",
-    threadKey: "telegram:42",
-    profile: host,
-    env: { OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318" },
-  });
-  assert.equal(sandbox.metadata.name, hostBaymaName("claude", "telegram:42"));
-  assert.match(sandbox.metadata.name, /^bayma-[0-9a-f]{20}$/u);
-  assert.notEqual(hostBaymaName("codex", "telegram:42"), sandbox.metadata.name);
-  assert.equal(sandbox.metadata.namespace, "alasio-host");
-  assert.equal(sandbox.metadata.annotations["alasio.dev/conversation"], "telegram:42");
-  assert.equal(sandbox.metadata.labels["alasio.dev/workload"], "folder");
-  const [bayma] = sandbox.spec.podTemplate.spec.containers;
-  assert.deepEqual(bayma.args.slice(-4), ["--token-file", "/run/alasio/bayma/token", "--state-dir", "/home/op/.alasio/bayma/claude/telegram-42"]);
-  const env = Object.fromEntries(bayma.env.map(({ name, value }) => [name, value]));
-  assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, "http://collector:4318/v1/traces");
-  assert.match(env.OTEL_RESOURCE_ATTRIBUTES, /alasio\.conversation\.id=telegram%3A42/u);
+  assert.equal(createSandbox({ templates: { host: profile() }, stateDir: "/tmp", kube: fakeKube() }), null);
 });
 
 test("an exec's exit code is read from its status", () => {

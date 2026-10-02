@@ -1,13 +1,6 @@
 /**
- * Which runtime alasio drives its workspaces with, and, on Kubernetes, the templates its
- * deployment renders for them.
- *
- * `ALASIO_RUNTIME=kubernetes` makes every workspace an agent-sandbox Sandbox: a session
- * filesystem's in the sessions namespace, a folder workspace's bayma in the host
- * namespace. Docker, the default while it remains, is the single-host runtime.
- *
- * `ALASIO_KUBE_TEMPLATES` is the path of a JSON file, which the Helm chart mounts from
- * a ConfigMap, of the form
+ * The templates the deployment renders for alasio's workspaces: `ALASIO_KUBE_TEMPLATES` is
+ * the path of a JSON file, which the Helm chart mounts from a ConfigMap, of the form
  *
  *     {
  *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
@@ -17,22 +10,9 @@
  *
  * either of which may be absent: no `sessions`, no session filesystems; no `host`, no
  * folder workspaces. Each `podTemplate` has a container named `bayma` whose arguments
- * serve MCP over HTTP on `port`; alasio adds the rest per Sandbox (../kube/sandboxes.js).
+ * serve MCP over HTTP on `port`; alasio adds the rest per Sandbox (./sandboxes.js).
  */
 import { readFileSync } from "node:fs";
-
-export const RUNTIMES = Object.freeze(["docker", "kubernetes"]);
-
-/** The runtime this alasio drives, from `ALASIO_RUNTIME`; docker unless set. */
-export function getRuntime(env = process.env) {
-  const value = env.ALASIO_RUNTIME?.trim() || "docker";
-  if (!RUNTIMES.includes(value)) throw new Error(`ALASIO_RUNTIME must be one of ${RUNTIMES.join(", ")}, got ${JSON.stringify(value)}`);
-  return value;
-}
-
-export function onKubernetes(env = process.env) {
-  return getRuntime(env) === "kubernetes";
-}
 
 const NAMESPACE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
 
@@ -55,7 +35,7 @@ function checkProfile(name, profile) {
  */
 export function loadKubeTemplates(env = process.env, read = (path) => readFileSync(path, "utf8")) {
   const path = env.ALASIO_KUBE_TEMPLATES?.trim();
-  if (!path) throw new Error("ALASIO_RUNTIME is kubernetes but ALASIO_KUBE_TEMPLATES is not set");
+  if (!path) throw new Error("ALASIO_KUBE_TEMPLATES is not set: alasio runs where its Helm chart deploys it");
   let parsed;
   try {
     parsed = JSON.parse(read(path));

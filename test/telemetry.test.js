@@ -38,7 +38,7 @@ const { buildClaudeEnv } = await import("../src/harness/claude/env.js");
 const { buildCodexEnv } = await import("../src/codex/env.js");
 const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app-server/telemetry.js");
 const { AppServerRpcClient } = await import("../src/codex/app-server/rpc-client.js");
-const { baymaLaunch } = await import("../src/mcp/bayma.js");
+const { hostBaymaManifest } = await import("../src/mcp/bayma.js");
 const { TurnController } = await import("../src/codex/turn-controller.js");
 const { createHarnessRegistry } = await import("../src/harness/index.js");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.js");
@@ -134,18 +134,16 @@ test("Claude Code exports each signal alasio exports, labelled with its conversa
   });
 });
 
-test("bayma exports where alasio does, from settings its MCP config hands it", () => {
-  assert.equal(baymaLaunch({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", env: { PATH: "/bin" } }).env, undefined);
-  withEnv({ ...ENDPOINT, OTEL_METRICS_EXPORTER: "none" }, () => {
-    const launch = baymaLaunch({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", env: { PATH: "/bin" } });
-    assert.equal(launch.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, "http://collector:4318/v1/traces");
-    assert.equal(launch.env.OTEL_METRICS_EXPORTER, "none");
-    assert.equal(launch.env.OTEL_RESOURCE_ATTRIBUTES, "alasio.conversation.id=telegram%3A7");
-    // docker hands each on to bayma by name, its value from the MCP config's env.
-    for (const name of Object.keys(launch.env)) {
-      assert.ok(launch.args.some((arg, index) => arg === "--env" && launch.args[index + 1] === name), name);
-    }
-  });
+test("a folder's bayma exports where alasio does, labelled with its conversation", () => {
+  const profile = { namespace: "alasio-host", port: 7290, stateRoot: "/s", podTemplate: { spec: { containers: [{ name: "bayma", args: [] }] } } };
+  const envOf = (env) => Object.fromEntries(
+    hostBaymaManifest({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", profile, env }).spec.podTemplate.spec.containers[0].env.map(({ name, value }) => [name, value]),
+  );
+  assert.deepEqual(envOf({ PATH: "/bin" }), {});
+  const env = envOf({ ...ENDPOINT, OTEL_METRICS_EXPORTER: "none" });
+  assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, "http://collector:4318/v1/traces");
+  assert.equal(env.OTEL_METRICS_EXPORTER, "none");
+  assert.equal(env.OTEL_RESOURCE_ATTRIBUTES, "alasio.conversation.id=telegram%3A7");
 });
 
 test("Codex's app-server exports each signal alasio exports through its own config", () => {

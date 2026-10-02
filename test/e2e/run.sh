@@ -61,4 +61,4 @@ helm install alasio "$root/charts/alasio" --namespace alasio --wait --timeout 20
 
 cd "$root"
 ALASIO_E2E_TELEMETRY=1 node --test --test-concurrency=1 --test-timeout=1800000 test/e2e/alasio.test.mjs
-npm run test:neon:kube
+npm run test:neon

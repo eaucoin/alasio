@@ -9,32 +9,32 @@
  * controller's compute hooks and serves the compute its spec, and reports
  * healthy once the compute can start.
  *
- * The compute gets its spec either way Neon's compute_ctl takes one: from the
- * file written under /state (`--config`, as the Docker stack runs it), or over
- * HTTP from `GET /compute/api/v2/computes/<id>/spec` (`--control-plane-uri`,
- * as the Kubernetes stack runs it), with the compute's token as its bearer.
+ * The compute fetches its spec as Neon's compute_ctl does from a control plane
+ * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with the
+ * compute's token as its bearer.
  *
  * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
- * the order of their ids, comma-separated (safekeeper-1,2,3 unless set); and
- * NEON_PAGESERVER_HOST (pageserver unless set). Mounts: /secrets (secrets.json,
- * the signing key), /keys (the public key), /state (its record, and the
- * compute's spec).
+ * the order of their ids, comma-separated; and NEON_PAGESERVER_HOST. Mounts:
+ * /secrets (secrets.json, the signing key), /keys (the public key), /state (its
+ * record of what it bootstrapped).
  */
-import { readFileSync, renameSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
 import { publicJwks, signToken, verifyToken } from "./jwt.js";
 import { scramVerifier } from "./scram.js";
 
-const CONTROLLER_URL = process.env.CONTROLLER_URL ?? "http://storage-controller:1234";
+const CONTROLLER_URL = process.env.CONTROLLER_URL;
 const PG_VERSION = 17;
 const COMPUTE_PORT = 55433;
-const SAFEKEEPER_HOSTS = (process.env.NEON_SAFEKEEPER_HOSTS ?? "safekeeper-1,safekeeper-2,safekeeper-3").split(",").map((host) => host.trim());
+const SAFEKEEPER_HOSTS = (process.env.NEON_SAFEKEEPER_HOSTS ?? "").split(",").map((host) => host.trim()).filter(Boolean);
 const SAFEKEEPERS = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
-const PAGESERVER_HOST = process.env.NEON_PAGESERVER_HOST ?? "pageserver";
+const PAGESERVER_HOST = process.env.NEON_PAGESERVER_HOST;
 const RECORD = "/state/bootstrap.json";
-const SPEC = "/state/compute/config.json";
+if (!CONTROLLER_URL || SAFEKEEPER_HOSTS.length === 0 || !PAGESERVER_HOST) {
+  throw new Error("CONTROLLER_URL, NEON_SAFEKEEPER_HOSTS and NEON_PAGESERVER_HOST must be set");
+}
 const COMPUTE_ID = "alasio";
 
 const secrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
@@ -191,7 +191,7 @@ function setting(name, value, vartype) {
 let computeConfig = null;
 
 /** The compute's spec: alasio's role and database on alasio's timeline. */
-function writeSpec(record) {
+function makeSpec(record) {
   const hostOf = (id) => SAFEKEEPERS.find((sk) => sk.id === id).host;
   computeConfig = {
     spec: {
@@ -235,9 +235,7 @@ function writeSpec(record) {
     },
     compute_ctl_config: { jwks: publicJwks(publicKeyPem) },
   };
-  mkdirSync("/state/compute", { recursive: true });
-  writeAtomically(SPEC, computeConfig);
-  log("compute spec written");
+  log("compute spec made");
 }
 
 async function bootstrap() {
@@ -250,7 +248,7 @@ async function bootstrap() {
   await ensureTenant();
   const record = await ensureTimeline(readRecord());
   await repairSafekeepers(record);
-  writeSpec(record);
+  makeSpec(record);
   ready = true;
   log("ready");
   setInterval(() => {
@@ -309,7 +307,7 @@ const server = createServer((request, response) => {
 });
 server.listen(8080, "0.0.0.0", () => log("listening", { port: 8080 }));
 
-// As PID 1 in its container, Node would otherwise ignore docker stop's SIGTERM.
+// As PID 1 in its container, Node would otherwise ignore the SIGTERM that stops it.
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 
 bootstrap().catch((error) => {

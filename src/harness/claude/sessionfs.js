@@ -10,7 +10,7 @@
  *   machine, which would reach its loopback.
  * - `settingSources: []` and `strictMcpConfig` keep the operator's settings, hooks,
  *   skills, plugins, and MCP servers out.
- * - bayma, reached through the workspace's forward (sandbox/bayma-forward.js), is the one
+ * - bayma, reached at the session's Sandbox with its token (sandbox/index.js), is the one
  *   MCP server, and so the agent's only way into the workspace.
  */
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../workspace-instructions.js";

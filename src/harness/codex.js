@@ -60,8 +60,8 @@ export function createCodexHarness({
   const directory = sessionFs ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
 
   // What each call runs against: `scope()` for a thread's work (a session filesystem's
-  // starts its session host; a folder's is built by the runtime), `listingScope()` for
-  // thread and model lists and goals, which need no session host.
+  // brings its Sandbox up; a folder's is built by the runtime), `listingScope()` for
+  // thread and model lists and goals, which need no Sandbox.
   const scope = sessionFs
     ? async () => sessionFsCodex.scope({ directory, bayma: (await sandbox.ensureSession(workspace.volumeId)).bayma })
     : null;

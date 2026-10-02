@@ -2,18 +2,17 @@
  * Prepares alasio's Neon on Kubernetes, as a Helm hook Job before the stack starts: the
  * secrets it runs on, made once and kept in one Secret, and what each service is given
  * from them, as a Secret of its own, rendered from them on every install and upgrade.
- * Idempotent, and never rotating: the Kubernetes counterpart of ./setup.js, from whose
- * makers and renderers it builds.
+ * Idempotent, and never rotating.
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the release's full name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
  * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
- * S3_BUCKET_NEON and S3_BUCKET_LAKE; S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
+ * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities are made here otherwise.
  */
 import { generateKeyPair, signToken } from "./jwt.js";
-import { completeSecrets, DATABASE, pageserverMetadata, pageserverToml, PAGESERVER_ID, remoteStorage, ROLE, s3Identities } from "./setup.js";
+import { completeSecrets, DATABASE, pageserverMetadata, pageserverToml, PAGESERVER_ID, remoteStorage, ROLE, s3Identities } from "./secrets.js";
 
 const PUBLIC_KEY = "auth_public_key.pem";
 
@@ -96,7 +95,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }) 
     },
   };
   if (!config.external) {
-    rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets), null, 2) + "\n" };
+    rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, { neon: config.neonBucket, lake: config.lakeBucket }), null, 2) + "\n" };
   }
   return rendered;
 }
@@ -120,6 +119,7 @@ export function setupConfig(env = process.env) {
     s3Endpoint: required("S3_ENDPOINT"),
     s3Region: env.S3_REGION?.trim() || "us-east-1",
     neonBucket: env.S3_BUCKET_NEON?.trim() || "neon",
+    lakeBucket: env.S3_BUCKET_LAKE?.trim() || "lake",
     external,
     ...(external ? { accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") } : {}),
   };

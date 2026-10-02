@@ -41,6 +41,7 @@ test("a turn's response is marked complete only once beforeResponseComplete has 
     persistence: recordingPersistence(calls),
     activeQueries: new Map(),
     codexFactory,
+    folderBayma: async () => ({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
     beforeResponseComplete: async (sessionId) => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       calls.push(`beforeResponseComplete:${sessionId}`);

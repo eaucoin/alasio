@@ -1,7 +1,7 @@
 # The lake service's image (see README.md): Node, DuckDB's Node API, and the DuckDB
 # extensions the lake loads, installed here so none is ever fetched at run time. The
-# base is glibc Debian because DuckDB's Node bindings are built for glibc. Built by
-# alasio as alasio-neon-lake:<revision of this directory> (src/neon/stack.js).
+# base is glibc Debian because DuckDB's Node bindings are built for glibc. Published as
+# ghcr.io/eaucoin/alasio-lake by .github/workflows/release.yml.
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio's analytics lake: DuckLake loaded from alasio's Neon"

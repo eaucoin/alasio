@@ -14,8 +14,7 @@ import {
   sessionFsThreadConfig,
 } from "../src/codex/sessionfs.js";
 import { createSandbox } from "../src/sandbox/index.js";
-import { createMetadataEngine } from "../src/sandbox/metadata-engine.js";
-import { assertValidVolumeId, isValidVolumeId, newVolumeId, sessionHostName, volumeS3Prefix } from "../src/sandbox/names.js";
+import { assertValidVolumeId, isValidVolumeId, newVolumeId } from "../src/sandbox/names.js";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.js";
 
 const dirs = [];
@@ -26,9 +25,9 @@ const tempDir = () => {
 };
 after(() => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); });
 
-const BAYMA = { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer forward-token" } };
+const BAYMA = { url: "http://fs-abc123.alasio-sessions.svc.cluster.local:7290/mcp", headers: { Authorization: "Bearer fs-abc123.token" } };
 
-test("volume ids are validated to JuiceFS's volume-name rule", () => {
+test("volume ids are DNS labels, as the names of their Sandboxes must be", () => {
   assert.equal(isValidVolumeId("fs-1a2b3c4d5e"), true);
   assert.equal(isValidVolumeId("abc"), true);
   assert.equal(isValidVolumeId(`${"a".repeat(63)}`), true);
@@ -36,14 +35,12 @@ test("volume ids are validated to JuiceFS's volume-name rule", () => {
   assert.equal(isValidVolumeId(`${"a".repeat(64)}`), false); // too long
   assert.equal(isValidVolumeId("has_underscore"), false);
   assert.equal(isValidVolumeId("has.dot"), false);
-  assert.equal(isValidVolumeId("fs-Foo1"), false); // JuiceFS rejects uppercase
-  assert.equal(isValidVolumeId("fs-abc-"), false); // and a trailing hyphen
+  assert.equal(isValidVolumeId("fs-Foo1"), false); // no uppercase
+  assert.equal(isValidVolumeId("fs-abc-"), false); // and no trailing hyphen
   assert.equal(isValidVolumeId("-abc"), false);
   assert.throws(() => assertValidVolumeId("no"), /invalid session volume id/);
   const id = newVolumeId(() => "1a2b3c4d-5e6f-7a8b-9c0d-e1f2a3b4c5d6");
   assert.ok(isValidVolumeId(id), id);
-  assert.equal(sessionHostName("fs-abc123"), "alasio-session-fs-abc123");
-  assert.equal(volumeS3Prefix("fs-abc123"), "fs-abc123/");
 });
 
 test("a workspace parses as a folder or a session filesystem, both from one string", () => {
@@ -54,19 +51,6 @@ test("a workspace parses as a folder or a session filesystem, both from one stri
   assert.equal(parseWorkspace(""), null);
   assert.equal(parseWorkspace(null), null);
   assert.throws(() => parseWorkspace("sessionfs:no"), /malformed session-filesystem workspace/);
-});
-
-test("the redis metadata engine builds per-volume URLs and rejects others", () => {
-  const engine = createMetadataEngine({ url: "redis://valkey:6379", databases: 4096 });
-  assert.equal(engine.kind, "redis");
-  assert.equal(engine.namespaceCount, 4095);
-  assert.equal(engine.firstNamespace, 1);
-  assert.equal(engine.metaUrl(7), "redis://valkey:6379/7");
-  assert.equal(engine.metaUrl(4095), "redis://valkey:6379/4095");
-  assert.throws(() => engine.metaUrl(0), /out of range/); // DB 0 reserved
-  assert.throws(() => engine.metaUrl(4096), /out of range/);
-  assert.throws(() => createMetadataEngine({ url: "postgres://pg/db", databases: 16 }), /unsupported/);
-  assert.throws(() => createMetadataEngine({ url: "redis://x", databases: 1 }), /databases count/);
 });
 
 test("a session filesystem's Claude Code keeps only tools that stay off this machine, and reaches bayma alone", () => {
@@ -148,68 +132,10 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
   }
 });
 
-/** A sandbox over a fake Docker: `running` says which session hosts are up. */
-function fakeSandbox({ running = new Set() } = {}) {
-  const calls = [];
-  const forwards = [];
-  const docker = {
-    cli: async (args) => {
-      calls.push(args);
-      if (args[0] === "run") running.add(args[args.indexOf("--name") + 1]);
-      return { stdout: args[0] === "logs" ? "session-host ready 1200\n" : "", stderr: "" };
-    },
-    isRunning: async (name) => running.has(name),
-    spawn: (args) => ({ args }),
-  };
-  const volumes = new Map([["fs-abc123", { id: "fs-abc123", netMode: "none", formatted: true }]]);
-  const store = {
-    sessionVolumes: {
-      getVolume: (id) => volumes.get(id) ?? null,
-      setVolumeFormatted: () => {},
-    },
-  };
-  const stateDir = tempDir();
-  const sandbox = createSandbox({
-    config: {
-      metadata: { url: "redis://valkey:6379", databases: 16, passwordFile: "/run/meta" },
-      s3: { endpoint: "http://seaweedfs:8333", bucket: "sessions", accessKey: "k", secretKey: "s" },
-      host: { network: "alasio-neon_default", agentImage: "alasio/agent", sessionHostImage: "alasio/session-host", memoryMb: 1, cpus: 1, pidsLimit: 1, cacheMb: 1, hostPublicIp: null },
-    },
-    store,
-    stateDir,
-    env: {}, // no telemetry, whatever the environment running the tests exports
-    docker,
-    startForward: async ({ connect }) => {
-      const forward = { connect, url: `http://127.0.0.1:${40000 + forwards.length}/mcp`, headers: { Authorization: "Bearer t" }, closed: false, close: async () => { forward.closed = true; } };
-      forwards.push(forward);
-      return forward;
-    },
-  });
-  sandbox.volumes.mountEnv = () => ({ JFS_META: "redis://valkey:6379/1" });
-  return { sandbox, calls, forwards, stateDir };
-}
-
-test("a session starts once for callers that ask together, and harnesses reach it only through its forward", async () => {
-  const { sandbox, calls, forwards } = fakeSandbox();
-  const [a, b] = await Promise.all([sandbox.ensureSession("fs-abc123"), sandbox.ensureSession("fs-abc123")]);
-  assert.equal(calls.filter((args) => args[0] === "run").length, 1); // one docker run, not a race of two
-  assert.deepEqual(a, { bayma: { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer t" } } });
-  assert.deepEqual(b, a);
-  assert.equal(forwards.length, 1);
-  // Each forwarded connection is a docker exec of agent-connect to bayma's port inside.
-  assert.deepEqual(forwards[0].connect().args, ["exec", "-i", "alasio-session-fs-abc123", "agent-connect", "7290"]);
-  // A host already running (one that outlived a alasio restart) is adopted, not restarted.
-  await sandbox.ensureSession("fs-abc123");
-  assert.equal(calls.filter((args) => args[0] === "run").length, 1);
-  // Closing alasio closes the forwards and leaves the host running.
-  await sandbox.close();
-  assert.equal(forwards[0].closed, true);
-  assert.ok(!calls.some((args) => args[0] === "stop"));
-  assert.equal(calls.filter((args) => args[0] === "rm").length, 1); // only the clear-out before the one start
-});
-
 test("a session's harness directory is its own, under the state directory, outside the sandbox", () => {
-  const { sandbox, stateDir } = fakeSandbox();
+  const stateDir = tempDir();
+  const profile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
+  const sandbox = createSandbox({ templates: { sessions: profile }, stateDir, env: {}, kube: {} });
   const directory = sandbox.harnessDirectory("fs-abc123");
   assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
   assert.ok(existsSync(directory));

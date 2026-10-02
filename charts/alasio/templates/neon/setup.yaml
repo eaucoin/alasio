@@ -83,6 +83,7 @@ spec:
             - { name: S3_ENDPOINT, value: {{ include "alasio.s3Endpoint" . | quote }} }
             - { name: S3_REGION, value: {{ .Values.objectStore.external.region | quote }} }
             - { name: S3_BUCKET_NEON, value: {{ .Values.objectStore.buckets.neon | quote }} }
+            - { name: S3_BUCKET_LAKE, value: {{ .Values.objectStore.buckets.lake | quote }} }
             {{- if not .Values.objectStore.bundled.enabled }}
             - { name: S3_EXTERNAL, value: "1" }
             - name: S3_ACCESS_KEY

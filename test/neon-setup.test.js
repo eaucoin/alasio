@@ -1,169 +1,116 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
-import { generateKeyPair } from "../neon/control/jwt.js";
-import { controlRevision, DEFAULT_BRIDGE, lakeRevision, neonLayout, setupNeon } from "../neon/control/setup.js";
-import { NEON_PROJECT, neonBridgeName, neonTelemetry } from "../src/neon/stack.js";
+import { generateKeyPair, verifyToken } from "../neon/control/jwt.js";
+import { renderSecrets, secretNames, setupConfig, setupKube } from "../neon/control/kube-setup.js";
 
-function withDir(fn) {
-  const dir = mkdtempSync(join(tmpdir(), "alasio-neon-setup-"));
-  try {
-    return fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+const ENV = {
+  NAMESPACE: "alasio",
+  SECRET_PREFIX: "q",
+  NEON_BROKER_URL: "http://q-neon-storage-broker:50051",
+  NEON_CONTROLLER_URL: "http://q-neon-storage-controller:1234",
+  NEON_PAGESERVER_HOST: "q-neon-pageserver",
+  NEON_COMPUTE_HOST: "q-neon-compute",
+  NEON_CONTROLLER_DB_HOST: "q-neon-controller-db",
+  S3_ENDPOINT: "http://q-seaweedfs:8333",
+};
+
+/** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
+function fakeKube() {
+  const secrets = new Map();
+  const stored = (object, version) => ({
+    ...object,
+    metadata: { ...object.metadata, resourceVersion: String(version) },
+    data: Object.fromEntries(Object.entries(object.stringData).map(([k, v]) => [k, Buffer.from(v).toString("base64")])),
+    stringData: undefined,
+  });
+  let version = 0;
+  return {
+    secrets,
+    writes: [],
+    async read(apiVersion, kind, namespace, name) {
+      return structuredClone(secrets.get(name) ?? null);
+    },
+    async create(object) {
+      if (secrets.has(object.metadata.name)) throw Object.assign(new Error("exists"), { code: 409 });
+      this.writes.push(["create", object.metadata.name]);
+      secrets.set(object.metadata.name, stored(object, ++version));
+    },
+    async replace(object) {
+      const current = secrets.get(object.metadata.name);
+      assert.equal(object.metadata.resourceVersion, current.metadata.resourceVersion, "a replace names the version it read");
+      this.writes.push(["replace", object.metadata.name]);
+      secrets.set(object.metadata.name, stored(object, ++version));
+    },
+  };
 }
 
-test("neon-control's revision changes with its code, and only with it", () => {
-  withDir((dir) => {
-    writeFileSync(join(dir, "service.js"), "a");
-    const before = controlRevision(dir);
-    writeFileSync(join(dir, "notes.txt"), "not code");
-    assert.equal(controlRevision(dir), before);
-    writeFileSync(join(dir, "service.js"), "a, changed");
-    assert.notEqual(controlRevision(dir), before);
-  });
+const value = (kube, name, key) => Buffer.from(kube.secrets.get(name).data[key], "base64").toString();
+
+test("the setup's configuration comes from the environment, checked", () => {
+  const config = setupConfig(ENV);
+  assert.equal(config.prefix, "q");
+  assert.equal(config.s3Region, "us-east-1");
+  assert.equal(config.neonBucket, "neon");
+  assert.equal(config.external, false);
+  assert.throws(() => setupConfig({ ...ENV, NEON_COMPUTE_HOST: "" }), /NEON_COMPUTE_HOST must be set/);
+  assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
+  assert.equal(setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" }).accessKey, "a");
 });
 
-test("alasio's stack gets the stable bridge name and any other project a distinct valid one", () => {
-  assert.equal(neonBridgeName(NEON_PROJECT), DEFAULT_BRIDGE);
-  const test1 = neonBridgeName("alasio-neon-test-1");
-  assert.notEqual(test1, DEFAULT_BRIDGE);
-  assert.notEqual(test1, neonBridgeName("alasio-neon-test-2"));
-  assert.match(test1, /^[A-Za-z0-9_.-]{1,15}$/); // a Linux interface name
-  withDir((dir) => {
-    setupNeon(dir, { bridgeName: test1 });
-    assert.match(readFileSync(neonLayout(dir).composeEnv, "utf8"), new RegExp(`^ALASIO_NEON_BRIDGE='${test1}'$`, "m"));
-    assert.throws(() => setupNeon(dir, { bridgeName: "a-name-far-too-long" }), /Linux interface name/);
-  });
+test("the stack's secrets are made once, and every service's rendered from them on each run", async () => {
+  const kube = fakeKube();
+  const config = setupConfig(ENV);
+  await setupKube({ kube, config, log: () => {} });
+  const names = secretNames("q");
+  assert.deepEqual([...kube.secrets.keys()].sort(), Object.values(names).sort());
+  const root = JSON.parse(value(kube, names.root, "secrets.json"));
+  const publicKey = value(kube, names.root, "auth_public_key.pem");
+
+  // Each service gets what it needs, signed with the stack's key.
+  assert.deepEqual(verifyToken(publicKey, value(kube, names.storageController, "CONTROL_PLANE_JWT_TOKEN")), { scope: "admin" });
+  assert.deepEqual(verifyToken(publicKey, value(kube, names.safekeeper, "safekeeper_peer_token")), { scope: "safekeeperdata" });
+  assert.equal(value(kube, names.compute, "NEON_CONTROL_PLANE_TOKEN"), root.computeControlToken);
+  assert.equal(value(kube, names.database, "url"), `postgresql://alasio:${encodeURIComponent(root.alasioPassword)}@q-neon-compute:55433/alasio`);
+  assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
+  assert.match(value(kube, names.pageserver, "pageserver.toml"), /control_plane_api='http:\/\/q-neon-storage-controller:1234\/upcall\/v1\/'/u);
+  assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
+  assert.equal(JSON.parse(value(kube, names.pageserver, "metadata.json")).host, "q-neon-pageserver");
+  assert.deepEqual(JSON.parse(value(kube, names.seaweedfs, "s3.json")).identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
+
+  // A second run keeps every secret and the key, and rewrites what derives from them.
+  await setupKube({ kube, config, log: () => {} });
+  assert.deepEqual(JSON.parse(value(kube, names.root, "secrets.json")), root);
+  assert.equal(value(kube, names.root, "auth_public_key.pem"), publicKey);
+  assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, Object.keys(names).length);
 });
 
-test("the session-filesystem secrets are rendered for the stack and as files for alasio", () => {
-  withDir((dir) => {
-    const layout = setupNeon(dir);
-    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
-    const s3 = JSON.parse(readFileSync(join(layout.seaweedfs, "s3.json"), "utf8"));
-    const sessions = s3.identities.find((identity) => identity.name === "sessions");
-    assert.deepEqual(sessions.actions, ["Read:sessions", "List:sessions", "Tagging:sessions", "Write:sessions"]);
-    assert.equal(readFileSync(layout.sandboxS3KeyFile, "utf8"), secrets.s3.sessions.accessKey);
-    assert.equal(readFileSync(layout.sandboxS3SecretFile, "utf8"), secrets.s3.sessions.secretKey);
-    assert.equal(readFileSync(layout.sandboxMetadataPasswordFile, "utf8"), secrets.sandboxMetadataPassword);
-    assert.match(readFileSync(layout.composeEnv, "utf8"), /^SANDBOX_METADATA_PASSWORD='.+'$/m); // Valkey's requirepass
-  });
+test("a root predating a secret gains it without losing the rest", async () => {
+  const kube = fakeKube();
+  const config = setupConfig(ENV);
+  await setupKube({ kube, config, log: () => {} });
+  const names = secretNames("q");
+  const root = JSON.parse(value(kube, names.root, "secrets.json"));
+  delete root.computeControlToken;
+  const current = kube.secrets.get(names.root);
+  current.data["secrets.json"] = Buffer.from(JSON.stringify(root)).toString("base64");
+  await setupKube({ kube, config, log: () => {} });
+  const completed = JSON.parse(value(kube, names.root, "secrets.json"));
+  assert.equal(completed.alasioPassword, root.alasioPassword);
+  assert.match(completed.computeControlToken, /^[\w-]{32}$/u);
 });
 
-test("a deployment made before a secret existed gains it on the next setup, keeping the rest", () => {
-  withDir((dir) => {
-    const layout = neonLayout(dir);
-    mkdirSync(layout.secrets, { recursive: true });
-    mkdirSync(layout.keys, { recursive: true });
-    const { privateKeyPem, publicKeyPem } = generateKeyPair();
-    writeFileSync(layout.privateKey, privateKeyPem);
-    writeFileSync(layout.publicKey, publicKeyPem);
-    const old = {
-      tenantId: "t",
-      timelineId: "tl",
-      s3: { neon: { accessKey: "n", secretKey: "ns" }, admin: { accessKey: "a", secretKey: "as" } },
-      controllerDbPassword: "c",
-      alasioPassword: "q",
-    };
-    writeFileSync(layout.secretsFile, JSON.stringify(old));
-    setupNeon(dir);
-    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
-    assert.ok(secrets.s3.sessions.accessKey && secrets.sandboxMetadataPassword); // gained
-    assert.ok(secrets.s3.lake.accessKey && secrets.lakePassword);
-    assert.deepEqual(secrets.s3.neon, old.s3.neon); // kept
-    assert.equal(secrets.alasioPassword, "q");
-    assert.equal(secrets.tenantId, "t");
-    const again = readFileSync(layout.secretsFile, "utf8");
-    setupNeon(dir);
-    assert.equal(readFileSync(layout.secretsFile, "utf8"), again); // then stable
+test("with an external object store, every service uses its credentials and no SeaweedFS identities are made", () => {
+  const config = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "AK", S3_SECRET_KEY: "SK", S3_REGION: "eu-west-1", S3_BUCKET_NEON: "my-neon" });
+  const rendered = renderSecrets({
+    secrets: { s3: {}, controllerDbPassword: "c", alasioPassword: "q", lakePassword: "l", computeControlToken: "t" },
+    privateKeyPem: generateKeyPair().privateKeyPem,
+    publicKeyPem: "pk",
+    config,
   });
-});
-
-test("the stack's telemetry collector runs only with an endpoint, and is recreated when its configuration changes", () => {
-  assert.equal(neonTelemetry({}), null);
-  assert.deepEqual(
-    neonTelemetry({ ALASIO_NEON_OTLP_ENDPOINT: "http://collector:4318", OTEL_EXPORTER_OTLP_HEADERS: "authorization=Bearer%20x" }),
-    { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } },
-  );
-  withDir((dir) => {
-    const layout = setupNeon(dir);
-    assert.match(readFileSync(layout.composeEnv, "utf8"), /^COMPOSE_PROFILES=''$/m);
-    assert.equal(existsSync(layout.otelCollectorConfig), false);
-
-    setupNeon(dir, { otlp: { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } } });
-    const composeEnv = readFileSync(layout.composeEnv, "utf8");
-    assert.match(composeEnv, /^COMPOSE_PROFILES='telemetry'$/m);
-    const revision = composeEnv.match(/^ALASIO_NEON_TELEMETRY_REVISION='(\w+)'$/m)[1];
-    const config = JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8"));
-    assert.equal(statSync(layout.otelCollectorConfig).mode & 0o777, 0o600); // it holds the backend's headers
-    assert.deepEqual(config.exporters.otlphttp, { endpoint: "http://collector:4318", headers: { authorization: "Bearer x" } });
-    const targets = config.receivers.prometheus.config.scrape_configs.flatMap((job) => job.static_configs[0].targets);
-    assert.deepEqual(targets, ["pageserver:9898", "safekeeper-1:7676", "safekeeper-2:7676", "safekeeper-3:7676", "storage-controller:1234", "storage-broker:50051", "compute:3080", "seaweedfs:9327"]);
-
-    setupNeon(dir, { otlp: { endpoint: "http://elsewhere:4318", headers: {} } });
-    assert.notEqual(readFileSync(layout.composeEnv, "utf8").match(/^ALASIO_NEON_TELEMETRY_REVISION='(\w+)'$/m)[1], revision);
-  });
-});
-
-const envValue = (layout, name) => readFileSync(layout.composeEnv, "utf8").match(new RegExp(`^${name}='(.*)'$`, "m"))?.[1];
-
-test("the analytics lake's role, database password, and storage identity exist whether or not it runs", () => {
-  withDir((dir) => {
-    const layout = setupNeon(dir);
-    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
-    const s3 = JSON.parse(readFileSync(join(layout.seaweedfs, "s3.json"), "utf8"));
-    const lake = s3.identities.find((identity) => identity.name === "lake");
-    assert.deepEqual(lake.actions, ["Read:lake", "List:lake", "Tagging:lake", "Write:lake"]); // its bucket alone
-    assert.deepEqual(lake.credentials, [secrets.s3.lake]);
-    assert.equal(envValue(layout, "LAKE_DATABASE_PASSWORD"), secrets.lakePassword);
-    assert.equal(envValue(layout, "LAKE_S3_ACCESS_KEY"), secrets.s3.lake.accessKey);
-    assert.equal(envValue(layout, "LAKE_S3_SECRET_KEY"), secrets.s3.lake.secretKey);
-    assert.match(envValue(layout, "ALASIO_NEON_LAKE_IMAGE"), /^alasio-neon-lake:[0-9a-f]{16}$/);
-    assert.equal(envValue(layout, "COMPOSE_PROFILES"), ""); // but it does not run
-  });
-});
-
-test("the lake runs only when on, its metrics scraped with the stack's", () => {
-  withDir((dir) => {
-    const layout = setupNeon(dir, { lake: true });
-    assert.equal(envValue(layout, "COMPOSE_PROFILES"), "lake");
-    setupNeon(dir, { lake: true, otlp: { endpoint: "http://collector:4318", headers: {} } });
-    assert.equal(envValue(layout, "COMPOSE_PROFILES"), "telemetry,lake");
-    const config = JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8"));
-    const jobs = Object.fromEntries(config.receivers.prometheus.config.scrape_configs.map((job) => [job.job_name, job.static_configs[0].targets]));
-    assert.deepEqual(jobs.lake, ["lake:9464"]);
-    setupNeon(dir, { otlp: { endpoint: "http://collector:4318", headers: {} } });
-    assert.equal(JSON.parse(readFileSync(layout.otelCollectorConfig, "utf8")).receivers.prometheus.config.scrape_configs.some((job) => job.job_name === "lake"), false);
-  });
-});
-
-test("the lake's image revision changes with what it is built from, and only with it", () => {
-  withDir((dir) => {
-    mkdirSync(join(dir, "src"));
-    for (const name of ["Dockerfile", ".dockerignore", "package.json", "package-lock.json", "src/service.js"]) writeFileSync(join(dir, name), name);
-    const before = lakeRevision(dir);
-    writeFileSync(join(dir, "README.md"), "not built from");
-    assert.equal(lakeRevision(dir), before);
-    writeFileSync(join(dir, "src", "service.js"), "changed");
-    assert.notEqual(lakeRevision(dir), before);
-  });
-});
-
-test("SeaweedFS is recreated when its S3 identities change, and only then", () => {
-  withDir((dir) => {
-    const layout = setupNeon(dir);
-    const revision = envValue(layout, "ALASIO_NEON_S3_REVISION");
-    setupNeon(dir, { lake: true });
-    assert.equal(envValue(layout, "ALASIO_NEON_S3_REVISION"), revision);
-    const secrets = JSON.parse(readFileSync(layout.secretsFile, "utf8"));
-    secrets.s3.lake.secretKey = "rotated";
-    writeFileSync(layout.secretsFile, JSON.stringify(secrets));
-    setupNeon(dir);
-    assert.notEqual(envValue(layout, "ALASIO_NEON_S3_REVISION"), revision);
-  });
+  const names = secretNames("q");
+  assert.equal(rendered[names.seaweedfs], undefined);
+  assert.equal(rendered[names.safekeeper].AWS_ACCESS_KEY_ID, "AK");
+  assert.equal(rendered[names.lake].LAKE_S3_SECRET, "SK");
+  assert.match(rendered[names.safekeeper].REMOTE_STORAGE, /bucket_name="my-neon", bucket_region="eu-west-1"/u);
 });

@@ -3,64 +3,48 @@ import { test } from "node:test";
 
 import { looksLikeSelfRestartCommand, looksLikeSelfRestartNearMiss } from "../src/policy/restart-command.js";
 
-test("self-restart detector accepts the Alasio restart wrapper", () => {
-  const commands = [
-    "/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh",
-    "cd /home/operator/monorepo-alasio-runtime/bots/alasio && ./restart-alasio-operator.sh",
-    "cd /home/operator/monorepo-alasio-runtime && bots/alasio/restart-alasio-operator.sh",
-    "bash -lc 'cd /home/operator/monorepo-alasio-runtime/bots/alasio && ./restart-alasio-operator.sh'",
-    "bash /home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh",
-    "/bin/bash -lc ./restart-alasio-operator.sh",
-  ];
+const env = { ALASIO_DEPLOYMENT: "alasio" };
 
-  for (const command of commands) {
-    assert.equal(looksLikeSelfRestartCommand(command), true, command);
-    assert.equal(looksLikeSelfRestartNearMiss(command), false, command);
+test("a rollout restart of alasio's own Deployment is a self-restart, however it is spelled", () => {
+  for (const command of [
+    "kubectl rollout restart deployment/alasio",
+    "kubectl -n alasio rollout restart deployment/alasio",
+    "kubectl rollout restart deploy/alasio --namespace alasio",
+    "kubectl --namespace=alasio rollout restart deployment alasio",
+    "/home/op/.local/bin/kubectl rollout restart deployments.apps/alasio",
+    "bash -lc 'kubectl -n alasio rollout restart deployment/alasio'",
+  ]) {
+    assert.equal(looksLikeSelfRestartCommand(command, { env }), true, command);
+    assert.equal(looksLikeSelfRestartNearMiss(command, { env }), false, command);
   }
 });
 
-test("self-restart detector accepts direct alasio systemd restarts", () => {
-  const commands = [
-    "sudo -n systemctl restart alasio.service",
-    "/usr/bin/sudo -n /usr/bin/systemctl restart alasio",
-    "bash -lc 'sudo -n systemctl restart alasio.service'",
-  ];
+test("a release's own Deployment name is the one that counts", () => {
+  const named = { ALASIO_DEPLOYMENT: "bot-alasio" };
+  assert.equal(looksLikeSelfRestartCommand("kubectl rollout restart deployment/bot-alasio", { env: named }), true);
+  assert.equal(looksLikeSelfRestartCommand("kubectl rollout restart deployment/alasio", { env: named }), false);
+});
 
-  for (const command of commands) {
-    assert.equal(looksLikeSelfRestartCommand(command), true, command);
-    assert.equal(looksLikeSelfRestartNearMiss(command), false, command);
+test("other rollouts and other commands are not alasio restarting", () => {
+  for (const command of [
+    "kubectl rollout restart deployment/alasio-lake",
+    "kubectl rollout status deployment/alasio",
+    "kubectl delete pod alasio-abc",
+    "systemctl restart alasio-standalone.service",
+    "echo kubectl rollout restart deployment/alasio",
+    "kubectl rollout restart deployment/alasio/x",
+  ]) {
+    assert.equal(looksLikeSelfRestartCommand(command, { env }), false, command);
   }
 });
 
-test("self-restart detector flags restart-shaped commands with extra args", () => {
-  const commands = [
-    "sudo -n systemctl restart alasio.service --now",
-    "cd /home/operator/monorepo-alasio-runtime/bots/alasio && ./restart-alasio-operator.sh --bad",
-    "bash -lc 'cd /home/operator/monorepo-alasio-runtime && bots/alasio/restart-alasio-operator.sh --bad'",
-  ];
-
-  for (const command of commands) {
-    assert.equal(looksLikeSelfRestartCommand(command), false, command);
-    assert.equal(looksLikeSelfRestartNearMiss(command), true, command);
+test("a rollout restart of alasio among others is a near miss, worth a warning", () => {
+  for (const command of [
+    "kubectl rollout restart deployment/alasio deployment/alasio-lake",
+    "kubectl rollout restart deployment alasio extra",
+  ]) {
+    assert.equal(looksLikeSelfRestartCommand(command, { env }), false, command);
+    assert.equal(looksLikeSelfRestartNearMiss(command, { env }), true, command);
   }
-});
-
-test("self-restart detector accepts the standalone restart wrapper and unit", () => {
-  const commands = [
-    "/home/operator/alasio/restart-alasio-standalone.sh",
-    "cd /home/operator/alasio && ./restart-alasio-standalone.sh",
-    "bash -lc 'cd /home/operator/alasio && ./restart-alasio-standalone.sh'",
-    "bash /home/operator/alasio/restart-alasio-standalone.sh",
-    "sudo -n systemctl restart alasio-standalone.service",
-    "/usr/bin/sudo -n /usr/bin/systemctl restart alasio-standalone",
-  ];
-
-  for (const command of commands) {
-    assert.equal(looksLikeSelfRestartCommand(command), true, command);
-    assert.equal(looksLikeSelfRestartNearMiss(command), false, command);
-  }
-
-  assert.equal(looksLikeSelfRestartCommand("cd /home/operator/alasio && ./restart-alasio-standalone.sh --bad"), false);
-  assert.equal(looksLikeSelfRestartNearMiss("cd /home/operator/alasio && ./restart-alasio-standalone.sh --bad"), true);
-  assert.equal(looksLikeSelfRestartNearMiss("sudo -n systemctl restart alasio-standalone.service --now"), true);
+  assert.equal(looksLikeSelfRestartNearMiss("kubectl rollout restart deployment/alasio-lake", { env }), false);
 });

@@ -1,9 +1,9 @@
 /**
  * Sandboxes: agent-sandbox's `Sandbox` objects (agents.x-k8s.io/v1beta1), each one pod
  * running bayma's MCP over HTTP, with its own Service, volumes and bearer token, which
- * alasio creates, resumes, suspends and deletes. Session filesystems
- * (../sandbox/kubernetes/) and folder workspaces' bayma (../mcp/bayma-kubernetes.js) are
- * both Sandboxes; they differ in the template they are made from and what each adds.
+ * alasio creates, resumes, suspends and deletes. Session filesystems (../sandbox/) and
+ * folder workspaces' bayma (../mcp/bayma.js) are both Sandboxes; they differ in the
+ * template they are made from and what each adds.
  *
  * A Sandbox's token is in a Secret of its own, owned by the Sandbox, so it is deleted
  * with it. bayma reads the token from a file (`--token-file`) and refuses any request
@@ -44,7 +44,7 @@ export function tokenSecretName(name) {
 
 /**
  * A token that names its Sandbox, `<name>.<random>`, so what presents one can be looked
- * up by it (./../sandbox/kubernetes/telemetry-receiver.js) without a table of tokens.
+ * up by it (../sandbox/telemetry-receiver.js) without a table of tokens.
  */
 export function newToken(name, random = () => randomBytes(32).toString("base64url")) {
   return `${name}.${random()}`;
@@ -135,7 +135,7 @@ export function sandboxReady(sandbox) {
 }
 
 /**
- * The Sandboxes of one namespace. `kube` is ../kube/client.js's client; `port` is
+ * The Sandboxes of one namespace. `kube` is ./client.js's client; `port` is
  * bayma's in every one; `fetchImpl` reaches bayma to see that it answers.
  *
  * - `ensure(name, manifest)`: makes sure the Sandbox exists (made from `manifest()`

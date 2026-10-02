@@ -1,209 +1,101 @@
 /**
- * bayma, the MCP server alasio itself gives its agents, next to whatever
- * servers the operator has configured for each harness on this machine.
+ * bayma, the MCP server alasio itself gives its agents, beside whatever servers the
+ * operator has configured for each harness.
  *
- * bayma runs from its image, pinned by digest, as a container beside alasio's
- * own through the host's Docker. Its container keeps what alasio's keeps (see
- * container/run.sh), so its REPL sessions can do what alasio's agents can: the
- * same user, /home and /tmp at the same paths, the host's network, Docker,
- * Tailscale, Stripe, Google Cloud, and systemd, and the environment it is
- * given. It
- * keeps its own processes, though, which is what lets bayma snapshot idle
- * REPL sessions as it stops and restore them whole in the next container.
- * Each harness adapter turns `baymaLaunch` into its own MCP config shape.
+ * A folder workspace's bayma is a Sandbox (../kube/sandboxes.js) per conversation and
+ * harness in the host namespace, made from the deployment's `host` template: the
+ * operator's opt-in to agents that work on a machine's own files. The template mounts
+ * what the operator chose from the node and runs bayma with what it needs to snapshot its
+ * REPL sessions as it stops and restore them whole as it starts; alasio adds only what is
+ * per conversation: bayma's state directory under the template's `stateRoot`, keyed by
+ * harness and conversation, and the conversation's telemetry settings. Harnesses reach it
+ * over MCP HTTP with its token; each adapter turns the server into its own config shape.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { statSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
-import { resolveStateDir } from "../config.js";
-import { loadKubeTemplates, onKubernetes } from "../kube/config.js";
-import { createLogger } from "../shared/log.js";
-import { conversationTelemetryEnv, inSpan } from "../telemetry/index.js";
-import { createHostBayma, sanitizePathToken } from "./bayma-kubernetes.js";
+import { createKubeClient } from "../kube/client.js";
+import { loadKubeTemplates } from "../kube/config.js";
+import { BAYMA_CONTAINER, createSandboxes, sandboxManifest } from "../kube/sandboxes.js";
+import { conversationTelemetryEnv } from "../telemetry/index.js";
 
 export const BAYMA_SERVER_NAME = "bayma";
 
-export const BAYMA_IMAGE =
-  "ghcr.io/eaucoin/bayma:0.10.0@sha256:d06080edb45b4929173fd58cf1f56dd1d9b94b0aa40e243097a6030623d26d2a";
-
 /**
- * A server that follows one on the same state directory waits for it to
- * snapshot its REPL sessions and stop, so allow well beyond a warm start.
+ * How long a harness waits for bayma as it starts: a conversation's first turn makes its
+ * Sandbox, and one that was suspended resumes, restoring its REPL sessions.
  */
 export const BAYMA_STARTUP_TIMEOUT_MS = 60_000;
 
-const DOCKER_SOCKET = "/var/run/docker.sock";
+const WORKLOAD_LABEL = "alasio.dev/workload";
+const HARNESS_LABEL = "alasio.dev/harness";
+const CONVERSATION_ANNOTATION = "alasio.dev/conversation";
 
-/** The container label that names the state directory a bayma serves. */
-const STATE_LABEL = "alasio.bayma.state-dir";
+/** A path segment from `value`. */
+export function sanitizePathToken(value) {
+  return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
+}
 
-// Mounted from the host at the same path, read-only unless bayma's sessions
-// write through them.
-const HOST_MOUNTS = [
-  "/etc/passwd:/etc/passwd:ro",
-  "/etc/group:/etc/group:ro",
-  "/etc/localtime:/etc/localtime:ro",
-  "/home:/home",
-  "/tmp:/tmp",
-  `${DOCKER_SOCKET}:${DOCKER_SOCKET}`,
-  "/usr/bin/docker:/usr/bin/docker:ro",
-  "/usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro",
-  "/var/run/tailscale:/var/run/tailscale",
-  "/usr/bin/tailscale:/usr/bin/tailscale:ro",
-  "/usr/bin/stripe:/usr/bin/stripe:ro",
-  "/usr/lib/google-cloud-sdk:/usr/lib/google-cloud-sdk:ro",
-  // The host's systemd, which restart-alasio-standalone.sh restarts alasio
-  // through, and the host's systemctl to reach it with.
-  "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket",
-  "/run/systemd:/run/systemd:ro",
-  "/usr/bin/systemctl:/usr/bin/systemctl:ro",
-  "/usr/lib/x86_64-linux-gnu/systemd:/usr/lib/x86_64-linux-gnu/systemd:ro",
-];
-
-// What bayma's container needs of its own: the image's PATH, which finds
-// CRIU and bayma's runtimes, and bayma's own settings.
-const OWN_VARIABLE = /^(PATH|HOSTNAME|BAYMA_.*)$/u;
-
-// A bayma snapshots its REPL sessions as it stops and holds its state
-// directory until it has, so the next one on that directory stops any bayma
-// still running there, then starts. Stopping rather than waiting matters: a
-// bayma whose alasio went away without closing its input never exits on its
-// own, and waiting on it left every later Claude session without bayma.
-// `docker stop` sends the same SIGTERM a normal shutdown does, so the old
-// bayma snapshots and exits (and one already stopping is simply waited for);
-// past docker's grace period it is killed and its sessions resume from their
-// histories instead of the snapshot.
-const STOP_THEN_RUN = `ids=$(docker ps --quiet --filter "label=${STATE_LABEL}=$0"); [ -z "$ids" ] || docker stop $ids >/dev/null; exec docker run --label "${STATE_LABEL}=$0" "$@"`;
-
-const log = createLogger("bayma");
-
-/**
- * Sessions are checkpointed, bayma's default, stated so a alasio restart can
- * never take them with it: a checkpointed session outlives the server,
- * restored whole where its processes were snapshotted, and otherwise resumed
- * with its history and what its code checkpointed.
- */
-function stdioCommand(stateDir, env) {
-  const environment = Object.keys(env)
-    .filter((name) => env[name] !== undefined && !OWN_VARIABLE.test(name))
-    .sort()
-    .flatMap((name) => ["--env", name]);
-  return {
-    command: "/bin/sh",
-    args: [
-      "-c",
-      STOP_THEN_RUN,
-      stateDir,
-      "--interactive",
-      "--rm",
-      "--log-driver",
-      "none",
-      "--user",
-      `${process.getuid()}:${process.getgid()}`,
-      "--group-add",
-      String(statSync(DOCKER_SOCKET).gid),
-      "--network",
-      "host",
-      // What CRIU needs to snapshot and restore the container's processes.
-      "--cap-add",
-      "CHECKPOINT_RESTORE",
-      "--cap-add",
-      "SYS_PTRACE",
-      "--security-opt",
-      "seccomp=unconfined",
-      // As alasio's own container: Docker's AppArmor profile keeps a container
-      // off the host's D-Bus, and so from its systemd.
-      "--security-opt",
-      "apparmor=unconfined",
-      ...HOST_MOUNTS.flatMap((mount) => ["--volume", mount]),
-      ...environment,
-      BAYMA_IMAGE,
-      "mcp-stdio",
-      "--default-durability",
-      "checkpointed",
-      "--state-dir",
-      stateDir,
-    ],
-  };
+/** The Sandbox serving bayma to one conversation under one harness. */
+export function hostBaymaName(harness, threadKey) {
+  return `bayma-${createHash("sha256").update(`${harness}\0${threadKey}`).digest("hex").slice(0, 20)}`;
 }
 
 /**
- * The command that serves bayma to one conversation under one harness.
- *
- * bayma leases its state directory to a single server, and a Codex thread
- * keeps its server alive after the conversation switches to Claude, so the
- * directory is keyed by harness as well as conversation. It lives under
- * alasio's state directory and is stable across restarts, so the next server
- * finds the previous one's sessions there.
+ * Where that bayma keeps its state, as the pod sees it. bayma leases its state directory
+ * to a single server, and a Codex thread keeps its server alive after the conversation
+ * switches to Claude, so the directory is keyed by harness as well as conversation.
  */
-export function baymaLaunch({ harness, threadKey, env = process.env }) {
-  // bayma exports its own telemetry where alasio exports its, labelled with the
-  // conversation, from settings the MCP config gives the command explicitly: the env
-  // it is launched from holds none of alasio's (telemetry/config.js), and Codex hands
-  // its servers an allowlist of the rest.
-  const telemetry = conversationTelemetryEnv({ conversationId: threadKey });
-  return {
-    ...stdioCommand(
-      join(resolveStateDir(env), "bayma", sanitizePathToken(harness), sanitizePathToken(threadKey)),
-      { ...env, ...telemetry },
-    ),
-    ...(Object.keys(telemetry).length > 0 ? { env: telemetry } : {}),
-  };
+export function hostBaymaStateDir(profile, harness, threadKey) {
+  return join(profile.stateRoot, sanitizePathToken(harness), sanitizePathToken(threadKey));
 }
-
-async function checkBayma(env) {
-  const stateDir = await mkdtemp(join(tmpdir(), "alasio-bayma-check-"));
-  const client = new Client({ name: "alasio-bayma-check", version: "1.0.0" });
-  try {
-    const { command, args } = stdioCommand(stateDir, env);
-    const timeout = { timeout: BAYMA_STARTUP_TIMEOUT_MS };
-    await client.connect(new StdioClientTransport({ command, args, env, stderr: "ignore" }), timeout);
-    const { tools } = await client.listTools(undefined, timeout);
-    if (tools.length === 0) {
-      throw new Error("bayma started but exposed no tools");
-    }
-    log.info(`ready (tools=${tools.length})`);
-  } finally {
-    await client.close().catch(() => {});
-    await rm(stateDir, { recursive: true, force: true });
-  }
-}
-
-let readiness = null;
 
 /**
- * Prove once per alasio process that bayma starts and serves its tools, so a
- * harness never begins a turn believing it has a REPL it cannot reach. The
- * check runs against a throwaway state directory; a failure is retried on the
- * next turn.
+ * The Sandbox for `harness` and `threadKey` from the `host` profile, exporting its
+ * telemetry where alasio exports its own, labelled with the conversation. Pure, for tests.
  */
-export function ensureBaymaReady(env) {
-  readiness ??= inSpan("alasio.bayma.check", {}, () => checkBayma(env)).catch((error) => {
-    readiness = null;
-    throw new Error(`bayma is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+export function hostBaymaManifest({ harness, threadKey, profile, env = process.env }) {
+  const telemetry = conversationTelemetryEnv({ conversationId: threadKey }, env);
+  return sandboxManifest({
+    name: hostBaymaName(harness, threadKey),
+    namespace: profile.namespace,
+    template: profile,
+    labels: { [WORKLOAD_LABEL]: "folder", [HARNESS_LABEL]: sanitizePathToken(harness) },
+    annotations: { [CONVERSATION_ANNOTATION]: threadKey },
+    configure(spec) {
+      const bayma = spec.containers.find((container) => container.name === BAYMA_CONTAINER);
+      bayma.args = [...bayma.args, "--state-dir", hostBaymaStateDir(profile, harness, threadKey)];
+      bayma.env = [...(bayma.env ?? []), ...Object.entries(telemetry).map(([name, value]) => ({ name, value }))];
+      return spec;
+    },
   });
-  return readiness;
+}
+
+/**
+ * The folder workspaces' bayma, or null when the deployment renders no `host` template.
+ * `ensure({ harness, threadKey })` resolves `{ url, headers }` once that conversation's
+ * bayma answers.
+ */
+export function createHostBayma({ templates, kube = null, env = process.env, fetchImpl = fetch }) {
+  const profile = templates?.host;
+  if (!profile) return null;
+  const sandboxes = createSandboxes({ kube: kube ?? createKubeClient(), namespace: profile.namespace, port: profile.port, fetchImpl });
+  return {
+    async ensure({ harness, threadKey }) {
+      return await sandboxes.ensure(hostBaymaName(harness, threadKey), () => hostBaymaManifest({ harness, threadKey, profile, env }));
+    },
+  };
 }
 
 let hostBayma = null;
 
 /**
  * The bayma MCP server a folder workspace's conversation gets under `harness`, once it
- * can be reached: `{ type: "stdio", command, args, env? }` on Docker, launched by the
- * harness, or `{ type: "http", url, headers }` on Kubernetes, the conversation's
- * Sandbox (./bayma-kubernetes.js). Each harness adapter turns it into its own MCP
- * config shape.
+ * answers: `{ type: "http", url, headers }`, in Claude Code's MCP config shape. `env`
+ * is alasio's own, whose telemetry settings the harnesses' environments leave out.
  */
 export async function folderBaymaServer({ harness, threadKey, env = process.env }) {
-  if (onKubernetes(env)) {
-    hostBayma ??= createHostBayma({ templates: loadKubeTemplates(env) });
-    if (!hostBayma) throw new Error("this deployment offers no folder workspaces: its Kubernetes templates have no host profile");
-    return { type: "http", ...(await hostBayma.ensure({ harness, threadKey })) };
-  }
-  await ensureBaymaReady(env);
-  return { type: "stdio", ...baymaLaunch({ harness, threadKey, env }) };
+  hostBayma ??= createHostBayma({ templates: loadKubeTemplates(env), env });
+  if (!hostBayma) throw new Error("this deployment offers no folder workspaces: its templates have no host profile");
+  return { type: "http", ...(await hostBayma.ensure({ harness, threadKey })) };
 }

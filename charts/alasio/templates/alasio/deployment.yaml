@@ -57,7 +57,6 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           workingDir: {{ $home }}
           env:
-            - { name: ALASIO_RUNTIME, value: kubernetes }
             - { name: ALASIO_KUBE_TEMPLATES, value: /etc/alasio/templates.json }
             - { name: ALASIO_STATE_DIR, value: /var/lib/alasio/state }
             - { name: HOME, value: {{ $home | quote }} }

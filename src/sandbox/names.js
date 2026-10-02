@@ -1,15 +1,15 @@
 /**
  * Naming for session filesystems. A workspace is one of two kinds (see
- * ../workspace/kind.js): a folder on the host, or a session filesystem identified by a
- * volume id. A volume id is what alasio generates and stores; the JuiceFS volume name,
- * the S3 prefix, and the metadata namespace all derive from it.
+ * ../workspace/kind.js): a folder, or a session filesystem identified by a volume id.
+ * A volume id is what alasio generates and stores, and its session's Sandbox, Service and
+ * volume claim are named for it.
  */
 
 /**
- * JuiceFS requires a volume name of 3–63 characters from `[a-z0-9-]` that starts and
- * ends with a letter or digit (verified against `juicefs format` 1.4.1, which rejects
- * `fs-Foo1` and `fs-abc-` although its message says "alphabet"). alasio generates ids
- * that already satisfy this, and this guards against any that would not.
+ * A volume id is a DNS label of 3–63 characters from `[a-z0-9-]` that starts and ends
+ * with a letter or digit, as the names of the Sandbox, its Service and its pod must be.
+ * alasio generates ids that already satisfy this, and this guards against any that would
+ * not.
  */
 const VOLUME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
@@ -27,14 +27,4 @@ export function assertValidVolumeId(volumeId) {
 /** A fresh volume id, e.g. `fs-1a2b3c4d5e`, valid by construction. */
 export function newVolumeId(random = () => crypto.randomUUID()) {
   return `fs-${random().replace(/-/g, "").slice(0, 12)}`;
-}
-
-/** The container name alasio gives a session host, one per volume. */
-export function sessionHostName(volumeId) {
-  return `alasio-session-${assertValidVolumeId(volumeId)}`;
-}
-
-/** The S3 prefix (a bucket subpath) a volume's data lives under. */
-export function volumeS3Prefix(volumeId) {
-  return `${assertValidVolumeId(volumeId)}/`;
 }

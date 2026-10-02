@@ -49,7 +49,7 @@ before(async () => {
   await store.ensureSchema();
   rollouts = new NeonRolloutStore(admin);
   await rollouts.ensureSchema();
-  // As alasio makes them as it starts (src/neon/stack.js).
+  // As alasio makes them as it starts (src/neon/connect.js).
   await ensureLakeRole(admin, LAKE_PASSWORD);
   await syncLakeReads(admin, true);
   dataDir = mkdtempSync(join(tmpdir(), "alasio-lake-data-"));

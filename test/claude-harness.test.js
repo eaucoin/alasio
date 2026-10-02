@@ -51,11 +51,15 @@ function assistant(content, extra = {}) {
 }
 
 /** One turn on a throwaway live-session registry, closed once the turn returns. */
+/** A folder conversation's bayma, as the deployment's host profile would give it. */
+const folderBayma = async ({ threadKey }) => ({ type: "http", url: `http://bayma-${threadKey.replace(/\W/gu, "")}.alasio-host.svc:7290/mcp`, headers: { Authorization: "Bearer t" } });
+
 async function runClaudeTurn(params) {
   const liveSessions = createClaudeLiveSessions({
     workingDirectory: params.workingDirectory,
     sessions: params.sessions,
     queryFactory: params.queryFactory,
+    folderBayma,
   });
   try {
     return await executeClaudeTurn({ ...params, liveSessions });
@@ -514,7 +518,7 @@ test("a restart through a Bun shell in bayma exec records self-induced provenanc
       await options.hooks.PreToolUse[0].hooks[0]({
         hook_event_name: "PreToolUse",
         tool_name: "mcp__bayma__exec",
-        tool_input: { session_id: "b1", code: "await $`./restart-alasio-standalone.sh`" },
+        tool_input: { session_id: "b1", code: "await $`kubectl rollout restart deployment/alasio`" },
         tool_use_id: "t1",
       });
       yield { type: "result", subtype: "success", is_error: false, result: "Restarting.", session_id: "s-5", user_message_uuids: [first.value.uuid] };
@@ -719,7 +723,7 @@ test("background work keeps running after the answer and its report is delivered
   const persistence = createPersistence();
   const activeQueries = new Map();
   const cli = createFakeCli();
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
   const events = [];
   const turn = executeClaudeTurn({
     ...turnParams(persistence, activeQueries),
@@ -761,7 +765,7 @@ test("later prompts on the same session reuse the live process; a new session or
   persistence.getModelChoice = () => model;
   const activeQueries = new Map();
   const cli = createFakeCli();
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
   const answer = async (text) => {
     const received = await cli.nextPrompt();
     cli.emit({ type: "result", subtype: "success", is_error: false, result: `re: ${received.message.content}`, session_id: "s-1", user_message_uuids: [received.uuid] });
@@ -793,7 +797,7 @@ test("steering a Claude-started turn is answered in that turn's own reply", asyn
   const persistence = createPersistence();
   const activeQueries = new Map();
   const cli = createFakeCli();
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
   const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
   const first = await cli.nextPrompt();
   cli.emit({ type: "result", subtype: "success", is_error: false, result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] });
@@ -816,7 +820,7 @@ test("/stop interrupts the turn without killing the process, and the interrupted
   const persistence = createPersistence();
   const activeQueries = new Map();
   const cli = createFakeCli();
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
   const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
   const first = await cli.nextPrompt();
   cli.emit(assistant([{ type: "text", text: "Working..." }]));
@@ -840,7 +844,7 @@ test("a Claude Code process that exits mid-turn fails that turn and the next pro
   const persistence = createPersistence();
   const activeQueries = new Map();
   const cli = createFakeCli();
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory });
+  const liveSessions = createClaudeLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
   const turn = executeClaudeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
   await cli.nextPrompt();
   cli.state.options[0].abortController.abort("crash");

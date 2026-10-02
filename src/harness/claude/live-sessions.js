@@ -65,12 +65,23 @@ function describeTasks(tasks) {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
+/** A folder conversation's bayma, from the deployment's host profile. */
+const defaultFolderBayma = ({ threadKey }) => folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey });
+
 /**
- * `workingDirectory` is where the CLI runs: a folder workspace itself, or a session
- * filesystem's harness directory, when `sessionFsBayma()` gives the workspace's bayma
- * endpoint (starting its session host) and the CLI is confined to it (sessionfs.js).
+ * `workingDirectory` is where the CLI runs: a folder workspace itself, with the
+ * conversation's bayma from `folderBayma()`, or a session filesystem's harness
+ * directory, when `sessionFsBayma()` gives the workspace's bayma endpoint (bringing its
+ * Sandbox up) and the CLI is confined to it (sessionfs.js).
  */
-export function createClaudeLiveSessions({ workingDirectory, sessions, sessionStore = null, sessionFsBayma = null, queryFactory = defaultQueryFactory } = {}) {
+export function createClaudeLiveSessions({
+  workingDirectory,
+  sessions,
+  sessionStore = null,
+  sessionFsBayma = null,
+  folderBayma = defaultFolderBayma,
+  queryFactory = defaultQueryFactory,
+} = {}) {
   const hosts = new Map();
 
   function closeHost(host, reason) {
@@ -387,7 +398,7 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
     // own, launched by the CLI on Docker and a Sandbox of its own on Kubernetes.
     const mcpServers = bayma
       ? undefined
-      : claudeMcpServers(await folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey, env: claudeEnv }));
+      : claudeMcpServers(await folderBayma({ threadKey }));
     const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
@@ -488,9 +499,9 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
    */
   async function hostFor(params) {
     const key = modelKey(params.persistence, params.threadKey);
-    // A session filesystem's host is made sure of before every turn, not only when the
-    // process starts: the process outlives turns, and its session host may have stopped
-    // in between. Its bayma is reached through the same forward either way.
+    // A session filesystem's Sandbox is made sure of before every turn, not only when the
+    // process starts: the process outlives turns, and the Sandbox may have been suspended
+    // in between. Its bayma is reached at the same address either way.
     const bayma = sessionFsBayma ? await sessionFsBayma() : null;
     const existing = hosts.get(params.threadKey);
     if (existing && !existing.closed) {

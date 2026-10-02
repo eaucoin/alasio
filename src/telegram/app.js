@@ -35,9 +35,9 @@ export class TelegramCodexApp {
       store: this.store,
       log,
     });
-    // Session filesystems, off unless configured (createSandbox returns null then), with
-    // the Codex app-server that serves them.
-    this.sandbox = config.sandbox ?? createSandbox({ config: config.sandboxConfig ?? null, store: this.store, stateDir: config.stateDir });
+    // Session filesystems, on when the deployment renders their template (createSandbox
+    // returns null otherwise), with the Codex app-server that serves them.
+    this.sandbox = config.sandbox ?? createSandbox({ templates: config.kubeTemplates ?? null, stateDir: config.stateDir });
     this.sessionFsCodex = config.sessionFsCodex
       ?? (this.sandbox ? createSessionFsCodex({ home: sessionFsCodexHome(config.stateDir) }) : null);
     this.harnesses = config.harnesses ?? createHarnessRegistry({
@@ -98,7 +98,7 @@ export class TelegramCodexApp {
     log.info(`  Default folder: ${this.config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
     log.info(`  Default service: ${this.config.defaultHarness ?? "none (operator chooses with /service)"}`);
     log.info(`  Hook port: ${this.config.hookPort}`);
-    log.info(`  Session filesystems: ${this.sandbox ? "enabled" : "off (set ALASIO_SANDBOX_ENABLED=1 to offer them)"}`);
+    log.info(`  Session filesystems: ${this.sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
     await this.client.deleteWebhook(false);
     await this.configureNativeCommands();
     this.startHookServer();

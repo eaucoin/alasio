@@ -511,22 +511,20 @@ test("restart recovery restores the interrupted turn's own harness session", asy
       timestamp: 99,
     });
     const [turn] = store.getActiveTurns();
-    // An empty environment gives the defaults even when the tests themselves
-    // run under a unit, such as alasio-standalone.service, that overrides them.
+    // An empty environment gives the defaults even when the tests themselves run in a
+    // release whose names differ.
     const job = store.stageRestartRecovery({ turn, prompt: buildRestartSyntheticText("self_induced", turn.harness, {}) });
     assert.equal(job.harness, CLAUDE_HARNESS);
-    assert.match(job.prompt, /You are Claude, connected through `alasio\.service`/);
+    assert.match(job.prompt, /You are Claude, connected through the Kubernetes Deployment alasio in namespace alasio/);
+    assert.match(job.prompt, /restart is `kubectl -n alasio rollout restart deployment\/alasio`/);
+    assert.match(job.prompt, /not deleting alasio's pod/);
     assert.equal(store.getHarnessSessionId(conversationId, CLAUDE_HARNESS), "claude-1");
     assert.equal(store.getHarnessSessionId(conversationId, CODEX_HARNESS), undefined);
     const operator = buildRestartSyntheticText("operator_induced", undefined, {});
     assert.match(operator, /You are Codex/);
-    assert.match(operator, /connected through `alasio\.service`/);
-    assert.match(operator, /bots\/alasio\/restart-alasio-operator\.sh`; from that directory use `\.\/restart-alasio-operator\.sh`/);
-    const standaloneEnv = { ALASIO_SERVICE_UNIT: "alasio-standalone.service", ALASIO_RESTART_WRAPPER: "/home/operator/alasio/restart-alasio-standalone.sh" };
-    const standalone = buildRestartSyntheticText("self_induced", CLAUDE_HARNESS, standaloneEnv);
-    assert.match(standalone, /You are Claude, connected through `alasio-standalone\.service`/);
-    assert.match(standalone, /`\/home\/operator\/alasio\/restart-alasio-standalone\.sh`; from that directory use `\.\/restart-alasio-standalone\.sh`/);
-    assert.match(standalone, /not raw `sudo systemctl restart alasio-standalone\.service`/);
+    const named = buildRestartSyntheticText("self_induced", CLAUDE_HARNESS, { ALASIO_DEPLOYMENT: "bot-alasio", ALASIO_NAMESPACE: "bots" });
+    assert.match(named, /connected through the Kubernetes Deployment bot-alasio in namespace bots/);
+    assert.match(named, /`kubectl -n bots rollout restart deployment\/bot-alasio`/);
   });
 });
 

@@ -1,154 +1,211 @@
 /**
- * The session-filesystem subsystem, assembled from configuration (config.js). On
- * Kubernetes it is ./kubernetes/; on Docker, what this module assembles: the metadata
- * engine, the volume manager, the session-host launcher, and the forwards that
- * carry harnesses to bayma inside each session. Off unless configured; `createSandbox`
- * returns null then, and callers treat a null sandbox as "session filesystems are
- * unavailable, offer only folders".
+ * Session filesystems: the empty, isolated workspace per session an operator may choose
+ * instead of a folder. Each is an agent-sandbox Sandbox (../kube/sandboxes.js) in the
+ * sessions namespace, made from the deployment's `sessions` template, whose volume claim
+ * is the workspace and whose pod runs bayma under the sandboxing runtime the template
+ * names (gVisor by default). The harness runs in alasio and reaches the session through
+ * one door, bayma, with the session's token; nothing of the harness, and no credential,
+ * is ever inside a session.
  *
- * When alasio exports telemetry, bayma inside each session exports its own through the
- * session's telemetry drain, which alasio relays where it exports (./telemetry.js).
+ * What a session may reach is NetworkPolicy's to enforce, by the labels set here: the
+ * chart's policies admit alasio alone in, and let a session out to alasio's telemetry
+ * receiver only ("none") or to the internet's public addresses too ("full"). DNS is
+ * set to match: public resolvers in "full", and none at all in "none", so a name cannot
+ * carry anything out through the cluster's resolver.
  *
- * A session is the workspace only. The harness runs in alasio with its own login and
- * state, and reaches the session through one door, bayma (./bayma-forward.js), so the
- * sandbox holds no credential and, in "none" mode, reaches nothing at all.
- *
- * The pieces and the evidence behind them live in session-fs-research; the atlas is in
- * ./README.md.
+ * Policies reach a new pod asynchronously, so a session's pod first waits, in an init
+ * container, until its egress is confined: until the cluster's API server, a private
+ * address both modes refuse, no longer answers. Where NetworkPolicy is not enforced at
+ * all a session therefore never starts, rather than starting open.
  */
+import { lookup } from "node:dns/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+
+import { createKubeClient } from "../kube/client.js";
+import { BAYMA_CONTAINER, createSandboxes, sameToken, sandboxManifest, tokenSandboxName, tokenSecretName } from "../kube/sandboxes.js";
 import { createLogger } from "../shared/log.js";
-import { startBaymaForward, SANDBOX_BAYMA_PORT } from "./bayma-forward.js";
-import { createDocker } from "./docker.js";
-import { createMetadataEngine } from "./metadata-engine.js";
-import { SessionHost } from "./session-host.js";
-import { assertValidVolumeId } from "./names.js";
-import { DRAIN_READ_PORT, sandboxBaymaTelemetryEnv, sandboxResource, startTelemetryRelay } from "./telemetry.js";
-import { SessionVolumeManager } from "./volume.js";
-import { createKubernetesSandbox } from "./kubernetes/index.js";
+import { overLimitNote } from "../telegram/rich-media.js";
+import { assertValidVolumeId, isValidVolumeId } from "./names.js";
+import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.js";
+import { startTelemetryReceiver } from "./telemetry-receiver.js";
 
 const log = createLogger("sandbox");
 
-/** The forwarder relayed telemetry is exported through, loaded only once it is needed. */
+export const NET_MODE_LABEL = "alasio.dev/net-mode";
+export const WORKLOAD_LABEL = "alasio.dev/workload";
+const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
+// The token's environment variable in bayma's container, which the OTLP headers expand.
+const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";
+
+/**
+ * The egress gate's program: exits once three connections in a row to the API server
+ * fail, and fails the pod if they still succeed after two minutes. Runs on the agent
+ * image's Node.
+ */
+export const EGRESS_GATE_SCRIPT = [
+  "const net = require('node:net');",
+  "const host = process.env.KUBERNETES_SERVICE_HOST, port = Number(process.env.KUBERNETES_SERVICE_PORT);",
+  "const deadline = Date.now() + 120000; let refused = 0;",
+  "(function probe() {",
+  "  const socket = net.connect({ host, port, timeout: 1000 });",
+  "  const next = (blocked) => { socket.destroy(); refused = blocked ? refused + 1 : 0;",
+  "    if (refused >= 3) process.exit(0);",
+  "    if (Date.now() > deadline) { console.error('egress is not confined: is NetworkPolicy enforced in this cluster?'); process.exit(1); }",
+  "    setTimeout(probe, 250); };",
+  "  socket.once('connect', () => next(false)); socket.once('timeout', () => next(true)); socket.once('error', () => next(true));",
+  "})();",
+].join("\n");
+
+/**
+ * The Sandbox for a session on `volumeId` with internet mode `netMode`, from the
+ * `profile` (ALASIO_KUBE_TEMPLATES `sessions`). `telemetry` is `{ endpoint, env }`, or
+ * null when alasio exports none. Pure, for tests.
+ */
+export function sessionSandboxManifest({ volumeId, netMode, profile, telemetry }) {
+  const full = netMode === "full";
+  return sandboxManifest({
+    name: assertValidVolumeId(volumeId),
+    namespace: profile.namespace,
+    template: profile,
+    labels: { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: full ? "full" : "none" },
+    configure(spec) {
+      const bayma = spec.containers.find((container) => container.name === BAYMA_CONTAINER);
+      if (telemetry) {
+        bayma.env = [
+          ...(bayma.env ?? []),
+          { name: TOKEN_ENV, valueFrom: { secretKeyRef: { name: tokenSecretName(volumeId), key: "token" } } },
+          ...Object.entries({ ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: telemetry.endpoint }).map(([name, value]) => ({ name, value })),
+          { name: "OTEL_EXPORTER_OTLP_HEADERS", value: `authorization=Bearer%20$(${TOKEN_ENV})` },
+        ];
+      }
+      return {
+        ...spec,
+        // Nothing in a session speaks to the cluster as anyone, or learns its services.
+        automountServiceAccountToken: false,
+        enableServiceLinks: false,
+        dnsPolicy: "None",
+        dnsConfig: { nameservers: full ? (profile.fullModeNameservers ?? DEFAULT_FULL_MODE_NAMESERVERS) : ["127.0.0.1"] },
+        initContainers: [
+          ...(profile.egressGate === false ? [] : [{
+            name: "egress-gate",
+            image: bayma.image,
+            command: ["node", "-e", EGRESS_GATE_SCRIPT],
+            securityContext: bayma.securityContext,
+            resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "64Mi" } },
+          }]),
+          ...(spec.initContainers ?? []),
+        ],
+      };
+    },
+  });
+}
+
+/** The address sessions export telemetry to: alasio's receiver Service, by IP, since "none" has no DNS. */
+async function receiverEndpoint(service, port, resolve = lookup) {
+  const { address } = await resolve(service);
+  return `http://${address}:${port}`;
+}
+
+/** The forwarder sessions' telemetry is exported through, loaded only once it is needed. */
 async function loadForwarder(env) {
   const { createOtlpForwarder } = await import("../telemetry/forward.js");
   return createOtlpForwarder(env, { warn: (message) => log.warn(message) });
 }
 
 /**
- * `stateDir` is alasio's state directory, under which each session's harness directory
- * lives (`harnessDirectory`). `env` holds the standard OpenTelemetry variables that
- * say whether and where sessions' telemetry is exported.
+ * The session-filesystem subsystem, or null when the deployment renders no `sessions`
+ * template (../kube/config.js), and callers then offer only folders. `stateDir` is
+ * alasio's state directory, under which each session's harness directory lives. `env`
+ * holds the standard OpenTelemetry variables and `ALASIO_TELEMETRY_RECEIVER_SERVICE` and
+ * `_PORT`, where sessions' telemetry is received when alasio exports any.
  */
 export function createSandbox({
-  config,
-  store,
+  templates,
   stateDir,
   env = process.env,
-  docker = createDocker(),
-  startForward = startBaymaForward,
-  startRelay = startTelemetryRelay,
+  kube = null,
   createForwarder = loadForwarder,
-} = {}) {
-  if (!config) return null;
-  if (config.runtime === "kubernetes") {
-    return createKubernetesSandbox({ templates: config.templates, stateDir, env, createForwarder });
-  }
+  startReceiver = startTelemetryReceiver,
+  resolve = lookup,
+  fetchImpl = fetch,
+}) {
+  const profile = templates?.sessions;
+  if (!profile) return null;
+  kube ??= createKubeClient();
+  const sandboxes = createSandboxes({ kube, namespace: profile.namespace, port: profile.port, fetchImpl });
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);
-  const engine = createMetadataEngine(config.metadata);
-  const volumes = new SessionVolumeManager({
-    engine,
-    store: store.sessionVolumes,
-    docker,
-    config: {
-      s3Endpoint: config.s3.endpoint,
-      s3Bucket: config.s3.bucket,
-      s3AccessKey: config.s3.accessKey,
-      s3SecretKey: config.s3.secretKey,
-      cacheMb: config.host.cacheMb,
-      network: config.host.network,
-      metadataPasswordFile: config.metadata.passwordFile,
-      sessionHostImage: config.host.sessionHostImage,
-    },
-  });
-  const host = new SessionHost({
-    docker,
-    config: {
-      network: config.host.network,
-      agentImage: config.host.agentImage,
-      sessionHostImage: config.host.sessionHostImage,
-      memoryMb: config.host.memoryMb,
-      cpus: config.host.cpus,
-      pidsLimit: config.host.pidsLimit,
-      hostPublicIp: config.host.hostPublicIp,
-      metadataPasswordFile: config.metadata.passwordFile,
-      telemetryEnv,
-    },
-  });
-
-  // Per volume, the start in flight (so two harnesses asking at once share one start
-  // rather than race a second `docker run` against it) and the forward to its bayma.
-  const starting = new Map();
-  const forwards = new Map();
-  // Per volume, the relay of its telemetry, while one runs, and the forwarder they share.
-  const relays = new Map();
-  let forwarder = null;
-
-  async function ensureRunning(volumeId) {
-    const record = store.sessionVolumes.getVolume(volumeId) ?? volumes.create(volumeId);
-    if (await host.isRunning(volumeId)) return;
-    await host.start(volumeId, { mountEnv: volumes.mountEnv(volumeId), netMode: record.netMode ?? "none" });
-    volumes.markFormatted(volumeId);
+  const receiverPort = Number(env.ALASIO_TELEMETRY_RECEIVER_PORT || 4318);
+  const receiverService = env.ALASIO_TELEMETRY_RECEIVER_SERVICE?.trim();
+  const exportsTelemetry = Object.keys(telemetryEnv).length > 0 && Boolean(receiverService);
+  if (Object.keys(telemetryEnv).length > 0 && !receiverService) {
+    log.warn("sessions' telemetry is not received: ALASIO_TELEMETRY_RECEIVER_SERVICE is not set");
   }
 
-  function forwardFor(volumeId) {
-    if (!forwards.has(volumeId)) {
-      const forward = startForward({ connect: () => host.connect(volumeId, SANDBOX_BAYMA_PORT) });
-      forward.catch(() => forwards.delete(volumeId));
-      forwards.set(volumeId, forward);
-    }
-    return forwards.get(volumeId);
-  }
-
-  /** Relays the session's telemetry, unless alasio exports none or a relay already runs. */
-  function relayFor(volumeId) {
-    if (Object.keys(telemetryEnv).length === 0 || relays.has(volumeId)) return;
-    forwarder ??= createForwarder(env).catch((error) => {
-      forwarder = null; // tried again for the next relay
+  // The receiver, and the forwarder it exports through, once started.
+  let receiving = null;
+  function receive() {
+    receiving ??= (async () => {
+      const forwarder = await createForwarder(env);
+      const receiver = await startReceiver({
+        port: receiverPort,
+        forwarder,
+        stampFor: (volumeId) => sandboxResource(volumeId, env),
+        async authenticate(token) {
+          const name = tokenSandboxName(token);
+          if (!isValidVolumeId(name)) return null;
+          const expected = await sandboxes.token(name).catch(() => null);
+          return expected && sameToken(token, expected) ? name : null;
+        },
+      });
+      return { forwarder, receiver };
+    })().catch((error) => {
+      receiving = null;
       throw error;
     });
-    const relay = forwarder.then((loaded) => startRelay({
-      volumeId,
-      connect: () => host.connect(volumeId, DRAIN_READ_PORT),
-      isRunning: () => host.isRunning(volumeId),
-      forwarder: loaded,
-      stamp: sandboxResource(volumeId, env),
-      onEnd: () => relays.delete(volumeId),
-    }));
-    relay.catch((error) => {
-      relays.delete(volumeId);
-      log.warn(`${volumeId}: cannot relay the session's telemetry: ${error.message}`);
-    });
-    relays.set(volumeId, relay);
+    return receiving;
   }
 
-  async function closeForward(volumeId) {
-    const forward = forwards.get(volumeId);
-    forwards.delete(volumeId);
-    await (await forward?.catch(() => null))?.close();
+  // Sessions that outlived the last alasio export as soon as this one is up.
+  if (exportsTelemetry) {
+    receive().catch((error) => log.warn(`cannot receive sessions' telemetry: ${error.message}`));
+  }
+
+  async function telemetry() {
+    if (!exportsTelemetry) return null;
+    await receive();
+    return { endpoint: await receiverEndpoint(receiverService, receiverPort, resolve), env: telemetryEnv };
+  }
+
+  async function manifest(volumeId, netMode) {
+    return sessionSandboxManifest({ volumeId, netMode, profile, telemetry: await telemetry() });
+  }
+
+  /** Makes the Sandbox, with what it is made from resolved first. */
+  async function ensure(volumeId, netMode) {
+    const made = await manifest(volumeId, netMode);
+    return await sandboxes.ensure(volumeId, () => made);
   }
 
   return {
     enabled: true,
-    engine,
-    volumes,
-    host,
+
+    volumes: {
+      /** A new session's Sandbox, made now so its volume is ready by its first turn. */
+      async create(volumeId, netMode = "none") {
+        await ensure(volumeId, netMode);
+        log.info(`created session ${volumeId} (${netMode} internet)`);
+        return { volumeId, netMode };
+      },
+      async destroy(volumeId) {
+        await sandboxes.remove(assertValidVolumeId(volumeId));
+      },
+    },
 
     /**
-     * The directory on this machine a session's harness runs in: empty, the session's
-     * own, and none of the workspace's (which is only in the sandbox). Its path keys the
-     * harness's sessions to the workspace (Claude Code's project, Codex's thread list).
+     * The directory in alasio a session's harness runs in: empty, the session's own, and
+     * none of the workspace's, which is only in the session. Its path keys the harness's
+     * sessions to the workspace (Claude Code's project, Codex's thread list).
      */
     harnessDirectory(volumeId) {
       const directory = join(stateDir, "sessionfs", "workspaces", assertValidVolumeId(volumeId));
@@ -157,44 +214,44 @@ export function createSandbox({
     },
 
     /**
-     * Make sure the session host for `volumeId` is running and bayma answers inside it,
-     * creating the volume on first use and starting the container if it is down (a host
-     * that survived a alasio restart is adopted as it is), and relay its telemetry while
-     * it runs. Returns `{ bayma: { url, headers } }`: the MCP endpoint a harness reaches
-     * the session through.
+     * Makes sure the session's Sandbox runs and bayma answers in it, resuming one that
+     * was suspended; one that is gone is made again, empty, with no internet.
      */
     async ensureSession(volumeId) {
-      if (!starting.has(volumeId)) {
-        starting.set(volumeId, ensureRunning(volumeId).finally(() => starting.delete(volumeId)));
-      }
-      await starting.get(volumeId);
-      relayFor(volumeId);
-      const { url, headers } = await forwardFor(volumeId);
-      return { bayma: { url, headers } };
+      return { bayma: await ensure(assertValidVolumeId(volumeId), "none") };
     },
 
     /**
-     * A file from a session's sandbox, as its agent sees it (see SessionHost.readFile):
-     * `{ bytes }` or `{ note }`. Only a running session is read; one is running while
-     * its turns deliver their responses.
+     * A file from the session as its agent sees it: read by the agent's own user in its
+     * container, relative to the workspace, so its path and symlinks reach only the
+     * session's files. `{ bytes }`, or `{ note }` saying why not.
      */
     async readFile(volumeId, path, maxBytes) {
-      if (!(await host.isRunning(volumeId))) return { note: "the session is not running" };
-      return await host.readFile(volumeId, path, maxBytes);
+      const sandbox = await kube.read("agents.x-k8s.io/v1beta1", "Sandbox", profile.namespace, assertValidVolumeId(volumeId));
+      if (!sandbox || sandbox.spec?.operatingMode === "Suspended") return { note: "the session is not running" };
+      const script = 'cd "$3" || exit 3; f="$1"; [ -f "$f" ] || exit 3; s=$(stat -L -c %s -- "$f") || exit 3; [ "$s" -le "$2" ] || { printf %s "$s" >&2; exit 4; }; exec cat -- "$f"';
+      const { exitCode, stdout, stderr } = await kube.exec(
+        profile.namespace,
+        volumeId,
+        BAYMA_CONTAINER,
+        ["sh", "-c", script, "sh", path, String(maxBytes), profile.workspaceDir],
+        { maxBytes: maxBytes + 1 },
+      );
+      if (exitCode === 0) return { bytes: stdout };
+      if (exitCode === 3) return { note: "file not found" };
+      if (exitCode === 4) return { note: overLimitNote(Number(stderr.trim()), maxBytes) };
+      throw new Error(`reading ${path} in session ${volumeId} failed (exit ${exitCode}): ${stderr.trim()}`);
     },
 
     /**
-     * alasio is shutting down: close every forward and relay. Session hosts keep running,
-     * with the agent's processes and bayma's REPL sessions, for the next alasio to adopt;
-     * nothing of the harness is in them to lose, and their drains hold what bayma records
-     * until the next alasio relays it.
+     * alasio is shutting down: stop receiving. Sessions keep running for the next alasio,
+     * and their exporters retry what they could not send meanwhile.
      */
     async close() {
-      await Promise.all([
-        ...[...forwards.keys()].map(closeForward),
-        ...[...relays.values()].map(async (relay) => (await relay.catch(() => null))?.close()),
-      ]);
-      (await forwarder?.catch(() => null))?.close();
+      const started = await receiving?.catch(() => null);
+      receiving = null;
+      await started?.receiver.close();
+      await started?.forwarder.close();
     },
   };
 }

@@ -1,8 +1,7 @@
-# The agent's world: bayma's image, with every runtime bayma serves. Mounted read-only
-# as the gVisor sandbox's root at /agent-root, so every session shares it. No harness
-# runs here: Claude Code and Codex run in alasio and reach the sandbox only through
-# bayma. The agent runs as the unprivileged user `agent`; /workspace and /home/agent are
-# bound from the session's JuiceFS volume at run time.
+# The image session filesystems run: bayma's, with every runtime bayma serves, run as
+# the unprivileged user `agent`. No harness runs here: Claude Code and Codex run in alasio
+# and reach a session only through its bayma. /workspace and /home/agent are the
+# session's volume, mounted by its Sandbox (charts/alasio, sessions template).
 ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.10.0@sha256:d06080edb45b4929173fd58cf1f56dd1d9b94b0aa40e243097a6030623d26d2a
 FROM ${BAYMA_IMAGE}
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
@@ -12,17 +11,14 @@ RUN usermod --login agent --home /home/agent --move-home ubuntu \
  && mkdir -p /workspace /home/agent \
  && chown agent:agent /workspace /home/agent
 # bayma installs its toolbelt (its own fixed set of tools, ~25k files) under
-# $XDG_DATA_HOME before it serves. Onto a session's JuiceFS volume that copy takes
+# $XDG_DATA_HOME before it serves. Onto every new session's volume that copy would take
 # minutes, so it is installed here once, by bayma's own installer (doctor prepares the
 # payload before it runs), and each session's ~/.local/share/bayma/toolbelt is a link to
-# it (session-host/entrypoint.sh). bayma finds its version current there and copies
-# nothing. The doctor's own verdict does not matter here, only the installed toolbelt.
+# it, made as its pod starts. bayma finds its version current there and copies nothing.
+# The doctor's own verdict does not matter here, only the installed toolbelt.
 RUN mkdir -p /tmp/bayma-build \
  && (XDG_DATA_HOME=/opt/bayma-data HOME=/tmp/bayma-build BAYMA_PAYLOAD_DIR=/opt/bayma/payload \
        node /opt/bayma/bayma.js doctor --runtime bun --state-dir /tmp/bayma-build/state >/dev/null 2>&1 || true) \
  && test -f /opt/bayma-data/bayma/toolbelt/.bayma-toolbelt-version \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
-# The drain bayma exports its telemetry to, which the session host runs beside it when
-# alasio exports telemetry, and alasio reads (session-host/entrypoint.sh).
-COPY telemetry-drain.mjs /opt/alasio/telemetry-drain.mjs

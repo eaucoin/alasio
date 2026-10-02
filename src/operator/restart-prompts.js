@@ -1,38 +1,18 @@
 import { harnessDisplayName } from "../harness/names.js";
-import { onKubernetes } from "../kube/config.js";
-
-const DEFAULT_SERVICE_UNIT = "alasio.service";
-const DEFAULT_RESTART_WRAPPER = "/home/operator/monorepo-alasio-runtime/bots/alasio/restart-alasio-operator.sh";
 
 /**
  * What this process runs as and how it is restarted, in the words the post-restart
- * prompts use. On Kubernetes, its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE,
- * which the chart sets) and a rollout restart of it. Under systemd, its unit and the
- * provenance-recording wrapper that restarts it: the deployment checkout keeps the
- * historical defaults, and alasio-standalone.service overrides both through its unit
- * file so post-restart prompts point the agent at its own wrapper.
+ * prompts use: its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE, which the chart
+ * sets) and a rollout restart of it.
  */
 export function resolveRestartPaths(env = process.env) {
-  if (onKubernetes(env)) {
-    // On Kubernetes alasio is a Deployment, restarted by rolling it out again.
-    const deployment = env.ALASIO_DEPLOYMENT?.trim() || "alasio";
-    const namespace = env.ALASIO_NAMESPACE?.trim() || "alasio";
-    return {
-      unit: `the Kubernetes Deployment ${deployment} in namespace ${namespace}`,
-      restartFact: `Fact: the documented Alasio restart is \`kubectl -n ${namespace} rollout restart deployment/${deployment}\`.\n\n`,
-      restartPath: "that command",
-      rawRestart: `deleting alasio's pod`,
-    };
-  }
-  const unit = env.ALASIO_SERVICE_UNIT?.trim() || DEFAULT_SERVICE_UNIT;
-  const wrapper = env.ALASIO_RESTART_WRAPPER?.trim() || DEFAULT_RESTART_WRAPPER;
-  const slash = wrapper.lastIndexOf("/");
-  const wrapperName = wrapper.slice(slash + 1);
+  const deployment = env.ALASIO_DEPLOYMENT?.trim() || "alasio";
+  const namespace = env.ALASIO_NAMESPACE?.trim() || "alasio";
   return {
-    unit: `\`${unit}\` on this machine`,
-    restartFact: `Fact: the documented Alasio restart path is \`${wrapper}\`; from that directory use \`./${wrapperName}\`.\n\n`,
-    restartPath: "the wrapper path",
-    rawRestart: `raw \`sudo systemctl restart ${unit}\``,
+    unit: `the Kubernetes Deployment ${deployment} in namespace ${namespace}`,
+    restartFact: `Fact: the documented Alasio restart is \`kubectl -n ${namespace} rollout restart deployment/${deployment}\`.\n\n`,
+    restartPath: "that command",
+    rawRestart: "deleting alasio's pod",
   };
 }
 

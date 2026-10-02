@@ -11,12 +11,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { loadKubeTemplates } from "/opt/alasio/src/kube/config.js";
 import { createKubeClient } from "/opt/alasio/src/kube/client.js";
 import { createSandboxes } from "/opt/alasio/src/kube/sandboxes.js";
-import { createKubernetesSandbox } from "/opt/alasio/src/sandbox/kubernetes/index.js";
+import { createSandbox } from "/opt/alasio/src/sandbox/index.js";
 
 const volumeId = process.argv[2];
 const templates = loadKubeTemplates();
 const kube = createKubeClient();
-const sandbox = createKubernetesSandbox({ templates, stateDir: "/tmp/roundtrip", kube, env: {}, createForwarder: async () => null });
+const sandbox = createSandbox({ templates, stateDir: "/tmp/roundtrip", kube, env: {}, createForwarder: async () => null });
 const seen = {};
 
 async function exec(bayma, code) {

@@ -12,10 +12,7 @@ import { codexHome } from "./env.js";
 
 /** A bayma server (../mcp/bayma.js folderBaymaServer) in Codex's MCP config shape. */
 export function codexMcpServer(server) {
-  const startup = { startup_timeout_sec: BAYMA_STARTUP_TIMEOUT_MS / 1000 };
-  if (server.type === "http") return { url: server.url, http_headers: server.headers, ...startup };
-  const { type: _stdio, ...command } = server;
-  return { ...command, ...startup };
+  return { url: server.url, http_headers: server.headers, startup_timeout_sec: BAYMA_STARTUP_TIMEOUT_MS / 1000 };
 }
 
 /** The overrides for a folder workspace's thread, whose bayma server is `bayma`. */
