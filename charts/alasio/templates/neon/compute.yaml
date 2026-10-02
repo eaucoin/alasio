@@ -95,6 +95,8 @@ spec:
   selector: {{- include "alasio.selectorLabels" (dict "root" . "component" "neon-compute") | nindent 4 }}
   ports:
     - { name: postgres, port: 55433 }
+    # compute_ctl's metrics, which the stack's collector scrapes.
+    - { name: http, port: 3080 }
 ---
 apiVersion: apps/v1
 kind: Deployment

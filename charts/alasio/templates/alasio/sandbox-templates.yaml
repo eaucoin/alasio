@@ -96,6 +96,9 @@ podTemplate:
     securityContext:
       runAsUser: {{ .Values.host.uid }}
       runAsGroup: {{ .Values.host.gid }}
+      # The group the bayma token's Secret volume is given, which the operator's user
+      # reads it as; the node's own paths the mounts give are left as they are.
+      fsGroup: {{ .Values.host.gid }}
       {{- with .Values.host.supplementalGroups }}
       supplementalGroups: {{- toYaml . | nindent 8 }}
       {{- end }}

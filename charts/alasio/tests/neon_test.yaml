@@ -85,6 +85,11 @@ tests:
     asserts:
       - hasDocuments: { count: 0 }
         template: templates/neon/collector.yaml
+  - it: serves the compute's metrics where the collector scrapes them
+    template: templates/neon/compute.yaml
+    documentSelector: { path: 'spec.ports[0].name', value: postgres }
+    asserts:
+      - contains: { path: spec.ports, content: { name: http, port: 3080 } }
   - it: scrapes every service of the stack when it does
     template: templates/neon/collector.yaml
     set:
