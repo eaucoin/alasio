@@ -105,6 +105,7 @@ mindmap
       a Telegram update is the root of a trace that the turn its prompt queues and the reply's delivery join however long the prompt waits and Telegram and Codex app-server calls Postgres queries bayma's check and session-host starts are spans in it
       alasio's metrics cover turns by harness and outcome time to first output prompt waits reply delivery lag the outbox Bot API and app-server call latency the pg pool and the Node runtime
       Claude Code Codex and bayma export their own telemetry to the same place under their own service names Codex's traces continuing alasio's turn and Claude Code's and bayma's carrying the conversation
+      bayma inside a session filesystem's sandbox exports to a drain beside it on the sandbox's loopback that alasio reads through agent-connect and relays to the same place with its resource stamped as bayma and the session's volume so the sandbox gets no route and no credential and what it sends is never trusted to say where it came from
       ALASIO_NEON_OTLP_ENDPOINT sends the Neon stack's metrics through a collector on the stack's own network to an endpoint that network reaches
       alasio's spans and metrics carry ids rather than prompts or replies while its log lines are exported as written to the journal and each harness keeps prompts out of its telemetry unless the operator opts in through that harness's own settings such as OTEL_LOG_USER_PROMPTS for Claude Code or otel.log_user_prompt in Codex's config.toml
     Historical emphasis

@@ -23,6 +23,12 @@ mindmap
       bayma-forward is the harness's one way into a session a listener on alasio's loopback that pipes each connection through docker exec agent-connect to bayma inside like kubectl port-forward
       bayma has no authentication so a connection opens with the forward's bearer which is checked before anything reaches the sandbox and answered 401 otherwise
       each connection is its own docker exec so nothing listens inside and a session host that restarts is reached by the next connection
+    Telemetry
+      when alasio exports telemetry the session host is given bayma's OTEL settings and runs the telemetry drain beside bayma inside the sandbox and bayma exports to the drain on the sandbox's own loopback so no endpoint route or credential ever enters a sandbox
+      telemetry relays each session's drain through agent-connect to its read port while the session runs reconnecting when a read ends and ending when the host stops or after five reads the drain never greets because a sandbox started before telemetry was configured has none until it starts fresh
+      what the drain holds while alasio is away waits for the next read within its bound so a alasio restart loses nothing and a flood is dropped oldest first in the sandbox and counted
+      the relay trusts nothing it reads otlp-resource strips service.name the deployment's attributes and every alasio attribute from each resource and stamps bayma the session's volume and the deployment's attributes rewriting binary protobuf at the wire level and re-encoding JSON with only OTLP's own fields
+      a request that does not parse is dropped and reading is paced to a byte rate so whatever runs in the sandbox can only lie about its own session and only so fast and alasio.sandbox.telemetry.requests counts what was exported and dropped and why
     The harness's side
       harnessDirectory is the empty directory on this machine a session's harness runs in under the state directory keyed by volume so its sessions are the workspace's Claude Code's project and Codex's thread list
       Claude Code runs there on the operator's login confined to bayma by harness/claude/sessionfs and Codex runs on its own app-server with a home of its own and no environment by codex/sessionfs
@@ -47,6 +53,7 @@ sequenceDiagram
   Sb-->>H: { bayma: { url, headers } }
   H->>Fwd: MCP over HTTP with the forward's bearer
   Fwd->>Host: connect(volumeId, 7290) per connection
+  Sb->>Host: connect(volumeId, 7291) to read the telemetry drain while it runs, when alasio exports telemetry
 ```
 
 ## Avoidance Atlas
@@ -60,6 +67,10 @@ stateDiagram-v2
   CredentialInside --> Exfiltration
   Confined --> OpenPort: bayma listens where other local processes reach it unauthenticated
   OpenPort --> SessionTakeover
+  Confined --> TelemetryRoute: bayma in the sandbox is given a route or a credential to export with
+  TelemetryRoute --> Exfiltration
+  Confined --> TrustedTelemetry: what the sandbox sends is believed about where it came from
+  TrustedTelemetry --> ForgedOrigin
   Confined --> HostCoupling: the design needs something installed on the host
   HostCoupling --> NotPortable
   Confined --> OneVolumeOneSandboxOneDoor: a volume and a gVisor sandbox per session, reached only through its authenticated bayma forward

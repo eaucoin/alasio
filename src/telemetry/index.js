@@ -8,11 +8,12 @@ import { context, INVALID_SPAN_CONTEXT, metrics, propagation, ROOT_CONTEXT, Span
 export { SpanKind } from "@opentelemetry/api";
 export {
   conversationTelemetryEnv,
-  parseHeaders,
+  parseKeyValueList,
   resolveTelemetry,
   sharedResourceAttributes,
   SIGNALS,
   signalHeaders,
+  signalSetting,
   telemetryEnabled,
   withoutTelemetry,
 } from "./config.js";

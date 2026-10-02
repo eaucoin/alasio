@@ -11,16 +11,19 @@ mindmap
     Images
       build.sh fetches gVisor and JuiceFS pinned by checksum then builds two images with no host install
       session-host is alpine plus gVisor runsc JuiceFS iproute2 iptables jq the entrypoint agent-exec and agent-connect and carries no agent software
-      agent is bayma's image with an unprivileged user agent and bayma's toolbelt installed and it is mounted read-only as the sandbox root at agent-root so every session shares it
+      agent is bayma's image with an unprivileged user agent and bayma's toolbelt installed and the telemetry drain and it is mounted read-only as the sandbox root at agent-root so every session shares it
     Session host entrypoint
       entrypoint mounts the session's JuiceFS volume with no-agent hide-internal enable-xattr a bounded cache and a password from a file never the URL
       entrypoint builds the agent a network namespace joined by a veth pair and applies the firewall none reaches no address at all full reaches the internet but never private link-local the host or the metadata service
       entrypoint runs the sandbox read-only root the volume's workspace and home bound a private tmp NoNewPrivs and nosuid binds and tini running bayma's http mcp server on the sandbox's own loopback as the sandbox init so orphans are reaped and a checkpoint restore keeps every runtime
       a stop checkpoints the sandbox onto the volume outside the workspace and home it binds and the next container restores it once then drops it so a crash never rolls processes back to a stale image and one that cannot be restored falls back to a fresh start
       its teardown is trapped from the first line so a stop during startup still unmounts
+      given SANDBOX_TELEMETRY the OTEL variables alasio chose for bayma it adds them to bayma's environment and starts the telemetry drain before bayma in the sandbox's init so the drain is checkpointed and restored with bayma and a sandbox restored from before keeps the telemetry it started with
     Getting in
       agent-exec runs a command as the agent with only the agent's HOME USER and PATH never the session host's own env which holds the storage keys and metadata URL
       agent-connect pipes stdio to a port on the sandbox's own loopback from inside as the agent so alasio's bayma forward needs no listener or firewall opening anywhere
+      the same agent-connect is how alasio reads the telemetry drain on port 7291 while bayma exports to the drain's OTLP port 4318 so telemetry needs no opening either
+      telemetry-drain holds bayma's OTLP requests within a bound for one reader at a time greets each read with its protocol version and reports what it dropped and it is the agent's like everything in the sandbox so alasio trusts nothing it reads
     What the agent sees
       an empty workspace its own home a private tmp and a read-only system image and its own gVisor kernel and nothing of the host no docker socket no host home no other session and no model login
 ```
@@ -38,6 +41,8 @@ sequenceDiagram
   Host->>Sbx: runsc run or restore, root = agent image, workspace + home bound, tini + bayma as init
   Alasio->>Host: docker exec agent-connect 7290, once per harness connection
   Host->>Bayma: piped from inside the sandbox, as the agent
+  Bayma->>Sbx: OTLP to the telemetry drain on 127.0.0.1:4318, when alasio exports telemetry
+  Alasio->>Host: docker exec agent-connect 7291, reading the drain while the session runs
 ```
 
 ## Avoidance Atlas

@@ -21,3 +21,6 @@ RUN mkdir -p /tmp/bayma-build \
  && test -f /opt/bayma-data/bayma/toolbelt/.bayma-toolbelt-version \
  && chown -R agent:agent /opt/bayma-data \
  && rm -rf /tmp/bayma-build
+# The drain bayma exports its telemetry to, which the session host runs beside it when
+# alasio exports telemetry, and alasio reads (session-host/entrypoint.sh).
+COPY telemetry-drain.mjs /opt/alasio/telemetry-drain.mjs

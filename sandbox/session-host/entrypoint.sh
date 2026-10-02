@@ -23,6 +23,9 @@
 #   CHECKPOINT_DIR      where the checkpoint image lives (default /mnt/session/.checkpoint:
 #                       on the volume, so the next container finds it, and outside the
 #                       workspace and home the sandbox binds, so the agent never sees it)
+#   SANDBOX_TELEMETRY   a JSON object of the OTEL_* variables bayma exports its telemetry
+#                       with, when alasio exports telemetry; the sandbox then also runs the
+#                       drain they point bayma at (sandbox/agent/telemetry-drain.mjs)
 # It prints `session-host ready <ms>` once bayma answers, then waits for SIGTERM.
 set -euo pipefail
 
@@ -127,19 +130,27 @@ stamp network
 mkdir -p /bundle "$CKPT" && cd /bundle
 # The sandbox's init is tini running bayma's HTTP MCP server, so it reaps orphans and
 # survives checkpoint/restore (E6). bayma serves on the sandbox's own loopback, which
-# nothing outside reaches except through `agent-connect`.
+# nothing outside reaches except through `agent-connect`. With telemetry, the telemetry
+# drain starts first beside it, also on that loopback, and bayma exports to it; alasio
+# reads it through `agent-connect` too (src/sandbox/telemetry.js), so the sandbox gets
+# no route and no credential for it.
+telemetry=${SANDBOX_TELEMETRY:-}
+[ -n "$telemetry" ] || telemetry='{}'
 /opt/gvisor/runsc spec
-jq --arg root "$AGENT_ROOT" --arg port "$BAYMA_PORT" '
+jq --arg root "$AGENT_ROOT" --arg port "$BAYMA_PORT" --argjson telemetry "$telemetry" '
     .root = {path: $root, readonly: true}
   | .process.terminal = false
   | .process.noNewPrivileges = true
   | .process.user = {uid: 1000, gid: 1000}
   | .process.cwd = "/home/agent"
   | .process.args = ["/usr/bin/tini", "-s", "--", "/bin/sh", "-c",
-      "exec node /opt/bayma/bayma.js mcp-http --host 127.0.0.1 --port " + $port + " --state-dir /home/agent/.bayma"]
+      (if ($telemetry | length) > 0 then "node /opt/alasio/telemetry-drain.mjs & " else "" end)
+      + "exec node /opt/bayma/bayma.js mcp-http --host 127.0.0.1 --port " + $port + " --state-dir /home/agent/.bayma"]
   | .process.env = [
       "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       "HOME=/home/agent", "USER=agent", "BAYMA_PAYLOAD_DIR=/opt/bayma/payload"]
+      + [$telemetry | to_entries[] | select((.key | test("^OTEL_[A-Z_]+$")) and (.value | type) == "string")
+          | "\(.key)=\(.value)"]
   | .hostname = "session"
   | .linux.namespaces = ([.linux.namespaces[] | select(.type != "network")]
       + [{type: "network", path: "/run/netns/agent"}])

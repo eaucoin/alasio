@@ -4,7 +4,7 @@
  * overrides for each signal alasio exports. A signal alasio does not export is left to
  * the operator's config.toml.
  */
-import { parseHeaders, resolveTelemetry, sharedResourceAttributes } from "../../telemetry/index.js";
+import { parseKeyValueList, resolveTelemetry, sharedResourceAttributes } from "../../telemetry/index.js";
 
 /** The `[otel]` key that configures each signal's exporter. */
 const EXPORTER_KEYS = { logs: "exporter", traces: "trace_exporter", metrics: "metrics_exporter" };
@@ -17,7 +17,7 @@ function tomlTable(entries) {
 
 /** A signal's exporter as Codex writes it: OTLP over gRPC, or over HTTP as protobuf or JSON. */
 function exporterValue({ endpoint, protocol, headers }) {
-  const settings = [["endpoint", toml(endpoint)], ["headers", tomlTable(Object.entries(parseHeaders(headers)).map(([key, value]) => [key, toml(value)]))]];
+  const settings = [["endpoint", toml(endpoint)], ["headers", tomlTable(Object.entries(parseKeyValueList(headers)).map(([key, value]) => [key, toml(value)]))]];
   if (protocol === "grpc") {
     return tomlTable([["otlp-grpc", tomlTable(settings)]]);
   }

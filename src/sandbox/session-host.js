@@ -35,6 +35,9 @@ export class SessionHost {
       // so the agent's processes and bayma's REPL sessions come back as they were.
       CHECKPOINT_ON_STOP: "1",
       RESTORE: "1",
+      // What bayma exports its telemetry with, to the drain the entrypoint then starts
+      // beside it (./telemetry.js); absent when alasio exports none.
+      ...(Object.keys(c.telemetryEnv ?? {}).length > 0 ? { SANDBOX_TELEMETRY: JSON.stringify(c.telemetryEnv) } : {}),
     };
     return [
       "run", "--detach", "--name", sessionHostName(volumeId),

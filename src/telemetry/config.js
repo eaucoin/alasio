@@ -54,9 +54,17 @@ export function resolveTelemetry(env = process.env) {
   }));
 }
 
+/**
+ * A signal's OTLP exporter setting `name` (HEADERS, TIMEOUT, ...): its own
+ * (`OTEL_EXPORTER_OTLP_<SIGNAL>_<NAME>`), else the shared one, or null.
+ */
+export function signalSetting(env, signal, name) {
+  return setting(env, `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_${name}`) ?? setting(env, `OTEL_EXPORTER_OTLP_${name}`);
+}
+
 /** The headers a signal is sent with: its own, else the shared ones, or null. */
 export function signalHeaders(env, signal) {
-  return setting(env, `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_HEADERS`) ?? setting(env, "OTEL_EXPORTER_OTLP_HEADERS");
+  return signalSetting(env, signal, "HEADERS");
 }
 
 /** Whether any signal is exported. */
@@ -108,10 +116,13 @@ export function conversationTelemetryEnv({ conversationId }, env = process.env) 
   return settings;
 }
 
-/** The standard `key=value,key=value` header list as an object, values URL-decoded. */
-export function parseHeaders(headers) {
-  if (!headers) return {};
-  return Object.fromEntries(headers.split(",").flatMap((pair) => {
+/**
+ * A standard `key=value,key=value` list, such as OTLP headers or resource attributes, as
+ * an object, values URL-decoded.
+ */
+export function parseKeyValueList(list) {
+  if (!list) return {};
+  return Object.fromEntries(list.split(",").flatMap((pair) => {
     const at = pair.indexOf("=");
     if (at <= 0) return [];
     return [[pair.slice(0, at).trim(), decodeURIComponent(pair.slice(at + 1).trim())]];

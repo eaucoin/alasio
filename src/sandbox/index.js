@@ -5,6 +5,9 @@
  * returns null then, and callers treat a null sandbox as "session filesystems are
  * unavailable, offer only folders".
  *
+ * When alasio exports telemetry, bayma inside each session exports its own through the
+ * session's telemetry drain, which alasio relays where it exports (./telemetry.js).
+ *
  * A session is the workspace only. The harness runs in alasio with its own login and
  * state, and reaches the session through one door, bayma (./bayma-forward.js), so the
  * sandbox holds no credential and, in "none" mode, reaches nothing at all.
@@ -14,19 +17,40 @@
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { createLogger } from "../shared/log.js";
 import { startBaymaForward, SANDBOX_BAYMA_PORT } from "./bayma-forward.js";
 import { createDocker } from "./docker.js";
 import { createMetadataEngine } from "./metadata-engine.js";
 import { SessionHost } from "./session-host.js";
 import { assertValidVolumeId } from "./names.js";
+import { DRAIN_READ_PORT, sandboxBaymaTelemetryEnv, sandboxResource, startTelemetryRelay } from "./telemetry.js";
 import { SessionVolumeManager } from "./volume.js";
+
+const log = createLogger("sandbox");
+
+/** The forwarder relayed telemetry is exported through, loaded only once it is needed. */
+async function loadForwarder(env) {
+  const { createOtlpForwarder } = await import("../telemetry/forward.js");
+  return createOtlpForwarder(env, { warn: (message) => log.warn(message) });
+}
 
 /**
  * `stateDir` is alasio's state directory, under which each session's harness directory
- * lives (`harnessDirectory`).
+ * lives (`harnessDirectory`). `env` holds the standard OpenTelemetry variables that
+ * say whether and where sessions' telemetry is exported.
  */
-export function createSandbox({ config, store, stateDir, docker = createDocker(), startForward = startBaymaForward } = {}) {
+export function createSandbox({
+  config,
+  store,
+  stateDir,
+  env = process.env,
+  docker = createDocker(),
+  startForward = startBaymaForward,
+  startRelay = startTelemetryRelay,
+  createForwarder = loadForwarder,
+} = {}) {
   if (!config) return null;
+  const telemetryEnv = sandboxBaymaTelemetryEnv(env);
   const engine = createMetadataEngine(config.metadata);
   const volumes = new SessionVolumeManager({
     engine,
@@ -54,6 +78,7 @@ export function createSandbox({ config, store, stateDir, docker = createDocker()
       pidsLimit: config.host.pidsLimit,
       hostPublicIp: config.host.hostPublicIp,
       metadataPasswordFile: config.metadata.passwordFile,
+      telemetryEnv,
     },
   });
 
@@ -61,6 +86,9 @@ export function createSandbox({ config, store, stateDir, docker = createDocker()
   // rather than race a second `docker run` against it) and the forward to its bayma.
   const starting = new Map();
   const forwards = new Map();
+  // Per volume, the relay of its telemetry, while one runs, and the forwarder they share.
+  const relays = new Map();
+  let forwarder = null;
 
   async function ensureRunning(volumeId) {
     const record = store.sessionVolumes.getVolume(volumeId) ?? volumes.create(volumeId);
@@ -76,6 +104,28 @@ export function createSandbox({ config, store, stateDir, docker = createDocker()
       forwards.set(volumeId, forward);
     }
     return forwards.get(volumeId);
+  }
+
+  /** Relays the session's telemetry, unless alasio exports none or a relay already runs. */
+  function relayFor(volumeId) {
+    if (Object.keys(telemetryEnv).length === 0 || relays.has(volumeId)) return;
+    forwarder ??= createForwarder(env).catch((error) => {
+      forwarder = null; // tried again for the next relay
+      throw error;
+    });
+    const relay = forwarder.then((loaded) => startRelay({
+      volumeId,
+      connect: () => host.connect(volumeId, DRAIN_READ_PORT),
+      isRunning: () => host.isRunning(volumeId),
+      forwarder: loaded,
+      stamp: sandboxResource(volumeId, env),
+      onEnd: () => relays.delete(volumeId),
+    }));
+    relay.catch((error) => {
+      relays.delete(volumeId);
+      log.warn(`${volumeId}: cannot relay the session's telemetry: ${error.message}`);
+    });
+    relays.set(volumeId, relay);
   }
 
   async function closeForward(volumeId) {
@@ -104,14 +154,16 @@ export function createSandbox({ config, store, stateDir, docker = createDocker()
     /**
      * Make sure the session host for `volumeId` is running and bayma answers inside it,
      * creating the volume on first use and starting the container if it is down (a host
-     * that survived a alasio restart is adopted as it is). Returns `{ bayma: { url,
-     * headers } }`: the MCP endpoint a harness reaches the session through.
+     * that survived a alasio restart is adopted as it is), and relay its telemetry while
+     * it runs. Returns `{ bayma: { url, headers } }`: the MCP endpoint a harness reaches
+     * the session through.
      */
     async ensureSession(volumeId) {
       if (!starting.has(volumeId)) {
         starting.set(volumeId, ensureRunning(volumeId).finally(() => starting.delete(volumeId)));
       }
       await starting.get(volumeId);
+      relayFor(volumeId);
       const { url, headers } = await forwardFor(volumeId);
       return { bayma: { url, headers } };
     },
@@ -127,12 +179,17 @@ export function createSandbox({ config, store, stateDir, docker = createDocker()
     },
 
     /**
-     * alasio is shutting down: close every forward. Session hosts keep running, with the
-     * agent's processes and bayma's REPL sessions, for the next alasio to adopt; nothing of
-     * the harness is in them to lose.
+     * alasio is shutting down: close every forward and relay. Session hosts keep running,
+     * with the agent's processes and bayma's REPL sessions, for the next alasio to adopt;
+     * nothing of the harness is in them to lose, and their drains hold what bayma records
+     * until the next alasio relays it.
      */
     async close() {
-      await Promise.all([...forwards.keys()].map(closeForward));
+      await Promise.all([
+        ...[...forwards.keys()].map(closeForward),
+        ...[...relays.values()].map(async (relay) => (await relay.catch(() => null))?.close()),
+      ]);
+      (await forwarder?.catch(() => null))?.close();
     },
   };
 }

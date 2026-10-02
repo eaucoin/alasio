@@ -19,7 +19,7 @@ import { COMPOSE_FILE, DEFAULT_BRIDGE, DEFAULT_COMPUTE_PORT, setupNeon } from ".
 import { NeonRolloutStore } from "../codex/rollouts/store.js";
 import { NeonSessionStore } from "../harness/claude/session-store.js";
 import { createLogger } from "../shared/log.js";
-import { inSpan, parseHeaders, signalHeaders } from "../telemetry/index.js";
+import { inSpan, parseKeyValueList, signalHeaders } from "../telemetry/index.js";
 
 const log = createLogger("neon");
 const run = promisify(execFile);
@@ -50,7 +50,7 @@ export function composeCommand(layout, project = NEON_PROJECT) {
  */
 export function neonTelemetry(env = process.env) {
   const endpoint = env.ALASIO_NEON_OTLP_ENDPOINT?.trim();
-  return endpoint ? { endpoint, headers: parseHeaders(signalHeaders(env, "metrics")) } : null;
+  return endpoint ? { endpoint, headers: parseKeyValueList(signalHeaders(env, "metrics")) } : null;
 }
 
 /** Pulls every image the stack runs, so its first start waits on none. */
