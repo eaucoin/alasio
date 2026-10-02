@@ -293,6 +293,10 @@ objectStore:
     storage:
       size: 100Gi
       storageClassName: ""
+    # The most volumes it keeps, each up to 1GiB, so storage.size in GiB is as many as fit.
+    # Every bucket grows seven at a time, so the slots must outnumber what the buckets
+    # take together; a count made from the disk free when it starts runs out on a full one.
+    volumes: 100
     # The disk it leaves free: below this it writes nothing new, so the volume it shares
     # never fills.
     minFreeSpace: 5GiB

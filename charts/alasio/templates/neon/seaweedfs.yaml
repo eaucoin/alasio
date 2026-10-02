@@ -69,7 +69,7 @@ spec:
             - -ip=$(POD_NAME).{{ $name }}-peers.$(POD_NAMESPACE).svc.cluster.local
             - -ip.bind=0.0.0.0
             - -dir=/data
-            - -volume.max=0
+            - -volume.max={{ .Values.objectStore.bundled.volumes }}
             - -master.volumeSizeLimitMB=1024
             - -master.defaultReplication=000
             - -master.telemetry=false

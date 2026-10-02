@@ -59,6 +59,13 @@ tests:
     asserts:
       - matchRegex: { path: 'spec.template.spec.containers[0].image', pattern: '(@sha256:[0-9a-f]{64}|alasio:1\.0\.0)$' }
         documentSelector: { path: kind, value: StatefulSet, matchMany: true }
+  - it: gives the object store a fixed count of volumes, not one made from the disk free
+    template: templates/neon/seaweedfs.yaml
+    documentSelector: { path: kind, value: StatefulSet }
+    set:
+      objectStore.bundled.volumes: 40
+    asserts:
+      - contains: { path: 'spec.template.spec.containers[0].args', content: -volume.max=40 }
   - it: uses the operator's object store and makes no SeaweedFS when told
     set:
       objectStore.bundled.enabled: false
