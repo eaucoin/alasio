@@ -220,7 +220,7 @@ export class TurnController {
       throw new Error(blocker);
     }
     const volumeId = newVolumeId();
-    this.sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none");
+    await this.sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none");
     const workingDirectory = sessionFsWorkspace(volumeId);
     const previous = this.workingDirectoryFor(conversationId);
     this.store.setWorkingDirectory(conversationId, workingDirectory);

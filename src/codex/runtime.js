@@ -24,7 +24,7 @@ import {
 } from "./command-event-policy.js";
 import { buildCodexThreadConfig } from "./thread-config.js";
 import { codexAppServerClient } from "./app-server/client.js";
-import { ensureBaymaReady } from "../mcp/bayma.js";
+import { folderBaymaServer } from "../mcp/bayma.js";
 import { createLogger } from "../shared/log.js";
 import { CODEX_HARNESS } from "../harness/names.js";
 
@@ -40,8 +40,8 @@ function getErrorMessage(error) {
  */
 export async function folderCodexScope({ workingDirectory, threadKey }) {
     const codexEnv = buildCodexEnv();
-    const codexConfig = buildCodexThreadConfig({ codexEnv, threadKey });
-    await ensureBaymaReady(codexEnv);
+    const bayma = await folderBaymaServer({ harness: CODEX_HARNESS, threadKey, env: codexEnv });
+    const codexConfig = buildCodexThreadConfig({ codexEnv, bayma });
     return { cwd: workingDirectory, codexEnv, codexConfig, client: codexAppServerClient };
 }
 

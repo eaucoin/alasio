@@ -235,7 +235,7 @@ test("both harnesses are told how to show media, Codex after the operator's own 
   assert.match(REPLY_INSTRUCTIONS, /!\[short caption\]\(path\)/);
 
   writeFileSync(join(dir, "config.toml"), 'developer_instructions = "Operator rule."\n');
-  const config = buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, threadKey: "t" });
+  const config = buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, bayma: { type: "stdio", command: "bayma", args: [] } });
   assert.equal(config.developer_instructions, `Operator rule.\n\n${REPLY_INSTRUCTIONS}`);
 
   const claude = buildClaudeQueryOptions({ workingDirectory: dir, claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {} });

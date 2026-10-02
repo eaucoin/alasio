@@ -33,7 +33,6 @@ import {
   createPromptChannel,
   createTurnTimer,
   defaultQueryFactory,
-  ensureBaymaReady,
   getErrorMessage,
   instrumentPromptChannel,
   isBlockedDbCommand,
@@ -47,6 +46,7 @@ import {
 } from "./runtime.js";
 import { getClaudeEffort, getClaudeModel } from "./model.js";
 import { BAYMA_EXEC_TOOL } from "./runtime.js";
+import { folderBaymaServer } from "../../mcp/bayma.js";
 import { extractShellCommands } from "../../policy/embedded-shell.js";
 import { looksLikeSelfRestartCommand } from "../../policy/restart-command.js";
 import { detectWorkflowWait } from "../../policy/workflow-wait.js";
@@ -383,10 +383,11 @@ export function createClaudeLiveSessions({ workingDirectory, sessions, sessionSt
   async function startHost(params, key, bayma) {
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
-    // A session filesystem's bayma runs in its sandbox, reached through its forward; a
-    // folder's is launched here for the conversation.
-    if (!bayma) await ensureBaymaReady(claudeEnv);
-    const mcpServers = bayma ? undefined : claudeMcpServers({ threadKey, env: claudeEnv });
+    // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
+    // own, launched by the CLI on Docker and a Sandbox of its own on Kubernetes.
+    const mcpServers = bayma
+      ? undefined
+      : claudeMcpServers(await folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey, env: claudeEnv }));
     const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });

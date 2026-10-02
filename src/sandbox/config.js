@@ -1,11 +1,18 @@
 /**
- * Configuration for session filesystems, read from the environment. The feature is off
- * unless `ALASIO_SANDBOX_ENABLED=1`, so a deployment without the Valkey, the S3 bucket,
- * and the built images behaves exactly as before. `loadSandboxConfig`
- * returns null when off, and throws with the missing key named when on but incomplete,
- * so a half-configured deployment fails loudly at startup rather than mid-session.
+ * Configuration for session filesystems, read from the environment. `loadSandboxConfig`
+ * returns null when they are off, and throws with the missing key named when on but
+ * incomplete, so a half-configured deployment fails loudly at startup rather than
+ * mid-session.
+ *
+ * On Kubernetes (`ALASIO_RUNTIME=kubernetes`) they are on when the deployment's
+ * templates have a `sessions` profile (../kube/config.js), and the config is
+ * `{ runtime: "kubernetes", templates }`. On Docker they are off unless
+ * `ALASIO_SANDBOX_ENABLED=1`, so a deployment without the Valkey, the S3 bucket, and the
+ * built images behaves exactly as before.
  */
 import { readFileSync } from "node:fs";
+
+import { loadKubeTemplates, onKubernetes } from "../kube/config.js";
 
 function required(env, key) {
   const value = env[key]?.trim();
@@ -21,6 +28,10 @@ function secret(env, key) {
 }
 
 export function loadSandboxConfig(env = process.env) {
+  if (onKubernetes(env)) {
+    const templates = loadKubeTemplates(env);
+    return templates.sessions ? { runtime: "kubernetes", templates } : null;
+  }
   if (env.ALASIO_SANDBOX_ENABLED !== "1") return null;
   const int = (key, fallback) => {
     const raw = env[key]?.trim();

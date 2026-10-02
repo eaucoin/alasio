@@ -6,7 +6,8 @@ import { sessionFsCodexHome } from "./codex/sessionfs.js";
 import { startTranscriptSearch } from "./harness/claude/search/index.js";
 import { loadSandboxConfig } from "./sandbox/config.js";
 import { syncLakeReads } from "./neon/lake.js";
-import { startNeon } from "./neon/stack.js";
+import { connectNeon, startNeon } from "./neon/stack.js";
+import { onKubernetes } from "./kube/config.js";
 import { createLogger } from "./shared/log.js";
 import { stopTelemetry } from "./telemetry/start.js";
 import { TelegramCodexApp } from "./telegram/app.js";
@@ -21,9 +22,10 @@ let sessionFsCodexRollouts = null;
 
 async function main() {
   // Claude Code's transcripts and Codex's rollouts are kept in alasio's Neon,
-  // which runs before anything is served, and Codex's are mirrored from the
-  // start so no turn runs unmirrored.
-  neon = await startNeon({ stateDir: config.stateDir });
+  // which runs before anything is served (on Kubernetes, the deployment runs it;
+  // on Docker, alasio brings it up), and Codex's are mirrored from the start so no
+  // turn runs unmirrored.
+  neon = onKubernetes() ? await connectNeon() : await startNeon({ stateDir: config.stateDir });
   codexRollouts = startCodexRollouts({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are off unless
   // configured; the app builds the subsystem from this with its own store. Their Codex

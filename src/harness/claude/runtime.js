@@ -21,7 +21,6 @@ import {
   createCommandEventPolicy,
 } from "../../codex/command-event-policy.js";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.js";
-import { ensureBaymaReady } from "../../mcp/bayma.js";
 import { createLogger } from "../../shared/log.js";
 import { buildClaudeEnv } from "./env.js";
 import {
@@ -145,7 +144,6 @@ export {
   claudeMcpServers,
   createCommandEventPolicy,
   createTurnTimer,
-  ensureBaymaReady,
   getErrorMessage,
   isBlockedDbCommand,
   isVisibleCodexItem,

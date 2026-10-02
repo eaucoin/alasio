@@ -98,20 +98,16 @@ test("each harness and conversation gets its own bayma state directory", () => {
 });
 
 test("alasio adds bayma to Claude Code's servers", () => {
-  const servers = claudeMcpServers({ threadKey: "telegram:1", env });
+  const servers = claudeMcpServers({ type: "stdio", ...baymaLaunch({ harness: "claude", threadKey: "telegram:1", env }) });
   assert.deepEqual(Object.keys(servers), ["bayma"]);
   assert.equal(servers.bayma.type, "stdio");
   assert.equal(servers.bayma.command, "/bin/sh");
 });
 
 test("Codex threads add bayma and leave the operator's servers and apps connector on", () => {
-  const config = buildCodexThreadConfig({ codexEnv: env, threadKey: "telegram:1" });
-  assert.deepEqual(config.mcp_servers, {
-    bayma: {
-      ...baymaLaunch({ harness: "codex", threadKey: "telegram:1", env }),
-      startup_timeout_sec: 60,
-    },
-  });
+  const launch = baymaLaunch({ harness: "codex", threadKey: "telegram:1", env });
+  const config = buildCodexThreadConfig({ codexEnv: env, bayma: { type: "stdio", ...launch } });
+  assert.deepEqual(config.mcp_servers, { bayma: { ...launch, startup_timeout_sec: 60 } });
   assert.equal(config.features, undefined);
 });
 

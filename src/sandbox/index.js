@@ -1,6 +1,7 @@
 /**
- * The session-filesystem subsystem, assembled from configuration (config.js): the
- * metadata engine, the volume manager, the session-host launcher, and the forwards that
+ * The session-filesystem subsystem, assembled from configuration (config.js). On
+ * Kubernetes it is ./kubernetes/; on Docker, what this module assembles: the metadata
+ * engine, the volume manager, the session-host launcher, and the forwards that
  * carry harnesses to bayma inside each session. Off unless configured; `createSandbox`
  * returns null then, and callers treat a null sandbox as "session filesystems are
  * unavailable, offer only folders".
@@ -25,6 +26,7 @@ import { SessionHost } from "./session-host.js";
 import { assertValidVolumeId } from "./names.js";
 import { DRAIN_READ_PORT, sandboxBaymaTelemetryEnv, sandboxResource, startTelemetryRelay } from "./telemetry.js";
 import { SessionVolumeManager } from "./volume.js";
+import { createKubernetesSandbox } from "./kubernetes/index.js";
 
 const log = createLogger("sandbox");
 
@@ -50,6 +52,9 @@ export function createSandbox({
   createForwarder = loadForwarder,
 } = {}) {
   if (!config) return null;
+  if (config.runtime === "kubernetes") {
+    return createKubernetesSandbox({ templates: config.templates, stateDir, env, createForwarder });
+  }
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);
   const engine = createMetadataEngine(config.metadata);
   const volumes = new SessionVolumeManager({

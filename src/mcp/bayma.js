@@ -20,8 +20,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { resolveStateDir } from "../config.js";
+import { loadKubeTemplates, onKubernetes } from "../kube/config.js";
 import { createLogger } from "../shared/log.js";
 import { conversationTelemetryEnv, inSpan } from "../telemetry/index.js";
+import { createHostBayma, sanitizePathToken } from "./bayma-kubernetes.js";
 
 export const BAYMA_SERVER_NAME = "bayma";
 
@@ -78,10 +80,6 @@ const OWN_VARIABLE = /^(PATH|HOSTNAME|BAYMA_.*)$/u;
 const STOP_THEN_RUN = `ids=$(docker ps --quiet --filter "label=${STATE_LABEL}=$0"); [ -z "$ids" ] || docker stop $ids >/dev/null; exec docker run --label "${STATE_LABEL}=$0" "$@"`;
 
 const log = createLogger("bayma");
-
-function sanitizePathToken(value) {
-  return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
-}
 
 /**
  * Sessions are checkpointed, bayma's default, stated so a alasio restart can
@@ -189,4 +187,23 @@ export function ensureBaymaReady(env) {
     throw new Error(`bayma is unavailable: ${error instanceof Error ? error.message : String(error)}`);
   });
   return readiness;
+}
+
+let hostBayma = null;
+
+/**
+ * The bayma MCP server a folder workspace's conversation gets under `harness`, once it
+ * can be reached: `{ type: "stdio", command, args, env? }` on Docker, launched by the
+ * harness, or `{ type: "http", url, headers }` on Kubernetes, the conversation's
+ * Sandbox (./bayma-kubernetes.js). Each harness adapter turns it into its own MCP
+ * config shape.
+ */
+export async function folderBaymaServer({ harness, threadKey, env = process.env }) {
+  if (onKubernetes(env)) {
+    hostBayma ??= createHostBayma({ templates: loadKubeTemplates(env) });
+    if (!hostBayma) throw new Error("this deployment offers no folder workspaces: its Kubernetes templates have no host profile");
+    return { type: "http", ...(await hostBayma.ensure({ harness, threadKey })) };
+  }
+  await ensureBaymaReady(env);
+  return { type: "stdio", ...baymaLaunch({ harness, threadKey, env }) };
 }
