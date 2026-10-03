@@ -1,281 +1,163 @@
 import type { CallbackQuery } from "@grammyjs/types";
-import type { ConcurrentPromptPayload, TurnController } from "../codex/turn-controller.ts";
-import type { AlasioConfig } from "../config.ts";
-import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
-import { NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
+import { Effect, Option, Result } from "effect";
+
+import { type ConcurrentPromptPayload, Turns } from "../codex/turn-controller.ts";
+import { ActiveTurns } from "../harness/active-turns.ts";
+import { Harnesses, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName, resolveHarnessName } from "../harness/index.ts";
+import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
 import { handleModelControlCallback, isModelControlAction } from "../operator/model-control.ts";
 import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.ts";
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.ts";
-import { handleWorkspaceControlCallback, isWorkspaceControlAction, sendChooseWorkspacePanel } from "../operator/workspace-control.ts";
+import { handleWorkspaceControlCallback, isWorkspaceControlAction } from "../operator/workspace-control.ts";
 import type { CallbackAction } from "../persistence/callback-repository.ts";
-import type { SqliteStore } from "../persistence/store.ts";
-import type { Authorizer } from "./authorizer.ts";
-import type { Client } from "./client.ts";
-
-/** What the handler calls on the turn controller. */
-export type CallbackTurns = Pick<
-  TurnController,
-  | "harnessFor"
-  | "switchHarness"
-  | "switchWorkspace"
-  | "createSessionWorkspace"
-  | "sandboxEnabled"
-  | "startNewSession"
-  | "setPromptDisposition"
-  | "enqueueMessage"
-  | "runGoalTurn"
-  | "scheduleConversation"
->;
-
-/** The Telegram calls the handler and the controls it hands a press to make. */
-export type CallbackClient = Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage" | "sendMessage">;
-
-export interface CallbackHandlerOptions {
-  readonly authorizer: Pick<Authorizer, "isAuthorizedCallbackQuery">;
-  readonly client: CallbackClient;
-  readonly config: Pick<AlasioConfig, "workspaceRoot">;
-  readonly store: SqliteStore;
-  readonly turns: CallbackTurns;
-  readonly activeTurns: ActiveTurnsFacade;
-}
-
-function clientAfterCallbackAck(client: CallbackClient): CallbackClient {
-  return new Proxy(client, {
-    get(target, property) {
-      if (property === "answerCallbackQuery") {
-        return async () => null;
-      }
-      const value: unknown = Reflect.get(target, property);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-}
+import { Store } from "../persistence/store.ts";
+import { Authorizer } from "./authorizer.ts";
+import { TelegramClient } from "./client.ts";
 
 /** A concurrent prompt's button payload: askHowToHandleConcurrentPrompt is the only writer of these kinds. */
 function concurrentPromptPayload(action: CallbackAction): ConcurrentPromptPayload {
   return action.payload as ConcurrentPromptPayload;
 }
 
-export class CallbackHandler {
-  private readonly authorizer: Pick<Authorizer, "isAuthorizedCallbackQuery">;
-  private readonly client: CallbackClient;
-  private readonly config: Pick<AlasioConfig, "workspaceRoot">;
-  private readonly store: SqliteStore;
-  private readonly turns: CallbackTurns;
-  private readonly activeTurns: ActiveTurnsFacade;
+/**
+ * Runs `control` after the press has been answered "Working...": the control's own
+ * answers then go nowhere, as a query is answered once.
+ */
+const afterAcknowledging = <A, E, R>(callbackQueryId: string, control: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(TelegramClient, (client) => client.answerCallbackQuery(callbackQueryId, "Working...")).pipe(
+    Effect.andThen(control.pipe(
+      Effect.updateService(TelegramClient, (client) => TelegramClient.of({ ...client, answerCallbackQuery: () => Effect.succeed(null) })),
+    )),
+  );
 
-  constructor({ authorizer, client, config, store, turns, activeTurns }: CallbackHandlerOptions) {
-    this.authorizer = authorizer;
-    this.client = client;
-    this.config = config;
-    this.store = store;
-    this.turns = turns;
-    this.activeTurns = activeTurns;
+/** Handles a press of one of alasio's buttons. */
+export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: CallbackQuery): Effect.fn.Return<
+  void,
+  CommandError,
+  Authorizer | OperatorServices
+> {
+  const store = yield* Store;
+  const client = yield* TelegramClient;
+  const activeTurns = yield* ActiveTurns;
+  const turns = yield* Turns;
+  if (!(yield* Effect.flatMap(Authorizer, (authorizer) => authorizer.isAuthorizedCallbackQuery(callbackQuery)))) {
+    yield* client.answerCallbackQuery(callbackQuery.id, "This action is not authorized for this Telegram user.");
+    return;
   }
-
-  async handle(callbackQuery: CallbackQuery): Promise<void> {
-    if (!this.authorizer.isAuthorizedCallbackQuery(callbackQuery)) {
-      await this.client.answerCallbackQuery(callbackQuery.id, "This action is not authorized for this Telegram user.");
-      return;
-    }
-    // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
-    const action = callbackQuery.data === undefined ? null : this.store.consumeCallbackAction(callbackQuery.data);
-    if (!action) {
-      await this.client.answerCallbackQuery(callbackQuery.id, "This action is no longer available.");
-      return;
-    }
-    if (!action.kind.endsWith(":close")
-      && Object.hasOwn(action.payload, "expectedSessionId")
-      && (this.store.getSessionId(action.conversationId) ?? null) !== action.payload["expectedSessionId"]) {
-      await this.client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
-      return;
-    }
-    if (!action.kind.endsWith(":close")
-      && !isServiceControlAction(action.kind)
-      && isHarnessName(action.payload?.["expectedHarness"])
-      && this.store.getActiveHarness(action.conversationId) !== action.payload["expectedHarness"]) {
-      await this.client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
-      return;
-    }
-    const harness = this.turns.harnessFor(action.conversationId);
-    const chatId = callbackQuery.message?.chat?.id;
-    const messageId = callbackQuery.message?.message_id;
-    if (!chatId || !messageId) {
-      await this.client.answerCallbackQuery(callbackQuery.id, "Missing message context.");
-      return;
-    }
-    if (isModelControlAction(action.kind)) {
-      await handleModelControlCallback({
-        client: this.client,
-        store: this.store,
-        action,
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-      });
-      return;
-    }
-    if (isServiceControlAction(action.kind)) {
-      await handleServiceControlCallback({
-        client: this.client,
-        store: this.store,
-        activeTurns: this.activeTurns,
-        action,
-        switchHarness: (args) => this.turns.switchHarness(args),
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-        onMounted: async () => {
-          // Service first, then folder: chain straight into the folder picker.
-          if (!resolveWorkingDirectory(this.store, action.conversationId)) {
-            await sendChooseWorkspacePanel({
-              client: this.client,
-              store: this.store,
-              activeTurns: this.activeTurns,
-              conversationId: action.conversationId,
-              chatId,
-              workspaceRoot: this.config.workspaceRoot,
-              sandboxEnabled: this.turns.sandboxEnabled,
-            });
-          }
-        },
-      });
-      return;
-    }
-    if (isWorkspaceControlAction(action.kind)) {
-      await handleWorkspaceControlCallback({
-        client: this.client,
-        store: this.store,
-        activeTurns: this.activeTurns,
-        action,
-        workspaceRoot: this.config.workspaceRoot,
-        switchWorkspace: (args) => this.turns.switchWorkspace(args),
-        createSessionWorkspace: (args) => this.turns.createSessionWorkspace(args),
-        sandboxEnabled: this.turns.sandboxEnabled,
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-      });
-      return;
-    }
-    if (!harness) {
-      const reason = resolveHarnessName(this.store, action.conversationId) ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
-      await this.client.answerCallbackQuery(callbackQuery.id, reason);
-      return;
-    }
-    if (isSessionControlAction(action.kind)) {
-      const acknowledged = !action.kind.endsWith(":close");
-      if (acknowledged) {
-        await this.client.answerCallbackQuery(callbackQuery.id, "Working...");
-      }
-      await handleSessionControlCallback({
-        client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
-        store: this.store,
-        harness,
-        activeTurns: this.activeTurns,
-        action,
-        startNewSession: (args) => this.turns.startNewSession(args),
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-      });
-      return;
-    }
-    if (action.kind === "steer") {
-      const payload = concurrentPromptPayload(action);
-      const promptJob = payload.jobId ? this.store.getPromptJob(payload.jobId) : null;
-      const prompt = promptJob?.prompt ?? payload.prompt;
-      const queue = () => {
-        if (promptJob) {
-          this.turns.setPromptDisposition(promptJob.id, "pending");
-        } else {
-          this.turns.enqueueMessage(action.conversationId, prompt);
-        }
-      };
-      let steered: boolean | null;
-      try {
-        steered = await this.activeTurns.steer(action.conversationId, prompt);
-        if (steered !== null) {
-          if (promptJob) {
-            this.turns.setPromptDisposition(promptJob.id, "completed");
-          }
-          await this.client.answerCallbackQuery(callbackQuery.id, "Steered.");
-          await this.client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
-        }
-      } catch (error) {
-        queue();
-        await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-        const message = error instanceof Error ? error.message : String(error);
-        await this.client.editMessageText(chatId, messageId, `Steer failed; queued instead.\n\n${message}`, { format: "plain" });
-        return;
-      }
-      if (steered === null) {
-        // No turn runs to take it.
-        queue();
-        await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-        await this.client.editMessageText(chatId, messageId, `${harness.displayName} is not ready to steer yet. Queued instead.`);
-      }
-      return;
-    }
-    if (isGoalControlAction(action.kind)) {
-      if (!harness.supportsGoals && !action.kind.endsWith(":close")) {
-        await this.client.answerCallbackQuery(callbackQuery.id, `Goals are a Codex feature; ${harness.displayName} is active.`);
-        return;
-      }
-      const acknowledged = !action.kind.endsWith(":close");
-      if (acknowledged) {
-        await this.client.answerCallbackQuery(callbackQuery.id, "Working...");
-      }
-      await handleGoalControlCallback({
-        client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
-        goalApi: harness.goals,
-        store: this.store,
-        action,
-        callbackQueryId: callbackQuery.id,
-        chatId,
-        messageId,
-        runGoalTurn: (args) => this.turns.runGoalTurn(args),
-        stopActiveTurn: async () => await this.activeTurns.stop(action.conversationId),
-        isTurnActive: this.activeTurns.isBusy(action.conversationId),
-      });
-      return;
-    }
-    if (action.kind === "queue") {
-      const payload = concurrentPromptPayload(action);
-      if (payload.jobId) {
-        this.turns.setPromptDisposition(payload.jobId, "pending");
-      } else {
-        this.turns.enqueueMessage(action.conversationId, payload.prompt);
-      }
-      await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-      await this.client.editMessageText(chatId, messageId, `Queued. ${harness.displayName} will process this after the current task.`);
-      return;
-    }
-    if (action.kind === "discard") {
-      const payload = concurrentPromptPayload(action);
-      if (payload.jobId) {
-        this.turns.setPromptDisposition(payload.jobId, "cancelled");
-      }
-      await this.client.answerCallbackQuery(callbackQuery.id, "Discarded.");
-      await this.client.editMessageText(chatId, messageId, "Discarded.");
-      return;
-    }
-    if (action.kind === "swerve") {
-      const payload = concurrentPromptPayload(action);
-      if (payload.jobId) {
-        this.store.setPromptJobDisposition(payload.jobId, "pending", 1);
-      } else {
-        this.turns.enqueueMessage(action.conversationId, payload.prompt, true);
-      }
-      await this.activeTurns.stop(action.conversationId, "swerve");
-      if (payload.jobId) {
-        void this.turns.scheduleConversation(action.conversationId);
-      }
-      await this.client.answerCallbackQuery(callbackQuery.id, "Swerving.");
-      await this.client.editMessageText(chatId, messageId, `Swerving ${harness.displayName} to this message.`);
-      return;
-    }
-    await this.client.answerCallbackQuery(callbackQuery.id, "Unknown action.");
+  // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
+  const action = callbackQuery.data === undefined ? null : store.consumeCallbackAction(callbackQuery.data);
+  if (!action) {
+    yield* client.answerCallbackQuery(callbackQuery.id, "This action is no longer available.");
+    return;
   }
-}
+  const { conversationId } = action;
+  const closes = action.kind.endsWith(":close");
+  if (!closes
+    && Object.hasOwn(action.payload, "expectedSessionId")
+    && (store.getSessionId(conversationId) ?? null) !== action.payload["expectedSessionId"]) {
+    yield* client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
+    return;
+  }
+  if (!closes
+    && !isServiceControlAction(action.kind)
+    && isHarnessName(action.payload?.["expectedHarness"])
+    && store.getActiveHarness(conversationId) !== action.payload["expectedHarness"]) {
+    yield* client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
+    return;
+  }
+  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forConversation(conversationId)));
+  const chatId = callbackQuery.message?.chat?.id;
+  const messageId = callbackQuery.message?.message_id;
+  if (!chatId || !messageId) {
+    yield* client.answerCallbackQuery(callbackQuery.id, "Missing message context.");
+    return;
+  }
+  const press = { action, callbackQueryId: callbackQuery.id, chatId, messageId };
+  if (isModelControlAction(action.kind)) {
+    return yield* handleModelControlCallback(press);
+  }
+  if (isServiceControlAction(action.kind)) {
+    return yield* handleServiceControlCallback(press);
+  }
+  if (isWorkspaceControlAction(action.kind)) {
+    return yield* handleWorkspaceControlCallback(press);
+  }
+  if (!harness) {
+    const reason = resolveHarnessName(store, conversationId) ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
+    yield* client.answerCallbackQuery(callbackQuery.id, reason);
+    return;
+  }
+  if (isSessionControlAction(action.kind)) {
+    const control = handleSessionControlCallback({ ...press, harness });
+    return yield* closes ? control : afterAcknowledging(callbackQuery.id, control);
+  }
+  if (action.kind === "steer") {
+    const payload = concurrentPromptPayload(action);
+    const promptJob = payload.jobId ? store.getPromptJob(payload.jobId) : null;
+    const prompt = promptJob?.prompt ?? payload.prompt;
+    /** Keeps the message for after the running turn instead: its job made pending again, or a queued message. */
+    const queueInstead = promptJob ? turns.setPromptDisposition(promptJob.id, "pending") : turns.enqueueMessage(conversationId, prompt);
+    const steered = yield* activeTurns.steer(conversationId, prompt).pipe(Effect.result);
+    if (Result.isFailure(steered)) {
+      yield* queueInstead;
+      yield* client.answerCallbackQuery(callbackQuery.id, "Queued.");
+      yield* client.editMessageText(chatId, messageId, `Steer failed; queued instead.\n\n${steered.failure.message}`, { format: "plain" });
+      return;
+    }
+    if (Option.getOrElse(steered.success, () => false)) {
+      if (promptJob) {
+        yield* turns.setPromptDisposition(promptJob.id, "completed");
+      }
+      yield* client.answerCallbackQuery(callbackQuery.id, "Steered.");
+      yield* client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
+      return;
+    }
+    // No turn runs to take it, or the one running cannot yet (a Codex turn not yet started upstream).
+    yield* queueInstead;
+    yield* client.answerCallbackQuery(callbackQuery.id, "Queued.");
+    yield* client.editMessageText(chatId, messageId, `${harness.displayName} is not ready to steer yet. Queued instead.`);
+    return;
+  }
+  if (isGoalControlAction(action.kind)) {
+    if (!harness.supportsGoals && !closes) {
+      yield* client.answerCallbackQuery(callbackQuery.id, `Goals are a Codex feature; ${harness.displayName} is active.`);
+      return;
+    }
+    const control = handleGoalControlCallback({ ...press, goals: harness.goals });
+    return yield* closes ? control : afterAcknowledging(callbackQuery.id, control);
+  }
+  if (action.kind === "queue") {
+    const payload = concurrentPromptPayload(action);
+    yield* payload.jobId ? turns.setPromptDisposition(payload.jobId, "pending") : turns.enqueueMessage(conversationId, payload.prompt);
+    yield* client.answerCallbackQuery(callbackQuery.id, "Queued.");
+    yield* client.editMessageText(chatId, messageId, `Queued. ${harness.displayName} will process this after the current task.`);
+    return;
+  }
+  if (action.kind === "discard") {
+    const payload = concurrentPromptPayload(action);
+    if (payload.jobId) {
+      yield* turns.setPromptDisposition(payload.jobId, "cancelled");
+    }
+    yield* client.answerCallbackQuery(callbackQuery.id, "Discarded.");
+    yield* client.editMessageText(chatId, messageId, "Discarded.");
+    return;
+  }
+  if (action.kind === "swerve") {
+    const payload = concurrentPromptPayload(action);
+    if (payload.jobId) {
+      // First in line, scheduled once the running turn has let go.
+      store.setPromptJobDisposition(payload.jobId, "pending", 1);
+    } else {
+      yield* turns.enqueueMessage(conversationId, payload.prompt, true);
+    }
+    yield* activeTurns.stop(conversationId, "swerve");
+    if (payload.jobId) {
+      yield* turns.schedule(conversationId);
+    }
+    yield* client.answerCallbackQuery(callbackQuery.id, "Swerving.");
+    yield* client.editMessageText(chatId, messageId, `Swerving ${harness.displayName} to this message.`);
+    return;
+  }
+  yield* client.answerCallbackQuery(callbackQuery.id, "Unknown action.");
+});

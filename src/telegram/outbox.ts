@@ -5,7 +5,6 @@ import { Clock, Context, Effect, Latch, Layer, Semaphore } from "effect";
 
 import type { NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
 import { Store } from "../persistence/store.ts";
-import type { EffectRunner } from "../shared/effects.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 import { type TelegramError, TelegramClient } from "./client.ts";
@@ -110,18 +109,4 @@ export class Outbox extends Context.Service<Outbox, {
       deliverDue,
     });
   }));
-}
-
-/**
- * The Outbox as alasio's code not yet written in Effect queues replies: synchronously,
- * through alasio's EffectRunner (src/alasio.ts). It goes when its last caller moves.
- */
-export interface TelegramOutbox {
-  readonly enqueueText: (text: OutboxText) => string;
-}
-
-/** The promise façade of the Outbox `effects` runs in. */
-export function outboxFacade(effects: EffectRunner<Outbox>): TelegramOutbox {
-  const outbox = effects.runSync(Outbox);
-  return { enqueueText: (text) => effects.runSync(outbox.enqueueText(text)) };
 }

@@ -6,7 +6,6 @@
  */
 import { Context, Effect, HashMap, Layer, Option, Ref, type Scope } from "effect";
 
-import type { EffectRunner } from "../shared/effects.ts";
 import type { HarnessError } from "./index.ts";
 
 /** Why the operator stops a running turn: /stop (or a panel's Stop), or a swerve to the prompt that came in meanwhile. */
@@ -79,31 +78,3 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
     });
   }));
 }
-
-/**
- * ActiveTurns as alasio's code not yet written in Effect asks it (the operator's panels
- * and controls), through alasio's EffectRunner. It goes when its last caller moves.
- */
-export interface ActiveTurnsFacade {
-  readonly isBusy: (conversationId: string) => boolean;
-  readonly stop: (conversationId: string, reason?: StopReason) => Promise<boolean>;
-  /** Whether the running turn took the guidance; null when no turn runs. */
-  readonly steer: (conversationId: string, prompt: string) => Promise<boolean | null>;
-}
-
-/** The promise façade of the ActiveTurns `effects` runs in. */
-export function activeTurnsFacade(effects: EffectRunner<ActiveTurns>): ActiveTurnsFacade {
-  const activeTurns = effects.runSync(ActiveTurns);
-  return {
-    isBusy: (conversationId) => effects.runSync(activeTurns.isBusy(conversationId)),
-    stop: (conversationId, reason = "interrupt") => effects.runPromise(activeTurns.stop(conversationId, reason)),
-    steer: (conversationId, prompt) => effects.runPromise(Effect.map(activeTurns.steer(conversationId, prompt), Option.getOrNull)),
-  };
-}
-
-/** No conversation busy: what a panel built outside any running turn is told. */
-export const noActiveTurns: ActiveTurnsFacade = {
-  isBusy: () => false,
-  stop: async () => false,
-  steer: async () => null,
-};

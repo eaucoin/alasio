@@ -37,7 +37,6 @@ if (import.meta.main) {
   if (encoded === undefined) throw new Error("usage: alasio-main.ts <config as JSON>");
   // The test writes the configuration.
   const config = JSON.parse(encoded) as AlasioProcessConfig;
-  // The harnesses alasio makes run their effects in its services, as the app's own do.
   const alasio = serveAlasio({
     telegramBotToken: "123:test",
     allowedUserIds: config.allowedUserIds,

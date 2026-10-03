@@ -1,41 +1,22 @@
-import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
+import type { InlineKeyboardButton } from "@grammyjs/types";
+import { Effect } from "effect";
+
+import { type ConversationBusy, Turns } from "../codex/turn-controller.ts";
 import type { ListedSession } from "../harness/claude/sessions.ts";
-import { type ActiveTurnsFacade, noActiveTurns } from "../harness/active-turns.ts";
-import type { HarnessFacade } from "../harness/index.ts";
-import type { CallbackAction, CallbackPayload } from "../persistence/callback-repository.ts";
-import type { SqliteStore } from "../persistence/store.ts";
+import { ActiveTurns } from "../harness/active-turns.ts";
+import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
+import type { CallbackPayload } from "../persistence/callback-repository.ts";
+import { type SqliteStore, Store } from "../persistence/store.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
-import type { ChatId, Client, TextMessageOptions } from "../telegram/client.ts";
+import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
+import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
 
-/** How an operator panel is sent or edited: as plain text, under its inline keyboard. */
-export interface ControlPanelOptions extends TextMessageOptions {
-  readonly format: "plain";
-  readonly reply_markup: InlineKeyboardMarkup;
-}
-
-/** An operator panel: a message and the buttons under it. */
-export interface ControlPanel {
-  readonly text: string;
-  readonly options: ControlPanelOptions;
-}
-
-/** A pressed panel button, as the callback handler hands it to a control. */
-export interface ControlCallback {
-  readonly action: CallbackAction;
-  readonly callbackQueryId: string;
-  readonly chatId: ChatId;
-  readonly messageId: number;
-}
-
-/** Starts and mounts a new session for the conversation; resolves to its id. */
-export type StartNewSession = (request: { readonly conversationId: string }) => Promise<string>;
-
-/** The store's sessions and callback actions, as the session panels read and change them. */
-export type SessionControlStore = Pick<SqliteStore, "getSessionId" | "setSessionId" | "getSessionTokens" | "createCallbackAction">;
-
 /** The mounted harness, as the session panels list, rewind, and resume its sessions. */
-export type SessionControlHarness = Pick<HarnessFacade, "displayName" | "sessions">;
+export type SessionControlHarness = Pick<Harness, "displayName" | "sessions">;
+
+/** How starting a new session from a panel fails. */
+export type NewSessionError = NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError;
 
 const CONTROL_KIND_PREFIX = "control:";
 
@@ -76,13 +57,6 @@ function createButton(
   };
 }
 
-function buildPanelOptions(replyMarkup: InlineKeyboardMarkup): ControlPanelOptions {
-  return {
-    format: "plain",
-    reply_markup: replyMarkup,
-  };
-}
-
 function closeRow(store: Pick<SqliteStore, "createCallbackAction">, conversationId: string): InlineKeyboardButton.CallbackButton[] {
   return [createButton(store, conversationId, "Close", "close")];
 }
@@ -102,38 +76,39 @@ function describeSession(session: ListedSession, mountedSessionId: string | unde
   return `${marker}${session.timestamp || "-"} - ${session.label || shortSessionId(session.uuid)}`;
 }
 
-async function buildMountedSummary(store: SessionControlStore, harness: SessionControlHarness, conversationId: string): Promise<string[]> {
+const buildMountedSummary = Effect.fnUntraced(function*(harness: SessionControlHarness, conversationId: string): Effect.fn.Return<string[], HarnessError, Store> {
+  const store = yield* Store;
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return ["Mounted", `No mounted ${harness.displayName} session.`];
   }
-  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
+  const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
   const tokens = store.getSessionTokens(sessionId);
   return [
     "Mounted",
     `${shortSessionId(sessionId)}${tokens ? ` - cache read ${tokens} tokens` : ""}`,
     lastMessage ? truncateText(lastMessage, 260) : "No assistant message found yet.",
   ];
-}
+});
 
 export interface SessionsPanelRequest {
-  readonly store: SessionControlStore;
   readonly harness: SessionControlHarness;
   readonly conversationId: string;
   /** The page to show; normalized into range, so a button's payload is passed as it is. */
   readonly page?: unknown;
 }
 
-export async function buildSessionsPanel({ store, harness, conversationId, page = 1 }: SessionsPanelRequest): Promise<ControlPanel> {
+export const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1 }: SessionsPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store> {
+  const store = yield* Store;
   const mountedSessionId = store.getSessionId(conversationId);
-  const totalPages = await harness.sessions.getTotalSessionPages();
+  const totalPages = yield* harness.sessions.getTotalSessionPages();
   const safePage = normalizePage(page, totalPages);
-  const sessions = await harness.sessions.listSessions(safePage);
+  const sessions = yield* harness.sessions.listSessions(safePage);
   const startNumber = (safePage - 1) * SESSIONS_PER_PAGE + 1;
   const lines = [
     `Sessions (${harness.displayName})`,
     "",
-    ...(await buildMountedSummary(store, harness, conversationId)),
+    ...(yield* buildMountedSummary(harness, conversationId)),
     "",
     `Recent sessions (page ${safePage}/${totalPages})`,
   ];
@@ -172,18 +147,17 @@ export async function buildSessionsPanel({ store, harness, conversationId, page 
 
   return {
     text: lines.join("\n"),
-    options: buildPanelOptions({ inline_keyboard: keyboard }),
+    options: panelOptions({ inline_keyboard: keyboard }),
   };
-}
+});
 
 export interface CurrentSessionPanelRequest {
-  readonly store: SessionControlStore;
   readonly harness: SessionControlHarness;
-  readonly activeTurns: ActiveTurnsFacade;
   readonly conversationId: string;
 }
 
-export async function buildCurrentSessionPanel({ store, harness, activeTurns, conversationId }: CurrentSessionPanelRequest): Promise<ControlPanel> {
+export const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
+  const store = yield* Store;
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return {
@@ -193,7 +167,7 @@ export async function buildCurrentSessionPanel({ store, harness, activeTurns, co
         `No ${harness.displayName} session is mounted.`,
         "Start a new session or open Sessions to mount an existing one.",
       ].join("\n"),
-      options: buildPanelOptions({
+      options: panelOptions({
         inline_keyboard: [
           [createButton(store, conversationId, "Sessions", "sessions", { page: 1 })],
           [createButton(store, conversationId, "New Session", "new")],
@@ -202,9 +176,9 @@ export async function buildCurrentSessionPanel({ store, harness, activeTurns, co
       }),
     };
   }
-  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
+  const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
   const tokens = store.getSessionTokens(sessionId);
-  const active = activeTurns.isBusy(conversationId);
+  const active = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
   const lines = [
     `Current Session (${harness.displayName})`,
     "",
@@ -229,18 +203,18 @@ export async function buildCurrentSessionPanel({ store, harness, activeTurns, co
 
   return {
     text: lines.join("\n"),
-    options: buildPanelOptions({ inline_keyboard: keyboard }),
+    options: panelOptions({ inline_keyboard: keyboard }),
   };
-}
+});
 
-async function buildSessionPreviewPanel({ store, harness, conversationId, sessionId, page = 1 }: {
-  readonly store: SessionControlStore;
+const buildSessionPreviewPanel = Effect.fnUntraced(function*({ harness, conversationId, sessionId, page = 1 }: {
   readonly harness: SessionControlHarness;
   readonly conversationId: string;
   readonly sessionId: string;
   readonly page?: unknown;
-}): Promise<ControlPanel> {
-  const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
+}): Effect.fn.Return<ControlPanel, HarnessError, Store> {
+  const store = yield* Store;
+  const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
   const mountedSessionId = store.getSessionId(conversationId);
   const lines = [
     "Session",
@@ -252,7 +226,7 @@ async function buildSessionPreviewPanel({ store, harness, conversationId, sessio
   ];
   return {
     text: lines.join("\n"),
-    options: buildPanelOptions({
+    options: panelOptions({
       inline_keyboard: [
         [createButton(store, conversationId, "Mount This Session", "mount", { sessionId })],
         [
@@ -263,24 +237,23 @@ async function buildSessionPreviewPanel({ store, harness, conversationId, sessio
       ],
     }),
   };
-}
+});
 
-async function buildRewindPanel({ store, harness, activeTurns, conversationId, page = 1, sessionId = null }: {
-  readonly store: SessionControlStore;
+const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1, sessionId = null }: {
   readonly harness: SessionControlHarness;
-  readonly activeTurns: ActiveTurnsFacade;
   readonly conversationId: string;
   readonly page?: unknown;
   /** The session to rewind; the mounted one when left out. */
   readonly sessionId?: string | null | undefined;
-}): Promise<ControlPanel> {
+}): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
+  const store = yield* Store;
   const targetSessionId = sessionId ?? store.getSessionId(conversationId);
   if (!targetSessionId) {
-    return await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId });
+    return yield* buildCurrentSessionPanel({ harness, conversationId });
   }
-  const totalPages = await harness.sessions.getTotalRewindPages(targetSessionId);
+  const totalPages = yield* harness.sessions.getTotalRewindPages(targetSessionId);
   const safePage = normalizePage(page, totalPages);
-  const messages = await harness.sessions.listSessionMessages(targetSessionId);
+  const messages = yield* harness.sessions.listSessionMessages(targetSessionId);
   const start = (safePage - 1) * SESSIONS_PER_PAGE;
   const pageMessages = messages.slice(start, start + SESSIONS_PER_PAGE);
   const lines = [
@@ -316,22 +289,22 @@ async function buildRewindPanel({ store, harness, activeTurns, conversationId, p
 
   return {
     text: lines.join("\n"),
-    options: buildPanelOptions({ inline_keyboard: keyboard }),
+    options: panelOptions({ inline_keyboard: keyboard }),
   };
-}
+});
 
-async function buildRewindPreviewPanel({ store, harness, conversationId, sessionId, index, page = 1 }: {
-  readonly store: SessionControlStore;
+const buildRewindPreviewPanel = Effect.fnUntraced(function*({ harness, conversationId, sessionId, index, page = 1 }: {
   readonly harness: SessionControlHarness;
   readonly conversationId: string;
   readonly sessionId: string;
   readonly index: number | undefined;
   readonly page?: unknown;
-}): Promise<ControlPanel> {
-  const messages = await harness.sessions.listSessionMessages(sessionId);
+}): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
+  const store = yield* Store;
+  const messages = yield* harness.sessions.listSessionMessages(sessionId);
   const target = messages.find((message) => message.index === index);
   if (!target) {
-    return await buildRewindPanel({ store, harness, activeTurns: noActiveTurns, conversationId, sessionId, page });
+    return yield* buildRewindPanel({ harness, conversationId, sessionId, page });
   }
   return {
     text: [
@@ -341,7 +314,7 @@ async function buildRewindPreviewPanel({ store, harness, conversationId, session
       "",
       truncateText(target.text, 1000),
     ].join("\n"),
-    options: buildPanelOptions({
+    options: panelOptions({
       inline_keyboard: [
         [createButton(store, conversationId, "Fork And Mount Here", "rewind_fork", { sessionId, index })],
         [createButton(store, conversationId, "Back", "rewind", { sessionId, page })],
@@ -349,147 +322,104 @@ async function buildRewindPreviewPanel({ store, harness, conversationId, session
       ],
     }),
   };
-}
-
-async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
-  try {
-    await client.editMessageText(chatId, messageId, panel.text, panel.options);
-  } catch (error) {
-    if (!String(error).includes("message is not modified")) {
-      throw error;
-    }
-  }
-}
+});
 
 export interface SendSessionsPanelRequest extends SessionsPanelRequest {
-  readonly client: Pick<Client, "sendMessage">;
   readonly chatId: ChatId;
 }
 
-export async function sendSessionsPanel({ client, store, harness, conversationId, chatId, page = 1 }: SendSessionsPanelRequest): Promise<void> {
-  const panel = await buildSessionsPanel({ store, harness, conversationId, page });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
+export const sendSessionsPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendSessionsPanelRequest): Effect.fn.Return<void, HarnessError | TelegramError, Store | TelegramClient> {
+  yield* sendPanel(chatId, yield* buildSessionsPanel(request));
+});
 
 export interface SendCurrentSessionPanelRequest extends CurrentSessionPanelRequest {
-  readonly client: Pick<Client, "sendMessage">;
   readonly chatId: ChatId;
 }
 
-export async function sendCurrentSessionPanel({ client, store, harness, activeTurns, conversationId, chatId }: SendCurrentSessionPanelRequest): Promise<void> {
-  const panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
+export const sendCurrentSessionPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendCurrentSessionPanelRequest): Effect.fn.Return<
+  void,
+  HarnessError | TelegramError,
+  Store | ActiveTurns | TelegramClient
+> {
+  yield* sendPanel(chatId, yield* buildCurrentSessionPanel(request));
+});
 
 export interface SessionControlCallback extends ControlCallback {
-  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage">;
-  readonly store: SessionControlStore;
   readonly harness: SessionControlHarness;
-  readonly activeTurns: ActiveTurnsFacade;
-  readonly startNewSession: StartNewSession;
 }
 
-export async function handleSessionControlCallback({
-  client,
-  store,
+export const handleSessionControlCallback = Effect.fnUntraced(function*({
   harness,
-  activeTurns,
   action,
-  startNewSession,
   callbackQueryId,
   chatId,
   messageId,
-}: SessionControlCallback): Promise<void> {
+}: SessionControlCallback): Effect.fn.Return<void, NewSessionError | TelegramError, Store | ActiveTurns | Turns | TelegramClient> {
+  const store = yield* Store;
+  const activeTurns = yield* ActiveTurns;
+  const client = yield* TelegramClient;
+  const { conversationId } = action;
   const kind = action.kind.slice(CONTROL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   // Every button of these panels that names a session carries it as a string.
   const payloadSessionId = stringField(payload, "sessionId");
+  const current = buildCurrentSessionPanel({ harness, conversationId });
   let panel: ControlPanel | null = null;
   let notice = "";
 
   if (kind === "sessions") {
-    panel = await buildSessionsPanel({ store, harness, conversationId: action.conversationId, page: payload["page"] });
+    panel = yield* buildSessionsPanel({ harness, conversationId, page: payload["page"] });
   } else if (kind === "current") {
-    panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
+    panel = yield* current;
   } else if (kind === "new") {
-    if (activeTurns.isBusy(action.conversationId)) {
+    if (yield* activeTurns.isBusy(conversationId)) {
       notice = `${harness.displayName} is currently working.`;
-      panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
     } else {
-      const sessionId = await startNewSession({ conversationId: action.conversationId });
+      const sessionId = yield* Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId));
       notice = `New session mounted: ${shortSessionId(sessionId)}.`;
-      panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
     }
+    panel = yield* current;
   } else if (kind === "preview" && payloadSessionId !== undefined) {
-    panel = await buildSessionPreviewPanel({
-      store,
-      harness,
-      conversationId: action.conversationId,
-      sessionId: payloadSessionId,
-      page: payload["page"],
-    });
+    panel = yield* buildSessionPreviewPanel({ harness, conversationId, sessionId: payloadSessionId, page: payload["page"] });
   } else if (kind === "mount" && payloadSessionId !== undefined) {
-    store.setSessionId(action.conversationId, payloadSessionId);
+    store.setSessionId(conversationId, payloadSessionId);
     notice = "Mounted.";
-    panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
+    panel = yield* current;
   } else if (kind === "rewind") {
-    panel = await buildRewindPanel({
-      store,
-      harness,
-      activeTurns,
-      conversationId: action.conversationId,
-      sessionId: payloadSessionId,
-      page: payload["page"],
-    });
+    panel = yield* buildRewindPanel({ harness, conversationId, sessionId: payloadSessionId, page: payload["page"] });
   } else if (kind === "rewind_preview" && payloadSessionId !== undefined) {
-    panel = await buildRewindPreviewPanel({
-      store,
+    panel = yield* buildRewindPreviewPanel({
       harness,
-      conversationId: action.conversationId,
+      conversationId,
       sessionId: payloadSessionId,
       index: numberField(payload, "index"),
       page: payload["page"],
     });
   } else if (kind === "rewind_fork" && payloadSessionId !== undefined) {
     const index = numberField(payload, "index");
-    const messages = await harness.sessions.listSessionMessages(payloadSessionId);
+    const messages = yield* harness.sessions.listSessionMessages(payloadSessionId);
     const target = messages.find((message) => message.index === index);
-    const forkedId = target
-      ? await harness.sessions.createForkedSession(payloadSessionId, target.uuid, { threadKey: action.conversationId })
-      : null;
+    const forkedId = target ? yield* harness.sessions.createForkedSession(payloadSessionId, target.uuid, { threadKey: conversationId }) : null;
     if (forkedId) {
-      store.setSessionId(action.conversationId, forkedId);
+      store.setSessionId(conversationId, forkedId);
       notice = "Fork mounted.";
-      panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
+      panel = yield* current;
     } else {
       notice = "Failed to fork.";
-      panel = await buildRewindPanel({
-        store,
-        harness,
-        activeTurns,
-        conversationId: action.conversationId,
-        sessionId: payloadSessionId,
-        page: 1,
-      });
+      panel = yield* buildRewindPanel({ harness, conversationId, sessionId: payloadSessionId, page: 1 });
     }
   } else if (kind === "stop") {
-    const interrupted = await activeTurns.stop(action.conversationId);
+    const interrupted = yield* activeTurns.stop(conversationId, "interrupt");
     notice = interrupted ? "Interrupted." : "No active turn.";
-    panel = await buildCurrentSessionPanel({ store, harness, activeTurns, conversationId: action.conversationId });
+    panel = yield* current;
   } else if (kind === "close") {
-    await client.answerCallbackQuery(callbackQueryId, "Closed.");
-    try {
-      await client.deleteMessage(chatId, messageId);
-    } catch {
-      await client.editMessageText(chatId, messageId, "Closed.", { format: "plain" });
-    }
-    return;
+    return yield* closePanel({ callbackQueryId, chatId, messageId });
   }
 
   if (!panel) {
-    await client.answerCallbackQuery(callbackQueryId, "Unknown action.");
+    yield* client.answerCallbackQuery(callbackQueryId, "Unknown action.");
     return;
   }
-  await client.answerCallbackQuery(callbackQueryId, notice);
-  await editPanel(client, chatId, messageId, panel);
-}
+  yield* client.answerCallbackQuery(callbackQueryId, notice);
+  yield* editPanel(chatId, messageId, panel);
+});

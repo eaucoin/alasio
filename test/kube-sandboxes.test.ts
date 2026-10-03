@@ -14,7 +14,7 @@ import type { Attributes } from "@opentelemetry/api";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { ConfigProvider, Context, Effect, Exit, Fiber, Layer, Option, Result, Schema, type Scope } from "effect";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -30,10 +30,9 @@ import {
   sandboxReady,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
-import { EGRESS_GATE_SCRIPT, SessionSandboxes, sessionFilesystemsFacade, sessionSandboxManifest } from "../src/sandbox/index.ts";
+import { EGRESS_GATE_SCRIPT, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
-import { effectRunner } from "../src/shared/effects.ts";
 import type { Signal } from "../src/telemetry/config.ts";
 import type { ForwardResult, OtlpEncoding, OtlpForwarder } from "../src/telemetry/forward.ts";
 
@@ -449,15 +448,15 @@ test("a session on Kubernetes is made when created, and its files are read as it
   }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))));
 });
 
-test("the app finds session filesystems only where alasio has them", async () => {
-  assert.equal(sessionFilesystemsFacade(effectRunner(Context.empty())), null);
+test("alasio finds session filesystems only where it has them, made without a call to Kubernetes", async () => {
+  const sessionFilesystems = Effect.map(Effect.serviceOption(SessionSandboxes), Option.isSome);
+  assert.equal(Effect.runSync(sessionFilesystems), false);
   const kube = fakeKube();
   const layer = SessionSandboxes.layer({ profile: profile(), stateDir: "/tmp/alasio-kube-test", env: {} }).pipe(
     Layer.provide(kube.layer),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
   );
-  const facade = await Effect.runPromise(Effect.scoped(Layer.build(layer).pipe(Effect.map((services) => sessionFilesystemsFacade(effectRunner(services))))));
-  assert.equal(facade?.enabled, true);
+  assert.equal(await Effect.runPromise(Effect.scoped(sessionFilesystems.pipe(Effect.provide(layer)))), true);
   assert.deepEqual(kube.calls, []);
 });
 

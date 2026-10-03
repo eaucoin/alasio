@@ -7,10 +7,11 @@ import { test } from "node:test";
 import type { v2 } from "../.types/codex/index.js";
 import { Effect } from "effect";
 
+import { NoActiveTurn } from "../src/codex/app-server/thread-client.ts";
+import { Turns } from "../src/codex/turn-controller.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
-import type { GoalUpdate, HarnessGoalsFacade } from "../src/harness/index.ts";
+import type { GoalUpdate, HarnessGoals } from "../src/harness/index.ts";
 import {
-  type GoalControlStore,
   type GoalPanelTarget,
   type GoalTurnRequest,
   buildGoalPanel,
@@ -21,8 +22,8 @@ import {
   handleGoalTextCommand,
 } from "../src/operator/goal-control.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
-import type { Client } from "../src/telegram/client.ts";
-import { withTurns } from "./support/turns.ts";
+import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
+import { type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
 /** A thread goal as Codex reports it, with what a test does not care about filled in. */
 function threadGoal(fields: Partial<v2.ThreadGoal>): v2.ThreadGoal {
@@ -47,41 +48,13 @@ function createStore(): GoalPanelTarget["store"] {
   };
 }
 
-function createClient() {
-  const calls: {
-    sendMessage: Parameters<Client["sendMessage"]>[];
-    editMessageText: Parameters<Client["editMessageText"]>[];
-    answerCallbackQuery: Parameters<Client["answerCallbackQuery"]>[];
-  } = {
-    sendMessage: [],
-    editMessageText: [],
-    answerCallbackQuery: [],
-  };
-  const client: Pick<Client, "sendMessage" | "editMessageText" | "answerCallbackQuery" | "deleteMessage"> = {
-    async sendMessage(...args) {
-      calls.sendMessage.push(args);
-      return [];
-    },
-    async editMessageText(...args) {
-      calls.editMessageText.push(args);
-      return true;
-    },
-    async answerCallbackQuery(...args) {
-      calls.answerCallbackQuery.push(args);
-      return true;
-    },
-    deleteMessage: () => assert.fail("deleteMessage"),
-  };
-  return { calls, client };
-}
-
 interface FakeGoalOptions {
   readonly currentGoal?: v2.ThreadGoal | null;
   readonly updatedGoal?: v2.ThreadGoal;
   readonly waitTurnId?: string | null;
 }
 
-function createGoalApi({ currentGoal = null, updatedGoal, waitTurnId = null }: FakeGoalOptions = {}) {
+function createGoals({ currentGoal = null, updatedGoal, waitTurnId = null }: FakeGoalOptions = {}) {
   const calls: {
     read: { readonly threadId: string }[];
     set: GoalUpdate[];
@@ -94,56 +67,71 @@ function createGoalApi({ currentGoal = null, updatedGoal, waitTurnId = null }: F
     waitForTurnId: [],
   };
   const events: string[] = [];
-  const goalApi: HarnessGoalsFacade = {
-    async read(args) {
-      calls.read.push(args);
-      events.push("read");
-      return currentGoal;
-    },
-    async set(args) {
-      calls.set.push(args);
-      events.push("set");
-      return updatedGoal ?? threadGoal({
-        objective: args.objective ?? currentGoal?.objective ?? "Goal",
-        status: args.status ?? currentGoal?.status ?? "active",
-        tokensUsed: 0,
-      });
-    },
-    async clear(args) {
-      calls.clear.push(args);
-      events.push("clear");
-      return { cleared: true };
-    },
-    async waitForTurnId(sessionId) {
-      calls.waitForTurnId.push(sessionId);
-      events.push("waitForTurnId");
-      return waitTurnId;
-    },
+  const goals: HarnessGoals = {
+    read: (args) =>
+      Effect.sync(() => {
+        calls.read.push(args);
+        events.push("read");
+        return currentGoal;
+      }),
+    set: (args) =>
+      Effect.sync(() => {
+        calls.set.push(args);
+        events.push("set");
+        return updatedGoal ?? threadGoal({
+          objective: args.objective ?? currentGoal?.objective ?? "Goal",
+          status: args.status ?? currentGoal?.status ?? "active",
+          tokensUsed: 0,
+        });
+      }),
+    clear: (args) =>
+      Effect.sync(() => {
+        calls.clear.push(args);
+        events.push("clear");
+        return { cleared: true };
+      }),
+    waitForTurnId: (sessionId) =>
+      Effect.sync(() => {
+        calls.waitForTurnId.push(sessionId);
+        events.push("waitForTurnId");
+        return waitTurnId;
+      }),
   };
-  return { calls, events, goalApi };
+  return { calls, events, goals };
 }
 
-function createMountedStore(sessionId = "session-1"): GoalControlStore {
+/** The conversation of chat 123, on Codex, with `sessionId` mounted when given. */
+const CONVERSATION = "telegram:123";
+
+/** The goal controls' services over a Codex conversation, the turns they run (made on its store) standing in, for one test. */
+async function withGoalControls<T>(
+  { sessionId = "session-1", turns = () => ({}) }: { readonly sessionId?: string | null; readonly turns?: (store: SqliteStore) => Partial<Turns["Service"]> },
+  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: SqliteStore) => Promise<T>,
+): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), "alasio-goal-control-"));
+  const store = new SqliteStore(root);
+  try {
+    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), "codex");
+    if (sessionId) store.setSessionId(CONVERSATION, sessionId);
+    const telegram = recordingTelegram();
+    return await withServices({ store, telegram: telegram.layer, turns: turnsStub(turns(store)) }, (alasio) => use(alasio, telegram, store));
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** A runGoalTurn that records each goal turn asked for, and takes it over. */
+function recordGoalTurns(runCalls: GoalTurnRequest[]): Pick<Turns["Service"], "runGoalTurn"> {
   return {
-    getSessionId: () => sessionId,
-    createCallbackAction({ kind, payload }) {
-      return `${kind}:${Object.keys(payload ?? {}).length}`;
-    },
+    runGoalTurn: (args) =>
+      Effect.sync(() => {
+        runCalls.push(args);
+        return true;
+      }),
   };
 }
 
-function createUnmountedStore(): GoalControlStore & Pick<SqliteStore, "setSessionId"> {
-  let sessionId: string | undefined;
-  return {
-    getSessionId: () => sessionId,
-    setSessionId: (_conversationId, mountedSessionId) => {
-      sessionId = mountedSessionId ?? undefined;
-    },
-    createCallbackAction({ kind, payload }) {
-      return `${kind}:${Object.keys(payload ?? {}).length}`;
-    },
-  };
-}
 test("goal panel renders no-mounted empty state", () => {
   const panel = buildNoMountedGoalPanel({
     store: createStore(),
@@ -255,96 +243,63 @@ test("replace panel requires explicit confirmation", () => {
 });
 
 test("goal text command starts a fallback turn when upstream does not create one", async () => {
-  const { calls, client } = createClient();
-  const goal = createGoalApi({
+  const goal = createGoals({
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
   });
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalTextCommand({
-    client,
-    store: createMountedStore(),
-    conversationId: "conversation-1",
-    chatId: 123,
-    messageId: 456,
-    args: "Refactor CI",
-    goalApi: goal.goalApi,
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio, { calls }) => {
+    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
+    assert.equal(goal.calls.set.length, 1);
+    assert.equal(goal.calls.waitForTurnId.length, 1);
+    assert.equal(runCalls.length, 1);
+    assert.equal(runCalls[0]?.turnId, null);
+    assert.match(runCalls[0]?.prompt ?? "", /Continue working toward this Codex goal\./);
+    assert.match(runCalls[0]?.prompt ?? "", /Refactor CI/);
+    assert.equal(calls.sendMessage.length, 0);
   });
-
-  assert.equal(goal.calls.set.length, 1);
-  assert.equal(goal.calls.waitForTurnId.length, 1);
-  assert.equal(runCalls.length, 1);
-  assert.equal(runCalls[0]?.turnId, null);
-  assert.match(runCalls[0]?.prompt ?? "", /Continue working toward this Codex goal\./);
-  assert.match(runCalls[0]?.prompt ?? "", /Refactor CI/);
-  assert.equal(calls.sendMessage.length, 0);
 });
 
 test("goal text command bootstraps a fresh session when none is mounted", async () => {
-  const { calls, client } = createClient();
-  const store = createUnmountedStore();
-  const goal = createGoalApi({
+  const goal = createGoals({
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
   });
-  const startCalls: { readonly conversationId: string }[] = [];
+  const startCalls: string[] = [];
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalTextCommand({
-    client,
-    store,
-    conversationId: "conversation-1",
-    chatId: 123,
-    messageId: 456,
-    args: "Refactor CI",
-    goalApi: goal.goalApi,
-    startNewSession: async (args) => {
-      startCalls.push(args);
-      store.setSessionId(args.conversationId, "fresh-session");
-      return "fresh-session";
-    },
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({
+    sessionId: null,
+    turns: (store) => ({
+      ...recordGoalTurns(runCalls),
+      startNewSession: (conversationId) =>
+        Effect.sync(() => {
+          startCalls.push(conversationId);
+          store.setSessionId(conversationId, "fresh-session");
+          return "fresh-session";
+        }),
+    }),
+  }, async (alasio, { calls }, store) => {
+    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
+    assert.deepEqual(startCalls, [CONVERSATION]);
+    assert.equal(store.getSessionId(CONVERSATION), "fresh-session");
+    assert.equal(goal.calls.set.length, 1);
+    assert.equal(goal.calls.set[0]?.threadId, "fresh-session");
+    assert.equal(runCalls.length, 1);
+    assert.equal(runCalls[0]?.sessionId, "fresh-session");
+    assert.equal(calls.sendMessage.length, 0);
   });
-
-  assert.deepEqual(startCalls, [{ conversationId: "conversation-1" }]);
-  assert.equal(goal.calls.set.length, 1);
-  assert.equal(goal.calls.set[0]?.threadId, "fresh-session");
-  assert.equal(runCalls.length, 1);
-  assert.equal(runCalls[0]?.sessionId, "fresh-session");
-  assert.equal(calls.sendMessage.length, 0);
 });
 
 test("goal text command clears completed goal state before setting a new objective", async () => {
-  const { client } = createClient();
-  const goal = createGoalApi({
+  const goal = createGoals({
     currentGoal: threadGoal({ objective: "Old goal", status: "complete", tokensUsed: 1200 }),
     updatedGoal: threadGoal({ objective: "New goal", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
   });
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalTextCommand({
-    client,
-    store: createMountedStore("session-1"),
-    conversationId: "conversation-1",
-    chatId: 123,
-    messageId: 456,
-    args: "New goal",
-    goalApi: goal.goalApi,
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio) => {
+    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "New goal", goals: goal.goals }));
   });
-
   assert.equal(goal.calls.clear.length, 1);
   assert.equal(goal.calls.clear[0]?.threadId, "session-1");
   assert.equal(goal.calls.set.length, 1);
@@ -354,87 +309,72 @@ test("goal text command clears completed goal state before setting a new objecti
 });
 
 test("goal replace callback clears stale goal state before setting replacement", async () => {
-  const { client } = createClient();
-  const goal = createGoalApi({
+  const goal = createGoals({
     updatedGoal: threadGoal({ objective: "New goal", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
   });
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalControlCallback({
-    client,
-    store: createMountedStore("session-1"),
-    action: { id: "action-1", kind: "goal:replace", conversationId: "conversation-1", payload: { objective: "New goal" } },
-    callbackQueryId: "callback-1",
-    chatId: 123,
-    messageId: 456,
-    goalApi: goal.goalApi,
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio) => {
+    await alasio.runPromise(handleGoalControlCallback({
+      action: { id: "action-1", kind: "goal:replace", conversationId: CONVERSATION, payload: { objective: "New goal" } },
+      callbackQueryId: "callback-1",
+      chatId: 123,
+      messageId: 456,
+      goals: goal.goals,
+    }));
   });
-
   assert.equal(goal.calls.clear.length, 1);
   assert.equal(goal.calls.set.length, 1);
   assert.equal(goal.calls.set[0]?.objective, "New goal");
   assert.ok(goal.events.indexOf("clear") < goal.events.indexOf("set"));
   assert.equal(runCalls.length, 1);
 });
+
 test("goal text command attaches to an upstream-created goal turn when present", async () => {
-  const { client } = createClient();
-  const goal = createGoalApi({
+  const goal = createGoals({
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
     waitTurnId: "goal-turn",
   });
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalTextCommand({
-    client,
-    store: createMountedStore("session-1"),
-    conversationId: "conversation-1",
-    chatId: 123,
-    messageId: 456,
-    args: "Refactor CI",
-    goalApi: goal.goalApi,
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio) => {
+    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
   });
-
   assert.equal(runCalls.length, 1);
   assert.equal(runCalls[0]?.sessionId, "session-1");
   assert.equal(runCalls[0]?.turnId, "goal-turn");
 });
 
 test("goal resume callback edits to starting before fallback turn execution", async () => {
-  const { calls, client } = createClient();
-  const goal = createGoalApi({
+  const goal = createGoals({
     currentGoal: threadGoal({ objective: "Refactor CI", status: "paused", tokensUsed: 0 }),
     updatedGoal: threadGoal({ objective: "Refactor CI", status: "active", tokensUsed: 0 }),
     waitTurnId: null,
   });
   const runCalls: GoalTurnRequest[] = [];
-
-  await handleGoalControlCallback({
-    client,
-    store: createMountedStore("session-1"),
-    action: { id: "action-1", kind: "goal:resume", conversationId: "conversation-1", payload: {} },
-    callbackQueryId: "callback-1",
-    chatId: 123,
-    messageId: 456,
-    goalApi: goal.goalApi,
-    runGoalTurn: async (args) => {
-      runCalls.push(args);
-      return true;
-    },
+  await withGoalControls({ turns: () => recordGoalTurns(runCalls) }, async (alasio, { calls }) => {
+    await alasio.runPromise(handleGoalControlCallback({
+      action: { id: "action-1", kind: "goal:resume", conversationId: CONVERSATION, payload: {} },
+      callbackQueryId: "callback-1",
+      chatId: 123,
+      messageId: 456,
+      goals: goal.goals,
+    }));
+    assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "Starting."]);
+    assert.match(calls.editMessageText[0]?.[2] ?? "", /Turn: starting/);
   });
-
-  assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "Starting."]);
-  assert.match(calls.editMessageText[0]?.[2] ?? "", /Turn: starting/);
   assert.equal(runCalls.length, 1);
   assert.equal(runCalls[0]?.turnId, null);
+});
+
+test("a goal that cannot be changed says why on its panel", async () => {
+  const goals: HarnessGoals = {
+    ...createGoals().goals,
+    set: () => Effect.fail(new NoActiveTurn()),
+  };
+  await withGoalControls({}, async (alasio, { calls }) => {
+    await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals }));
+    assert.equal(calls.sendMessage.at(-1)?.[1], "Goal\n\nFailed to update goal: Cannot steer Codex without an active turn id");
+  });
 });
 
 test("goal turns use normal concurrent-message decision panel when Codex is already working", async () => {
@@ -443,20 +383,21 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
   try {
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
     store.setActiveHarness(conversationId, "codex");
-    const { calls, client } = createClient();
-    const handled = await withTurns({ store, client, harnesses: {}, config: { workspaceRoot: root, workingDirectory: "/repo" } }, ({ turns, effects }) =>
+    const { calls, layer } = recordingTelegram();
+    const handled = await withServices({ store, telegram: layer, workspaceRoot: root }, (alasio) =>
       // Codex is working: a turn of the conversation is running.
-      effects.runPromise(Effect.scoped(Effect.gen(function*() {
+      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
         const activeTurns = yield* ActiveTurns;
         yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
-        return yield* Effect.promise(() => turns.runGoalTurn({
+        const turns = yield* Turns;
+        return yield* turns.runGoalTurn({
           conversationId,
           chatId: 123,
           messageId: 456,
           sessionId: "session-1",
           turnId: null,
           prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
-        }));
+        });
       }))));
 
     assert.equal(handled, true);

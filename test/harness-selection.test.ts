@@ -7,16 +7,14 @@ import { test } from "node:test";
 
 import type { CallbackQuery, InlineKeyboardButton, Message } from "@grammyjs/types";
 import Database from "better-sqlite3";
-import { Context, Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Scope } from "effect";
 
-import type { TurnControllerConfig } from "../src/codex/turn-controller.ts";
-import { ActiveTurns, noActiveTurns } from "../src/harness/active-turns.ts";
+import { ActiveTurns, type RunningTurn } from "../src/harness/active-turns.ts";
 import {
   type FreshSessionParams,
   type Harness,
   NO_SERVICE_MOUNTED,
   NO_WORKSPACE_MOUNTED,
-  harnessFacade,
   resolveHarnessName,
 } from "../src/harness/index.ts";
 import {
@@ -25,26 +23,28 @@ import {
   type HarnessName,
   getDefaultHarness,
   harnessDisplayName,
-  isHarnessName,
   normalizeHarnessName,
 } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
+import { Turns } from "../src/codex/turn-controller.ts";
+import { Mounts } from "../src/operator/mounts.ts";
+import { processPrompt } from "../src/operator/prompts.ts";
 import { buildRestartSyntheticText } from "../src/operator/restart-prompts.ts";
 import {
   CHOOSE_SERVICE_NOTICE,
-  type SwitchHarness,
   buildServicePanel,
   handleServiceControlCallback,
   handleServiceTextCommand,
 } from "../src/operator/service-control.ts";
 import { migrateSqliteSchema } from "../src/persistence/schema.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
-import { CallbackHandler, type CallbackTurns } from "../src/telegram/callback-handler.ts";
-import type { Client, TextMessageOptions } from "../src/telegram/client.ts";
-import { MessageHandler } from "../src/telegram/message-handler.ts";
-import { effectRunner, type EffectRunner } from "../src/shared/effects.ts";
+import type { SessionSandboxes } from "../src/sandbox/index.ts";
+import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
+import type { TextMessageOptions } from "../src/telegram/client.ts";
+import { handleMessage } from "../src/telegram/message-handler.ts";
 import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
-import { type TestTurns, withTurns } from "./support/turns.ts";
+import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
+import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
 
 /** Where a test's workspace root and its folders are. */
 interface WorkspacePaths {
@@ -92,7 +92,6 @@ function createFakeHarness(name: HarnessName, { sessionId = `${name}-fresh` } = 
     displayName: harnessDisplayName(name),
     supportsGoals: name === CODEX_HARNESS,
     supportsWarmup: false,
-    supportsSteer: true,
     sessions: {
       listSessions: () => assert.fail("listSessions"),
       getTotalSessionPages: () => assert.fail("getTotalSessionPages"),
@@ -122,77 +121,35 @@ function createHarnesses() {
   return { harnesses: { [CODEX_HARNESS]: codex, [CLAUDE_HARNESS]: claude }, codex, claude };
 }
 
-/** The turns over `store` and both stand-in harnesses, for one test. */
-function withTurnController<T>(
+/** alasio's services over `store`, both stand-in harnesses, and a Telegram client recording its calls, for one test. */
+function withAlasio<T>(
   store: SqliteStore,
-  use: (turns: TestTurns, harnesses: ReturnType<typeof createHarnesses>) => T | Promise<T>,
-  { client = createClient(), config = {} }: { readonly client?: FakeClient; readonly config?: Partial<TurnControllerConfig> } = {},
+  use: (alasio: TestAlasio, harnesses: ReturnType<typeof createHarnesses>) => T | Promise<T>,
+  { telegram = recordingTelegram(), ...options }: Omit<TestServicesOptions, "store" | "harnesses" | "telegram"> & { readonly telegram?: RecordingTelegram } = {},
 ): Promise<T> {
   const harnesses = createHarnesses();
-  return withTurns({ store, client, harnesses: harnesses.harnesses, config }, (turns) => use(turns, harnesses));
+  return withServices({ store, harnesses: harnesses.harnesses, telegram: telegram.layer, ...options }, (alasio) => use(alasio, harnesses));
 }
 
-/** Holds the conversation busy, as a running turn does, until the returned release. */
-function occupy(effects: EffectRunner<ActiveTurns>, conversationId: string): () => void {
-  const scope = effects.runSync(Scope.make());
-  effects.runSync(Effect.flatMap(ActiveTurns, (activeTurns) =>
-    activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false })).pipe(Scope.provide(scope)));
-  return () => effects.runSync(Scope.close(scope, Exit.void));
+/** Holds the conversation busy, as a running turn does, with `turn`'s stop and steer, until the returned release. */
+async function occupy(alasio: TestAlasio, conversationId: string, turn: Partial<RunningTurn> = {}): Promise<() => Promise<void>> {
+  const scope = await alasio.runPromise(Scope.make());
+  await alasio.runPromise(Effect.flatMap(ActiveTurns, (activeTurns) =>
+    activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false, ...turn })).pipe(Scope.provide(scope)));
+  return () => alasio.runPromise(Scope.close(scope, Exit.void));
 }
 
-/** A stand-in harness as the operator's controls reach it. */
-const facadeOf = (harness: Harness) => harnessFacade(harness, effectRunner(Context.empty()));
+/** Runs `f` on alasio's Mounts, failing as it does. */
+const mounts = <A, E>(alasio: TestAlasio, f: (mounts: Mounts["Service"]) => Effect.Effect<A, E>): Promise<A> =>
+  alasio.runPromise(Effect.flatMap(Mounts, f));
 
-/** The turns a CallbackHandler is given, each failing if the press reaches it unless a test supplies it. */
-function createCallbackTurns(supplied: Partial<CallbackTurns>): CallbackTurns {
-  return {
-    harnessFor: () => assert.fail("harnessFor"),
-    switchHarness: () => assert.fail("switchHarness"),
-    switchWorkspace: () => assert.fail("switchWorkspace"),
-    createSessionWorkspace: () => assert.fail("createSessionWorkspace"),
-    sandboxEnabled: false,
-    startNewSession: () => assert.fail("startNewSession"),
-    setPromptDisposition: () => assert.fail("setPromptDisposition"),
-    enqueueMessage: () => assert.fail("enqueueMessage"),
-    runGoalTurn: () => assert.fail("runGoalTurn"),
-    scheduleConversation: () => assert.fail("scheduleConversation"),
-    ...supplied,
-  };
-}
-
-/** A Telegram client that records the calls alasio makes. */
-interface FakeClient extends Pick<Client, "sendMessage" | "editMessageText" | "answerCallbackQuery" | "deleteMessage" | "downloadTelegramFile"> {
-  readonly calls: {
-    readonly sendMessage: Parameters<Client["sendMessage"]>[];
-    readonly editMessageText: Parameters<Client["editMessageText"]>[];
-    readonly answerCallbackQuery: Parameters<Client["answerCallbackQuery"]>[];
-    readonly deleteMessage: Parameters<Client["deleteMessage"]>[];
-  };
-}
-
-function createClient(): FakeClient {
-  const calls: FakeClient["calls"] = { sendMessage: [], editMessageText: [], answerCallbackQuery: [], deleteMessage: [] };
-  return {
-    calls,
-    async sendMessage(...args) {
-      calls.sendMessage.push(args);
-      return [{ message_id: 77, date: 0, chat: { id: Number(args[0]), type: "private", first_name: "Operator" } }];
-    },
-    async editMessageText(...args) {
-      calls.editMessageText.push(args);
-      return true;
-    },
-    async answerCallbackQuery(...args) {
-      calls.answerCallbackQuery.push(args);
-      return true;
-    },
-    async deleteMessage(...args) {
-      calls.deleteMessage.push(args);
-      return true;
-    },
-    downloadTelegramFile: () => assert.fail("downloadTelegramFile"),
-  };
-}
+/** Session filesystems a test offers without making any. */
+const unusedSandbox: SessionSandboxes["Service"] = {
+  volumes: { create: () => Effect.die(new Error("no volume is made")), destroy: () => Effect.die(new Error("no volume is destroyed")) },
+  harnessDirectory: () => assert.fail("harnessDirectory"),
+  ensureSession: () => Effect.die(new Error("no session is ensured")),
+  readFile: () => Effect.die(new Error("no file is read")),
+};
 
 /** The buttons of a message's inline keyboard. */
 function inlineKeyboard(options: TextMessageOptions | undefined): InlineKeyboardButton[][] {
@@ -495,36 +452,30 @@ test("switching services is refused while a turn is active or prompts are queued
     const conversationId = store.upsertConversation({ chatId: "3", user: { id: 3 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.setWorkingDirectory(conversationId, paths.repo);
-    await withTurnController(store, async ({ turns, effects }) => {
-      let release = occupy(effects, conversationId);
-      await assert.rejects(
-        () => turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS }),
-        /Codex is currently working/,
-      );
-      release();
+    await withAlasio(store, async (alasio) => {
+      let release = await occupy(alasio, conversationId);
+      await assert.rejects(mounts(alasio, (m) => m.switchHarness(conversationId, CLAUDE_HARNESS)), /Codex is currently working/);
+      await release();
 
       const job = store.enqueuePromptJob({ conversationId, chatId: "3", messageId: "10", prompt: "later" });
       assert.equal(job.harness, CODEX_HARNESS);
-      await assert.rejects(
-        () => turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS }),
-        /Queued prompts are still waiting/,
-      );
+      await assert.rejects(mounts(alasio, (m) => m.switchHarness(conversationId, CLAUDE_HARNESS)), /Queued prompts are still waiting/);
       store.setPromptJobDisposition(job.id, "cancelled");
 
-      const result = await turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS });
+      const result = await mounts(alasio, (m) => m.switchHarness(conversationId, CLAUDE_HARNESS));
       assert.deepEqual(result, { switched: true, previous: CODEX_HARNESS, next: CLAUDE_HARNESS, sessionId: null, workingDirectory: paths.repo });
       assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
-      const again = await turns.switchHarness({ conversationId, harness: CLAUDE_HARNESS });
+      const again = await mounts(alasio, (m) => m.switchHarness(conversationId, CLAUDE_HARNESS));
       assert.equal(again.switched, false);
-      await assert.rejects(() => turns.switchHarness({ conversationId, harness: "gemini" }), /Unknown service/);
+      await assert.rejects(mounts(alasio, (m) => m.switchHarness(conversationId, UNKNOWN_HARNESS)), /Unknown service/);
 
-      release = occupy(effects, conversationId);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "plain" }), /Claude is currently working/);
-      await assert.rejects(() => turns.createWorkspace({ conversationId, name: "fresh" }), /Claude is currently working/);
-      release();
-      const same = await turns.switchWorkspace({ conversationId, target: "repo" });
+      release = await occupy(alasio, conversationId);
+      await assert.rejects(mounts(alasio, (m) => m.switchWorkspace(conversationId, "plain")), /Claude is currently working/);
+      await assert.rejects(mounts(alasio, (m) => m.createWorkspace(conversationId, "fresh")), /Claude is currently working/);
+      await release();
+      const same = await mounts(alasio, (m) => m.switchWorkspace(conversationId, "repo"));
       assert.deepEqual(same, { switched: false, previous: paths.repo, workingDirectory: paths.repo });
-    }, { config: { workspaceRoot: paths.workspaceRoot } });
+    }, { workspaceRoot: paths.workspaceRoot });
   });
 });
 
@@ -532,43 +483,46 @@ test("workspace policy keeps every folder under the root", async () => {
   await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "16", user: { id: 16 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
-    await withTurnController(store, async ({ turns }) => {
-      const byName = await turns.switchWorkspace({ conversationId, target: "repo" });
+    await withAlasio(store, async (alasio) => {
+      const switchTo = (target: string) => mounts(alasio, (m) => m.switchWorkspace(conversationId, target));
+      const create = (name: string) => mounts(alasio, (m) => m.createWorkspace(conversationId, name));
+      const byName = await switchTo("repo");
       assert.deepEqual(byName, { switched: true, previous: null, workingDirectory: paths.repo });
-      const byAbsolute = await turns.switchWorkspace({ conversationId, target: paths.plain });
+      const byAbsolute = await switchTo(paths.plain);
       assert.equal(byAbsolute.workingDirectory, paths.plain);
       assert.equal(store.getWorkingDirectory(conversationId), paths.plain);
 
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "missing" }), /does not exist under/);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "../" }), /outside the workspace root/);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "escape" }), /outside the workspace root/);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "/etc" }), /outside the workspace root/);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "notes.txt" }), /not a directory/);
-      await assert.rejects(() => turns.switchWorkspace({ conversationId, target: "" }), /Folder path is empty/);
+      await assert.rejects(switchTo("missing"), /does not exist under/);
+      await assert.rejects(switchTo("../"), /outside the workspace root/);
+      await assert.rejects(switchTo("escape"), /outside the workspace root/);
+      await assert.rejects(switchTo("/etc"), /outside the workspace root/);
+      await assert.rejects(switchTo("notes.txt"), /not a directory/);
+      await assert.rejects(switchTo(""), /Folder path is empty/);
       assert.equal(store.getWorkingDirectory(conversationId), paths.plain);
 
-      await assert.rejects(() => turns.createWorkspace({ conversationId, name: "../oops" }), /Folder names may only use/);
-      await assert.rejects(() => turns.createWorkspace({ conversationId, name: ".hidden" }), /Folder names may only use/);
-      await assert.rejects(() => turns.createWorkspace({ conversationId, name: "repo" }), /already exists/);
-      const created = await turns.createWorkspace({ conversationId, name: "fresh-1" });
+      await assert.rejects(create("../oops"), /Folder names may only use/);
+      await assert.rejects(create(".hidden"), /Folder names may only use/);
+      await assert.rejects(create("repo"), /already exists/);
+      const created = await create("fresh-1");
       assert.deepEqual(created, { switched: true, created: true, previous: paths.plain, workingDirectory: join(paths.workspaceRoot, "fresh-1") });
       assert.equal(store.getWorkingDirectory(conversationId), created.workingDirectory);
       assert.equal(execFileSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: created.workingDirectory }).toString().trim(), "main");
 
       const candidates = (await listWorkspaceCandidates(paths.workspaceRoot)).map((candidate) => [candidate.name, candidate.git]);
       assert.deepEqual(candidates, [["fresh-1", true], ["repo", true], ["plain", false]]);
-    }, { config: { workspaceRoot: paths.workspaceRoot } });
+    }, { workspaceRoot: paths.workspaceRoot });
   });
 });
 
 test("new sessions and active turns are recorded under the active harness", async () => {
   await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "4", user: { id: 4 } });
-    await withTurnController(store, async ({ turns }, { claude, codex }) => {
+    await withAlasio(store, async (alasio, { claude, codex }) => {
+      const startNewSession = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId)));
       store.setActiveHarness(conversationId, CLAUDE_HARNESS);
-      await assert.rejects(() => turns.startNewSession({ conversationId }), /No folder is mounted/);
+      await assert.rejects(startNewSession(), /No folder is mounted/);
       store.setWorkingDirectory(conversationId, paths.repo);
-      const sessionId = await turns.startNewSession({ conversationId });
+      const sessionId = await startNewSession();
       assert.equal(sessionId, "claude-fresh");
       assert.equal(claude.calls.length, 1);
       assert.equal(claude.calls[0]?.[1].workingDirectory, paths.repo);
@@ -622,7 +576,7 @@ test("restart recovery restores the interrupted turn's own harness session", asy
 test("service panel lists both harness mounts and offers the inactive switch", async () => {
   await withStore((store) => {
     const conversationId = store.upsertConversation({ chatId: "6", user: { id: 6 } });
-    const neutral = buildServicePanel({ store, activeTurns: noActiveTurns, conversationId, notice: CHOOSE_SERVICE_NOTICE });
+    const neutral = buildServicePanel({ store, conversationId, working: false, notice: CHOOSE_SERVICE_NOTICE });
     assert.match(neutral.text, /Active: none/);
     assert.match(neutral.text, /Nothing runs until a service is chosen/);
     assert.match(neutral.text, /No service is mounted/);
@@ -633,8 +587,9 @@ test("service panel lists both harness mounts and offers the inactive switch", a
 
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.setSessionId(conversationId, "codex-abcdef12");
-    const panel = buildServicePanel({ store, activeTurns: noActiveTurns, conversationId });
+    const panel = buildServicePanel({ store, conversationId, working: true });
     assert.match(panel.text, /Active: Codex/);
+    assert.match(panel.text, /Status: working/);
     assert.match(panel.text, /\* Codex: session codex-ab/);
     assert.match(panel.text, /Claude: no mounted session/);
     const buttons = panel.options.reply_markup.inline_keyboard.flat().map((button) => button.text);
@@ -643,52 +598,26 @@ test("service panel lists both harness mounts and offers the inactive switch", a
 });
 
 test("/service text command switches and reports the outcome", async () => {
-  await withStore(async (store) => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "7", user: { id: 7 } });
-    const client = createClient();
-    const switches: Parameters<SwitchHarness>[0][] = [];
-    const switchHarness: SwitchHarness = async (args) => {
-      switches.push(args);
-      const previous = store.getActiveHarness(args.conversationId);
-      store.setActiveHarness(args.conversationId, args.harness);
-      return { switched: true, previous, next: args.harness, sessionId: null };
-    };
-    await handleServiceTextCommand({
-      client,
-      store,
-      activeTurns: noActiveTurns,
-      conversationId,
-      chatId: "7",
-      target: "claude",
-      switchHarness,
-    });
-    assert.deepEqual(switches, [{ conversationId, harness: CLAUDE_HARNESS }]);
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Mounted Claude\. Send a message to start\./);
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Active: Claude/);
+    // With a folder mounted, a newly mounted service needs no folder picker after it.
+    store.setWorkingDirectory(conversationId, paths.repo);
+    const telegram = recordingTelegram();
+    await withAlasio(store, async (alasio) => {
+      const command = (target: string) => alasio.runPromise(handleServiceTextCommand({ conversationId, chatId: "7", target }));
+      await command("claude");
+      assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
+      assert.match(telegram.calls.sendMessage[0]?.[1] ?? "", /Mounted Claude\. Send a message to start\./);
+      assert.match(telegram.calls.sendMessage[0]?.[1] ?? "", /Active: Claude/);
 
-    await handleServiceTextCommand({
-      client,
-      store,
-      activeTurns: noActiveTurns,
-      conversationId,
-      chatId: "7",
-      target: "codex",
-      switchHarness,
-    });
-    assert.match(client.calls.sendMessage[1]?.[1] ?? "", /Switched to Codex\./);
+      await command("codex");
+      assert.match(telegram.calls.sendMessage[1]?.[1] ?? "", /Switched to Codex\./);
 
-    await handleServiceTextCommand({
-      client,
-      store,
-      activeTurns: noActiveTurns,
-      conversationId,
-      chatId: "7",
-      target: "gemini",
-      switchHarness: async () => {
-        throw new Error("should not be called");
-      },
-    });
-    assert.match(client.calls.sendMessage[2]?.[1] ?? "", /Unknown service "gemini"/);
+      await command("gemini");
+      assert.match(telegram.calls.sendMessage[2]?.[1] ?? "", /Unknown service "gemini"/);
+      assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
+      assert.equal(telegram.calls.sendMessage.length, 3);
+    }, { telegram, workspaceRoot: paths.workspaceRoot });
   });
 });
 
@@ -696,25 +625,19 @@ test("service callbacks switch harness and surface refusals in the panel", async
   await withStore(async (store) => {
     const conversationId = store.upsertConversation({ chatId: "8", user: { id: 8 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
-    const client = createClient();
-    const actionId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CLAUDE_HARNESS } });
-    const action = store.consumeCallbackAction(actionId);
-    assert.ok(action);
-    await handleServiceControlCallback({
-      client,
-      store,
-      activeTurns: noActiveTurns,
-      action,
-      switchHarness: async () => {
-        throw new Error("Codex is currently working. Stop the active turn before switching services.");
-      },
-      callbackQueryId: "cb-1",
-      chatId: "8",
-      messageId: 5,
-    });
-    assert.match(client.calls.answerCallbackQuery[0]?.[1] ?? "", /Codex is currently working/);
-    assert.match(client.calls.editMessageText[0]?.[2] ?? "", /Active: Codex/);
-    assert.match(client.calls.editMessageText[0]?.[2] ?? "", /Codex is currently working/);
+    const telegram = recordingTelegram();
+    await withAlasio(store, async (alasio) => {
+      await occupy(alasio, conversationId);
+      const actionId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CLAUDE_HARNESS } });
+      const action = store.consumeCallbackAction(actionId);
+      assert.ok(action);
+      await alasio.runPromise(handleServiceControlCallback({ action, callbackQueryId: "cb-1", chatId: "8", messageId: 5 }));
+      assert.match(telegram.calls.answerCallbackQuery[0]?.[1] ?? "", /Codex is currently working/);
+      assert.match(telegram.calls.editMessageText[0]?.[2] ?? "", /Active: Codex/);
+      assert.match(telegram.calls.editMessageText[0]?.[2] ?? "", /Status: working/);
+      assert.match(telegram.calls.editMessageText[0]?.[2] ?? "", /Codex is currently working/);
+      assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
+    }, { telegram });
   });
 });
 
@@ -722,62 +645,45 @@ test("choosing a service from its panel chains into a folder picker that offers 
   await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "10", user: { id: 10 } });
     const actionId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CLAUDE_HARNESS } });
-    const client = createClient();
-    const handler = new CallbackHandler({
-      authorizer: { isAuthorizedCallbackQuery: () => true },
-      client,
-      config: { workspaceRoot: paths.workspaceRoot },
-      store,
-      turns: createCallbackTurns({
-        harnessFor: () => null,
-        switchHarness: async ({ harness }) => {
-          assert.ok(isHarnessName(harness));
-          store.setActiveHarness(conversationId, harness);
-          return { switched: true, previous: null, next: harness, sessionId: null, workingDirectory: null };
-        },
-        sandboxEnabled: true,
-      }),
-      activeTurns: noActiveTurns,
-    });
-    await handler.handle(buttonPress("cb-10", actionId, 10, 4));
-    const picker = client.calls.sendMessage.at(-1);
-    assert.ok(inlineKeyboard(picker?.[2]).flat().some((button) => button.text === "New empty workspace…"));
+    const telegram = recordingTelegram();
+    await withAlasio(store, async (alasio) => {
+      await alasio.runPromise(handleCallbackQuery(buttonPress("cb-10", actionId, 10, 4)));
+      assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
+      const picker = telegram.calls.sendMessage.at(-1);
+      assert.match(picker?.[1] ?? "", /Folder: none/);
+      assert.ok(inlineKeyboard(picker?.[2]).flat().some((button) => button.text === "New empty workspace…"));
+    }, { telegram, workspaceRoot: paths.workspaceRoot, allowedUserIds: "10", sandbox: unusedSandbox });
   });
 });
 
 test("callback handler rejects panels created under another harness", async () => {
-  await withStore(async (store) => {
+  await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "9", user: { id: 9 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     const actionId = store.createCallbackAction({ conversationId, kind: "control:current", payload: {} });
     store.setActiveHarness(conversationId, CLAUDE_HARNESS);
-    const client = createClient();
-    const handler = new CallbackHandler({
-      authorizer: { isAuthorizedCallbackQuery: () => true },
-      client,
-      config: { workspaceRoot: "/tmp" },
-      store,
-      turns: createCallbackTurns({
-        harnessFor: () => facadeOf(createFakeHarness(CLAUDE_HARNESS)),
-      }),
-      activeTurns: noActiveTurns,
-    });
-    await handler.handle(buttonPress("cb-9", actionId, 9, 3));
-    assert.deepEqual(client.calls.answerCallbackQuery, [["cb-9", "This panel belongs to another service. Open it again."]]);
+    store.setWorkingDirectory(conversationId, paths.repo);
+    const telegram = recordingTelegram();
+    await withAlasio(store, async (alasio) => {
+      await alasio.runPromise(handleCallbackQuery(buttonPress("cb-9", actionId, 9, 3)));
+      assert.deepEqual(telegram.calls.answerCallbackQuery, [["cb-9", "This panel belongs to another service. Open it again."]]);
+    }, { telegram, allowedUserIds: "9" });
   });
 });
 
 test("prompts sent before a service and folder are chosen only get the pickers and are not queued", async () => {
   await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "12", user: { id: 12 } });
-    const client = createClient();
-    await withTurnController(store, async ({ turns }, { codex, claude }) => {
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 1, text: "hello there", filePaths: [] });
-      assert.equal(client.calls.sendMessage.length, 1);
-      assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Active: none/);
-      assert.match(client.calls.sendMessage[0]?.[1] ?? "", /your message was not queued/);
+    const telegram = recordingTelegram();
+    const sent = telegram.calls.sendMessage;
+    await withAlasio(store, async (alasio, { codex, claude }) => {
+      const prompt = (messageId: number, text: string) => alasio.runPromise(processPrompt({ conversationId, chatId: "12", messageId, text, filePaths: [] }));
+      await prompt(1, "hello there");
+      assert.equal(sent.length, 1);
+      assert.match(sent[0]?.[1] ?? "", /Active: none/);
+      assert.match(sent[0]?.[1] ?? "", /your message was not queued/);
       assert.deepEqual(
-        inlineKeyboard(client.calls.sendMessage[0]?.[2]).flat().map((button) => button.text),
+        inlineKeyboard(sent[0]?.[2]).flat().map((button) => button.text),
         ["Use Codex", "Use Claude", "Close"],
       );
       assert.equal(store.hasOpenPromptJobs(conversationId), false);
@@ -785,83 +691,77 @@ test("prompts sent before a service and folder are chosen only get the pickers a
       assert.equal(codex.calls.length, 0);
       assert.equal(claude.calls.length, 0);
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 2, text: "/sessions", filePaths: [] });
-      assert.match(client.calls.sendMessage[1]?.[1] ?? "", /Active: none/);
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 3, text: "/stop", filePaths: [] });
-      assert.equal(client.calls.sendMessage[2]?.[1], "No active query to stop.");
+      await prompt(2, "/sessions");
+      assert.match(sent[1]?.[1] ?? "", /Active: none/);
+      await prompt(3, "/stop");
+      assert.equal(sent[2]?.[1], "No active query to stop.");
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 4, text: "/service claude", filePaths: [] });
-      assert.match(client.calls.sendMessage[3]?.[1] ?? "", /Mounted Claude/);
+      await prompt(4, "/service claude");
+      assert.match(sent[3]?.[1] ?? "", /Mounted Claude/);
       assert.equal(store.getActiveHarness(conversationId), CLAUDE_HARNESS);
       // Service first, then folder: the folder picker follows immediately.
-      assert.match(client.calls.sendMessage[4]?.[1] ?? "", /Workspace\n\nFolder: none/);
-      assert.match(client.calls.sendMessage[4]?.[1] ?? "", /No folder is mounted/);
+      assert.match(sent[4]?.[1] ?? "", /Workspace\n\nFolder: none/);
+      assert.match(sent[4]?.[1] ?? "", /No folder is mounted/);
       assert.deepEqual(
-        inlineKeyboard(client.calls.sendMessage[4]?.[2]).flat().map((button) => button.text),
+        inlineKeyboard(sent[4]?.[2]).flat().map((button) => button.text),
         ["repo", "· plain", "New folder…", "Refresh", "Close"],
       );
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 5, text: "hello again", filePaths: [] });
-      assert.match(client.calls.sendMessage[5]?.[1] ?? "", /Folder: none/);
+      await prompt(5, "hello again");
+      assert.match(sent[5]?.[1] ?? "", /Folder: none/);
       assert.equal(store.hasOpenPromptJobs(conversationId), false);
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 6, text: "/sessions new", filePaths: [] });
-      assert.match(client.calls.sendMessage[6]?.[1] ?? "", /Folder: none/);
+      await prompt(6, "/sessions new");
+      assert.match(sent[6]?.[1] ?? "", /Folder: none/);
       assert.equal(claude.calls.length, 0);
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 7, text: "/workspace escape", filePaths: [] });
-      assert.match(client.calls.sendMessage[7]?.[1] ?? "", /outside the workspace root/);
+      await prompt(7, "/workspace escape");
+      assert.match(sent[7]?.[1] ?? "", /outside the workspace root/);
       assert.equal(store.getWorkingDirectory(conversationId), null);
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 8, text: "/workspace repo", filePaths: [] });
-      assert.match(client.calls.sendMessage[8]?.[1] ?? "", /Mounted repo \(/);
-      assert.match(client.calls.sendMessage[8]?.[1] ?? "", new RegExp(`Folder: ${paths.repo}`));
-      assert.equal(inlineKeyboard(client.calls.sendMessage[8]?.[2])[0]?.[0]?.text, "* repo");
+      await prompt(8, "/workspace repo");
+      assert.match(sent[8]?.[1] ?? "", /Mounted repo \(/);
+      assert.match(sent[8]?.[1] ?? "", new RegExp(`Folder: ${paths.repo}`));
+      assert.equal(inlineKeyboard(sent[8]?.[2])[0]?.[0]?.text, "* repo");
       assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 9, text: "/sessions new", filePaths: [] });
-      assert.match(client.calls.sendMessage[9]?.[1] ?? "", /New Claude session mounted: claude-f/);
+      await prompt(9, "/sessions new");
+      assert.match(sent[9]?.[1] ?? "", /New Claude session mounted: claude-f/);
       assert.equal(claude.calls.length, 1);
       assert.equal(codex.calls.length, 0);
 
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 10, text: "/workspace new made-here", filePaths: [] });
-      assert.match(client.calls.sendMessage[10]?.[1] ?? "", /Created and mounted made-here/);
+      await prompt(10, "/workspace new made-here");
+      assert.match(sent[10]?.[1] ?? "", /Created and mounted made-here/);
       assert.equal(store.getWorkingDirectory(conversationId), join(paths.workspaceRoot, "made-here"));
       assert.equal(store.getSessionId(conversationId), undefined);
-      await turns.processPrompt({ conversationId, chatId: "12", messageId: 11, text: "/workspace repo", filePaths: [] });
+      await prompt(11, "/workspace repo");
       assert.equal(store.getSessionId(conversationId), "claude-fresh");
-    }, { client, config: { workspaceRoot: paths.workspaceRoot } });
+    }, { telegram, workspaceRoot: paths.workspaceRoot });
   });
 });
 
 test("/start offers the pickers until a service and folder are mounted", async () => {
   await withStore(async (store, paths) => {
-    const client = createClient();
-    await withTurnController(store, async ({ turns }) => {
-      const handler = new MessageHandler({
-        authorizer: { isAuthorizedMessage: () => true },
-        client,
-        store,
-        turns,
-        mediaGroups: { buffer() {} },
-        log: { warn() {}, error() {} },
-    });
-    const message: Message = {
-      message_id: 1,
-      date: 0,
-      chat: { id: 13, type: "private", first_name: "Operator" },
-      from: { id: 13, is_bot: false, first_name: "Operator" },
-      text: "/start",
-    };
-    await handler.handle(message, 1);
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Active: none/);
+    const telegram = recordingTelegram();
+    const sent = telegram.calls.sendMessage;
+    await withAlasio(store, async (alasio) => {
+      const message: Message = {
+        message_id: 1,
+        date: 0,
+        chat: { id: 13, type: "private", first_name: "Operator" },
+        from: { id: 13, is_bot: false, first_name: "Operator" },
+        text: "/start",
+      };
+      const handle = (messageId: number) => alasio.runPromise(handleMessage({ ...message, message_id: messageId }, messageId));
+      assert.equal(await handle(1), null, "/start is no prompt");
+      assert.match(sent[0]?.[1] ?? "", /Active: none/);
 
-    store.setActiveHarness("telegram:13", CODEX_HARNESS);
-    await handler.handle({ ...message, message_id: 2 }, 2);
-    assert.match(client.calls.sendMessage[1]?.[1] ?? "", /Folder: none/);
+      store.setActiveHarness("telegram:13", CODEX_HARNESS);
+      await handle(2);
+      assert.match(sent[1]?.[1] ?? "", /Folder: none/);
 
-    store.setWorkingDirectory("telegram:13", paths.repo);
-    await handler.handle({ ...message, message_id: 3 }, 3);
-    assert.equal(client.calls.sendMessage[2]?.[1], "Alasio is ready.");
-    }, { client, config: { workspaceRoot: paths.workspaceRoot } });
+      store.setWorkingDirectory("telegram:13", paths.repo);
+      await handle(3);
+      assert.equal(sent[2]?.[1], "Alasio is ready.");
+    }, { telegram, workspaceRoot: paths.workspaceRoot, allowedUserIds: "13" });
   });
 });
 
@@ -869,38 +769,69 @@ test("callbacks other than service and workspace controls are refused while noth
   await withStore(async (store, paths) => {
     const conversationId = store.upsertConversation({ chatId: "14", user: { id: 14 } });
     const actionId = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
-    const client = createClient();
-    await withTurnController(store, async ({ turns }) => {
-      const handler = new CallbackHandler({
-        authorizer: { isAuthorizedCallbackQuery: () => true },
-        client,
-        config: { workspaceRoot: paths.workspaceRoot },
-        store,
-        turns,
-        activeTurns: turns.activeTurns,
-    });
-    await handler.handle(buttonPress("cb-14", actionId, 14, 3));
-    assert.deepEqual(client.calls.answerCallbackQuery, [["cb-14", NO_SERVICE_MOUNTED]]);
-    assert.equal(client.calls.editMessageText.length, 0);
+    const telegram = recordingTelegram();
+    const { calls } = telegram;
+    await withAlasio(store, async (alasio) => {
+      const press = (id: string, data: string, messageId: number) => alasio.runPromise(handleCallbackQuery(buttonPress(id, data, 14, messageId)));
+      await press("cb-14", actionId, 3);
+      assert.deepEqual(calls.answerCallbackQuery, [["cb-14", NO_SERVICE_MOUNTED]]);
+      assert.equal(calls.editMessageText.length, 0);
 
-    const useId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CODEX_HARNESS } });
-    await handler.handle(buttonPress("cb-15", useId, 14, 4));
-    assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
-    assert.match(client.calls.answerCallbackQuery[1]?.[1] ?? "", /Mounted Codex/);
-    assert.match(client.calls.editMessageText[0]?.[2] ?? "", /Active: Codex/);
-    // Mounting a service chains into the folder picker.
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Folder: none/);
+      const useId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CODEX_HARNESS } });
+      await press("cb-15", useId, 4);
+      assert.equal(store.getActiveHarness(conversationId), CODEX_HARNESS);
+      assert.match(calls.answerCallbackQuery[1]?.[1] ?? "", /Mounted Codex/);
+      assert.match(calls.editMessageText[0]?.[2] ?? "", /Active: Codex/);
+      // Mounting a service chains into the folder picker.
+      assert.match(calls.sendMessage[0]?.[1] ?? "", /Folder: none/);
 
-    const queueAgain = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
-    await handler.handle(buttonPress("cb-16", queueAgain, 14, 5));
-    assert.deepEqual(client.calls.answerCallbackQuery[2], ["cb-16", NO_WORKSPACE_MOUNTED]);
+      const queueAgain = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
+      await press("cb-16", queueAgain, 5);
+      assert.deepEqual(calls.answerCallbackQuery[2], ["cb-16", NO_WORKSPACE_MOUNTED]);
 
-    const pick = inlineKeyboard(client.calls.sendMessage[0]?.[2])[0]?.[0];
-    assert.ok(pick && "callback_data" in pick);
-    await handler.handle(buttonPress("cb-17", pick.callback_data, 14, 6));
-    assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
-    assert.match(client.calls.answerCallbackQuery[3]?.[1] ?? "", /Mounted repo/);
-    assert.match(client.calls.editMessageText[1]?.[2] ?? "", new RegExp(`Folder: ${paths.repo}`));
-    }, { client, config: { workspaceRoot: paths.workspaceRoot } });
+      const pick = inlineKeyboard(calls.sendMessage[0]?.[2])[0]?.[0];
+      assert.ok(pick && "callback_data" in pick);
+      await press("cb-17", pick.callback_data, 6);
+      assert.equal(store.getWorkingDirectory(conversationId), paths.repo);
+      assert.match(calls.answerCallbackQuery[3]?.[1] ?? "", /Mounted repo/);
+      assert.match(calls.editMessageText[1]?.[2] ?? "", new RegExp(`Folder: ${paths.repo}`));
+    }, { telegram, workspaceRoot: paths.workspaceRoot, allowedUserIds: "14" });
+  });
+});
+
+test("Steer says whether the running turn took the message, and queues it when it did not", async () => {
+  await withStore(async (store, paths) => {
+    const conversationId = store.upsertConversation({ chatId: "15", user: { id: 15 } });
+    store.setActiveHarness(conversationId, CODEX_HARNESS);
+    store.setWorkingDirectory(conversationId, paths.repo);
+    const telegram = recordingTelegram();
+    const { calls } = telegram;
+    await withAlasio(store, async (alasio) => {
+      const steered: string[] = [];
+      /** A press of Steer on a concurrent prompt held as a prompt job. */
+      const pressSteer = async (id: string) => {
+        const job = store.enqueuePromptJob({ conversationId, chatId: "15", messageId: id, prompt: `also ${id}`, state: "awaiting_choice" });
+        const steer = store.createCallbackAction({ conversationId, kind: "steer", payload: { jobId: job.id, prompt: job.prompt } });
+        await alasio.runPromise(handleCallbackQuery(buttonPress(id, steer, 15, 7)));
+        return job.id;
+      };
+
+      // A Codex turn not yet started upstream takes no guidance: the message waits for the turn after it.
+      let release = await occupy(alasio, conversationId, { steer: () => Effect.succeed(false) });
+      const notTaken = await pressSteer("1");
+      assert.deepEqual(calls.answerCallbackQuery.at(-1), ["1", "Queued."]);
+      assert.equal(calls.editMessageText.at(-1)?.[2], "Codex is not ready to steer yet. Queued instead.");
+      assert.equal(store.getPromptJob(notTaken)?.state, "pending");
+      await release();
+      store.setPromptJobDisposition(notTaken, "cancelled");
+
+      release = await occupy(alasio, conversationId, { steer: (prompt) => Effect.sync(() => steered.push(prompt)).pipe(Effect.as(true)) });
+      const taken = await pressSteer("2");
+      assert.deepEqual(steered, ["also 2"]);
+      assert.deepEqual(calls.answerCallbackQuery.at(-1), ["2", "Steered."]);
+      assert.equal(calls.editMessageText.at(-1)?.[2], "Sent as guidance to the active Codex turn.");
+      assert.equal(store.getPromptJob(taken)?.state, "completed");
+      await release();
+    }, { telegram, workspaceRoot: paths.workspaceRoot, allowedUserIds: "15" });
   });
 });

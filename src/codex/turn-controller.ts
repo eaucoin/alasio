@@ -1,51 +1,35 @@
-import { Clock, Context, Deferred, Effect, Fiber, FiberMap, FiberSet, HashMap, Layer, Option, Ref, Schedule, Schema } from "effect";
+import { Clock, Context, Deferred, Effect, Fiber, FiberMap, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
 
 import {
   type AttachedTurn,
   type Harness,
   type HarnessError,
-  type HarnessFacade,
   Harnesses,
-  type HarnessesFacade,
   type HarnessUnavailable,
-  NO_WORKSPACE_MOUNTED,
   type NoServiceMounted,
   NoWorkspaceMounted,
-  harnessDisplayName,
-  harnessesFacade,
-  isHarnessName,
-  resolveHarnessName,
+  harnessLabelOf,
   resolveWorkingDirectory,
 } from "../harness/index.ts";
-import { ActiveTurns, type ActiveTurnsFacade, activeTurnsFacade } from "../harness/active-turns.ts";
+import { ActiveTurns } from "../harness/active-turns.ts";
 import { errorsIn, type ResponseBlock } from "./event-projection.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
-import { buildFilePromptSuffix } from "../shared/file-prompt.ts";
-import { CommandHandler } from "../operator/command-handler.ts";
 import type { GoalTurnRequest } from "../operator/goal-control.ts";
-import { type HarnessSwitch, sendChooseServicePanel } from "../operator/service-control.ts";
-import { type WorkspaceChange, sendChooseWorkspacePanel } from "../operator/workspace-control.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
-import { type NetMode, type SessionFilesystems, SessionSandboxes } from "../sandbox/index.ts";
-import type { EffectRunner } from "../shared/effects.ts";
-import { type ChatId, type Client, TelegramClient, type TelegramError } from "../telegram/client.ts";
+import { Store } from "../persistence/store.ts";
+import { SessionSandboxes } from "../sandbox/index.ts";
+import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { WorkflowHooks } from "../workflow/hook-server.ts";
-import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.ts";
-import { sessionFsWorkspace } from "../workspace/kind.ts";
-import { newVolumeId } from "../sandbox/names.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
 import { recordExternalRestartEvent, recoverInterruptedTurns } from "./restart-recovery.ts";
 import { makeStatusReporter } from "./status-reporter.ts";
-import { createLogger, withLogScope } from "../shared/log.ts";
+import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 
 const LOG_SCOPE = "codex-turn-controller";
-/** The scope's lines, for the operator controls not yet written in Effect. */
-const log = createLogger(LOG_SCOPE);
 
 const turnDuration = meter.createHistogram("alasio.turn.duration", {
   description: "Time from a turn starting to its reply being queued for delivery, by harness and outcome",
@@ -60,27 +44,16 @@ const promptWait = meter.createHistogram("alasio.prompt.wait", {
   unit: "s",
 });
 
-/** How often completed responses that were never delivered are looked for. */
-const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
-
 /**
- * The configuration the controller reads: the workspace root, the pre-mounted folder if
- * any, and the state directory a reply's media are copied under, without which replies
- * go as text only.
+ * What Turns is made with: the state directory a reply's media are copied under, without
+ * which replies go as text only.
  */
-export type TurnControllerConfig = Pick<AlasioConfig, "workspaceRoot"> & Partial<Pick<AlasioConfig, "workingDirectory" | "stateDir">>;
+export type TurnsConfig = Partial<Pick<AlasioConfig, "stateDir">>;
 
-/** A conversation and the chat it is in, as the setup pickers are sent to. */
+/** A conversation and the chat it is in. */
 export interface ConversationChat {
   readonly conversationId: string;
   readonly chatId: ChatId;
-}
-
-/** A prompt as it arrives from Telegram: its text, and the files sent with it. */
-export interface IncomingPrompt extends ConversationChat {
-  readonly messageId: number;
-  readonly text: string;
-  readonly filePaths: readonly string[];
 }
 
 /** An operator's prompt to queue as a prompt job: its text as sent, and the prompt it makes. */
@@ -144,12 +117,6 @@ function notCompleted(harnessName: string, blocks: readonly ResponseBlock[]): st
   return error ? `${harnessName} did not complete: ${error}` : `${harnessName} did not complete.`;
 }
 
-/** The mounted service's name as the operator reads it, or "No service". */
-function harnessLabelOf(store: SqliteStore, conversationId: string): string {
-  const name = resolveHarnessName(store, conversationId);
-  return name ? harnessDisplayName(name) : "No service";
-}
-
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /**
@@ -187,14 +154,14 @@ export class Turns extends Context.Service<Turns, {
   /** Schedules every conversation with prompt jobs waiting. */
   readonly resumePendingPrompts: Effect.Effect<void>;
 }>()("alasio/codex/Turns") {
-  static readonly layer = (config: Partial<Pick<AlasioConfig, "stateDir">> = {}): Layer.Layer<
+  static readonly layer = (config: TurnsConfig = {}): Layer.Layer<
     Turns,
     never,
     Store | TelegramClient | Outbox | WorkflowHooks | Harnesses | ActiveTurns
   > => Layer.effect(Turns, makeTurns(config));
 }
 
-const makeTurns = Effect.fnUntraced(function*({ stateDir }: Partial<Pick<AlasioConfig, "stateDir">>) {
+const makeTurns = Effect.fnUntraced(function*({ stateDir }: TurnsConfig) {
   const store = yield* Store;
   const client = yield* TelegramClient;
   const harnesses = yield* Harnesses;
@@ -471,13 +438,6 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: Partial<Pick<AlasioC
     });
   });
 
-  // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
-  yield* flushCompletedResponses.pipe(
-    Effect.catchDefect((defect) => Effect.logWarning(`Completed response recovery failed: ${errorText(defect)}`).pipe(withLogScope("telegram-app"))),
-    Effect.schedule(Schedule.spaced(COMPLETED_RESPONSE_RECOVERY)),
-    Effect.forkScoped,
-  );
-
   return Turns.of({
     submit: Effect.fnUntraced(function*({ conversationId, chatId, messageId, prompt, filePaths, visibleText }: QueuedPrompt) {
       const job = store.enqueuePromptJob({
@@ -557,271 +517,3 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: Partial<Pick<AlasioC
     resumePendingPrompts: Effect.suspend(() => Effect.forEach(store.listPendingPromptConversations(), schedule, { discard: true })),
   });
 }, withLogScope(LOG_SCOPE));
-
-/** What the turn controller façade runs its effects in: the turns, and what the operator's controls ask of the harnesses and running turns. */
-export type TurnControllerServices = Turns | ActiveTurns | Harnesses;
-
-export interface TurnControllerOptions {
-  readonly config: TurnControllerConfig;
-  readonly client: Pick<Client, "sendMessage" | "editMessageText">;
-  readonly store: SqliteStore;
-  readonly effects: EffectRunner<TurnControllerServices>;
-  readonly sandbox?: SessionFilesystems | null;
-}
-
-/**
- * Turns as the code not yet written in Effect drives them (the message and callback
- * handlers, the media-group buffer, the operator's commands and controls, the app's
- * start): its effects as promises run through alasio's EffectRunner, and the operator's
- * service, workspace and session switches, which move with that code. It goes when its
- * last caller moves.
- */
-export class TurnController {
-  private readonly sandbox: SessionFilesystems | null;
-  private readonly config: TurnControllerConfig;
-  private readonly client: Pick<Client, "sendMessage" | "editMessageText">;
-  private readonly store: SqliteStore;
-  private readonly effects: EffectRunner<TurnControllerServices>;
-  private readonly turns: Turns["Service"];
-  readonly activeTurns: ActiveTurnsFacade;
-  readonly harnesses: HarnessesFacade;
-  private readonly commands: CommandHandler;
-
-  constructor({ config, client, store, effects, sandbox = null }: TurnControllerOptions) {
-    this.sandbox = sandbox;
-    this.config = config;
-    this.client = client;
-    this.store = store;
-    this.effects = effects;
-    this.turns = effects.runSync(Turns);
-    this.activeTurns = activeTurnsFacade(effects);
-    this.harnesses = harnessesFacade(effects);
-    this.commands = new CommandHandler({
-      client,
-      config,
-      store,
-      activeTurns: this.activeTurns,
-      harnessFor: (conversationId) => this.harnessFor(conversationId),
-      runCodexTurn: (args) => this.runCodexTurn(args),
-      runGoalTurn: (args) => this.runGoalTurn(args),
-      startNewSession: (args) => this.startNewSession(args),
-      switchHarness: (args) => this.switchHarness(args),
-      switchWorkspace: (args) => this.switchWorkspace(args),
-      createWorkspace: (args) => this.createWorkspace(args),
-      sandboxEnabled: this.sandboxEnabled,
-    });
-  }
-
-  harnessFor(conversationId: string): HarnessFacade | null {
-    return this.harnesses.forConversation(conversationId);
-  }
-
-  requireHarness(conversationId: string): HarnessFacade {
-    return this.harnesses.requireForConversation(conversationId);
-  }
-
-  harnessLabel(conversationId: string): string {
-    return harnessLabelOf(this.store, conversationId);
-  }
-
-  workingDirectoryFor(conversationId: string): string | null {
-    return resolveWorkingDirectory(this.store, conversationId);
-  }
-
-  requireWorkingDirectory(conversationId: string): string {
-    const workingDirectory = this.workingDirectoryFor(conversationId);
-    if (!workingDirectory) {
-      throw new Error(NO_WORKSPACE_MOUNTED);
-    }
-    return workingDirectory;
-  }
-
-  async sendChooseServicePanel({ conversationId, chatId }: ConversationChat): Promise<void> {
-    await sendChooseServicePanel({
-      client: this.client,
-      store: this.store,
-      activeTurns: this.activeTurns,
-      conversationId,
-      chatId,
-    });
-  }
-
-  async sendChooseWorkspacePanel({ conversationId, chatId }: ConversationChat): Promise<void> {
-    await sendChooseWorkspacePanel({
-      client: this.client,
-      store: this.store,
-      activeTurns: this.activeTurns,
-      conversationId,
-      chatId,
-      workspaceRoot: this.config.workspaceRoot,
-      sandboxEnabled: this.sandboxEnabled,
-    });
-  }
-
-  /**
-   * Service first, then folder. Sends the picker for the first missing layer and
-   * reports whether one was sent, so ingress can stop there.
-   */
-  async sendNextSetupStep({ conversationId, chatId }: ConversationChat): Promise<boolean> {
-    if (!resolveHarnessName(this.store, conversationId)) {
-      await this.sendChooseServicePanel({ conversationId, chatId });
-      return true;
-    }
-    if (!this.workingDirectoryFor(conversationId)) {
-      await this.sendChooseWorkspacePanel({ conversationId, chatId });
-      return true;
-    }
-    return false;
-  }
-
-  describeSwitchBlocker(conversationId: string): string | null {
-    if (this.activeTurns.isBusy(conversationId)) {
-      return `${this.harnessLabel(conversationId)} is currently working. Stop the active turn before switching services.`;
-    }
-    if (this.store.hasOpenPromptJobs(conversationId)) {
-      return "Queued prompts are still waiting for the current service. Let them finish or discard them before switching.";
-    }
-    return null;
-  }
-
-  async switchHarness({ conversationId, harness }: { readonly conversationId: string; readonly harness: string }): Promise<HarnessSwitch> {
-    if (!isHarnessName(harness)) {
-      throw new Error(`Unknown service: ${String(harness)}`);
-    }
-    const previous = this.store.getActiveHarness(conversationId);
-    if (previous === harness) {
-      return { switched: false, previous, next: harness, sessionId: this.store.getSessionId(conversationId) ?? null };
-    }
-    const blocker = this.describeSwitchBlocker(conversationId);
-    if (blocker) {
-      throw new Error(blocker);
-    }
-    this.store.setActiveHarness(conversationId, harness);
-    log.info(`service.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${harness}`);
-    return {
-      switched: true,
-      previous,
-      next: harness,
-      sessionId: this.store.getSessionId(conversationId) ?? null,
-      workingDirectory: this.workingDirectoryFor(conversationId),
-    };
-  }
-
-  async switchWorkspace({ conversationId, target }: { readonly conversationId: string; readonly target: string }): Promise<WorkspaceChange> {
-    const workingDirectory = await resolveWorkspacePath({ root: this.config.workspaceRoot, candidate: target });
-    const previous = this.workingDirectoryFor(conversationId);
-    if (previous === workingDirectory) {
-      return { switched: false, previous, workingDirectory };
-    }
-    const blocker = this.describeSwitchBlocker(conversationId);
-    if (blocker) {
-      throw new Error(blocker);
-    }
-    this.store.setWorkingDirectory(conversationId, workingDirectory);
-    log.info(`workspace.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${workingDirectory}`);
-    return { switched: true, previous, workingDirectory };
-  }
-
-  async createWorkspace({ conversationId, name }: { readonly conversationId: string; readonly name: string }): Promise<WorkspaceChange> {
-    const blocker = this.describeSwitchBlocker(conversationId);
-    if (blocker) {
-      throw new Error(blocker);
-    }
-    const workingDirectory = await createWorkspace({ root: this.config.workspaceRoot, name });
-    const previous = this.workingDirectoryFor(conversationId);
-    this.store.setWorkingDirectory(conversationId, workingDirectory);
-    log.info(`workspace.created conversation=${JSON.stringify(conversationId)} path=${workingDirectory}`);
-    return { switched: true, created: true, previous, workingDirectory };
-  }
-
-  /** Whether this deployment offers session filesystems (the sandbox is configured). */
-  get sandboxEnabled(): boolean {
-    return Boolean(this.sandbox);
-  }
-
-  /**
-   * Create and mount a new, empty session filesystem with the chosen internet mode.
-   * The workspace is the sentinel `sessionfs:<volumeId>` (src/workspace/kind.ts), so it
-   * parks and restores like any other workspace; its volume and sandbox come up when a
-   * turn first needs them.
-   */
-  async createSessionWorkspace({ conversationId, netMode }: { readonly conversationId: string; readonly netMode: NetMode }): Promise<WorkspaceChange> {
-    if (!this.sandbox) {
-      throw new Error("Session filesystems are not enabled on this deployment.");
-    }
-    const blocker = this.describeSwitchBlocker(conversationId);
-    if (blocker) {
-      throw new Error(blocker);
-    }
-    const volumeId = newVolumeId();
-    await this.sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none");
-    const workingDirectory = sessionFsWorkspace(volumeId);
-    const previous = this.workingDirectoryFor(conversationId);
-    this.store.setWorkingDirectory(conversationId, workingDirectory);
-    log.info(`workspace.created.sessionfs conversation=${JSON.stringify(conversationId)} volume=${volumeId} net=${netMode}`);
-    return { switched: true, created: true, previous, workingDirectory };
-  }
-
-  enqueueMessage(conversationId: string, prompt: string, front = false): void {
-    this.effects.runSync(this.turns.enqueueMessage(conversationId, prompt, front));
-  }
-
-  async processPrompt({ conversationId, chatId, messageId, text, filePaths }: IncomingPrompt): Promise<void> {
-    const effectiveText = text || (filePaths.length > 0 ? "Please inspect the attached file(s)." : "");
-    const handledCommand = await this.commands.handleTextCommand({
-      text: effectiveText,
-      filePaths,
-      conversationId,
-      chatId,
-      messageId,
-    });
-    if (handledCommand) {
-      return;
-    }
-    const prompt = effectiveText + buildFilePromptSuffix(filePaths);
-    if (!prompt.trim()) {
-      return;
-    }
-    if (await this.sendNextSetupStep({ conversationId, chatId })) {
-      // Neutral by default: nothing is queued until a service and a folder are chosen.
-      return;
-    }
-    await this.effects.runPromise(this.turns.submit({ conversationId, chatId, messageId, prompt, filePaths, visibleText: effectiveText }));
-  }
-
-  scheduleConversation(conversationId: string): void {
-    this.effects.runSync(this.turns.schedule(conversationId));
-  }
-
-  resumePendingPrompts(): void {
-    this.effects.runSync(this.turns.resumePendingPrompts);
-  }
-
-  reconcilePersistentState(): void {
-    this.effects.runSync(this.turns.reconcilePersistentState);
-  }
-
-  setPromptDisposition(jobId: string, state: PromptJobState, priority = 0): PromptJob | null {
-    return this.effects.runSync(this.turns.setPromptDisposition(jobId, state, priority));
-  }
-
-  async startNewSession({ conversationId }: { readonly conversationId: string }): Promise<string> {
-    return await this.effects.runPromise(this.turns.startNewSession(conversationId));
-  }
-
-  async runCodexTurn(request: TurnRequest): Promise<boolean> {
-    return await this.effects.runPromise(this.turns.run(request));
-  }
-
-  async runGoalTurn(request: GoalTurnRequest): Promise<boolean> {
-    return await this.effects.runPromise(this.turns.runGoalTurn(request));
-  }
-
-  async flushCompletedResponses(): Promise<void> {
-    await this.effects.runPromise(this.turns.flushCompletedResponses);
-  }
-
-  async recoverInterruptedTurns(): Promise<void> {
-    await this.effects.runPromise(this.turns.recoverInterruptedTurns);
-  }
-}

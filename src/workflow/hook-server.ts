@@ -23,12 +23,6 @@ export interface WorkflowWait {
   readonly startedAt: number;
 }
 
-/** Wakes a turn's status loop as soon as a workflow wait is reported for its session. */
-export interface WorkflowWakeEvent {
-  readonly promise: Promise<void>;
-  resolve(): void;
-}
-
 /** Where the active turns are read from: alasio's store. */
 export interface ActiveTurnSource {
   getActiveTurns(): readonly Pick<Turn, "session_id" | "thread_key">[];
@@ -55,14 +49,13 @@ function findThreadKeyBySessionId(store: ActiveTurnSource, sessionId: string): s
 
 /**
  * The workflow waits agents report, by session, as the hook server on localhost:`port`
- * records them while the service lasts; a report wakes the session's status loop
- * (`wakeEvents`) at once.
+ * records them while the service lasts; a turn's status shows its session's wait when it
+ * next checks (codex/status-reporter.ts).
  */
 export class WorkflowHooks extends Context.Service<WorkflowHooks, {
   /** The port the server listens on: the one it was given, or the one it was assigned for 0. */
   readonly port: number;
   readonly waits: ReadonlyMap<string, WorkflowWait>;
-  readonly wakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
 }>()("alasio/workflow/WorkflowHooks") {
   static readonly layer = (port: number): Layer.Layer<WorkflowHooks, never, Store> =>
     Layer.effect(WorkflowHooks, serveWorkflowHooks(port));
@@ -71,7 +64,6 @@ export class WorkflowHooks extends Context.Service<WorkflowHooks, {
 const serveWorkflowHooks = Effect.fnUntraced(function*(port: number): Effect.fn.Return<WorkflowHooks["Service"], never, Store | Scope.Scope> {
   const store = yield* Store;
   const waits = new Map<string, WorkflowWait>();
-  const wakeEvents = new Map<string, WorkflowWakeEvent>();
 
   const record = Effect.gen(function*() {
     const notification = yield* HttpServerRequest.schemaBodyJson(WorkflowHookNotification);
@@ -82,7 +74,6 @@ const serveWorkflowHooks = Effect.fnUntraced(function*(port: number): Effect.fn.
       threadKey: findThreadKeyBySessionId(store, notification.session_id),
       startedAt: (yield* Clock.currentTimeMillis) / 1000,
     });
-    wakeEvents.get(notification.session_id)?.resolve();
     return HttpServerResponse.text("OK");
   }).pipe(
     Effect.catchTag("SchemaError", () => Effect.succeed(HttpServerResponse.text("Missing session_id or run_id", { status: 400 }))),
@@ -101,5 +92,5 @@ const serveWorkflowHooks = Effect.fnUntraced(function*(port: number): Effect.fn.
   const server = yield* Effect.orDie(NodeHttpServer.make(() => createServer(), { port, host: "localhost" }));
   yield* server.serve(handle);
   yield* Effect.logInfo(`Hook server started on localhost:${port}`).pipe(withLogScope("telegram-app"));
-  return WorkflowHooks.of({ port: server.address._tag === "UnixPathAddress" ? port : server.address.port, waits, wakeEvents });
+  return WorkflowHooks.of({ port: server.address._tag === "UnixPathAddress" ? port : server.address.port, waits });
 });

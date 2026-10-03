@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { Clock, Deferred, Effect, type Scope } from "effect";
+import { Clock, Deferred, Effect, Schedule, type Scope } from "effect";
 
 import { Store } from "../persistence/store.ts";
 import { formatDuration } from "../shared/human-time.ts";
@@ -111,7 +111,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
   const store = yield* Store;
   const client = yield* TelegramClient;
   const outbox = yield* Outbox;
-  const { waits, wakeEvents } = yield* WorkflowHooks;
+  const { waits } = yield* WorkflowHooks;
 
   const enqueueFinalResponse = Effect.fnUntraced(function*({ chatId, text, pendingResponseId }: FinalResponse) {
     let prepared: PreparedReply = { text, options: FINAL_RESPONSE_OPTIONS };
@@ -124,22 +124,21 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     yield* outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
   });
 
-  /** Keeps a posted status message current: every STATUS_CHECK, or as soon as a workflow wait is reported. */
-  const keepCurrent = Effect.fnUntraced(function*(chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, messageId: number) {
+  /** Keeps a posted status message current: every STATUS_CHECK, it is edited if what it says has changed. */
+  const keepCurrent = (chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, messageId: number): Effect.Effect<void> => {
     let shown = shownAtFirst;
-    while (true) {
-      const wakeEvent = sessionId ? wakeEvents.get(sessionId) : null;
-      yield* wakeEvent ? Effect.raceFirst(Effect.sleep(STATUS_CHECK), Effect.promise(() => wakeEvent.promise)) : Effect.sleep(STATUS_CHECK);
+    const check = Effect.suspend(() => {
       const next = statusHtml(sessionId ? waits.get(sessionId) ?? null : null);
       if (next === shown) {
-        continue;
+        return Effect.void;
       }
       shown = next;
-      yield* client.editMessageText(chatId, messageId, next, { parse_mode: "HTML" }).pipe(
+      return client.editMessageText(chatId, messageId, next, { parse_mode: "HTML" }).pipe(
         Effect.catch((error) => Effect.logWarning(`Failed to edit status message: ${error}`)),
       );
-    }
-  });
+    });
+    return check.pipe(Effect.schedule(Schedule.spaced(STATUS_CHECK)), Effect.asVoid);
+  };
 
   const statusUpdates = Effect.fnUntraced(function*({ chatId, sessionId, harnessName = "Codex" }: StatusUpdates) {
     const posted = yield* Deferred.make<PostedStatus | null>();

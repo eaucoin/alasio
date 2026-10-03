@@ -12,19 +12,18 @@ import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
 import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
+import { Turns } from "../src/codex/turn-controller.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { SqliteStore, Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
-import { effectRunnerHere } from "../src/shared/effects.ts";
-import { TelegramCodexApp } from "../src/telegram/app.ts";
-import { TelegramApiError, TelegramClient } from "../src/telegram/client.ts";
+import { TelegramApiError } from "../src/telegram/client.ts";
 import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
-import { WorkflowHooks } from "../src/workflow/hook-server.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
-import { telegramClientOf } from "./support/turns.ts";
+import { recordingTelegram } from "./support/telegram-calls.ts";
+import { noWorkflowHooks } from "./support/turns.ts";
 
 /** A Telegram client for a reporter that only queues replies, never sending or editing itself. */
-const unusedClient = telegramClientOf({
+const unusedClient = recordingTelegram({
   sendMessage: () => assert.fail("no message is sent directly"),
   editMessageText: () => assert.fail("no message is edited"),
 });
@@ -33,9 +32,9 @@ const unusedClient = telegramClientOf({
 function reporterFor(store: SqliteStore, enqueue: (text: OutboxText) => string): StatusReporter {
   return Effect.runSync(makeStatusReporter().pipe(Effect.provide(Layer.mergeAll(
     Layer.succeed(Store, store),
-    Layer.succeed(TelegramClient, unusedClient),
+    unusedClient.layer,
     Layer.succeed(Outbox, Outbox.of({ enqueueText: (text) => Effect.sync(() => enqueue(text)), deliverDue: Effect.void })),
-    Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map(), wakeEvents: new Map() })),
+    noWorkflowHooks,
   ))));
 }
 
@@ -268,7 +267,7 @@ test("SQLite prompt jobs and outbox survive process boundaries", () => {
   }
 });
 
-test("Telegram app wires the durable outbox into final response delivery", async () => {
+test("alasio's services wire the durable outbox into final response delivery", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-composition-"));
   // Telegram refuses every connection, so what is queued stays queued.
   const apiRoot = process.env["TELEGRAM_API_ROOT"];
@@ -286,18 +285,15 @@ test("Telegram app wires the durable outbox into final response delivery", async
       defaultHarness: null,
     };
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const effects = yield* effectRunnerHere(yield* Layer.build(alasioServices(options)));
-      const app = new TelegramCodexApp({ ...options, effects });
-      assert.equal(app.store, effects.runSync(Store));
-      const { store } = app;
+      const store = yield* Store;
       store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
       const pendingResponseId = store.createPendingResponse("123", "9");
       store.appendBlockToPending(pendingResponseId, { type: "text", content: "Delivered durably.", phase: "final_answer" });
       store.markPendingResponseComplete(pendingResponseId);
-      yield* Effect.promise(() => app.turns.flushCompletedResponses());
+      yield* (yield* Turns).flushCompletedResponses;
       assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
       assert.equal(store.getPendingOutboxCount(), 1);
-    })));
+    }).pipe(Effect.provide(alasioServices(options)))));
   } finally {
     if (apiRoot === undefined) delete process.env["TELEGRAM_API_ROOT"];
     else process.env["TELEGRAM_API_ROOT"] = apiRoot;

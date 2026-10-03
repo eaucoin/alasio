@@ -121,7 +121,6 @@ export const makeCodexHarness = Effect.fnUntraced(function*({
     displayName: harnessDisplayName(CODEX_HARNESS),
     supportsGoals: true,
     supportsWarmup: true,
-    supportsSteer: true,
     sessions: createCodexSessionApi({
       listingScope,
       fork: ({ sessionId, beforeTurnId, threadKey }) => forkCodexSession({ sessionId, beforeTurnId, threadKey, ...scopeParams }),

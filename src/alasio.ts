@@ -9,34 +9,57 @@ import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turn-controller.ts";
+import type { AlasioConfig } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
+import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { Harnesses } from "./harness/index.ts";
+import type { KubeTemplates } from "./kube/config.ts";
 import { KubeClient } from "./kube/client.ts";
-import { HostBayma } from "./mcp/bayma.ts";
+import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
+import { Mounts } from "./operator/mounts.ts";
 import { Store } from "./persistence/store.ts";
 import { SessionSandboxes } from "./sandbox/index.ts";
 import { AlasioLoggerLayer } from "./shared/log.ts";
-import { type EffectRunner, effectRunnerHere } from "./shared/effects.ts";
 import { TracingLayer } from "./telemetry/index.ts";
 import { stopTelemetry } from "./telemetry/start.ts";
-import { TelegramCodexApp, type TelegramCodexAppConfig } from "./telegram/app.ts";
+import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
+import { Authorizer } from "./telegram/authorizer.ts";
 import { TelegramClient } from "./telegram/client.ts";
+import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
 import { WorkflowHooks } from "./workflow/hook-server.ts";
 
-/** The services alasio runs on, which its app's code not yet written in Effect reaches through an EffectRunner. */
-export type AlasioServices = Store | TelegramClient | Outbox | WorkflowHooks | CodexAppServer | ActiveTurns | Harnesses | Turns;
+/** What alasio is made with: its configuration, what main keeps in Neon, and what the deployment's templates offer. */
+export interface AlasioOptions extends AlasioConfig, TelegramAppConfig {
+  readonly kubeTemplates?: KubeTemplates | null | undefined;
+  /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
+  readonly folderBayma?: FolderBayma | undefined;
+  readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
+}
 
-/** What alasio is made with: the app's configuration, but for what alasio makes itself. */
-export type AlasioOptions = Omit<TelegramCodexAppConfig, "effects">;
+/** The services alasio's app runs on, which are always there. */
+export type AlasioServices =
+  | Store
+  | TelegramClient
+  | Outbox
+  | WorkflowHooks
+  | CodexAppServer
+  | ActiveTurns
+  | Harnesses
+  | Turns
+  | Mounts
+  | Authorizer
+  | MediaGroups;
 
 /**
  * alasio's services, made for `options`: each made after what it runs on, and stopped
- * before it. The turns are made last, so that stopping alasio interrupts the turns running
- * while the harnesses, Telegram and the store they report to are still there.
+ * before it. The turns are made after the harnesses, Telegram and the store they report
+ * to, so that stopping alasio interrupts the turns running while those are still there.
  */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices> {
-  return Turns.layer(options).pipe(
+  return MediaGroups.layer().pipe(
+    Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds))),
+    Layer.provideMerge(Turns.layer(options)),
     Layer.provideMerge(Harnesses.layer({
       sessionStore: options.sessionStore,
       codexRollouts: options.codexRollouts,
@@ -78,26 +101,16 @@ function codexServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<
     : CodexAppServer.layer;
 }
 
-/** What runs the effects of alasio's code not yet written in Effect, in alasio's services. */
-export type AlasioEffects = EffectRunner<AlasioServices>;
-
 /**
- * alasio serving Telegram, in the scope it is run in: its services made, its app started
- * on them, and both stopped, the app first, when the scope closes.
+ * alasio serving Telegram, in the scope it is run in: its services made, then its app
+ * started on them; when the scope closes, the app stops first, then each service in the
+ * reverse of the order it was made in.
  */
-export const serveAlasio = (options: AlasioOptions): Effect.Effect<void, never, Scope.Scope> =>
-  Effect.gen(function*() {
-    // Built in the scope alasio runs in, so they last as long as it does.
-    const effects = yield* effectRunnerHere(yield* Layer.build(alasioServices(options)));
-    yield* Effect.acquireRelease(
-      Effect.promise(async () => {
-        const app = new TelegramCodexApp({ ...options, effects });
-        await app.start();
-        return app;
-      }),
-      (app) => Effect.logInfo("Shutting down...").pipe(Effect.andThen(Effect.promise(() => app.stop()))),
-    );
-  });
+export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): Effect.fn.Return<void, TelegramAppError, Scope.Scope> {
+  yield* Layer.build(serveTelegram(options).pipe(Layer.provide(alasioServices(options))));
+  // Added last, so the first thing a stop does.
+  yield* Effect.addFinalizer(() => Effect.logInfo("Shutting down..."));
+});
 
 /**
  * Exits once the telemetry is flushed: 0 when alasio was stopped, 1 when what it runs

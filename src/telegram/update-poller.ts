@@ -1,5 +1,5 @@
 import type { Update } from "@grammyjs/types";
-import { Effect } from "effect";
+import { Cause, Effect } from "effect";
 
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -8,8 +8,14 @@ import { TelegramClient } from "./client.ts";
 /** How long polling waits after a failed poll before the next. */
 const POLL_BACKOFF = "3 seconds";
 
-/** What is done with each update, as the app's code not yet written in Effect does it. */
-export type ProcessUpdate = (update: Update) => Promise<void>;
+/** What is done with each update; however it fails, the update is skipped. */
+export type ProcessUpdate = (update: Update) => Effect.Effect<void, unknown>;
+
+/** What an update's processing failed with, as the log says it: its stack, where it has one. */
+function describeFailure(cause: Cause.Cause<unknown>): string {
+  const error = Cause.squash(cause);
+  return error instanceof Error ? error.stack ?? error.message : String(error);
+}
 
 /**
  * Long-polls Telegram for updates and hands each to `processUpdate` in turn, until it is
@@ -23,11 +29,10 @@ export const pollUpdates = Effect.fnUntraced(
     const store = yield* Store;
 
     const handle = (update: Update): Effect.Effect<void> =>
-      Effect.tryPromise(() => processUpdate(update)).pipe(
+      processUpdate(update).pipe(
         // The raw update is already persisted before processing, so skipping it loses
         // nothing durable; re-fetching it forever would wedge the bot.
-        Effect.catch(({ cause }) =>
-          Effect.logError(`Skipping update ${update.update_id} after processing failure: ${cause instanceof Error ? cause.stack ?? cause.message : String(cause)}`)),
+        Effect.catchCause((cause) => Effect.logError(`Skipping update ${update.update_id} after processing failure: ${describeFailure(cause)}`)),
         Effect.andThen(Effect.sync(() => store.setTelegramOffset(update.update_id + 1))),
         Effect.uninterruptible,
       );

@@ -18,7 +18,6 @@ import type {
 } from "@grammyjs/types";
 import { Clock, Config, Context, Effect, Layer, Schema, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
-import type { EffectRunner } from "../shared/effects.ts";
 import { withRpcCall } from "../telemetry/index.ts";
 import { renderTelegramHtml } from "./markdown.ts";
 import { splitRichMarkdown, toRichMarkdown } from "./rich-markdown.ts";
@@ -482,35 +481,3 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
       }, { traced: false, rateLimitRetries: 0 }),
   });
 });
-
-/**
- * TelegramClient as promises, for alasio's code not yet written in Effect, which reaches
- * it through alasio's EffectRunner (src/alasio.ts). It goes when its last caller moves.
- */
-export interface Client {
-  readonly getMe: () => Promise<BotResult<"getMe">>;
-  readonly deleteWebhook: (dropPendingUpdates?: boolean) => Promise<BotResult<"deleteWebhook">>;
-  readonly setMyCommands: (commands: readonly BotCommand[]) => Promise<BotResult<"setMyCommands">>;
-  readonly setChatMenuButton: (menuButton?: MenuButton) => Promise<BotResult<"setChatMenuButton">>;
-  readonly sendMessage: (chatId: ChatId, text: string, options?: SendMessageOptions) => Promise<readonly Message[]>;
-  readonly editMessageText: (chatId: ChatId, messageId: number, text: string, options?: TextMessageOptions) => Promise<BotResult<"editMessageText">>;
-  readonly deleteMessage: (chatId: ChatId, messageId: number) => Promise<BotResult<"deleteMessage">>;
-  readonly answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<BotResult<"answerCallbackQuery"> | null>;
-  readonly downloadTelegramFile: (file: Pick<File, "file_id">, preferredName?: string) => Promise<DownloadedFile>;
-}
-
-/** The promise façade of the TelegramClient `effects` runs in. */
-export function telegramClientFacade(effects: EffectRunner<TelegramClient>): Client {
-  const client = effects.runSync(TelegramClient);
-  return {
-    getMe: () => effects.runPromise(client.getMe),
-    deleteWebhook: (dropPendingUpdates) => effects.runPromise(client.deleteWebhook(dropPendingUpdates)),
-    setMyCommands: (commands) => effects.runPromise(client.setMyCommands(commands)),
-    setChatMenuButton: (menuButton) => effects.runPromise(client.setChatMenuButton(menuButton)),
-    sendMessage: (chatId, text, options) => effects.runPromise(client.sendMessage(chatId, text, options)),
-    editMessageText: (chatId, messageId, text, options) => effects.runPromise(client.editMessageText(chatId, messageId, text, options)),
-    deleteMessage: (chatId, messageId) => effects.runPromise(client.deleteMessage(chatId, messageId)),
-    answerCallbackQuery: (callbackQueryId, text) => effects.runPromise(client.answerCallbackQuery(callbackQueryId, text)),
-    downloadTelegramFile: (file, preferredName) => effects.runPromise(client.downloadTelegramFile(file, preferredName)),
-  };
-}

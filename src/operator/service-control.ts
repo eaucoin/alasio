@@ -1,5 +1,8 @@
-import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
-import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import type { InlineKeyboardButton } from "@grammyjs/types";
+import { Effect } from "effect";
+
+import type { ConversationChat } from "../codex/turn-controller.ts";
+import { ActiveTurns } from "../harness/active-turns.ts";
 import {
   CLAUDE_HARNESS,
   CODEX_HARNESS,
@@ -8,31 +11,24 @@ import {
   harnessDisplayName,
   normalizeHarnessName,
   resolveHarnessName,
+  resolveWorkingDirectory,
 } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
-import type { SqliteStore } from "../persistence/store.ts";
-import type { ChatId, Client } from "../telegram/client.ts";
-import type { ControlCallback, ControlPanel, ControlPanelOptions } from "./session-control.ts";
+import { type SqliteStore, Store } from "../persistence/store.ts";
+import { TelegramClient, type TelegramError } from "../telegram/client.ts";
+import { type HarnessSwitch, Mounts } from "./mounts.ts";
+import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
-
-/** The outcome of mounting a service on a conversation. */
-export interface HarnessSwitch {
-  /** Whether the service changed; false when it was already the active one. */
-  readonly switched: boolean;
-  readonly previous: HarnessName | null;
-  readonly next: HarnessName;
-  readonly sessionId: string | null;
-  readonly workingDirectory?: string | null | undefined;
-}
-
-/** Mounts `harness` on the conversation, or throws why it cannot be switched now. */
-export type SwitchHarness = (request: { readonly conversationId: string; readonly harness: HarnessName }) => Promise<HarnessSwitch>;
+import { sendChooseWorkspacePanel } from "./workspace-control.ts";
 
 /** The store's mounts, sessions, and callback actions, as the service panel reads them. */
 export type ServiceControlStore = MountStore
   & Pick<SqliteStore, "createCallbackAction">
   & Partial<Pick<SqliteStore, "getHarnessSessionId">>;
+
+/** What the service controls run on. */
+export type ServiceControlServices = Store | TelegramClient | ActiveTurns | Mounts;
 
 const SERVICE_KIND_PREFIX = "service:";
 
@@ -67,13 +63,6 @@ function createButton(
   };
 }
 
-function buildPanelOptions(replyMarkup: InlineKeyboardMarkup): ControlPanelOptions {
-  return {
-    format: "plain",
-    reply_markup: replyMarkup,
-  };
-}
-
 function mountedLine(store: ServiceControlStore, conversationId: string, harness: HarnessName): string {
   const sessionId = store.getHarnessSessionId?.(conversationId, harness) ?? null;
   return `${harnessDisplayName(harness)}: ${sessionId ? `session ${shortSessionId(sessionId)}` : "no mounted session"}`;
@@ -81,14 +70,14 @@ function mountedLine(store: ServiceControlStore, conversationId: string, harness
 
 export interface ServicePanelRequest {
   readonly store: ServiceControlStore;
-  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly conversationId: string;
+  /** Whether a turn runs in the conversation. */
+  readonly working: boolean;
   readonly notice?: string | undefined;
 }
 
-export function buildServicePanel({ store, activeTurns, conversationId, notice = "" }: ServicePanelRequest): ControlPanel {
+export function buildServicePanel({ store, conversationId, working, notice = "" }: ServicePanelRequest): ControlPanel {
   const active = resolveHarnessName(store, conversationId);
-  const working = activeTurns?.isBusy(conversationId) ?? false;
   const lines = [
     "Service",
     "",
@@ -115,26 +104,22 @@ export function buildServicePanel({ store, activeTurns, conversationId, notice =
   keyboard.push([createButton(store, conversationId, "Close", "close")]);
   return {
     text: lines.join("\n"),
-    options: buildPanelOptions({ inline_keyboard: keyboard }),
+    options: panelOptions({ inline_keyboard: keyboard }),
   };
 }
 
-export interface SendServicePanelRequest {
-  readonly client: Pick<Client, "sendMessage">;
-  readonly store: ServiceControlStore;
-  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
-  readonly conversationId: string;
-  readonly chatId: ChatId;
-}
+/** The conversation's service panel as it stands, with `notice` under it. */
+const servicePanel = Effect.fnUntraced(function*(conversationId: string, notice?: string): Effect.fn.Return<ControlPanel, never, Store | ActiveTurns> {
+  const working = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
+  return buildServicePanel({ store: yield* Store, conversationId, working, notice });
+});
 
 /**
  * Reply used whenever a prompt or control arrives before any service is mounted.
  * It is the only thing alasio says in that state.
  */
-export async function sendChooseServicePanel({ client, store, activeTurns, conversationId, chatId }: SendServicePanelRequest): Promise<void> {
-  const panel = buildServicePanel({ store, activeTurns, conversationId, notice: CHOOSE_SERVICE_NOTICE });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
+export const sendChooseServicePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError, Store | TelegramClient | ActiveTurns> =>
+  Effect.flatMap(servicePanel(conversationId, CHOOSE_SERVICE_NOTICE), (panel) => sendPanel(chatId, panel));
 
 function describeSwitch(result: HarnessSwitch, harness: HarnessName): string {
   if (!result.switched) {
@@ -155,108 +140,72 @@ export function resolveServiceTarget(target: unknown): HarnessName | null {
   return null;
 }
 
-export interface ServiceTextCommand extends SendServicePanelRequest {
+/** Mounts `harness`: what to tell the operator, and whether it was newly mounted. */
+const switchTo = (conversationId: string, harness: HarnessName): Effect.Effect<{ readonly notice: string; readonly mounted: boolean }, never, Mounts> =>
+  Effect.flatMap(Mounts, (mounts) => mounts.switchHarness(conversationId, harness)).pipe(
+    Effect.match({
+      onFailure: (refusal) => ({ notice: refusal.message, mounted: false }),
+      onSuccess: (result) => ({ notice: describeSwitch(result, harness), mounted: result.switched }),
+    }),
+  );
+
+/** Service first, then folder: once a service is newly mounted, the folder picker follows when no folder is. */
+const chainIntoFolderPicker = Effect.fnUntraced(function*(conversation: ConversationChat): Effect.fn.Return<void, TelegramError, ServiceControlServices> {
+  if (!resolveWorkingDirectory(yield* Store, conversation.conversationId)) {
+    yield* sendChooseWorkspacePanel(conversation);
+  }
+});
+
+export interface ServiceTextCommand extends ConversationChat {
   /** The service named after /service; empty for the panel alone. */
   readonly target: string;
-  readonly switchHarness: SwitchHarness;
-  /** Called once a service has been newly mounted. */
-  readonly onMounted?: (() => Promise<void>) | null | undefined;
 }
 
-export async function handleServiceTextCommand({ client, store, activeTurns, conversationId, chatId, target, switchHarness, onMounted = null }: ServiceTextCommand): Promise<void> {
-  if (target) {
-    const harness = resolveServiceTarget(target);
-    if (!harness) {
-      await client.sendMessage(chatId, `Unknown service "${target}". Use /service codex or /service claude.`);
-      return;
-    }
-    let notice;
-    let mounted = false;
-    try {
-      const result = await switchHarness({ conversationId, harness });
-      notice = describeSwitch(result, harness);
-      mounted = result.switched;
-    } catch (error) {
-      notice = error instanceof Error ? error.message : String(error);
-    }
-    const panel = buildServicePanel({ store, activeTurns, conversationId, notice });
-    await client.sendMessage(chatId, panel.text, panel.options);
-    if (mounted && onMounted) {
-      await onMounted();
-    }
+export const handleServiceTextCommand = Effect.fnUntraced(function*({ conversationId, chatId, target }: ServiceTextCommand): Effect.fn.Return<
+  void,
+  TelegramError,
+  ServiceControlServices
+> {
+  if (!target) {
+    return yield* sendPanel(chatId, yield* servicePanel(conversationId));
+  }
+  const harness = resolveServiceTarget(target);
+  if (!harness) {
+    yield* Effect.flatMap(TelegramClient, (client) => client.sendMessage(chatId, `Unknown service "${target}". Use /service codex or /service claude.`));
     return;
   }
-  const panel = buildServicePanel({ store, activeTurns, conversationId });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
-
-async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
-  try {
-    await client.editMessageText(chatId, messageId, panel.text, panel.options);
-  } catch (error) {
-    if (!String(error).includes("message is not modified")) {
-      throw error;
-    }
+  const { notice, mounted } = yield* switchTo(conversationId, harness);
+  yield* sendPanel(chatId, yield* servicePanel(conversationId, notice));
+  if (mounted) {
+    yield* chainIntoFolderPicker({ conversationId, chatId });
   }
-}
+});
 
-export interface ServiceControlCallback extends ControlCallback {
-  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage">;
-  readonly store: ServiceControlStore;
-  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
-  readonly switchHarness: SwitchHarness;
-  /** Called once a service has been newly mounted. */
-  readonly onMounted?: (() => Promise<void>) | null | undefined;
-}
-
-export async function handleServiceControlCallback({
-  client,
-  store,
-  activeTurns,
-  action,
-  switchHarness,
-  callbackQueryId,
-  chatId,
-  messageId,
-  onMounted = null,
-}: ServiceControlCallback): Promise<void> {
+export const handleServiceControlCallback = Effect.fnUntraced(function*({ action, callbackQueryId, chatId, messageId }: ControlCallback): Effect.fn.Return<
+  void,
+  TelegramError,
+  ServiceControlServices
+> {
+  const client = yield* TelegramClient;
+  const { conversationId } = action;
   const kind = action.kind.slice(SERVICE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   if (kind === "close") {
-    await client.answerCallbackQuery(callbackQueryId, "Closed.");
-    try {
-      await client.deleteMessage(chatId, messageId);
-    } catch {
-      await client.editMessageText(chatId, messageId, "Closed.", { format: "plain" });
-    }
-    return;
+    return yield* closePanel({ callbackQueryId, chatId, messageId });
   }
   if (kind === "use") {
     const harness = resolveServiceTarget(payload["harness"]);
     if (!harness) {
-      await client.answerCallbackQuery(callbackQueryId, "Unknown service.");
+      yield* client.answerCallbackQuery(callbackQueryId, "Unknown service.");
       return;
     }
-    let notice;
-    let mounted = false;
-    try {
-      const result = await switchHarness({ conversationId: action.conversationId, harness });
-      notice = describeSwitch(result, harness);
-      mounted = result.switched;
-    } catch (error) {
-      notice = error instanceof Error ? error.message : String(error);
-    }
-    await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
-    await editPanel(client, chatId, messageId, buildServicePanel({
-      store,
-      activeTurns,
-      conversationId: action.conversationId,
-      notice,
-    }));
-    if (mounted && onMounted) {
-      await onMounted();
+    const { notice, mounted } = yield* switchTo(conversationId, harness);
+    yield* client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
+    yield* editPanel(chatId, messageId, yield* servicePanel(conversationId, notice));
+    if (mounted) {
+      yield* chainIntoFolderPicker({ conversationId, chatId });
     }
     return;
   }
-  await client.answerCallbackQuery(callbackQueryId, "Unknown action.");
-}
+  yield* client.answerCallbackQuery(callbackQueryId, "Unknown action.");
+});

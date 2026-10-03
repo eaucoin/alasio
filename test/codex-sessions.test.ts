@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
 
-import { Context, Effect, Exit, Logger, Scope, Stream } from "effect";
+import { Effect, Exit, Logger, Scope, Stream } from "effect";
 import pg from "pg";
 
 import { type AppServer, makeAppServer } from "../src/codex/app-server/client.ts";
@@ -24,8 +24,6 @@ import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
-import { harnessSessionsFacade } from "../src/harness/index.ts";
-import { effectRunner } from "../src/shared/effects.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
 import { type TestPostgres, dockerAvailable, startPostgres } from "./support/postgres.ts";
@@ -48,8 +46,8 @@ interface ResponsesStandIn {
   close(): Promise<void>;
 }
 
-/** What runs the session panels' effects, their log lines dropped. */
-const effects = effectRunner(Context.make(Logger.CurrentLoggers, new Set()));
+/** Runs the session panels' effects, their log lines dropped. */
+const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(effect.pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
 
 /** No config beyond what alasio itself sets on a thread. */
 const NO_CONFIG: CodexThreadConfig = { developer_instructions: "", mcp_servers: {} };
@@ -130,22 +128,22 @@ test("sessions are labelled by name, else first prompt; turns without a prompt a
         ? Effect.fail(new AppServerRequestFailed({ error: { message: "thread not found" } }))
         : Effect.succeed([turn("t3", null, "continued on its own"), turn("t2", "second", null), turn("t1", "first", "answered")]),
   };
-  const sessions = harnessSessionsFacade(createCodexSessionApi({
+  const sessions = createCodexSessionApi({
     listingScope: Effect.succeed({ cwd: "/work", codexEnv: {}, appServer }),
     fork: () => Effect.sync(() => assert.fail("nothing is forked")),
-  }), effects);
-  assert.deepEqual(await sessions.listSessions(1), [
+  });
+  assert.deepEqual(await run(sessions.listSessions(1)), [
     { uuid: "named", timestamp: "2026-09-21", label: "Named thread" },
     { uuid: "prompted", timestamp: "-", label: "a first prompt that is well over fort..." },
     { uuid: "empty-thread-id", timestamp: "2026-09-21", label: "empty-thread-id" },
   ]);
   assert.deepEqual(
-    (await sessions.listSessionMessages("thread")).map(({ index, text, uuid }) => ({ index, text, uuid })),
+    (await run(sessions.listSessionMessages("thread"))).map(({ index, text, uuid }) => ({ index, text, uuid })),
     [{ index: -1, text: "second", uuid: "t2" }, { index: -2, text: "first", uuid: "t1" }],
   );
-  assert.equal(await sessions.getSessionLastMessage("thread"), "continued on its own");
-  assert.deepEqual(await sessions.listSessionMessages("gone"), []);
-  assert.equal(await sessions.getSessionLastMessage("gone"), null);
+  assert.equal(await run(sessions.getSessionLastMessage("thread")), "continued on its own");
+  assert.deepEqual(await run(sessions.listSessionMessages("gone")), []);
+  assert.equal(await run(sessions.getSessionLastMessage("gone")), null);
 });
 
 describe("Codex sessions through the app-server", { skip }, () => {
@@ -179,7 +177,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
 
   /** One turn on a thread of conversation-1, the conversation every thread here is for, run to its end. */
   async function runTurn(client: AppServer, threadId: string, prompt: string, cwd: string): Promise<void> {
-    await effects.runPromise(Effect.gen(function*() {
+    await run(Effect.gen(function*() {
       const turnId = yield* client.startTurn({ threadId, threadKey: "conversation-1", prompt, cwd, env: buildCodexEnv(), config: NO_CONFIG });
       yield* Stream.runForEach(client.eventsForTurn(threadId, turnId), (event) =>
         event.type === "turn.failed" ? Effect.sync(() => assert.fail(event.error.message)) : Effect.void);
@@ -193,15 +191,15 @@ describe("Codex sessions through the app-server", { skip }, () => {
     const home = makeCodexHome(root, "codex-home", responses.url);
     process.env["CODEX_HOME"] = home;
     running = Effect.runSync(Scope.make());
-    const client = await effects.runPromise(makeAppServer().pipe(Scope.provide(running)));
+    const client = await run(makeAppServer().pipe(Scope.provide(running)));
     const forks: string[] = [];
-    const sessions = harnessSessionsFacade(createCodexSessionApi({
+    const sessions = createCodexSessionApi({
       listingScope: Effect.sync(() => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), appServer: client })),
       fork: ({ sessionId, beforeTurnId, threadKey }) => {
         forks.push(threadKey);
         return client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
       },
-    }), effects);
+    });
 
     // Mirrored from the start, as alasio does.
     const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });
@@ -218,7 +216,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
       return files.length > 0;
     };
 
-    const threadId = await effects.runPromise(client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
+    const threadId = await run(client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
     for (const prompt of ["remember the heron", "and now the crane"]) {
       await runTurn(client, threadId, prompt, workingDirectory);
       // What Codex wrote by the turn's end is all in the store once a flush returns.
@@ -226,29 +224,29 @@ describe("Codex sessions through the app-server", { skip }, () => {
       assert.ok(await heldExactly(threadId));
     }
 
-    assert.equal(await sessions.getTotalSessionPages(), 1);
-    const [listed] = await sessions.listSessions(1);
+    assert.equal(await run(sessions.getTotalSessionPages()), 1);
+    const [listed] = await run(sessions.listSessions(1));
     assert.ok(listed);
     assert.equal(listed.uuid, threadId);
     assert.equal(listed.label, "remember the heron");
     assert.match(listed.timestamp, /^\d{4}-\d{2}-\d{2}$/);
-    assert.equal(await sessions.getSessionByNumber(1), threadId);
-    assert.equal(await sessions.getSessionByNumber(2), null);
-    assert.equal(await sessions.getSessionLastMessage(threadId), "answer 2");
-    const messages = await sessions.listSessionMessages(threadId);
+    assert.equal(await run(sessions.getSessionByNumber(1)), threadId);
+    assert.equal(await run(sessions.getSessionByNumber(2)), null);
+    assert.equal(await run(sessions.getSessionLastMessage(threadId)), "answer 2");
+    const messages = await run(sessions.listSessionMessages(threadId));
     assert.deepEqual(messages.map(({ index, text }) => ({ index, text })), [
       { index: -1, text: "and now the crane" },
       { index: -2, text: "remember the heron" },
     ]);
-    assert.equal(await sessions.getTotalRewindPages(threadId), 1);
+    assert.equal(await run(sessions.getTotalRewindPages(threadId)), 1);
 
     // Rewind to before the second message: a new thread with the first turn's history only.
     const [latest] = messages;
     assert.ok(latest);
-    const forkedId = await sessions.createForkedSession(threadId, latest.uuid, { threadKey: "conversation-1" });
+    const forkedId = await run(sessions.createForkedSession(threadId, latest.uuid, { threadKey: "conversation-1" }));
     assert.ok(forkedId && forkedId !== threadId);
     assert.deepEqual(forks, ["conversation-1"]);
-    assert.equal(await sessions.createForkedSession(threadId, "no-such-turn", { threadKey: "conversation-1" }), null);
+    assert.equal(await run(sessions.createForkedSession(threadId, "no-such-turn", { threadKey: "conversation-1" })), null);
 
     // The fork is mirrored too, unasked: the watcher reports its file.
     const deadline = Date.now() + 3_000;
@@ -260,7 +258,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
     await Effect.runPromise(Scope.close(scope, Exit.void));
 
     // Lose everything: the files, and every index Codex made from them.
-    await effects.runPromise(client.stop);
+    await run(client.stop);
     const newHome = makeCodexHome(root, "new-codex-home", responses.url);
     process.env["CODEX_HOME"] = newHome;
     const written = await Effect.runPromise(restoreRollouts({ store, threadIds: [forkedId], home: newHome }));
@@ -274,17 +272,17 @@ describe("Codex sessions through the app-server", { skip }, () => {
     // Codex resumes the fork again, and its next turn carries the first
     // turn's history and not the rewound one. The client starts a new
     // app-server, on the new Codex home, as it does after any stop.
-    await effects.runPromise(client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
+    await run(client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
     await runTurn(client, forkedId, "which bird?", workingDirectory);
     const lastRequest = responses.requests.at(-1) ?? "";
     assert.match(lastRequest, /remember the heron/);
     assert.match(lastRequest, /answer 1/);
     assert.match(lastRequest, /which bird\?/);
     assert.doesNotMatch(lastRequest, /and now the crane/);
-    assert.equal(await sessions.getSessionLastMessage(forkedId), `answer ${responses.requests.length}`);
+    assert.equal(await run(sessions.getSessionLastMessage(forkedId)), `answer ${responses.requests.length}`);
     // Codex lists a thread once it holds a prompt of its own: both, now.
     assert.deepEqual(
-      (await sessions.listSessions(1)).map(({ uuid }) => uuid).sort(),
+      (await run(sessions.listSessions(1))).map(({ uuid }) => uuid).sort(),
       [threadId, forkedId].sort(),
     );
   });

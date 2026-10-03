@@ -1,100 +1,112 @@
 /**
- * alasio's turns for a unit test: the Turns service, and the turn controller's façade over
- * it, on the test's store, a Telegram client the test records, and harnesses it stands
- * in, with ActiveTurns and the Harnesses of their own; built for one test and taken
- * down after it.
+ * alasio's services for a unit test: the turns and the operator's side, as alasio makes
+ * them (src/alasio.ts), on the test's store, a Telegram client the test records, and
+ * harnesses it stands in, with alasio's tracing; built for one test and taken down after
+ * it.
  */
-import { Effect, Exit, Layer, Scope } from "effect";
+import { Effect, Layer, ManagedRuntime } from "effect";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
-import { TurnController, type TurnControllerConfig, Turns } from "../../src/codex/turn-controller.ts";
+import { Turns } from "../../src/codex/turn-controller.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
+import { Mounts } from "../../src/operator/mounts.ts";
 import { type SqliteStore, Store } from "../../src/persistence/store.ts";
-import { type EffectRunner, effectRunnerHere } from "../../src/shared/effects.ts";
-import { type Client, TelegramClient, TelegramTransportError } from "../../src/telegram/client.ts";
+import type { AlasioServices } from "../../src/alasio.ts";
+import { SessionSandboxes } from "../../src/sandbox/index.ts";
+import { Authorizer } from "../../src/telegram/authorizer.ts";
+import type { TelegramClient } from "../../src/telegram/client.ts";
+import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
 import { WorkflowHooks } from "../../src/workflow/hook-server.ts";
-
-/** The Telegram calls turns make, as a test records them. */
-export type TurnsClient = Pick<Client, "sendMessage" | "editMessageText">;
-
-/** A TelegramClient making `client`'s calls; any other call fails the test as Telegram would refuse it. */
-export function telegramClientOf(client: TurnsClient): TelegramClient["Service"] {
-  const unused = (method: string) => Effect.fail(TelegramTransportError.of(method, new Error(`the test's Telegram client makes no ${method} call`)));
-  const call = <A>(method: string, promise: () => Promise<A>) =>
-    Effect.tryPromise({ try: promise, catch: (cause) => TelegramTransportError.of(method, cause) });
-  return TelegramClient.of({
-    call: (method) => unused(method),
-    callMultipart: (method) => unused(method),
-    getMe: unused("getMe"),
-    deleteWebhook: () => unused("deleteWebhook"),
-    setMyCommands: () => unused("setMyCommands"),
-    setChatMenuButton: () => unused("setChatMenuButton"),
-    getUpdates: () => unused("getUpdates"),
-    sendMessage: (chatId, text, options) => call("sendMessage", () => client.sendMessage(chatId, text, options)),
-    editMessageText: (chatId, messageId, text, options) => call("editMessageText", () => client.editMessageText(chatId, messageId, text, options)),
-    deleteMessage: () => unused("deleteMessage"),
-    answerCallbackQuery: () => unused("answerCallbackQuery"),
-    getFile: () => unused("getFile"),
-    downloadTelegramFile: () => unused("downloadTelegramFile"),
-    sendDocument: () => unused("sendDocument"),
-  });
-}
+import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
 export const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({ enqueueText: () => Effect.succeed("outbox-1"), deliverDue: Effect.void }));
 
-/** What turnsFor is given: the store, the Telegram client, the harnesses standing in, and what else a test changes. */
-export interface TurnsOptions {
+/** No workflow hook server: no workflow waits are reported. */
+export const noWorkflowHooks: Layer.Layer<WorkflowHooks> = Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map() }));
+
+/** Turns standing in for alasio's, each of its effects dying unless `turns` gives it, as a test expects none of the rest. */
+export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
+  const unused = (name: string) => Effect.die(new Error(`the test's turns run no ${name}`));
+  return Turns.of({
+    submit: () => unused("submit"),
+    enqueueMessage: () => unused("enqueueMessage"),
+    schedule: () => unused("schedule"),
+    setPromptDisposition: () => unused("setPromptDisposition"),
+    run: () => unused("run"),
+    runGoalTurn: () => unused("runGoalTurn"),
+    startNewSession: () => unused("startNewSession"),
+    reconcilePersistentState: unused("reconcilePersistentState"),
+    flushCompletedResponses: unused("flushCompletedResponses"),
+    recoverInterruptedTurns: unused("recoverInterruptedTurns"),
+    resumePendingPrompts: unused("resumePendingPrompts"),
+    ...turns,
+  });
+}
+
+/** What the test's services are made with: the store, and what the test stands in or changes. */
+export interface TestServicesOptions {
   readonly store: SqliteStore;
-  readonly client: TurnsClient;
-  readonly harnesses: Partial<Record<HarnessName, Harness>>;
-  readonly config?: Partial<TurnControllerConfig> | undefined;
+  /** The Telegram client: one recording every call unless given. */
+  readonly telegram?: Layer.Layer<TelegramClient> | undefined;
+  /** Stand-ins for a harness in every folder. */
+  readonly harnesses?: Partial<Record<HarnessName, Harness>> | undefined;
+  /** Stands in for alasio's turns. */
+  readonly turns?: Turns["Service"] | undefined;
+  readonly workspaceRoot?: string | undefined;
+  /** Where a reply's media are copied; replies go as text only without it. */
+  readonly stateDir?: string | undefined;
+  readonly allowedUserIds?: string | undefined;
   /** The outbox replies are queued to: unusedOutbox unless given. */
   readonly outbox?: Layer.Layer<Outbox> | undefined;
+  /** Session filesystems, where a test offers them. */
+  readonly sandbox?: SessionSandboxes["Service"] | undefined;
 }
 
-/** The services the turn controller runs on in a test. */
-export type TestTurnServices = Turns | ActiveTurns | Harnesses | Store | Outbox;
-
-/** Turns, their façade, and the EffectRunner of their services, until `close`. */
-export interface TestTurns {
-  readonly turns: TurnController;
-  readonly effects: EffectRunner<TestTurnServices>;
-  readonly close: () => Promise<void>;
-}
-
-/**
- * alasio's turns over `options`, as alasio makes them (src/alasio.ts) but for what the test
- * stands in, with alasio's tracing.
- */
-export async function turnsFor({ store, client, harnesses, config = {}, outbox = unusedOutbox }: TurnsOptions): Promise<TestTurns> {
-  const scope = Effect.runSync(Scope.make());
-  const layer = Turns.layer(config).pipe(
+/** alasio's services over `options`, as src/alasio.ts makes them but for what the test stands in. */
+export function testServices({
+  store,
+  telegram = recordingTelegram().layer,
+  harnesses = {},
+  turns,
+  workspaceRoot = "/nonexistent-workspace-root",
+  stateDir,
+  allowedUserIds = "",
+  outbox = unusedOutbox,
+  sandbox,
+}: TestServicesOptions): Layer.Layer<AlasioServices> {
+  return MediaGroups.layer().pipe(
+    Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot }), Authorizer.layer(allowedUserIds))),
+    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer(stateDir === undefined ? {} : { stateDir })),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
       outbox,
-      Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map(), wakeEvents: new Map() })),
+      noWorkflowHooks,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
       CodexAppServer.layer,
+      sandbox ? Layer.succeed(SessionSandboxes, sandbox) : Layer.empty,
     )),
-    Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(TelegramClient, telegramClientOf(client)))),
+    Layer.provideMerge(Layer.mergeAll(Layer.succeed(Store, store), telegram)),
   );
-  const effects = await Effect.runPromise(Layer.buildWithScope(layer, scope).pipe(Effect.flatMap(effectRunnerHere), Effect.provide(TracingLayer)));
-  const turns = new TurnController({ config: { workspaceRoot: "/nonexistent-workspace-root", ...config }, client, store, effects });
-  return { turns, effects, close: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
 }
 
-/** Runs `use` on turnsFor(`options`), and takes them down after, however it ends. */
-export async function withTurns<T>(options: TurnsOptions, use: (turns: TestTurns) => T | Promise<T>): Promise<T> {
-  const made = await turnsFor(options);
+/** alasio's services for one test, which runs its effects in them. */
+export type TestAlasio = ManagedRuntime.ManagedRuntime<AlasioServices | Layer.Success<typeof TracingLayer>, never>;
+
+/**
+ * Runs `use` on alasio's services over `options`, and takes them down after, however it
+ * ends. They are made with alasio's tracing, as their background work runs with it too.
+ */
+export async function withServices<T>(options: TestServicesOptions, use: (alasio: TestAlasio) => T | Promise<T>): Promise<T> {
+  const alasio = ManagedRuntime.make(testServices(options).pipe(Layer.provideMerge(TracingLayer)));
   try {
-    return await use(made);
+    return await use(alasio);
   } finally {
-    await made.close();
+    await alasio.dispose();
   }
 }

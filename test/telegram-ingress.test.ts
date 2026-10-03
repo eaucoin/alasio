@@ -4,57 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import type { File, Message } from "@grammyjs/types";
+import type { Message } from "@grammyjs/types";
 import { Array as Arr, Effect, Fiber, Layer, Logger } from "effect";
 
 import { SqliteStore, Store } from "../src/persistence/store.ts";
-import type { Client, DownloadedFile } from "../src/telegram/client.ts";
-import { type IncomingPrompt, MessageHandler, type MessageHandlerOptions, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
+import { TelegramTransportError } from "../src/telegram/client.ts";
+import { handleMessage, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
 import { pollUpdates } from "../src/telegram/update-poller.ts";
 import { botApiLayer, paramsOf } from "./support/bot-api.ts";
+import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
+import { withServices } from "./support/turns.ts";
 
 const CHAT = { id: 5, type: "private", first_name: "Operator" } as const;
 const OPERATOR = { id: 5, is_bot: false, first_name: "Operator" };
-
-interface FakeClientOptions {
-  readonly downloadError?: Error | null;
-}
-
-function createClient({ downloadError = null }: FakeClientOptions = {}) {
-  const calls: { sendMessage: Parameters<Client["sendMessage"]>[]; downloads: string[] } = { sendMessage: [], downloads: [] };
-  return {
-    calls,
-    async sendMessage(...args: Parameters<Client["sendMessage"]>): Promise<Message[]> {
-      calls.sendMessage.push(args);
-      return [{ message_id: 1, date: 0, chat: CHAT }];
-    },
-    async downloadTelegramFile(file: Pick<File, "file_id">): Promise<DownloadedFile> {
-      calls.downloads.push(file.file_id);
-      if (downloadError) {
-        throw downloadError;
-      }
-      return { localPath: `/tmp/${file.file_id}`, sha256: "abc", remote: { file_id: file.file_id, file_unique_id: file.file_id } };
-    },
-  };
-}
-
-function createHandler(store: SqliteStore, client: MessageHandlerOptions["client"], prompts: IncomingPrompt[]) {
-  return new MessageHandler({
-    authorizer: { isAuthorizedMessage: () => true },
-    client,
-    store,
-    turns: {
-      async processPrompt(args) {
-        prompts.push(args);
-      },
-      async sendNextSetupStep() {
-        return false;
-      },
-    },
-    mediaGroups: { buffer() {} },
-    log: { warn() {}, error() {} },
-  });
-}
 
 async function withStore(run: (store: SqliteStore) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), "alasio-ingress-"));
@@ -67,12 +29,16 @@ async function withStore(run: (store: SqliteStore) => Promise<void>) {
   }
 }
 
+/** Handles `message` from the operator, as update `updateId`, on `store` and `telegram`: the prompt it carries. */
+function handleOperatorMessage(store: SqliteStore, telegram: RecordingTelegram, message: Message, updateId: number) {
+  return withServices({ store, telegram: telegram.layer, allowedUserIds: String(OPERATOR.id) }, (alasio) =>
+    alasio.runPromise(handleMessage(message, updateId)));
+}
+
 test("oversized documents are reported instead of failing the update", async () => {
   await withStore(async (store) => {
-    const prompts: IncomingPrompt[] = [];
-    const client = createClient();
-    const handler = createHandler(store, client, prompts);
-    await handler.handle({
+    const telegram = recordingTelegram();
+    const prompt = await handleOperatorMessage(store, telegram, {
       message_id: 10,
       date: 0,
       chat: CHAT,
@@ -80,30 +46,29 @@ test("oversized documents are reported instead of failing the update", async () 
       caption: "look at this",
       document: { file_id: "big", file_unique_id: "big", file_name: "video.mov", file_size: TELEGRAM_BOT_FILE_LIMIT_BYTES + 1 },
     }, 1);
-    assert.deepEqual(client.calls.downloads, []);
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "", /Could not fetch video\.mov \(20\.0 MB\): Telegram only lets bots download files up to 20 MB/);
+    assert.deepEqual(telegram.calls.downloadTelegramFile, []);
+    assert.match(telegram.calls.sendMessage[0]?.[1] ?? "", /Could not fetch video\.mov \(20\.0 MB\): Telegram only lets bots download files up to 20 MB/);
     // The caption still reaches the harness without the file.
-    assert.equal(prompts.length, 1);
-    assert.deepEqual(prompts[0]?.filePaths, []);
-    assert.equal(prompts[0]?.text, "look at this");
+    assert.deepEqual(prompt, { conversationId: "telegram:5", chatId: 5, messageId: 10, text: "look at this", filePaths: [] });
   });
 });
 
 test("Bot API download refusals are reported and a file-only message ends there", async () => {
   await withStore(async (store) => {
-    const prompts: IncomingPrompt[] = [];
-    const client = createClient({ downloadError: new Error('Telegram getFile failed: HTTP 400 {"description":"Bad Request: file is too big"}') });
-    const handler = createHandler(store, client, prompts);
-    await handler.handle({
+    const telegram = recordingTelegram({
+      downloadTelegramFile: () =>
+        Effect.fail(TelegramTransportError.of("getFile", new Error('Telegram getFile failed: HTTP 400 {"description":"Bad Request: file is too big"}'))),
+    });
+    const prompt = await handleOperatorMessage(store, telegram, {
       message_id: 11,
       date: 0,
       chat: CHAT,
       from: OPERATOR,
       document: { file_id: "unknown-size", file_unique_id: "unknown-size", file_name: "dump.bin" },
     }, 2);
-    assert.deepEqual(client.calls.downloads, ["unknown-size"]);
-    assert.match(client.calls.sendMessage[0]?.[1] ?? "",/Could not fetch dump\.bin: Telegram only lets bots download files up to 20 MB/);
-    assert.equal(prompts.length, 0);
+    assert.deepEqual(telegram.calls.downloadTelegramFile.map(([file]) => file.file_id), ["unknown-size"]);
+    assert.match(telegram.calls.sendMessage[0]?.[1] ?? "", /Could not fetch dump\.bin: Telegram only lets bots download files up to 20 MB/);
+    assert.equal(prompt, null);
   });
 });
 
@@ -120,12 +85,12 @@ test("the poller advances past an update whose processing throws", async () => {
       return await new Promise<never>(() => {}); // a long poll that lasts until polling stops
     });
     const logged = Logger.layer([Logger.make(({ message }) => errors.push(Arr.ensure(message).join(" ")))]);
-    const poller = Effect.runFork(pollUpdates(async (update) => {
-      seen.push(update.update_id);
-      if (update.update_id === 100) {
-        throw new Error("poison");
-      }
-    }).pipe(Effect.provide([telegram, Layer.succeed(Store, store), logged])));
+    const poller = Effect.runFork(pollUpdates((update) =>
+      Effect.suspend(() => {
+        seen.push(update.update_id);
+        return update.update_id === 100 ? Effect.die(new Error("poison")) : Effect.void;
+      })
+    ).pipe(Effect.provide([telegram, Layer.succeed(Store, store), logged])));
     await polledAgain;
     await Effect.runPromise(Fiber.interrupt(poller));
     assert.deepEqual(offsets, [undefined, 102]);

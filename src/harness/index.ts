@@ -11,7 +11,6 @@ import { type FolderBayma, folderBayma as hostFolderBayma } from "../mcp/bayma.t
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import { type SqliteStore, Store } from "../persistence/store.ts";
 import { type SessionFilesystemsDisabled, SessionSandboxes } from "../sandbox/index.ts";
-import type { EffectRunner } from "../shared/effects.ts";
 import type { ActiveTurns } from "./active-turns.ts";
 import { makeClaudeHarness } from "./claude/index.ts";
 import type { ClaudeCodeError, ClaudeQueryFactory } from "./claude/runtime.ts";
@@ -160,7 +159,6 @@ export interface Harness {
   readonly displayName: string;
   readonly supportsGoals: boolean;
   readonly supportsWarmup: boolean;
-  readonly supportsSteer: boolean;
   readonly sessions: HarnessSessions;
   /** Present when the harness supports goals. */
   readonly goals?: HarnessGoals;
@@ -177,8 +175,6 @@ export interface Harness {
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */
   readonly defaultModelChoice: () => ModelChoice;
-  /** Ends the live process of a conversation, for a harness that keeps one. */
-  readonly closeLiveSession?: (threadKey: string, reason: string) => Effect.Effect<void>;
 }
 
 /** What a harness is made with, besides the services it runs on; each harness takes what it uses. */
@@ -218,7 +214,13 @@ export function resolveWorkingDirectory(store: MountStore | null | undefined, co
   return typeof workingDirectory === "string" && workingDirectory.trim() ? workingDirectory : null;
 }
 
-export const NO_SERVICE_MOUNTED = "No service is mounted. Use /service to choose Codex or Claude.";
+/** The mounted service's name as the operator reads it, or "No service". */
+export function harnessLabelOf(store: MountStore | null | undefined, conversationId: string): string {
+  const name = resolveHarnessName(store, conversationId);
+  return name ? harnessDisplayName(name) : "No service";
+}
+
+export const NO_SERVICE_MOUNTED ="No service is mounted. Use /service to choose Codex or Claude.";
 export const NO_WORKSPACE_MOUNTED = "No folder is mounted. Use /workspace to choose or create one.";
 
 /** The conversation has no service mounted. */
@@ -333,96 +335,3 @@ const makeHarnesses = Effect.fnUntraced(function*({
   });
 });
 
-/** A harness's sessions as promises, for alasio's code not yet written in Effect. */
-export interface HarnessSessionsFacade {
-  listSessions(page?: number): Promise<ListedSession[]>;
-  getTotalSessionPages(): Promise<number>;
-  getSessionByNumber(num: number): Promise<string | null>;
-  getSessionLastMessage(sessionId: string): Promise<string | null>;
-  listSessionMessages(sessionId: string): Promise<RewindMessage[]>;
-  getTotalRewindPages(sessionId: string): Promise<number>;
-  createForkedSession(sessionId: string, beforeUuid: string, options: { readonly threadKey: string }): Promise<string | null>;
-}
-
-/** A harness's goals as promises, for operator/goal-control.ts. */
-export interface HarnessGoalsFacade {
-  read(params: { readonly threadId: string }): Promise<v2.ThreadGoal | null>;
-  set(params: GoalUpdate): Promise<v2.ThreadGoal | null>;
-  clear(params: { readonly threadId: string }): Promise<v2.ThreadGoalClearResponse>;
-  waitForTurnId(threadId: string, timeoutMs?: number): Promise<string | null>;
-}
-
-/**
- * A harness as alasio's code not yet written in Effect calls it (the operator's panels and
- * commands, the app's warmup): its effects as promises run by alasio's EffectRunner. It
- * goes when its last caller moves.
- */
-export interface HarnessFacade {
-  readonly name: HarnessName;
-  readonly displayName: string;
-  readonly supportsGoals: boolean;
-  readonly supportsWarmup: boolean;
-  readonly sessions: HarnessSessionsFacade;
-  readonly goals?: HarnessGoalsFacade;
-  warmSession(params: WarmSessionParams): Promise<boolean>;
-  listModels(): Promise<ModelOption[]>;
-  defaultModelChoice(): ModelChoice;
-}
-
-/** The promise façade of a harness's `sessions`, their effects run by `effects`. */
-export function harnessSessionsFacade(sessions: HarnessSessions, effects: EffectRunner<never>): HarnessSessionsFacade {
-  return {
-    listSessions: (page) => effects.runPromise(sessions.listSessions(page)),
-    getTotalSessionPages: () => effects.runPromise(sessions.getTotalSessionPages()),
-    getSessionByNumber: (num) => effects.runPromise(sessions.getSessionByNumber(num)),
-    getSessionLastMessage: (sessionId) => effects.runPromise(sessions.getSessionLastMessage(sessionId)),
-    listSessionMessages: (sessionId) => effects.runPromise(sessions.listSessionMessages(sessionId)),
-    getTotalRewindPages: (sessionId) => effects.runPromise(sessions.getTotalRewindPages(sessionId)),
-    createForkedSession: (sessionId, beforeUuid, options) => effects.runPromise(sessions.createForkedSession(sessionId, beforeUuid, options)),
-  };
-}
-
-/** The promise façade of `harness`, its effects run by `effects`. */
-export function harnessFacade(harness: Harness, effects: EffectRunner<never>): HarnessFacade {
-  const { goals } = harness;
-  return {
-    name: harness.name,
-    displayName: harness.displayName,
-    supportsGoals: harness.supportsGoals,
-    supportsWarmup: harness.supportsWarmup,
-    sessions: harnessSessionsFacade(harness.sessions, effects),
-    ...(goals
-      ? {
-        goals: {
-          read: (params) => effects.runPromise(goals.read(params)),
-          set: (params) => effects.runPromise(goals.set(params)),
-          clear: (params) => effects.runPromise(goals.clear(params)),
-          waitForTurnId: (threadId, timeoutMs) => effects.runPromise(goals.waitForTurnId(threadId, timeoutMs)),
-        },
-      }
-      : {}),
-    warmSession: (params) => effects.runPromise(harness.warmSession(params)),
-    listModels: () => effects.runPromise(harness.listModels()),
-    defaultModelChoice: () => harness.defaultModelChoice(),
-  };
-}
-
-/** Harnesses as alasio's code not yet written in Effect asks for them; it goes when its last caller moves. */
-export interface HarnessesFacade {
-  readonly names: typeof HARNESS_NAMES;
-  getFor(name: string, workingDirectory: string | null | undefined): HarnessFacade;
-  forConversation(conversationId: string): HarnessFacade | null;
-  requireForConversation(conversationId: string): HarnessFacade;
-}
-
-/** The promise façade of the Harnesses `effects` runs in; a harness is made synchronously, so these are too. */
-export function harnessesFacade(effects: EffectRunner<Harnesses>): HarnessesFacade {
-  const harnesses = effects.runSync(Harnesses);
-  const facade = (harness: Harness) => harnessFacade(harness, effects);
-  return {
-    names: harnesses.names,
-    getFor: (name, workingDirectory) => facade(effects.runSync(harnesses.getFor(name, workingDirectory))),
-    forConversation: (conversationId) => Option.match(effects.runSync(harnesses.forConversation(conversationId)), { onNone: () => null, onSome: facade }),
-    requireForConversation: (conversationId) => facade(effects.runSync(harnesses.requireForConversation(conversationId))),
-  };
-}

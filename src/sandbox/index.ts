@@ -39,7 +39,6 @@ import {
   sandboxManifest,
   tokenSecretName,
 } from "../kube/sandboxes.ts";
-import type { EffectRunner } from "../shared/effects.ts";
 import { withLogScope } from "../shared/log.ts";
 import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
@@ -335,36 +334,3 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     readFile,
   });
 }, withLogScope("sandbox"));
-
-/**
- * SessionSandboxes as promises, for alasio's code not yet written in Effect (the
- * harnesses, operator controls, reply media), which reaches it through alasio's
- * EffectRunner (src/alasio.ts). It goes when its last caller moves.
- */
-export interface SessionFilesystems {
-  readonly enabled: true;
-  readonly volumes: {
-    create(volumeId: string, netMode?: NetMode): Promise<{ readonly volumeId: string; readonly netMode: NetMode }>;
-    destroy(volumeId: string): Promise<void>;
-  };
-  harnessDirectory(volumeId: string): string;
-  ensureSession(volumeId: string): Promise<{ readonly bayma: BaymaEndpoint }>;
-  readFile(volumeId: string, path: string, maxBytes: number): Promise<FileRead>;
-}
-
-/** The promise façade of the SessionSandboxes `effects` runs in, or null where the deployment has none. */
-export function sessionFilesystemsFacade(effects: EffectRunner<never>): SessionFilesystems | null {
-  return Option.match(effects.runSync(Effect.serviceOption(SessionSandboxes)), {
-    onNone: () => null,
-    onSome: (sessions) => ({
-      enabled: true,
-      volumes: {
-        create: (volumeId, netMode) => effects.runPromise(sessions.volumes.create(volumeId, netMode)),
-        destroy: (volumeId) => effects.runPromise(sessions.volumes.destroy(volumeId)),
-      },
-      harnessDirectory: sessions.harnessDirectory,
-      ensureSession: (volumeId) => effects.runPromise(sessions.ensureSession(volumeId)),
-      readFile: (volumeId, path, maxBytes) => effects.runPromise(sessions.readFile(volumeId, path, maxBytes)),
-    }),
-  });
-}

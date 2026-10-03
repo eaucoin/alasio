@@ -73,7 +73,6 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     displayName: harnessDisplayName(CLAUDE_HARNESS),
     supportsGoals: false,
     supportsWarmup: false,
-    supportsSteer: true,
     sessions: claudeSessions(sessions),
     startFreshSession: ({ threadKey }) => startFreshClaudeSession({ threadKey }),
     warmSession: () => Effect.succeed(false),
@@ -86,7 +85,5 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     listModels: () => listClaudeModels({ workingDirectory: directory }),
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice: () => ({ model: getClaudeModel(), effort: getClaudeEffort() }),
-    /** Live processes are replaced on demand; this ends one when its conversation is unmounted. */
-    closeLiveSession: (threadKey, reason) => liveSessions.close(threadKey, reason),
   };
 });

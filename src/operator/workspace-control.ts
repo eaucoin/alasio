@@ -1,41 +1,27 @@
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import { Effect } from "effect";
+
+import type { ConversationChat } from "../codex/turn-controller.ts";
+import { ActiveTurns } from "../harness/active-turns.ts";
 import { type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
-import type { SqliteStore } from "../persistence/store.ts";
-import type { NetMode } from "../sandbox/index.ts";
-import type { ChatId, Client } from "../telegram/client.ts";
+import { type SqliteStore, Store } from "../persistence/store.ts";
+import { TelegramClient, type TelegramError } from "../telegram/client.ts";
 import {
   MAX_LISTED_WORKSPACES,
   type WorkspaceCandidate,
-  WorkspaceError,
   listWorkspaceCandidates,
   workspaceLabel,
 } from "../workspace/policy.ts";
-import type { ControlCallback, ControlPanel } from "./session-control.ts";
+import { Mounts, type WorkspaceChange, type WorkspaceChangeError } from "./mounts.ts";
+import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
-
-/** The outcome of mounting a folder on a conversation, or of creating one and mounting it. */
-export interface WorkspaceChange {
-  /** Whether the folder changed; false when it was already the mounted one. */
-  readonly switched: boolean;
-  /** Set when the folder was newly created. */
-  readonly created?: boolean | undefined;
-  readonly previous: string | null;
-  readonly workingDirectory: string;
-}
-
-/** Mounts the folder `target` names under the workspace root, or throws why it cannot. */
-export type SwitchWorkspace = (request: { readonly conversationId: string; readonly target: string }) => Promise<WorkspaceChange>;
-
-/** Creates a git-initialized folder `name` under the workspace root and mounts it, or throws why it cannot. */
-export type CreateWorkspace = (request: { readonly conversationId: string; readonly name: string }) => Promise<WorkspaceChange>;
-
-/** Creates an empty session filesystem with internet access `netMode` and mounts it, or throws why it cannot. */
-export type CreateSessionWorkspace = (request: { readonly conversationId: string; readonly netMode: NetMode }) => Promise<WorkspaceChange>;
 
 /** The store's mounts and callback actions, as the workspace panel reads them. */
 export type WorkspaceControlStore = MountStore & Pick<SqliteStore, "createCallbackAction">;
+
+/** What the workspace controls run on. */
+export type WorkspaceControlServices = Store | TelegramClient | ActiveTurns | Mounts;
 
 const WORKSPACE_KIND_PREFIX = "workspace:";
 
@@ -74,11 +60,18 @@ function pairs<T>(items: readonly T[]): T[][] {
   return rows;
 }
 
+/** The folders under the workspace root, or why they could not be listed. */
+export type WorkspaceListing =
+  | { readonly candidates: readonly WorkspaceCandidate[] }
+  | { readonly error: string };
+
 export interface WorkspacePanelRequest {
   readonly store: WorkspaceControlStore;
-  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly conversationId: string;
   readonly workspaceRoot: string;
+  readonly listing: WorkspaceListing;
+  /** Whether a turn runs in the conversation. */
+  readonly working: boolean;
   readonly notice?: string | undefined;
   /** Whether to offer a new session filesystem: the deployment has a sandbox. */
   readonly sandboxEnabled?: boolean | undefined;
@@ -89,16 +82,9 @@ export interface WorkspacePanelRequest {
  * root (git repositories first) as buttons; anything beyond the button cap is
  * still reachable with `/workspace <name>`.
  */
-export async function buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): Promise<ControlPanel> {
+export function buildWorkspacePanel({ store, conversationId, workspaceRoot, listing, working, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): ControlPanel {
   const current = resolveWorkingDirectory(store, conversationId);
-  const working = activeTurns?.isBusy(conversationId) ?? false;
-  let candidates: WorkspaceCandidate[] = [];
-  let listingError = null;
-  try {
-    candidates = await listWorkspaceCandidates(workspaceRoot);
-  } catch (error) {
-    listingError = error instanceof Error ? error.message : String(error);
-  }
+  const candidates = "candidates" in listing ? listing.candidates : [];
   const shown = candidates.slice(0, MAX_LISTED_WORKSPACES);
   const lines = [
     "Workspace",
@@ -111,8 +97,8 @@ export async function buildWorkspacePanel({ store, activeTurns, conversationId, 
     "",
     "Type /workspace <name> to mount a folder under the root, or /workspace new <name> to create a git-initialized one.",
   ];
-  if (listingError) {
-    lines.push("", `Could not list folders: ${truncateText(listingError, 200)}`);
+  if ("error" in listing) {
+    lines.push("", `Could not list folders: ${truncateText(listing.error, 200)}`);
   } else if (candidates.length > shown.length) {
     lines.push("", `${candidates.length - shown.length} more folders are not shown; mount them by name.`);
   }
@@ -136,22 +122,39 @@ export async function buildWorkspacePanel({ store, activeTurns, conversationId, 
   ]);
   return {
     text: lines.join("\n"),
-    options: { format: "plain", reply_markup: { inline_keyboard: keyboard } },
+    options: panelOptions({ inline_keyboard: keyboard }),
   };
 }
 
-export interface SendWorkspacePanelRequest extends Omit<WorkspacePanelRequest, "notice"> {
-  readonly client: Pick<Client, "sendMessage">;
-  readonly chatId: ChatId;
-}
+/** The folders under `workspaceRoot`, as the panel lists them. */
+const listWorkspaces = (workspaceRoot: string): Effect.Effect<WorkspaceListing> =>
+  Effect.tryPromise(() => listWorkspaceCandidates(workspaceRoot)).pipe(
+    Effect.match({
+      onFailure: ({ cause }) => ({ error: cause instanceof Error ? cause.message : String(cause) }),
+      onSuccess: (candidates) => ({ candidates }),
+    }),
+  );
+
+/** The conversation's workspace panel as it stands, with `notice` under it. */
+const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, never, Store | ActiveTurns | Mounts> {
+  const mounts = yield* Mounts;
+  const working = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
+  return buildWorkspacePanel({
+    store: yield* Store,
+    conversationId,
+    workspaceRoot: mounts.workspaceRoot,
+    listing: yield* listWorkspaces(mounts.workspaceRoot),
+    working,
+    notice,
+    sandboxEnabled: mounts.sessionFilesystems,
+  });
+});
 
 /**
  * Reply used whenever a prompt or control arrives before a folder is mounted.
  */
-export async function sendChooseWorkspacePanel({ client, store, activeTurns, conversationId, chatId, workspaceRoot, sandboxEnabled = false }: SendWorkspacePanelRequest): Promise<void> {
-  const panel = await buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE, sandboxEnabled });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
+export const sendChooseWorkspacePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError, WorkspaceControlServices> =>
+  Effect.flatMap(workspacePanel(conversationId, CHOOSE_WORKSPACE_NOTICE), (panel) => sendPanel(chatId, panel));
 
 function describeOutcome(result: WorkspaceChange): string {
   if (result.created) {
@@ -165,16 +168,9 @@ function describeOutcome(result: WorkspaceChange): string {
     : `Mounted ${workspaceLabel(result.workingDirectory)} (${result.workingDirectory}). Send a message to start.`;
 }
 
-async function applyWorkspaceChange(run: () => Promise<WorkspaceChange>): Promise<string> {
-  try {
-    return describeOutcome(await run());
-  } catch (error) {
-    if (error instanceof WorkspaceError) {
-      return error.message;
-    }
-    return error instanceof Error ? error.message : String(error);
-  }
-}
+/** What to tell the operator of a change of folder: what it did, or why it did not. */
+const applyWorkspaceChange = <R>(change: Effect.Effect<WorkspaceChange, WorkspaceChangeError, R>): Effect.Effect<string, never, R> =>
+  Effect.match(change, { onFailure: (error) => error.message, onSuccess: describeOutcome });
 
 /** What /workspace was asked to do: show the panel, mount a folder, or create one. */
 export type WorkspaceArgs =
@@ -195,78 +191,42 @@ export function parseWorkspaceArgs(args: string | null | undefined): WorkspaceAr
   return { action: "use", target: trimmed };
 }
 
-export interface WorkspaceTextCommand extends SendWorkspacePanelRequest {
+export interface WorkspaceTextCommand extends ConversationChat {
   /** What followed /workspace. */
   readonly args: string;
-  readonly switchWorkspace: SwitchWorkspace;
-  readonly createWorkspace: CreateWorkspace;
 }
 
-export async function handleWorkspaceTextCommand({
-  client,
-  store,
-  activeTurns,
-  conversationId,
-  chatId,
-  args,
-  workspaceRoot,
-  switchWorkspace,
-  createWorkspace,
-  sandboxEnabled = false,
-}: WorkspaceTextCommand): Promise<void> {
+export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversationId, chatId, args }: WorkspaceTextCommand): Effect.fn.Return<
+  void,
+  TelegramError,
+  WorkspaceControlServices
+> {
+  const mounts = yield* Mounts;
   const parsed = parseWorkspaceArgs(args);
   let notice = "";
   if (parsed.action === "use") {
-    notice = await applyWorkspaceChange(() => switchWorkspace({ conversationId, target: parsed.target }));
+    notice = yield* applyWorkspaceChange(mounts.switchWorkspace(conversationId, parsed.target));
   } else if (parsed.action === "create") {
-    notice = await applyWorkspaceChange(() => createWorkspace({ conversationId, name: parsed.name }));
+    notice = yield* applyWorkspaceChange(mounts.createWorkspace(conversationId, parsed.name));
   }
-  const panel = await buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice, sandboxEnabled });
-  await client.sendMessage(chatId, panel.text, panel.options);
-}
+  yield* sendPanel(chatId, yield* workspacePanel(conversationId, notice));
+});
 
-async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
-  try {
-    await client.editMessageText(chatId, messageId, panel.text, panel.options);
-  } catch (error) {
-    if (!String(error).includes("message is not modified")) {
-      throw error;
-    }
-  }
-}
-
-export interface WorkspaceControlCallback extends ControlCallback {
-  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage" | "sendMessage">;
-  readonly store: WorkspaceControlStore;
-  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
-  readonly workspaceRoot: string;
-  readonly switchWorkspace: SwitchWorkspace;
-  /** Present when the deployment offers session filesystems. */
-  readonly createSessionWorkspace?: CreateSessionWorkspace | null | undefined;
-  readonly sandboxEnabled?: boolean | undefined;
-}
-
-export async function handleWorkspaceControlCallback({
-  client,
-  store,
-  activeTurns,
-  action,
-  workspaceRoot,
-  switchWorkspace,
-  createSessionWorkspace = null,
-  sandboxEnabled = false,
-  callbackQueryId,
-  chatId,
-  messageId,
-}: WorkspaceControlCallback): Promise<void> {
+export const handleWorkspaceControlCallback = Effect.fnUntraced(function*({ action, callbackQueryId, chatId, messageId }: ControlCallback): Effect.fn.Return<
+  void,
+  TelegramError,
+  WorkspaceControlServices
+> {
+  const store = yield* Store;
+  const client = yield* TelegramClient;
+  const mounts = yield* Mounts;
   const kind = action.kind.slice(WORKSPACE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
-  const conversationId = action.conversationId;
-  const panel = (notice: string) => buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice, sandboxEnabled });
+  const { conversationId } = action;
   if (kind === "sessionfs") {
     // Offer the internet choice before creating the empty workspace.
-    await client.answerCallbackQuery(callbackQueryId, "Choose internet access.");
-    await editPanel(client, chatId, messageId, {
+    yield* client.answerCallbackQuery(callbackQueryId, "Choose internet access.");
+    yield* editPanel(chatId, messageId, {
       text: [
         "New empty workspace",
         "",
@@ -276,52 +236,46 @@ export async function handleWorkspaceControlCallback({
         "· No internet — only the model is reachable.",
         "· Full internet — the public internet is reachable (never the host or other sessions).",
       ].join("\n"),
-      options: { format: "plain", reply_markup: { inline_keyboard: [[
+      options: panelOptions({ inline_keyboard: [[
         createButton(store, conversationId, "No internet", "sessionfs_create", { net: "none" }),
         createButton(store, conversationId, "Full internet", "sessionfs_create", { net: "full" }),
-      ], [createButton(store, conversationId, "Back", "refresh")]] } },
+      ], [createButton(store, conversationId, "Back", "refresh")]] }),
     });
     return;
   }
   if (kind === "sessionfs_create") {
-    if (!createSessionWorkspace) {
-      await client.answerCallbackQuery(callbackQueryId, "Session filesystems are not enabled.");
+    if (!mounts.sessionFilesystems) {
+      yield* client.answerCallbackQuery(callbackQueryId, "Session filesystems are not enabled.");
       return;
     }
-    const notice = await applyWorkspaceChange(() => createSessionWorkspace({ conversationId, netMode: payload["net"] === "full" ? "full" : "none" }));
-    await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
-    await editPanel(client, chatId, messageId, await panel(notice));
+    const notice = yield* applyWorkspaceChange(mounts.createSessionWorkspace(conversationId, payload["net"] === "full" ? "full" : "none"));
+    yield* client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
+    yield* editPanel(chatId, messageId, yield* workspacePanel(conversationId, notice));
     return;
   }
   if (kind === "close") {
-    await client.answerCallbackQuery(callbackQueryId, "Closed.");
-    try {
-      await client.deleteMessage(chatId, messageId);
-    } catch {
-      await client.editMessageText(chatId, messageId, "Closed.", { format: "plain" });
-    }
-    return;
+    return yield* closePanel({ callbackQueryId, chatId, messageId });
   }
   if (kind === "new") {
-    await client.answerCallbackQuery(callbackQueryId, "Send /workspace new <name>");
-    await client.sendMessage(chatId, "Send /workspace new <name> to create a git-initialized folder under the workspace root.");
+    yield* client.answerCallbackQuery(callbackQueryId, "Send /workspace new <name>");
+    yield* client.sendMessage(chatId, "Send /workspace new <name> to create a git-initialized folder under the workspace root.");
     return;
   }
   if (kind === "refresh") {
-    await client.answerCallbackQuery(callbackQueryId, "Refreshed.");
-    await editPanel(client, chatId, messageId, await panel(""));
+    yield* client.answerCallbackQuery(callbackQueryId, "Refreshed.");
+    yield* editPanel(chatId, messageId, yield* workspacePanel(conversationId));
     return;
   }
   if (kind === "use") {
     const path = payload["path"];
     if (typeof path !== "string" || !path) {
-      await client.answerCallbackQuery(callbackQueryId, "Unknown folder.");
+      yield* client.answerCallbackQuery(callbackQueryId, "Unknown folder.");
       return;
     }
-    const notice = await applyWorkspaceChange(() => switchWorkspace({ conversationId, target: path }));
-    await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
-    await editPanel(client, chatId, messageId, await panel(notice));
+    const notice = yield* applyWorkspaceChange(mounts.switchWorkspace(conversationId, path));
+    yield* client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
+    yield* editPanel(chatId, messageId, yield* workspacePanel(conversationId, notice));
     return;
   }
-  await client.answerCallbackQuery(callbackQueryId, "Unknown action.");
-}
+  yield* client.answerCallbackQuery(callbackQueryId, "Unknown action.");
+});

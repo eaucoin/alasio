@@ -5,22 +5,18 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
+import { Effect, Layer } from "effect";
 
 import { resolveCodexModelChoice, ALASIO_CODEX_MODEL, ALASIO_CODEX_REASONING_EFFORT } from "../src/codex/model.ts";
 import { getClaudeEffort, getClaudeModel, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
-import {
-  buildModelPanel,
-  handleModelControlCallback,
-  isModelControlAction,
-  type ModelControlCallback,
-  type ModelControlHarness,
-} from "../src/operator/model-control.ts";
+import { buildModelPanel, handleModelControlCallback, isModelControlAction, type ModelControlHarness } from "../src/operator/model-control.ts";
 import type { CallbackAction } from "../src/persistence/callback-repository.ts";
-import { SqliteStore } from "../src/persistence/store.ts";
-import type { TextMessageOptions } from "../src/telegram/client.ts";
+import { SqliteStore, Store } from "../src/persistence/store.ts";
+import type { TelegramClient } from "../src/telegram/client.ts";
+import { recordingTelegram } from "./support/telegram-calls.ts";
 
 async function withStore<T>(run: (store: SqliteStore, id: string) => T | Promise<T>): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), "alasio-model-"));
@@ -35,26 +31,9 @@ async function withStore<T>(run: (store: SqliteStore, id: string) => T | Promise
   }
 }
 
-/** A call the panels made on the Telegram client. */
-interface ClientCall {
-  readonly op: "edit" | "answer";
-  readonly text: string;
-  readonly options?: TextMessageOptions;
-}
-
-function fakeClient(): ModelControlCallback["client"] & { readonly calls: ClientCall[] } {
-  const calls: ClientCall[] = [];
-  return {
-    calls,
-    async editMessageText(_chatId, _messageId, text, options = {}) {
-      calls.push({ op: "edit", text, options });
-      return true;
-    },
-    async answerCallbackQuery(_id, text = "") {
-      calls.push({ op: "answer", text });
-      return true;
-    },
-  };
+/** Runs a /model effect on `store` and a Telegram client recording into `telegram`. */
+function run<A, E>(effect: Effect.Effect<A, E, Store | TelegramClient>, store: SqliteStore, telegram = recordingTelegram()): Promise<A> {
+  return Effect.runPromise(effect.pipe(Effect.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))));
 }
 
 /** The buttons of a panel's keyboard, row after row. */
@@ -79,8 +58,8 @@ function consume(store: SqliteStore, data: string): CallbackAction {
 const claudeHarness: ModelControlHarness = {
   name: CLAUDE_HARNESS,
   displayName: "Claude",
-  async listModels() {
-    return [
+  listModels: () =>
+    Effect.succeed([
       {
         id: "opus[1m]",
         label: "Opus (1M context)",
@@ -91,8 +70,7 @@ const claudeHarness: ModelControlHarness = {
         isDefault: false,
       },
       { id: "haiku", label: "Haiku", description: "", resolvedModel: "haiku", efforts: [], defaultEffort: null, isDefault: false },
-    ];
-  },
+    ]),
   defaultModelChoice: () => ({ model: ALASIO_CLAUDE_MODEL, effort: "high" }),
 };
 
@@ -142,30 +120,29 @@ test("a Codex choice replaces the pinned model and effort for the turn", () => {
 
 test("/model walks model then effort, using the chosen model's own effort levels", async () => {
   await withStore(async (store, id) => {
-    const panel = await buildModelPanel({ store, harness: claudeHarness, conversationId: id });
+    const panel = await run(buildModelPanel({ harness: claudeHarness, conversationId: id }), store);
     assert.match(panel.text, /Current: claude-opus-5-5\[1m\] at high effort \(default\)/);
     const pick = consume(store, callbackData(panel.options.reply_markup, "Opus (1M context)"));
     assert.ok(isModelControlAction(pick.kind));
 
-    const client = fakeClient();
-    await handleModelControlCallback({ client, store, action: pick, callbackQueryId: "q1", chatId: 42, messageId: 7 });
-    const effortPanel = client.calls.find((call) => call.op === "edit");
-    const effortTexts = buttonsOf(effortPanel?.options?.reply_markup).map((b) => b.text);
+    const telegram = recordingTelegram();
+    await run(handleModelControlCallback({ action: pick, callbackQueryId: "q1", chatId: 42, messageId: 7 }), store, telegram);
+    const [effortPanel] = telegram.calls.editMessageText;
+    const effortTexts = buttonsOf(effortPanel?.[3]?.reply_markup).map((b) => b.text);
     assert.deepEqual(effortTexts.filter((t) => t !== "Close"), ["low", "medium", "high", "xhigh", "max"]);
     assert.equal(store.getModelChoice(id, CLAUDE_HARNESS), null, "nothing is stored until an effort is chosen");
 
-    const max = callbackData(effortPanel?.options?.reply_markup, "max");
-    await handleModelControlCallback({ client, store, action: consume(store, max), callbackQueryId: "q2", chatId: 42, messageId: 7 });
+    const max = callbackData(effortPanel?.[3]?.reply_markup, "max");
+    await run(handleModelControlCallback({ action: consume(store, max), callbackQueryId: "q2", chatId: 42, messageId: 7 }), store, telegram);
     assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "opus[1m]", effort: "max" });
   });
 });
 
 test("a model without effort control is chosen in one step", async () => {
   await withStore(async (store, id) => {
-    const panel = await buildModelPanel({ store, harness: claudeHarness, conversationId: id });
+    const panel = await run(buildModelPanel({ harness: claudeHarness, conversationId: id }), store);
     const haiku = callbackData(panel.options.reply_markup, "Haiku");
-    const client = fakeClient();
-    await handleModelControlCallback({ client, store, action: consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 });
+    await run(handleModelControlCallback({ action: consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 }), store);
     assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "haiku", effort: null });
   });
 });

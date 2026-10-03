@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 
-import type { Message } from "@grammyjs/types";
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { InMemoryLogRecordExporter, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { DataPointType, type MetricData, MetricReader } from "@opentelemetry/sdk-metrics";
@@ -15,8 +14,9 @@ import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@o
 import type { Harness } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
-import type { EffectRunner } from "../src/shared/effects.ts";
-import type { Client } from "../src/telegram/client.ts";
+// Types only: effect itself is loaded once the SDK is registered, below.
+import type { Effect as EffectTypes } from "effect";
+import type { Outbox as OutboxService } from "../src/telegram/outbox.ts";
 import type { BotAnswer } from "./support/bot-api.ts";
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
@@ -48,31 +48,29 @@ const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app
 const { makeAppServerRpc } = await import("../src/codex/app-server/rpc-client.ts");
 const { appServerProcess } = await import("./support/app-server-process.ts");
 const { hostBaymaManifest } = await import("../src/mcp/bayma.ts");
-const { withTurns } = await import("./support/turns.ts");
+const { withServices } = await import("./support/turns.ts");
+const { recordingTelegram, sentMessage } = await import("./support/telegram-calls.ts");
+const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
 const { createLogger } = await import("../src/shared/log.ts");
 const { inSpan, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
-const { Effect, Exit, Layer, Schema, Scope } = await import("effect");
+const { Effect, Layer, ManagedRuntime, Schema } = await import("effect");
 const { FetchHttpClient } = await import("effect/http");
 const { Store } = await import("../src/persistence/store.ts");
-const { effectRunnerHere } = await import("../src/shared/effects.ts");
 const { TelegramClient } = await import("../src/telegram/client.ts");
-const { Outbox, outboxFacade } = await import("../src/telegram/outbox.ts");
+const { Outbox } = await import("../src/telegram/outbox.ts");
 const { botApiLayer, paramsOf } = await import("./support/bot-api.ts");
 
-type SendMessageArgs = Parameters<Client["sendMessage"]>;
-
 /**
- * The Outbox over `store` and a Bot API `answer` answers, built in a scope `t` closes,
- * with the tracing alasio runs with; and the EffectRunner that runs effects in it.
+ * The Outbox over `store` and a Bot API `answer` answers, made with the tracing alasio
+ * runs with (its delivery loop runs with it too), until `t` ends: what runs effects on it.
  */
-async function outboxFor(t: TestContext, store: InstanceType<typeof SqliteStore>, answer: BotAnswer): Promise<EffectRunner<InstanceType<typeof Outbox>>> {
-  const scope = await Effect.runPromise(Scope.make());
-  t.after(() => Effect.runPromise(Scope.close(scope, Exit.void)));
-  const layer = Outbox.layer.pipe(Layer.provide([botApiLayer(answer), Layer.succeed(Store, store)]));
-  return await Effect.runPromise(Layer.buildWithScope(layer, scope).pipe(Effect.flatMap(effectRunnerHere), Effect.provide(TracingLayer)));
+function outboxFor(t: TestContext, store: InstanceType<typeof SqliteStore>, answer: BotAnswer): <A, E>(effect: EffectTypes.Effect<A, E, OutboxService>) => Promise<A> {
+  const outbox = ManagedRuntime.make(Outbox.layer.pipe(Layer.provide([botApiLayer(answer), Layer.succeed(Store, store)]), Layer.provideMerge(TracingLayer)));
+  t.after(() => outbox.dispose());
+  return (effect) => outbox.runPromise(effect);
 }
 
 const ENDPOINT = { OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/" };
@@ -272,17 +270,9 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     const conversationId = store.upsertConversation({ chatId: "42", user: { id: 42 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.setWorkingDirectory(conversationId, folder);
-    const sent: SendMessageArgs[] = [];
-    const telegram = {
-      async sendMessage(...args: SendMessageArgs): Promise<Message[]> {
-        sent.push(args);
-        return [{ message_id: sent.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } }];
-      },
-      // What the Bot API answers for an edit it makes without returning the message.
-      async editMessageText(): Promise<true> {
-        return true;
-      },
-    };
+    const telegram = recordingTelegram({
+      sendMessage: () => Effect.sync(() => [sentMessage(42, telegram.calls.sendMessage.length)]),
+    });
     // A harness that only runs turns: what else a harness does, a turn does not use.
     const harness = (name: HarnessName): Harness => {
       const unused = (): never => {
@@ -293,7 +283,6 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
         displayName: name,
         supportsGoals: false,
         supportsWarmup: false,
-        supportsSteer: false,
         sessions: {
           listSessions: unused,
           getTotalSessionPages: unused,
@@ -327,11 +316,13 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     ]));
     const harnesses = { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) };
     spans.reset();
-    await withTurns({ store, client: telegram, harnesses, config: { workspaceRoot: root }, outbox }, async ({ turns, effects }) => {
-      await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }));
+    await withServices({ store, telegram: telegram.layer, harnesses, workspaceRoot: root, outbox }, async (alasio) => {
+      await alasio.runPromise(processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }).pipe(
+        withAlasioSpan("alasio.update", { kind: SpanKind.CONSUMER, parent: null }),
+      ));
       // The conversation's prompt worker runs the turn, whose reply the outbox delivers.
       await eventually("the turn to end", () => spans.getFinishedSpans().find((span) => span.name === "alasio.turn"));
-      await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+      await alasio.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
     });
 
     const update = finishedSpan("alasio.update");
@@ -365,14 +356,13 @@ test("a deferred delivery records what stopped it and keeps its trace", async (t
   const store = new SqliteStore(root, join(root, "alasio.sqlite"));
   try {
     store.upsertConversation({ chatId: "43", user: { id: 43 } });
-    const effects = await outboxFor(t, store, async () => {
+    const run = outboxFor(t, store, async () => {
       throw new Error("Telegram is down");
     });
-    const outbox = outboxFacade(effects);
     spans.reset();
     const turn = await inSpan("test.turn", { parent: null }, async (span) => {
-      outbox.enqueueText({ chatId: "43", text: "reply" });
-      await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+      await run(Effect.flatMap(Outbox, (outbox) => outbox.enqueueText({ chatId: "43", text: "reply" })));
+      await run(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
       return span;
     });
     const delivery = finishedSpan("alasio.delivery");

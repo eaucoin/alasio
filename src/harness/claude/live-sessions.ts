@@ -180,8 +180,6 @@ export interface ClaudeLiveSessions {
   readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult>;
   /** The live process serving a conversation, if any (for tests and diagnostics). */
   readonly get: (threadKey: string) => ClaudeHost | null;
-  /** Ends the live process of a conversation, if it has one. */
-  readonly close: (threadKey: string, reason?: string) => Effect.Effect<void>;
 }
 
 function modelKey(persistence: TurnPersistence, threadKey: string): string {
@@ -350,7 +348,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
         yield* releaseCliTurn(host, cliTurn);
       }
-    });
+    }, withLogScope(LOG_SCOPE));
     const steer = Effect.fnUntraced(function*(steerPrompt: string) {
       if (host.closed || host.cliTurn !== cliTurn) {
         return false;
@@ -358,7 +356,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       const uuid = randomUUID();
       cliTurn.promptUuids.add(uuid);
       return yield* host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
-    });
+    }, withLogScope(LOG_SCOPE));
     const cliTurn: CliTurn = {
       pendingResponseId,
       blockSequence: [],
@@ -715,7 +713,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         yield* finishOperatorTurn(live, current);
       }
       yield* Deferred.await(done);
-    });
+    }, withLogScope(LOG_SCOPE));
     const steer = Effect.fnUntraced(function*(steerPrompt: string) {
       const live = host;
       if (!live) {
@@ -729,7 +727,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       const uuid = randomUUID();
       current.promptUuids.add(uuid);
       return yield* live.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
-    });
+    }, withLogScope(LOG_SCOPE));
     const current: OperatorTurn = {
       promptUuids: new Set(),
       blockSequence: [],
@@ -803,10 +801,5 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   return {
     runTurn,
     get: (threadKey) => hosts.get(threadKey) ?? null,
-    close: (threadKey, reason = "closed") =>
-      Effect.suspend(() => {
-        const host = hosts.get(threadKey);
-        return host ? closeHost(host, reason) : Effect.void;
-      }).pipe(withLogScope(LOG_SCOPE)),
   };
 }, withLogScope(LOG_SCOPE));

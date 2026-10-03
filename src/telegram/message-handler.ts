@@ -1,35 +1,23 @@
 import type { Message } from "@grammyjs/types";
-import type { TurnController } from "../codex/turn-controller.ts";
-import type { SqliteStore } from "../persistence/store.ts";
-import type { Logger } from "../shared/log.ts";
-import type { Authorizer } from "./authorizer.ts";
-import type { Client } from "./client.ts";
-import type { MediaGroupBuffer } from "./media-group-buffer.ts";
+import { Effect } from "effect";
+
+import { harnessLabelOf } from "../harness/index.ts";
+import type { OperatorServices } from "../operator/command-handler.ts";
+import { type IncomingPrompt, processPrompt, sendNextSetupStep } from "../operator/prompts.ts";
+import { Store } from "../persistence/store.ts";
+import { Authorizer } from "./authorizer.ts";
+import { TelegramClient, type TelegramError } from "./client.ts";
+import { MediaGroups } from "./media-group-buffer.ts";
 import { type IncomingFile, getMessageFiles, getMessageText } from "./message.ts";
 
 /** Bot API getFile refuses anything larger than this, regardless of plan. */
 export const TELEGRAM_BOT_FILE_LIMIT_BYTES = 20 * 1024 * 1024;
 
-export type { IncomingPrompt } from "../codex/turn-controller.ts";
+/** What a message is handled with. */
+export type MessageServices = Authorizer | MediaGroups | OperatorServices;
 
-/** What the handler calls on the turn controller; its harness label only when it has one. */
-export type MessageTurns = Pick<TurnController, "sendNextSetupStep" | "processPrompt"> & Partial<Pick<TurnController, "harnessLabel">>;
-
-/** The store's conversations, messages, and files, as the handler records them. */
-type MessageStore = Pick<SqliteStore, "upsertConversation" | "insertMessage" | "getSessionId" | "insertFile">;
-
-export interface MessageHandlerOptions {
-  authorizer: Pick<Authorizer, "isAuthorizedMessage">;
-  client: Pick<Client, "sendMessage" | "downloadTelegramFile">;
-  store: MessageStore;
-  turns: MessageTurns;
-  mediaGroups: Pick<MediaGroupBuffer, "buffer">;
-  log: Pick<Logger, "warn" | "error">;
-}
-
-function describeDownloadFailure(file: IncomingFile, error: unknown): string {
+function describeDownloadFailure(file: IncomingFile, message: string): string {
   const name = file.file_name ?? file.kind ?? "file";
-  const message = error instanceof Error ? error.message : String(error);
   if ((file.file_size ?? 0) > TELEGRAM_BOT_FILE_LIMIT_BYTES || /file is too big/i.test(message)) {
     const size = file.file_size ? ` (${(file.file_size / (1024 * 1024)).toFixed(1)} MB)` : "";
     return `Could not fetch ${name}${size}: Telegram only lets bots download files up to 20 MB. Put it in the mounted folder yourself, or send a link or a smaller file.`;
@@ -37,110 +25,93 @@ function describeDownloadFailure(file: IncomingFile, error: unknown): string {
   return `Could not fetch ${name}: ${message}`;
 }
 
-export class MessageHandler {
-  private readonly authorizer: Pick<Authorizer, "isAuthorizedMessage">;
-  private readonly client: Pick<Client, "sendMessage" | "downloadTelegramFile">;
-  private readonly store: MessageStore;
-  private readonly turns: MessageTurns;
-  private readonly mediaGroups: Pick<MediaGroupBuffer, "buffer">;
-  private readonly log: Pick<Logger, "warn" | "error">;
-
-  constructor({ authorizer, client, store, turns, mediaGroups, log }: MessageHandlerOptions) {
-    this.authorizer = authorizer;
-    this.client = client;
-    this.store = store;
-    this.turns = turns;
-    this.mediaGroups = mediaGroups;
-    this.log = log;
+/**
+ * Records a message from Telegram and downloads its files: the prompt it carries, for
+ * processIncomingPrompt, or null when it carries none to process now (it was not the
+ * operator's, it was /start, it carried nothing, or it is part of an album, which is
+ * handled as one prompt once all of it has arrived).
+ */
+export const handleMessage = Effect.fnUntraced(function*(message: Message, updateId: number): Effect.fn.Return<
+  IncomingPrompt | null,
+  TelegramError,
+  MessageServices
+> {
+  const store = yield* Store;
+  const client = yield* TelegramClient;
+  const authorizer = yield* Authorizer;
+  if (!(yield* authorizer.isAuthorizedMessage(message))) {
+    if (message.chat?.type === "private") {
+      yield* client.sendMessage(message.chat.id, "This bot is not authorized for this Telegram user.");
+    }
+    return null;
   }
 
-  upsertConversationFromMessage(message: Message): string {
-    const chatId = message.chat.id;
-    return this.store.upsertConversation({ chatId, user: message.from });
+  const conversationId = store.upsertConversation({ chatId: message.chat.id, user: message.from });
+  const text = getMessageText(message);
+  const files = getMessageFiles(message);
+  const messageId = store.insertMessage({
+    conversationId,
+    direction: "in",
+    kind: files.length > 0 ? "file" : "text",
+    transportMessageId: message.message_id,
+    text,
+    mediaGroupId: message.media_group_id ?? null,
+    raw: message,
+    sessionId: store.getSessionId(conversationId) ?? null,
+    turnId: null,
+  });
+
+  if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
+    if (!(yield* sendNextSetupStep({ conversationId, chatId: message.chat.id }))) {
+      yield* client.sendMessage(message.chat.id, "Alasio is ready.");
+    }
+    return null;
   }
 
-  async handle(message: Message, updateId: number): Promise<void> {
-    if (!this.authorizer.isAuthorizedMessage(message)) {
-      if (message.chat?.type === "private") {
-        await this.client.sendMessage(message.chat.id, "This bot is not authorized for this Telegram user.");
-      }
-      return;
+  const localPaths: string[] = [];
+  const failures: string[] = [];
+  for (const file of files) {
+    // A file the Bot API refuses must not poison the update: report it and carry on
+    // with whatever else the message carried.
+    if ((file.file_size ?? 0) > TELEGRAM_BOT_FILE_LIMIT_BYTES) {
+      failures.push(describeDownloadFailure(file, "file is too big"));
+      continue;
     }
-
-    const conversationId = this.upsertConversationFromMessage(message);
-    const text = getMessageText(message);
-    const files = getMessageFiles(message);
-    const messageId = this.store.insertMessage({
-      conversationId,
-      direction: "in",
-      kind: files.length > 0 ? "file" : "text",
-      transportMessageId: message.message_id,
-      text,
-      mediaGroupId: message.media_group_id ?? null,
-      raw: message,
-      sessionId: this.store.getSessionId(conversationId) ?? null,
-      turnId: null,
-    });
-
-    if (/^\/start(?:@\w+)?(?:\s|$)/i.test(text)) {
-      if (!(await this.turns.sendNextSetupStep({ conversationId, chatId: message.chat.id }))) {
-        await this.client.sendMessage(message.chat.id, "Alasio is ready.");
-      }
-      return;
-    }
-
-    const localPaths: string[] = [];
-    const failures: string[] = [];
-    for (const file of files) {
-      // A file the Bot API refuses must not poison the update: report it and carry on
-      // with whatever else the message carried.
-      if ((file.file_size ?? 0) > TELEGRAM_BOT_FILE_LIMIT_BYTES) {
-        failures.push(describeDownloadFailure(file, new Error("file is too big")));
-        continue;
-      }
-      try {
-        const downloaded = await this.client.downloadTelegramFile(file, file.file_name ?? `telegram-${message.message_id}`);
-        this.store.insertFile({
-          conversationId,
-          messageId,
-          file,
-          localPath: downloaded.localPath,
-          sha256: downloaded.sha256,
-        });
-        localPaths.push(downloaded.localPath);
-      } catch (error) {
-        this.log.warn(`Download failed for ${file.file_id} in ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
-        failures.push(describeDownloadFailure(file, error));
-      }
-    }
-    if (failures.length > 0) {
-      await this.client.sendMessage(message.chat.id, failures.join("\n\n"));
-    }
-
-    if (!text && localPaths.length === 0) {
-      return;
-    }
-
-    if (message.media_group_id) {
-      this.mediaGroups.buffer({
-        mediaGroupId: message.media_group_id,
-        conversationId,
-        updateId,
-        chatId: message.chat.id,
-      });
-      return;
-    }
-
-    this.turns.processPrompt({
-      conversationId,
-      chatId: message.chat.id,
-      messageId: message.message_id,
-      text,
-      filePaths: localPaths,
-    }).catch((error: unknown) => {
-      this.log.error(`Failed to process prompt for ${conversationId}: ${error}`);
-      const agentName = this.turns.harnessLabel?.(conversationId) ?? "The agent";
-      this.client.sendMessage(message.chat.id, `${agentName} hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
-    });
+    yield* client.downloadTelegramFile(file, file.file_name ?? `telegram-${message.message_id}`).pipe(
+      Effect.flatMap(({ localPath, sha256 }) => Effect.sync(() => {
+        store.insertFile({ conversationId, messageId, file, localPath, sha256 });
+        localPaths.push(localPath);
+      })),
+      Effect.catch((error) =>
+        Effect.logWarning(`Download failed for ${file.file_id} in ${conversationId}: ${error.message}`).pipe(
+          Effect.andThen(Effect.sync(() => failures.push(describeDownloadFailure(file, error.message)))),
+        )),
+    );
   }
-}
+  if (failures.length > 0) {
+    yield* client.sendMessage(message.chat.id, failures.join("\n\n"));
+  }
+
+  if (!text && localPaths.length === 0) {
+    return null;
+  }
+
+  const mediaGroupId = message.media_group_id;
+  if (mediaGroupId) {
+    yield* Effect.flatMap(MediaGroups, (mediaGroups) => mediaGroups.buffer({ mediaGroupId, conversationId, updateId, chatId: message.chat.id }));
+    return null;
+  }
+
+  return { conversationId, chatId: message.chat.id, messageId: message.message_id, text, filePaths: localPaths };
+});
+
+/** Processes a message's prompt, telling the operator when that fails. */
+export const processIncomingPrompt = (prompt: IncomingPrompt): Effect.Effect<void, never, OperatorServices> => {
+  const failed = Effect.fnUntraced(function*(error: unknown) {
+    yield* Effect.logError(`Failed to process prompt for ${prompt.conversationId}: ${error}`);
+    const agentName = harnessLabelOf(yield* Store, prompt.conversationId);
+    yield* Effect.flatMap(TelegramClient, (client) =>
+      client.sendMessage(prompt.chatId, `${agentName} hit an error: ${error instanceof Error ? error.message : String(error)}`)).pipe(Effect.ignore);
+  });
+  return processPrompt(prompt).pipe(Effect.catch(failed), Effect.catchDefect(failed));
+};

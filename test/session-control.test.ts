@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { noActiveTurns } from "../src/harness/active-turns.ts";
-import type { HarnessSessionsFacade } from "../src/harness/index.ts";
+import { Effect } from "effect";
+
+import type { Turns } from "../src/codex/turn-controller.ts";
+import type { HarnessSessions } from "../src/harness/index.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
-import {
-  type SessionControlCallback,
-  type SessionControlHarness,
-  type SessionControlStore,
-  type StartNewSession,
-  handleSessionControlCallback,
-} from "../src/operator/session-control.ts";
-import type { Client } from "../src/telegram/client.ts";
+import { type SessionControlHarness, handleSessionControlCallback } from "../src/operator/session-control.ts";
+import { SqliteStore } from "../src/persistence/store.ts";
+import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
+import { type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
 test("command parser accepts Telegram-native session commands", () => {
   assert.deepEqual(parseCommand("/session"), { type: "session_panel" });
@@ -34,50 +35,34 @@ test("command parser accepts bang session command aliases", () => {
   assert.deepEqual(parseCommand("!stop"), { type: "stop" });
 });
 
-function createClient() {
-  const calls: {
-    answerCallbackQuery: Parameters<Client["answerCallbackQuery"]>[];
-    editMessageText: Parameters<Client["editMessageText"]>[];
-  } = {
-    answerCallbackQuery: [],
-    editMessageText: [],
-  };
-  const client: SessionControlCallback["client"] = {
-    async answerCallbackQuery(...args) {
-      calls.answerCallbackQuery.push(args);
-      return true;
-    },
-    async editMessageText(...args) {
-      calls.editMessageText.push(args);
-      return true;
-    },
-    deleteMessage: () => assert.fail("deleteMessage"),
-  };
-  return { calls, client };
+/** The conversation of chat 123, on Codex. */
+const CONVERSATION = "telegram:123";
+
+/** The session controls' services over a Codex conversation, the turns they run (made on its store) standing in, for one test. */
+async function withSessionControls<T>(
+  turns: (store: SqliteStore) => Partial<Turns["Service"]>,
+  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: SqliteStore) => Promise<T>,
+): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), "alasio-session-control-"));
+  const store = new SqliteStore(root);
+  try {
+    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), "codex");
+    const telegram = recordingTelegram();
+    return await withServices({ store, telegram: telegram.layer, turns: turnsStub(turns(store)) }, (alasio) => use(alasio, telegram, store));
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
-function createStore(): SessionControlStore {
-  let sessionId: string | undefined;
-  return {
-    getSessionId: () => sessionId,
-    setSessionId: (_conversationId, mountedSessionId) => {
-      sessionId = mountedSessionId ?? undefined;
-    },
-    getSessionTokens: () => 0,
-    createCallbackAction({ kind, payload }) {
-      return `${kind}:${Object.keys(payload ?? {}).length}`;
-    },
-  };
-}
-
-function createHarness(sessions: Partial<HarnessSessionsFacade> = {}): SessionControlHarness {
+function createHarness(sessions: Partial<HarnessSessions> = {}): SessionControlHarness {
   return {
     displayName: "Codex",
     sessions: {
       listSessions: () => assert.fail("listSessions"),
       getTotalSessionPages: () => assert.fail("getTotalSessionPages"),
       getSessionByNumber: () => assert.fail("getSessionByNumber"),
-      getSessionLastMessage: async () => null,
+      getSessionLastMessage: () => Effect.succeed(null),
       listSessionMessages: () => assert.fail("listSessionMessages"),
       getTotalRewindPages: () => assert.fail("getTotalRewindPages"),
       createForkedSession: () => assert.fail("createForkedSession"),
@@ -87,59 +72,52 @@ function createHarness(sessions: Partial<HarnessSessionsFacade> = {}): SessionCo
 }
 
 test("new-session callback starts and mounts a fresh session", async () => {
-  const { calls, client } = createClient();
-  const store = createStore();
-  const startCalls: Parameters<StartNewSession>[0][] = [];
-
-  await handleSessionControlCallback({
-    client,
-    store,
-    harness: createHarness(),
-    activeTurns: noActiveTurns,
-    action: { id: "action-1", kind: "control:new", conversationId: "conversation-1", payload: {} },
-    startNewSession: async (args) => {
-      startCalls.push(args);
-      store.setSessionId(args.conversationId, "fresh-session");
-      return "fresh-session";
-    },
-    callbackQueryId: "callback-1",
-    chatId: 123,
-    messageId: 456,
+  const startCalls: string[] = [];
+  await withSessionControls((store) => ({
+    startNewSession: (conversationId) =>
+      Effect.sync(() => {
+        startCalls.push(conversationId);
+        store.setSessionId(conversationId, "fresh-session");
+        return "fresh-session";
+      }),
+  }), async (alasio, { calls }) => {
+    await alasio.runPromise(handleSessionControlCallback({
+      harness: createHarness(),
+      action: { id: "action-1", kind: "control:new", conversationId: CONVERSATION, payload: {} },
+      callbackQueryId: "callback-1",
+      chatId: 123,
+      messageId: 456,
+    }));
+    assert.deepEqual(startCalls, [CONVERSATION]);
+    assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "New session mounted: fresh-se."]);
+    assert.match(calls.editMessageText[0]?.[2] ?? "", /Session: fresh-se/);
   });
-
-  assert.deepEqual(startCalls, [{ conversationId: "conversation-1" }]);
-  assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "New session mounted: fresh-se."]);
-  assert.match(calls.editMessageText[0]?.[2] ?? "", /Session: fresh-se/);
 });
 
 test("rewind forks before the chosen message for the conversation and mounts the fork", async () => {
-  const { calls, client } = createClient();
-  const store = createStore();
-  const forkCalls: Parameters<HarnessSessionsFacade["createForkedSession"]>[] = [];
+  const forkCalls: Parameters<HarnessSessions["createForkedSession"]>[] = [];
   const harness = createHarness({
-    listSessionMessages: async () => [
-      { index: -1, timestamp: "", text: "second", uuid: "turn-2" },
-      { index: -2, timestamp: "", text: "first", uuid: "turn-1" },
-    ],
-    createForkedSession: async (...args) => {
-      forkCalls.push(args);
-      return "forked-session";
-    },
+    listSessionMessages: () =>
+      Effect.succeed([
+        { index: -1, timestamp: "", text: "second", uuid: "turn-2" },
+        { index: -2, timestamp: "", text: "first", uuid: "turn-1" },
+      ]),
+    createForkedSession: (...args) =>
+      Effect.sync(() => {
+        forkCalls.push(args);
+        return "forked-session";
+      }),
   });
-
-  await handleSessionControlCallback({
-    client,
-    store,
-    harness,
-    activeTurns: noActiveTurns,
-    action: { id: "action-1", kind: "control:rewind_fork", conversationId: "conversation-1", payload: { sessionId: "source-session", index: -1 } },
-    startNewSession: async () => assert.fail("a rewind starts no new session"),
-    callbackQueryId: "callback-1",
-    chatId: 123,
-    messageId: 456,
+  await withSessionControls(() => ({}), async (alasio, { calls }, store) => {
+    await alasio.runPromise(handleSessionControlCallback({
+      harness,
+      action: { id: "action-1", kind: "control:rewind_fork", conversationId: CONVERSATION, payload: { sessionId: "source-session", index: -1 } },
+      callbackQueryId: "callback-1",
+      chatId: 123,
+      messageId: 456,
+    }));
+    assert.deepEqual(forkCalls, [["source-session", "turn-2", { threadKey: CONVERSATION }]]);
+    assert.equal(store.getSessionId(CONVERSATION), "forked-session");
+    assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "Fork mounted."]);
   });
-
-  assert.deepEqual(forkCalls, [["source-session", "turn-2", { threadKey: "conversation-1" }]]);
-  assert.equal(store.getSessionId("conversation-1"), "forked-session");
-  assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "Fork mounted."]);
 });
