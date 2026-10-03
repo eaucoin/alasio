@@ -277,6 +277,12 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     await kubectl("delete", "pod", pod, "--wait=true");
     await query("create table after_loss (id int primary key)");
     await query("insert into after_loss values (1)");
+    // kubectl wait fails at once on a pod that does not exist, which this one does not
+    // until its StatefulSet has made it again.
+    for (let tries = 0; !(await kubectl("get", "pod", pod).then(() => true, () => false)); tries++) {
+      assert.ok(tries < 60, `the StatefulSet never made ${pod} again`);
+      await sleep(2000);
+    }
     await kubectl("wait", `pod/${pod}`, "--for=condition=Ready", "--timeout=300s");
     const { tenantId, timelineId } = await record();
     const url = `http://127.0.0.1:7676/v1/tenant/${tenantId}/timeline/${timelineId}`;
