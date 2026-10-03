@@ -1,4 +1,4 @@
-# The lake service's image (src/service.js): Node, DuckDB's Node API, and the DuckDB
+# The lake service's image (src/service.ts): Node, DuckDB's Node API, and the DuckDB
 # extensions the lake loads, installed here so none is ever fetched at run time. The
 # base is glibc Debian because DuckDB's Node bindings are built for glibc. Published as
 # ghcr.io/eaucoin/alasio-lake by .github/workflows/release.yml.
@@ -11,9 +11,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
 # The extensions before the rest of the code, so a code change rebuilds only the last layer.
-COPY src/extensions.js src/install-extensions.js src/
-RUN node src/install-extensions.js /opt/lake/extensions && chmod -R a+rX /opt/lake/extensions
+COPY src/extensions.ts src/install-extensions.ts src/
+RUN node src/install-extensions.ts /opt/lake/extensions && chmod -R a+rX /opt/lake/extensions
 
 COPY src src
 ENV LAKE_EXTENSION_DIRECTORY=/opt/lake/extensions NODE_ENV=production
-CMD ["node", "src/service.js"]
+CMD ["node", "src/service.ts"]

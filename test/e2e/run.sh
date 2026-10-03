@@ -59,8 +59,8 @@ KUBECONFIG_OUT=$KUBECONFIG AGENTS=$agents "$root/deploy/k3d/cluster.sh" "$name" 
 
 # The stand-ins alasio talks to instead of Telegram and a telemetry backend.
 kubectl create namespace alasio-test
-kubectl --namespace alasio-test create configmap telegram-stub --from-file="$root/test/e2e/telegram-stub.mjs"
-kubectl --namespace alasio-test create configmap otlp-sink --from-file="$root/test/e2e/otlp-sink.mjs"
+kubectl --namespace alasio-test create configmap telegram-stub --from-file="$root/test/e2e/telegram-stub.ts"
+kubectl --namespace alasio-test create configmap otlp-sink --from-file="$root/test/e2e/otlp-sink.ts"
 kubectl --namespace alasio-test apply -f "$root/test/e2e/telegram-stub.yaml" -f "$root/test/e2e/otlp-sink.yaml"
 kubectl --namespace alasio-test rollout status deployment/telegram-stub deployment/otlp-sink --timeout=300s
 
@@ -92,5 +92,5 @@ helm install alasio "$root/charts/alasio" --namespace alasio --wait --timeout 20
   --set-string "images.lake.repository=$images/alasio-lake,images.lake.tag=e2e"
 
 cd "$root"
-ALASIO_E2E_TELEMETRY=1 node --test --test-concurrency=1 --test-timeout=1800000 test/e2e/alasio.test.mjs
+ALASIO_E2E_TELEMETRY=1 node --test --test-concurrency=1 --test-timeout=1800000 test/e2e/alasio.test.ts
 npm run test:neon

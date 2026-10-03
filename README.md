@@ -70,7 +70,7 @@ Every Claude Code transcript entry and Codex rollout line is also a row in an
 analytics lake, which you query read-only with
 
 ```sh
-kubectl -n alasio exec deployment/alasio-lake -- node src/query.js "SELECT count(*) FROM claude.entries"
+kubectl -n alasio exec deployment/alasio-lake -- node src/query.ts "SELECT count(*) FROM claude.entries"
 ```
 
 alasio exports OpenTelemetry traces, metrics, and logs, over OTLP, to wherever

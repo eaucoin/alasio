@@ -14,7 +14,7 @@ tests:
     documentSelector: { path: kind, value: Job }
     asserts:
       - equal: { path: 'metadata.annotations["helm.sh/hook"]', value: "pre-install,pre-upgrade" }
-      - equal: { path: 'spec.template.spec.containers[0].command', value: [node, /opt/alasio/neon/control/kube-setup.js] }
+      - equal: { path: 'spec.template.spec.containers[0].command', value: [node, /opt/alasio/neon/control/kube-setup.ts] }
       - notContains:
           path: spec.template.spec.containers[0].env
           content: { name: S3_EXTERNAL, value: "1" }

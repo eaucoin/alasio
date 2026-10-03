@@ -6,7 +6,7 @@
 {{- range $index := until (int .Values.neon.safekeepers.replicas) -}}
 {{- $hosts = append $hosts (printf "%s-%d.%s.%s.svc.cluster.local" $safekeeper $index $safekeeper $.Release.Namespace) -}}
 {{- end -}}
-# neon-control: alasio's stand-in for Neon's control plane (neon/control/service.js). It
+# neon-control: alasio's stand-in for Neon's control plane (neon/control/service.ts). It
 # bootstraps the tenant and timeline, serves the compute its spec, answers the storage
 # controller's hooks, and repairs a safekeeper that lost its disk. Its record of what it
 # bootstrapped is on a volume of its own.
@@ -49,7 +49,7 @@ spec:
         - name: neon-control
           image: {{ include "alasio.image" (dict "image" .Values.images.alasio "root" .) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: [node, /opt/alasio/neon/control/service.js]
+          command: [node, /opt/alasio/neon/control/service.ts]
           env:
             - { name: CONTROLLER_URL, value: {{ printf "http://%s:1234" (include "alasio.neonName" (dict "root" . "component" "storage-controller")) | quote }} }
             - { name: NEON_SAFEKEEPER_HOSTS, value: {{ join "," $hosts | quote }} }

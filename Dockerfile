@@ -40,4 +40,4 @@ ENV NODE_ENV=production
 # tini reaps what the harnesses leave behind and passes SIGTERM on, so alasio shuts
 # down cleanly when its pod stops.
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "/opt/alasio/src/index.js"]
+CMD ["node", "/opt/alasio/src/index.ts"]

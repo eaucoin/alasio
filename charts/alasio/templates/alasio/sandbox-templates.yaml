@@ -1,5 +1,5 @@
 {{- /*
-The templates alasio makes its workspaces' Sandboxes from (src/kube/config.js): a
+The templates alasio makes its workspaces' Sandboxes from (src/kube/config.ts): a
 session filesystem's, and a folder workspace's bayma's. alasio adds to each what is
 per Sandbox: its name and labels, bayma's token, and a session's network mode.
 */ -}}

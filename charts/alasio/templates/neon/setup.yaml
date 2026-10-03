@@ -2,7 +2,7 @@
 {{- $name := include "alasio.neonName" (dict "root" . "component" "setup") -}}
 {{- $full := include "alasio.fullname" . -}}
 # The stack's secrets, made once and kept, and each service's rendered from them, by
-# neon/control/kube-setup.js before anything of the release starts.
+# neon/control/kube-setup.ts before anything of the release starts.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -68,7 +68,7 @@ spec:
         - name: setup
           image: {{ include "alasio.image" (dict "image" .Values.images.alasio "root" .) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: [node, /opt/alasio/neon/control/kube-setup.js]
+          command: [node, /opt/alasio/neon/control/kube-setup.ts]
           env:
             - name: NAMESPACE
               valueFrom:

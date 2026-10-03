@@ -14,5 +14,5 @@ Restart it:
   kubectl --namespace {{ .Release.Namespace }} rollout restart deployment/{{ include "alasio.fullname" . }}
 {{- if and .Values.lake.enabled .Values.neon.enabled }}
 Query the analytics lake:
-  kubectl --namespace {{ .Release.Namespace }} exec deployment/{{ include "alasio.componentName" (dict "root" . "component" "lake") }} -- node src/query.js "SELECT count(*) FROM claude.entries"
+  kubectl --namespace {{ .Release.Namespace }} exec deployment/{{ include "alasio.componentName" (dict "root" . "component" "lake") }} -- node src/query.ts "SELECT count(*) FROM claude.entries"
 {{- end }}

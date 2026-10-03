@@ -1,0 +1,49 @@
+// @ts-nocheck
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { buildClaudeEnv } from "./env.ts";
+
+/**
+ * The models this machine's Claude login can use, in the shape /model shows.
+ *
+ * `supportedModels()` is a control request, so it needs a live CLI process but
+ * not a turn: the prompt stream below never yields, and the process is closed
+ * as soon as the list arrives.
+ */
+export async function listClaudeModels({ workingDirectory, queryFactory = query } = {}) {
+  const idle = {
+    async *[Symbol.asyncIterator]() {
+      await new Promise(() => {});
+    },
+  };
+  const controller = new AbortController();
+  const q = queryFactory({
+    prompt: idle,
+    options: {
+      cwd: workingDirectory,
+      env: buildClaudeEnv(),
+      abortController: controller,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      persistSession: false,
+    },
+  });
+  try {
+    const models = await q.supportedModels();
+    return models.map((model) => ({
+      id: model.value,
+      label: model.displayName ?? model.value,
+      description: model.description ?? "",
+      resolvedModel: model.resolvedModel ?? model.value,
+      efforts: model.supportsEffort ? [...(model.supportedEffortLevels ?? [])] : [],
+      defaultEffort: null,
+      isDefault: model.value === "default",
+    }));
+  } finally {
+    controller.abort();
+    try {
+      q.close?.();
+    } catch {
+      // Already closed.
+    }
+  }
+}

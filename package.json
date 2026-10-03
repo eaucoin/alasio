@@ -4,13 +4,14 @@
   "private": true,
   "type": "module",
   "description": "Alasio Telegram bridge runtime",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "scripts": {
-    "start": "node ./src/index.js",
-    "doctor:telegram": "node ./src/telegram/doctor.js",
-    "test": "node --test test/*.test.js",
-    "test:neon": "node --test --test-concurrency=1 --test-timeout=1800000 neon/test/stack.test.js",
-    "lake": "node ./src/neon/lake-query.js"
+    "start": "node ./src/index.ts",
+    "doctor:telegram": "node ./src/telegram/doctor.ts",
+    "typecheck": "tsc -p .",
+    "test": "node --test test/*.test.ts",
+    "test:neon": "node --test --test-concurrency=1 --test-timeout=1800000 neon/test/stack.test.ts",
+    "lake": "node ./src/neon/lake-query.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.280",
@@ -40,6 +41,10 @@
     "@opentelemetry/sdk-logs": "^0.222.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",
     "@opentelemetry/sdk-trace-base": "^2.11.0",
-    "protobufjs": "^7.6.6"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.19.1",
+    "@types/pg": "^8.23.1",
+    "protobufjs": "^7.6.6",
+    "typescript": "7.0.2"
   }
 }
