@@ -406,6 +406,8 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     const config: ServedComputeConfig = JSON.parse(await kubectl(
       "exec", `deployment/${neonName("control")}`, "--", "node", "-e",
       'fetch("http://127.0.0.1:8080/compute/api/v2/computes/alasio/spec", { headers: { authorization: "Bearer " + process.argv[1] } }).then((r) => r.text()).then((t) => process.stdout.write(t))',
+      // The token is random, and one starting with "-" would be read as an option of node's.
+      "--",
       computeToken,
     ));
     delete config.status;
