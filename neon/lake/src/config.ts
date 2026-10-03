@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The lake's configuration, from its environment, which the stack's compose.env
  * gives it (neon/control/setup.js). Every setting has a stated meaning and those
@@ -20,19 +19,50 @@
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
  */
 
+/** A Postgres database the lake connects to, as role `lake`. */
+export interface DatabaseConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+}
+
+/** The object store an s3:// data path is in. */
+export interface S3Config {
+  endpoint: string;
+  key: string;
+  secret: string;
+}
+
+export interface LakeConfig {
+  /** alasio's database, which the lake loads from. */
+  source: DatabaseConfig;
+  /** DuckLake's catalog. */
+  catalog: DatabaseConfig;
+  dataPath: string;
+  s3: S3Config | null;
+  intervalMs: number;
+  maintenanceIntervalMs: number;
+  memoryLimit: string;
+  threads: number;
+  extensionDirectory: string | null;
+  httpPort: number;
+}
+
 const ROLE = "lake";
 
-function required(env, name) {
+function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (!value) throw new Error(`${name} is not set`);
   return value;
 }
 
-function optional(env, name, fallback) {
+function optional(env: NodeJS.ProcessEnv, name: string, fallback: string): string {
   return env[name]?.trim() || fallback;
 }
 
-function positive(env, name, fallback) {
+function positive(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = env[name]?.trim();
   if (!raw) return fallback;
   const value = Number(raw);
@@ -40,8 +70,8 @@ function positive(env, name, fallback) {
   return value;
 }
 
-export function loadConfig(env = process.env) {
-  const database = (name) => ({
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
+  const database = (name: string): DatabaseConfig => ({
     host: required(env, "LAKE_DATABASE_HOST"),
     port: positive(env, "LAKE_DATABASE_PORT", 5432),
     user: ROLE,
@@ -64,7 +94,7 @@ export function loadConfig(env = process.env) {
     maintenanceIntervalMs: positive(env, "LAKE_MAINTENANCE_HOURS", 24) * 3_600_000,
     memoryLimit: optional(env, "LAKE_MEMORY_LIMIT", "1GB"),
     threads: positive(env, "LAKE_THREADS", 2),
-    extensionDirectory: env.LAKE_EXTENSION_DIRECTORY?.trim() || null,
+    extensionDirectory: env["LAKE_EXTENSION_DIRECTORY"]?.trim() || null,
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
   };
 }

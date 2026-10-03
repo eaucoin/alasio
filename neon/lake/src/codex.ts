@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Loads Codex's rollout files (codex_sessions and codex_sessionfs_sessions,
  * src/codex/rollouts/store.ts) into the lake, a row per line.
@@ -10,10 +9,59 @@
  * lines are loaded: a line still being written is loaded once its newline lands.
  * Each file's load is one transaction, its lines and its record together.
  */
+import type { DuckDBConnection } from "@duckdb/node-api";
+
 import { LAKE, SOURCE, rows, transaction } from "./lake.ts";
 
+/** A Codex home the source mirrors, and the schema it is kept in. */
+export interface CodexHome {
+  home: string;
+  schema: string;
+}
+
+export interface CodexSyncOptions {
+  /** For tests: runs inside each file's transaction just before it commits. */
+  beforeCommit?: () => Promise<void>;
+}
+
+/** What a load changed: files loaded, and lines inserted into and deleted from the lake. */
+export interface CodexLoad {
+  files: number;
+  inserted: number;
+  deleted: number;
+}
+
+/** A rollout file as the source keeps it (src/codex/rollouts/store.ts). */
+interface SourceRollout {
+  name: string;
+  path: string;
+  thread_id: string;
+  rollout_id: string;
+  history_base: string | null;
+  size: bigint;
+  head_digest: string;
+  modified_ms: bigint;
+}
+
+/** The lake's record of a file it loaded. */
+interface LoadedFile {
+  name: string;
+  size: bigint;
+  head_digest: string;
+  loaded_bytes: bigint;
+  lines: bigint;
+  path: string;
+  modified_at: Date;
+}
+
+/** What stageLines staged: how many lines, and the offset just past the last. */
+interface StagedLines {
+  lines: number;
+  loadedBytes: number;
+}
+
 /** Each Codex home the source mirrors, by the schema it is kept in. */
-export const HOMES = [
+export const HOMES: readonly CodexHome[] = [
   { home: "folder", schema: "codex_sessions" },
   { home: "sessionfs", schema: "codex_sessionfs_sessions" },
 ];
@@ -34,7 +82,7 @@ const INSERT_LINES = `
       not json_valid(text) as malformed
     from codex_batch)`;
 
-async function sourceHas(db, schema) {
+async function sourceHas(db: DuckDBConnection, schema: string): Promise<boolean> {
   const found = await rows(
     db,
     `select 1 from duckdb_tables() where database_name = '${SOURCE}' and schema_name = $1 and table_name in ('rollouts', 'rollout_chunks')`,
@@ -48,10 +96,15 @@ async function sourceHas(db, schema) {
  * reading its chunks in order so no more than one is held at a time. Returns
  * `{ lines, loadedBytes }`: how many lines, and the offset just past the last.
  */
-async function stageLines(db, schema, name, { from, firstLine }) {
+async function stageLines(
+  db: DuckDBConnection,
+  schema: string,
+  name: string,
+  { from, firstLine }: { from: number; firstLine: number },
+): Promise<StagedLines> {
   await db.run(`create or replace temp table codex_batch (line_number BIGINT, byte_offset BIGINT, text VARCHAR)`);
   const appender = await db.createAppender("codex_batch", "main", "temp");
-  const chunks = await rows(
+  const chunks = await rows<{ start: bigint; length: bigint }>(
     db,
     `select start, octet_length(bytes) as length from ${SOURCE}.${schema}.rollout_chunks where name = $1 order by start`,
     [name],
@@ -64,7 +117,8 @@ async function stageLines(db, schema, name, { from, firstLine }) {
       const start = Number(chunk.start);
       const end = start + Number(chunk.length);
       if (end <= from) continue;
-      const [{ bytes }] = await rows(db, `select bytes from ${SOURCE}.${schema}.rollout_chunks where name = $1 and start = $2`, [name, chunk.start]);
+      // The chunk was just listed, and the source is only read.
+      const { bytes } = (await rows<{ bytes: Uint8Array }>(db, `select bytes from ${SOURCE}.${schema}.rollout_chunks where name = $1 and start = $2`, [name, chunk.start]))[0]!;
       const piece = Buffer.from(bytes).subarray(Math.max(0, from - start));
       const buffer = carry.length ? Buffer.concat([carry, piece]) : piece;
       let lineStart = 0;
@@ -86,7 +140,7 @@ async function stageLines(db, schema, name, { from, firstLine }) {
 }
 
 /** Replaces the lake's record of a file. */
-async function recordFile(db, home, file, { loadedBytes, lines }) {
+async function recordFile(db: DuckDBConnection, home: string, file: SourceRollout, { loadedBytes, lines }: StagedLines): Promise<void> {
   await db.run(`delete from ${LAKE}.codex.files where home = $1 and name = $2`, [home, file.name]);
   await db.run(
     `insert into ${LAKE}.codex.files values ($1, $2, $3, $4, $5, $6, $7, $8, make_timestamptz($9::BIGINT * 1000), $10, $11)`,
@@ -99,13 +153,13 @@ async function recordFile(db, home, file, { loadedBytes, lines }) {
  * source has. `beforeCommit`, for tests, runs inside each file's transaction just
  * before it commits. Returns `{ files, inserted, deleted }`: files loaded, and lines.
  */
-export async function syncCodex(db, { beforeCommit = async () => {} } = {}) {
+export async function syncCodex(db: DuckDBConnection, { beforeCommit = async () => {} }: CodexSyncOptions = {}): Promise<CodexLoad> {
   const totals = { files: 0, inserted: 0, deleted: 0 };
   for (const { home, schema } of HOMES) {
     if (!(await sourceHas(db, schema))) continue;
-    const source = await rows(db, `select name, path, thread_id, rollout_id, history_base, size, head_digest, modified_ms from ${SOURCE}.${schema}.rollouts`);
+    const source = await rows<SourceRollout>(db, `select name, path, thread_id, rollout_id, history_base, size, head_digest, modified_ms from ${SOURCE}.${schema}.rollouts`);
     const kept = new Map(
-      (await rows(db, `select name, size, head_digest, loaded_bytes, lines, path, modified_at from ${LAKE}.codex.files where home = $1`, [home]))
+      (await rows<LoadedFile>(db, `select name, size, head_digest, loaded_bytes, lines, path, modified_at from ${LAKE}.codex.files where home = $1`, [home]))
         .map((file) => [file.name, file]),
     );
     const names = new Set(source.map((file) => file.name));

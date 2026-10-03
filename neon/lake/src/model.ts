@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The lake's model: what each table and view holds, and its version.
  *
@@ -17,7 +16,14 @@
  * The lake is derived: alasio's Neon is the source of truth. A model this version
  * does not match is dropped and loaded again from it (ensureModel).
  */
+import type { DuckDBConnection } from "@duckdb/node-api";
+
 import { LAKE, rows } from "./lake.ts";
+
+export interface RebuildOptions {
+  /** Drop the lake whatever its model version, to be loaded again from its source. */
+  rebuild?: boolean;
+}
 
 /** Bumped whenever a table changes shape; the lake then rebuilds from its source. */
 export const MODEL_VERSION = 1;
@@ -119,7 +125,7 @@ const VIEWS = {
 
 const SCHEMAS = ["claude", "codex", "loader"];
 
-async function create(db) {
+async function create(db: DuckDBConnection): Promise<void> {
   for (const schema of SCHEMAS) await db.run(`create schema if not exists ${LAKE}.${schema}`);
   for (const [table, columns] of Object.entries(TABLES)) {
     await db.run(`create table if not exists ${LAKE}.${table} (${columns})`);
@@ -132,16 +138,16 @@ async function create(db) {
   await db.run("use memory");
 }
 
-async function drop(db) {
+async function drop(db: DuckDBConnection): Promise<void> {
   for (const view of Object.keys(VIEWS)) await db.run(`drop view if exists ${LAKE}.${view}`);
   for (const table of Object.keys(TABLES)) await db.run(`drop table if exists ${LAKE}.${table}`);
 }
 
 /** The model version the lake was built with, or null for a lake not yet built. */
-export async function lakeModelVersion(db) {
+export async function lakeModelVersion(db: DuckDBConnection): Promise<number | null> {
   const [schema] = await rows(db, `select 1 from duckdb_tables() where database_name = '${LAKE}' and schema_name = 'loader' and table_name = 'meta'`);
   if (!schema) return null;
-  const [row] = await rows(db, `select value from ${LAKE}.loader.meta where key = 'model_version'`);
+  const [row] = await rows<{ value: string }>(db, `select value from ${LAKE}.loader.meta where key = 'model_version'`);
   return row ? Number(row.value) : null;
 }
 
@@ -150,7 +156,7 @@ export async function lakeModelVersion(db) {
  * dropped first, to be loaded again from its source; `rebuild` drops it whatever its
  * version. Returns whether it was (re)built empty.
  */
-export async function ensureModel(db, { rebuild = false } = {}) {
+export async function ensureModel(db: DuckDBConnection, { rebuild = false }: RebuildOptions = {}): Promise<boolean> {
   const version = await lakeModelVersion(db);
   if (version === MODEL_VERSION && !rebuild) {
     await create(db);

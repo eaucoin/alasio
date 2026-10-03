@@ -1,5 +1,19 @@
-// @ts-nocheck
-export function parseCommand(text) {
+/** A command the operator typed into a conversation, as parseCommand reads it. */
+export type OperatorCommand =
+    | { readonly type: "stop" }
+    | { readonly type: "session_panel" }
+    | { readonly type: "model" }
+    | { readonly type: "service"; readonly target: string }
+    | { readonly type: "workspace"; readonly args: string }
+    | { readonly type: "sessions_panel" }
+    | { readonly type: "sessions_new" }
+    | { readonly type: "goal"; readonly args: string }
+    | { readonly type: "sessions"; readonly page: number }
+    | { readonly type: "rewind_exec"; readonly index: number }
+    | { readonly type: "rewind_list"; readonly page: number }
+    | { readonly type: "resume"; readonly ref: string; readonly followUp: string };
+
+export function parseCommand(text: string): OperatorCommand | null {
     const trimmed = text.trim();
     const normalized = trimmed.replace(/^\/([a-z][a-z0-9_]*)(?:@[a-z0-9_]+)?/i, "/$1");
     if (normalized.toLowerCase() === "!stop" || normalized.toLowerCase() === "/stop") {
@@ -36,7 +50,8 @@ export function parseCommand(text) {
     }
     const rewindExecMatch = /^!rewind\s+(-\d+)$/i.exec(trimmed);
     if (rewindExecMatch) {
-        return { type: "rewind_exec", index: Number.parseInt(rewindExecMatch[1], 10) };
+        // The group is not optional, so every match fills it and the `?? ""` never applies.
+        return { type: "rewind_exec", index: Number.parseInt(rewindExecMatch[1] ?? "", 10) };
     }
     const rewindListMatch = /^!rewind(?:\s+page\s+(\d+))?$/i.exec(trimmed);
     if (rewindListMatch) {

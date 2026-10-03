@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Starts the OpenTelemetry SDK for the signals ./config.ts resolves, before the rest of
  * alasio is loaded (see src/index.ts), and stops it, flushing what it holds, as alasio
@@ -8,17 +7,18 @@ import { execFileSync } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { diag, DiagLogLevel } from "@opentelemetry/api";
+import { diag, type DiagLogFunction, type DiagLogger, DiagLogLevel } from "@opentelemetry/api";
+import type { NodeSDK } from "@opentelemetry/sdk-node";
 
 import { resolveTelemetry, SIGNALS, telemetryEnabled } from "./config.ts";
 
 /** The modules alasio's instrumentations patch, which the import hook must intercept. */
 const INSTRUMENTED_MODULES = ["pg", "pg-pool", "http", "https", "node:http", "node:https"];
 
-let sdk = null;
+let sdk: NodeSDK | null = null;
 
 /** The commit alasio runs from, or null outside a git checkout. */
-function revision() {
+function revision(): string | null {
   try {
     return execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: dirname(fileURLToPath(import.meta.url)),
@@ -31,12 +31,17 @@ function revision() {
 }
 
 /** The SDK's own problems, exporting above all, as alasio logs: on the console only. */
-const diagnostics = Object.fromEntries(["error", "warn", "info", "debug", "verbose"].map((level) => [
-  level,
-  (message, ...args) => (level === "error" ? console.error : console.warn)(`[telemetry] ${[message, ...args].join(" ")}`),
-]));
+const diagnostic = (level: keyof DiagLogger): DiagLogFunction =>
+  (message, ...args) => (level === "error" ? console.error : console.warn)(`[telemetry] ${[message, ...args].join(" ")}`);
+const diagnostics: DiagLogger = {
+  error: diagnostic("error"),
+  warn: diagnostic("warn"),
+  info: diagnostic("info"),
+  debug: diagnostic("debug"),
+  verbose: diagnostic("verbose"),
+};
 
-export async function startTelemetry(env = process.env) {
+export async function startTelemetry(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const telemetry = resolveTelemetry(env);
   if (!telemetryEnabled(telemetry)) {
     return;
@@ -75,7 +80,7 @@ export async function startTelemetry(env = process.env) {
 }
 
 /** Flushes and stops the SDK, if it was started. */
-export async function stopTelemetry() {
+export async function stopTelemetry(): Promise<void> {
   await sdk?.shutdown();
   sdk = null;
 }

@@ -1,14 +1,22 @@
-// @ts-nocheck
-import { harnessDisplayName } from "../harness/names.ts";
+import { harnessDisplayName, type HarnessName } from "../harness/names.ts";
+import type { RestartCause } from "../persistence/restart-repository.ts";
+
+/** How the post-restart prompts name what alasio runs as and how it is restarted. */
+export interface RestartPaths {
+  readonly unit: string;
+  readonly restartFact: string;
+  readonly restartPath: string;
+  readonly rawRestart: string;
+}
 
 /**
  * What this process runs as and how it is restarted, in the words the post-restart
  * prompts use: its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE, which the chart
  * sets) and a rollout restart of it.
  */
-export function resolveRestartPaths(env = process.env) {
-  const deployment = env.ALASIO_DEPLOYMENT?.trim() || "alasio";
-  const namespace = env.ALASIO_NAMESPACE?.trim() || "alasio";
+export function resolveRestartPaths(env: NodeJS.ProcessEnv = process.env): RestartPaths {
+  const deployment = env["ALASIO_DEPLOYMENT"]?.trim() || "alasio";
+  const namespace = env["ALASIO_NAMESPACE"]?.trim() || "alasio";
   return {
     unit: `the Kubernetes Deployment ${deployment} in namespace ${namespace}`,
     restartFact: `Fact: the documented Alasio restart is \`kubectl -n ${namespace} rollout restart deployment/${deployment}\`.\n\n`,
@@ -17,7 +25,11 @@ export function resolveRestartPaths(env = process.env) {
   };
 }
 
-export function buildRestartSyntheticText(cause, harness = "codex", env = process.env) {
+export function buildRestartSyntheticText(
+  cause: RestartCause,
+  harness: HarnessName | null = "codex",
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const agentName = harnessDisplayName(harness);
   const { unit, restartFact, restartPath, rawRestart } = resolveRestartPaths(env);
   const header = "[SYSTEM RESTART EVENT]\n\n" +

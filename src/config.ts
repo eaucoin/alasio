@@ -1,11 +1,26 @@
-// @ts-nocheck
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { getDefaultHarness } from "./harness/names.ts";
+import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
 import { resolveHookPort } from "./shared/runtime-constants.ts";
 
-export function requireEnv(key) {
+/** alasio's configuration, as its environment sets it. */
+export interface AlasioConfig {
+  readonly telegramBotToken: string;
+  readonly allowedUserIds: string;
+  readonly workingDirectory: string | null;
+  readonly workspaceRoot: string;
+  readonly stateDir: string;
+  readonly dbPath: string;
+  readonly hookPort: number;
+  readonly warmLinkedSessions: boolean;
+  readonly defaultHarness: HarnessName | null;
+}
+
+/** How alasio talks to Codex: through `codex exec` or a Codex app-server. */
+export type CodexTransportMode = "exec" | "app-server";
+
+export function requireEnv(key: string): string {
   const value = process.env[key];
   if (!value) {
     throw new Error(`Missing required environment variable: ${key}`);
@@ -18,42 +33,42 @@ export function requireEnv(key) {
  * directory for existing deployments, otherwise under the operator's home so a
  * second bot never shares a database with the first.
  */
-export function resolveStateDir(env = process.env) {
-  if (env.ALASIO_STATE_DIR?.trim()) {
-    return env.ALASIO_STATE_DIR.trim();
+export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  if (env["ALASIO_STATE_DIR"]?.trim()) {
+    return env["ALASIO_STATE_DIR"].trim();
   }
-  if (env.WORKING_DIRECTORY?.trim()) {
-    return join(env.WORKING_DIRECTORY.trim(), ".alasio");
+  if (env["WORKING_DIRECTORY"]?.trim()) {
+    return join(env["WORKING_DIRECTORY"].trim(), ".alasio");
   }
   return join(homedir(), ".alasio");
 }
 
-export function loadAlasioConfig(env = process.env) {
+export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioConfig {
   const stateDir = resolveStateDir(env);
   return {
     telegramBotToken: requireEnv("TELEGRAM_BOT_TOKEN"),
-    allowedUserIds: env.TELEGRAM_ALLOWED_USER_IDS ?? "",
+    allowedUserIds: env["TELEGRAM_ALLOWED_USER_IDS"] ?? "",
     // Optional pre-mount for new conversations; unset means the operator picks a folder in Telegram.
-    workingDirectory: env.WORKING_DIRECTORY?.trim() || null,
+    workingDirectory: env["WORKING_DIRECTORY"]?.trim() || null,
     // Every folder chosen or created from Telegram must live directly under this root.
-    workspaceRoot: env.ALASIO_WORKSPACE_ROOT?.trim() || homedir(),
+    workspaceRoot: env["ALASIO_WORKSPACE_ROOT"]?.trim() || homedir(),
     stateDir,
     dbPath: join(stateDir, "alasio.sqlite"),
     hookPort: resolveHookPort(env),
-    warmLinkedSessions: env.ALASIO_WARM_LINKED_SESSIONS === "1",
+    warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),
   };
 }
 
-export function getCodexTransportMode() {
-  return process.env.ALASIO_CODEX_TRANSPORT === "exec" ? "exec" : "app-server";
+export function getCodexTransportMode(): CodexTransportMode {
+  return process.env["ALASIO_CODEX_TRANSPORT"] === "exec" ? "exec" : "app-server";
 }
 
-export function getCodexBinaryOverride() {
-  return process.env.ALASIO_CODEX_BIN || null;
+export function getCodexBinaryOverride(): string | null {
+  return process.env["ALASIO_CODEX_BIN"] || null;
 }
 
-export function readPositiveIntEnv(key, fallback, env = process.env) {
+export function readPositiveIntEnv(key: string, fallback: number, env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[key];
   if (!raw?.trim()) {
     return fallback;

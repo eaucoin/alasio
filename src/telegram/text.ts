@@ -1,10 +1,9 @@
-// @ts-nocheck
-export function splitTelegramText(text) {
+export function splitTelegramText(text: string): string[] {
   const limit = 4096;
   if (text.length <= limit) {
     return [text || " "];
   }
-  const chunks = [];
+  const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > limit) {
     let cut = remaining.lastIndexOf("\n\n", limit);

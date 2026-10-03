@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { resolveCommandTokens, tokenizeShellCommand, unwrapShellCommand } from "./shell-command.ts";
 
 const SUPABASE_QUERY_ENDPOINT_PATTERN = /(?:\/v1\/projects\/[^/]+\/database\/query(?:\b|[?&/])|api\.supabase\.com\/v1\/projects\/[^/]+\/database\/query(?:\b|[?&/]))/i;
@@ -6,7 +5,7 @@ const SUPABASE_TOKEN_FILE_PATTERN = /(?:^|\/)\.(?:supabase|config\/supabase)\/ac
 
 export const MAX_DB_GUARDRAIL_RECOVERY_ATTEMPTS = 1;
 
-function isDirectSupabaseCredentialProbe(normalizedCommand, exe, tokens) {
+function isDirectSupabaseCredentialProbe(normalizedCommand: string, exe: string, tokens: readonly string[]): boolean {
   if (exe === "printenv" && tokens[1] === "SUPABASE_ACCESS_TOKEN") {
     return true;
   }
@@ -26,7 +25,7 @@ function isDirectSupabaseCredentialProbe(normalizedCommand, exe, tokens) {
   return false;
 }
 
-export function isBlockedDbCommand(command) {
+export function isBlockedDbCommand(command: string): boolean {
   const normalizedCommand = unwrapShellCommand(command);
   const tokens = tokenizeShellCommand(normalizedCommand);
   if (tokens.length === 0) {
@@ -75,7 +74,7 @@ export function isBlockedDbCommand(command) {
   return false;
 }
 
-export function buildDbGuardrailSyntheticText(command) {
+export function buildDbGuardrailSyntheticText(command: string): string {
   return "[SYSTEM GUARDRAIL EVENT]\n\n" +
     "Your attempted tool command was blocked by the monorepo DB guardrail.\n\n" +
     `Blocked command: \`${command}\`\n\n` +
@@ -90,7 +89,7 @@ export function buildDbGuardrailSyntheticText(command) {
     "- If the blocked command was central to the plan, briefly explain the constraint to the user and propose the compliant alternative.";
 }
 
-export function buildDbGuardrailFallbackText(command) {
+export function buildDbGuardrailFallbackText(command: string): string {
   return "I hit the monorepo DB guardrail while trying to continue. " +
     `The blocked command was \`${command}\`. ` +
     "Local DB access and local schema pull are forbidden here, so I need to continue with the readonly query CLI for inspection and CI workflows for schema reconciliation.";

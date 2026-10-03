@@ -1,4 +1,5 @@
-// @ts-nocheck
+import type { Database } from "better-sqlite3";
+
 const SCHEMA_VERSION = "8";
 
 const SQLITE_SCHEMA_SQL = `
@@ -200,9 +201,19 @@ const SQLITE_SCHEMA_SQL = `
     on turns (state, started_at);
 `;
 
-export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) {
+/** A row of `pragma table_info`, as far as migrations read it. */
+interface ColumnInfo {
+  readonly name: string;
+  readonly notnull: 0 | 1;
+}
+
+export interface SchemaMigrationOptions {
+  readonly legacyWorkingDirectory?: string | null | undefined;
+}
+
+export function migrateSqliteSchema(db: Database, { legacyWorkingDirectory = null }: SchemaMigrationOptions = {}): void {
     db.exec(SQLITE_SCHEMA_SQL);
-    const promptJobColumns = new Set(db.prepare("pragma table_info(prompt_jobs)").all().map((column) => column.name));
+    const promptJobColumns = new Set(db.prepare<[], ColumnInfo>("pragma table_info(prompt_jobs)").all().map((column) => column.name));
     if (!promptJobColumns.has("upstream_completed_at")) {
       db.exec("alter table prompt_jobs add column upstream_completed_at real");
     }
@@ -212,10 +223,10 @@ export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) 
     if (!promptJobColumns.has("traceparent")) {
       db.exec("alter table prompt_jobs add column traceparent text");
     }
-    if (!db.prepare("pragma table_info(telegram_outbox)").all().some((column) => column.name === "traceparent")) {
+    if (!db.prepare<[], ColumnInfo>("pragma table_info(telegram_outbox)").all().some((column) => column.name === "traceparent")) {
       db.exec("alter table telegram_outbox add column traceparent text");
     }
-    const conversationColumnInfo = db.prepare("pragma table_info(conversations)").all();
+    const conversationColumnInfo = db.prepare<[], ColumnInfo>("pragma table_info(conversations)").all();
     const conversationColumns = new Set(conversationColumnInfo.map((column) => column.name));
     if (!conversationColumns.has("claude_session_id")) {
       db.exec("alter table conversations add column claude_session_id text");
@@ -253,13 +264,13 @@ export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) 
       // Conversations mounted before folders were per-conversation ran in the
       // deployment's WORKING_DIRECTORY; keep them there instead of stranding them
       // behind the folder picker.
-      db.prepare(`
+      db.prepare<[string]>(`
         update conversations
         set working_directory = ?
         where working_directory is null and active_harness is not null
       `).run(legacyWorkingDirectory);
     }
-    const turnColumns = new Set(db.prepare("pragma table_info(turns)").all().map((column) => column.name));
+    const turnColumns = new Set(db.prepare<[], ColumnInfo>("pragma table_info(turns)").all().map((column) => column.name));
     if (!turnColumns.has("harness")) {
       db.exec("alter table turns add column harness text not null default 'codex'");
     }
@@ -292,7 +303,7 @@ export function migrateSqliteSchema(db, { legacyWorkingDirectory = null } = {}) 
         on telegram_outbox (pending_response_id)
         where pending_response_id is not null;
     `);
-    db.prepare(`
+    db.prepare<[string]>(`
       insert into bot_state (key, value, updated_at)
       values ('schema_version', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at

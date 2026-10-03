@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Loads Claude Code's transcript entries (claude_sessions.entries, src/harness/
  * claude/session-store.ts) into the lake: every entry the source holds and the
@@ -11,14 +10,29 @@
  * transaction, so a load cut short leaves whole entries and loads the rest next
  * time.
  */
+import type { DuckDBConnection } from "@duckdb/node-api";
+
 import { LAKE, SOURCE, rows, transaction } from "./lake.ts";
+
+export interface ClaudeSyncOptions {
+  /** Entries loaded per transaction. */
+  batchEntries?: number;
+  /** For tests: runs inside each batch's transaction just before it commits. */
+  beforeCommit?: () => Promise<void>;
+}
+
+/** What a load changed: entries inserted into and deleted from the lake. */
+export interface ClaudeLoad {
+  inserted: number;
+  deleted: number;
+}
 
 const SOURCE_TABLE = `${SOURCE}.claude_sessions.entries`;
 
 /** Entries loaded per transaction, which bounds a batch's memory. */
 export const BATCH_ENTRIES = 1000;
 
-const usage = (field) => `try_cast(entry->'message'->'usage'->>'${field}' as BIGINT)`;
+const usage = (field: string) => `try_cast(entry->'message'->'usage'->>'${field}' as BIGINT)`;
 
 const INSERT_ENTRIES = `
   insert into ${LAKE}.claude.entries
@@ -79,13 +93,17 @@ const INSERT_BLOCKS = `
  * runs inside each batch's transaction just before it commits. Returns
  * `{ inserted, deleted }`.
  */
-export async function syncClaude(db, { batchEntries = BATCH_ENTRIES, beforeCommit = async () => {} } = {}) {
+export async function syncClaude(
+  db: DuckDBConnection,
+  { batchEntries = BATCH_ENTRIES, beforeCommit = async () => {} }: ClaudeSyncOptions = {},
+): Promise<ClaudeLoad> {
   await db.run(`create or replace temp table claude_source_seq as select seq from ${SOURCE_TABLE}`);
   await db.run(`create or replace temp table claude_lake_seq as select seq from ${LAKE}.claude.entries`);
   await db.run(`create or replace temp table claude_gone as select seq from claude_lake_seq except select seq from claude_source_seq`);
   await db.run(`create or replace temp table claude_missing as select seq from claude_source_seq except select seq from claude_lake_seq`);
 
-  const [{ gone }] = await rows(db, "select count(*) as gone from claude_gone");
+  // A count is one row.
+  const { gone } = (await rows<{ gone: bigint }>(db, "select count(*) as gone from claude_gone"))[0]!;
   if (gone > 0n) {
     await transaction(db, async () => {
       await db.run(`delete from ${LAKE}.claude.content_blocks where seq in (select seq from claude_gone)`);
@@ -94,7 +112,7 @@ export async function syncClaude(db, { batchEntries = BATCH_ENTRIES, beforeCommi
     });
   }
 
-  const missing = (await rows(db, "select seq from claude_missing order by seq")).map((row) => row.seq);
+  const missing = (await rows<{ seq: bigint }>(db, "select seq from claude_missing order by seq")).map((row) => row.seq);
   for (let at = 0; at < missing.length; at += batchEntries) {
     const batch = missing.slice(at, at + batchEntries);
     // The range is pushed down to Postgres; the membership test keeps what is missing.
@@ -108,7 +126,8 @@ export async function syncClaude(db, { batchEntries = BATCH_ENTRIES, beforeCommi
         from (select seq, project_key, session_id, subpath, uuid, mtime, entry::VARCHAR as text
               from ${SOURCE_TABLE}
               where seq between $1 and $2 and seq in (select seq from claude_missing))`,
-      [batch[0], batch.at(-1)],
+      // A batch is never empty.
+      [batch[0]!, batch.at(-1)!],
     );
     await transaction(db, async () => {
       await db.run(INSERT_ENTRIES);

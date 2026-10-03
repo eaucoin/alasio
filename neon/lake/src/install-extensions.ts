@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Installs the lake's DuckDB extensions into a directory, at image build time, and
  * loads each to prove it works, so the running lake never fetches one.

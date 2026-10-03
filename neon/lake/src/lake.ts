@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * A DuckDB connection to the lake: the DuckLake catalog in Postgres, its Parquet
  * files at the data path, and, for loading, alasio's database attached read-only as
@@ -9,22 +8,39 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DuckDBInstance } from "@duckdb/node-api";
+import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 
+import type { DatabaseConfig, LakeConfig } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
 export const LAKE = "lake";
 export const SOURCE = "source";
 
+/** The lake, open: a DuckDB connection, and how to close it. */
+export interface Lake {
+  db: DuckDBConnection;
+  close(): void;
+}
+
+export interface OpenLakeOptions {
+  /** Attach the lake read-only, for queries. */
+  readOnly?: boolean;
+  /** Attach alasio's database too, read-only, for loading. */
+  source?: boolean;
+}
+
+/** A row as DuckDB returns it, its values as plain JavaScript. */
+export type Row = Record<string, JS>;
+
 /** `value` as an SQL string literal. */
-export function literal(value) {
+export function literal(value: string): string {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 /** A libpq connection string for `database` (`{ host, port, user, password, database }`). */
-export function conninfo({ host, port, user, password, database }) {
-  const quote = (value) => `'${String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
+export function conninfo({ host, port, user, password, database }: DatabaseConfig): string {
+  const quote = (value: string | number) => `'${String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
   return [
     `host=${quote(host)}`,
     `port=${quote(port)}`,
@@ -39,8 +55,8 @@ export function conninfo({ host, port, user, password, database }) {
  * attaches alasio's database read-only, for loading. Returns `{ db, close }`, `db`
  * a DuckDB connection.
  */
-export async function openLake(config, { readOnly = false, source = !readOnly } = {}) {
-  const options = {
+export async function openLake(config: LakeConfig, { readOnly = false, source = !readOnly }: OpenLakeOptions = {}): Promise<Lake> {
+  const options: Record<string, string> = {
     memory_limit: config.memoryLimit,
     threads: String(config.threads),
     // Where a large load spills past the memory limit: scratch, never the lake.
@@ -82,13 +98,16 @@ export async function openLake(config, { readOnly = false, source = !readOnly } 
   }
 }
 
-/** The rows `sql` returns, as plain JavaScript values. */
-export async function rows(db, sql, values) {
-  return (await db.runAndReadAll(sql, values)).getRowObjectsJS();
+/**
+ * The rows `sql` returns, as plain JavaScript values. `Selected` names the columns
+ * `sql` selects and the values DuckDB gives them, which the caller's SQL decides.
+ */
+export async function rows<Selected = Row>(db: DuckDBConnection, sql: string, values?: DuckDBValue[]): Promise<Selected[]> {
+  return (await db.runAndReadAll(sql, values)).getRowObjectsJS() as Selected[];
 }
 
 /** Runs `work` in one transaction on the lake: all of it is committed, or none. */
-export async function transaction(db, work) {
+export async function transaction<T>(db: DuckDBConnection, work: () => Promise<T>): Promise<T> {
   await db.run("begin transaction");
   try {
     const result = await work();

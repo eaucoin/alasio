@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Harness identifiers shared by persistence, operator controls, and runtime selection.
  *
@@ -13,18 +12,24 @@
  */
 export const CODEX_HARNESS = "codex";
 export const CLAUDE_HARNESS = "claude";
-export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS]);
+export const HARNESS_NAMES = Object.freeze([CODEX_HARNESS, CLAUDE_HARNESS] as const);
 
-const DISPLAY_NAMES = Object.freeze({
+/** The name of a harness alasio can drive. */
+export type HarnessName = (typeof HARNESS_NAMES)[number];
+
+const DISPLAY_NAMES: Readonly<Record<HarnessName, string>> = Object.freeze({
   [CODEX_HARNESS]: "Codex",
   [CLAUDE_HARNESS]: "Claude",
 });
 
-export function isHarnessName(candidate) {
-  return typeof candidate === "string" && HARNESS_NAMES.includes(candidate);
+export function isHarnessName(candidate: unknown): candidate is HarnessName {
+  const names: readonly string[] = HARNESS_NAMES;
+  return typeof candidate === "string" && names.includes(candidate);
 }
 
-export function normalizeHarnessName(candidate, fallback = CODEX_HARNESS) {
+export function normalizeHarnessName(candidate: unknown, fallback?: HarnessName): HarnessName;
+export function normalizeHarnessName(candidate: unknown, fallback: HarnessName | null): HarnessName | null;
+export function normalizeHarnessName(candidate: unknown, fallback: HarnessName | null = CODEX_HARNESS): HarnessName | null {
   if (typeof candidate !== "string") {
     return fallback;
   }
@@ -38,8 +43,8 @@ export function normalizeHarnessName(candidate, fallback = CODEX_HARNESS) {
   return fallback;
 }
 
-export function harnessDisplayName(harness) {
-  return DISPLAY_NAMES[harness] ?? DISPLAY_NAMES[CODEX_HARNESS];
+export function harnessDisplayName(harness: HarnessName | null): string {
+  return (harness && DISPLAY_NAMES[harness]) ?? DISPLAY_NAMES[CODEX_HARNESS];
 }
 
 /**
@@ -48,6 +53,6 @@ export function harnessDisplayName(harness) {
  * Neutral by default: returns null unless ALASIO_DEFAULT_HARNESS opts into a
  * harness, in which case new conversations skip the picker.
  */
-export function getDefaultHarness(env = process.env) {
-  return normalizeHarnessName(env.ALASIO_DEFAULT_HARNESS, null);
+export function getDefaultHarness(env: NodeJS.ProcessEnv = process.env): HarnessName | null {
+  return normalizeHarnessName(env["ALASIO_DEFAULT_HARNESS"], null);
 }

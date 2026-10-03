@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The lake service: the stack's container that keeps the analytics lake loaded from
  * alasio's Neon (model.ts). One loads at a time, which a Postgres advisory
@@ -15,9 +14,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import pg from "pg";
 
-import { loadConfig } from "./config.ts";
-import { openLake } from "./lake.ts";
-import { startLoader } from "./loader.ts";
+import { type DatabaseConfig, loadConfig } from "./config.ts";
+import { type Lake, openLake } from "./lake.ts";
+import { type LoaderLake, startLoader } from "./loader.ts";
 import { createMetrics } from "./metrics.ts";
 import { prepareLake } from "./sync.ts";
 
@@ -25,7 +24,13 @@ import { prepareLake } from "./sync.ts";
 const LOCK = "alasio.lake.loader";
 const LOCK_RETRY_MS = 10_000;
 
-function log(message, fields = {}) {
+/** The loader's lock: the connection holding it, and whether that has since been lost. */
+interface LoaderLock {
+  client: pg.Client;
+  lost: () => boolean;
+}
+
+function log(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
 }
 
@@ -34,7 +39,7 @@ function log(message, fields = {}) {
  * the same entries. Resolves `{ client, lost() }`: the connection holding it, and
  * whether that connection, and so the lock, has since been lost.
  */
-async function takeLock(catalog, signal) {
+async function takeLock(catalog: DatabaseConfig, signal: AbortSignal): Promise<LoaderLock> {
   const client = new pg.Client({ ...catalog, connectionTimeoutMillis: 30_000 });
   let lost = false;
   client.on("error", (error) => {
@@ -47,8 +52,9 @@ async function takeLock(catalog, signal) {
   try {
     await client.connect();
     for (let attempt = 0; ; attempt += 1) {
-      const { rows } = await client.query("select pg_try_advisory_lock(hashtext($1)) as held", [LOCK]);
-      if (rows[0].held) return { client, lost: () => lost };
+      const { rows } = await client.query<{ held: boolean }>("select pg_try_advisory_lock(hashtext($1)) as held", [LOCK]);
+      // A select of a function is one row.
+      if (rows[0]!.held) return { client, lost: () => lost };
       if (attempt % 6 === 0) log("another loader holds the lock; waiting");
       await sleep(LOCK_RETRY_MS, undefined, { signal });
     }
@@ -61,9 +67,9 @@ async function takeLock(catalog, signal) {
 const config = loadConfig();
 
 /** Opens the lake for loading, under the lock, its model made ready. */
-async function open(signal) {
+async function open(signal: AbortSignal): Promise<LoaderLake> {
   const lock = await takeLock(config.catalog, signal);
-  let lake;
+  let lake: Lake | undefined;
   try {
     lake = await openLake(config);
     const rebuilt = await prepareLake(lake.db);

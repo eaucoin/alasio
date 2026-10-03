@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The secrets alasio's Neon runs on, and the configuration rendered from them, for the
  * setup job (./kube-setup.ts): made once and kept, completed when a deployment predates
@@ -10,11 +9,67 @@ export const PAGESERVER_ID = 1;
 export const DATABASE = "alasio";
 export const ROLE = "alasio";
 
-function hexId() {
+/** Who holds S3 credentials: Neon's storage, the stack's admin, and the lake. */
+export type S3Identity = "neon" | "admin" | "lake";
+
+export interface S3Credentials {
+  accessKey: string;
+  secretKey: string;
+}
+
+/** The stack's secrets, as the root Secret's secrets.json keeps them. */
+export interface StackSecrets {
+  tenantId: string;
+  timelineId: string;
+  s3: Record<S3Identity, S3Credentials>;
+  controllerDbPassword: string;
+  alasioPassword: string;
+  lakePassword: string;
+  computeControlToken: string;
+}
+
+/** The stack's secrets as an earlier release may have kept them: any may be absent. */
+export type StoredSecrets = Partial<Omit<StackSecrets, "s3">> & { s3?: Partial<Record<S3Identity, S3Credentials>> };
+
+/** Where Neon keeps its files: an S3 bucket at an endpoint. */
+export interface RemoteStorageLocation {
+  endpoint: string;
+  bucket: string;
+  region?: string;
+}
+
+/** The buckets of the bundled SeaweedFS, by who uses each. */
+export interface Buckets {
+  neon: string;
+  lake: string;
+}
+
+/** SeaweedFS's S3 configuration (its s3.json). */
+export interface SeaweedS3Config {
+  identities: SeaweedIdentity[];
+}
+
+export interface SeaweedIdentity {
+  name: S3Identity;
+  credentials: S3Credentials[];
+  actions: string[];
+}
+
+/** The pageserver's configuration, which pageserverToml renders. */
+export interface PageserverConfig {
+  brokerUrl: string;
+  controllerUrl: string;
+  token: string;
+  publicKeyPath: string;
+  /** Its remote storage, as remoteStorage renders it. */
+  storage: string;
+}
+
+function hexId(): string {
   return randomUUID().replaceAll("-", "");
 }
 
-function secret() {
+function secret(): string {
   return randomBytes(24).toString("base64url");
 }
 
@@ -24,44 +79,40 @@ function secret() {
  * that predates a new secret gains it on the next install or upgrade without disturbing
  * the rest. Returns `{ secrets, changed }`.
  */
-export function completeSecrets(existing = {}) {
-  const secrets = structuredClone(existing);
-  const makers = {
-    tenantId: () => hexId(),
-    timelineId: () => hexId(),
-    s3: () => ({}),
-    controllerDbPassword: () => secret(),
-    alasioPassword: () => secret(),
-    lakePassword: () => secret(),
-    computeControlToken: () => secret(),
-  };
-  const s3Makers = {
-    neon: () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() }),
-    admin: () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() }),
-    lake: () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() }),
-  };
+export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackSecrets; changed: boolean } {
+  const stored = structuredClone(existing);
   let changed = false;
-  for (const [key, make] of Object.entries(makers)) {
-    if (secrets[key] === undefined) {
-      secrets[key] = make();
-      changed = true;
-    }
-  }
-  for (const [name, make] of Object.entries(s3Makers)) {
-    if (secrets.s3[name] === undefined) {
-      secrets.s3[name] = make();
-      changed = true;
-    }
-  }
+  const kept = <T>(value: T | undefined, make: () => T): T => {
+    if (value !== undefined) return value;
+    changed = true;
+    return make();
+  };
+  // A secret already held keeps its place; one made is added after them, in this order.
+  const s3: Partial<Record<S3Identity, S3Credentials>> = kept(stored.s3, () => ({}));
+  const secrets: StackSecrets = {
+    ...stored,
+    tenantId: kept(stored.tenantId, () => hexId()),
+    timelineId: kept(stored.timelineId, () => hexId()),
+    s3: {
+      ...s3,
+      neon: kept(s3.neon, () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() })),
+      admin: kept(s3.admin, () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() })),
+      lake: kept(s3.lake, () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() })),
+    },
+    controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
+    alasioPassword: kept(stored.alasioPassword, () => secret()),
+    lakePassword: kept(stored.lakePassword, () => secret()),
+    computeControlToken: kept(stored.computeControlToken, () => secret()),
+  };
   return { secrets, changed };
 }
 
-function toml(value) {
+function toml(value: string): string {
   return `'${String(value).replaceAll("'", "")}'`;
 }
 
 /** Neon's S3 settings, under `prefix` of `bucket` at `endpoint`, as a TOML inline table. */
-export function remoteStorage(prefix, { endpoint, bucket, region = "us-east-1" }) {
+export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-east-1" }: RemoteStorageLocation): string {
   return `{ endpoint="${endpoint}", bucket_name="${bucket}", bucket_region="${region}", prefix_in_bucket="${prefix}" }`;
 }
 
@@ -69,8 +120,8 @@ export function remoteStorage(prefix, { endpoint, bucket, region = "us-east-1" }
  * SeaweedFS's S3 identities: Neon and the lake each on their own bucket of `buckets`
  * (`{ neon, lake }`), and an admin, which makes the buckets and keeps the backups.
  */
-export function s3Identities(secrets, buckets) {
-  const on = (name) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
+export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
+  const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
   return {
     identities: [
       { name: "neon", credentials: [secrets.s3.neon], actions: on(buckets.neon) },
@@ -85,7 +136,7 @@ export function s3Identities(secrets, buckets) {
  * remote storage, and the token it calls the controller with. Its key is read from
  * `publicKeyPath`.
  */
-export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath, storage }) {
+export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath, storage }: PageserverConfig): string {
   return [
     `broker_endpoint=${toml(brokerUrl)}`,
     `pg_distrib_dir=${toml("/usr/local/")}`,
@@ -103,6 +154,6 @@ export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath,
 }
 
 /** How the storage controller and computes reach the pageserver at `host`; it registers itself with these. */
-export function pageserverMetadata(host) {
+export function pageserverMetadata(host: string): string {
   return JSON.stringify({ host, port: 6400, http_host: host, http_port: 9898, availability_zone_id: "az-pageserver" }) + "\n";
 }

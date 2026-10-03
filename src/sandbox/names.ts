@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Naming for session filesystems. A workspace is one of two kinds (see
  * ../workspace/kind.ts): a folder, or a session filesystem identified by a volume id.
@@ -14,11 +13,11 @@
  */
 const VOLUME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
-export function isValidVolumeId(volumeId) {
+export function isValidVolumeId(volumeId: unknown): volumeId is string {
   return typeof volumeId === "string" && VOLUME_ID_PATTERN.test(volumeId);
 }
 
-export function assertValidVolumeId(volumeId) {
+export function assertValidVolumeId(volumeId: unknown): string {
   if (!isValidVolumeId(volumeId)) {
     throw new Error(`invalid session volume id: ${JSON.stringify(volumeId)} (need 3–63 chars of [a-z0-9-], starting and ending with a letter or digit)`);
   }
@@ -26,6 +25,6 @@ export function assertValidVolumeId(volumeId) {
 }
 
 /** A fresh volume id, e.g. `fs-1a2b3c4d5e`, valid by construction. */
-export function newVolumeId(random = () => crypto.randomUUID()) {
+export function newVolumeId(random: () => string = () => crypto.randomUUID()): string {
   return `fs-${random().replace(/-/g, "").slice(0, 12)}`;
 }

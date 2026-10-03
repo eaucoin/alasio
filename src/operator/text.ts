@@ -1,5 +1,4 @@
-// @ts-nocheck
-export function truncateText(value, maxLength = 120) {
+export function truncateText(value: string | null | undefined, maxLength = 120): string {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (text.length <= maxLength) {
     return text;
@@ -10,7 +9,7 @@ export function truncateText(value, maxLength = 120) {
   return `${text.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
-export function formatCommandListRows(rows, emptyText) {
+export function formatCommandListRows(rows: readonly string[], emptyText: string): string {
   if (rows.length === 0) {
     return emptyText;
   }

@@ -1,5 +1,30 @@
-// @ts-nocheck
-function parseAllowedUserIds(raw) {
+import type { CallbackQuery, Chat, Message, User } from "@grammyjs/types";
+
+/** The bot state the Authorizer keeps the bootstrapped operator in (SqliteStore). */
+interface OperatorStateStore {
+  getState(key: string): string | null;
+  setState(key: string, value: string): void;
+}
+
+interface AuthorizerLog {
+  info(message: string): void;
+}
+
+export interface AuthorizerOptions {
+  /** Comma-separated Telegram user ids; empty lets the first private user bootstrap as the operator. */
+  allowedUserIds: string;
+  store: OperatorStateStore;
+  log: AuthorizerLog;
+}
+
+/** Who an update came from and where, and whether it may claim an empty allowlist. */
+export interface PrivateUpdate {
+  chat: Chat | undefined;
+  from: User | undefined;
+  allowBootstrap: boolean;
+}
+
+function parseAllowedUserIds(raw: string) {
   return new Set(
     String(raw ?? "")
       .split(",")
@@ -9,13 +34,17 @@ function parseAllowedUserIds(raw) {
 }
 
 export class Authorizer {
-  constructor({ allowedUserIds, store, log }) {
+  private readonly allowedUserIds: Set<string>;
+  private readonly store: OperatorStateStore;
+  private readonly log: AuthorizerLog;
+
+  constructor({ allowedUserIds, store, log }: AuthorizerOptions) {
     this.allowedUserIds = parseAllowedUserIds(allowedUserIds);
     this.store = store;
     this.log = log;
   }
 
-  isAuthorizedMessage(message) {
+  isAuthorizedMessage(message: Message): boolean {
     return this.isAuthorizedPrivateUpdate({
       chat: message.chat,
       from: message.from,
@@ -23,7 +52,7 @@ export class Authorizer {
     });
   }
 
-  isAuthorizedCallbackQuery(callbackQuery) {
+  isAuthorizedCallbackQuery(callbackQuery: CallbackQuery): boolean {
     return this.isAuthorizedPrivateUpdate({
       chat: callbackQuery.message?.chat,
       from: callbackQuery.from,
@@ -31,7 +60,7 @@ export class Authorizer {
     });
   }
 
-  isAuthorizedPrivateUpdate({ chat, from, allowBootstrap }) {
+  isAuthorizedPrivateUpdate({ chat, from, allowBootstrap }: PrivateUpdate): boolean {
     if (chat?.type !== "private") {
       return false;
     }

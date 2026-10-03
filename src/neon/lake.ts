@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * alasio's side of the analytics lake (neon/lake/src/model.ts): whether it runs, its role
  * and catalog database, and what it may read.
@@ -9,11 +8,13 @@
  * and its database exist whether or not the lake runs, so turning the lake on or off
  * restarts nothing but the lake; it may read alasio's data only while it runs.
  */
+import type { Pool } from "pg";
+
 import { scramVerifier } from "../../neon/control/scram.ts";
 
 /** Whether the lake runs: `ALASIO_LAKE_ENABLED=1`. Off unless set. */
-export function lakeEnabled(env = process.env) {
-  return env.ALASIO_LAKE_ENABLED?.trim() === "1";
+export function lakeEnabled(env: Readonly<NodeJS.ProcessEnv> = process.env): boolean {
+  return env["ALASIO_LAKE_ENABLED"]?.trim() === "1";
 }
 
 /** The role the lake connects as, and the database its catalog is kept in. */
@@ -21,7 +22,7 @@ export const LAKE_ROLE = "lake";
 export const LAKE_DATABASE = "lake";
 
 /** What the lake reads: the schemas and tables it loads from, as alasio's stores make them. */
-export const LAKE_SOURCES = {
+export const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
   claude_sessions: ["entries"],
   codex_sessions: ["rollouts", "rollout_chunks"],
   codex_sessionfs_sessions: ["rollouts", "rollout_chunks"],
@@ -33,7 +34,7 @@ export const LAKE_SOURCES = {
  * only the lake may connect to, make its catalog's schema in, and stage DuckLake's
  * updates in temporary tables in. Idempotent.
  */
-export async function ensureLakeRole(pool, password) {
+export async function ensureLakeRole(pool: Pool, password: string): Promise<void> {
   const role = await pool.query("select 1 from pg_roles where rolname = $1", [LAKE_ROLE]);
   if (role.rows.length === 0) await pool.query(`create role ${LAKE_ROLE} login`);
   await pool.query(`alter role ${LAKE_ROLE} with login password '${scramVerifier(password)}'`);
@@ -48,8 +49,8 @@ export async function ensureLakeRole(pool, password) {
  * `enabled` false revokes it. Idempotent; a store made later (the session-filesystem
  * Codex's) is covered by calling it again once that store exists.
  */
-export async function syncLakeReads(pool, enabled) {
-  const { rows } = await pool.query(
+export async function syncLakeReads(pool: Pool, enabled: boolean): Promise<void> {
+  const { rows } = await pool.query<{ table_schema: string; table_name: string }>(
     `select table_schema, table_name from information_schema.tables
      where (table_schema, table_name) in (select * from unnest($1::text[], $2::text[]))`,
     [

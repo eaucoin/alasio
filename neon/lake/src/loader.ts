@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The loader's loop: a load now and then every interval, and a maintenance pass
  * whenever the last is older than its interval (it is recorded in the lake, so a
@@ -10,12 +9,49 @@
  * load did. So the loader rides out the compute restarting, its lock's connection
  * being lost, or alasio not having granted it its reads yet (src/neon/lake.ts).
  */
-import { lastMaintained, maintainLake, syncLake } from "./sync.ts";
+import type { DuckDBConnection } from "@duckdb/node-api";
+
+import type { Metrics } from "./metrics.ts";
+import { type LakeLoad, lastMaintained, maintainLake, syncLake } from "./sync.ts";
+
+/** The lake as the loader holds it: open for loading, under the loader's lock. */
+export interface LoaderLake {
+  db: DuckDBConnection;
+  close(): Promise<unknown>;
+  /** Whether it can no longer be used. */
+  lost(): boolean;
+}
+
+/** Logs an event, with its fields. */
+export type Log = (message: string, fields?: Record<string, unknown>) => void;
+
+export interface LoaderOptions {
+  open: (signal: AbortSignal) => Promise<LoaderLake>;
+  metrics: Pick<Metrics, "add" | "set">;
+  log: Log;
+  intervalMs: number;
+  maintenanceIntervalMs: number;
+  retryMs?: number;
+  sync?: (db: DuckDBConnection) => Promise<LakeLoad>;
+}
+
+/** Whether the loader is well: unhealthy once loads have failed long enough, and why. */
+export interface LoaderHealth {
+  ok: boolean;
+  detail: string;
+}
+
+export interface Loader {
+  health(): LoaderHealth;
+  stop(): Promise<void>;
+}
 
 /** How soon a failed load is tried again, at most. */
 export const RETRY_MS = 30_000;
 /** How many intervals of failing loads make the loader unhealthy. */
 const UNHEALTHY_AFTER_INTERVALS = 3;
+
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /**
  * Starts the loop. `open(signal)` opens the lake for loading and resolves
@@ -25,12 +61,12 @@ const UNHEALTHY_AFTER_INTERVALS = 3;
  * failed for UNHEALTHY_AFTER_INTERVALS intervals; `stop()` lets a load under way
  * finish, closes the lake, and resolves once the loop has ended.
  */
-export function startLoader({ open, metrics, log, intervalMs, maintenanceIntervalMs, retryMs = RETRY_MS, sync = syncLake }) {
+export function startLoader({ open, metrics, log, intervalMs, maintenanceIntervalMs, retryMs = RETRY_MS, sync = syncLake }: LoaderOptions): Loader {
   const stopped = new AbortController();
-  let lake = null;
-  let wake = null;
+  let lake: LoaderLake | null = null;
+  let wake: (() => void) | null = null;
   let detail = "starting";
-  let failingSince = null;
+  let failingSince: number | null = null;
 
   async function drop() {
     const closing = lake;
@@ -61,8 +97,8 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
     } catch (error) {
       if (stopped.signal.aborted) return false;
       metrics.add("lake_cycles_total", { outcome: "failure" });
-      log("load failed", { error: error.message });
-      detail = `load failed: ${error.message}`;
+      log("load failed", { error: errorText(error) });
+      detail = `load failed: ${errorText(error)}`;
       failingSince ??= Date.now();
       await drop();
       return false;
@@ -70,15 +106,17 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
   }
 
   async function maintainIfDue() {
-    const last = await lastMaintained(lake.db).catch(() => null);
+    // Only ever after a load that succeeded, which leaves the lake open.
+    const { db } = lake!;
+    const last = await lastMaintained(db).catch(() => null);
     if (last && Date.now() - last.getTime() < maintenanceIntervalMs) return;
     try {
-      await maintainLake(lake.db);
+      await maintainLake(db);
       metrics.add("lake_maintenance_total", { outcome: "success" });
       log("maintained");
     } catch (error) {
       metrics.add("lake_maintenance_total", { outcome: "failure" });
-      log("maintenance failed", { error: error.message });
+      log("maintenance failed", { error: errorText(error) });
     }
   }
 
@@ -88,7 +126,7 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
       if (stopped.signal.aborted) break;
       if (loaded) await maintainIfDue();
       if (stopped.signal.aborted) break;
-      await new Promise((resolve) => {
+      await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, loaded ? intervalMs : Math.min(intervalMs, retryMs));
         wake = () => {
           clearTimeout(timer);

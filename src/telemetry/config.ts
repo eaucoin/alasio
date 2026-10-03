@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Which of alasio's signals are exported, and where, decided from the standard
  * OpenTelemetry environment variables alone, so any OTLP backend works and none is
@@ -11,14 +10,28 @@
  * exports nothing and loads no SDK.
  */
 
-export const SIGNALS = ["traces", "metrics", "logs"];
+export const SIGNALS = ["traces", "metrics", "logs"] as const;
+
+/** One of the OpenTelemetry signals alasio exports. */
+export type Signal = (typeof SIGNALS)[number];
+
+/** How alasio exports one signal. */
+export interface SignalExporter {
+  readonly endpoint: string;
+  readonly protocol: string;
+  /** The standard `key=value,key=value` list, or null. */
+  readonly headers: string | null;
+}
+
+/** Each signal's exporter, or null for a signal alasio does not export. */
+export type Telemetry = Readonly<Record<Signal, SignalExporter | null>>;
 
 const DEFAULT_PROTOCOL = "http/protobuf";
 
 /** Variables that configure telemetry, which alasio hands no child as it is. */
 const TELEMETRY_VARIABLE = /^(OTEL_.*|TRACEPARENT|TRACESTATE)$/u;
 
-function setting(env, name) {
+function setting(env: Readonly<NodeJS.ProcessEnv>, name: string): string | null {
   return env[name]?.trim() || null;
 }
 
@@ -26,7 +39,7 @@ function setting(env, name) {
  * The OTLP endpoint a signal is sent to: its own as given, else the shared one, to
  * which OTLP over HTTP adds the signal's path and OTLP over gRPC adds nothing.
  */
-function signalEndpoint(env, signal, protocol) {
+function signalEndpoint(env: Readonly<NodeJS.ProcessEnv>, signal: Signal, protocol: string): string | null {
   const own = setting(env, `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_ENDPOINT`);
   if (own) return own;
   const shared = setting(env, "OTEL_EXPORTER_OTLP_ENDPOINT");
@@ -34,47 +47,54 @@ function signalEndpoint(env, signal, protocol) {
   return `${shared.replace(/\/+$/u, "")}/v1/${signal}`;
 }
 
+/** How `signal` is exported, or null when it is not. */
+function signalExporter(env: Readonly<NodeJS.ProcessEnv>, signal: Signal, disabled: boolean): SignalExporter | null {
+  const upper = signal.toUpperCase();
+  const exporter = setting(env, `OTEL_${upper}_EXPORTER`) ?? "otlp";
+  const protocol = setting(env, `OTEL_EXPORTER_OTLP_${upper}_PROTOCOL`)
+    ?? setting(env, "OTEL_EXPORTER_OTLP_PROTOCOL")
+    ?? DEFAULT_PROTOCOL;
+  const endpoint = signalEndpoint(env, signal, protocol);
+  if (disabled || exporter !== "otlp" || !endpoint) {
+    return null;
+  }
+  return { endpoint, protocol, headers: signalHeaders(env, signal) };
+}
+
 /**
  * `{ traces, metrics, logs }`, each `{ endpoint, protocol, headers }` for a signal
  * alasio exports or null for one it does not. `headers` is the standard
  * `key=value,key=value` list, or null.
  */
-export function resolveTelemetry(env = process.env) {
+export function resolveTelemetry(env: Readonly<NodeJS.ProcessEnv> = process.env): Telemetry {
   const disabled = setting(env, "OTEL_SDK_DISABLED")?.toLowerCase() === "true";
-  return Object.fromEntries(SIGNALS.map((signal) => {
-    const upper = signal.toUpperCase();
-    const exporter = setting(env, `OTEL_${upper}_EXPORTER`) ?? "otlp";
-    const protocol = setting(env, `OTEL_EXPORTER_OTLP_${upper}_PROTOCOL`)
-      ?? setting(env, "OTEL_EXPORTER_OTLP_PROTOCOL")
-      ?? DEFAULT_PROTOCOL;
-    const endpoint = signalEndpoint(env, signal, protocol);
-    if (disabled || exporter !== "otlp" || !endpoint) {
-      return [signal, null];
-    }
-    return [signal, { endpoint, protocol, headers: signalHeaders(env, signal) }];
-  }));
+  return {
+    traces: signalExporter(env, "traces", disabled),
+    metrics: signalExporter(env, "metrics", disabled),
+    logs: signalExporter(env, "logs", disabled),
+  };
 }
 
 /**
  * A signal's OTLP exporter setting `name` (HEADERS, TIMEOUT, ...): its own
  * (`OTEL_EXPORTER_OTLP_<SIGNAL>_<NAME>`), else the shared one, or null.
  */
-export function signalSetting(env, signal, name) {
+export function signalSetting(env: Readonly<NodeJS.ProcessEnv>, signal: Signal, name: string): string | null {
   return setting(env, `OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_${name}`) ?? setting(env, `OTEL_EXPORTER_OTLP_${name}`);
 }
 
 /** The headers a signal is sent with: its own, else the shared ones, or null. */
-export function signalHeaders(env, signal) {
+export function signalHeaders(env: Readonly<NodeJS.ProcessEnv>, signal: Signal): string | null {
   return signalSetting(env, signal, "HEADERS");
 }
 
 /** Whether any signal is exported. */
-export function telemetryEnabled(telemetry) {
+export function telemetryEnabled(telemetry: Telemetry): boolean {
   return SIGNALS.some((signal) => telemetry[signal]);
 }
 
 /** An environment without the variables that configure telemetry. */
-export function withoutTelemetry(env) {
+export function withoutTelemetry(env: Readonly<NodeJS.ProcessEnv>): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(env).filter(([name]) => !TELEMETRY_VARIABLE.test(name)));
 }
 
@@ -83,10 +103,10 @@ export function withoutTelemetry(env) {
  * the operator's `OTEL_RESOURCE_ATTRIBUTES`, which describe the deployment, without
  * `service.name`, which is alasio's. The standard `key=value,key=value` list, or null.
  */
-export function sharedResourceAttributes(env = process.env) {
+export function sharedResourceAttributes(env: Readonly<NodeJS.ProcessEnv> = process.env): string | null {
   const shared = (setting(env, "OTEL_RESOURCE_ATTRIBUTES") ?? "")
     .split(",")
-    .filter((pair) => pair.trim() && pair.split("=")[0].trim() !== "service.name");
+    .filter((pair) => pair.trim() && pair.split("=")[0]?.trim() !== "service.name");
   return shared.length ? shared.join(",") : null;
 }
 
@@ -97,10 +117,13 @@ export function sharedResourceAttributes(env = process.env) {
  * signal's exporter none, and the deployment's resource attributes with the
  * conversation's. Nothing when alasio exports nothing.
  */
-export function conversationTelemetryEnv({ conversationId }, env = process.env) {
+export function conversationTelemetryEnv(
+  { conversationId }: { readonly conversationId: string },
+  env: Readonly<NodeJS.ProcessEnv> = process.env,
+): Record<string, string> {
   const telemetry = resolveTelemetry(env);
   if (!telemetryEnabled(telemetry)) return {};
-  const settings = {
+  const settings: Record<string, string> = {
     OTEL_RESOURCE_ATTRIBUTES: [sharedResourceAttributes(env), `alasio.conversation.id=${encodeURIComponent(conversationId)}`]
       .filter(Boolean)
       .join(","),
@@ -121,9 +144,9 @@ export function conversationTelemetryEnv({ conversationId }, env = process.env) 
  * A standard `key=value,key=value` list, such as OTLP headers or resource attributes, as
  * an object, values URL-decoded.
  */
-export function parseKeyValueList(list) {
+export function parseKeyValueList(list: string | null): Record<string, string> {
   if (!list) return {};
-  return Object.fromEntries(list.split(",").flatMap((pair) => {
+  return Object.fromEntries(list.split(",").flatMap((pair): [string, string][] => {
     const at = pair.indexOf("=");
     if (at <= 0) return [];
     return [[pair.slice(0, at).trim(), decodeURIComponent(pair.slice(at + 1).trim())]];

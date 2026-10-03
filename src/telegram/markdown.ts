@@ -1,43 +1,42 @@
-// @ts-nocheck
-const PLACEHOLDER_START = "\uE000";
-const PLACEHOLDER_END = "\uE001";
+const PLACEHOLDER_START = "";
+const PLACEHOLDER_END = "";
 
-function escapeHtml(value) {
+function escapeHtml(value: string) {
   return String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
 
-function escapeAttribute(value) {
+function escapeAttribute(value: string) {
   return escapeHtml(value).replaceAll('"', "&quot;");
 }
 
-function makePlaceholder(index) {
+function makePlaceholder(index: number) {
   return `${PLACEHOLDER_START}${index}${PLACEHOLDER_END}`;
 }
 
-function restorePlaceholders(value, placeholders) {
-  return value.replace(new RegExp(`${PLACEHOLDER_START}(\\d+)${PLACEHOLDER_END}`, "g"), (_, index) => placeholders[Number(index)] ?? "");
+function restorePlaceholders(value: string, placeholders: readonly string[]) {
+  return value.replace(new RegExp(`${PLACEHOLDER_START}(\\d+)${PLACEHOLDER_END}`, "g"), (_: string, index: string) => placeholders[Number(index)] ?? "");
 }
 
-function stashLinks(value, placeholders) {
-  return value.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => {
+function stashLinks(value: string, placeholders: string[]) {
+  return value.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, (_: string, label: string, href: string) => {
     const html = `<a href="${escapeAttribute(href)}">${renderInline(label)}</a>`;
     placeholders.push(html);
     return makePlaceholder(placeholders.length - 1);
   });
 }
 
-function stashCodeSpans(value, placeholders) {
-  return value.replace(/`([^`\n]+)`/g, (_, code) => {
+function stashCodeSpans(value: string, placeholders: string[]) {
+  return value.replace(/`([^`\n]+)`/g, (_: string, code: string) => {
     placeholders.push(`<code>${escapeHtml(code)}</code>`);
     return makePlaceholder(placeholders.length - 1);
   });
 }
 
-function renderInline(value) {
-  const placeholders = [];
+function renderInline(value: string): string {
+  const placeholders: string[] = [];
   const protectedValue = stashLinks(stashCodeSpans(String(value), placeholders), placeholders);
   const escaped = escapeHtml(protectedValue)
     .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
@@ -45,14 +44,14 @@ function renderInline(value) {
   return restorePlaceholders(escaped, placeholders);
 }
 
-function renderFence(buffer) {
+function renderFence(buffer: readonly string[]) {
   return `<pre>${escapeHtml(buffer.join("\n"))}</pre>`;
 }
 
-export function renderTelegramHtml(markdown) {
+export function renderTelegramHtml(markdown: string): string {
   const lines = String(markdown).split("\n");
-  const rendered = [];
-  let fenceBuffer = null;
+  const rendered: string[] = [];
+  let fenceBuffer: string[] | null = null;
 
   for (const line of lines) {
     if (fenceBuffer) {
@@ -73,7 +72,8 @@ export function renderTelegramHtml(markdown) {
 
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
-      rendered.push(`<b>${renderInline(heading[2])}</b>`);
+      // Both groups are mandatory, so a match always has its text.
+      rendered.push(`<b>${renderInline(heading[2]!)}</b>`);
       continue;
     }
 

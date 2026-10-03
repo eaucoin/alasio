@@ -1,7 +1,38 @@
-// @ts-nocheck
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 
-function findThreadKeyBySessionId(store, sessionId) {
+import type { Turn } from "../persistence/turn-repository.ts";
+import type { WorkflowHookNotification, WorkflowWaitType } from "../policy/workflow-wait.ts";
+import type { Logger } from "../shared/log.ts";
+
+/** A wait on a workflow run an agent reported for its session, shown in the turn's status. */
+export interface WorkflowWait {
+  readonly runId: string;
+  readonly waitType: WorkflowWaitType | "unknown";
+  readonly command: string;
+  readonly threadKey: string;
+  readonly startedAt: number;
+}
+
+/** Wakes a turn's status loop as soon as a workflow wait is reported for its session. */
+export interface WorkflowWakeEvent {
+  readonly promise: Promise<void>;
+  resolve(): void;
+}
+
+/** Where the active turns are read from: alasio's store. */
+export interface ActiveTurnSource {
+  getActiveTurns(): readonly Pick<Turn, "session_id" | "thread_key">[];
+}
+
+export interface WorkflowHookServerOptions {
+  readonly port: number;
+  readonly store: ActiveTurnSource;
+  readonly workflowWaits: Map<string, WorkflowWait>;
+  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
+  readonly log: Logger;
+}
+
+function findThreadKeyBySessionId(store: ActiveTurnSource, sessionId: string): string {
   for (const turn of store.getActiveTurns()) {
     if (turn.session_id === sessionId) {
       return turn.thread_key;
@@ -10,10 +41,10 @@ function findThreadKeyBySessionId(store, sessionId) {
   return "";
 }
 
-function readJsonBody(request) {
+function readJsonBody(request: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let body = "";
-    request.on("data", (chunk) => {
+    request.on("data", (chunk: Buffer) => {
       body += chunk.toString();
     });
     request.on("end", () => {
@@ -27,7 +58,7 @@ function readJsonBody(request) {
   });
 }
 
-export function startWorkflowHookServer({ port, store, workflowWaits, workflowWakeEvents, log }) {
+export function startWorkflowHookServer({ port, store, workflowWaits, workflowWakeEvents, log }: WorkflowHookServerOptions): Server {
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/hook/workflow") {
       response.writeHead(404);
@@ -35,7 +66,8 @@ export function startWorkflowHookServer({ port, store, workflowWaits, workflowWa
       return;
     }
     try {
-      const data = await readJsonBody(request);
+      // The body is what notifyWorkflowWait posts; its fields are checked or defaulted below.
+      const data = await readJsonBody(request) as Partial<WorkflowHookNotification>;
       const sessionId = data.session_id;
       const runId = data.run_id;
       if (!sessionId || !runId) {

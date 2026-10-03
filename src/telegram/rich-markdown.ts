@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Prepares an agent's Markdown for Telegram rich messages (Bot API 10.1+, `sendRichMessage`
  * with `rich_message.markdown`), which render tables, headings, lists, and code natively.
@@ -20,23 +19,29 @@ export const RICH_MESSAGE_MAX_CHARS = 30_000;
 /** Rich messages hold 500 blocks (rows, list items, paragraphs, ...); this bounds a part's lines. */
 export const RICH_MESSAGE_MAX_LINES = 450;
 
+/** How large each part `splitRichMarkdown` makes may be. */
+export interface RichMarkdownLimits {
+  maxChars?: number;
+  maxLines?: number;
+}
+
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 const TABLE_ROW = /^\s*\|/;
 // A line's block-structure prefix: blockquote markers, then a list marker if any.
 const BLOCK_PREFIX = /^(\s*(?:>\s?)*)((?:[*+-]|\d{1,9}[.)])\s+)?/;
 
 /** The fence run a line opens with, or null. */
-function openingFence(line) {
+function openingFence(line: string) {
   return FENCE.exec(line)?.[1] ?? null;
 }
 
 /** Whether `line` closes a block opened by `opener`: the same character, at least as long, nothing after. */
-function closesFence(line, opener) {
+function closesFence(line: string, opener: string) {
   const run = openingFence(line);
-  return Boolean(run) && run[0] === opener[0] && run.length >= opener.length && line.trim() === run;
+  return !!run && run[0] === opener[0] && run.length >= opener.length && line.trim() === run;
 }
 
-function escapeProse(text, { tableRow }) {
+function escapeProse(text: string, { tableRow }: { tableRow: boolean }) {
   let out = text
     // An entity the agent wrote is shown as written, not decoded.
     .replace(/&(?=#?[A-Za-z0-9]+;)/g, "&amp;")
@@ -51,9 +56,10 @@ function escapeProse(text, { tableRow }) {
 }
 
 /** Escapes one line of prose, leaving its block prefix (quote, list marker) and inline code spans as written. */
-function escapeLine(line) {
+function escapeLine(line: string) {
   const tableRow = TABLE_ROW.test(line);
-  const prefix = BLOCK_PREFIX.exec(line)[0];
+  // Always matches: every part of BLOCK_PREFIX is optional.
+  const prefix = BLOCK_PREFIX.exec(line)![0];
   let out = prefix;
   let i = prefix.length;
   while (i < line.length) {
@@ -63,7 +69,8 @@ function escapeLine(line) {
       break;
     }
     out += escapeProse(line.slice(i, tick), { tableRow });
-    const run = /^`+/.exec(line.slice(tick))[0];
+    // Always matches: the slice starts at a backtick.
+    const run = /^`+/.exec(line.slice(tick))![0];
     const close = line.indexOf(run, tick + run.length);
     if (close < 0) {
       // An unmatched backtick run is ordinary text.
@@ -81,8 +88,8 @@ function escapeLine(line) {
  * The agent's Markdown with the syntax it did not mean escaped, ready for
  * `rich_message.markdown`. Media lines alasio placed itself (rich-media.ts) pass through.
  */
-export function toRichMarkdown(markdown) {
-  let fence = null;
+export function toRichMarkdown(markdown: string): string {
+  let fence: string | null = null;
   return String(markdown)
     .split("\n")
     .map((line) => {
@@ -102,21 +109,21 @@ export function toRichMarkdown(markdown) {
  * breaks at blank lines between blocks. A block too large on its own (a long code block)
  * is split by line, its fence closed at the end of one part and reopened in the next.
  */
-export function splitRichMarkdown(markdown, { maxChars = RICH_MESSAGE_MAX_CHARS, maxLines = RICH_MESSAGE_MAX_LINES } = {}) {
+export function splitRichMarkdown(markdown: string, { maxChars = RICH_MESSAGE_MAX_CHARS, maxLines = RICH_MESSAGE_MAX_LINES }: RichMarkdownLimits = {}): string[] {
   const lines = String(markdown).split("\n");
-  const parts = [];
-  let current = [];
+  const parts: string[] = [];
+  let current: string[] = [];
   let chars = 0;
-  let fence = null; // the opening fence line while inside a fenced block
+  let fence: string | null = null; // the opening fence line while inside a fenced block
   let lastBreak = -1; // a length of `current` that ends on a blank line between blocks
 
   const flush = (upTo = current.length) => {
     const part = current.slice(0, upTo);
     const rest = current.slice(upTo);
-    while (part.length && !part.at(-1).trim()) part.pop();
+    while (part.length && !part.at(-1)?.trim()) part.pop();
     if (part.length) parts.push(part.join("\n"));
     current = rest;
-    while (current.length && !current[0].trim()) current.shift();
+    while (current.length && !current[0]?.trim()) current.shift();
     chars = current.reduce((n, l) => n + l.length + 1, 0);
     lastBreak = -1;
   };
@@ -128,7 +135,8 @@ export function splitRichMarkdown(markdown, { maxChars = RICH_MESSAGE_MAX_CHARS,
         flush(lastBreak);
       } else if (fence) {
         // Mid-fence with nowhere better to break: close it here, reopen in the next part.
-        current.push(openingFence(fence));
+        // `fence` is a line that opened a fence, so it has a fence run.
+        current.push(openingFence(fence)!);
         flush();
         current.push(fence);
         chars = fence.length + 1;
@@ -139,7 +147,7 @@ export function splitRichMarkdown(markdown, { maxChars = RICH_MESSAGE_MAX_CHARS,
     current.push(line);
     chars += size;
     if (fence) {
-      if (closesFence(line, openingFence(fence))) fence = null;
+      if (closesFence(line, openingFence(fence)!)) fence = null;
     } else if (openingFence(line)) {
       fence = line;
     } else if (!line.trim()) {

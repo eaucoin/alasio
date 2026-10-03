@@ -1,10 +1,44 @@
-// @ts-nocheck
-export function getMessageText(message) {
+import type { Audio, Document, Message, PhotoSize, Video, Voice } from "@grammyjs/types";
+
+/** A file an incoming message carries, as Telegram describes it, with a kind and a name to save it under. */
+export type IncomingFile = IncomingDocument | IncomingPhoto | IncomingVideo | IncomingAudio | IncomingVoice;
+
+export type IncomingFileKind = IncomingFile["kind"];
+
+export interface IncomingDocument extends Document {
+  kind: "document";
+  file_name: string;
+}
+
+/** The largest size Telegram offers of a photo. */
+export interface IncomingPhoto extends PhotoSize {
+  kind: "photo";
+  file_name: string;
+  mime_type: "image/jpeg";
+}
+
+export interface IncomingVideo extends Video {
+  kind: "video";
+  file_name: string;
+}
+
+export interface IncomingAudio extends Audio {
+  kind: "audio";
+  file_name: string;
+}
+
+export interface IncomingVoice extends Voice {
+  kind: "voice";
+  file_name: string;
+  mime_type: string;
+}
+
+export function getMessageText(message: Message): string {
   return String(message.text ?? message.caption ?? "").trim();
 }
 
-export function getMessageFiles(message) {
-  const files = [];
+export function getMessageFiles(message: Message): IncomingFile[] {
+  const files: IncomingFile[] = [];
   if (message.document?.file_id) {
     files.push({
       ...message.document,
@@ -12,8 +46,10 @@ export function getMessageFiles(message) {
       file_name: message.document.file_name ?? `document-${message.message_id}`,
     });
   }
-  if (Array.isArray(message.photo) && message.photo.length > 0) {
-    const largest = [...message.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0))[0];
+  const largest = Array.isArray(message.photo)
+    ? [...message.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0))[0]
+    : undefined;
+  if (largest) {
     files.push({
       ...largest,
       kind: "photo",

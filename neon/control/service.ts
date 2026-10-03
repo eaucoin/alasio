@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * neon-control: alasio's small stand-in for Neon's control plane, the one part
  * of Neon that is not open source. Runs as a service of the stack.
@@ -20,25 +19,117 @@
  * record of what it bootstrapped).
  */
 import { readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-import { publicJwks, signToken, verifyToken } from "./jwt.ts";
+import { type JsonWebKeySet, publicJwks, signToken, verifyToken } from "./jwt.ts";
 import { scramVerifier } from "./scram.ts";
+import type { StackSecrets } from "./secrets.ts";
 
-const CONTROLLER_URL = process.env.CONTROLLER_URL;
+/** A safekeeper of the stack, by its id. */
+interface Safekeeper {
+  id: number;
+  host: string;
+  pgPort: number;
+  httpPort: number;
+}
+
+/** Where the storage controller placed the timeline: its safekeepers, by id, at a generation. */
+interface Placement {
+  generation: number;
+  ids: number[];
+}
+
+/** What it bootstrapped: the timeline, and where it was placed. */
+interface TimelineRecord {
+  tenantId: string;
+  timelineId: string;
+  safekeepers: Placement;
+}
+
+/** RECORD, which holds nothing until the timeline is created. */
+type BootstrapRecord = TimelineRecord | { safekeepers?: undefined };
+
+/** A call to the storage controller. */
+interface ControllerRequest {
+  body?: unknown;
+  token?: string;
+  /** Statuses that are answers rather than failures. */
+  allow?: readonly number[];
+}
+
+/** An HTTP answer, its body parsed as JSON, or null when it had none. */
+interface JsonResponse<Body> {
+  status: number;
+  body: Body | null;
+}
+
+/** The storage controller's answer to creating a timeline. */
+interface TimelineCreated {
+  safekeepers?: { generation: number; safekeepers: { id: number }[] } | null;
+}
+
+/** A pageserver as the storage controller lists it. */
+interface StorageNode {
+  id: number;
+  availability: unknown;
+}
+
+/** A safekeeper's status of a timeline, with its membership configuration. */
+interface TimelineStatus {
+  mconf: unknown;
+}
+
+type SettingType = "string" | "integer" | "enum" | "bool";
+
+/** A Postgres setting in a compute spec. */
+interface ComputeSetting {
+  name: string;
+  value: string;
+  vartype: SettingType;
+}
+
+/** What compute_ctl is given: its spec and its own configuration. */
+interface ComputeConfig {
+  spec: ComputeSpec;
+  compute_ctl_config: { jwks: JsonWebKeySet };
+}
+
+/** The compute's spec, as compute_ctl reads it (compute_api's ComputeSpec). */
+interface ComputeSpec {
+  format_version: number;
+  suspend_timeout_seconds: number;
+  cluster: {
+    cluster_id: string;
+    name: string;
+    roles: { name: string; encrypted_password: string; options: null }[];
+    databases: { name: string; owner: string; options: null }[];
+    settings: ComputeSetting[];
+  };
+  delta_operations: unknown[];
+  tenant_id: string;
+  timeline_id: string;
+  mode: "Primary";
+  pageserver_connstring: string;
+  safekeepers_generation: number;
+  safekeeper_connstrings: string[];
+  storage_auth_token: string;
+}
+
+const CONTROLLER_URL = process.env["CONTROLLER_URL"];
 const PG_VERSION = 17;
 const COMPUTE_PORT = 55433;
-const SAFEKEEPER_HOSTS = (process.env.NEON_SAFEKEEPER_HOSTS ?? "").split(",").map((host) => host.trim()).filter(Boolean);
-const SAFEKEEPERS = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
-const PAGESERVER_HOST = process.env.NEON_PAGESERVER_HOST;
+const SAFEKEEPER_HOSTS = (process.env["NEON_SAFEKEEPER_HOSTS"] ?? "").split(",").map((host) => host.trim()).filter(Boolean);
+const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
+const PAGESERVER_HOST = process.env["NEON_PAGESERVER_HOST"];
 const RECORD = "/state/bootstrap.json";
 if (!CONTROLLER_URL || SAFEKEEPER_HOSTS.length === 0 || !PAGESERVER_HOST) {
   throw new Error("CONTROLLER_URL, NEON_SAFEKEEPER_HOSTS and NEON_PAGESERVER_HOST must be set");
 }
 const COMPUTE_ID = "alasio";
 
-const secrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
+// Written by the setup job (./kube-setup.ts).
+const secrets: StackSecrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
 const privateKeyPem = readFileSync("/secrets/auth_private_key.pem", "utf8");
 const publicKeyPem = readFileSync("/keys/auth_public_key.pem", "utf8");
 // The storage controller's /control and /debug APIs take the admin scope.
@@ -48,29 +139,37 @@ const REPAIR_INTERVAL_MS = 30_000;
 
 let ready = false;
 
-function log(message, fields = {}) {
+function log(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-async function controller(method, path, { body, token = adminToken, allow = [] } = {}) {
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Calls the storage controller; `Body` is what its API answers this call with. */
+async function controller<Body = unknown>(
+  method: string,
+  path: string,
+  { body, token = adminToken, allow = [] }: ControllerRequest = {},
+): Promise<JsonResponse<Body>> {
   const response = await fetch(`${CONTROLLER_URL}${path}`, {
     method,
     headers: {
       authorization: `Bearer ${token}`,
       ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await response.text();
   if (!response.ok && !allow.includes(response.status)) {
     throw new Error(`${method} ${path}: ${response.status} ${text}`);
   }
-  return { status: response.status, body: text ? JSON.parse(text) : null };
+  const parsed: Body | null = text ? JSON.parse(text) : null;
+  return { status: response.status, body: parsed };
 }
 
-async function until(what, check, { attempts = 300, delayMs = 1000 } = {}) {
+async function until<T>(what: string, check: () => Promise<T>, { attempts = 300, delayMs = 1000 } = {}): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       const result = await check();
@@ -83,16 +182,18 @@ async function until(what, check, { attempts = 300, delayMs = 1000 } = {}) {
   }
 }
 
-function readRecord() {
-  return existsSync(RECORD) ? JSON.parse(readFileSync(RECORD, "utf8")) : {};
+function readRecord(): BootstrapRecord {
+  // This service's own record (writeAtomically), or nothing yet.
+  const record: BootstrapRecord = existsSync(RECORD) ? JSON.parse(readFileSync(RECORD, "utf8")) : {};
+  return record;
 }
 
-function writeAtomically(path, value) {
+function writeAtomically(path: string, value: unknown): void {
   writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
 }
 
-async function registerSafekeepers() {
+async function registerSafekeepers(): Promise<void> {
   for (const sk of SAFEKEEPERS) {
     await controller("POST", `/control/v1/safekeeper/${sk.id}`, {
       body: {
@@ -115,7 +216,7 @@ async function registerSafekeepers() {
   log("safekeepers registered");
 }
 
-async function ensureTenant() {
+async function ensureTenant(): Promise<void> {
   const found = await controller("GET", `/control/v1/tenant/${secrets.tenantId}`, { allow: [404] });
   if (found.status === 404) {
     await controller("POST", "/v1/tenant", {
@@ -126,14 +227,15 @@ async function ensureTenant() {
 }
 
 /** Creates the timeline once, recording the safekeepers it was placed on. */
-async function ensureTimeline(record) {
+async function ensureTimeline(record: BootstrapRecord): Promise<TimelineRecord> {
   if (record.safekeepers) return record;
-  const created = await controller("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
+  const created = await controller<TimelineCreated>("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
     body: { new_timeline_id: secrets.timelineId, pg_version: PG_VERSION },
   });
-  const placed = created.body.safekeepers;
+  // A timeline created is answered with its description.
+  const placed = created.body!.safekeepers;
   if (!placed) throw new Error("the storage controller placed the timeline on no safekeepers");
-  const next = {
+  const next: TimelineRecord = {
     ...record,
     tenantId: secrets.tenantId,
     timelineId: secrets.timelineId,
@@ -144,17 +246,31 @@ async function ensureTimeline(record) {
   return next;
 }
 
-async function safekeeper(sk, method, path, body) {
+/** Calls a safekeeper's HTTP API; `Body` is what it answers this call with. */
+async function safekeeper<Body = unknown>(sk: Safekeeper, method: string, path: string, body?: unknown): Promise<JsonResponse<Body>> {
   const response = await fetch(`http://${sk.host}:${sk.httpPort}${path}`, {
     method,
     headers: {
       authorization: `Bearer ${safekeeperToken}`,
       ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await response.text();
-  return { status: response.status, body: text ? JSON.parse(text) : null };
+  const parsed: Body | null = text ? JSON.parse(text) : null;
+  return { status: response.status, body: parsed };
+}
+
+/** A safekeeper and its status of the timeline, or null where it could not be asked. */
+interface SafekeeperState {
+  sk: Safekeeper;
+  state: JsonResponse<TimelineStatus> | null;
+}
+
+/** A safekeeper that has the timeline: it answered 200, with the timeline's status. */
+interface HealthySafekeeper {
+  sk: Safekeeper;
+  state: { status: 200; body: TimelineStatus };
 }
 
 /**
@@ -162,20 +278,21 @@ async function safekeeper(sk, method, path, body) {
  * membership mode does not recreate it: it pulls it from the peers that
  * have it, joining the timeline's current membership.
  */
-async function repairSafekeepers(record) {
+async function repairSafekeepers(record: TimelineRecord): Promise<void> {
   const placed = SAFEKEEPERS.filter((sk) => record.safekeepers.ids.includes(sk.id));
   const path = `/v1/tenant/${record.tenantId}/timeline/${record.timelineId}`;
   const states = await Promise.all(
-    placed.map(async (sk) => ({ sk, state: await safekeeper(sk, "GET", path).catch(() => null) })),
+    placed.map(async (sk): Promise<SafekeeperState> => ({ sk, state: await safekeeper<TimelineStatus>(sk, "GET", path).catch(() => null) })),
   );
-  const healthy = states.filter(({ state }) => state?.status === 200);
+  const healthy = states.filter((entry): entry is HealthySafekeeper => entry.state?.status === 200);
   for (const { sk, state } of states) {
     if (state?.status !== 404 || healthy.length === 0) continue;
     const pulled = await safekeeper(sk, "POST", "/v1/pull_timeline", {
       tenant_id: record.tenantId,
       timeline_id: record.timelineId,
       http_hosts: healthy.map(({ sk: peer }) => `http://${peer.host}:${peer.httpPort}`),
-      mconf: healthy[0].state.body.mconf,
+      // Not empty: checked above.
+      mconf: healthy[0]!.state.body.mconf,
     });
     log(pulled.status === 200 ? "safekeeper repaired from its peers" : "safekeeper repair failed", {
       safekeeper: sk.id,
@@ -185,15 +302,16 @@ async function repairSafekeepers(record) {
   }
 }
 
-function setting(name, value, vartype) {
+function setting(name: string, value: string | number, vartype: SettingType): ComputeSetting {
   return { name, value: String(value), vartype };
 }
 
-let computeConfig = null;
+let computeConfig: ComputeConfig | null = null;
 
 /** The compute's spec: alasio's role and database on alasio's timeline. */
-function makeSpec(record) {
-  const hostOf = (id) => SAFEKEEPERS.find((sk) => sk.id === id).host;
+function makeSpec(record: TimelineRecord): void {
+  // The timeline was placed on safekeepers of the stack, so each id is one of theirs.
+  const hostOf = (id: number) => SAFEKEEPERS.find((sk) => sk.id === id)!.host;
   computeConfig = {
     spec: {
       format_version: 1.0,
@@ -239,11 +357,12 @@ function makeSpec(record) {
   log("compute spec made");
 }
 
-async function bootstrap() {
+async function bootstrap(): Promise<void> {
   await until("the storage controller", async () => (await controller("GET", "/status")).status === 200);
   await registerSafekeepers();
   await until("the pageserver to register", async () => {
-    const nodes = (await controller("GET", "/control/v1/node")).body;
+    // The controller answers with its nodes; a failure here is retried.
+    const nodes = (await controller<StorageNode[]>("GET", "/control/v1/node")).body!;
     return nodes.some((node) => node.id === 1 && node.availability === "Active");
   });
   await ensureTenant();
@@ -253,17 +372,17 @@ async function bootstrap() {
   ready = true;
   log("ready");
   setInterval(() => {
-    repairSafekeepers(record).catch((error) => log("safekeeper check failed", { error: error.message }));
+    repairSafekeepers(record).catch((error: unknown) => log("safekeeper check failed", { error: errorText(error) }));
   }, REPAIR_INTERVAL_MS).unref();
 }
 
-function authorized(request) {
+function authorized(request: IncomingMessage): boolean {
   const token = request.headers.authorization?.replace(/^Bearer /, "");
   return Boolean(token && verifyToken(publicKeyPem, token));
 }
 
 /** Whether the request carries the compute's token, which only the compute is given. */
-function fromCompute(request) {
+function fromCompute(request: IncomingMessage): boolean {
   const presented = Buffer.from(request.headers.authorization ?? "");
   const expected = Buffer.from(`Bearer ${secrets.computeControlToken}`);
   return Boolean(secrets.computeControlToken) && presented.length === expected.length && timingSafeEqual(presented, expected);
@@ -294,7 +413,7 @@ const server = createServer((request, response) => {
       return;
     }
     let body = "";
-    request.on("data", (chunk) => (body += chunk));
+    request.on("data", (chunk: Buffer) => (body += chunk));
     request.on("end", () => {
       // One compute, whose spec names the one pageserver and the timeline's
       // safekeepers: an attach changes nothing it needs. A safekeeper
@@ -311,7 +430,7 @@ server.listen(8080, "0.0.0.0", () => log("listening", { port: 8080 }));
 // As PID 1 in its container, Node would otherwise ignore the SIGTERM that stops it.
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 
-bootstrap().catch((error) => {
-  log("bootstrap failed", { error: error.message });
+bootstrap().catch((error: unknown) => {
+  log("bootstrap failed", { error: errorText(error) });
   process.exit(1);
 });

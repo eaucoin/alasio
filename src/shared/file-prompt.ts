@@ -1,14 +1,13 @@
-// @ts-nocheck
-function ordinal(n) {
+function ordinal(n: number): string {
   const mod100 = n % 100;
   if (mod100 >= 11 && mod100 <= 13) {
     return `${n}th`;
   }
-  const suffixes = { 1: "st", 2: "nd", 3: "rd" };
+  const suffixes: Readonly<Record<number, string>> = { 1: "st", 2: "nd", 3: "rd" };
   return `${n}${suffixes[n % 10] ?? "th"}`;
 }
 
-export function buildFilePromptSuffix(filePaths) {
+export function buildFilePromptSuffix(filePaths: readonly string[]): string {
   if (filePaths.length === 0) {
     return "";
   }

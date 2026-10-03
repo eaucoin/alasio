@@ -1,5 +1,4 @@
-// @ts-nocheck
-export function formatDuration(seconds) {
+export function formatDuration(seconds: number): string {
   if (seconds < 1) {
     return "less than 1 second";
   }

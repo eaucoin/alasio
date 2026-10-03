@@ -1,13 +1,30 @@
-// @ts-nocheck
+import type { Logger } from "../shared/log.ts";
 import { resolveHookPort } from "../shared/runtime-constants.ts";
 
-const WORKFLOW_WAIT_PATTERNS = [
+/** How an agent waits on a GitHub Actions run: watching it, polling it, or checking its status. */
+export type WorkflowWaitType = "watch" | "poll" | "check";
+
+/** A wait on a workflow run, as a command an agent ran reveals it. */
+export interface DetectedWorkflowWait {
+  readonly runId: string;
+  readonly waitType: WorkflowWaitType;
+}
+
+/** What notifyWorkflowWait posts to the workflow hook server. */
+export interface WorkflowHookNotification {
+  readonly session_id: string;
+  readonly run_id: string;
+  readonly wait_type: WorkflowWaitType;
+  readonly command: string;
+}
+
+const WORKFLOW_WAIT_PATTERNS: readonly { readonly pattern: RegExp; readonly waitType: WorkflowWaitType }[] = [
   { pattern: /gh run watch (\d+)/, waitType: "watch" },
   { pattern: /sleep \d+.*gh run (?:view|list).*?(\d{8,})/, waitType: "poll" },
   { pattern: /gh run view (\d+).*--json.*status/, waitType: "check" },
 ];
 
-export function detectWorkflowWait(command) {
+export function detectWorkflowWait(command: string): DetectedWorkflowWait | null {
   for (const { pattern, waitType } of WORKFLOW_WAIT_PATTERNS) {
     const match = pattern.exec(command);
     if (match?.[1]) {
@@ -17,7 +34,13 @@ export function detectWorkflowWait(command) {
   return null;
 }
 
-export async function notifyWorkflowWait(sessionId, runId, waitType, command, log = console) {
+export async function notifyWorkflowWait(
+  sessionId: string,
+  runId: string,
+  waitType: WorkflowWaitType,
+  command: string,
+  log: Pick<Logger, "warn"> = console,
+): Promise<void> {
   try {
     const response = await fetch(`http://localhost:${resolveHookPort()}/hook/workflow`, {
       method: "POST",
@@ -27,7 +50,7 @@ export async function notifyWorkflowWait(sessionId, runId, waitType, command, lo
         run_id: runId,
         wait_type: waitType,
         command,
-      }),
+      } satisfies WorkflowHookNotification),
     });
     if (!response.ok) {
       log.warn(`Workflow hook POST returned ${response.status}`);

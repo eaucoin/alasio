@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Prepares alasio's Neon on Kubernetes, as a Helm hook Job before the stack starts: the
  * secrets it runs on, made once and kept in one Secret, and what each service is given
@@ -12,13 +11,81 @@
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities are made here otherwise.
  */
-import { generateKeyPair, signToken } from "./jwt.ts";
-import { completeSecrets, DATABASE, pageserverMetadata, pageserverToml, PAGESERVER_ID, remoteStorage, ROLE, s3Identities } from "./secrets.ts";
+import type { V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
+
+import type { KubeClient } from "../../src/kube/client.ts";
+import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
+import {
+  completeSecrets,
+  DATABASE,
+  pageserverMetadata,
+  pageserverToml,
+  PAGESERVER_ID,
+  remoteStorage,
+  ROLE,
+  s3Identities,
+  type S3Credentials,
+  type S3Identity,
+  type StackSecrets,
+  type StoredSecrets,
+} from "./secrets.ts";
 
 const PUBLIC_KEY = "auth_public_key.pem";
 
 /** Every Secret's name, by what it is for. */
-export function secretNames(prefix) {
+export interface SecretNames {
+  root: string;
+  safekeeper: string;
+  pageserver: string;
+  storageController: string;
+  controllerDb: string;
+  seaweedfs: string;
+  s3Admin: string;
+  compute: string;
+  database: string;
+  lake: string;
+}
+
+/** The deployment's configuration, from the environment the module comment lists. */
+export type SetupConfig = SetupConfigBase & (
+  | { external: false }
+  | { external: true; accessKey: string; secretKey: string }
+);
+
+interface SetupConfigBase {
+  namespace: string;
+  prefix: string;
+  brokerUrl: string;
+  controllerUrl: string;
+  pageserverHost: string;
+  computeHost: string;
+  controllerDbHost: string;
+  s3Endpoint: string;
+  s3Region: string;
+  neonBucket: string;
+  lakeBucket: string;
+}
+
+/** What renderSecrets renders from. */
+export interface RenderSecretsOptions extends KeyPair {
+  secrets: StackSecrets;
+  config: SetupConfig;
+}
+
+/** Each Secret's string data, by the Secret's name. */
+export type RenderedSecrets = Record<string, Record<string, string>>;
+
+/** A Secret as the API server returns it, which always has its metadata and version. */
+export type StoredSecret = V1Secret & { metadata: V1ObjectMeta & { resourceVersion: string } };
+
+export interface SetupKubeOptions {
+  kube: Pick<KubeClient, "read" | "create" | "replace">;
+  config: SetupConfig;
+  log?: (message: string) => void;
+}
+
+/** Every Secret's name, by what it is for. */
+export function secretNames(prefix: string): SecretNames {
   return {
     root: `${prefix}-neon-root`,
     safekeeper: `${prefix}-neon-safekeeper`,
@@ -37,15 +104,15 @@ export function secretNames(prefix) {
  * What each service is given, by Secret name, from the stack's `secrets` and keys and
  * the deployment's `config` (the environment above, as an object). Pure, for tests.
  */
-export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }) {
+export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: RenderSecretsOptions): RenderedSecrets {
   const names = secretNames(config.prefix);
-  const token = (scope, tenantId) => signToken(privateKeyPem, scope, tenantId);
-  const s3 = (identity) => (config.external
+  const token = (scope: string, tenantId?: string) => signToken(privateKeyPem, scope, tenantId);
+  const s3 = (identity: S3Identity): S3Credentials => (config.external
     ? { accessKey: config.accessKey, secretKey: config.secretKey }
     : secrets.s3[identity]);
-  const aws = (identity) => ({ AWS_ACCESS_KEY_ID: s3(identity).accessKey, AWS_SECRET_ACCESS_KEY: s3(identity).secretKey });
-  const storage = (prefix) => remoteStorage(prefix, { endpoint: config.s3Endpoint, bucket: config.neonBucket, region: config.s3Region });
-  const rendered = {
+  const aws = (identity: S3Identity) => ({ AWS_ACCESS_KEY_ID: s3(identity).accessKey, AWS_SECRET_ACCESS_KEY: s3(identity).secretKey });
+  const storage = (prefix: string) => remoteStorage(prefix, { endpoint: config.s3Endpoint, bucket: config.neonBucket, region: config.s3Region });
+  const rendered: RenderedSecrets = {
     [names.root]: {
       "secrets.json": JSON.stringify(secrets, null, 2) + "\n",
       "auth_private_key.pem": privateKeyPem,
@@ -102,14 +169,14 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }) 
 }
 
 /** The deployment's configuration, from the environment, checked. */
-export function setupConfig(env = process.env) {
-  const required = (key) => {
+export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
+  const required = (key: string) => {
     const value = env[key]?.trim();
     if (!value) throw new Error(`${key} must be set`);
     return value;
   };
-  const external = env.S3_EXTERNAL === "1";
-  return {
+  const external = env["S3_EXTERNAL"] === "1";
+  const base: SetupConfigBase = {
     namespace: required("NAMESPACE"),
     prefix: required("SECRET_PREFIX"),
     brokerUrl: required("NEON_BROKER_URL"),
@@ -118,41 +185,48 @@ export function setupConfig(env = process.env) {
     computeHost: required("NEON_COMPUTE_HOST"),
     controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
     s3Endpoint: required("S3_ENDPOINT"),
-    s3Region: env.S3_REGION?.trim() || "us-east-1",
-    neonBucket: env.S3_BUCKET_NEON?.trim() || "neon",
-    lakeBucket: env.S3_BUCKET_LAKE?.trim() || "lake",
-    external,
-    ...(external ? { accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") } : {}),
+    s3Region: env["S3_REGION"]?.trim() || "us-east-1",
+    neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
+    lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
   };
+  return external
+    ? { ...base, external, accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") }
+    : { ...base, external };
 }
 
-const decode = (secret, key) => (secret?.data?.[key] ? Buffer.from(secret.data[key], "base64").toString("utf8") : null);
+const decode = (secret: StoredSecret | null, key: string) => {
+  const value = secret?.data?.[key];
+  return value ? Buffer.from(value, "base64").toString("utf8") : null;
+};
 
 /**
  * Makes or completes the root Secret, then writes every service's Secret, replacing
  * what an earlier release wrote. `kube` is src/kube/client.ts's client.
  */
-export async function setupKube({ kube, config, log = console.log }) {
+export async function setupKube({ kube, config, log = console.log }: SetupKubeOptions): Promise<void> {
   const names = secretNames(config.prefix);
   const labels = { "app.kubernetes.io/managed-by": "alasio-neon-setup", "app.kubernetes.io/part-of": "alasio-neon" };
-  const root = await kube.read("v1", "Secret", config.namespace, names.root);
-  const keys = root
+  // What the API server returns for a Secret is the Secret, as it stores it.
+  const readSecret = async (name: string) => (await kube.read("v1", "Secret", config.namespace, name)) as StoredSecret | null;
+  const root = await readSecret(names.root);
+  const { privateKeyPem, publicKeyPem } = root
     ? { privateKeyPem: decode(root, "auth_private_key.pem"), publicKeyPem: decode(root, PUBLIC_KEY) }
     : generateKeyPair();
-  if (!keys.privateKeyPem || !keys.publicKeyPem) throw new Error(`${names.root} is missing its keys`);
-  const existing = JSON.parse(decode(root, "secrets.json") ?? "{}");
+  if (!privateKeyPem || !publicKeyPem) throw new Error(`${names.root} is missing its keys`);
+  // The secrets.json this job wrote, by this release or an earlier one.
+  const existing: StoredSecrets = JSON.parse(decode(root, "secrets.json") ?? "{}");
   const { secrets, changed } = completeSecrets(existing);
   log(root ? (changed ? "completing the stack's secrets" : "the stack's secrets are complete") : "making the stack's secrets");
 
-  for (const [name, stringData] of Object.entries(renderSecrets({ secrets, ...keys, config }))) {
+  for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }))) {
     const object = {
       apiVersion: "v1",
       kind: "Secret",
       metadata: { name, namespace: config.namespace, labels },
       type: "Opaque",
       stringData,
-    };
-    const current = name === names.root ? root : await kube.read("v1", "Secret", config.namespace, name);
+    } satisfies V1Secret;
+    const current = name === names.root ? root : await readSecret(name);
     if (current) {
       // The root's secrets are only ever added to; everything else is rendered whole.
       await kube.replace({ ...object, metadata: { ...object.metadata, resourceVersion: current.metadata.resourceVersion } });
@@ -165,8 +239,8 @@ export async function setupKube({ kube, config, log = console.log }) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const { createKubeClient } = await import("../../src/kube/client.ts");
-  setupKube({ kube: createKubeClient(), config: setupConfig() }).catch((error) => {
-    console.error(`setting up the stack failed: ${error.message}`);
+  setupKube({ kube: createKubeClient(), config: setupConfig() }).catch((error: unknown) => {
+    console.error(`setting up the stack failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   });
 }

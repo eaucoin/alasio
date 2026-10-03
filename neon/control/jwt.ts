@@ -1,57 +1,75 @@
-// @ts-nocheck
 /**
  * The tokens Neon's services authenticate each other with: EdDSA JWTs with a
  * scope, and a tenant for tenant-scoped ones, with no expiry, as Neon issues
  * them (libs/utils/src/auth.rs).
  */
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { createPrivateKey, createPublicKey, generateKeyPairSync, type JsonWebKey, sign, verify } from "node:crypto";
+
+/** An Ed25519 keypair, as PEM. */
+export interface KeyPair {
+  privateKeyPem: string;
+  publicKeyPem: string;
+}
+
+/** What a token grants: its scope, and the tenant a tenant-scoped one is limited to. */
+export interface TokenClaims {
+  scope: string;
+  tenant_id?: string;
+}
+
+/** A JWK set, as compute_ctl reads one. */
+export interface JsonWebKeySet {
+  keys: JsonWebKey[];
+}
 
 const HEADER = base64url(JSON.stringify({ alg: "EdDSA", typ: "JWT" }));
 
-function base64url(value) {
+function base64url(value: string): string {
   return Buffer.from(value).toString("base64url");
 }
 
 /** A new Ed25519 keypair, as PEM. */
-export function generateKeyPair() {
-  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  return {
-    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }),
-    publicKeyPem: publicKey.export({ type: "spki", format: "pem" }),
-  };
+export function generateKeyPair(): KeyPair {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519", {
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  return { privateKeyPem: privateKey, publicKeyPem: publicKey };
 }
 
 /**
  * A token for `scope` (tenant, pageserverapi, safekeeperdata,
  * generations_api, admin, infra, ...), limited to `tenantId` if given.
  */
-export function signToken(privateKeyPem, scope, tenantId = null) {
-  const claims = tenantId ? { scope, tenant_id: tenantId } : { scope };
+export function signToken(privateKeyPem: string, scope: string, tenantId: string | null = null): string {
+  const claims: TokenClaims = tenantId ? { scope, tenant_id: tenantId } : { scope };
   const unsigned = `${HEADER}.${base64url(JSON.stringify(claims))}`;
   const signature = sign(null, Buffer.from(unsigned), createPrivateKey(privateKeyPem));
   return `${unsigned}.${signature.toString("base64url")}`;
 }
 
 /** The claims of `token` if `publicKeyPem` signed it, else null. */
-export function verifyToken(publicKeyPem, token) {
-  const parts = String(token).split(".");
-  if (parts.length !== 3 || parts[0] !== HEADER) return null;
+export function verifyToken(publicKeyPem: string, token: string): TokenClaims | null {
+  const [header, claims, signature, ...rest] = String(token).split(".");
+  if (claims === undefined || signature === undefined || rest.length !== 0 || header !== HEADER) return null;
   const valid = verify(
     null,
-    Buffer.from(`${parts[0]}.${parts[1]}`),
+    Buffer.from(`${header}.${claims}`),
     createPublicKey(publicKeyPem),
-    Buffer.from(parts[2], "base64url"),
+    Buffer.from(signature, "base64url"),
   );
   if (!valid) return null;
   try {
-    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    // Signed with the stack's key, so made by signToken.
+    const parsed: TokenClaims = JSON.parse(Buffer.from(claims, "base64url").toString("utf8"));
+    return parsed;
   } catch {
     return null;
   }
 }
 
 /** The public key as a JWK set, which compute_ctl verifies its API's tokens with. */
-export function publicJwks(publicKeyPem) {
+export function publicJwks(publicKeyPem: string): JsonWebKeySet {
   const jwk = createPublicKey(publicKeyPem).export({ format: "jwk" });
   return { keys: [{ ...jwk, use: "sig", key_ops: ["verify"], alg: "EdDSA", kid: "alasio-neon" }] };
 }

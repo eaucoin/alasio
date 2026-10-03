@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Queries the analytics lake, read-only (neon/lake/src/query.ts):
  *
@@ -12,8 +11,8 @@
 import { spawn } from "node:child_process";
 
 const query = spawn("kubectl", [
-  "--namespace", process.env.ALASIO_NAMESPACE?.trim() || "alasio",
-  "exec", `deployment/${process.env.ALASIO_LAKE_DEPLOYMENT?.trim() || "alasio-lake"}`, "--",
+  "--namespace", process.env["ALASIO_NAMESPACE"]?.trim() || "alasio",
+  "exec", `deployment/${process.env["ALASIO_LAKE_DEPLOYMENT"]?.trim() || "alasio-lake"}`, "--",
   "node", "src/query.ts", ...process.argv.slice(2),
 ], { stdio: "inherit" });
 query.on("error", (error) => {

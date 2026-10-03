@@ -1,6 +1,5 @@
-// @ts-nocheck
 /** A session's one-line label in the session panels: its text, whitespace folded, at most `maxChars`. */
-export function sessionLabel(text, maxChars = 40, suffix = "...") {
+export function sessionLabel(text: string | null | undefined, maxChars = 40, suffix = "..."): string {
   const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
   if (normalized.length <= maxChars) {
     return normalized;
@@ -12,7 +11,7 @@ export function sessionLabel(text, maxChars = 40, suffix = "...") {
 }
 
 /** A session's date in the session panels, YYYY-MM-DD, or "-" without one. */
-export function dateLabel(epochMs) {
+export function dateLabel(epochMs: number | null | undefined): string {
   const value = Number(epochMs);
   if (!Number.isFinite(value) || value <= 0) {
     return "-";

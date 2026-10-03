@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Reads single string settings from the operator's `$CODEX_HOME/config.toml`, where alasio
  * must combine rather than override them (developer instructions). Only root-table string
@@ -7,21 +6,22 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const BASIC_ESCAPES = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\", e: "\x1b" };
+const BASIC_ESCAPES: Readonly<Record<string, string>> = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\", e: "\x1b" };
 
-function unescapeBasic(value, multiline) {
+function unescapeBasic(value: string, multiline: boolean): string {
   let out = value;
   // In a multi-line basic string, a backslash ending a line trims the break and leading space.
   if (multiline) out = out.replace(/\\[ \t]*\r?\n\s*/g, "");
-  return out.replace(/\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)/g, (whole, esc) => {
+  return out.replace(/\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)/g, (whole, esc: string) => {
     if (esc[0] === "u" || esc[0] === "U") return String.fromCodePoint(Number.parseInt(esc.slice(1), 16));
     return BASIC_ESCAPES[esc] ?? whole;
   });
 }
 
 /** The root-table string value of `key` in TOML `text`, or null. */
-export function tomlRootString(text, key) {
-  const root = String(text).split(/^\s*\[/m)[0];
+export function tomlRootString(text: string, key: string): string | null {
+  // split always yields a first part, so the `?? ""` never applies.
+  const root = String(text).split(/^\s*\[/m)[0] ?? "";
   const keyPattern = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const at = new RegExp(`^[ \\t]*${keyPattern}[ \\t]*=[ \\t]*`, "m").exec(root);
   if (!at) return null;
@@ -56,7 +56,7 @@ export function tomlRootString(text, key) {
 }
 
 /** The operator's own `developer_instructions` in their Codex config, or null. */
-export function operatorDeveloperInstructions(codexHomeDir) {
+export function operatorDeveloperInstructions(codexHomeDir: string): string | null {
   try {
     return tomlRootString(readFileSync(join(codexHomeDir, "config.toml"), "utf8"), "developer_instructions");
   } catch {
