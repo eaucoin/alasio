@@ -194,7 +194,7 @@ test("app-server start sends configured model and keeps observed notification tu
     rpc: {
       request: async (method, params) => {
         assert.equal(method, "turn/start");
-        assert.equal(params.model, "gpt-5.6-terra");
+        assert.equal(params.model, "gpt-5.6-sol");
         assert.equal(params.effort, "high");
         queue.observe({
           method: "turn/started",
@@ -312,7 +312,7 @@ test("app-server thread start and resume carry alasio model config", async () =>
   const resumeRequest = requests.find((request) => request.method === "thread/resume");
   const startRequest = requests.find((request) => request.method === "thread/start");
   for (const request of [resumeRequest, startRequest]) {
-    assert.equal(request.params.model, "gpt-5.6-terra");
+    assert.equal(request.params.model, "gpt-5.6-sol");
     assert.equal(request.params.config.model_reasoning_effort, "high");
     assert.equal(request.params.config.project_doc_max_bytes, 32768);
   }
