@@ -3,10 +3,13 @@ import type { ModelChoice } from "../persistence/conversation-repository.ts";
 export const ALASIO_CODEX_MODEL = "gpt-5.6-sol";
 export const ALASIO_CODEX_REASONING_EFFORT = "high";
 
-/** The setting alasio adds to every Codex config it passes on. */
-export interface AlasioCodexModelConfig {
+/**
+ * The setting alasio adds to every Codex config it passes on: a type rather than an
+ * interface, so the config it is part of stays a JSON object to the protocol's types.
+ */
+export type AlasioCodexModelConfig = {
   readonly model_reasoning_effort: typeof ALASIO_CODEX_REASONING_EFFORT;
-}
+};
 
 export function withAlasioCodexModelConfig(): AlasioCodexModelConfig;
 export function withAlasioCodexModelConfig<Config extends object>(config: Config): Config & AlasioCodexModelConfig;

@@ -6,15 +6,10 @@
  * alongside them.
  */
 import { withReplyInstructions } from "../harness/reply-instructions.ts";
+import type { BaymaEndpoint } from "../kube/sandboxes.ts";
 import { BAYMA_SERVER_NAME, BAYMA_STARTUP_TIMEOUT_MS } from "../mcp/bayma.ts";
 import { operatorDeveloperInstructions } from "./config-toml.ts";
 import { type CodexEnv, codexHome } from "./env.ts";
-
-/** A bayma server as a thread reaches it: its URL, and the headers to send it. */
-interface BaymaEndpoint {
-  readonly url: string;
-  readonly headers: Readonly<Record<string, string>>;
-}
 
 // These two are types rather than interfaces so they are JSON objects to TypeScript, as
 // the app-server's and the Codex SDK's config types take them.

@@ -11,14 +11,6 @@ import type {
 type ProtocolParams<M extends ClientRequest["method"]> = Extract<ClientRequest, { method: M }>["params"];
 
 /**
- * thread/fork's `beforeTurnId`: an experimental field, which alasio opts into at
- * initialize and the protocol's generated (stable) types leave out.
- */
-interface ExperimentalForkParams {
-  readonly beforeTurnId?: string | null;
-}
-
-/**
  * initialize's params as the app-server takes them: its generated types require
  * `requestAttestation`, a capability the app-server accepts left out.
  */
@@ -32,7 +24,7 @@ export interface AppServerRequests {
   "thread/loaded/list": { params: ProtocolParams<"thread/loaded/list">; result: v2.ThreadLoadedListResponse };
   "thread/resume": { params: ProtocolParams<"thread/resume">; result: v2.ThreadResumeResponse };
   "thread/start": { params: ProtocolParams<"thread/start">; result: v2.ThreadStartResponse };
-  "thread/fork": { params: ProtocolParams<"thread/fork"> & ExperimentalForkParams; result: v2.ThreadForkResponse };
+  "thread/fork": { params: ProtocolParams<"thread/fork">; result: v2.ThreadForkResponse };
   "thread/list": { params: ProtocolParams<"thread/list">; result: v2.ThreadListResponse };
   "thread/turns/list": { params: ProtocolParams<"thread/turns/list">; result: v2.ThreadTurnsListResponse };
   "model/list": { params: ProtocolParams<"model/list">; result: v2.ModelListResponse };

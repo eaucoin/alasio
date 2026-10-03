@@ -71,15 +71,12 @@ export interface AppServerThreadClientOptions {
 
 /** What every thread alasio starts, resumes, or forks is loaded with. */
 function threadOverrides({ cwd, config }: { readonly cwd: string; readonly config: CodexThreadConfig }) {
-  // Typed as an object type rather than as model.ts's interface, so the protocol's types
-  // take it as the JSON object it is.
-  const threadConfig: CodexThreadConfig & { readonly model_reasoning_effort: string } = withAlasioCodexModelConfig(config);
   return {
     cwd,
     model: ALASIO_CODEX_MODEL,
     approvalPolicy: "never",
     sandbox: "danger-full-access",
-    config: threadConfig,
+    config: withAlasioCodexModelConfig(config),
   } as const;
 }
 

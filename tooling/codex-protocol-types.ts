@@ -4,7 +4,8 @@
  *
  *   node tooling/codex-protocol-types.ts
  *
- * Codex writes its protocol as TypeScript whose imports name no extension; they are
+ * alasio's client turns on the app-server's experimental API, so its methods and fields
+ * are included. Codex writes its protocol as TypeScript whose imports name no extension; they are
  * kept here, under .types/codex, as declarations that import each other by the names
  * Node's module resolution expects. npm run typecheck runs this first.
  */
@@ -26,7 +27,7 @@ function files(directory: string): string[] {
 
 const generated = mkdtempSync(join(tmpdir(), "codex-protocol-"));
 try {
-  execFileSync(join(root, "node_modules", ".bin", "codex"), ["app-server", "generate-ts", "--out", generated], { stdio: "inherit" });
+  execFileSync(join(root, "node_modules", ".bin", "codex"), ["app-server", "generate-ts", "--experimental", "--out", generated], { stdio: "inherit" });
   rmSync(target, { recursive: true, force: true });
   for (const file of files(generated).filter((name) => name.endsWith(".ts"))) {
     // A specifier names a module or a directory of them, whose index.ts it means. One
