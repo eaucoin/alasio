@@ -115,6 +115,18 @@ test("SQLite response recovery exposes only terminal upstream responses", () => 
   }
 });
 
+test("a block for a pending response that does not exist is dropped with a warning", () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-response-unknown-"));
+  try {
+    const store = new SqliteStore(root);
+    store.appendBlockToPending("no-such-response", { type: "text", content: "Lost.", phase: "final_answer" });
+    assert.equal(store.db.prepare("select count(*) as n from response_blocks").get().n, 0);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("completed response recovery enqueues one final answer exactly once", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-response-once-"));
   try {

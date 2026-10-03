@@ -45,11 +45,11 @@ export interface CompletedResponse {
  * an aggregate, which yields a row of nulls when the response has no blocks.
  */
 interface LatestBlock {
-  readonly conversation_id: string | null;
-  readonly channel: string | null;
-  readonly thread_ts: string | null;
+  readonly conversation_id: string;
+  readonly channel: string;
+  readonly thread_ts: string;
   readonly session_id: string | null;
-  readonly sequence: number | null;
+  readonly sequence: number;
 }
 
 export class SqliteResponseRepository {
@@ -86,7 +86,10 @@ export class SqliteResponseRepository {
   }
 
   appendBlockToPending(pendingResponseId: string, block: ResponseBlock): void {
-    const last = this.db.prepare<[string], LatestBlock>("select conversation_id, channel, thread_ts, session_id, max(sequence) as sequence from response_blocks where pending_response_id = ?").get(pendingResponseId);
+    const last = this.db.prepare<[string], LatestBlock>(`
+      select conversation_id, channel, thread_ts, session_id, sequence from response_blocks
+      where pending_response_id = ? order by sequence desc limit 1
+    `).get(pendingResponseId);
     if (!last) {
       log.warn(`Pending response ${pendingResponseId} not found`);
       return;
@@ -94,9 +97,9 @@ export class SqliteResponseRepository {
     this.db.prepare<[
       id: string,
       pendingResponseId: string,
-      conversationId: string | null,
-      channel: string | null,
-      threadTs: string | null,
+      conversationId: string,
+      channel: string,
+      threadTs: string,
       sessionId: string | null,
       sequence: number,
       blockJson: string,
@@ -104,7 +107,7 @@ export class SqliteResponseRepository {
     ]>(`
       insert into response_blocks (id, pending_response_id, conversation_id, channel, thread_ts, session_id, sequence, block_json, created_at)
       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(newId(), pendingResponseId, last.conversation_id, last.channel, last.thread_ts, last.session_id, Number(last.sequence ?? 0) + 1, JSON.stringify(block), Date.now() / 1000);
+    `).run(newId(), pendingResponseId, last.conversation_id, last.channel, last.thread_ts, last.session_id, last.sequence + 1, JSON.stringify(block), Date.now() / 1000);
   }
 
   markPendingComplete(pendingResponseId: string): void {
