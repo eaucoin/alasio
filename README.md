@@ -30,7 +30,7 @@ allowed to use it in a Secret, and install:
 kubectl create namespace alasio
 kubectl -n alasio create secret generic alasio-telegram \
   --from-literal=token=<bot token> --from-literal=allowedUserIds=<user ids>
-helm install alasio oci://ghcr.io/eaucoin/charts/alasio --version 1.0.2 \
+helm install alasio oci://ghcr.io/eaucoin/charts/alasio --version 2.0.0 \
   -n alasio --set alasio.telegram.existingSecret=alasio-telegram
 ```
 
@@ -79,7 +79,8 @@ export theirs to the same place; with no endpoint set, nothing is exported.
 
 ## Development
 
-See `package.json` for the development scripts, `.env.example` for running
+alasio is TypeScript that Node 24 runs as it is, checked by `npm run typecheck`
+against `tsconfig.json`. See `package.json` for the development scripts, `.env.example` for running
 alasio outside the cluster against one, `Dockerfile`, `sandbox/`, and
 `neon/lake/` for the images, `charts/alasio/` for the chart and its tests,
 `test/e2e/run.sh` for the end-to-end run, and `.github/workflows/` for the
