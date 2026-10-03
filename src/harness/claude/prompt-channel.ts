@@ -67,10 +67,6 @@ export function promptUuidsAnsweredBy(message: SDKMessage, promptUuids: string |
   return [];
 }
 
-export function resultAnswersPrompt(message: SDKMessage, promptUuids: string | Set<string>): boolean {
-  return promptUuidsAnsweredBy(message, promptUuids).length > 0;
-}
-
 /** Now, as a log line gives it. */
 const at = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
 

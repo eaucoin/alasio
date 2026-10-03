@@ -1,90 +1,92 @@
-import { Context, Exit, Scope } from "effect";
+import { Effect, type Scope } from "effect";
 
-import { effectRunner } from "../../shared/effects.ts";
+import { SessionFilesystemsDisabled } from "../../sandbox/index.ts";
+import { parseWorkspace } from "../../workspace/kind.ts";
+import type { ActiveTurns } from "../active-turns.ts";
+import type { Harness, HarnessOptions, HarnessSessions } from "../index.ts";
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.ts";
-import type { Harness, HarnessOptions } from "../index.ts";
+import { makeClaudeLiveSessions } from "./live-sessions.ts";
 import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
-import { makeClaudeLiveSessions } from "./live-sessions.ts";
-import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.ts";
+import { ClaudeCodeError, startFreshClaudeSession } from "./runtime.ts";
 import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
-import { parseWorkspace } from "../../workspace/kind.ts";
 
-/** What createClaudeHarness is given: a harness's options, and a stand-in session api for tests. */
+/** What makeClaudeHarness is given: a harness's options, and a stand-in session api for tests. */
 export interface ClaudeHarnessOptions extends HarnessOptions {
   readonly sessionApi?: ClaudeSessionApi | null;
+}
+
+/** A promise of the session api, failing as the api says. */
+const asked = <A>(ask: () => Promise<A>): Effect.Effect<A, ClaudeCodeError> =>
+  Effect.tryPromise({ try: ask, catch: (cause) => new ClaudeCodeError({ cause }) });
+
+/** Claude Code's session api, which the Agent SDK's helpers make promises, as a harness's sessions. */
+function claudeSessions(api: ClaudeSessionApi): HarnessSessions {
+  return {
+    listSessions: (page) => asked(() => api.listSessions(page)),
+    getTotalSessionPages: () => asked(() => api.getTotalSessionPages()),
+    getSessionByNumber: (num) => asked(() => api.getSessionByNumber(num)),
+    getSessionLastMessage: (sessionId) => asked(() => api.getSessionLastMessage(sessionId)),
+    listSessionMessages: (sessionId) => asked(() => api.listSessionMessages(sessionId)),
+    getTotalRewindPages: (sessionId) => asked(() => api.getTotalRewindPages(sessionId)),
+    createForkedSession: (sessionId, beforeUuid) => asked(() => api.createForkedSession(sessionId, beforeUuid)),
+  };
 }
 
 /**
  * Claude Code harness adapter. Sessions live in the Claude project transcript
  * store, mirrored to alasio's Neon through `sessionStore` when one is given,
  * and each mounted session is served by one long-lived Claude Code process
- * that every turn is pushed into.
+ * that every turn is pushed into: its live sessions (live-sessions.ts), which last as
+ * long as the scope the harness is made in.
  *
  * A session-filesystem workspace's CLI runs in the workspace's harness directory, and
  * its sessions are that directory's, confined to the workspace's bayma (sessionfs.ts).
- *
- * The harness is the promise façade of its live sessions (live-sessions.ts), whose
- * effects `effects` runs: they last from the harness's making to its shutdown, in a
- * scope of their own until harnesses run in alasio's.
  */
-export function createClaudeHarness({
+export const makeClaudeHarness = Effect.fnUntraced(function*({
   workingDirectory,
   sessionStore = null,
-  sandbox = null,
+  sandbox,
   sessionApi = null,
   folderBayma,
   claudeQueryFactory,
-  effects = effectRunner(Context.empty()),
-}: ClaudeHarnessOptions): Harness {
+}: ClaudeHarnessOptions): Effect.fn.Return<Harness, SessionFilesystemsDisabled, ActiveTurns | Scope.Scope> {
   const workspace = parseWorkspace(workingDirectory);
-  const sessionFs = workspace?.kind === "sessionfs";
+  const sessionFs = workspace?.kind === "sessionfs" ? workspace : null;
   if (sessionFs && !sandbox) {
-    throw new Error("this conversation's workspace is a session filesystem, which this deployment does not enable");
+    return yield* new SessionFilesystemsDisabled();
   }
   // `sandbox` is there whenever `sessionFs` is, as just checked.
-  const directory = sessionFs && sandbox ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
-  const sessionFsBayma = sessionFs && sandbox ? async () => (await sandbox.ensureSession(workspace.volumeId)).bayma : null;
+  const directory = sessionFs && sandbox ? sandbox.harnessDirectory(sessionFs.volumeId) : workingDirectory;
+  const sessionFsBayma = sessionFs && sandbox ? Effect.map(sandbox.ensureSession(sessionFs.volumeId), ({ bayma }) => bayma) : null;
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory: directory, store: sessionStore });
-  const scope = Scope.makeUnsafe();
-  const liveSessions = effects.runSync(Scope.provide(scope)(makeClaudeLiveSessions({
+  const liveSessions = yield* makeClaudeLiveSessions({
     workingDirectory: directory,
     sessions,
     sessionStore,
     sessionFsBayma,
-    ...(folderBayma ? { folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }) } : {}),
+    folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }),
     queryFactory: claudeQueryFactory,
-  })));
+  });
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),
     supportsGoals: false,
     supportsWarmup: false,
     supportsSteer: true,
-    sessions,
-    async startFreshSession({ threadKey }) {
-      return startFreshClaudeSession({ threadKey });
-    },
-    async warmSession() {
-      return false;
-    },
-    executeTurn(params) {
-      return effects.runPromise(executeClaudeTurn({ ...params, workingDirectory: directory, sessions, liveSessions }));
-    },
-    listModels() {
-      return effects.runPromise(listClaudeModels({ workingDirectory: directory }));
-    },
+    sessions: claudeSessions(sessions),
+    startFreshSession: ({ threadKey }) => startFreshClaudeSession({ threadKey }),
+    warmSession: () => Effect.succeed(false),
+    /**
+     * One operator prompt on the conversation's live Claude Code process, starting or
+     * replacing that process when the mounted session, folder or model differs from
+     * the one it serves.
+     */
+    runTurn: (params) => liveSessions.runTurn({ ...params, workingDirectory: directory }),
+    listModels: () => listClaudeModels({ workingDirectory: directory }),
     /** What a turn runs on when no /model choice is stored. */
-    defaultModelChoice() {
-      return { model: getClaudeModel(), effort: getClaudeEffort() };
-    },
+    defaultModelChoice: () => ({ model: getClaudeModel(), effort: getClaudeEffort() }),
     /** Live processes are replaced on demand; this ends one when its conversation is unmounted. */
-    closeLiveSession(threadKey, reason) {
-      effects.runFork(liveSessions.close(threadKey, reason));
-    },
-    /** Closes every live process, and resolves once each has ended and its turns are settled. */
-    shutdown() {
-      return effects.runPromise(Scope.close(scope, Exit.void));
-    },
+    closeLiveSession: (threadKey, reason) => liveSessions.close(threadKey, reason),
   };
-}
+});

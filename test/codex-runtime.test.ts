@@ -7,6 +7,7 @@ import { Effect, Logger } from "effect";
 import { makeAppServer } from "../src/codex/app-server/client.ts";
 import { executeCodexTurn } from "../src/codex/runtime.ts";
 import type { CodexExecClient } from "../src/codex/transport.ts";
+import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { SqliteStore } from "../src/persistence/store.ts";
 
 /** A Codex whose every thread runs one turn that answers and completes. */
@@ -57,14 +58,13 @@ test("a turn's response is marked complete only once beforeResponseComplete has 
       messageId: "2",
       workingDirectory: process.cwd(),
       persistence: recordingPersistence(calls),
-      activeQueries: new Map(),
       appServer,
       codexFactory,
-      folderBayma: async () => ({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
+      folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
       beforeResponseComplete: (sessionId) =>
         Effect.sleep("20 millis").pipe(Effect.andThen(Effect.sync(() => calls.push(`beforeResponseComplete:${sessionId}`)))),
     });
-  })).pipe(Effect.provide(Logger.layer([]))));
+  })).pipe(Effect.provide([ActiveTurns.layer, Logger.layer([])])));
 
   assert.equal(result.responseCompleted, true);
   const flushed = calls.indexOf("beforeResponseComplete:thread-1");

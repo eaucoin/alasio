@@ -1,19 +1,20 @@
 import { randomUUID } from "node:crypto";
-import type { SqliteStore } from "../persistence/store.ts";
-import { sleep } from "../shared/async.ts";
-import type { Logger } from "../shared/log.ts";
-import type { ChatId, Client } from "../telegram/client.ts";
-import type { TelegramOutbox } from "../telegram/outbox.ts";
-import type { WorkflowWait, WorkflowWakeEvent } from "../workflow/hook-server.ts";
+
+import { Clock, Deferred, Effect, type Scope } from "effect";
+
+import { Store } from "../persistence/store.ts";
+import { formatDuration } from "../shared/human-time.ts";
+import { type ChatId, TelegramClient } from "../telegram/client.ts";
+import { Outbox } from "../telegram/outbox.ts";
+import { type WorkflowWait, WorkflowHooks } from "../workflow/hook-server.ts";
 import type { PreparedReply, ReplyMedia } from "./reply-media.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
-import { formatDuration } from "../shared/human-time.ts";
 
 /** Final responses render as Telegram rich messages: tables, headings, lists, and code. */
 const FINAL_RESPONSE_OPTIONS = Object.freeze({ format: "rich" });
 
 /** How often a running turn's status is checked for a change worth showing (a workflow wait). */
-const STATUS_CHECK_MS = 30_000;
+const STATUS_CHECK = "30 seconds";
 
 function escapeHtml(value: string): string {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -39,17 +40,9 @@ export function workingStatusHtml({ harnessName, startedAtMs, workflowWait = nul
   return `${doing} · ${since}`;
 }
 
-/** Where delivered and undelivered responses are recorded: alasio's store. */
-export type StatusReporterStore = Pick<SqliteStore, "markPendingAsPosted" | "getCompletedResponsesPendingDelivery">;
-
-export interface StatusReporterOptions {
-  readonly client: Pick<Client, "sendMessage" | "editMessageText">;
-  readonly store: StatusReporterStore;
-  readonly outbox: Pick<TelegramOutbox, "enqueueText">;
-  readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
-  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
-  readonly log: Logger;
-  readonly replyMedia?: Pick<ReplyMedia, "prepare"> | null;
+/** What a turn's status message says when alasio stops during the turn, which it continues after the restart. */
+export function restartingStatusText(harnessName: string): string {
+  return `alasio is restarting; ${harnessName} continues this turn after the restart.`;
 }
 
 /** A final response to queue for delivery, as the pending response it delivers. */
@@ -59,13 +52,15 @@ export interface FinalResponse {
   readonly pendingResponseId: string | null | undefined;
 }
 
+/** A turn's status message, once posted: its id, and when the turn started. */
+export interface PostedStatus {
+  readonly messageId: number;
+  readonly startTime: number;
+}
+
 export interface StatusUpdates {
   readonly chatId: ChatId;
-  /** Ends the updates when aborted: the turn is over. */
-  readonly signal: AbortSignal;
   readonly sessionId: string | null;
-  /** Called with the status message's id and the turn's start once the message is posted. */
-  readonly onStatusMessageCreated: (statusMessageId: number, startTime: number) => void;
   readonly harnessName?: string;
 }
 
@@ -73,133 +68,139 @@ export interface PostedResponse {
   readonly chatId: ChatId;
   readonly response: string;
   readonly pendingResponseId: string | null | undefined;
-  readonly statusMessageId: number | null;
-  readonly statusStartTime: number | null;
+  readonly status: PostedStatus | null;
   readonly harnessName?: string;
 }
 
 export interface UnansweredTurn {
   readonly chatId: ChatId;
   readonly pendingResponseId: string | null | undefined;
-  readonly statusMessageId: number | null;
+  readonly status: PostedStatus | null;
   readonly statusText?: string | null;
   readonly harnessName?: string;
 }
 
-export class StatusReporter {
-  private readonly client: Pick<Client, "sendMessage" | "editMessageText">;
-  private readonly store: StatusReporterStore;
-  private readonly outbox: Pick<TelegramOutbox, "enqueueText">;
-  private readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
-  private readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
-  private readonly log: Logger;
-  private readonly replyMedia: Pick<ReplyMedia, "prepare"> | null;
-
-  constructor({ client, store, outbox, workflowWaits, workflowWakeEvents, log, replyMedia = null }: StatusReporterOptions) {
-    if (!outbox) {
-      throw new Error("StatusReporter requires a Telegram outbox");
-    }
-    this.client = client;
-    this.store = store;
-    this.outbox = outbox;
-    this.workflowWaits = workflowWaits;
-    this.workflowWakeEvents = workflowWakeEvents;
-    this.log = log;
-    // Resolves the media a response shows (codex/reply-media.ts); without it, responses
-    // go as rich text only.
-    this.replyMedia = replyMedia;
-  }
-
+/** What a turn shows the operator: its status message as it runs and as it ends, and its reply. */
+export interface StatusReporter {
   /**
-   * Queue a final response for delivery, with any media it shows copied alongside. A
+   * Queues a final response for delivery, with any media it shows copied alongside. A
    * failure to prepare the media never holds the response back: it goes as text.
    */
-  async enqueueFinalResponse({ chatId, text, pendingResponseId }: FinalResponse): Promise<void> {
-    let prepared: PreparedReply = { text, options: FINAL_RESPONSE_OPTIONS };
-    if (this.replyMedia) {
-      try {
-        prepared = await this.replyMedia.prepare({ chatId, text, key: pendingResponseId ?? randomUUID() });
-      } catch (error) {
-        this.log.warn(`Reply media could not be prepared; sending the response as text: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    this.outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
-  }
+  readonly enqueueFinalResponse: (response: FinalResponse) => Effect.Effect<void>;
+  /**
+   * Posts the turn's status message and keeps it current, in a fiber of the scope, until
+   * the scope closes. The status message once posted; null if it could not be.
+   */
+  readonly statusUpdates: (updates: StatusUpdates) => Effect.Effect<Deferred.Deferred<PostedStatus | null>, never, Scope.Scope>;
+  readonly postResponse: (response: PostedResponse) => Effect.Effect<void>;
+  readonly finishWithoutResponse: (turn: UnansweredTurn) => Effect.Effect<void>;
+  /** Says on the status message that alasio is restarting and the turn continues after it. */
+  readonly restarting: (chatId: ChatId, status: PostedStatus | null, harnessName: string) => Effect.Effect<void>;
+  /** Queues every completed response that has not been delivered. */
+  readonly flushCompletedResponses: Effect.Effect<void>;
+}
 
-  async postStatusUpdates({ chatId, signal, sessionId, onStatusMessageCreated, harnessName = "Codex" }: StatusUpdates): Promise<void> {
-    const startTime = Date.now();
-    const statusHtml = (workflowWait: WorkflowWait | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, workflowWait });
-    let statusMessageId: number | null = null;
-    let shown = statusHtml(null);
-    try {
-      const [sent] = await this.client.sendMessage(chatId, shown, { parse_mode: "HTML" });
-      statusMessageId = sent?.message_id ?? null;
-      if (statusMessageId) {
-        onStatusMessageCreated(statusMessageId, startTime);
-      }
-    } catch (error) {
-      this.log.warn(`Failed to post status message: ${error}`);
-      return;
+/**
+ * The status reporter of alasio's store, Telegram client, outbox and workflow hooks. With
+ * `replyMedia` (codex/reply-media.ts), the media a response shows are delivered with it;
+ * without, responses go as rich text only.
+ */
+export const makeStatusReporter = Effect.fnUntraced(function*(
+  { replyMedia = null }: { readonly replyMedia?: Pick<ReplyMedia, "prepare"> | null } = {},
+): Effect.fn.Return<StatusReporter, never, Store | TelegramClient | Outbox | WorkflowHooks> {
+  const store = yield* Store;
+  const client = yield* TelegramClient;
+  const outbox = yield* Outbox;
+  const { waits, wakeEvents } = yield* WorkflowHooks;
+
+  const enqueueFinalResponse = Effect.fnUntraced(function*({ chatId, text, pendingResponseId }: FinalResponse) {
+    let prepared: PreparedReply = { text, options: FINAL_RESPONSE_OPTIONS };
+    if (replyMedia) {
+      prepared = yield* replyMedia.prepare({ chatId, text, key: pendingResponseId ?? randomUUID() }).pipe(
+        Effect.catchTag("ReplyMediaError", (error) =>
+          Effect.logWarning(`Reply media could not be prepared; sending the response as text: ${error.message}`).pipe(Effect.as(prepared))),
+      );
     }
-    while (!signal.aborted) {
-      try {
-        const wakeEvent = sessionId ? this.workflowWakeEvents.get(sessionId) : null;
-        if (wakeEvent) {
-          await Promise.race([sleep(STATUS_CHECK_MS, signal), wakeEvent.promise]);
-        } else {
-          await sleep(STATUS_CHECK_MS, signal);
-        }
-      } catch {
-        return;
-      }
-      if (signal.aborted || !statusMessageId) {
-        return;
-      }
-      const next = statusHtml(sessionId ? this.workflowWaits.get(sessionId) ?? null : null);
+    yield* outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
+  });
+
+  /** Keeps a posted status message current: every STATUS_CHECK, or as soon as a workflow wait is reported. */
+  const keepCurrent = Effect.fnUntraced(function*(chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, messageId: number) {
+    let shown = shownAtFirst;
+    while (true) {
+      const wakeEvent = sessionId ? wakeEvents.get(sessionId) : null;
+      yield* wakeEvent ? Effect.raceFirst(Effect.sleep(STATUS_CHECK), Effect.promise(() => wakeEvent.promise)) : Effect.sleep(STATUS_CHECK);
+      const next = statusHtml(sessionId ? waits.get(sessionId) ?? null : null);
       if (next === shown) {
         continue;
       }
       shown = next;
-      await this.client.editMessageText(chatId, statusMessageId, next, { parse_mode: "HTML" }).catch((error) => {
-        this.log.warn(`Failed to edit status message: ${error}`);
-      });
+      yield* client.editMessageText(chatId, messageId, next, { parse_mode: "HTML" }).pipe(
+        Effect.catch((error) => Effect.logWarning(`Failed to edit status message: ${error}`)),
+      );
     }
-  }
+  });
 
-  async postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime, harnessName = "Codex" }: PostedResponse): Promise<void> {
+  const statusUpdates = Effect.fnUntraced(function*({ chatId, sessionId, harnessName = "Codex" }: StatusUpdates) {
+    const posted = yield* Deferred.make<PostedStatus | null>();
+    const startTime = yield* Clock.currentTimeMillis;
+    const statusHtml = (workflowWait: WorkflowWait | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, workflowWait });
+    const shown = statusHtml(null);
+    // The message is posted whole however soon the turn ends; only keeping it current is interrupted.
+    const post = client.sendMessage(chatId, shown, { parse_mode: "HTML" }).pipe(
+      Effect.map(([sent]) => (sent?.message_id ? { messageId: sent.message_id, startTime } : null)),
+      Effect.catch((error) => Effect.logWarning(`Failed to post status message: ${error}`).pipe(Effect.as(null))),
+      Effect.tap((status) => Deferred.succeed(posted, status)),
+      Effect.uninterruptible,
+    );
+    yield* post.pipe(
+      Effect.flatMap((status) => (status ? keepCurrent(chatId, sessionId, shown, statusHtml, status.messageId) : Effect.void)),
+      Effect.ensuring(Deferred.succeed(posted, null)),
+      Effect.forkScoped,
+    );
+    return posted;
+  });
+
+  const postResponse = Effect.fnUntraced(function*({ chatId, response, pendingResponseId, status, harnessName = "Codex" }: PostedResponse) {
     const trimmedResponse = response.trim();
-    if (statusMessageId && statusStartTime) {
-      const elapsedSeconds = (Date.now() - statusStartTime) / 1000;
-      await this.client.editMessageText(chatId, statusMessageId, `${harnessName} worked for ${formatDuration(elapsedSeconds)}.`).catch(() => undefined);
+    if (status) {
+      const elapsedSeconds = ((yield* Clock.currentTimeMillis) - status.startTime) / 1000;
+      yield* client.editMessageText(chatId, status.messageId, `${harnessName} worked for ${formatDuration(elapsedSeconds)}.`).pipe(Effect.ignore);
     }
     if (!trimmedResponse) {
       if (pendingResponseId) {
-        this.store.markPendingAsPosted(pendingResponseId);
+        store.markPendingAsPosted(pendingResponseId);
       }
       return;
     }
-    await this.enqueueFinalResponse({ chatId, text: trimmedResponse, pendingResponseId });
-  }
+    yield* enqueueFinalResponse({ chatId, text: trimmedResponse, pendingResponseId });
+  });
 
-  async finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, statusText = null, harnessName = "Codex" }: UnansweredTurn): Promise<void> {
-    if (statusMessageId) {
-      statusText = statusText ?? `${harnessName} interrupted.`;
-      await this.client.editMessageText(chatId, statusMessageId, statusText).catch(() => undefined);
+  const finishWithoutResponse = Effect.fnUntraced(function*({ chatId, pendingResponseId, status, statusText = null, harnessName = "Codex" }: UnansweredTurn) {
+    if (status) {
+      yield* client.editMessageText(chatId, status.messageId, statusText ?? `${harnessName} interrupted.`).pipe(Effect.ignore);
     }
     if (pendingResponseId) {
-      this.store.markPendingAsPosted(pendingResponseId);
+      store.markPendingAsPosted(pendingResponseId);
     }
-  }
+  });
 
-  async flushCompletedResponses(): Promise<void> {
-    const completedResponses = this.store.getCompletedResponsesPendingDelivery();
-    for (const completed of completedResponses) {
-      const response = finalResponseToMarkdown(completed.blocks);
-      if (response.trim()) {
-        await this.enqueueFinalResponse({ chatId: completed.chatId, text: response, pendingResponseId: completed.id });
-      } else {
-        this.store.markPendingAsPosted(completed.id);
+  return {
+    enqueueFinalResponse,
+    statusUpdates,
+    postResponse,
+    finishWithoutResponse,
+    restarting: (chatId, status, harnessName) =>
+      status ? client.editMessageText(chatId, status.messageId, restartingStatusText(harnessName)).pipe(Effect.ignore) : Effect.void,
+    flushCompletedResponses: Effect.gen(function*() {
+      for (const completed of store.getCompletedResponsesPendingDelivery()) {
+        const response = finalResponseToMarkdown(completed.blocks);
+        if (response.trim()) {
+          yield* enqueueFinalResponse({ chatId: completed.chatId, text: response, pendingResponseId: completed.id });
+        } else {
+          store.markPendingAsPosted(completed.id);
+        }
       }
-    }
-  }
-}
+    }),
+  };
+});

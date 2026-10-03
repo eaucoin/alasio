@@ -3,17 +3,16 @@
  * when the process is told to stop (SIGTERM, SIGINT) or what it runs fails, after which
  * the telemetry it holds is flushed and the process exits.
  */
-import { Cause, Context, Effect } from "effect";
+import { Cause, Effect } from "effect";
 
 import { loadAlasioConfig } from "./config.ts";
 import { codexHome } from "./codex/env.ts";
-import { CodexRollouts, codexRolloutsFacade, SessionFsCodexRollouts } from "./codex/rollouts/index.ts";
+import { CodexRollouts, SessionFsCodexRollouts } from "./codex/rollouts/index.ts";
 import { sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { indexTranscripts } from "./harness/claude/search/index.ts";
 import { loadKubeTemplates } from "./kube/config.ts";
 import { Neon } from "./neon/connect.ts";
 import { runAlasio, serveAlasio } from "./alasio.ts";
-import { effectRunnerHere } from "./shared/effects.ts";
 import { withLogScope } from "./shared/log.ts";
 
 const alasio = Effect.gen(function*() {
@@ -31,13 +30,11 @@ const alasio = Effect.gen(function*() {
   const sessionFsCodexRollouts = kubeTemplates.sessions
     ? yield* SessionFsCodexRollouts.make({ store: yield* neon.sessionFsRollouts, home: sessionFsCodexHome(config.stateDir) })
     : null;
-  // The app, not yet written in Effect, calls the rollouts as promises run in this program.
-  const effects = yield* effectRunnerHere(Context.empty());
   yield* serveAlasio({
     ...config,
     sessionStore: neon.sessionStore,
-    codexRollouts: codexRolloutsFacade(codexRollouts, effects),
-    sessionFsCodexRollouts: sessionFsCodexRollouts && codexRolloutsFacade(sessionFsCodexRollouts, effects),
+    codexRollouts,
+    sessionFsCodexRollouts,
     kubeTemplates,
   });
   yield* Effect.logInfo("Telegram Alasio bot is running");

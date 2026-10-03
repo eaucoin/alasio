@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Context, Effect, Layer } from "effect";
+import { Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { buildCodexThreadConfig, codexMcpServer } from "../src/codex/thread-config.ts";
@@ -10,14 +10,13 @@ import { KubeClient } from "../src/kube/client.ts";
 import type { HostProfile } from "../src/kube/config.ts";
 import {
   type BaymaMcpServer,
-  folderBaymaFacade,
+  folderBayma,
   HostBayma,
   hostBaymaManifest,
   hostBaymaName,
   hostBaymaStateDir,
   noFolderBayma,
 } from "../src/mcp/bayma.ts";
-import { effectRunner } from "../src/shared/effects.ts";
 
 const host: HostProfile = {
   namespace: "alasio-host",
@@ -55,9 +54,10 @@ test("each harness and conversation gets its own bayma and state directory", () 
 });
 
 test("a deployment without the host profile offers no folder bayma", async () => {
-  const folderBayma = folderBaymaFacade(effectRunner(Context.empty()));
-  assert.equal(folderBayma, noFolderBayma);
-  await assert.rejects(folderBayma({ harness: "claude", threadKey: "telegram:42" }), /this deployment offers no folder workspaces: its templates have no host profile/u);
+  const none = Effect.runSync(folderBayma);
+  assert.equal(none, noFolderBayma);
+  const refused = await Effect.runPromise(Effect.flip(none({ harness: "claude", threadKey: "telegram:42" })));
+  assert.equal(refused.message, "this deployment offers no folder workspaces: its templates have no host profile");
 });
 
 test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Code's shape", async () => {
@@ -80,7 +80,7 @@ test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Co
     Layer.provide(Layer.succeed(FetchHttpClient.Fetch, async () => new Response(null, { status: 400 }))),
   );
   const server = await Effect.runPromise(Effect.scoped(Layer.build(layer).pipe(
-    Effect.flatMap((services) => Effect.promise(() => folderBaymaFacade(effectRunner(services))({ harness: "claude", threadKey: "telegram:42" }))),
+    Effect.flatMap((services) => folderBayma.pipe(Effect.flatMap((ensure) => ensure({ harness: "claude", threadKey: "telegram:42" })), Effect.provideContext(services))),
   )));
   const name = hostBaymaName("claude", "telegram:42");
   assert.deepEqual(made, [`Sandbox/${name}`, `Secret/${name}-bayma-token`]);

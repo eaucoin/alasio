@@ -1,6 +1,6 @@
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
 import type { v2 } from "../../.types/codex/index.js";
-import type { HarnessGoals } from "../harness/index.ts";
+import type { HarnessGoalsFacade } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { ChatId, Client } from "../telegram/client.ts";
@@ -316,7 +316,7 @@ async function ensureGoalTurn({ conversationId, chatId, messageId, sessionId, go
   readonly sessionId: string;
   readonly goal: v2.ThreadGoal | null;
   readonly runGoalTurn: RunGoalTurn | null | undefined;
-  readonly goalApi: HarnessGoals;
+  readonly goalApi: HarnessGoalsFacade;
 }): Promise<boolean> {
   if (!runGoalTurn || goal?.status !== "active") {
     return false;
@@ -336,7 +336,7 @@ async function setFreshObjectiveGoal({ sessionId, objective, currentGoal, goalAp
   readonly sessionId: string;
   readonly objective: string;
   readonly currentGoal: v2.ThreadGoal | null;
-  readonly goalApi: HarnessGoals;
+  readonly goalApi: HarnessGoalsFacade;
 }): Promise<v2.ThreadGoal | null> {
   if (currentGoal) {
     await goalApi.clear({ threadId: sessionId });
@@ -348,7 +348,7 @@ async function buildGoalPanelFromState({ store, conversationId, turnState = null
   readonly store: GoalControlStore;
   readonly conversationId: string;
   readonly turnState?: GoalTurnState | null;
-  readonly goalApi: HarnessGoals;
+  readonly goalApi: HarnessGoalsFacade;
 }): Promise<ControlPanel> {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
@@ -413,7 +413,7 @@ export interface SendGoalPanelRequest {
   readonly conversationId: string;
   readonly chatId: ChatId;
   readonly isTurnActive?: boolean | undefined;
-  readonly goalApi: HarnessGoals;
+  readonly goalApi: HarnessGoalsFacade;
 }
 
 export async function sendGoalPanel({ client, store, conversationId, chatId, isTurnActive = false, goalApi }: SendGoalPanelRequest): Promise<void> {
@@ -532,7 +532,7 @@ export interface GoalControlCallback extends ControlCallback {
   readonly stopActiveTurn?: StopActiveTurn | null | undefined;
   readonly isTurnActive?: boolean | undefined;
   /** The harness's goals; a harness without them can only close a goal panel. */
-  readonly goalApi: HarnessGoals | undefined;
+  readonly goalApi: HarnessGoalsFacade | undefined;
 }
 
 export async function handleGoalControlCallback({

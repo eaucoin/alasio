@@ -1,14 +1,7 @@
 import { type ModelControlStore, sendModelPanel } from "./model-control.ts";
 import type { AlasioConfig } from "../config.ts";
-import {
-  type ActiveQueries,
-  type Harness,
-  type HarnessRegistry,
-  createHarnessRegistry,
-  interruptActiveTurn,
-  resolveHarnessName,
-  resolveWorkingDirectory,
-} from "../harness/index.ts";
+import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import { type HarnessFacade, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { ChatId, Client } from "../telegram/client.ts";
 import { type OperatorCommand, parseCommand } from "./command-parser.ts";
@@ -52,8 +45,9 @@ export interface CommandHandlerOptions {
   readonly client: Pick<Client, "sendMessage" | "editMessageText">;
   readonly config: Pick<AlasioConfig, "workspaceRoot"> & Partial<Pick<AlasioConfig, "workingDirectory">>;
   readonly store: CommandStore;
-  readonly activeQueries: ActiveQueries;
-  readonly harnesses?: HarnessRegistry | null | undefined;
+  readonly activeTurns: ActiveTurnsFacade;
+  /** The conversation's mounted harness in its mounted folder, or null until both are mounted. */
+  readonly harnessFor: (conversationId: string) => HarnessFacade | null;
   readonly runCodexTurn: RunCommandTurn;
   readonly runGoalTurn: RunGoalTurn;
   readonly startNewSession: StartNewSession;
@@ -91,8 +85,8 @@ export class CommandHandler {
   private readonly client: CommandHandlerOptions["client"];
   private readonly config: CommandHandlerOptions["config"];
   private readonly store: CommandStore;
-  private readonly activeQueries: ActiveQueries;
-  private readonly harnesses: HarnessRegistry;
+  private readonly activeTurns: ActiveTurnsFacade;
+  readonly harnessFor: (conversationId: string) => HarnessFacade | null;
   private readonly runCodexTurn: RunCommandTurn;
   private readonly runGoalTurn: RunGoalTurn;
   private readonly startNewSession: StartNewSession;
@@ -105,8 +99,8 @@ export class CommandHandler {
     client,
     config,
     store,
-    activeQueries,
-    harnesses = null,
+    activeTurns,
+    harnessFor,
     runCodexTurn,
     runGoalTurn,
     startNewSession,
@@ -118,8 +112,8 @@ export class CommandHandler {
     this.client = client;
     this.config = config;
     this.store = store;
-    this.activeQueries = activeQueries;
-    this.harnesses = harnesses ?? createHarnessRegistry({ config });
+    this.activeTurns = activeTurns;
+    this.harnessFor = harnessFor;
     this.runCodexTurn = runCodexTurn;
     this.runGoalTurn = runGoalTurn;
     this.startNewSession = startNewSession;
@@ -127,10 +121,6 @@ export class CommandHandler {
     this.switchWorkspace = switchWorkspace;
     this.createWorkspace = createWorkspace;
     this.sandboxEnabled = sandboxEnabled;
-  }
-
-  harnessFor(conversationId: string): Harness | null {
-    return this.harnesses.forConversation(this.store, conversationId);
   }
 
   /** Handles `text` if it is a command; resolves to whether it was. */
@@ -148,12 +138,12 @@ export class CommandHandler {
     const harness = this.harnessFor(conversationId);
     const label = harness?.displayName ?? "The agent";
     if (cmd.type === "stop") {
-      if (!this.activeQueries.has(conversationId)) {
+      if (!this.activeTurns.isBusy(conversationId)) {
         await this.client.sendMessage(chatId, "No active query to stop.");
         return true;
       }
       const [status] = await this.client.sendMessage(chatId, `Stopping ${label}...`);
-      const interrupted = await interruptActiveTurn(this.activeQueries, conversationId);
+      const interrupted = await this.activeTurns.stop(conversationId);
       const text = interrupted ? `${label} stopped.` : "No active query to stop.";
       if (status?.message_id) {
         await this.client.editMessageText(chatId, status.message_id, text, { format: "plain" }).catch(() => undefined);
@@ -174,7 +164,7 @@ export class CommandHandler {
       await handleServiceTextCommand({
         client: this.client,
         store: this.store,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         conversationId,
         chatId,
         target: cmd.target,
@@ -185,7 +175,7 @@ export class CommandHandler {
             await sendChooseWorkspacePanel({
               client: this.client,
               store: this.store,
-              activeQueries: this.activeQueries,
+              activeTurns: this.activeTurns,
               conversationId,
               chatId,
               workspaceRoot: this.config.workspaceRoot,
@@ -204,7 +194,7 @@ export class CommandHandler {
       await handleWorkspaceTextCommand({
         client: this.client,
         store: this.store,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         conversationId,
         chatId,
         args: cmd.args,
@@ -217,14 +207,14 @@ export class CommandHandler {
     }
     if (!harnessName) {
       // Every remaining control acts on the mounted service's own sessions or turns.
-      await sendChooseServicePanel({ client: this.client, store: this.store, activeQueries: this.activeQueries, conversationId, chatId });
+      await sendChooseServicePanel({ client: this.client, store: this.store, activeTurns: this.activeTurns, conversationId, chatId });
       return true;
     }
     if (!harness) {
       await sendChooseWorkspacePanel({
         client: this.client,
         store: this.store,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         conversationId,
         chatId,
         workspaceRoot: this.config.workspaceRoot,
@@ -254,7 +244,7 @@ export class CommandHandler {
         client: this.client,
         store: this.store,
         harness,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         conversationId,
         chatId,
       });
@@ -275,14 +265,14 @@ export class CommandHandler {
         messageId,
         args: cmd.args,
         runGoalTurn: this.runGoalTurn,
-        stopActiveTurn: async () => await interruptActiveTurn(this.activeQueries, conversationId),
+        stopActiveTurn: async () => await this.activeTurns.stop(conversationId),
         startNewSession: this.startNewSession,
-        isTurnActive: this.activeQueries.has(conversationId),
+        isTurnActive: this.activeTurns.isBusy(conversationId),
       });
       return true;
     }
     if (cmd.type === "sessions_new") {
-      if (this.activeQueries.has(conversationId)) {
+      if (this.activeTurns.isBusy(conversationId)) {
         await this.client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
         return true;
       }

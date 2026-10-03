@@ -19,7 +19,6 @@ import { join } from "node:path";
 
 import { Clock, Context, Effect, Fiber, Queue, Schedule, Schema, Scope, Semaphore } from "effect";
 
-import type { EffectRunner } from "../../shared/effects.ts";
 import { withLogScope } from "../../shared/log.ts";
 import { isNotFound, listRolloutFiles, parseRolloutName, rolloutFile, type RolloutFile, ROLLOUT_DIRS } from "./files.ts";
 import { mirrorRollout, type KnownRollouts } from "./mirror.ts";
@@ -262,20 +261,3 @@ export class SessionFsCodexRollouts extends Context.Service<SessionFsCodexRollou
   "alasio/codex/rollouts/SessionFsCodexRollouts",
   { make: makeCodexRollouts },
 ) {}
-
-/** Kept rollouts as code not yet written in Effect calls them: restore and flush as promises. */
-export interface CodexRolloutsFacade {
-  restore(threadIds: readonly string[]): Promise<string[]>;
-  flush(threadId: string): Promise<void>;
-}
-
-/**
- * The promise façade of `rollouts`, its effects run by `effects`, for the app's code not
- * yet written in Effect; it goes when the last of that code has moved.
- */
-export function codexRolloutsFacade(rollouts: KeptCodexRollouts, effects: EffectRunner<never>): CodexRolloutsFacade {
-  return {
-    restore: (threadIds) => effects.runPromise(rollouts.restore(threadIds)),
-    flush: (threadId) => effects.runPromise(rollouts.flush(threadId)),
-  };
-}

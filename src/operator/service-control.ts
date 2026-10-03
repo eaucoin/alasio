@@ -1,6 +1,6 @@
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
+import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
 import {
-  type ActiveQueries,
   CLAUDE_HARNESS,
   CODEX_HARNESS,
   HARNESS_NAMES,
@@ -81,14 +81,14 @@ function mountedLine(store: ServiceControlStore, conversationId: string, harness
 
 export interface ServicePanelRequest {
   readonly store: ServiceControlStore;
-  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly conversationId: string;
   readonly notice?: string | undefined;
 }
 
-export function buildServicePanel({ store, activeQueries, conversationId, notice = "" }: ServicePanelRequest): ControlPanel {
+export function buildServicePanel({ store, activeTurns, conversationId, notice = "" }: ServicePanelRequest): ControlPanel {
   const active = resolveHarnessName(store, conversationId);
-  const working = activeQueries?.has?.(conversationId) ?? false;
+  const working = activeTurns?.isBusy(conversationId) ?? false;
   const lines = [
     "Service",
     "",
@@ -122,7 +122,7 @@ export function buildServicePanel({ store, activeQueries, conversationId, notice
 export interface SendServicePanelRequest {
   readonly client: Pick<Client, "sendMessage">;
   readonly store: ServiceControlStore;
-  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly conversationId: string;
   readonly chatId: ChatId;
 }
@@ -131,8 +131,8 @@ export interface SendServicePanelRequest {
  * Reply used whenever a prompt or control arrives before any service is mounted.
  * It is the only thing alasio says in that state.
  */
-export async function sendChooseServicePanel({ client, store, activeQueries, conversationId, chatId }: SendServicePanelRequest): Promise<void> {
-  const panel = buildServicePanel({ store, activeQueries, conversationId, notice: CHOOSE_SERVICE_NOTICE });
+export async function sendChooseServicePanel({ client, store, activeTurns, conversationId, chatId }: SendServicePanelRequest): Promise<void> {
+  const panel = buildServicePanel({ store, activeTurns, conversationId, notice: CHOOSE_SERVICE_NOTICE });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -163,7 +163,7 @@ export interface ServiceTextCommand extends SendServicePanelRequest {
   readonly onMounted?: (() => Promise<void>) | null | undefined;
 }
 
-export async function handleServiceTextCommand({ client, store, activeQueries, conversationId, chatId, target, switchHarness, onMounted = null }: ServiceTextCommand): Promise<void> {
+export async function handleServiceTextCommand({ client, store, activeTurns, conversationId, chatId, target, switchHarness, onMounted = null }: ServiceTextCommand): Promise<void> {
   if (target) {
     const harness = resolveServiceTarget(target);
     if (!harness) {
@@ -179,14 +179,14 @@ export async function handleServiceTextCommand({ client, store, activeQueries, c
     } catch (error) {
       notice = error instanceof Error ? error.message : String(error);
     }
-    const panel = buildServicePanel({ store, activeQueries, conversationId, notice });
+    const panel = buildServicePanel({ store, activeTurns, conversationId, notice });
     await client.sendMessage(chatId, panel.text, panel.options);
     if (mounted && onMounted) {
       await onMounted();
     }
     return;
   }
-  const panel = buildServicePanel({ store, activeQueries, conversationId });
+  const panel = buildServicePanel({ store, activeTurns, conversationId });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -203,7 +203,7 @@ async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId
 export interface ServiceControlCallback extends ControlCallback {
   readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage">;
   readonly store: ServiceControlStore;
-  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly switchHarness: SwitchHarness;
   /** Called once a service has been newly mounted. */
   readonly onMounted?: (() => Promise<void>) | null | undefined;
@@ -212,7 +212,7 @@ export interface ServiceControlCallback extends ControlCallback {
 export async function handleServiceControlCallback({
   client,
   store,
-  activeQueries,
+  activeTurns,
   action,
   switchHarness,
   callbackQueryId,
@@ -249,7 +249,7 @@ export async function handleServiceControlCallback({
     await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
     await editPanel(client, chatId, messageId, buildServicePanel({
       store,
-      activeQueries,
+      activeTurns,
       conversationId: action.conversationId,
       notice,
     }));

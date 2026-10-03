@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { v2 } from "../.types/codex/index.js";
-import { TurnController } from "../src/codex/turn-controller.ts";
-import type { GoalUpdate, HarnessGoals } from "../src/harness/index.ts";
+import { Effect } from "effect";
+
+import { ActiveTurns } from "../src/harness/active-turns.ts";
+import type { GoalUpdate, HarnessGoalsFacade } from "../src/harness/index.ts";
 import {
   type GoalControlStore,
   type GoalPanelTarget,
@@ -20,6 +22,7 @@ import {
 } from "../src/operator/goal-control.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
 import type { Client } from "../src/telegram/client.ts";
+import { withTurns } from "./support/turns.ts";
 
 /** A thread goal as Codex reports it, with what a test does not care about filled in. */
 function threadGoal(fields: Partial<v2.ThreadGoal>): v2.ThreadGoal {
@@ -91,7 +94,7 @@ function createGoalApi({ currentGoal = null, updatedGoal, waitTurnId = null }: F
     waitForTurnId: [],
   };
   const events: string[] = [];
-  const goalApi: HarnessGoals = {
+  const goalApi: HarnessGoalsFacade = {
     async read(args) {
       calls.read.push(args);
       events.push("read");
@@ -441,25 +444,20 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
     const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
     store.setActiveHarness(conversationId, "codex");
     const { calls, client } = createClient();
-    const turns = new TurnController({
-      config: { workspaceRoot: root, workingDirectory: "/repo" },
-      client,
-      store,
-      outbox: { enqueueText: () => "outbox-1" },
-      activeQueries: new Map([[conversationId, { abort: async () => undefined, steer: async () => true }]]),
-      workflowWaits: new Map(),
-      workflowWakeEvents: new Map(),
-      isStopping: () => false,
-    });
-
-    const handled = await turns.runGoalTurn({
-      conversationId,
-      chatId: 123,
-      messageId: 456,
-      sessionId: "session-1",
-      turnId: null,
-      prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
-    });
+    const handled = await withTurns({ store, client, harnesses: {}, config: { workspaceRoot: root, workingDirectory: "/repo" } }, ({ turns, effects }) =>
+      // Codex is working: a turn of the conversation is running.
+      effects.runPromise(Effect.scoped(Effect.gen(function*() {
+        const activeTurns = yield* ActiveTurns;
+        yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
+        return yield* Effect.promise(() => turns.runGoalTurn({
+          conversationId,
+          chatId: 123,
+          messageId: 456,
+          sessionId: "session-1",
+          turnId: null,
+          prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
+        }));
+      }))));
 
     assert.equal(handled, true);
     assert.match(calls.sendMessage[0]?.[1] ?? "", /Codex is currently working/);

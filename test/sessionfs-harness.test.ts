@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { Context, Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Layer, Scope } from "effect";
 
 import type { v2 } from "../.types/codex/index.js";
 import { type AppServer, CodexAppServer, makeAppServer } from "../src/codex/app-server/client.ts";
@@ -10,15 +10,16 @@ import type { AppServerScope } from "../src/codex/app-server/rpc-client.ts";
 import type { ThreadOptions, ThreadScope } from "../src/codex/app-server/thread-client.ts";
 import { SessionFsCodex } from "../src/codex/sessionfs.ts";
 import { codexMcpServer } from "../src/codex/thread-config.ts";
-import { createCodexHarness } from "../src/harness/codex.ts";
-import { createClaudeHarness } from "../src/harness/claude/index.ts";
+import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { makeCodexHarness } from "../src/harness/codex.ts";
+import { makeClaudeHarness } from "../src/harness/claude/index.ts";
 import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
 import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
-import type { SessionFilesystems } from "../src/sandbox/index.ts";
-import { effectRunner } from "../src/shared/effects.ts";
+import { noFolderBayma } from "../src/mcp/bayma.ts";
+import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { fakeQuery, initMessage, stamped, successResult } from "./support/claude-sdk.ts";
 
 // Both harnesses on a session filesystem, over a fake sandbox: what they run in, what they
@@ -28,18 +29,18 @@ const DIRECTORY = "/state/sessionfs/workspaces/fs-abc123";
 const BAYMA: BaymaEndpoint = { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer forward-token" } };
 const CODEX_ENV = { CODEX_HOME: "/state/sessionfs/codex" };
 
-function fakeSandbox(): SessionFilesystems & { readonly ensured: string[] } {
+function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string[] } {
   const ensured: string[] = [];
   const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
   return {
     ensured,
-    enabled: true,
     volumes: { create: unused, destroy: unused },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
-    ensureSession: async (volumeId) => {
-      ensured.push(volumeId);
-      return { bayma: BAYMA };
-    },
+    ensureSession: (volumeId) =>
+      Effect.sync(() => {
+        ensured.push(volumeId);
+        return { bayma: BAYMA };
+      }),
     readFile: unused,
   };
 }
@@ -142,9 +143,15 @@ function recordingAppServer(idle: AppServer): AppServer & { readonly calls: read
   };
 }
 
-test("neither harness serves a session filesystem where the deployment does not enable them", () => {
-  assert.throws(() => createCodexHarness({ workingDirectory: WORKSPACE }), /does not enable/);
-  assert.throws(() => createClaudeHarness({ workingDirectory: WORKSPACE }), /does not enable/);
+test("neither harness serves a session filesystem where the deployment does not enable them", async () => {
+  const options = { workingDirectory: WORKSPACE, sandbox: null, folderBayma: noFolderBayma };
+  const refusals = await Effect.runPromise(Effect.scoped(Effect.all([
+    Effect.flip(makeCodexHarness({ ...options, sessionFsCodex: null })),
+    Effect.flip(makeClaudeHarness(options)),
+  ])).pipe(Effect.provide([ActiveTurns.layer, Layer.effect(CodexAppServer, idleAppServer)])));
+  for (const refusal of refusals) {
+    assert.match(refusal.message, /does not enable/);
+  }
 });
 
 test("Codex on a session filesystem runs on its own app-server, in the harness directory, with the session's bayma", async (t) => {
@@ -164,13 +171,17 @@ test("Codex on a session filesystem runs on its own app-server, in the harness d
     listingScope: ({ directory }) => Effect.succeed({ cwd: directory, codexEnv: CODEX_ENV, appServer: client }),
     stop: Effect.void,
   });
-  const effects = effectRunner(Context.make(CodexAppServer, operatorAppServer).pipe(Context.add(SessionFsCodex, sessionFsCodex)));
-  const harness = createCodexHarness({ workingDirectory: WORKSPACE, sandbox, effects });
+  const harness = await Effect.runPromise(makeCodexHarness({ workingDirectory: WORKSPACE, sandbox, sessionFsCodex, folderBayma: noFolderBayma }).pipe(
+    Effect.provideService(CodexAppServer, operatorAppServer),
+    Effect.provide(ActiveTurns.layer),
+  ));
+  const { goals } = harness;
+  assert.ok(goals, "Codex has goals");
 
   // Lists, goals, and models need no session host.
-  assert.equal((await harness.sessions.listSessions(1))[0]?.uuid, "thread-1");
-  assert.deepEqual(await harness.goals?.read({ threadId: "thread-1" }), GOAL);
-  assert.equal((await harness.listModels())[0]?.id, "m");
+  assert.equal((await Effect.runPromise(harness.sessions.listSessions(1)))[0]?.uuid, "thread-1");
+  assert.deepEqual(await Effect.runPromise(goals.read({ threadId: "thread-1" })), GOAL);
+  assert.equal((await Effect.runPromise(harness.listModels()))[0]?.id, "m");
   assert.deepEqual(sandbox.ensured, []);
   for (const { args } of client.calls) {
     assert.equal(args.cwd, DIRECTORY); // never the sentinel, never the operator's folder
@@ -178,7 +189,7 @@ test("Codex on a session filesystem runs on its own app-server, in the harness d
   }
 
   // A thread's work starts the session's host and reaches it through its bayma.
-  assert.equal(await harness.startFreshSession({ threadKey: "telegram:1" }), "thread-2");
+  assert.equal(await Effect.runPromise(harness.startFreshSession({ threadKey: "telegram:1" })), "thread-2");
   assert.deepEqual(sandbox.ensured, ["fs-abc123"]);
   assert.deepEqual(scopes, [{ directory: DIRECTORY, bayma: BAYMA }]);
   const started = client.calls.find((call) => call.method === "startThread");
@@ -207,7 +218,12 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
       return true;
     },
   };
-  const harness = createClaudeHarness({ workingDirectory: WORKSPACE, sandbox, sessionApi, claudeQueryFactory: queryFactory });
+  // The harness lasts as long as the scope it is made in, as alasio's last as long as alasio.
+  const scope = Effect.runSync(Scope.make());
+  const harness = await Effect.runPromise(makeClaudeHarness({ workingDirectory: WORKSPACE, sandbox, sessionApi, claudeQueryFactory: queryFactory, folderBayma: noFolderBayma }).pipe(
+    Effect.provide(ActiveTurns.layer),
+    Scope.provide(scope),
+  ));
   const persistence: TurnPersistence = {
     createPendingResponse: () => "pending-1",
     markPendingAsPosted: () => undefined,
@@ -221,14 +237,13 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
   };
   try {
     for (const prompt of ["hi", "again"]) {
-      const result = await harness.executeTurn({
-        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE,
-        persistence, activeQueries: new Map(),
-      });
+      const result = await Effect.runPromise(harness.runTurn({
+        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, persistence,
+      }));
       assert.equal(result.responseCompleted, true);
     }
   } finally {
-    await harness.shutdown();
+    await Effect.runPromise(Scope.close(scope, Exit.void));
   }
   // One live process serves both turns, and the session is made sure of before each: its
   // host may have stopped between them.

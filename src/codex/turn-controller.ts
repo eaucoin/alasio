@@ -1,16 +1,23 @@
-import { RestartRecovery } from "./restart-recovery.ts";
+import { Clock, Context, Deferred, Effect, Fiber, FiberMap, FiberSet, HashMap, Layer, Option, Ref, Schedule, Schema } from "effect";
+
 import {
-  type ActiveQueries,
   type AttachedTurn,
   type Harness,
-  type HarnessRegistry,
+  type HarnessError,
+  type HarnessFacade,
+  Harnesses,
+  type HarnessesFacade,
+  type HarnessUnavailable,
   NO_WORKSPACE_MOUNTED,
-  createHarnessRegistry,
+  type NoServiceMounted,
+  NoWorkspaceMounted,
   harnessDisplayName,
+  harnessesFacade,
   isHarnessName,
   resolveHarnessName,
   resolveWorkingDirectory,
 } from "../harness/index.ts";
+import { ActiveTurns, type ActiveTurnsFacade, activeTurnsFacade } from "../harness/active-turns.ts";
 import { errorsIn, type ResponseBlock } from "./event-projection.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 import { buildFilePromptSuffix } from "../shared/file-prompt.ts";
@@ -20,27 +27,31 @@ import { type HarnessSwitch, sendChooseServicePanel } from "../operator/service-
 import { type WorkspaceChange, sendChooseWorkspacePanel } from "../operator/workspace-control.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
-import type { SqliteStore } from "../persistence/store.ts";
-import type { NetMode, SessionFilesystems } from "../sandbox/index.ts";
-import type { ChatId, Client } from "../telegram/client.ts";
-import type { TelegramOutbox } from "../telegram/outbox.ts";
-import type { WorkflowWait, WorkflowWakeEvent } from "../workflow/hook-server.ts";
+import { type SqliteStore, Store } from "../persistence/store.ts";
+import { type NetMode, type SessionFilesystems, SessionSandboxes } from "../sandbox/index.ts";
+import type { EffectRunner } from "../shared/effects.ts";
+import { type ChatId, type Client, TelegramClient, type TelegramError } from "../telegram/client.ts";
+import { Outbox } from "../telegram/outbox.ts";
+import { WorkflowHooks } from "../workflow/hook-server.ts";
 import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.ts";
 import { sessionFsWorkspace } from "../workspace/kind.ts";
 import { newVolumeId } from "../sandbox/names.ts";
 import { truncateText } from "../operator/text.ts";
-import { ReplyMedia } from "./reply-media.ts";
-import { StatusReporter } from "./status-reporter.ts";
-import { createLogger } from "../shared/log.ts";
-import { currentSpan, currentTraceparent, inSpan, meter } from "../telemetry/index.ts";
+import { makeReplyMedia } from "./reply-media.ts";
+import { recordExternalRestartEvent, recoverInterruptedTurns } from "./restart-recovery.ts";
+import { makeStatusReporter } from "./status-reporter.ts";
+import { createLogger, withLogScope } from "../shared/log.ts";
+import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 
-const log = createLogger("codex-turn-controller");
+const LOG_SCOPE = "codex-turn-controller";
+/** The scope's lines, for the operator controls not yet written in Effect. */
+const log = createLogger(LOG_SCOPE);
 
 const turnDuration = meter.createHistogram("alasio.turn.duration", {
   description: "Time from a turn starting to its reply being queued for delivery, by harness and outcome",
   unit: "s",
 });
-const activeTurns = meter.createUpDownCounter("alasio.turn.active", {
+const runningTurns = meter.createUpDownCounter("alasio.turn.active", {
   description: "Turns running now, by harness",
   unit: "{turn}",
 });
@@ -49,28 +60,15 @@ const promptWait = meter.createHistogram("alasio.prompt.wait", {
   unit: "s",
 });
 
+/** How often completed responses that were never delivered are looked for. */
+const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
+
 /**
  * The configuration the controller reads: the workspace root, the pre-mounted folder if
  * any, and the state directory a reply's media are copied under, without which replies
  * go as text only.
  */
 export type TurnControllerConfig = Pick<AlasioConfig, "workspaceRoot"> & Partial<Pick<AlasioConfig, "workingDirectory" | "stateDir">>;
-
-/** The Telegram calls the controller makes, and the panels and status messages it sends make. */
-export type TurnControllerClient = Pick<Client, "sendMessage" | "editMessageText">;
-
-export interface TurnControllerOptions {
-  readonly config: TurnControllerConfig;
-  readonly client: TurnControllerClient;
-  readonly store: SqliteStore;
-  readonly outbox: Pick<TelegramOutbox, "enqueueText">;
-  readonly activeQueries: ActiveQueries;
-  readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
-  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
-  readonly isStopping: () => boolean;
-  readonly harnesses?: HarnessRegistry | null;
-  readonly sandbox?: SessionFilesystems | null;
-}
 
 /** A conversation and the chat it is in, as the setup pickers are sent to. */
 export interface ConversationChat {
@@ -83,6 +81,15 @@ export interface IncomingPrompt extends ConversationChat {
   readonly messageId: number;
   readonly text: string;
   readonly filePaths: readonly string[];
+}
+
+/** An operator's prompt to queue as a prompt job: its text as sent, and the prompt it makes. */
+export interface QueuedPrompt extends ConversationChat {
+  readonly messageId: number;
+  readonly prompt: string;
+  readonly filePaths: readonly string[];
+  /** What the operator wrote, as the concurrent prompt's question quotes it. */
+  readonly visibleText: string;
 }
 
 /** A turn to run on the conversation's mounted session. */
@@ -101,14 +108,8 @@ interface SessionTurn extends TurnRequest {
   readonly attachedTurn: AttachedTurn | null;
 }
 
-/** How a turn ended; see runTurn. */
+/** How a turn ended: completed, without its answer, interrupted by the operator, or stopped by alasio stopping. */
 export type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
-
-interface SettledTurn {
-  readonly outcome: TurnOutcome;
-  /** Whether the response completed; undefined while alasio stops. */
-  readonly result: boolean | undefined;
-}
 
 /**
  * What a concurrent prompt's buttons (steer, queue, swerve, discard) carry: its prompt
@@ -120,42 +121,487 @@ export type ConcurrentPromptPayload = {
   readonly prompt: string;
 };
 
+/** A goal turn asked of a harness that has no goals. */
+export class GoalTurnsUnsupported extends Schema.TaggedError<GoalTurnsUnsupported>()("GoalTurnsUnsupported", {
+  harness: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.harness} does not support attached goal turns.`;
+  }
+}
+
+/** What needs the conversation free was asked while a turn runs in it. */
+export class ConversationBusy extends Schema.TaggedError<ConversationBusy>()("ConversationBusy", {
+  message: Schema.String,
+}) {}
+
+/** Why a turn could not run: no harness to run it on, or one that cannot run it. */
+export type TurnError = NoServiceMounted | HarnessUnavailable | GoalTurnsUnsupported;
+
 /** What a turn that ended without its answer shows: that it did not complete, and why, when the harness said. */
 function notCompleted(harnessName: string, blocks: readonly ResponseBlock[]): string {
   const error = errorsIn(blocks).at(-1);
   return error ? `${harnessName} did not complete: ${error}` : `${harnessName} did not complete.`;
 }
 
+/** The mounted service's name as the operator reads it, or "No service". */
+function harnessLabelOf(store: SqliteStore, conversationId: string): string {
+  const name = resolveHarnessName(store, conversationId);
+  return name ? harnessDisplayName(name) : "No service";
+}
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * alasio's turns: each conversation's prompt jobs drained one at a time by a worker of its
+ * own, each turn from its status message to its reply, a turn's queued messages as the
+ * turn after it, and what a restart left (interrupted turns, undelivered responses).
+ * Stopping alasio interrupts every running turn while the store and Telegram are still
+ * open: the restart is recorded for the turn to continue after it, and its status
+ * message says so.
+ */
+export class Turns extends Context.Service<Turns, {
+  /**
+   * Queues an operator's prompt as a prompt job: run as soon as the conversation is free,
+   * or, while a turn runs in it, held for the operator to say what to do with it.
+   */
+  readonly submit: (prompt: QueuedPrompt) => Effect.Effect<void, TelegramError>;
+  /** Keeps a message (a concurrent prompt's, steered or swerved without a job) for the turn after the current one. */
+  readonly enqueueMessage: (conversationId: string, prompt: string, front?: boolean) => Effect.Effect<void>;
+  /** Makes sure the conversation's worker is draining its prompt jobs. */
+  readonly schedule: (conversationId: string) => Effect.Effect<void>;
+  /** Settles what becomes of a prompt job; a job made pending again is scheduled. The job as it is now. */
+  readonly setPromptDisposition: (jobId: string, state: PromptJobState, priority?: number) => Effect.Effect<PromptJob | null>;
+  /** Runs a turn on the conversation's mounted session now, then its queued messages: whether its response completed. */
+  readonly run: (request: TurnRequest) => Effect.Effect<boolean, TurnError>;
+  /** Runs a goal's turn on its session, or asks what to do with it while a turn runs. */
+  readonly runGoalTurn: (request: GoalTurnRequest) => Effect.Effect<boolean, TurnError | TelegramError>;
+  /** A new, empty session of the mounted service, mounted on the conversation: its id. */
+  readonly startNewSession: (conversationId: string) => Effect.Effect<string, NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError>;
+  /** Settles, as alasio starts, the prompt jobs the last alasio left running. */
+  readonly reconcilePersistentState: Effect.Effect<void>;
+  /** Queues every completed response that was never delivered. */
+  readonly flushCompletedResponses: Effect.Effect<void>;
+  /** Continues, or lets go of, the turns the last alasio was running when it stopped. */
+  readonly recoverInterruptedTurns: Effect.Effect<void>;
+  /** Schedules every conversation with prompt jobs waiting. */
+  readonly resumePendingPrompts: Effect.Effect<void>;
+}>()("alasio/codex/Turns") {
+  static readonly layer = (config: Partial<Pick<AlasioConfig, "stateDir">> = {}): Layer.Layer<
+    Turns,
+    never,
+    Store | TelegramClient | Outbox | WorkflowHooks | Harnesses | ActiveTurns
+  > => Layer.effect(Turns, makeTurns(config));
+}
+
+const makeTurns = Effect.fnUntraced(function*({ stateDir }: Partial<Pick<AlasioConfig, "stateDir">>) {
+  const store = yield* Store;
+  const client = yield* TelegramClient;
+  const harnesses = yield* Harnesses;
+  const activeTurns = yield* ActiveTurns;
+  const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
+  const status = yield* makeStatusReporter({
+    // Media a response shows are copied under the state directory until delivered.
+    replyMedia: stateDir
+      ? makeReplyMedia({
+        stateDir,
+        workspaceForChat: (chatId) => {
+          const conversation = store.getConversationByChatId(chatId);
+          return conversation ? resolveWorkingDirectory(store, conversation.id) : null;
+        },
+        sandbox,
+      })
+      : null,
+  });
+  // Each conversation's prompt worker, and the turns run outside one (a command's, a
+  // goal's): interrupted, each turn left for after the restart, as alasio stops.
+  const workers = yield* FiberMap.make<string>();
+  const directTurns = yield* FiberSet.make<boolean, TurnError>();
+  const queuedMessages = yield* Ref.make(HashMap.empty<string, readonly string[]>());
+
+  const flushCompletedResponses = status.flushCompletedResponses.pipe(withLogScope(LOG_SCOPE));
+
+  /**
+   * One turn through `harness`, from its status message to its reply: its outcome, and
+   * whether its response completed. Interrupted, as alasio stops, the turn is left for
+   * after the restart: the restart recorded for it to continue then, or its completed
+   * response for delivery, and its status message saying so.
+   */
+  const runTurn = Effect.fnUntraced(function*(
+    harness: Harness,
+    { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }: Omit<SessionTurn, "traceparent">,
+  ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted> {
+    if (attachedTurn && !harness.supportsGoals) {
+      return yield* new GoalTurnsUnsupported({ harness: harness.displayName });
+    }
+    const workingDirectory = resolveWorkingDirectory(store, conversationId);
+    if (!workingDirectory) {
+      return yield* new NoWorkspaceMounted();
+    }
+    store.upsertActiveTurn({
+      conversationId,
+      chatId: String(chatId),
+      messageId: String(messageId),
+      sessionId: existingSession ?? null,
+      harness: harness.name,
+      pendingResponseId: null,
+      prompt,
+      startedAt: (yield* Clock.currentTimeMillis) / 1000,
+    });
+    let responseCompleted: boolean | null = null;
+    return yield* Effect.scoped(Effect.gen(function*() {
+      const posted = yield* status.statusUpdates({ chatId, sessionId: existingSession ?? null, harnessName: harness.displayName });
+
+      /** Leaves the turn, as alasio stops, for after the restart. */
+      const leaveForRestart = Effect.gen(function*() {
+        const turn = store.getActiveTurns().find((active) => active.thread_key === conversationId);
+        if (!turn) {
+          // The turn had already let go of the conversation.
+          return;
+        }
+        const pendingResponseId = turn.pending_response_id;
+        const completed = responseCompleted
+          ?? (pendingResponseId !== null && store.getCompletedResponsesPendingDelivery().some((response) => response.id === pendingResponseId));
+        if (completed) {
+          store.clearActiveTurn(conversationId, pendingResponseId);
+          store.clearRestartEvent(conversationId);
+          yield* Effect.logInfo(`Leaving completed response ${pendingResponseId} for post-restart delivery`);
+        } else {
+          yield* recordExternalRestartEvent(store, conversationId);
+          yield* Effect.logInfo(`Leaving active turn ${conversationId} for post-restart recovery because the service is stopping`);
+        }
+        yield* status.restarting(chatId, yield* Deferred.await(posted), harness.displayName);
+      });
+
+      return yield* Effect.gen(function*() {
+        const queryResult = yield* harness.runTurn({
+          prompt,
+          resumeSession: existingSession ?? null,
+          threadKey: conversationId,
+          chatId: String(chatId),
+          messageId: String(messageId),
+          workingDirectory,
+          persistence: store,
+          attachedTurn,
+          onPromptDispatched: () => {
+            if (jobId) {
+              store.markPromptJobDispatched(jobId);
+            }
+          },
+          onTransportStarted: ({ sessionId, turnId }) => {
+            if (jobId) {
+              store.markPromptJobUpstreamStarted(jobId, sessionId, turnId);
+            }
+          },
+          onTransportCompleted: ({ sessionId, turnId }) => {
+            if (jobId) {
+              store.markPromptJobUpstreamCompleted(jobId, sessionId, turnId);
+            }
+          },
+          // A harness that keeps running between prompts (Claude Code background work)
+          // produces replies of its own and frees the conversation when they finish.
+          onBackgroundResponse: flushCompletedResponses.pipe(
+            Effect.catchDefect((defect) => Effect.logWarning(`Background response delivery deferred for ${conversationId}: ${errorText(defect)}`)),
+            withLogScope(LOG_SCOPE),
+          ),
+          onIdle: schedule(conversationId),
+        });
+        const { blockSequence, sessionId: newSessionId, pendingResponseId, interrupted } = queryResult;
+        responseCompleted = queryResult.responseCompleted;
+        const shown = yield* Deferred.await(posted);
+        if (newSessionId && !existingSession) {
+          store.setSessionId(conversationId, newSessionId);
+          yield* Effect.annotateCurrentSpan("alasio.session.id", newSessionId);
+        }
+        if (interrupted) {
+          yield* status.finishWithoutResponse({ chatId, pendingResponseId, status: shown, harnessName: harness.displayName });
+          store.clearActiveTurn(conversationId, pendingResponseId);
+          store.clearRestartEvent(conversationId);
+          return { outcome: "interrupted", completed: false } as const;
+        }
+        if (!responseCompleted) {
+          yield* status.finishWithoutResponse({
+            chatId,
+            pendingResponseId,
+            status: shown,
+            statusText: notCompleted(harness.displayName, blockSequence),
+          });
+          store.clearActiveTurn(conversationId, pendingResponseId);
+          store.clearRestartEvent(conversationId);
+          return { outcome: "incomplete", completed: false } as const;
+        }
+        yield* Effect.suspend(() =>
+          status.postResponse({ chatId, response: finalResponseToMarkdown(blockSequence), pendingResponseId, status: shown, harnessName: harness.displayName })
+        ).pipe(
+          Effect.catchDefect((defect) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${errorText(defect)}`)),
+          Effect.ensuring(Effect.sync(() => {
+            store.clearActiveTurn(conversationId, pendingResponseId);
+            store.clearRestartEvent(conversationId);
+          })),
+        );
+        return { outcome: "completed", completed: true } as const;
+      }).pipe(Effect.onInterrupt(() => leaveForRestart));
+    }));
+  });
+
+  /**
+   * Runs a turn, then the messages queued while it ran, as a turn of their own. The turn
+   * is the span `alasio.turn`, continuing `traceparent` when given (a queued prompt's;
+   * null for a trace of its own) and the active span otherwise; its outcome labels it
+   * and its duration.
+   */
+  const runSessionTurn = (turn: SessionTurn): Effect.Effect<boolean, TurnError> =>
+    Effect.gen(function*() {
+      const harness = yield* harnesses.requireForConversation(turn.conversationId);
+      const labels = { "alasio.harness": harness.name };
+      const startedAt = yield* Clock.currentTimeMillis;
+      let outcome: TurnOutcome | "failed" = "failed";
+      runningTurns.add(1, labels);
+      const { completed } = yield* runTurn(harness, turn).pipe(
+        Effect.tap((settled) => Effect.sync(() => {
+          outcome = settled.outcome;
+        })),
+        Effect.onInterrupt(() => Effect.sync(() => {
+          outcome = "stopped";
+        })),
+        Effect.onExit(() => Effect.suspend(() => Effect.annotateCurrentSpan("alasio.turn.outcome", outcome))),
+        withAlasioSpan("alasio.turn", {
+          parent: turn.traceparent,
+          attributes: {
+            ...labels,
+            "alasio.conversation.id": turn.conversationId,
+            "telegram.chat.id": String(turn.chatId),
+            ...(turn.jobId ? { "alasio.prompt_job.id": turn.jobId } : {}),
+            ...(turn.existingSession ? { "alasio.session.id": turn.existingSession } : {}),
+          },
+        }),
+        Effect.onExit(() => Effect.gen(function*() {
+          runningTurns.add(-1, labels);
+          turnDuration.record(((yield* Clock.currentTimeMillis) - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
+        })),
+      );
+      const queued = yield* Ref.modify(queuedMessages, (all) => [Option.getOrElse(HashMap.get(all, turn.conversationId), () => []), HashMap.remove(all, turn.conversationId)]);
+      if (queued.length > 0) {
+        yield* run({
+          conversationId: turn.conversationId,
+          chatId: turn.chatId,
+          messageId: turn.messageId,
+          prompt: queued.join("\n\n---\n\n"),
+          traceparent: null,
+        });
+      }
+      return completed;
+    }).pipe(withLogScope(LOG_SCOPE));
+
+  /** A turn on the conversation's mounted session, in the trace `traceparent` names (null: one of its own). */
+  const run = (request: TurnRequest & { readonly traceparent: string | null }): Effect.Effect<boolean, TurnError> =>
+    Effect.suspend(() =>
+      runSessionTurn({
+        ...request,
+        existingSession: store.getSessionId(request.conversationId) ?? null,
+        attachedTurn: null,
+      })
+    );
+
+  /** A turn run outside a worker, as a fiber of the service's, for alasio's stopping to reach. */
+  const runDirect = (turn: Effect.Effect<boolean, TurnError>): Effect.Effect<boolean, TurnError> =>
+    Effect.flatMap(FiberSet.run(directTurns, turn), Fiber.join);
+
+  /** The conversation's prompt jobs, one at a time, for as long as it is free and has any. */
+  const drain = (conversationId: string): Effect.Effect<void, NoServiceMounted | HarnessUnavailable> =>
+    Effect.gen(function*() {
+      /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
+      const failJob = (job: PromptJob, error: unknown) =>
+        Effect.suspend(() => {
+          store.failPromptJob(job.id, error);
+          return client.sendMessage(job.chat_id, `${harnessLabelOf(store, conversationId)} hit an error: ${errorText(error)}`).pipe(Effect.ignore);
+        });
+      while (!(yield* activeTurns.isBusy(conversationId))) {
+        const job = store.claimNextPromptJob(conversationId);
+        if (!job) {
+          return;
+        }
+        const activeHarness = (yield* harnesses.requireForConversation(conversationId)).name;
+        if (job.harness && job.harness !== activeHarness) {
+          yield* Effect.logWarning(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
+        }
+        // Claiming a job stamps its start, so a claimed job's started_at is set.
+        promptWait.record(job.started_at! - job.created_at, { "alasio.harness": activeHarness });
+        yield* run({
+          conversationId,
+          chatId: job.chat_id,
+          messageId: job.message_id,
+          prompt: job.prompt,
+          jobId: job.id,
+          traceparent: job.traceparent,
+        }).pipe(
+          Effect.flatMap((completed) => Effect.sync(() => store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled"))),
+          Effect.catch((error) => failJob(job, error)),
+          Effect.catchDefect((defect) => failJob(job, defect)),
+        );
+      }
+    });
+
+  // A worker scheduled once alasio is stopping is not run: the map is closed.
+  const schedule = (conversationId: string): Effect.Effect<void> =>
+    FiberMap.run(workers, conversationId, drain(conversationId).pipe(
+      Effect.catch((error) => Effect.logError(`Prompt worker for ${conversationId} stopped: ${error.message}`)),
+      withLogScope(LOG_SCOPE),
+    ), { onlyIfMissing: true }).pipe(Effect.exit, Effect.asVoid);
+
+  const askHowToHandleConcurrentPrompt = Effect.fnUntraced(function*({ conversationId, chatId, job, visibleText }: ConversationChat & {
+    readonly job: Pick<PromptJob, "id" | "prompt">;
+    readonly visibleText: string;
+  }): Effect.fn.Return<void, TelegramError> {
+    const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
+    const queueAction = store.createCallbackAction({ conversationId, kind: "queue", payload });
+    const steerAction = store.createCallbackAction({ conversationId, kind: "steer", payload });
+    const swerveAction = store.createCallbackAction({ conversationId, kind: "swerve", payload });
+    const discardAction = store.createCallbackAction({ conversationId, kind: "discard", payload });
+    yield* client.sendMessage(chatId, `${harnessLabelOf(store, conversationId)} is currently working. What should I do with this message?\n\n${truncateText(visibleText, 220)}`, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "Steer", callback_data: steerAction },
+          { text: "Queue", callback_data: queueAction },
+        ], [
+          { text: "Swerve", callback_data: swerveAction },
+          { text: "Discard", callback_data: discardAction },
+        ]],
+      },
+    });
+  });
+
+  // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
+  yield* flushCompletedResponses.pipe(
+    Effect.catchDefect((defect) => Effect.logWarning(`Completed response recovery failed: ${errorText(defect)}`).pipe(withLogScope("telegram-app"))),
+    Effect.schedule(Schedule.spaced(COMPLETED_RESPONSE_RECOVERY)),
+    Effect.forkScoped,
+  );
+
+  return Turns.of({
+    submit: Effect.fnUntraced(function*({ conversationId, chatId, messageId, prompt, filePaths, visibleText }: QueuedPrompt) {
+      const job = store.enqueuePromptJob({
+        conversationId,
+        chatId,
+        messageId,
+        prompt,
+        filePaths,
+        state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
+        traceparent: currentTraceparent(),
+      });
+      if (job.state === "awaiting_choice") {
+        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText });
+        return;
+      }
+      yield* schedule(conversationId);
+    }),
+    enqueueMessage: (conversationId, prompt, front = false) =>
+      Ref.update(queuedMessages, (all) => {
+        const queue = Option.getOrElse(HashMap.get(all, conversationId), () => []);
+        return HashMap.set(all, conversationId, front ? [prompt, ...queue] : [...queue, prompt]);
+      }),
+    schedule,
+    setPromptDisposition: (jobId, state, priority = 0) =>
+      Effect.gen(function*() {
+        store.setPromptJobDisposition(jobId, state, priority);
+        const job = store.getPromptJob(jobId);
+        if (state === "pending" && job) {
+          yield* schedule(job.conversation_id);
+        }
+        return job;
+      }),
+    // The trace a turn asked for without one is the asker's, read before the turn is forked.
+    run: (request) => Effect.suspend(() => runDirect(run({ ...request, traceparent: request.traceparent === undefined ? currentTraceparent() : request.traceparent }))),
+    runGoalTurn: ({ conversationId, chatId, messageId, sessionId, turnId, prompt }) =>
+      Effect.gen(function*() {
+        if (yield* activeTurns.isBusy(conversationId)) {
+          const job = store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
+          yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
+          return true;
+        }
+        store.setSessionId(conversationId, sessionId);
+        yield* runDirect(runSessionTurn({
+          conversationId,
+          chatId,
+          messageId,
+          prompt,
+          existingSession: sessionId,
+          attachedTurn: turnId ? { sessionId, turnId } : null,
+          traceparent: currentTraceparent(),
+        }));
+        return true;
+      }),
+    startNewSession: (conversationId) =>
+      Effect.gen(function*() {
+        const harness = yield* harnesses.requireForConversation(conversationId);
+        if (yield* activeTurns.isBusy(conversationId)) {
+          return yield* new ConversationBusy({ message: `${harness.displayName} is currently working. Stop the active turn before starting a new session.` });
+        }
+        const workingDirectory = resolveWorkingDirectory(store, conversationId);
+        if (!workingDirectory) {
+          return yield* new NoWorkspaceMounted();
+        }
+        const sessionId = yield* harness.startFreshSession({ threadKey: conversationId, workingDirectory });
+        store.setSessionId(conversationId, sessionId);
+        return sessionId;
+      }),
+    reconcilePersistentState: Effect.sync(() => {
+      const completedConversations = store.recoverPromptJobsAfterRestart();
+      for (const conversationId of completedConversations) {
+        store.clearActiveTurn(conversationId);
+        store.clearRestartEvent(conversationId);
+      }
+    }),
+    flushCompletedResponses,
+    recoverInterruptedTurns: recoverInterruptedTurns(store),
+    resumePendingPrompts: Effect.suspend(() => Effect.forEach(store.listPendingPromptConversations(), schedule, { discard: true })),
+  });
+}, withLogScope(LOG_SCOPE));
+
+/** What the turn controller façade runs its effects in: the turns, and what the operator's controls ask of the harnesses and running turns. */
+export type TurnControllerServices = Turns | ActiveTurns | Harnesses;
+
+export interface TurnControllerOptions {
+  readonly config: TurnControllerConfig;
+  readonly client: Pick<Client, "sendMessage" | "editMessageText">;
+  readonly store: SqliteStore;
+  readonly effects: EffectRunner<TurnControllerServices>;
+  readonly sandbox?: SessionFilesystems | null;
+}
+
+/**
+ * Turns as the code not yet written in Effect drives them (the message and callback
+ * handlers, the media-group buffer, the operator's commands and controls, the app's
+ * start): its effects as promises run through alasio's EffectRunner, and the operator's
+ * service, workspace and session switches, which move with that code. It goes when its
+ * last caller moves.
+ */
 export class TurnController {
   private readonly sandbox: SessionFilesystems | null;
   private readonly config: TurnControllerConfig;
-  private readonly client: TurnControllerClient;
+  private readonly client: Pick<Client, "sendMessage" | "editMessageText">;
   private readonly store: SqliteStore;
-  private readonly activeQueries: ActiveQueries;
-  private readonly isStopping: () => boolean;
-  private readonly queuedMessages: Map<string, string[]>;
-  private readonly promptWorkers: Map<string, Promise<void>>;
-  private readonly harnesses: HarnessRegistry;
+  private readonly effects: EffectRunner<TurnControllerServices>;
+  private readonly turns: Turns["Service"];
+  readonly activeTurns: ActiveTurnsFacade;
+  readonly harnesses: HarnessesFacade;
   private readonly commands: CommandHandler;
-  private readonly status: StatusReporter;
-  private readonly recovery: RestartRecovery;
 
-  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null, sandbox = null }: TurnControllerOptions) {
+  constructor({ config, client, store, effects, sandbox = null }: TurnControllerOptions) {
     this.sandbox = sandbox;
     this.config = config;
     this.client = client;
     this.store = store;
-    this.activeQueries = activeQueries;
-    this.isStopping = isStopping;
-    this.queuedMessages = new Map();
-    this.promptWorkers = new Map();
-    this.harnesses = harnesses ?? createHarnessRegistry({ config });
+    this.effects = effects;
+    this.turns = effects.runSync(Turns);
+    this.activeTurns = activeTurnsFacade(effects);
+    this.harnesses = harnessesFacade(effects);
     this.commands = new CommandHandler({
       client,
       config,
       store,
-      activeQueries,
-      harnesses: this.harnesses,
+      activeTurns: this.activeTurns,
+      harnessFor: (conversationId) => this.harnessFor(conversationId),
       runCodexTurn: (args) => this.runCodexTurn(args),
       runGoalTurn: (args) => this.runGoalTurn(args),
       startNewSession: (args) => this.startNewSession(args),
@@ -164,40 +610,18 @@ export class TurnController {
       createWorkspace: (args) => this.createWorkspace(args),
       sandboxEnabled: this.sandboxEnabled,
     });
-    this.status = new StatusReporter({
-      client,
-      store,
-      outbox,
-      workflowWaits,
-      workflowWakeEvents,
-      log,
-      // Media a response shows are copied under the state directory until delivered.
-      replyMedia: config?.stateDir
-        ? new ReplyMedia({
-          stateDir: config.stateDir,
-          workspaceForChat: (chatId) => {
-            const conversation = store.getConversationByChatId(chatId);
-            return conversation ? this.workingDirectoryFor(conversation.id) : null;
-          },
-          sandbox,
-          log,
-        })
-        : null,
-    });
-    this.recovery = new RestartRecovery({ store });
   }
 
-  harnessFor(conversationId: string): Harness | null {
-    return this.harnesses.forConversation(this.store, conversationId);
+  harnessFor(conversationId: string): HarnessFacade | null {
+    return this.harnesses.forConversation(conversationId);
   }
 
-  requireHarness(conversationId: string): Harness {
-    return this.harnesses.requireForConversation(this.store, conversationId);
+  requireHarness(conversationId: string): HarnessFacade {
+    return this.harnesses.requireForConversation(conversationId);
   }
 
   harnessLabel(conversationId: string): string {
-    const name = resolveHarnessName(this.store, conversationId);
-    return name ? harnessDisplayName(name) : "No service";
+    return harnessLabelOf(this.store, conversationId);
   }
 
   workingDirectoryFor(conversationId: string): string | null {
@@ -216,7 +640,7 @@ export class TurnController {
     await sendChooseServicePanel({
       client: this.client,
       store: this.store,
-      activeQueries: this.activeQueries,
+      activeTurns: this.activeTurns,
       conversationId,
       chatId,
     });
@@ -226,7 +650,7 @@ export class TurnController {
     await sendChooseWorkspacePanel({
       client: this.client,
       store: this.store,
-      activeQueries: this.activeQueries,
+      activeTurns: this.activeTurns,
       conversationId,
       chatId,
       workspaceRoot: this.config.workspaceRoot,
@@ -251,7 +675,7 @@ export class TurnController {
   }
 
   describeSwitchBlocker(conversationId: string): string | null {
-    if (this.activeQueries.has(conversationId)) {
+    if (this.activeTurns.isBusy(conversationId)) {
       return `${this.harnessLabel(conversationId)} is currently working. Stop the active turn before switching services.`;
     }
     if (this.store.hasOpenPromptJobs(conversationId)) {
@@ -339,13 +763,7 @@ export class TurnController {
   }
 
   enqueueMessage(conversationId: string, prompt: string, front = false): void {
-    const queue = this.queuedMessages.get(conversationId) ?? [];
-    if (front) {
-      queue.unshift(prompt);
-    } else {
-      queue.push(prompt);
-    }
-    this.queuedMessages.set(conversationId, queue);
+    this.effects.runSync(this.turns.enqueueMessage(conversationId, prompt, front));
   }
 
   async processPrompt({ conversationId, chatId, messageId, text, filePaths }: IncomingPrompt): Promise<void> {
@@ -368,333 +786,42 @@ export class TurnController {
       // Neutral by default: nothing is queued until a service and a folder are chosen.
       return;
     }
-    const job = this.store.enqueuePromptJob({
-      conversationId,
-      chatId,
-      messageId,
-      prompt,
-      filePaths,
-      state: this.activeQueries.has(conversationId) ? "awaiting_choice" : "pending",
-      traceparent: currentTraceparent(),
-    });
-    if (job.state === "awaiting_choice") {
-      await this.askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: effectiveText });
-      return;
-    }
-    void this.scheduleConversation(conversationId);
+    await this.effects.runPromise(this.turns.submit({ conversationId, chatId, messageId, prompt, filePaths, visibleText: effectiveText }));
   }
 
-  scheduleConversation(conversationId: string): Promise<void> {
-    const existing = this.promptWorkers.get(conversationId);
-    if (existing) {
-      return existing;
-    }
-    const worker = this.drainConversation(conversationId).finally(() => {
-      this.promptWorkers.delete(conversationId);
-    });
-    this.promptWorkers.set(conversationId, worker);
-    return worker;
-  }
-
-  async drainConversation(conversationId: string): Promise<void> {
-    while (!this.activeQueries.has(conversationId) && !this.isStopping()) {
-      const job = this.store.claimNextPromptJob(conversationId);
-      if (!job) {
-        return;
-      }
-      const activeHarness = this.requireHarness(conversationId).name;
-      if (job.harness && job.harness !== activeHarness) {
-        log.warn(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
-      }
-      // Claiming a job stamps its start, so a claimed job's started_at is set.
-      promptWait.record(job.started_at! - job.created_at, { "alasio.harness": activeHarness });
-      try {
-        const completed = await this.runCodexTurn({
-          conversationId,
-          chatId: job.chat_id,
-          messageId: job.message_id,
-          prompt: job.prompt,
-          jobId: job.id,
-          traceparent: job.traceparent,
-        });
-        if (this.isStopping()) {
-          return;
-        }
-        this.store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled");
-      } catch (error) {
-        this.store.failPromptJob(job.id, error);
-        await this.client.sendMessage(job.chat_id, `${this.harnessLabel(conversationId)} hit an error: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
-      }
-    }
+  scheduleConversation(conversationId: string): void {
+    this.effects.runSync(this.turns.schedule(conversationId));
   }
 
   resumePendingPrompts(): void {
-    for (const conversationId of this.store.listPendingPromptConversations()) {
-      void this.scheduleConversation(conversationId);
-    }
+    this.effects.runSync(this.turns.resumePendingPrompts);
   }
 
   reconcilePersistentState(): void {
-    const completedConversations = this.store.recoverPromptJobsAfterRestart();
-    for (const conversationId of completedConversations) {
-      this.store.clearActiveTurn(conversationId);
-      this.store.clearRestartEvent(conversationId);
-    }
+    this.effects.runSync(this.turns.reconcilePersistentState);
   }
 
   setPromptDisposition(jobId: string, state: PromptJobState, priority = 0): PromptJob | null {
-    this.store.setPromptJobDisposition(jobId, state, priority);
-    const job = this.store.getPromptJob(jobId);
-    if (state === "pending" && job) {
-      void this.scheduleConversation(job.conversation_id);
-    }
-    return job;
+    return this.effects.runSync(this.turns.setPromptDisposition(jobId, state, priority));
   }
 
   async startNewSession({ conversationId }: { readonly conversationId: string }): Promise<string> {
-    const harness = this.requireHarness(conversationId);
-    if (this.activeQueries.has(conversationId)) {
-      throw new Error(`${harness.displayName} is currently working. Stop the active turn before starting a new session.`);
-    }
-    const sessionId = await harness.startFreshSession({
-      threadKey: conversationId,
-      workingDirectory: this.requireWorkingDirectory(conversationId),
-    });
-    this.store.setSessionId(conversationId, sessionId);
-    return sessionId;
+    return await this.effects.runPromise(this.turns.startNewSession(conversationId));
   }
 
-  async askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText }: ConversationChat & {
-    readonly job: Pick<PromptJob, "id" | "prompt">;
-    readonly visibleText: string;
-  }): Promise<void> {
-    const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
-    const queueAction = this.store.createCallbackAction({ conversationId, kind: "queue", payload });
-    const steerAction = this.store.createCallbackAction({ conversationId, kind: "steer", payload });
-    const swerveAction = this.store.createCallbackAction({ conversationId, kind: "swerve", payload });
-    const discardAction = this.store.createCallbackAction({ conversationId, kind: "discard", payload });
-    await this.client.sendMessage(chatId, `${this.harnessLabel(conversationId)} is currently working. What should I do with this message?\n\n${truncateText(visibleText, 220)}`, {
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "Steer", callback_data: steerAction },
-          { text: "Queue", callback_data: queueAction },
-        ], [
-          { text: "Swerve", callback_data: swerveAction },
-          { text: "Discard", callback_data: discardAction },
-        ]],
-      },
-    });
+  async runCodexTurn(request: TurnRequest): Promise<boolean> {
+    return await this.effects.runPromise(this.turns.run(request));
   }
 
-  async runCodexTurn({ conversationId, chatId, messageId, prompt, jobId = null, traceparent }: TurnRequest): Promise<boolean | undefined> {
-    const existingSession = this.store.getSessionId(conversationId);
-    return await this.runCodexTurnWithSession({
-      conversationId,
-      chatId,
-      messageId,
-      prompt,
-      existingSession: existingSession ?? null,
-      attachedTurn: null,
-      jobId,
-      traceparent,
-    });
-  }
-
-  async runGoalTurn({ conversationId, chatId, messageId, sessionId, turnId, prompt }: GoalTurnRequest): Promise<boolean> {
-    if (this.activeQueries.has(conversationId)) {
-      const job = this.store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
-      await this.askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
-      return true;
-    }
-    this.store.setSessionId(conversationId, sessionId);
-    await this.runCodexTurnWithSession({
-      conversationId,
-      chatId,
-      messageId,
-      prompt,
-      existingSession: sessionId,
-      attachedTurn: turnId ? { sessionId, turnId } : null,
-    });
-    return true;
-  }
-
-  /**
-   * Runs a turn, then the messages queued while it ran, as a turn of their own. The
-   * turn is the span `alasio.turn`, continuing `traceparent` when given (a queued
-   * prompt's; null for a trace of its own) and the active span otherwise; its outcome
-   * labels it and its duration.
-   */
-  async runCodexTurnWithSession({ traceparent, ...turn }: SessionTurn): Promise<boolean | undefined> {
-    const harness = this.requireHarness(turn.conversationId);
-    const labels = { "alasio.harness": harness.name };
-    const startedAt = performance.now();
-    // Widened, since the span's callback sets it and the checker does not follow it there.
-    let outcome = "failed" as TurnOutcome | "failed";
-    activeTurns.add(1, labels);
-    let result;
-    try {
-      result = await inSpan("alasio.turn", {
-        parent: traceparent,
-        attributes: {
-          ...labels,
-          "alasio.conversation.id": turn.conversationId,
-          "telegram.chat.id": String(turn.chatId),
-          ...(turn.jobId ? { "alasio.prompt_job.id": turn.jobId } : {}),
-          ...(turn.existingSession ? { "alasio.session.id": turn.existingSession } : {}),
-        },
-      }, async (span) => {
-        try {
-          const settled = await this.runTurn(harness, turn);
-          outcome = settled.outcome;
-          return settled.result;
-        } finally {
-          span.setAttribute("alasio.turn.outcome", outcome);
-        }
-      });
-    } finally {
-      activeTurns.add(-1, labels);
-      turnDuration.record((performance.now() - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
-    }
-    if (outcome === "stopped") {
-      return result;
-    }
-    const queued = this.queuedMessages.get(turn.conversationId);
-    if (queued && queued.length > 0) {
-      this.queuedMessages.delete(turn.conversationId);
-      await this.runCodexTurn({
-        conversationId: turn.conversationId,
-        chatId: turn.chatId,
-        messageId: turn.messageId,
-        prompt: queued.join("\n\n---\n\n"),
-        traceparent: null,
-      });
-    }
-    return result;
-  }
-
-  /**
-   * One turn through `harness`, from its status message to its reply: `{ outcome,
-   * result }`, where `result` is whether the response completed (undefined while
-   * alasio stops) and `outcome` one of completed, incomplete, interrupted, or stopped.
-   */
-  async runTurn(harness: Harness, { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }: Omit<SessionTurn, "traceparent">): Promise<SettledTurn> {
-    if (attachedTurn && !harness.supportsGoals) {
-      throw new Error(`${harness.displayName} does not support attached goal turns.`);
-    }
-    this.store.upsertActiveTurn({
-      conversationId,
-      chatId: String(chatId),
-      messageId: String(messageId),
-      sessionId: existingSession ?? null,
-      harness: harness.name,
-      pendingResponseId: null,
-      prompt,
-      startedAt: Date.now() / 1000,
-    });
-    const statusAbortController = new AbortController();
-    let statusMessageId: number | null = null;
-    let statusStartTime: number | null = null;
-    const statusPromise = this.status.postStatusUpdates({
-      chatId,
-      signal: statusAbortController.signal,
-      sessionId: existingSession ?? null,
-      harnessName: harness.displayName,
-      onStatusMessageCreated: (createdMessageId, startTime) => {
-        statusMessageId = createdMessageId;
-        statusStartTime = startTime;
-      },
-    });
-    const queryResult = await harness.executeTurn({
-      prompt,
-      resumeSession: existingSession ?? null,
-      threadKey: conversationId,
-      chatId: String(chatId),
-      messageId: String(messageId),
-      workingDirectory: this.requireWorkingDirectory(conversationId),
-      persistence: this.store,
-      activeQueries: this.activeQueries,
-      attachedTurn,
-      onPromptDispatched: () => {
-        if (jobId) {
-          this.store.markPromptJobDispatched(jobId);
-        }
-      },
-      onTransportStarted: ({ sessionId, turnId }) => {
-        if (jobId) {
-          this.store.markPromptJobUpstreamStarted(jobId, sessionId, turnId);
-        }
-      },
-      onTransportCompleted: ({ sessionId, turnId }) => {
-        if (jobId) {
-          this.store.markPromptJobUpstreamCompleted(jobId, sessionId, turnId);
-        }
-      },
-      // A harness that keeps running between prompts (Claude Code background work)
-      // produces replies of its own and frees the conversation when they finish.
-      onBackgroundResponse: () => {
-        this.flushCompletedResponses().catch((error: unknown) => {
-          log.warn(`Background response delivery deferred for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
-        });
-      },
-      onIdle: () => {
-        void this.scheduleConversation(conversationId);
-      },
-    });
-    statusAbortController.abort();
-    await statusPromise.catch(() => undefined);
-    const { blockSequence, sessionId: newSessionId, pendingResponseId, interrupted, responseCompleted } = queryResult;
-    if (this.isStopping()) {
-      if (responseCompleted) {
-        this.store.clearActiveTurn(conversationId, pendingResponseId);
-        this.store.clearRestartEvent(conversationId);
-        log.info(`Leaving completed response ${pendingResponseId} for post-restart delivery`);
-      } else {
-        log.info(`Leaving active turn ${conversationId} for post-restart recovery because the service is stopping`);
-      }
-      return { outcome: "stopped", result: undefined };
-    }
-    if (newSessionId && !existingSession) {
-      this.store.setSessionId(conversationId, newSessionId);
-      currentSpan().setAttribute("alasio.session.id", newSessionId);
-    }
-    if (interrupted) {
-      await this.status.finishWithoutResponse({ chatId, pendingResponseId, statusMessageId, harnessName: harness.displayName });
-      this.store.clearActiveTurn(conversationId, pendingResponseId);
-      this.store.clearRestartEvent(conversationId);
-      return { outcome: "interrupted", result: false };
-    }
-    if (!responseCompleted) {
-      await this.status.finishWithoutResponse({
-        chatId,
-        pendingResponseId,
-        statusMessageId,
-        statusText: notCompleted(harness.displayName, blockSequence),
-      });
-      this.store.clearActiveTurn(conversationId, pendingResponseId);
-      this.store.clearRestartEvent(conversationId);
-    } else {
-      try {
-        const response = finalResponseToMarkdown(blockSequence);
-        await this.status.postResponse({ chatId, response, pendingResponseId, statusMessageId, statusStartTime, harnessName: harness.displayName });
-      } catch (error) {
-        log.error(`Final response handoff deferred for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
-      } finally {
-        this.store.clearActiveTurn(conversationId, pendingResponseId);
-        this.store.clearRestartEvent(conversationId);
-      }
-    }
-    return { outcome: responseCompleted ? "completed" : "incomplete", result: responseCompleted };
+  async runGoalTurn(request: GoalTurnRequest): Promise<boolean> {
+    return await this.effects.runPromise(this.turns.runGoalTurn(request));
   }
 
   async flushCompletedResponses(): Promise<void> {
-    await this.status.flushCompletedResponses();
+    await this.effects.runPromise(this.turns.flushCompletedResponses);
   }
 
   async recoverInterruptedTurns(): Promise<void> {
-    await this.recovery.recoverInterruptedTurns();
-  }
-
-  recordExternalRestartEventsForActiveTurns(): void {
-    this.recovery.recordExternalRestartEventsForActiveTurns();
+    await this.effects.runPromise(this.turns.recoverInterruptedTurns);
   }
 }

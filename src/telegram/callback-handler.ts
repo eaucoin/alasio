@@ -1,7 +1,8 @@
 import type { CallbackQuery } from "@grammyjs/types";
 import type { ConcurrentPromptPayload, TurnController } from "../codex/turn-controller.ts";
 import type { AlasioConfig } from "../config.ts";
-import { type ActiveQueries, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, interruptActiveTurn, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
+import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import { NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
 import { handleModelControlCallback, isModelControlAction } from "../operator/model-control.ts";
 import { handleServiceControlCallback, isServiceControlAction } from "../operator/service-control.ts";
@@ -36,7 +37,7 @@ export interface CallbackHandlerOptions {
   readonly config: Pick<AlasioConfig, "workspaceRoot">;
   readonly store: SqliteStore;
   readonly turns: CallbackTurns;
-  readonly activeQueries: ActiveQueries;
+  readonly activeTurns: ActiveTurnsFacade;
 }
 
 function clientAfterCallbackAck(client: CallbackClient): CallbackClient {
@@ -62,15 +63,15 @@ export class CallbackHandler {
   private readonly config: Pick<AlasioConfig, "workspaceRoot">;
   private readonly store: SqliteStore;
   private readonly turns: CallbackTurns;
-  private readonly activeQueries: ActiveQueries;
+  private readonly activeTurns: ActiveTurnsFacade;
 
-  constructor({ authorizer, client, config, store, turns, activeQueries }: CallbackHandlerOptions) {
+  constructor({ authorizer, client, config, store, turns, activeTurns }: CallbackHandlerOptions) {
     this.authorizer = authorizer;
     this.client = client;
     this.config = config;
     this.store = store;
     this.turns = turns;
-    this.activeQueries = activeQueries;
+    this.activeTurns = activeTurns;
   }
 
   async handle(callbackQuery: CallbackQuery): Promise<void> {
@@ -119,7 +120,7 @@ export class CallbackHandler {
       await handleServiceControlCallback({
         client: this.client,
         store: this.store,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         action,
         switchHarness: (args) => this.turns.switchHarness(args),
         callbackQueryId: callbackQuery.id,
@@ -131,7 +132,7 @@ export class CallbackHandler {
             await sendChooseWorkspacePanel({
               client: this.client,
               store: this.store,
-              activeQueries: this.activeQueries,
+              activeTurns: this.activeTurns,
               conversationId: action.conversationId,
               chatId,
               workspaceRoot: this.config.workspaceRoot,
@@ -146,7 +147,7 @@ export class CallbackHandler {
       await handleWorkspaceControlCallback({
         client: this.client,
         store: this.store,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         action,
         workspaceRoot: this.config.workspaceRoot,
         switchWorkspace: (args) => this.turns.switchWorkspace(args),
@@ -172,7 +173,7 @@ export class CallbackHandler {
         client: acknowledged ? clientAfterCallbackAck(this.client) : this.client,
         store: this.store,
         harness,
-        activeQueries: this.activeQueries,
+        activeTurns: this.activeTurns,
         action,
         startNewSession: (args) => this.turns.startNewSession(args),
         callbackQueryId: callbackQuery.id,
@@ -183,35 +184,37 @@ export class CallbackHandler {
     }
     if (action.kind === "steer") {
       const payload = concurrentPromptPayload(action);
-      const activeQuery = this.activeQueries.get(action.conversationId);
       const promptJob = payload.jobId ? this.store.getPromptJob(payload.jobId) : null;
       const prompt = promptJob?.prompt ?? payload.prompt;
-      if (!activeQuery?.steer) {
+      const queue = () => {
         if (promptJob) {
           this.turns.setPromptDisposition(promptJob.id, "pending");
         } else {
           this.turns.enqueueMessage(action.conversationId, prompt);
         }
-        await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
-        await this.client.editMessageText(chatId, messageId, `${harness.displayName} is not ready to steer yet. Queued instead.`);
-        return;
-      }
+      };
+      let steered: boolean | null;
       try {
-        await activeQuery.steer(prompt);
-        if (promptJob) {
-          this.turns.setPromptDisposition(promptJob.id, "completed");
+        steered = await this.activeTurns.steer(action.conversationId, prompt);
+        if (steered !== null) {
+          if (promptJob) {
+            this.turns.setPromptDisposition(promptJob.id, "completed");
+          }
+          await this.client.answerCallbackQuery(callbackQuery.id, "Steered.");
+          await this.client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
         }
-        await this.client.answerCallbackQuery(callbackQuery.id, "Steered.");
-        await this.client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
       } catch (error) {
-        if (promptJob) {
-          this.turns.setPromptDisposition(promptJob.id, "pending");
-        } else {
-          this.turns.enqueueMessage(action.conversationId, prompt);
-        }
+        queue();
         await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
         const message = error instanceof Error ? error.message : String(error);
         await this.client.editMessageText(chatId, messageId, `Steer failed; queued instead.\n\n${message}`, { format: "plain" });
+        return;
+      }
+      if (steered === null) {
+        // No turn runs to take it.
+        queue();
+        await this.client.answerCallbackQuery(callbackQuery.id, "Queued.");
+        await this.client.editMessageText(chatId, messageId, `${harness.displayName} is not ready to steer yet. Queued instead.`);
       }
       return;
     }
@@ -233,8 +236,8 @@ export class CallbackHandler {
         chatId,
         messageId,
         runGoalTurn: (args) => this.turns.runGoalTurn(args),
-        stopActiveTurn: async () => await interruptActiveTurn(this.activeQueries, action.conversationId),
-        isTurnActive: this.activeQueries.has(action.conversationId),
+        stopActiveTurn: async () => await this.activeTurns.stop(action.conversationId),
+        isTurnActive: this.activeTurns.isBusy(action.conversationId),
       });
       return;
     }
@@ -265,10 +268,7 @@ export class CallbackHandler {
       } else {
         this.turns.enqueueMessage(action.conversationId, payload.prompt, true);
       }
-      const activeQuery = this.activeQueries.get(action.conversationId);
-      if (activeQuery) {
-        await activeQuery.abort("Telegram swerve");
-      }
+      await this.activeTurns.stop(action.conversationId, "swerve");
       if (payload.jobId) {
         void this.turns.scheduleConversation(action.conversationId);
       }

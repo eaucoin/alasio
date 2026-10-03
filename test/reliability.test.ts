@@ -4,51 +4,61 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Array as Arr, Effect, Layer, Logger as EffectLogger } from "effect";
+import { Array as Arr, Deferred, Effect, Exit, Fiber, Layer, Logger as EffectLogger, Scope } from "effect";
 import { makeAppServerNotifications } from "../src/codex/app-server/notification-queue.ts";
 import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
-import { interruptCodexTurn } from "../src/codex/runtime.ts";
-import { RestartRecovery } from "../src/codex/restart-recovery.ts";
-import { StatusReporter, type StatusReporterOptions } from "../src/codex/status-reporter.ts";
-import type { ActiveQueries } from "../src/harness/index.ts";
+import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
+import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
+import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { SqliteStore, Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
 import { effectRunnerHere } from "../src/shared/effects.ts";
-import type { Logger } from "../src/shared/log.ts";
 import { TelegramCodexApp } from "../src/telegram/app.ts";
-import { TelegramApiError } from "../src/telegram/client.ts";
-import type { OutboxText } from "../src/telegram/outbox.ts";
+import { TelegramApiError, TelegramClient } from "../src/telegram/client.ts";
+import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
+import { WorkflowHooks } from "../src/workflow/hook-server.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
-
-const silentLog: Logger = { info() {}, warn() {}, error() {} };
+import { telegramClientOf } from "./support/turns.ts";
 
 /** A Telegram client for a reporter that only queues replies, never sending or editing itself. */
-const unusedClient: StatusReporterOptions["client"] = {
+const unusedClient = telegramClientOf({
   sendMessage: () => assert.fail("no message is sent directly"),
   editMessageText: () => assert.fail("no message is edited"),
-};
+});
 
-test("stop remains active until transport cleanup finishes", async () => {
-  const { promise: cleanup, resolve: release } = Promise.withResolvers<void>();
-  const activeQueries: ActiveQueries = new Map();
-  activeQueries.set("thread", {
-    abort: async () => {
-      await cleanup;
-      activeQueries.delete("thread");
-    },
-    steer: async () => false,
-  });
-  let finished = false;
-  const stopping = interruptCodexTurn(activeQueries, "thread").then(() => { finished = true; });
-  await Promise.resolve();
-  assert.equal(activeQueries.has("thread"), true);
-  assert.equal(finished, false);
-  release();
-  await stopping;
-  assert.equal(finished, true);
+/** The status reporter of `store`, whose replies `enqueue` queues. */
+function reporterFor(store: SqliteStore, enqueue: (text: OutboxText) => string): StatusReporter {
+  return Effect.runSync(makeStatusReporter().pipe(Effect.provide(Layer.mergeAll(
+    Layer.succeed(Store, store),
+    Layer.succeed(TelegramClient, unusedClient),
+    Layer.succeed(Outbox, Outbox.of({ enqueueText: (text) => Effect.sync(() => enqueue(text)), deliverDue: Effect.void })),
+    Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map(), wakeEvents: new Map() })),
+  ))));
+}
+
+test("a stop is done only once the turn has let go of its conversation", async () => {
+  await Effect.runPromise(Effect.gen(function*() {
+    const activeTurns = yield* ActiveTurns;
+    const cleanup = yield* Deferred.make<void>();
+    const registration = yield* Scope.make();
+    // A turn whose stop lets go of the conversation once its transport is cleaned up.
+    yield* activeTurns.register("thread", {
+      stop: () => Deferred.await(cleanup).pipe(Effect.andThen(Scope.close(registration, Exit.void))),
+      steer: () => Effect.succeed(false),
+      cliInitiated: false,
+    }).pipe(Scope.provide(registration));
+    const stopping = yield* Effect.forkChild(activeTurns.stop("thread", "interrupt"));
+    yield* Effect.yieldNow;
+    assert.equal(yield* activeTurns.isBusy("thread"), true);
+    assert.equal(stopping.pollUnsafe(), undefined, "the stop waits for the turn");
+    yield* Deferred.succeed(cleanup, undefined);
+    assert.equal(yield* Fiber.join(stopping), true);
+    assert.equal(yield* activeTurns.isBusy("thread"), false);
+    assert.equal(yield* activeTurns.stop("thread", "interrupt"), false, "no turn is left to stop");
+  }).pipe(Effect.provide(ActiveTurns.layer)));
 });
 
 test("failed app-server interrupt forgets local turn ownership", async () => {
@@ -98,29 +108,28 @@ test("final response does not promote commentary when phased output lacks a fina
 });
 
 test("missing phased final answer does not enqueue fabricated completion text", async () => {
-  const enqueued: OutboxText[] = [];
-  const posted: string[] = [];
-  const reporter = new StatusReporter({
-    client: unusedClient,
-    store: {
-      markPendingAsPosted: (id) => { posted.push(id); },
-      getCompletedResponsesPendingDelivery: () => assert.fail("no completed responses are flushed"),
-    },
-    outbox: {
-      enqueueText: (item) => {
-        enqueued.push(item);
-        return "outbox-1";
-      },
-    },
-    workflowWaits: new Map(),
-    workflowWakeEvents: new Map(),
-    log: silentLog,
-  });
+  const root = mkdtempSync(join(tmpdir(), "alasio-response-missing-"));
+  try {
+    const store = new SqliteStore(root);
+    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
+    const pendingResponseId = store.createPendingResponse("123", "9");
+    store.appendBlockToPending(pendingResponseId, { type: "text", content: "Still investigating.", phase: "commentary" });
+    store.markPendingResponseComplete(pendingResponseId);
+    const enqueued: OutboxText[] = [];
+    const reporter = reporterFor(store, (item) => {
+      enqueued.push(item);
+      return "outbox-1";
+    });
 
-  await reporter.postResponse({ chatId: "123", response: "", pendingResponseId: "pending-1", statusMessageId: null, statusStartTime: null });
+    await Effect.runPromise(reporter.postResponse({ chatId: "123", response: "", pendingResponseId, status: null }));
 
-  assert.deepEqual(enqueued, []);
-  assert.deepEqual(posted, ["pending-1"]);
+    assert.deepEqual(enqueued, []);
+    // Posted as it is, with nothing to deliver.
+    assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("SQLite response recovery exposes only terminal upstream responses", () => {
@@ -175,17 +184,10 @@ test("completed response recovery enqueues one final answer exactly once", async
       phase: "final_answer",
     });
     store.markPendingResponseComplete(pendingResponseId);
-    const reporter = new StatusReporter({
-      client: unusedClient,
-      store,
-      outbox: { enqueueText: (args) => store.enqueueOutboxText(args) },
-      workflowWaits: new Map(),
-      workflowWakeEvents: new Map(),
-      log: silentLog,
-    });
+    const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
 
-    await reporter.flushCompletedResponses();
-    await reporter.flushCompletedResponses();
+    await Effect.runPromise(reporter.flushCompletedResponses);
+    await Effect.runPromise(reporter.flushCompletedResponses);
 
     const due = store.getDueOutbox(10);
     assert.equal(due.length, 1);
@@ -268,6 +270,9 @@ test("SQLite prompt jobs and outbox survive process boundaries", () => {
 
 test("Telegram app wires the durable outbox into final response delivery", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-composition-"));
+  // Telegram refuses every connection, so what is queued stays queued.
+  const apiRoot = process.env["TELEGRAM_API_ROOT"];
+  process.env["TELEGRAM_API_ROOT"] = "http://127.0.0.1:9";
   try {
     const options: AlasioOptions = {
       telegramBotToken: "test-token",
@@ -283,11 +288,19 @@ test("Telegram app wires the durable outbox into final response delivery", async
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const effects = yield* effectRunnerHere(yield* Layer.build(alasioServices(options)));
       const app = new TelegramCodexApp({ ...options, effects });
-      // The wiring is private to the turn controller and its reporter, so read through it.
-      assert.equal(app.turns["status"]["outbox"], app.outbox);
       assert.equal(app.store, effects.runSync(Store));
+      const { store } = app;
+      store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
+      const pendingResponseId = store.createPendingResponse("123", "9");
+      store.appendBlockToPending(pendingResponseId, { type: "text", content: "Delivered durably.", phase: "final_answer" });
+      store.markPendingResponseComplete(pendingResponseId);
+      yield* Effect.promise(() => app.turns.flushCompletedResponses());
+      assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
+      assert.equal(store.getPendingOutboxCount(), 1);
     })));
   } finally {
+    if (apiRoot === undefined) delete process.env["TELEGRAM_API_ROOT"];
+    else process.env["TELEGRAM_API_ROOT"] = apiRoot;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -370,9 +383,8 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
     });
 
     store.recoverPromptJobsAfterRestart();
-    const recovery = new RestartRecovery({ store });
-    await recovery.recoverInterruptedTurns();
-    await recovery.recoverInterruptedTurns();
+    Effect.runSync(recoverInterruptedTurns(store));
+    Effect.runSync(recoverInterruptedTurns(store));
 
     assert.equal(store.getPromptJob(original.id)?.state, "interrupted");
     assert.deepEqual(store.getActiveTurns(), []);
@@ -393,15 +405,8 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
     store.appendBlockToPending(completedResponseId, { type: "text", content: "Recovered commentary.", phase: "commentary" });
     store.appendBlockToPending(completedResponseId, { type: "text", content: "Recovered final answer.", phase: "final_answer" });
     store.markPendingResponseComplete(completedResponseId);
-    const reporter = new StatusReporter({
-      client: unusedClient,
-      store,
-      outbox: { enqueueText: (args) => store.enqueueOutboxText(args) },
-      workflowWaits: new Map(),
-      workflowWakeEvents: new Map(),
-      log: silentLog,
-    });
-    await reporter.flushCompletedResponses();
+    const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
+    await Effect.runPromise(reporter.flushCompletedResponses);
     assert.deepEqual(store.getDueOutbox(10).map((item) => item.text), ["Recovered final answer."]);
     store.close();
   } finally {

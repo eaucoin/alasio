@@ -86,6 +86,13 @@ export class SessionFileError extends Schema.TaggedError<SessionFileError>()("Se
 /** How making a session's Sandbox and reaching its bayma fails. */
 export type SessionError = SandboxError | SessionTelemetryUnavailable;
 
+/** A conversation's workspace is a session filesystem, and the deployment renders no sessions template. */
+export class SessionFilesystemsDisabled extends Schema.TaggedError<SessionFilesystemsDisabled>()("SessionFilesystemsDisabled", {}) {
+  override get message(): string {
+    return "this conversation's workspace is a session filesystem, which this deployment does not enable";
+  }
+}
+
 /** What SessionSandboxes is made with; see there. */
 export interface SessionSandboxesOptions {
   readonly profile: SessionsProfile;

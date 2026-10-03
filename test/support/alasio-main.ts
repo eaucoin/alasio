@@ -48,7 +48,7 @@ if (import.meta.main) {
     hookPort: 0,
     warmLinkedSessions: false,
     defaultHarness: null,
-    folderBayma: async () => config.folderBayma,
+    folderBayma: () => Effect.succeed(config.folderBayma),
     claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
   });
   runAlasio(alasio.pipe(Effect.andThen(Effect.sync(() => process.send?.(READY)))));

@@ -1,16 +1,17 @@
 import type { Update } from "@grammyjs/types";
 import { Fiber } from "effect";
 import { TurnController } from "../codex/turn-controller.ts";
-import type { CodexRolloutsFacade } from "../codex/rollouts/index.ts";
+import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { type AdoptedSession, adoptTranscripts } from "../harness/claude/transcripts.ts";
 import type { KubeTemplates } from "../kube/config.ts";
 import type { ClaudeQueryFactory } from "../harness/claude/runtime.ts";
-import { type FolderBayma, folderBaymaFacade } from "../mcp/bayma.ts";
+import type { FolderBayma } from "../mcp/bayma.ts";
 import { type SessionFilesystems, sessionFilesystemsFacade } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { type ActiveQueries, type HarnessRegistry, createHarnessRegistry } from "../harness/index.ts";
+import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import type { HarnessesFacade } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import { type SqliteStore, Store } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
@@ -32,13 +33,10 @@ export interface TelegramCodexAppConfig extends AlasioConfig {
   /** Claude Code's transcripts in Neon. */
   readonly sessionStore?: NeonSessionStore | null;
   /** Codex's rollouts in Neon, for the operator's Codex home and the session-filesystem one. */
-  readonly codexRollouts?: CodexRolloutsFacade | null;
-  readonly sessionFsCodexRollouts?: CodexRolloutsFacade | null;
+  readonly codexRollouts?: KeptCodexRollouts | null;
+  readonly sessionFsCodexRollouts?: KeptCodexRollouts | null;
   readonly kubeTemplates?: KubeTemplates | null;
-  /** Stand-ins (test doubles) for what the app otherwise builds itself. */
-  readonly sandbox?: SessionFilesystems | null;
-  readonly harnesses?: HarnessRegistry | null;
-  /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses the app makes. */
+  /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes (src/alasio.ts). */
   readonly folderBayma?: FolderBayma | undefined;
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
   /** What runs the effects of alasio's services for the app (src/alasio.ts). */
@@ -50,17 +48,15 @@ export class TelegramCodexApp {
   readonly client: Client;
   readonly store: SqliteStore;
   readonly outbox: TelegramOutbox;
-  readonly activeQueries: ActiveQueries;
+  readonly activeTurns: ActiveTurnsFacade;
   readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
   readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
-  private isStopping: boolean;
   readonly authorizer: Authorizer;
   readonly sandbox: SessionFilesystems | null;
-  readonly harnesses: HarnessRegistry;
+  readonly harnesses: HarnessesFacade;
   readonly turns: TurnController;
   readonly callbacks: CallbackHandler;
   readonly mediaGroups: MediaGroupBuffer;
-  private completedResponseRecoveryTimer: ReturnType<typeof setInterval> | null;
   readonly messages: MessageHandler;
   /** Polling Telegram for updates, from start to stop. */
   private poller: Fiber.Fiber<never> | null;
@@ -70,11 +66,9 @@ export class TelegramCodexApp {
     this.client = telegramClientFacade(config.effects);
     this.store = config.effects.runSync(Store);
     this.outbox = outboxFacade(config.effects);
-    this.activeQueries = new Map();
     const workflowHooks = config.effects.runSync(WorkflowHooks);
     this.workflowWaits = workflowHooks.waits;
     this.workflowWakeEvents = workflowHooks.wakeEvents;
-    this.isStopping = false;
     this.authorizer = new Authorizer({
       allowedUserIds: config.allowedUserIds,
       store: this.store,
@@ -82,43 +76,31 @@ export class TelegramCodexApp {
     });
     // Session filesystems, on when the deployment renders their template (alasio then
     // has SessionSandboxes, and SessionFsCodex for the Codex app-server that serves them).
-    this.sandbox = config.sandbox ?? sessionFilesystemsFacade(config.effects);
-    this.harnesses = config.harnesses ?? createHarnessRegistry({
-      config,
-      sessionStore: config.sessionStore ?? null,
-      codexRollouts: config.codexRollouts ?? null,
-      sandbox: this.sandbox,
-      sessionFsCodexRollouts: config.sessionFsCodexRollouts ?? null,
-      folderBayma: config.folderBayma ?? folderBaymaFacade(config.effects),
-      claudeQueryFactory: config.claudeQueryFactory,
-      effects: config.effects,
-    });
+    this.sandbox = sessionFilesystemsFacade(config.effects);
+    // The turns, and the harnesses and running turns the operator's controls reach, are
+    // alasio's services (src/alasio.ts); the app reaches them through the turns' façade.
     this.turns = new TurnController({
       config: this.config,
       client: this.client,
       store: this.store,
-      outbox: this.outbox,
-      activeQueries: this.activeQueries,
-      workflowWaits: this.workflowWaits,
-      workflowWakeEvents: this.workflowWakeEvents,
-      isStopping: () => this.isStopping,
-      harnesses: this.harnesses,
+      effects: config.effects,
       sandbox: this.sandbox,
     });
+    this.harnesses = this.turns.harnesses;
+    this.activeTurns = this.turns.activeTurns;
     this.callbacks = new CallbackHandler({
       authorizer: this.authorizer,
       client: this.client,
       config: this.config,
       store: this.store,
       turns: this.turns,
-      activeQueries: this.activeQueries,
+      activeTurns: this.activeTurns,
     });
     this.mediaGroups = new MediaGroupBuffer({
       store: this.store,
       turns: this.turns,
       log,
     });
-    this.completedResponseRecoveryTimer = null;
     this.messages = new MessageHandler({
       authorizer: this.authorizer,
       client: this.client,
@@ -149,7 +131,6 @@ export class TelegramCodexApp {
     await this.turns.recoverInterruptedTurns();
     this.turns.resumePendingPrompts();
     this.poller = this.config.effects.runFork(pollUpdates((update) => this.processUpdate(update)));
-    this.startCompletedResponseRecovery();
     this.warmLinkedSessions().catch((error: unknown) => {
       log.warn(`Linked Codex session warmup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -195,25 +176,22 @@ export class TelegramCodexApp {
       const threadIds = references
         .filter(({ workingDirectory }) => (parseWorkspace(workingDirectory)?.kind === "sessionfs") === sessionFs)
         .map(({ sessionId }) => sessionId);
-      const written = await rollouts.restore(threadIds);
+      const written = await this.config.effects.runPromise(rollouts.restore(threadIds));
       log.info(`  Rollout store${sessionFs ? " (session filesystems)" : ""}: ${threadIds.length} Codex thread(s), ${written.length} rollout file(s) written back`);
     }
   }
 
+  /**
+   * Stops taking updates. The turns running then are interrupted after, as alasio's
+   * services stop (src/alasio.ts), while the store and Telegram are still open.
+   */
   async stop(): Promise<void> {
-    this.isStopping = true;
     this.mediaGroups.stop();
-    if (this.completedResponseRecoveryTimer) {
-      clearInterval(this.completedResponseRecoveryTimer);
-      this.completedResponseRecoveryTimer = null;
-    }
-    this.turns.recordExternalRestartEventsForActiveTurns();
     const { poller } = this;
     if (poller) {
       await this.config.effects.runPromise(Fiber.interrupt(poller));
       this.poller = null;
     }
-    await this.harnesses.shutdownAll();
   }
 
   async configureNativeCommands(): Promise<void> {
@@ -231,18 +209,6 @@ export class TelegramCodexApp {
     } catch (error) {
       log.warn(`Failed to configure Telegram native commands: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
-
-  startCompletedResponseRecovery(): void {
-    if (this.completedResponseRecoveryTimer) {
-      return;
-    }
-    this.completedResponseRecoveryTimer = setInterval(() => {
-      this.turns.flushCompletedResponses().catch((error: unknown) => {
-        log.warn(`Completed response recovery failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }, 30_000);
-    this.completedResponseRecoveryTimer.unref?.();
   }
 
   async warmLinkedSessions(): Promise<void> {

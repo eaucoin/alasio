@@ -1,3 +1,5 @@
+import { Clock, Effect } from "effect";
+
 import { buildRestartSyntheticText } from "../operator/restart-prompts.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 
@@ -6,46 +8,46 @@ export type RestartRecoveryStore =
   & Pick<SqliteStore, "getActiveTurns" | "getRestartEvent" | "recordRestartEvent" | "markPendingAsPosted" | "clearActiveTurn" | "stageRestartRecovery">
   & Partial<Pick<SqliteStore, "getActiveHarness">>;
 
-export class RestartRecovery {
-  private readonly store: RestartRecoveryStore;
-
-  constructor({ store }: { readonly store: RestartRecoveryStore }) {
-    this.store = store;
-  }
-
-  async recoverInterruptedTurns(): Promise<void> {
-    const activeTurns = this.store.getActiveTurns();
-    for (const turn of activeTurns) {
+/**
+ * What becomes, as alasio starts, of the turns the last alasio was running when it
+ * stopped: a turn whose restart was recorded is continued by a prompt of its own, which
+ * says what restarted it; one without is let go of.
+ */
+export const recoverInterruptedTurns = (store: RestartRecoveryStore): Effect.Effect<void> =>
+  Effect.sync(() => {
+    for (const turn of store.getActiveTurns()) {
       const conversationId = turn.thread_key;
-      const restartEvent = this.store.getRestartEvent(conversationId);
+      const restartEvent = store.getRestartEvent(conversationId);
       if (!restartEvent) {
         if (turn.pending_response_id) {
-          this.store.markPendingAsPosted(turn.pending_response_id);
+          store.markPendingAsPosted(turn.pending_response_id);
         }
-        this.store.clearActiveTurn(conversationId);
+        store.clearActiveTurn(conversationId);
         continue;
       }
-      this.store.stageRestartRecovery({
+      store.stageRestartRecovery({
         turn,
-        prompt: buildRestartSyntheticText(restartEvent.cause, turn.harness ?? this.store.getActiveHarness?.(conversationId)),
+        prompt: buildRestartSyntheticText(restartEvent.cause, turn.harness ?? store.getActiveHarness?.(conversationId)),
       });
     }
-  }
+  });
 
-  recordExternalRestartEventsForActiveTurns(): void {
-    for (const turn of this.store.getActiveTurns()) {
-      const conversationId = turn.thread_key;
-      if (this.store.getRestartEvent(conversationId)) {
-        continue;
-      }
-      this.store.recordRestartEvent({
-        cause: "external_or_unknown",
-        thread_key: conversationId,
-        channel: turn.channel,
-        thread_ts: turn.thread_ts,
-        session_id: turn.session_id ?? null,
-        timestamp: Date.now() / 1000,
-      });
+/**
+ * Records that the conversation's running turn was cut short by a restart alasio cannot
+ * attribute, unless what restarted it is already recorded (the agent's own command).
+ */
+export const recordExternalRestartEvent = (store: RestartRecoveryStore, conversationId: string): Effect.Effect<void> =>
+  Effect.gen(function*() {
+    const turn = store.getActiveTurns().find((active) => active.thread_key === conversationId);
+    if (!turn || store.getRestartEvent(conversationId)) {
+      return;
     }
-  }
-}
+    store.recordRestartEvent({
+      cause: "external_or_unknown",
+      thread_key: conversationId,
+      channel: turn.channel,
+      thread_ts: turn.thread_ts,
+      session_id: turn.session_id ?? null,
+      timestamp: (yield* Clock.currentTimeMillis) / 1000,
+    });
+  });

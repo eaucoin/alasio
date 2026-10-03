@@ -7,12 +7,12 @@ import { test } from "node:test";
 import { Effect, Layer } from "effect";
 
 import { tomlRootString, operatorDeveloperInstructions } from "../src/codex/config-toml.ts";
-import { ReplyMedia } from "../src/codex/reply-media.ts";
+import { makeReplyMedia } from "../src/codex/reply-media.ts";
 import { buildCodexThreadConfig } from "../src/codex/thread-config.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { REPLY_INSTRUCTIONS, withReplyInstructions } from "../src/harness/reply-instructions.ts";
 import { SqliteStore, Store } from "../src/persistence/store.ts";
-import type { SessionFilesystems } from "../src/sandbox/index.ts";
+import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import type { MediaAttachment } from "../src/telegram/client.ts";
 import { Outbox } from "../src/telegram/outbox.ts";
 import { findMediaEmbeds, mediaIdsIn, placeMedia, sniffMedia, withoutMediaLines } from "../src/telegram/rich-media.ts";
@@ -99,12 +99,12 @@ test("in a folder workspace, files resolve against it and are copied until deliv
   writeFileSync(join(workspace, "out", "render.png"), PNG);
   writeFileSync(join(workspace, "notes.txt"), "not media at all");
   writeFileSync(join(workspace, "huge.png"), Buffer.concat([PNG, Buffer.alloc(10 * 1024 * 1024)]));
-  const media = new ReplyMedia({ stateDir: join(dir, "state"), workspaceForChat: () => workspace });
-  const { text, options } = await media.prepare({
+  const media = makeReplyMedia({ stateDir: join(dir, "state"), workspaceForChat: () => workspace });
+  const { text, options } = await Effect.runPromise(media.prepare({
     chatId: 1,
     key: "resp-1",
     text: "![render](out/render.png)\n\n![n](notes.txt) ![h](huge.png) ![m](missing.png) ![again](out/render.png)",
-  });
+  }));
   assert.equal(options.format, "rich");
   assert.equal(options.media?.length, 1);
   const [item] = options.media ?? [];
@@ -119,33 +119,34 @@ test("in a folder workspace, files resolve against it and are copied until deliv
   assert.match(text, /m \*\(not attached: file not found\)\*/);
   assert.match(text, / again$/m); // a repeat keeps its caption, not a second copy
 
-  const plain = await media.prepare({ chatId: 1, key: "resp-2", text: "No media, `just/a.png` named." });
+  const plain = await Effect.runPromise(media.prepare({ chatId: 1, key: "resp-2", text: "No media, `just/a.png` named." }));
   assert.deepEqual(plain, { text: "No media, `just/a.png` named.", options: { format: "rich" } });
 }));
 
 test("a reply carries at most ten media", () => withDir(async (dir) => {
   for (let i = 0; i < 12; i += 1) writeFileSync(join(dir, `${i}.png`), PNG);
-  const media = new ReplyMedia({ stateDir: join(dir, "state"), workspaceForChat: () => dir });
+  const media = makeReplyMedia({ stateDir: join(dir, "state"), workspaceForChat: () => dir });
   const embeds = Array.from({ length: 12 }, (_, i) => `![${i}](${i}.png)`).join("\n\n");
-  const { text, options } = await media.prepare({ chatId: 1, key: "k", text: embeds });
+  const { text, options } = await Effect.runPromise(media.prepare({ chatId: 1, key: "k", text: embeds }));
   assert.equal(options.media?.length, 10);
   assert.equal((text.match(/not attached: more than 10 in one reply/g) ?? []).length, 2);
 }));
 
 test("in a session filesystem, files are read through the sandbox, never from the host", () => withDir(async (dir) => {
   const reads: { volumeId: string; path: string; maxBytes: number }[] = [];
-  const sandbox: Pick<SessionFilesystems, "readFile"> = {
-    readFile: async (volumeId, path, maxBytes) => {
-      reads.push({ volumeId, path, maxBytes });
-      return path === "/workspace/out.mp4" ? { bytes: MP4 } : { note: "file not found" };
-    },
+  const sandbox: Pick<SessionSandboxes["Service"], "readFile"> = {
+    readFile: (volumeId, path, maxBytes) =>
+      Effect.sync(() => {
+        reads.push({ volumeId, path, maxBytes });
+        return path === "/workspace/out.mp4" ? { bytes: MP4 } : { note: "file not found" };
+      }),
   };
-  const media = new ReplyMedia({ stateDir: dir, workspaceForChat: () => sessionFsWorkspace("fs-abc123"), sandbox });
-  const { text, options } = await media.prepare({
+  const media = makeReplyMedia({ stateDir: dir, workspaceForChat: () => sessionFsWorkspace("fs-abc123"), sandbox });
+  const { text, options } = await Effect.runPromise(media.prepare({
     chatId: 1,
     key: "k",
     text: "![film](/workspace/out.mp4) and ![host file](/etc/hostname) and ![home](~/pic.png)",
-  });
+  }));
   assert.deepEqual(reads.map((r) => r.path), ["/workspace/out.mp4", "/etc/hostname", "/home/agent/pic.png"]);
   assert.ok(reads.every((r) => r.volumeId === "fs-abc123"));
   assert.equal(options.media?.length, 1);

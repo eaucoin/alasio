@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { HarnessSessions } from "../src/harness/index.ts";
+import { noActiveTurns } from "../src/harness/active-turns.ts";
+import type { HarnessSessionsFacade } from "../src/harness/index.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
 import {
   type SessionControlCallback,
@@ -69,7 +70,7 @@ function createStore(): SessionControlStore {
   };
 }
 
-function createHarness(sessions: Partial<HarnessSessions> = {}): SessionControlHarness {
+function createHarness(sessions: Partial<HarnessSessionsFacade> = {}): SessionControlHarness {
   return {
     displayName: "Codex",
     sessions: {
@@ -94,7 +95,7 @@ test("new-session callback starts and mounts a fresh session", async () => {
     client,
     store,
     harness: createHarness(),
-    activeQueries: new Map(),
+    activeTurns: noActiveTurns,
     action: { id: "action-1", kind: "control:new", conversationId: "conversation-1", payload: {} },
     startNewSession: async (args) => {
       startCalls.push(args);
@@ -114,7 +115,7 @@ test("new-session callback starts and mounts a fresh session", async () => {
 test("rewind forks before the chosen message for the conversation and mounts the fork", async () => {
   const { calls, client } = createClient();
   const store = createStore();
-  const forkCalls: Parameters<HarnessSessions["createForkedSession"]>[] = [];
+  const forkCalls: Parameters<HarnessSessionsFacade["createForkedSession"]>[] = [];
   const harness = createHarness({
     listSessionMessages: async () => [
       { index: -1, timestamp: "", text: "second", uuid: "turn-2" },
@@ -130,7 +131,7 @@ test("rewind forks before the chosen message for the conversation and mounts the
     client,
     store,
     harness,
-    activeQueries: new Map(),
+    activeTurns: noActiveTurns,
     action: { id: "action-1", kind: "control:rewind_fork", conversationId: "conversation-1", payload: { sessionId: "source-session", index: -1 } },
     startNewSession: async () => assert.fail("a rewind starts no new session"),
     callbackQueryId: "callback-1",

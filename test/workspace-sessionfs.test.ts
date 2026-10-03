@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 
+import { noActiveTurns } from "../src/harness/active-turns.ts";
 import {
   type CreateSessionWorkspace,
   type WorkspaceControlCallback,
@@ -63,7 +64,7 @@ test("choosing New empty workspace shows the internet dialog, then creates with 
 
   // Step 1: the "sessionfs" action edits the panel to a two-option internet dialog.
   await handleWorkspaceControlCallback({
-    client, store, activeQueries: new Map(),
+    client, store, activeTurns: noActiveTurns,
     action: { id: "a1", kind: "workspace:sessionfs", conversationId: "c1", payload: {} },
     workspaceRoot: "/root", sandboxEnabled: true, switchWorkspace,
     createSessionWorkspace,
@@ -75,7 +76,7 @@ test("choosing New empty workspace shows the internet dialog, then creates with 
 
   // Step 2: the "sessionfs_create" action with net=full creates the session filesystem.
   await handleWorkspaceControlCallback({
-    client, store, activeQueries: new Map(),
+    client, store, activeTurns: noActiveTurns,
     action: { id: "a2", kind: "workspace:sessionfs_create", conversationId: "c1", payload: { net: "full" } },
     workspaceRoot: "/root", sandboxEnabled: true, switchWorkspace,
     createSessionWorkspace,
@@ -85,7 +86,7 @@ test("choosing New empty workspace shows the internet dialog, then creates with 
 
   // Without the creator wired, it declines rather than throwing.
   await handleWorkspaceControlCallback({
-    client, store, activeQueries: new Map(),
+    client, store, activeTurns: noActiveTurns,
     action: { id: "a3", kind: "workspace:sessionfs_create", conversationId: "c1", payload: { net: "none" } },
     workspaceRoot: "/root", sandboxEnabled: true, switchWorkspace, createSessionWorkspace: null,
     callbackQueryId: "cb3", chatId: 1, messageId: 2,

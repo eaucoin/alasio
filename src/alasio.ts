@@ -8,6 +8,9 @@ import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
+import { Turns } from "./codex/turn-controller.ts";
+import { ActiveTurns } from "./harness/active-turns.ts";
+import { Harnesses } from "./harness/index.ts";
 import { KubeClient } from "./kube/client.ts";
 import { HostBayma } from "./mcp/bayma.ts";
 import { Store } from "./persistence/store.ts";
@@ -22,14 +25,26 @@ import { Outbox } from "./telegram/outbox.ts";
 import { WorkflowHooks } from "./workflow/hook-server.ts";
 
 /** The services alasio runs on, which its app's code not yet written in Effect reaches through an EffectRunner. */
-export type AlasioServices = Store | TelegramClient | Outbox | WorkflowHooks | CodexAppServer;
+export type AlasioServices = Store | TelegramClient | Outbox | WorkflowHooks | CodexAppServer | ActiveTurns | Harnesses | Turns;
 
 /** What alasio is made with: the app's configuration, but for what alasio makes itself. */
 export type AlasioOptions = Omit<TelegramCodexAppConfig, "effects">;
 
-/** alasio's services, made for `options`. */
+/**
+ * alasio's services, made for `options`: each made after what it runs on, and stopped
+ * before it. The turns are made last, so that stopping alasio interrupts the turns running
+ * while the harnesses, Telegram and the store they report to are still there.
+ */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices> {
-  return Layer.mergeAll(Outbox.layer, WorkflowHooks.layer(options.hookPort), workspaceServices(options), codexServices(options)).pipe(
+  return Turns.layer(options).pipe(
+    Layer.provideMerge(Harnesses.layer({
+      sessionStore: options.sessionStore,
+      codexRollouts: options.codexRollouts,
+      sessionFsCodexRollouts: options.sessionFsCodexRollouts,
+      folderBayma: options.folderBayma,
+      claudeQueryFactory: options.claudeQueryFactory,
+    })),
+    Layer.provideMerge(Layer.mergeAll(Outbox.layer, WorkflowHooks.layer(options.hookPort), workspaceServices(options), codexServices(options), ActiveTurns.layer)),
     Layer.provideMerge(Layer.mergeAll(Store.layer(options), TelegramClient.layer(options.telegramBotToken))),
   );
 }

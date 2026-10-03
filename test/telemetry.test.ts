@@ -48,8 +48,8 @@ const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app
 const { makeAppServerRpc } = await import("../src/codex/app-server/rpc-client.ts");
 const { appServerProcess } = await import("./support/app-server-process.ts");
 const { hostBaymaManifest } = await import("../src/mcp/bayma.ts");
-const { TurnController } = await import("../src/codex/turn-controller.ts");
-const { createHarnessRegistry } = await import("../src/harness/index.ts");
+const { withTurns } = await import("./support/turns.ts");
+const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
 const { createLogger } = await import("../src/shared/log.ts");
@@ -262,7 +262,7 @@ test("Codex app-server requests carry their span's trace context", async () => {
   assert.equal(sent.trace?.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
 });
 
-test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async (t) => {
+test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
   const folder = join(root, "repo");
   mkdirSync(folder);
@@ -307,40 +307,32 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
         warmSession: unused,
         listModels: unused,
         defaultModelChoice: unused,
-        async executeTurn() {
-          return {
+        runTurn: () =>
+          Effect.succeed({
             blockSequence: [{ type: "text", phase: "final_answer", content: "done" }],
             sessionId: "thread-1",
             pendingResponseId: "pending-1",
             interrupted: false,
             responseCompleted: true,
-          };
-        },
-        shutdown() {},
+          }),
       };
     };
     const delivered: string[] = [];
-    const effects = await outboxFor(t, store, async (call) => {
-      delivered.push(paramsOf(call, "sendRichMessage").rich_message.markdown ?? "");
-      return { message_id: 100 + delivered.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
-    });
-    const outbox = outboxFacade(effects);
-    const turns = new TurnController({
-      config: { workspaceRoot: root },
-      client: telegram,
-      store,
-      outbox,
-      activeQueries: new Map(),
-      workflowWaits: new Map(),
-      workflowWakeEvents: new Map(),
-      isStopping: () => false,
-      harnesses: createHarnessRegistry({ config: {}, overrides: { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) } }),
-    });
+    const outbox = Outbox.layer.pipe(Layer.provide([
+      botApiLayer(async (call) => {
+        delivered.push(paramsOf(call, "sendRichMessage").rich_message.markdown ?? "");
+        return { message_id: 100 + delivered.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
+      }),
+      Layer.succeed(Store, store),
+    ]));
+    const harnesses = { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) };
     spans.reset();
-    await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }));
-    // The conversation's prompt worker, already running: it resolves once the prompt is done.
-    await turns.scheduleConversation(conversationId);
-    await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+    await withTurns({ store, client: telegram, harnesses, config: { workspaceRoot: root }, outbox }, async ({ turns, effects }) => {
+      await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }));
+      // The conversation's prompt worker runs the turn, whose reply the outbox delivers.
+      await eventually("the turn to end", () => spans.getFinishedSpans().find((span) => span.name === "alasio.turn"));
+      await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+    });
 
     const update = finishedSpan("alasio.update");
     const turn = finishedSpan("alasio.turn");

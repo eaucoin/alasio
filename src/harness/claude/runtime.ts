@@ -19,19 +19,14 @@ import type {
   SDKUserMessage,
   SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
-import { type Effect, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
-import type { TurnParams, TurnResult } from "../index.ts";
-import type { ClaudeLiveSessions } from "./live-sessions.ts";
-import type { ClaudeSessionApi } from "./sessions.ts";
-import { createLogger } from "../../shared/log.ts";
+import { withLogScope } from "../../shared/log.ts";
 import { sessionFsQueryOptions } from "./sessionfs.ts";
 import { REPLY_INSTRUCTIONS } from "../reply-instructions.ts";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.ts";
 import { mirrorOnly } from "./session-store.ts";
-
-const log = createLogger("claude-runtime");
 
 /** What alasio starts a Claude Code query with: its streaming prompt, and its options. */
 export interface ClaudeQueryParams {
@@ -61,12 +56,6 @@ export interface ClaudeQueryOptionsInput {
   readonly sessionFsBayma?: BaymaEndpoint | null;
 }
 
-/** A turn as the adapter hands it on, with the live sessions that run it. */
-export interface ClaudeTurnRequest extends TurnParams {
-  readonly sessions?: ClaudeSessionApi;
-  readonly liveSessions: ClaudeLiveSessions;
-}
-
 export function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -80,16 +69,12 @@ export class ClaudeCodeError extends Schema.TaggedError<ClaudeCodeError>()("Clau
   }
 }
 
-function isIntentionalTurnInterrupt(reason: unknown): boolean {
-  const message = typeof reason === "string" ? reason : getErrorMessage(reason);
-  return message === "Interrupted from Telegram" || message === "Telegram swerve";
-}
-
-export function startFreshClaudeSession({ threadKey }: { readonly threadKey: string }): string {
+/** A new session for the conversation: an id reserved for it, which its first turn starts Claude Code under. */
+export const startFreshClaudeSession = Effect.fnUntraced(function*({ threadKey }: { readonly threadKey: string }): Effect.fn.Return<string> {
   const sessionId = randomUUID();
-  log.info(`new_session.reserved thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`);
+  yield* Effect.logInfo(`new_session.reserved thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`);
   return sessionId;
-}
+}, withLogScope("claude-runtime"));
 
 /**
  * Built-in tools removed from the model's context entirely. Shell and file
@@ -163,14 +148,3 @@ export function buildClaudeQueryOptions({
   }
   return options;
 }
-
-export function isOperatorInterrupt(reason: unknown): boolean {
-  return isIntentionalTurnInterrupt(reason);
-}
-
-/**
- * Run one operator prompt on the conversation's live Claude Code process,
- * starting or replacing that process when the mounted session, folder or
- * model differs from the one it serves.
- */
-export const executeClaudeTurn = (params: ClaudeTurnRequest): Effect.Effect<TurnResult> => params.liveSessions.runTurn(params);

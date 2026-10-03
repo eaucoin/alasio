@@ -6,6 +6,7 @@ import test from "node:test";
 
 import type { CallbackQuery, Message } from "@grammyjs/types";
 
+import { noActiveTurns } from "../src/harness/active-turns.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
 import type { Logger } from "../src/shared/log.ts";
 import { Authorizer } from "../src/telegram/authorizer.ts";
@@ -111,7 +112,7 @@ test("unauthorized callback is rejected before consuming its action", async () =
       config: { workspaceRoot: root },
       store,
       turns: unreachableTurns,
-      activeQueries: new Map(),
+      activeTurns: noActiveTurns,
     });
 
     await handler.handle(privateCallback(456, 456, actionId));

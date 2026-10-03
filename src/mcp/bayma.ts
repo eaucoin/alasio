@@ -14,12 +14,11 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
-import { Context, Effect, Layer, Option } from "effect";
+import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { KubeClient } from "../kube/client.ts";
 import type { HostProfile } from "../kube/config.ts";
 import { type BaymaEndpoint, makeSandboxes, type Sandbox, type SandboxError, sandboxManifest } from "../kube/sandboxes.ts";
-import type { EffectRunner } from "../shared/effects.ts";
 import { conversationTelemetryEnv } from "../telemetry/index.ts";
 
 export const BAYMA_SERVER_NAME = "bayma";
@@ -116,22 +115,24 @@ export class HostBayma extends Context.Service<HostBayma, {
     );
 }
 
+/** A folder workspace's bayma was asked of a deployment that offers no folder workspaces. */
+export class NoFolderWorkspaces extends Schema.TaggedError<NoFolderWorkspaces>()("NoFolderWorkspaces", {}) {
+  override get message(): string {
+    return "this deployment offers no folder workspaces: its templates have no host profile";
+  }
+}
+
 /**
  * The bayma MCP server a folder workspace's conversation gets under `harness`, once it
- * answers: `{ type: "http", url, headers }`, in Claude Code's MCP config shape. The
- * harnesses, not yet written in Effect, are given it as a promise (folderBaymaFacade).
+ * answers: `{ type: "http", url, headers }`, in Claude Code's MCP config shape.
  */
-export type FolderBayma = (scope: HostBaymaScope) => Promise<BaymaMcpServer>;
+export type FolderBayma = (scope: HostBaymaScope) => Effect.Effect<BaymaMcpServer, SandboxError | NoFolderWorkspaces>;
 
 /** The folder bayma of a deployment that offers no folder workspaces. */
-export const noFolderBayma: FolderBayma = async () => {
-  throw new Error("this deployment offers no folder workspaces: its templates have no host profile");
-};
+export const noFolderBayma: FolderBayma = () => Effect.fail(new NoFolderWorkspaces());
 
-/** The promise façade of the HostBayma `effects` runs in, or noFolderBayma where the deployment has none. It goes when its last caller moves. */
-export function folderBaymaFacade(effects: EffectRunner<never>): FolderBayma {
-  return Option.match(effects.runSync(Effect.serviceOption(HostBayma)), {
-    onNone: () => noFolderBayma,
-    onSome: (hostBayma) => (scope) => effects.runPromise(hostBayma.ensure(scope)),
-  });
-}
+/** The folder bayma of the HostBayma alasio runs with, or noFolderBayma where the deployment has none. */
+export const folderBayma: Effect.Effect<FolderBayma> = Effect.map(
+  Effect.serviceOption(HostBayma),
+  Option.match({ onNone: () => noFolderBayma, onSome: (hostBayma) => hostBayma.ensure }),
+);

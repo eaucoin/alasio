@@ -1,5 +1,5 @@
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
-import { type Harness, harnessDisplayName, isHarnessName } from "../harness/index.ts";
+import { type HarnessFacade, harnessDisplayName, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
@@ -19,7 +19,7 @@ export type ModelControlStore = Pick<SqliteStore, "createCallbackAction" | "setM
   & Partial<Pick<SqliteStore, "getModelChoice">>;
 
 /** The mounted harness, as /model lists its models. */
-export type ModelControlHarness = Pick<Harness, "name" | "displayName" | "listModels" | "defaultModelChoice">;
+export type ModelControlHarness = Pick<HarnessFacade, "name" | "displayName" | "listModels" | "defaultModelChoice">;
 
 /** What a model's button carries to the effort step. */
 interface ModelPick {

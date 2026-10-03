@@ -3,7 +3,7 @@
  *
  * Owns alasio turn orchestration and local command guardrails.
  */
-import { Cause, Context, Deferred, Effect, Exit, Schema, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect";
 
 import { buildCodexEnv } from "./env.ts";
 import { appendBlock, errorBlock, isVisibleCodexItem, mapItemToBlocks } from "./event-projection.ts";
@@ -32,10 +32,10 @@ import type { ThreadIdMissing } from "./app-server/thread-client.ts";
 import type { CodexListingScope } from "./sessions.ts";
 import type { CodexStreamParams } from "./transport.ts";
 import { type FolderBayma, noFolderBayma } from "../mcp/bayma.ts";
-import { effectRunnerHere } from "../shared/effects.ts";
 import { createLogger, withLogScope } from "../shared/log.ts";
+import { ActiveTurns, type RunningTurn, stopReasonText } from "../harness/active-turns.ts";
 import { CODEX_HARNESS } from "../harness/names.ts";
-import type { ActiveQueries, ActiveQuery, TurnParams, TurnResult } from "../harness/index.ts";
+import type { HarnessError, TurnParams, TurnResult } from "../harness/index.ts";
 import type { ResponseBlock } from "./event-projection.ts";
 
 const log = createLogger("codex-runtime");
@@ -91,8 +91,17 @@ export interface CodexTurnParams extends TurnParams, CodexScopeParams {
     readonly guardrailRecoveryDepth?: number | undefined;
 }
 
-/** The operator, or the DB guardrail, stopped a turn for `reason`. */
-class TurnAborted extends Schema.TaggedError<TurnAborted>()("TurnAborted", {
+/** The operator stopped a turn, with /stop or a swerve. */
+class TurnStopped extends Schema.TaggedError<TurnStopped>()("TurnStopped", {
+    reason: Schema.Literals(["interrupt", "swerve"]),
+}) {
+    override get message(): string {
+        return stopReasonText(this.reason);
+    }
+}
+
+/** The DB guardrail stopped a turn for `reason`. */
+class GuardrailStopped extends Schema.TaggedError<GuardrailStopped>()("GuardrailStopped", {
     reason: Schema.String,
 }) {
     override get message(): string {
@@ -110,13 +119,13 @@ export const folderCodexScope = ({
     appServer,
     folderBayma = noFolderBayma,
 }: Omit<CodexScopeParams, "scope">): Effect.Effect<CodexScope, CodexScopeError> =>
-    Effect.tryPromise({
-        try: () => folderBayma({ harness: CODEX_HARNESS, threadKey }),
-        catch: (cause) => new CodexScopeError({ cause }),
-    }).pipe(Effect.map((bayma) => {
-        const codexEnv = buildCodexEnv();
-        return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma }), appServer };
-    }));
+    folderBayma({ harness: CODEX_HARNESS, threadKey }).pipe(
+        Effect.mapError((cause) => new CodexScopeError({ cause })),
+        Effect.map((bayma) => {
+            const codexEnv = buildCodexEnv();
+            return { cwd: workingDirectory, codexEnv, codexConfig: buildCodexThreadConfig({ codexEnv, bayma }), appServer };
+        }),
+    );
 
 /**
  * The scope a call runs against: `scope`, when the harness gives one (a session
@@ -145,10 +154,6 @@ export const forkCodexSession = Effect.fnUntraced(function*({ sessionId, beforeT
     return yield* forkCodexTransportThread({ sessionId, beforeTurnId, threadKey: params.threadKey, workingDirectory: cwd, codexEnv, codexConfig, appServer });
 });
 
-function isIntentionalTurnInterrupt(message: string): boolean {
-    return message === "Interrupted from Telegram" || message === "Telegram swerve";
-}
-
 export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...params }: WarmCodexSessionParams): Effect.fn.Return<boolean, CodexSessionError> {
     if (!sessionId || !canWarmCodexSession()) {
         return false;
@@ -162,12 +167,18 @@ export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...para
 
 /**
  * A Codex turn, from its pending response to its result. It does not fail: what goes
- * wrong ends up in its response, as an error. While it runs it is the conversation's
- * active query, whose abort interrupts the fiber reading the turn's events (and so the
- * turn upstream) and resolves once the turn has let go of the conversation.
+ * wrong ends up in its response, as an error. While its events are read it is the
+ * conversation's running turn, whose stop interrupts the reading (and so the turn
+ * upstream) and is done once the turn has let go of the conversation.
+ *
+ * Interrupted itself, as alasio stops, the turn lets go of its events without stopping
+ * the turn upstream, which its app-server's end ends as alasio's end always did: an
+ * interrupt would have Codex record it as one the user made, which the turn continued
+ * after the restart is not to believe.
  */
-export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult> {
-    const { prompt, resumeSession, threadKey, chatId, messageId, persistence, activeQueries, onStarted } = params;
+export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult, never, ActiveTurns> {
+    const { prompt, resumeSession, threadKey, chatId, messageId, persistence, onStarted } = params;
+    const activeTurns = yield* ActiveTurns;
     const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
     const turnTimer = createTurnTimer({ harness: CODEX_HARNESS, threadKey, resumeSession, prompt, log });
     yield* Effect.logInfo(`Querying Codex (resume=${resumeSession})`);
@@ -180,20 +191,21 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
     const pendingResponseId = persistence.createPendingResponse(chatId, messageId, resumeSession);
     persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
     // Why the turn is stopped, once it is; and its letting go of the conversation.
-    const aborted = yield* Deferred.make<string>();
+    const stopped = yield* Deferred.make<never, TurnStopped | GuardrailStopped>();
     const finished = yield* Deferred.make<void>();
-    const effects = yield* effectRunnerHere(Context.empty());
-    const activeQuery: ActiveQuery = {
-        abort: (reason) => effects.runPromise(Deferred.succeed(aborted, reason).pipe(Effect.andThen(Deferred.await(finished)))),
-        steer: async () => false,
+    // Steering needs the turn upstream, which the transport starts.
+    let steer: (prompt: string) => Effect.Effect<boolean, HarnessError> = () => Effect.succeed(false);
+    const running: RunningTurn = {
+        stop: (reason) => Deferred.fail(stopped, new TurnStopped({ reason })).pipe(Effect.andThen(Deferred.await(finished))),
+        steer: (steerPrompt) => steer(steerPrompt),
+        cliInitiated: false,
     };
-    activeQueries.set(threadKey, activeQuery);
     const commandPolicy = createCommandEventPolicy({
         persistence,
         threadKey,
         chatId,
         messageId,
-        controller: { abort: (reason) => Deferred.doneUnsafe(aborted, Exit.succeed(String(reason))) },
+        controller: { abort: (reason) => Deferred.doneUnsafe(stopped, Exit.fail(new GuardrailStopped({ reason: String(reason) }))) },
         log,
     });
 
@@ -298,23 +310,31 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         params.onTransportStarted?.({ sessionId, turnId: streamed.turnId });
         if (sessionId && streamed.turnId) {
             const steered = { sessionId, turnId: streamed.turnId, appServer };
-            activeQuery.steer = (steerPrompt) => effects.runPromise(steerCodexTransportTurn({ ...steered, prompt: steerPrompt }));
+            steer = (steerPrompt) => steerCodexTransportTurn({ ...steered, prompt: steerPrompt });
         }
         yield* Stream.runForEach(streamed.events, onEvent(streamed.turnId));
     }));
 
-    // Stopping the turn interrupts the reading of its events, which interrupts it upstream.
-    const read = yield* readEvents.pipe(
-        Effect.raceFirst(Effect.flatMap(Deferred.await(aborted), (reason) => Effect.fail(new TurnAborted({ reason })))),
+    // The turn is the conversation's running turn while its events are read; stopping it
+    // interrupts the reading, which interrupts it upstream. The reading is a fiber of its
+    // own, which interrupting this one leaves be.
+    const reader = yield* Effect.forkDetach(readEvents);
+    const read = yield* Effect.scoped(activeTurns.register(threadKey, running).pipe(
+        Effect.andThen(Fiber.join(reader).pipe(
+            Effect.raceFirst(Deferred.await(stopped)),
+            // Stopped, the reading is interrupted, and with it the turn upstream.
+            Effect.tapError(() => Fiber.interrupt(reader)),
+        )),
         Effect.exit,
-    );
+    )).pipe(Effect.ensuring(Deferred.succeed(finished, undefined)));
     if (Exit.isFailure(read)) {
         if (commandPolicy.getGuardrailResult().guardrailBlocked) {
             yield* Effect.logWarning("Query aborted by DB guardrail");
         }
         else {
-            const errMsg = getErrorMessage(Cause.squash(read.cause));
-            if (isIntentionalTurnInterrupt(errMsg)) {
+            const failure = Cause.squash(read.cause);
+            const errMsg = getErrorMessage(failure);
+            if (failure instanceof TurnStopped) {
                 interrupted = true;
                 blockSequence.length = 0;
                 turnTimer("query.interrupted", { reason: errMsg });
@@ -328,8 +348,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         }
     }
     const { guardrailBlocked, blockedGuardrailCommand } = commandPolicy.getGuardrailResult();
-    activeQueries.delete(threadKey);
-    yield* Deferred.succeed(finished, undefined);
     turnTimer("query.finished", { guardrail_blocked: guardrailBlocked });
     if (guardrailBlocked && blockedGuardrailCommand) {
         if (sessionId && guardrailRecoveryDepth < MAX_DB_GUARDRAIL_RECOVERY_ATTEMPTS) {
@@ -356,15 +374,3 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         responseCompleted,
     };
 }, withLogScope("codex-runtime"));
-
-export async function interruptCodexTurn(activeQueries: ActiveQueries, threadKey: string): Promise<boolean> {
-    const activeQuery = activeQueries.get(threadKey);
-    if (!activeQuery) {
-        log.info(`No active query for thread key ${threadKey}`);
-        return false;
-    }
-    log.info(`Stopping query for thread key ${threadKey}`);
-    await activeQuery.abort("Interrupted from Telegram");
-    log.info(`Stopped query for thread key ${threadKey}`);
-    return true;
-}

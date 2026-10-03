@@ -1,5 +1,6 @@
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import { type ActiveQueries, type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
+import type { ActiveTurnsFacade } from "../harness/active-turns.ts";
+import { type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { NetMode } from "../sandbox/index.ts";
@@ -75,7 +76,7 @@ function pairs<T>(items: readonly T[]): T[][] {
 
 export interface WorkspacePanelRequest {
   readonly store: WorkspaceControlStore;
-  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly conversationId: string;
   readonly workspaceRoot: string;
   readonly notice?: string | undefined;
@@ -88,9 +89,9 @@ export interface WorkspacePanelRequest {
  * root (git repositories first) as buttons; anything beyond the button cap is
  * still reachable with `/workspace <name>`.
  */
-export async function buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): Promise<ControlPanel> {
+export async function buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): Promise<ControlPanel> {
   const current = resolveWorkingDirectory(store, conversationId);
-  const working = activeQueries?.has?.(conversationId) ?? false;
+  const working = activeTurns?.isBusy(conversationId) ?? false;
   let candidates: WorkspaceCandidate[] = [];
   let listingError = null;
   try {
@@ -147,8 +148,8 @@ export interface SendWorkspacePanelRequest extends Omit<WorkspacePanelRequest, "
 /**
  * Reply used whenever a prompt or control arrives before a folder is mounted.
  */
-export async function sendChooseWorkspacePanel({ client, store, activeQueries, conversationId, chatId, workspaceRoot, sandboxEnabled = false }: SendWorkspacePanelRequest): Promise<void> {
-  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE, sandboxEnabled });
+export async function sendChooseWorkspacePanel({ client, store, activeTurns, conversationId, chatId, workspaceRoot, sandboxEnabled = false }: SendWorkspacePanelRequest): Promise<void> {
+  const panel = await buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE, sandboxEnabled });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -204,7 +205,7 @@ export interface WorkspaceTextCommand extends SendWorkspacePanelRequest {
 export async function handleWorkspaceTextCommand({
   client,
   store,
-  activeQueries,
+  activeTurns,
   conversationId,
   chatId,
   args,
@@ -220,7 +221,7 @@ export async function handleWorkspaceTextCommand({
   } else if (parsed.action === "create") {
     notice = await applyWorkspaceChange(() => createWorkspace({ conversationId, name: parsed.name }));
   }
-  const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
+  const panel = await buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice, sandboxEnabled });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
@@ -237,7 +238,7 @@ async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId
 export interface WorkspaceControlCallback extends ControlCallback {
   readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage" | "sendMessage">;
   readonly store: WorkspaceControlStore;
-  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly activeTurns?: ActiveTurnsFacade | null | undefined;
   readonly workspaceRoot: string;
   readonly switchWorkspace: SwitchWorkspace;
   /** Present when the deployment offers session filesystems. */
@@ -248,7 +249,7 @@ export interface WorkspaceControlCallback extends ControlCallback {
 export async function handleWorkspaceControlCallback({
   client,
   store,
-  activeQueries,
+  activeTurns,
   action,
   workspaceRoot,
   switchWorkspace,
@@ -261,7 +262,7 @@ export async function handleWorkspaceControlCallback({
   const kind = action.kind.slice(WORKSPACE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   const conversationId = action.conversationId;
-  const panel = (notice: string) => buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
+  const panel = (notice: string) => buildWorkspacePanel({ store, activeTurns, conversationId, workspaceRoot, notice, sandboxEnabled });
   if (kind === "sessionfs") {
     // Offer the internet choice before creating the empty workspace.
     await client.answerCallbackQuery(callbackQueryId, "Choose internet access.");

@@ -14,7 +14,7 @@ import type {
   SessionStore,
   SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Option, Scope } from "effect";
 
 import type { ResponseBlock } from "../src/codex/event-projection.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
@@ -26,10 +26,11 @@ import {
 } from "../src/harness/claude/event-projection.ts";
 import { buildClaudeUserMessage, makePromptChannel } from "../src/harness/claude/prompt-channel.ts";
 import { type ClaudeLiveSessions, type ClaudeLiveSessionsOptions, makeClaudeLiveSessions } from "../src/harness/claude/live-sessions.ts";
-import { buildClaudeQueryOptions, executeClaudeTurn, type ClaudeQueryFactory, type ClaudeTurnRequest } from "../src/harness/claude/runtime.ts";
+import { buildClaudeQueryOptions, type ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.ts";
 import { type ClaudeSessionApi, type ClaudeTranscriptStore, createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
-import type { ActiveQueries, ActiveQuery, TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
+import { ActiveTurns } from "../src/harness/active-turns.ts";
+import type { TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
@@ -103,11 +104,24 @@ function textBlocks(blocks: readonly ResponseBlock[]): TextResponseBlock[] {
   return blocks.filter((block): block is TextResponseBlock => block.type === "text");
 }
 
-/** The turn running for `threadKey`, which there must be. */
-function activeQueryOf(activeQueries: ActiveQueries, threadKey: string): ActiveQuery {
-  const active = activeQueries.get(threadKey);
-  assert.ok(active, `a turn is running for ${threadKey}`);
-  return active;
+/** The running turns, as alasio keeps them, for a test's live sessions to register theirs in. */
+function makeActiveTurns(): ActiveTurns["Service"] {
+  return Effect.runSync(Effect.provide(ActiveTurns, ActiveTurns.layer));
+}
+
+/** Whether a turn runs for `threadKey`. */
+const busy = (activeTurns: ActiveTurns["Service"], threadKey: string): boolean => Effect.runSync(activeTurns.isBusy(threadKey));
+
+/** The turn running for `threadKey`, which there must be, as the operator's controls reach it. */
+function runningTurnOf(activeTurns: ActiveTurns["Service"], threadKey: string) {
+  const running = Effect.runSync(activeTurns.get(threadKey));
+  assert.ok(Option.isSome(running), `a turn is running for ${threadKey}`);
+  const turn = running.value;
+  return {
+    cliInitiated: turn.cliInitiated,
+    steer: (prompt: string) => Effect.runPromise(turn.steer(prompt)),
+    stop: () => Effect.runPromise(turn.stop("interrupt")),
+  };
 }
 
 /** What a query's abort controller signals; alasio gives every query one. */
@@ -117,35 +131,37 @@ function abortSignalOf(options: Options): AbortSignal {
 }
 
 /** A folder conversation's bayma, as the deployment's host profile would give it. */
-const folderBayma = async ({ threadKey }: Pick<HostBaymaScope, "threadKey">): Promise<BaymaMcpServer> => ({
-  type: "http",
-  url: `http://bayma-${threadKey.replace(/\W/gu, "")}.alasio-host.svc:7290/mcp`,
-  headers: { Authorization: "Bearer t" },
-});
+const folderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) =>
+  Effect.succeed<BaymaMcpServer>({
+    type: "http",
+    url: `http://bayma-${threadKey.replace(/\W/gu, "")}.alasio-host.svc:7290/mcp`,
+    headers: { Authorization: "Bearer t" },
+  });
 
-/** A turn for runClaudeTurn: the turn, and what its live sessions are made with. */
+/** A turn for runClaudeTurn: the turn, what its live sessions are made with, and the running turns they register in. */
 interface ClaudeTurnRun extends TurnParams {
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly queryFactory: ClaudeQueryFactory;
+  readonly activeTurns?: ActiveTurns["Service"];
 }
 
 /** One turn on a throwaway live-session registry, closed once the turn returns. */
-async function runClaudeTurn({ sessions, queryFactory, ...params }: ClaudeTurnRun): Promise<TurnResult> {
+async function runClaudeTurn({ sessions, queryFactory, activeTurns = makeActiveTurns(), ...params }: ClaudeTurnRun): Promise<TurnResult> {
   return await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const liveSessions = yield* makeClaudeLiveSessions({ workingDirectory: params.workingDirectory, sessions, queryFactory, folderBayma });
-    return yield* executeClaudeTurn({ ...params, liveSessions });
-  })));
+    return yield* liveSessions.runTurn(params);
+  })).pipe(Effect.provideService(ActiveTurns, activeTurns)));
 }
 
 /** Live sessions kept open until `closeAll`, as a harness keeps them from its making to its shutdown. */
-function openLiveSessions(options: ClaudeLiveSessionsOptions): { readonly liveSessions: ClaudeLiveSessions; readonly closeAll: () => Promise<void> } {
+function openLiveSessions(options: ClaudeLiveSessionsOptions, activeTurns: ActiveTurns["Service"]): { readonly liveSessions: ClaudeLiveSessions; readonly closeAll: () => Promise<void> } {
   const scope = Scope.makeUnsafe();
-  const liveSessions = Effect.runSync(Scope.provide(scope)(makeClaudeLiveSessions(options)));
+  const liveSessions = Effect.runSync(makeClaudeLiveSessions(options).pipe(Scope.provide(scope), Effect.provideService(ActiveTurns, activeTurns)));
   return { liveSessions, closeAll: () => Effect.runPromise(Scope.close(scope, Exit.void)) };
 }
 
 /** A turn on live sessions, as the harness runs one. */
-const executeTurn = (request: ClaudeTurnRequest): Promise<TurnResult> => Effect.runPromise(executeClaudeTurn(request));
+const runTurn = (liveSessions: ClaudeLiveSessions, params: TurnParams): Promise<TurnResult> => Effect.runPromise(liveSessions.runTurn(params));
 
 async function* drainPromptChannel(iterable: AsyncIterable<SDKUserMessage>, seen: SDKUserMessage[]) {
   for await (const message of iterable) {
@@ -286,7 +302,7 @@ test("with a session store, a query mirrors every transcript write as it is writ
 
 test("a result for another turn does not end the prompt channel", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   let promptUuid: string | null = null;
   let channelOpenWhenForeignResultSeen: boolean | null = null;
   const queryFactory: ClaudeQueryFactory = ({ prompt }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
@@ -326,7 +342,7 @@ test("a result for another turn does not end the prompt channel", async () => {
     messageId: "2",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
+    activeTurns,
     sessions: { sessionExists: async () => true },
     queryFactory,
   });
@@ -342,14 +358,14 @@ test("a result for another turn does not end the prompt channel", async () => {
 
 test("a steered prompt keeps the channel open until its own result arrives", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   let closedBeforeSteerAnswered: boolean | null = null;
   const queryFactory: ClaudeQueryFactory = ({ prompt }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
     const iterator = prompt[Symbol.asyncIterator]();
     const own = (await readPrompt(iterator)).uuid;
     yield initMessage("s1");
     // Steer arrives while the turn is running.
-    await activeQueryOf(activeQueries, "telegram:1").steer("also do this");
+    await runningTurnOf(activeTurns, "telegram:1").steer("also do this");
     const steered = (await readPrompt(iterator)).uuid;
     // The CLI answers only the original prompt first.
     yield successResult({
@@ -376,7 +392,7 @@ test("a steered prompt keeps the channel open until its own result arrives", asy
     messageId: "2",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
+    activeTurns,
     sessions: { sessionExists: async () => true },
     queryFactory,
   });
@@ -390,7 +406,7 @@ test("a steered prompt keeps the channel open until its own result arrives", asy
 
 test("Claude turn persists session identity, tool blocks, and the result as final answer", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const seenPrompts: SDKUserMessage["message"]["content"][] = [];
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
     assert.equal(options.cwd, "/work");
@@ -414,7 +430,7 @@ test("Claude turn persists session identity, tool blocks, and the result as fina
     messageId: "1",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
+    activeTurns,
     sessions: quietSessions,
     queryFactory,
   });
@@ -427,12 +443,12 @@ test("Claude turn persists session identity, tool blocks, and the result as fina
   assert.deepEqual(persistence.state.usage, [["reserved-1", { cacheReadInputTokens: 42 }]]);
   assert.deepEqual(result.blockSequence.map((block) => block.type), ["text", "tool", "text"]);
   assert.equal(finalResponseToMarkdown(result.blockSequence), "All done.");
-  assert.equal(activeQueries.size, 0);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
 });
 
 test("a result from a turn the CLI started itself does not end the operator's turn", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   let channelOpenAfterNotificationResult: boolean | null = null;
   const queryFactory: ClaudeQueryFactory = ({ prompt }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
     const iterator = prompt[Symbol.asyncIterator]();
@@ -453,7 +469,7 @@ test("a result from a turn the CLI started itself does not end the operator's tu
     messageId: "7",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
+    activeTurns,
     sessions: quietSessions,
     queryFactory,
   });
@@ -464,7 +480,7 @@ test("a result from a turn the CLI started itself does not end the operator's tu
 
 test("Claude turn interruption is classified as operator control and steering pushes guidance", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const pushed: SDKUserMessage["message"]["content"][] = [];
   const { promise: steerSeen, resolve: releaseSteer } = Promise.withResolvers<void>();
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
@@ -486,23 +502,23 @@ test("Claude turn interruption is classified as operator control and steering pu
     messageId: "2",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
+    activeTurns,
     sessions: quietSessions,
     queryFactory,
   });
-  while (!activeQueries.has("telegram:2")) {
+  while (!busy(activeTurns, "telegram:2")) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
-  const activeQuery = activeQueryOf(activeQueries, "telegram:2");
-  assert.equal(await activeQuery.steer("focus on tests"), true);
+  const running = runningTurnOf(activeTurns, "telegram:2");
+  assert.equal(await running.steer("focus on tests"), true);
   await steerSeen;
-  await activeQuery.abort("Interrupted from Telegram");
+  await running.stop();
   const result = await turn;
   assert.deepEqual(pushed, ["focus on tests"]);
   assert.equal(result.interrupted, true);
   assert.equal(result.responseCompleted, false);
   assert.deepEqual(result.blockSequence, []);
-  assert.equal(activeQueries.size, 0);
+  assert.equal(busy(activeTurns, "telegram:2"), false);
 });
 
 test("Claude turn surfaces failures and non-operator aborts as errors", async () => {
@@ -520,7 +536,6 @@ test("Claude turn surfaces failures and non-operator aborts as errors", async ()
     messageId: "3",
     workingDirectory: "/work",
     persistence,
-    activeQueries: new Map(),
     sessions: quietSessions,
     queryFactory,
   });
@@ -559,7 +574,6 @@ test("Bash, Monitor, Grep and Glob are removed and bayma exec code passes the da
     messageId: "4",
     workingDirectory: "/work",
     persistence,
-    activeQueries: new Map(),
     sessions: quietSessions,
     queryFactory,
   });
@@ -592,7 +606,6 @@ test("a restart through a Bun shell in bayma exec records self-induced provenanc
     messageId: "5",
     workingDirectory: "/work",
     persistence,
-    activeQueries: new Map(),
     sessions: quietSessions,
     queryFactory,
   });
@@ -780,7 +793,7 @@ function createFakeCli() {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5));
 
-function turnParams(persistence: TurnPersistence, activeQueries: ActiveQueries, extra: Partial<TurnParams> = {}): TurnParams {
+function turnParams(persistence: TurnPersistence, extra: Partial<TurnParams> = {}): TurnParams {
   return {
     prompt: "go",
     resumeSession: "s-1",
@@ -789,22 +802,20 @@ function turnParams(persistence: TurnPersistence, activeQueries: ActiveQueries, 
     messageId: "1",
     workingDirectory: "/work",
     persistence,
-    activeQueries,
     ...extra,
   };
 }
 
 test("background work keeps running after the answer and its report is delivered as its own reply", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const events: string[] = [];
-  const turn = executeTurn({
-    ...turnParams(persistence, activeQueries),
-    liveSessions,
-    onBackgroundResponse: () => events.push("background-response"),
-    onIdle: () => events.push("idle"),
+  const turn = runTurn(liveSessions, {
+    ...turnParams(persistence),
+    onBackgroundResponse: Effect.sync(() => events.push("background-response")),
+    onIdle: Effect.sync(() => events.push("idle")),
   });
   const first = await cli.nextPrompt();
   cli.emit(initMessage("s-1"));
@@ -815,16 +826,16 @@ test("background work keeps running after the answer and its report is delivered
   assert.equal(result.responseCompleted, true);
   assert.equal(finalResponseToMarkdown(result.blockSequence), "Tests are running; I'll report back.");
   assert.equal(cli.state.closed, 0, "the answer does not end the process");
-  assert.equal(activeQueries.size, 0, "the conversation is free once answered");
+  assert.equal(busy(activeTurns, "telegram:1"), false, "the conversation is free once answered");
 
   // The task settles and Claude Code starts a turn of its own to report it.
   cli.emit(backgroundTasksChanged([]));
   cli.emit(assistantMessage([text("Checking the log.")]));
   await settle();
-  assert.equal(activeQueries.get("telegram:1")?.cliInitiated, true, "the report holds the conversation busy");
+  assert.equal(runningTurnOf(activeTurns, "telegram:1").cliInitiated, true, "the report holds the conversation busy");
   cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
   await settle();
-  assert.equal(activeQueries.size, 0);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
   assert.deepEqual(persistence.state.completed, ["pending-1", "pending-2"]);
   assert.match(persistence.state.pending[1] ?? "", /^claude-cli-turn:/);
   assert.equal(persistence.state.blocks.filter((block) => block["phase"] === "final_answer").at(-1)?.["content"], "All 212 tests passed.");
@@ -838,16 +849,16 @@ test("later prompts on the same session reuse the live process; a new session or
   const persistence = createPersistence();
   let model: ModelChoice | null = null;
   persistence.getModelChoice = () => model;
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const answer = async () => {
     const received = await cli.nextPrompt();
     cli.emit(successResult({ result: `re: ${received.message.content}`, session_id: "s-1", user_message_uuids: [received.uuid] }));
     return received;
   };
   const run = async (prompt: string, extra: Partial<TurnParams> = {}) => {
-    const turn = executeTurn({ ...turnParams(persistence, activeQueries, { prompt, ...extra }), liveSessions });
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt, ...extra }));
     await answer();
     return await turn;
   };
@@ -870,37 +881,37 @@ test("later prompts on the same session reuse the live process; a new session or
 
 test("steering a Claude-started turn is answered in that turn's own reply", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
-  const turn = executeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, turnParams(persistence));
   const first = await cli.nextPrompt();
   cli.emit(successResult({ result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] }));
   await turn;
   cli.emit(assistantMessage([text("Build finished, reviewing.")]));
   await settle();
-  const cliTurn = activeQueryOf(activeQueries, "telegram:1");
+  const cliTurn = runningTurnOf(activeTurns, "telegram:1");
   assert.equal(cliTurn.cliInitiated, true);
   assert.equal(await cliTurn.steer("also summarize warnings"), true);
   const steered = await cli.nextPrompt();
   assert.equal(steered.message.content, "also summarize warnings");
   cli.emit(successResult({ result: "Build is green; 3 warnings.", session_id: "s-1", user_message_uuids: [steered.uuid] }));
   await settle();
-  assert.equal(activeQueries.size, 0);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
   assert.equal(persistence.state.completed.at(-1), "pending-2");
   await closeAll();
 });
 
 test("/stop interrupts the turn without killing the process, and the interrupted turn's tail is not a new turn", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
-  const turn = executeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, turnParams(persistence));
   const first = await cli.nextPrompt();
   cli.emit(assistantMessage([text("Working...")]));
   await settle();
-  await activeQueryOf(activeQueries, "telegram:1").abort("Interrupted from Telegram");
+  await runningTurnOf(activeTurns, "telegram:1").stop();
   const result = await turn;
   assert.equal(result.interrupted, true);
   assert.equal(cli.state.interrupts, 1);
@@ -908,7 +919,7 @@ test("/stop interrupts the turn without killing the process, and the interrupted
   // Output the CLI flushes while stopping belongs to the stopped turn.
   cli.emit(assistantMessage([text("(stopping)")]));
   await settle();
-  assert.equal(activeQueries.size, 0, "the tail does not open a Claude-started turn");
+  assert.equal(busy(activeTurns, "telegram:1"), false, "the tail does not open a Claude-started turn");
   cli.emit(errorResult({ subtype: "error_during_execution", errors: ["interrupted"], session_id: "s-1", user_message_uuids: [first.uuid] }));
   await settle();
   assert.deepEqual(persistence.state.pending, ["1"], "no reply was created for the tail");
@@ -917,10 +928,10 @@ test("/stop interrupts the turn without killing the process, and the interrupted
 
 test("a Claude Code process that exits mid-turn fails that turn and the next prompt starts a fresh one", async () => {
   const persistence = createPersistence();
-  const activeQueries: ActiveQueries = new Map();
+  const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma });
-  const turn = executeTurn({ ...turnParams(persistence, activeQueries), liveSessions });
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, turnParams(persistence));
   await cli.nextPrompt();
   const [options] = cli.state.options;
   assert.ok(options?.abortController, "the process's abort controller");
@@ -931,10 +942,36 @@ test("a Claude Code process that exits mid-turn fails that turn and the next pro
   assert.ok(last?.type === "text");
   assert.match(last.content, /^Error: Claude Code exited before answering/);
   assert.equal(liveSessions.get("telegram:1"), null);
-  const next = executeTurn({ ...turnParams(persistence, activeQueries, { prompt: "again" }), liveSessions });
+  const next = runTurn(liveSessions, turnParams(persistence, { prompt: "again" }));
   const again = await cli.nextPrompt();
   cli.emit(successResult({ result: "Back.", session_id: "s-1", user_message_uuids: [again.uuid] }));
   assert.equal((await next).responseCompleted, true);
   assert.equal(cli.state.created, 2);
+  await closeAll();
+});
+
+test("a stop asked while Claude Code is still starting is done once the turn ends, though the start fails", async () => {
+  const persistence = createPersistence();
+  const activeTurns = makeActiveTurns();
+  const { promise: lookedUp, reject: failLookup } = Promise.withResolvers<boolean>();
+  const { liveSessions, closeAll } = openLiveSessions({
+    workingDirectory: "/work",
+    // Starting the process waits on whether the session it resumes exists.
+    sessions: { sessionExists: () => lookedUp },
+    queryFactory: () => assert.fail("Claude Code never starts"),
+    folderBayma,
+  }, activeTurns);
+  const turn = runTurn(liveSessions, turnParams(persistence));
+  while (!busy(activeTurns, "telegram:1")) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  const stopping = runningTurnOf(activeTurns, "telegram:1").stop();
+  assert.equal(await settlesSoon(stopping), false, "the stop waits for the turn to end");
+  failLookup(new Error("transcripts unreachable"));
+  const result = await turn;
+  assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
+  assert.equal(result.responseCompleted, false);
+  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: transcripts unreachable" }]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });

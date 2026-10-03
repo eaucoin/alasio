@@ -54,6 +54,9 @@ const SELF_INDUCED_RESTART = [
   "Instruction: if the restart was intended to apply a configuration or code change, verify the expected post-restart state, then proceed with the interrupted task.",
 ].join("\n");
 
+/** What a turn's status message says once alasio stops during the turn. */
+const RESTARTING = "alasio is restarting; Codex continues this turn after the restart.";
+
 /**
  * Whether alasio has recorded that Codex accepted the turn `turnId`: a prompt whose turn
  * Codex accepted is not run again after a restart.
@@ -90,8 +93,8 @@ test("a turn alasio stops during is recovered after the restart, with unknown pr
   const mark = telegram.mark();
 
   assert.deepEqual(await alasio.stop(), { code: 0, signal: null });
-  // Stopping says nothing to the operator: the status message stays as it was.
-  assert.deepEqual(telegram.shown(mark), []);
+  // Stopping says on the turn's status message that alasio is restarting, and the turn continues after it.
+  assert.deepEqual(telegram.shown(mark), [{ method: "editMessageText", text: RESTARTING }]);
   await alasio.start();
   const recovery = await recoveryTurn(alasio);
   assert.equal(inputText(recovery), EXTERNAL_RESTART);
@@ -100,6 +103,7 @@ test("a turn alasio stops during is recovered after the restart, with unknown pr
   answerTurn(codex, "thread-1", "turn-2", "alasio restarted while I worked. Should I carry on?");
   await telegram.waitFor("sendRichMessage", () => true, { mark });
   assert.deepEqual(timeless(telegram.shown(mark)), [
+    { method: "editMessageText", text: RESTARTING },
     { method: "sendMessage", text: WORKING("Codex") },
     { method: "editMessageText", text: "Codex worked for a moment." },
     { method: "sendRichMessage", text: "alasio restarted while I worked. Should I carry on?" },
@@ -153,6 +157,7 @@ test("a turn that ran alasio's rollout restart is continued after it as one the 
   answerTurn(codex, "thread-1", "turn-2", "Restarted; the change is live.");
   await telegram.waitFor("sendRichMessage", () => true, { mark });
   assert.deepEqual(timeless(telegram.shown(mark)), [
+    { method: "editMessageText", text: RESTARTING },
     { method: "sendMessage", text: WORKING("Codex") },
     { method: "editMessageText", text: "Codex worked for a moment." },
     { method: "sendRichMessage", text: "Restarted; the change is live." },

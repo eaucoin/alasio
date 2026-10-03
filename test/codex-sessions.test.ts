@@ -24,6 +24,7 @@ import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
+import { harnessSessionsFacade } from "../src/harness/index.ts";
 import { effectRunner } from "../src/shared/effects.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
@@ -129,11 +130,10 @@ test("sessions are labelled by name, else first prompt; turns without a prompt a
         ? Effect.fail(new AppServerRequestFailed({ error: { message: "thread not found" } }))
         : Effect.succeed([turn("t3", null, "continued on its own"), turn("t2", "second", null), turn("t1", "first", "answered")]),
   };
-  const sessions = createCodexSessionApi({
+  const sessions = harnessSessionsFacade(createCodexSessionApi({
     listingScope: Effect.succeed({ cwd: "/work", codexEnv: {}, appServer }),
     fork: () => Effect.sync(() => assert.fail("nothing is forked")),
-    effects,
-  });
+  }), effects);
   assert.deepEqual(await sessions.listSessions(1), [
     { uuid: "named", timestamp: "2026-09-21", label: "Named thread" },
     { uuid: "prompted", timestamp: "-", label: "a first prompt that is well over fort..." },
@@ -195,14 +195,13 @@ describe("Codex sessions through the app-server", { skip }, () => {
     running = Effect.runSync(Scope.make());
     const client = await effects.runPromise(makeAppServer().pipe(Scope.provide(running)));
     const forks: string[] = [];
-    const sessions = createCodexSessionApi({
+    const sessions = harnessSessionsFacade(createCodexSessionApi({
       listingScope: Effect.sync(() => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), appServer: client })),
       fork: ({ sessionId, beforeTurnId, threadKey }) => {
         forks.push(threadKey);
         return client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
       },
-      effects,
-    });
+    }), effects);
 
     // Mirrored from the start, as alasio does.
     const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });

@@ -1,5 +1,5 @@
 import type { v2 } from "../../.types/codex/index.js";
-import { Effect, Option } from "effect";
+import { Effect } from "effect";
 
 import { CodexAppServer } from "../codex/app-server/client.ts";
 import { resolveCodexModelChoice } from "../codex/model.ts";
@@ -12,10 +12,11 @@ import {
   warmCodexSession,
 } from "../codex/runtime.ts";
 import { type CodexListingScope, createCodexSessionApi, folderListingScope } from "../codex/sessions.ts";
-import { SessionFsCodex } from "../codex/sessionfs.ts";
-import type { SessionFilesystems } from "../sandbox/index.ts";
+import type { SessionFsCodex } from "../codex/sessionfs.ts";
+import { SessionFilesystemsDisabled, type SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { withLogScope } from "../shared/log.ts";
+import { ActiveTurns } from "./active-turns.ts";
 import type { Harness, HarnessOptions, ModelOption } from "./index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "./names.ts";
 
@@ -35,38 +36,24 @@ function toModelOption(model: v2.Model): ModelOption {
   };
 }
 
-const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
 /** A session-filesystem workspace's volume, with the Sandbox and the app-server that serve it. */
 interface ServedSessionFs {
   readonly volumeId: string;
-  readonly sandbox: SessionFilesystems;
+  readonly sandbox: SessionSandboxes["Service"];
   readonly sessionFsCodex: SessionFsCodex["Service"];
 }
 
-/** What serves the workspace at `workingDirectory` if it is a session filesystem; null for a folder. */
-function servedSessionFs(
-  workingDirectory: string,
-  sandbox: SessionFilesystems | null,
-  sessionFsCodex: Option.Option<SessionFsCodex["Service"]>,
-): ServedSessionFs | null {
-  const workspace = parseWorkspace(workingDirectory);
-  if (workspace?.kind !== "sessionfs") {
-    return null;
-  }
-  if (!(sandbox && Option.isSome(sessionFsCodex))) {
-    throw new Error("this conversation's workspace is a session filesystem, which this deployment does not enable");
-  }
-  return { volumeId: workspace.volumeId, sandbox, sessionFsCodex: sessionFsCodex.value };
+/** What makeCodexHarness is given: a harness's options, and the session filesystems' app-server where they are on. */
+export interface CodexHarnessOptions extends HarnessOptions {
+  readonly sessionFsCodex: SessionFsCodex["Service"] | null;
 }
 
 /**
  * Codex harness adapter over the app-server runtime, with its sessions as the
- * app-server reports them: the promise façade of alasio's Codex services (CodexAppServer,
- * and SessionFsCodex where session filesystems are on), whose effects `effects` runs.
- * With Codex's rollouts kept in Neon (see codex/rollouts/), a thread's rollout files
- * missing here are written back before it is resumed or forked, and a turn's thread is
- * mirrored before its response is final.
+ * app-server reports them, on alasio's Codex services (CodexAppServer, and SessionFsCodex
+ * where session filesystems are on). With Codex's rollouts kept in Neon (see
+ * codex/rollouts/), a thread's rollout files missing here are written back before it is
+ * resumed or forked, and a turn's thread is mirrored before its response is final.
  *
  * A folder workspace runs on the operator's app-server with the operator's Codex. A
  * session-filesystem workspace runs on the session-filesystem app-server
@@ -74,31 +61,36 @@ function servedSessionFs(
  * only through its bayma; its rollouts are that app-server's home's, mirrored by
  * `sessionFsCodexRollouts`.
  */
-export function createCodexHarness({
+export const makeCodexHarness = Effect.fnUntraced(function*({
   workingDirectory,
   codexRollouts = null,
-  sandbox = null,
+  sandbox,
+  sessionFsCodex,
   sessionFsCodexRollouts = null,
   folderBayma,
-  effects,
-}: HarnessOptions): Harness {
-  const sessionFs = servedSessionFs(workingDirectory, sandbox, effects ? effects.runSync(Effect.serviceOption(SessionFsCodex)) : Option.none());
-  const appServer = effects && Option.getOrUndefined(effects.runSync(Effect.serviceOption(CodexAppServer)));
-  if (!effects || !appServer) {
-    throw new Error("the Codex harness runs on alasio's Codex app-server, and was given none");
+}: CodexHarnessOptions): Effect.fn.Return<Harness, SessionFilesystemsDisabled, CodexAppServer | ActiveTurns> {
+  const appServer = yield* CodexAppServer;
+  const activeTurns = yield* ActiveTurns;
+  const workspace = parseWorkspace(workingDirectory);
+  let sessionFs: ServedSessionFs | null = null;
+  if (workspace?.kind === "sessionfs") {
+    if (!sandbox || !sessionFsCodex) {
+      return yield* new SessionFilesystemsDisabled();
+    }
+    sessionFs = { volumeId: workspace.volumeId, sandbox, sessionFsCodex };
   }
-  const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => effects.runPromise(effect.pipe(withLogScope("codex-harness")));
   const rollouts = sessionFs ? sessionFsCodexRollouts : codexRollouts;
   const directory = sessionFs ? sessionFs.sandbox.harnessDirectory(sessionFs.volumeId) : workingDirectory;
+  const scoped = withLogScope("codex-harness");
 
   // What each call runs against: `scope` for a thread's work (a session filesystem's
   // brings its Sandbox up; a folder's is built by the runtime), `listingScope` for
   // thread and model lists and goals, which need no Sandbox.
   const scope: CodexScopeProvider | null = sessionFs
-    ? Effect.tryPromise({
-      try: () => sessionFs.sandbox.ensureSession(sessionFs.volumeId),
-      catch: (cause) => new CodexScopeError({ cause }),
-    }).pipe(Effect.flatMap(({ bayma }) => sessionFs.sessionFsCodex.scope({ directory, bayma })))
+    ? sessionFs.sandbox.ensureSession(sessionFs.volumeId).pipe(
+      Effect.mapError((cause) => new CodexScopeError({ cause })),
+      Effect.flatMap(({ bayma }) => sessionFs.sessionFsCodex.scope({ directory, bayma })),
+    )
     : null;
   const listingScope: Effect.Effect<CodexListingScope, CodexScopeError> = sessionFs
     ? sessionFs.sessionFsCodex.listingScope({ directory })
@@ -108,16 +100,17 @@ export function createCodexHarness({
   const ensureRollouts = (sessionId: string | null | undefined): Effect.Effect<void> =>
     !rollouts || !sessionId
       ? Effect.void
-      : Effect.tryPromise(() => rollouts.restore([sessionId])).pipe(
-        Effect.catch((error) => Effect.logWarning(`could not check Neon for the rollouts of ${sessionId}: ${errorText(error.cause)}`)),
+      : rollouts.restore([sessionId]).pipe(
+        Effect.catch((error) => Effect.logWarning(`could not check Neon for the rollouts of ${sessionId}: ${error.message}`)),
+        Effect.asVoid,
       );
 
   const flushRollouts = (sessionId: string | null | undefined): Effect.Effect<void> =>
     !rollouts || !sessionId
       ? Effect.void
-      : Effect.tryPromise(() => rollouts.flush(sessionId)).pipe(
-        Effect.catch((error) => Effect.logWarning(`the turn's response goes on before ${sessionId} was mirrored: ${errorText(error.cause)}`)),
-        withLogScope("codex-harness"),
+      : rollouts.flush(sessionId).pipe(
+        Effect.catch((error) => Effect.logWarning(`the turn's response goes on before ${sessionId} was mirrored: ${error.message}`)),
+        scoped,
       );
 
   /** The app-server goals are read and set through, and the directory and env each call names. */
@@ -133,38 +126,31 @@ export function createCodexHarness({
       listingScope,
       fork: ({ sessionId, beforeTurnId, threadKey }) => forkCodexSession({ sessionId, beforeTurnId, threadKey, ...scopeParams }),
       beforeFork: ensureRollouts,
-      effects,
     }),
     /** Codex's goals on a thread, for operator/goal-control.ts. */
     goals: {
       read: ({ threadId }) =>
-        run(Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.getGoal({ threadId, cwd, env })).pipe(Effect.map((response) => response?.goal ?? null))),
+        Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.getGoal({ threadId, cwd, env })).pipe(Effect.map((response) => response?.goal ?? null), scoped),
       set: ({ threadId, objective, status }) =>
-        run(Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.setGoal({ threadId, objective, status, cwd, env })).pipe(Effect.map((response) => response?.goal ?? null))),
-      clear: ({ threadId }) => run(Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.clearGoal({ threadId, cwd, env }))),
-      waitForTurnId: (threadId, timeoutMs) => run(Effect.flatMap(listingScope, ({ appServer }) => appServer.waitForTurnId(threadId, timeoutMs))),
+        Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.setGoal({ threadId, objective, status, cwd, env })).pipe(Effect.map((response) => response?.goal ?? null), scoped),
+      clear: ({ threadId }) => Effect.flatMap(goalScope, ({ appServer, cwd, env }) => appServer.clearGoal({ threadId, cwd, env })).pipe(scoped),
+      waitForTurnId: (threadId, timeoutMs) => Effect.flatMap(listingScope, ({ appServer }) => appServer.waitForTurnId(threadId, timeoutMs)).pipe(scoped),
     },
-    startFreshSession: ({ threadKey }) => run(startFreshCodexSession({ threadKey, ...scopeParams })),
+    startFreshSession: ({ threadKey }) => startFreshCodexSession({ threadKey, ...scopeParams }).pipe(scoped),
     warmSession: ({ sessionId, threadKey }) =>
-      run(ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })))),
-    executeTurn: (params) =>
-      run(ensureRollouts(params.resumeSession).pipe(
+      ensureRollouts(sessionId).pipe(Effect.andThen(warmCodexSession({ sessionId, threadKey, ...scopeParams })), scoped),
+    runTurn: (params) =>
+      ensureRollouts(params.resumeSession).pipe(
         Effect.andThen(executeCodexTurn({ ...params, ...scopeParams, beforeResponseComplete: flushRollouts })),
-      )),
+        Effect.provideService(ActiveTurns, activeTurns),
+        scoped,
+      ),
     listModels: () =>
-      run(Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listModels({ env: codexEnv, cwd })).pipe(
+      Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listModels({ env: codexEnv, cwd })).pipe(
         Effect.map((models) => models.filter((model) => !model.hidden).map(toModelOption)),
-      )),
+        scoped,
+      ),
     /** What a turn runs on when no /model choice is stored. */
-    defaultModelChoice() {
-      return resolveCodexModelChoice(null);
-    },
-    /** Stops alasio's Codex app-servers, as alasio stops; a turn running on one ends with it. */
-    shutdown: () =>
-      run(Effect.gen(function*() {
-        yield* appServer.stop;
-        const sessionFsCodex = yield* Effect.serviceOption(SessionFsCodex);
-        if (Option.isSome(sessionFsCodex)) yield* sessionFsCodex.value.stop;
-      })),
+    defaultModelChoice: () => resolveCodexModelChoice(null),
   };
-}
+});

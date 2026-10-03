@@ -8,7 +8,6 @@ import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
 import type { HarnessSessions } from "../harness/index.ts";
-import type { EffectRunner } from "../shared/effects.ts";
 import { withLogScope } from "../shared/log.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
 import { dateLabel, sessionLabel } from "../shared/session-labels.ts";
@@ -63,17 +62,15 @@ export interface CodexSessionApiOptions {
   readonly fork: ForkSession;
   /** Runs first with the thread forked from, for the rollout store to write back any file of it missing here. */
   readonly beforeFork?: ((sessionId: string) => Effect.Effect<void>) | undefined;
-  /** What runs the panels' effects for their promise interface. */
-  readonly effects: EffectRunner<never>;
 }
 
 /**
  * The session panels' view of the threads `listingScope` lists, which a folder workspace's
  * harness and a session filesystem's each give: listings, previews, rewind points, and
- * rewind, as promises run by `effects`.
+ * rewind.
  */
-export function createCodexSessionApi({ listingScope, fork, beforeFork, effects }: CodexSessionApiOptions): HarnessSessions {
-  const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => effects.runPromise(effect.pipe(withLogScope("codex-sessions")));
+export function createCodexSessionApi({ listingScope, fork, beforeFork }: CodexSessionApiOptions): HarnessSessions {
+  const run = withLogScope("codex-sessions");
 
   const listAll = Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listThreads({ env: codexEnv, cwd }));
 
