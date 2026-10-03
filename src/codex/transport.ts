@@ -1,6 +1,6 @@
 import { CODEX_HARNESS } from "../harness/names.ts";
 import { resolveCodexModelChoice } from "./model.ts";
-import { Codex, type ThreadEvent } from "@openai/codex-sdk";
+import { Codex, type Thread, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
 import { type AppServerClient, codexAppServerClient, stopCodexAppServer } from "./app-server/client.ts";
 import type { AppServerEvent } from "./app-server/protocol.ts";
 import {
@@ -39,6 +39,12 @@ export interface CodexSessionOptions {
     readonly client?: AppServerClient | undefined;
 }
 
+/** What the exec transport uses of the Codex SDK's client: threads to stream a turn in. */
+export interface CodexExecClient {
+    startThread(options?: ThreadOptions): Pick<Thread, "runStreamed">;
+    resumeThread(id: string, options?: ThreadOptions): Pick<Thread, "runStreamed">;
+}
+
 /** A turn to run: the prompt, the session to resume if any, and where its progress is recorded. */
 export interface CodexStreamParams extends CodexSessionOptions {
     readonly resumeSession: string | null | undefined;
@@ -48,7 +54,7 @@ export interface CodexStreamParams extends CodexSessionOptions {
     readonly controller: AbortController;
     readonly turnTimer: TurnTimer;
     /** Makes the Codex SDK client of the exec transport, for tests. */
-    readonly codexFactory?: (() => Codex) | undefined;
+    readonly codexFactory?: (() => CodexExecClient) | undefined;
 }
 
 /** A turn already running in the app-server (a goal's), to attach to. */

@@ -68,7 +68,10 @@ const jsonl = (entries: readonly SessionStoreEntry[]): string => entries.map((en
  * JSONL, each subagent's JSONL, and a subagent's metadata beside it.
  * Returns whether the transcript is present locally afterwards.
  */
-export async function ensureLocalTranscript(store: NeonSessionStore, sessionId: string): Promise<boolean> {
+export async function ensureLocalTranscript(
+  store: Pick<NeonSessionStore, "projectKeyOf" | "listSubkeys" | "load">,
+  sessionId: string,
+): Promise<boolean> {
   const projectKey = await store.projectKeyOf(sessionId);
   if (!projectKey) return false;
   const home = claudeHome();

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,18 +9,21 @@ import { ReplyMedia } from "../src/codex/reply-media.ts";
 import { buildCodexThreadConfig } from "../src/codex/thread-config.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { REPLY_INSTRUCTIONS, withReplyInstructions } from "../src/harness/reply-instructions.ts";
-import { Client } from "../src/telegram/client.ts";
-import { TelegramOutbox } from "../src/telegram/outbox.ts";
+import type { OutboxEntry } from "../src/persistence/outbox-repository.ts";
+import type { SessionFilesystems } from "../src/sandbox/index.ts";
+import { Client, type MediaAttachment } from "../src/telegram/client.ts";
+import { type OutboxStore, TelegramOutbox } from "../src/telegram/outbox.ts";
 import { findMediaEmbeds, mediaIdsIn, placeMedia, sniffMedia, withoutMediaLines } from "../src/telegram/rich-media.ts";
 import { toRichMarkdown } from "../src/telegram/rich-markdown.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
+import { type BotCall, answerBotCalls, botApiError, paramsOf } from "./support/bot-api.ts";
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0]);
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 const MP4 = Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from("ftypisom"), Buffer.alloc(4)]);
 const GIF = Buffer.concat([Buffer.from("GIF89a"), Buffer.alloc(10)]);
 
-function withDir(fn) {
+function withDir<T>(fn: (dir: string) => T | Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "alasio-reply-media-"));
   return Promise.resolve(fn(dir)).finally(() => rmSync(dir, { recursive: true, force: true }));
 }
@@ -102,8 +104,9 @@ test("in a folder workspace, files resolve against it and are copied until deliv
     text: "![render](out/render.png)\n\n![n](notes.txt) ![h](huge.png) ![m](missing.png) ![again](out/render.png)",
   });
   assert.equal(options.format, "rich");
-  assert.equal(options.media.length, 1);
-  const [item] = options.media;
+  assert.equal(options.media?.length, 1);
+  const [item] = options.media ?? [];
+  assert.ok(item);
   assert.deepEqual({ id: item.id, kind: item.kind }, { id: "m1", kind: "photo" });
   assert.equal(options.mediaDir, join(dir, "state", "reply-media", "resp-1"));
   assert.deepEqual(readFileSync(item.file), PNG); // a copy, not the original
@@ -123,13 +126,13 @@ test("a reply carries at most ten media", () => withDir(async (dir) => {
   const media = new ReplyMedia({ stateDir: join(dir, "state"), workspaceForChat: () => dir });
   const embeds = Array.from({ length: 12 }, (_, i) => `![${i}](${i}.png)`).join("\n\n");
   const { text, options } = await media.prepare({ chatId: 1, key: "k", text: embeds });
-  assert.equal(options.media.length, 10);
+  assert.equal(options.media?.length, 10);
   assert.equal((text.match(/not attached: more than 10 in one reply/g) ?? []).length, 2);
 }));
 
 test("in a session filesystem, files are read through the sandbox, never from the host", () => withDir(async (dir) => {
-  const reads = [];
-  const sandbox = {
+  const reads: { volumeId: string; path: string; maxBytes: number }[] = [];
+  const sandbox: Pick<SessionFilesystems, "readFile"> = {
     readFile: async (volumeId, path, maxBytes) => {
       reads.push({ volumeId, path, maxBytes });
       return path === "/workspace/out.mp4" ? { bytes: MP4 } : { note: "file not found" };
@@ -143,8 +146,8 @@ test("in a session filesystem, files are read through the sandbox, never from th
   });
   assert.deepEqual(reads.map((r) => r.path), ["/workspace/out.mp4", "/etc/hostname", "/home/agent/pic.png"]);
   assert.ok(reads.every((r) => r.volumeId === "fs-abc123"));
-  assert.equal(options.media.length, 1);
-  assert.equal(options.media[0].kind, "video");
+  assert.equal(options.media?.length, 1);
+  assert.equal(options.media[0]?.kind, "video");
   assert.match(text, /host file \*\(not attached: file not found\)\*/); // the sandbox has no such file
 }));
 
@@ -155,62 +158,77 @@ test("a rich part uploads its media with it; when rejected, text then media go t
   writeFileSync(photo, PNG);
   writeFileSync(video, MP4);
   writeFileSync(gif, GIF);
-  const media = [
+  const media: MediaAttachment[] = [
     { id: "m1", kind: "photo", animation: false, file: photo },
     { id: "m2", kind: "video", animation: false, file: video },
     { id: "m3", kind: "video", animation: true, file: gif },
   ];
   const text = "Look:\n\n<tg-collage>\n![](tg://photo?id=m1)\n![](tg://video?id=m2)\n</tg-collage>\n\n![](tg://video?id=m3 \"loop\")";
   const client = new Client("test-token");
-  const calls = [];
+  const calls: BotCall[] = [];
   let reject = false;
-  client.call = async (method, payload) => {
-    calls.push({ method, payload });
-    return { message_id: calls.length };
-  };
-  client.callMultipart = async (method, fields, files) => {
-    calls.push({ method, fields, files });
-    if (reject && method === "sendRichMessage") {
-      const error = new Error("Bad Request");
-      error.status = 400;
-      throw error;
+  answerBotCalls(client, async (call) => {
+    calls.push(call);
+    if (reject && call.files && call.method === "sendRichMessage") {
+      throw botApiError("Bad Request", 400);
     }
-    return method === "sendMediaGroup" ? [{ message_id: 1 }, { message_id: 2 }] : { message_id: calls.length };
-  };
+    return call.method === "sendMediaGroup" ? [{ message_id: 1 }, { message_id: 2 }] : { message_id: calls.length };
+  });
 
   await client.sendMessage(7, text, { format: "rich", media, mediaDir: dir });
   assert.equal(calls.length, 1);
   const [rich] = calls;
-  assert.equal(rich.method, "sendRichMessage");
-  assert.deepEqual(rich.fields.rich_message.media.map((m) => [m.id, m.media.type, m.media.media]), [
+  const richParams = paramsOf(rich, "sendRichMessage");
+  assert.deepEqual(richParams.rich_message.media?.map((m) => [m.id, m.media.type, m.media.media]), [
     ["m1", "photo", "attach://m1"],
     ["m2", "video", "attach://m2"],
     ["m3", "animation", "attach://m3"],
   ]);
-  assert.deepEqual(rich.files.map((f) => f.name), ["m1", "m2", "m3"]);
-  assert.equal(rich.fields.mediaDir, undefined); // alasio's own options stay home
-  assert.equal(rich.fields.media, undefined);
+  assert.deepEqual(rich?.files?.map((f) => f.name), ["m1", "m2", "m3"]);
+  assert.equal("mediaDir" in richParams, false); // alasio's own options stay home
+  assert.equal("media" in richParams, false);
 
   calls.length = 0;
   reject = true;
   await client.sendMessage(7, text, { format: "rich", media, mediaDir: dir });
   assert.deepEqual(calls.map((c) => c.method), ["sendRichMessage", "sendMessage", "sendAnimation", "sendMediaGroup"]);
-  assert.doesNotMatch(calls[1].payload.text, /tg:\/\/|tg-collage/);
-  assert.equal(calls[3].fields.disable_notification, true);
-  assert.deepEqual(calls[3].fields.media.map((m) => m.type), ["photo", "video"]);
+  assert.doesNotMatch(paramsOf(calls[1], "sendMessage").text, /tg:\/\/|tg-collage/);
+  const album = paramsOf(calls[3], "sendMediaGroup");
+  assert.equal(album.disable_notification, true);
+  assert.deepEqual(album.media.map((m) => m.type), ["photo", "video"]);
 }));
 
 test("a sent reply's media copies are deleted", () => withDir(async (dir) => {
   const mediaDir = join(dir, "reply-media", "k");
   mkdirSync(mediaDir, { recursive: true });
   writeFileSync(join(mediaDir, "m1.png"), PNG);
-  const sent = [];
-  const store = {
-    getDueOutbox: () => [{ id: "o1", chat_id: "7", text: "x", options: { format: "rich", mediaDir }, attempts: 0 }],
+  const sent: string[] = [];
+  const options = { format: "rich", mediaDir } as const;
+  const due: OutboxEntry = {
+    id: "o1",
+    conversation_id: null,
+    chat_id: "7",
+    kind: "text",
+    text: "x",
+    options_json: JSON.stringify(options),
+    options,
+    pending_response_id: null,
+    state: "pending",
+    attempts: 0,
+    available_at: 0,
+    last_error: null,
+    traceparent: null,
+    created_at: new Date().toISOString(),
+    sent_at: null,
+  };
+  const store: OutboxStore = {
+    enqueueOutboxText: () => assert.fail("not enqueued"),
+    getDueOutbox: () => [due],
     markOutboxSent: (id) => sent.push(id),
     rescheduleOutbox: () => assert.fail("not rescheduled"),
+    getPendingOutboxCount: () => 1,
   };
-  const outbox = new TelegramOutbox({ client: { sendMessage: async () => [] }, store, log: { warn() {} } });
+  const outbox = new TelegramOutbox({ client: { sendMessage: async () => [] }, store, log: { info() {}, warn() {}, error() {} } });
   await outbox.flushDue();
   assert.deepEqual(sent, ["o1"]);
   assert.equal(existsSync(mediaDir), false);
@@ -236,7 +254,7 @@ test("both harnesses are told how to show media, Codex after the operator's own 
   assert.match(REPLY_INSTRUCTIONS, /!\[short caption\]\(path\)/);
 
   writeFileSync(join(dir, "config.toml"), 'developer_instructions = "Operator rule."\n');
-  const config = buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, bayma: { type: "stdio", command: "bayma", args: [] } });
+  const config = buildCodexThreadConfig({ codexEnv: { CODEX_HOME: dir, HOME: dir }, bayma: { url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} } });
   assert.equal(config.developer_instructions, `Operator rule.\n\n${REPLY_INSTRUCTIONS}`);
 
   const claude = buildClaudeQueryOptions({ workingDirectory: dir, claudeEnv: {}, mcpServers: {}, controller: new AbortController(), hooks: {} });

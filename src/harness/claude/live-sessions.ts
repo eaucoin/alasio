@@ -21,7 +21,6 @@ import { randomUUID } from "node:crypto";
 
 import type {
   HookCallback,
-  Query,
   SDKBackgroundTasksChangedMessage,
   SDKResultMessage,
   SessionStore,
@@ -32,12 +31,12 @@ import type { ResponseBlock } from "../../codex/event-projection.ts";
 import type { TurnTimer } from "../../codex/turn-timing.ts";
 import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../../mcp/bayma.ts";
-import type { SqliteStore } from "../../persistence/store.ts";
-import type { ActiveQueries, ActiveQuery, TransportTurn, TurnParams, TurnResult } from "../index.ts";
+import type { ActiveQueries, ActiveQuery, TransportTurn, TurnParams, TurnPersistence, TurnResult } from "../index.ts";
 import { CLAUDE_HARNESS } from "../names.ts";
 import type { PromptChannel } from "./prompt-channel.ts";
 import type { ClaudeSessionApi } from "./sessions.ts";
 import {
+  type ClaudeQuery,
   type ClaudeQueryFactory,
   appendBlock,
   buildClaudeEnv,
@@ -86,7 +85,7 @@ export interface OperatorTurn {
   readonly promptUuids: Set<string>;
   readonly blockSequence: ResponseBlock[];
   readonly pendingResponseId: string;
-  readonly persistence: SqliteStore;
+  readonly persistence: TurnPersistence;
   readonly turnTimer: TurnTimer;
   readonly onStarted: (() => void) | undefined;
   readonly onTransportCompleted: ((turn: TransportTurn) => void) | undefined;
@@ -126,7 +125,7 @@ export interface ClaudeHost {
   sessionId: string | null;
   readonly channel: PromptChannel;
   readonly controller: AbortController;
-  sdkQuery: Query | null;
+  sdkQuery: ClaudeQuery | null;
   loop?: Promise<void>;
   readonly mode: ClaudeHostMode;
   initialized?: boolean;
@@ -138,7 +137,7 @@ export interface ClaudeHost {
   /** Prompts of finished turns, whose late results are ignored. */
   readonly retiredUuids: Set<string>;
   readonly interruptedUuids: Set<string>;
-  persistence: SqliteStore;
+  persistence: TurnPersistence;
   activeQueries: ActiveQueries;
   chatId: string;
   messageId: string;
@@ -165,7 +164,7 @@ export interface ClaudeLiveSessions {
   closeAll(reason?: string): Promise<void>;
 }
 
-function modelKey(persistence: SqliteStore, threadKey: string): string {
+function modelKey(persistence: TurnPersistence, threadKey: string): string {
   const choice = persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null;
   return JSON.stringify({ model: getClaudeModel(process.env, choice) ?? null, effort: getClaudeEffort(process.env, choice) ?? null });
 }
@@ -433,7 +432,7 @@ export function createClaudeLiveSessions({
     );
   }
 
-  async function consume(host: ClaudeHost, sdkQuery: Query): Promise<void> {
+  async function consume(host: ClaudeHost, sdkQuery: ClaudeQuery): Promise<void> {
     let exitError: unknown = null;
     try {
       for await (const message of sdkQuery) {

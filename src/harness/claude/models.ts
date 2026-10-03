@@ -1,13 +1,14 @@
-import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { ModelOption } from "../index.ts";
 import { buildClaudeEnv } from "./env.ts";
-import type { ClaudeQueryFactory } from "./runtime.ts";
+import type { ClaudeQueryParams } from "./runtime.ts";
 
 /** What listClaudeModels is given. */
 export interface ClaudeModelListOptions {
   readonly workingDirectory: string;
-  readonly queryFactory?: ClaudeQueryFactory;
+  /** Starts the query the list is asked through: the SDK's `query`, or a test's stand-in. */
+  readonly queryFactory?: (params: ClaudeQueryParams) => Pick<Query, "supportedModels" | "close">;
 }
 
 /**

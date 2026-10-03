@@ -1,9 +1,16 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { HarnessSessions } from "../src/harness/index.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
-import { handleSessionControlCallback } from "../src/operator/session-control.ts";
+import {
+  type SessionControlCallback,
+  type SessionControlHarness,
+  type SessionControlStore,
+  type StartNewSession,
+  handleSessionControlCallback,
+} from "../src/operator/session-control.ts";
+import type { Client } from "../src/telegram/client.ts";
 
 test("command parser accepts Telegram-native session commands", () => {
   assert.deepEqual(parseCommand("/session"), { type: "session_panel" });
@@ -27,56 +34,68 @@ test("command parser accepts bang session command aliases", () => {
 });
 
 function createClient() {
-  const calls = {
+  const calls: {
+    answerCallbackQuery: Parameters<Client["answerCallbackQuery"]>[];
+    editMessageText: Parameters<Client["editMessageText"]>[];
+  } = {
     answerCallbackQuery: [],
     editMessageText: [],
   };
-  return {
-    calls,
+  const client: SessionControlCallback["client"] = {
     async answerCallbackQuery(...args) {
       calls.answerCallbackQuery.push(args);
+      return true;
     },
     async editMessageText(...args) {
       calls.editMessageText.push(args);
+      return true;
     },
+    deleteMessage: () => assert.fail("deleteMessage"),
   };
+  return { calls, client };
 }
 
-function createStore() {
-  let sessionId = null;
+function createStore(): SessionControlStore {
+  let sessionId: string | undefined;
   return {
     getSessionId: () => sessionId,
     setSessionId: (_conversationId, mountedSessionId) => {
-      sessionId = mountedSessionId;
+      sessionId = mountedSessionId ?? undefined;
     },
-    getSessionTokens: () => null,
+    getSessionTokens: () => 0,
     createCallbackAction({ kind, payload }) {
       return `${kind}:${Object.keys(payload ?? {}).length}`;
     },
   };
 }
 
-function createHarness(sessions = {}) {
+function createHarness(sessions: Partial<HarnessSessions> = {}): SessionControlHarness {
   return {
     displayName: "Codex",
     sessions: {
+      listSessions: () => assert.fail("listSessions"),
+      getTotalSessionPages: () => assert.fail("getTotalSessionPages"),
+      getSessionByNumber: () => assert.fail("getSessionByNumber"),
       getSessionLastMessage: async () => null,
+      listSessionMessages: () => assert.fail("listSessionMessages"),
+      getTotalRewindPages: () => assert.fail("getTotalRewindPages"),
+      createForkedSession: () => assert.fail("createForkedSession"),
       ...sessions,
     },
   };
 }
 
 test("new-session callback starts and mounts a fresh session", async () => {
-  const client = createClient();
+  const { calls, client } = createClient();
   const store = createStore();
-  const startCalls = [];
+  const startCalls: Parameters<StartNewSession>[0][] = [];
 
   await handleSessionControlCallback({
     client,
     store,
     harness: createHarness(),
     activeQueries: new Map(),
-    action: { kind: "control:new", conversationId: "conversation-1", payload: {} },
+    action: { id: "action-1", kind: "control:new", conversationId: "conversation-1", payload: {} },
     startNewSession: async (args) => {
       startCalls.push(args);
       store.setSessionId(args.conversationId, "fresh-session");
@@ -88,14 +107,14 @@ test("new-session callback starts and mounts a fresh session", async () => {
   });
 
   assert.deepEqual(startCalls, [{ conversationId: "conversation-1" }]);
-  assert.deepEqual(client.calls.answerCallbackQuery[0], ["callback-1", "New session mounted: fresh-se."]);
-  assert.match(client.calls.editMessageText[0][2], /Session: fresh-se/);
+  assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "New session mounted: fresh-se."]);
+  assert.match(calls.editMessageText[0]?.[2] ?? "", /Session: fresh-se/);
 });
 
 test("rewind forks before the chosen message for the conversation and mounts the fork", async () => {
-  const client = createClient();
+  const { calls, client } = createClient();
   const store = createStore();
-  const forkCalls = [];
+  const forkCalls: Parameters<HarnessSessions["createForkedSession"]>[] = [];
   const harness = createHarness({
     listSessionMessages: async () => [
       { index: -1, timestamp: "", text: "second", uuid: "turn-2" },
@@ -112,7 +131,7 @@ test("rewind forks before the chosen message for the conversation and mounts the
     store,
     harness,
     activeQueries: new Map(),
-    action: { kind: "control:rewind_fork", conversationId: "conversation-1", payload: { sessionId: "source-session", index: -1 } },
+    action: { id: "action-1", kind: "control:rewind_fork", conversationId: "conversation-1", payload: { sessionId: "source-session", index: -1 } },
     startNewSession: async () => assert.fail("a rewind starts no new session"),
     callbackQueryId: "callback-1",
     chatId: 123,
@@ -121,5 +140,5 @@ test("rewind forks before the chosen message for the conversation and mounts the
 
   assert.deepEqual(forkCalls, [["source-session", "turn-2", { threadKey: "conversation-1" }]]);
   assert.equal(store.getSessionId("conversation-1"), "forked-session");
-  assert.deepEqual(client.calls.answerCallbackQuery[0], ["callback-1", "Fork mounted."]);
+  assert.deepEqual(calls.answerCallbackQuery[0], ["callback-1", "Fork mounted."]);
 });

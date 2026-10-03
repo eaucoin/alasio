@@ -44,6 +44,11 @@ export interface CodexListingScope {
   readonly client: AppServerClient;
 }
 
+/** What the session panels read of a listing scope: its directory and env, and its client's thread and turn lists. */
+export interface SessionListingScope extends Omit<CodexListingScope, "client"> {
+  readonly client: Pick<AppServerClient, "listThreads" | "listTurns">;
+}
+
 /**
  * The app-server and directory a folder workspace's threads are listed from: the shared
  * app-server, in the folder itself.
@@ -54,7 +59,7 @@ export function folderListingScope(workingDirectory: string): () => Promise<Code
 
 export interface CodexSessionApiOptions {
   readonly workingDirectory: string;
-  readonly listingScope?: () => Promise<CodexListingScope>;
+  readonly listingScope?: () => Promise<SessionListingScope>;
   readonly fork?: (params: ForkCodexSessionParams) => Promise<string>;
   readonly beforeFork?: (sessionId: string) => Promise<void>;
 }

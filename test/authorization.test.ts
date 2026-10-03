@@ -1,35 +1,46 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+
+import type { CallbackQuery, Message } from "@grammyjs/types";
+
+import { SqliteStore } from "../src/persistence/store.ts";
+import type { Logger } from "../src/shared/log.ts";
 import { Authorizer } from "../src/telegram/authorizer.ts";
-import { CallbackHandler } from "../src/telegram/callback-handler.ts";
+import { type CallbackClient, CallbackHandler, type CallbackTurns } from "../src/telegram/callback-handler.ts";
 
-const silentLog = { info() {}, warn() {}, error() {} };
+const silentLog: Logger = { info() {}, warn() {}, error() {} };
 
-function createStateStore() {
-  const state = new Map();
+function createStateStore(): Pick<SqliteStore, "getState" | "setState"> {
+  const state = new Map<string, string>();
   return {
     getState: (key) => state.get(key) ?? null,
-    setState: (key, value) => state.set(key, value),
+    setState: (key, value) => state.set(key, String(value)),
   };
 }
 
-function privateMessage(userId, chatId = userId) {
+function privateMessage(userId: number, chatId = userId): Message {
   return {
-    from: { id: userId },
-    chat: { id: chatId, type: "private" },
+    message_id: 1,
+    date: 0,
+    from: { id: userId, is_bot: false, first_name: "Operator" },
+    chat: { id: chatId, type: "private", first_name: "Operator" },
   };
 }
 
-function privateCallback(userId, chatId = userId) {
+function privateCallback(userId: number, chatId = userId, data = "action-1"): CallbackQuery {
   return {
     id: "callback-1",
-    from: { id: userId },
+    chat_instance: "chat-instance-1",
+    from: { id: userId, is_bot: false, first_name: "Operator" },
     message: {
       message_id: 10,
-      chat: { id: chatId, type: "private" },
+      date: 0,
+      chat: { id: chatId, type: "private", first_name: "Operator" },
     },
-    data: "action-1",
+    data,
   };
 }
 
@@ -43,7 +54,12 @@ test("explicit allowlist owns private messages and callback queries", () => {
   assert.equal(authorizer.isAuthorizedMessage(privateMessage(123)), true);
   assert.equal(authorizer.isAuthorizedMessage(privateMessage(456)), false);
   assert.equal(authorizer.isAuthorizedMessage(privateMessage(123, 456)), false);
-  assert.equal(authorizer.isAuthorizedMessage({ from: { id: 123 }, chat: { id: -1, type: "group" } }), false);
+  assert.equal(authorizer.isAuthorizedMessage({
+    message_id: 1,
+    date: 0,
+    from: { id: 123, is_bot: false, first_name: "Operator" },
+    chat: { id: -1, type: "group", title: "Group" },
+  }), false);
   assert.equal(authorizer.isAuthorizedCallbackQuery(privateCallback(123)), true);
   assert.equal(authorizer.isAuthorizedCallbackQuery(privateCallback(456)), false);
   assert.equal(authorizer.isAuthorizedCallbackQuery(privateCallback(123, 456)), false);
@@ -60,20 +76,51 @@ test("callback queries cannot claim an empty bootstrap allowlist", () => {
   assert.equal(authorizer.isAuthorizedCallbackQuery(privateCallback(456)), false);
 });
 
+// An unauthorized press is answered before the handler reaches any turn.
+const unreachableTurns: CallbackTurns = {
+  harnessFor: () => assert.fail("harnessFor"),
+  switchHarness: () => assert.fail("switchHarness"),
+  switchWorkspace: () => assert.fail("switchWorkspace"),
+  createSessionWorkspace: () => assert.fail("createSessionWorkspace"),
+  sandboxEnabled: false,
+  startNewSession: () => assert.fail("startNewSession"),
+  setPromptDisposition: () => assert.fail("setPromptDisposition"),
+  enqueueMessage: () => assert.fail("enqueueMessage"),
+  runGoalTurn: () => assert.fail("runGoalTurn"),
+  scheduleConversation: () => assert.fail("scheduleConversation"),
+};
+
 test("unauthorized callback is rejected before consuming its action", async () => {
-  let consumed = false;
-  const answers = [];
-  const handler = new CallbackHandler({
-    authorizer: { isAuthorizedCallbackQuery: () => false },
-    client: { answerCallbackQuery: async (...args) => answers.push(args) },
-    config: {},
-    store: { consumeCallbackAction: () => { consumed = true; } },
-    turns: {},
-    activeQueries: new Map(),
-  });
+  const root = mkdtempSync(join(tmpdir(), "alasio-authorization-"));
+  const store = new SqliteStore(root);
+  try {
+    const conversationId = store.upsertConversation({ chatId: "456", user: { id: 456 } });
+    const actionId = store.createCallbackAction({ conversationId, kind: "queue", payload: { prompt: "later" } });
+    const answers: Parameters<CallbackClient["answerCallbackQuery"]>[] = [];
+    const handler = new CallbackHandler({
+      authorizer: { isAuthorizedCallbackQuery: () => false },
+      client: {
+        answerCallbackQuery: async (...args) => {
+          answers.push(args);
+          return true;
+        },
+        editMessageText: () => assert.fail("editMessageText"),
+        deleteMessage: () => assert.fail("deleteMessage"),
+        sendMessage: () => assert.fail("sendMessage"),
+      },
+      config: { workspaceRoot: root },
+      store,
+      turns: unreachableTurns,
+      activeQueries: new Map(),
+    });
 
-  await handler.handle(privateCallback(456));
+    await handler.handle(privateCallback(456, 456, actionId));
 
-  assert.equal(consumed, false);
-  assert.deepEqual(answers, [["callback-1", "This action is not authorized for this Telegram user."]]);
+    // The action is still there to be pressed by someone who may.
+    assert.notEqual(store.consumeCallbackAction(actionId), null);
+    assert.deepEqual(answers, [["callback-1", "This action is not authorized for this Telegram user."]]);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

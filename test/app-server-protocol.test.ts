@@ -1,25 +1,93 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 
+import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
+
+import type { v2 } from "../.types/codex/index.js";
 import { AppServerClient } from "../src/codex/app-server/client.ts";
 import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.ts";
+import {
+  type AppServerEvent,
+  type AppServerMethod,
+  type AppServerNotification,
+  type AppServerParams,
+  type AppServerResult,
+  getNotificationTurnId,
+  mapNotificationToSdkEvent,
+  notificationMatchesTurn,
+} from "../src/codex/app-server/protocol.ts";
+import type { AppServerRpcClient } from "../src/codex/app-server/rpc-client.ts";
 import { AppServerThreadClient } from "../src/codex/app-server/thread-client.ts";
-import { getNotificationTurnId, mapNotificationToSdkEvent, notificationMatchesTurn } from "../src/codex/app-server/protocol.ts";
-import { mapItemToBlocks } from "../src/codex/event-projection.ts";
+import { type ResponseBlock, mapItemToBlocks } from "../src/codex/event-projection.ts";
+import type { Logger } from "../src/shared/log.ts";
+import { agentMessage, codexThread, codexTurn } from "./support/codex-protocol.ts";
+
+const silentLog: Logger = { info: () => undefined, warn: () => undefined, error: () => undefined };
+
+/** An active goal as Codex reports it. */
+function activeGoal(threadId: string, objective: string): v2.ThreadGoal {
+  return { threadId, objective, status: "active", tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 0, updatedAt: 0 };
+}
+
+/** Codex's answer to a thread's resume (or, leaving out the turn pages, its start). */
+function threadLoaded(loaded: v2.Thread): v2.ThreadResumeResponse {
+  return {
+    thread: loaded,
+    model: "gpt-5.6-sol",
+    modelProvider: "openai",
+    serviceTier: null,
+    cwd: loaded.cwd,
+    runtimeWorkspaceRoots: [],
+    instructionSources: [],
+    approvalPolicy: "never",
+    approvalsReviewer: "user",
+    sandbox: { type: "dangerFullAccess" },
+    activePermissionProfile: null,
+    reasoningEffort: "high",
+    multiAgentMode: "explicitRequestOnly",
+    initialTurnsPage: null,
+    turnsBackwardsCursor: null,
+    itemsBackwardsCursor: null,
+  };
+}
+
+/** Token usage as Codex reports it, all zero. */
+function noTokenUsage(): v2.ThreadTokenUsage {
+  const none = { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+  return { total: none, last: none, modelContextWindow: null };
+}
+
+/** How a test's app-server answers each request it expects. */
+type AppServerAnswers = {
+  readonly [M in AppServerMethod]?: (params: AppServerParams<M>) => Promise<AppServerResult<M>>;
+};
+
+/** An app-server that is already running and answers requests with `answers`; any other request fails the test. */
+function answeringRpc(answers: AppServerAnswers): Pick<AppServerRpcClient, "start" | "request"> {
+  return {
+    start: async () => undefined,
+    request: async (method, params) => {
+      const answer = answers[method];
+      if (!answer) {
+        return assert.fail(`unexpected app-server request ${method}`);
+      }
+      return await answer(params);
+    },
+  };
+}
 
 test("app-server protocol reads turn identity from direct and nested notification shapes", () => {
-  assert.equal(getNotificationTurnId({ params: { turnId: "turn-direct" } }), "turn-direct");
-  assert.equal(getNotificationTurnId({ params: { turn: { id: "turn-nested" } } }), "turn-nested");
-  assert.equal(getNotificationTurnId({ params: { item: { turnId: "turn-item" } } }), "turn-item");
+  assert.equal(getNotificationTurnId({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-direct", diff: "" } }), "turn-direct");
+  assert.equal(getNotificationTurnId({ method: "turn/started", params: { threadId: "thread-1", turn: codexTurn("turn-nested") } }), "turn-nested");
+  assert.equal(getNotificationTurnId({ method: "thread/realtime/itemAdded", params: { threadId: "thread-1", item: { turnId: "turn-item" } } }), "turn-item");
 });
 
 test("app-server protocol rejects stale completed-turn notifications for the active stream", () => {
-  const staleCompletion = {
+  const staleCompletion: AppServerNotification = {
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "old-turn", status: { type: "completed" } },
+      turn: codexTurn("old-turn", { status: "completed" }),
     },
   };
 
@@ -31,36 +99,33 @@ test("app-server protocol preserves the upstream agent message phase", () => {
   const event = mapNotificationToSdkEvent({
     method: "item/completed",
     params: {
-      item: {
-        id: "answer-1",
-        type: "agentMessage",
-        text: "The final answer.",
-        phase: "final_answer",
-      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: agentMessage("answer-1", "The final answer.", "final_answer"),
+      completedAtMs: 0,
     },
   });
 
-  assert.equal(event.item.type, "agent_message");
-  assert.equal(event.item.phase, "final_answer");
+  const item = event?.type === "item.completed" ? event.item : null;
+  assert.equal(item?.type, "agent_message");
+  assert.equal(item.phase, "final_answer");
 });
 
 test("app-server notification queue does not forget the active turn when an old completion arrives", () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
 
   queue.observe({
     method: "turn/started",
     params: {
       threadId: "thread-1",
-      turn: { id: "new-turn" },
+      turn: codexTurn("new-turn"),
     },
   });
   queue.observe({
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "old-turn", status: { type: "completed" } },
+      turn: codexTurn("old-turn", { status: "completed" }),
     },
   });
 
@@ -68,9 +133,7 @@ test("app-server notification queue does not forget the active turn when an old 
 });
 
 test("app-server notification queue remembers goal-created turn ids", async () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
 
   const turnIdPromise = queue.waitForTurnId("thread-1", { timeoutMs: 100 });
   queue.observe({
@@ -78,7 +141,7 @@ test("app-server notification queue remembers goal-created turn ids", async () =
     params: {
       threadId: "thread-1",
       turnId: "goal-turn",
-      goal: { objective: "Keep working", status: "active" },
+      goal: activeGoal("thread-1", "Keep working"),
     },
   });
 
@@ -90,15 +153,13 @@ test("app-server notification queue remembers goal-created turn ids", async () =
 });
 
 test("app-server goal handoff after completion starts a distinct logical turn", () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
   queue.rememberTurn("thread-1", "completed-turn");
   queue.observe({
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "completed-turn", status: { type: "completed" } },
+      turn: codexTurn("completed-turn", { status: "completed" }),
     },
   });
 
@@ -107,7 +168,7 @@ test("app-server goal handoff after completion starts a distinct logical turn", 
     params: {
       threadId: "thread-1",
       turnId: "goal-turn",
-      goal: { objective: "Keep working", status: "active" },
+      goal: activeGoal("thread-1", "Keep working"),
     },
   });
 
@@ -116,31 +177,22 @@ test("app-server goal handoff after completion starts a distinct logical turn", 
 });
 
 test("app-server notification waits do not acquire a wall-clock timeout", async () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
-  const originalSetTimeout = globalThis.setTimeout;
-  let timeoutScheduled = false;
-  let notificationPromise;
-  globalThis.setTimeout = (...args) => {
-    timeoutScheduled = true;
-    return originalSetTimeout(...args);
-  };
+  const queue = new AppServerNotificationQueue({ log: silentLog });
+  const setTimeoutSpy = mock.method(globalThis, "setTimeout");
+  let notificationPromise: Promise<AppServerNotification> | undefined;
   try {
     notificationPromise = queue.nextForThread("thread-1");
   } finally {
-    globalThis.setTimeout = originalSetTimeout;
+    setTimeoutSpy.mock.restore();
   }
 
-  assert.equal(timeoutScheduled, false);
-  queue.observe({ method: "turn/progress", params: { threadId: "thread-1" } });
-  assert.equal((await notificationPromise).method, "turn/progress");
+  assert.equal(setTimeoutSpy.mock.callCount(), 0);
+  queue.observe({ method: "thread/queue/changed", params: { threadId: "thread-1" } });
+  assert.equal((await notificationPromise)?.method, "thread/queue/changed");
 });
 
 test("app-server notification waits honor an already-aborted control signal", async () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
   const controller = new AbortController();
   controller.abort("operator stop");
 
@@ -152,16 +204,14 @@ test("app-server notification waits honor an already-aborted control signal", as
 });
 
 test("app-server completion accepts every identity for one logical turn", () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
 
   queue.rememberTurn("thread-1", "response-turn");
   queue.observe({
     method: "turn/started",
     params: {
       threadId: "thread-1",
-      turn: { id: "notification-turn" },
+      turn: codexTurn("notification-turn"),
     },
   });
 
@@ -175,7 +225,7 @@ test("app-server completion accepts every identity for one logical turn", () => 
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "response-turn", status: { type: "completed" } },
+      turn: codexTurn("response-turn", { status: "completed" }),
     },
   });
 
@@ -187,27 +237,24 @@ test("app-server completion accepts every identity for one logical turn", () => 
 });
 
 test("app-server start sends configured model and keeps observed notification turn id when response handle differs", async () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
   const thread = new AppServerThreadClient({
     notifications: queue,
-    log: { info: () => undefined, warn: () => undefined },
-    rpc: {
-      request: async (method, params) => {
-        assert.equal(method, "turn/start");
+    log: silentLog,
+    rpc: answeringRpc({
+      "turn/start": async (params) => {
         assert.equal(params.model, "gpt-5.6-sol");
         assert.equal(params.effort, "high");
         queue.observe({
           method: "turn/started",
           params: {
             threadId: "thread-1",
-            turn: { id: "notification-turn" },
+            turn: codexTurn("notification-turn"),
           },
         });
-        return { turn: { id: "response-turn" } };
+        return { turn: codexTurn("response-turn") };
       },
-    },
+    }),
   });
 
   const turnId = await thread.startTurn({ threadId: "thread-1", prompt: "go", cwd: "/tmp" });
@@ -219,38 +266,35 @@ test("app-server start sends configured model and keeps observed notification tu
 });
 
 test("app-server fast completion cannot become a leftover turn after the start response", async () => {
-  const queue = new AppServerNotificationQueue({
-    log: { info: () => undefined, warn: () => undefined },
-  });
+  const queue = new AppServerNotificationQueue({ log: silentLog });
   let starts = 0;
   let interrupts = 0;
   const thread = new AppServerThreadClient({
     notifications: queue,
-    log: { info: () => undefined, warn: () => undefined },
-    rpc: {
-      request: async (method) => {
-        if (method === "turn/interrupt") {
-          interrupts += 1;
-          return {};
-        }
-        assert.equal(method, "turn/start");
+    log: silentLog,
+    rpc: answeringRpc({
+      "turn/interrupt": async () => {
+        interrupts += 1;
+        return {};
+      },
+      "turn/start": async () => {
         starts += 1;
         if (starts === 1) {
           queue.observe({
             method: "turn/started",
-            params: { threadId: "thread-1", turn: { id: "notification-turn-1" } },
+            params: { threadId: "thread-1", turn: codexTurn("notification-turn-1") },
           });
           queue.observe({
             method: "turn/completed",
             params: {
               threadId: "thread-1",
-              turn: { id: "notification-turn-1", status: { type: "completed" } },
+              turn: codexTurn("notification-turn-1", { status: "completed" }),
             },
           });
         }
-        return { turn: { id: `response-turn-${starts}` } };
+        return { turn: codexTurn(`response-turn-${starts}`) };
       },
-    },
+    }),
   });
 
   assert.equal(
@@ -272,51 +316,43 @@ test("app-server fast completion cannot become a leftover turn after the start r
 });
 
 test("app-server thread start and resume carry alasio model config", async () => {
-  const requests = [];
-  const rpc = {
-    start: async () => undefined,
-    request: async (method, params) => {
-      requests.push({ method, params });
-      if (method === "thread/loaded/list") {
-        return { data: [] };
-      }
-      if (method === "thread/resume") {
-        return { thread: { id: params.threadId, turns: [] } };
-      }
-      if (method === "thread/start") {
-        return { thread: { id: "thread-started" } };
-      }
-      throw new Error(`unexpected method ${method}`);
-    },
-  };
+  const resumes: AppServerParams<"thread/resume">[] = [];
+  const starts: AppServerParams<"thread/start">[] = [];
   const thread = new AppServerThreadClient({
-    notifications: new AppServerNotificationQueue({
-      log: { info: () => undefined, warn: () => undefined },
+    notifications: new AppServerNotificationQueue({ log: silentLog }),
+    log: silentLog,
+    rpc: answeringRpc({
+      "thread/loaded/list": async () => ({ data: [], nextCursor: null }),
+      "thread/resume": async (params) => {
+        resumes.push(params);
+        return threadLoaded(codexThread(params.threadId));
+      },
+      "thread/start": async (params) => {
+        starts.push(params);
+        return threadLoaded(codexThread("thread-started"));
+      },
     }),
-    log: { info: () => undefined, warn: () => undefined },
-    rpc,
   });
+  const config = { project_doc_max_bytes: 32768, developer_instructions: "", mcp_servers: {} };
 
   await thread.ensureThread({
     threadId: "thread-existing",
     threadKey: "conversation-1",
     cwd: "/repo",
     env: {},
-    config: { project_doc_max_bytes: 32768 },
+    config,
   });
   await thread.startThread({
     threadKey: "conversation-2",
     cwd: "/repo",
     env: {},
-    config: { project_doc_max_bytes: 32768 },
+    config,
   });
 
-  const resumeRequest = requests.find((request) => request.method === "thread/resume");
-  const startRequest = requests.find((request) => request.method === "thread/start");
-  for (const request of [resumeRequest, startRequest]) {
-    assert.equal(request.params.model, "gpt-5.6-sol");
-    assert.equal(request.params.config.model_reasoning_effort, "high");
-    assert.equal(request.params.config.project_doc_max_bytes, 32768);
+  for (const params of [resumes[0], starts[0]]) {
+    assert.equal(params?.model, "gpt-5.6-sol");
+    assert.equal(params.config?.["model_reasoning_effort"], "high");
+    assert.equal(params.config?.["project_doc_max_bytes"], 32768);
   }
 });
 
@@ -327,32 +363,36 @@ test("app-server stream adopts notification turn id when response handle differs
     method: "turn/started",
     params: {
       threadId: "thread-1",
-      turn: { id: "notification-turn" },
+      turn: codexTurn("notification-turn"),
     },
   });
   client.notifications.observe({
     method: "item/started",
     params: {
       threadId: "thread-1",
-      item: { id: "item-1", turnId: "notification-turn", type: "agentMessage", text: "" },
+      turnId: "notification-turn",
+      item: agentMessage("item-1", ""),
+      startedAtMs: 0,
     },
   });
   client.notifications.observe({
     method: "item/completed",
     params: {
       threadId: "thread-1",
-      item: { id: "item-1", turnId: "notification-turn", type: "agentMessage", text: "done" },
+      turnId: "notification-turn",
+      item: agentMessage("item-1", "done"),
+      completedAtMs: 0,
     },
   });
   client.notifications.observe({
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "notification-turn", status: { type: "completed" } },
+      turn: codexTurn("notification-turn", { status: "completed" }),
     },
   });
 
-  const events = [];
+  const events: AppServerEvent["type"][] = [];
   for await (const event of client.eventsForTurn("thread-1", "response-turn")) {
     events.push(event.type);
   }
@@ -363,7 +403,7 @@ test("app-server stream adopts notification turn id when response handle differs
 
 test("app-server stream attributes an in-flight abort to its control signal", async () => {
   const client = new AppServerClient();
-  const origins = [];
+  const origins: (string | undefined)[] = [];
   client.notifications.rememberTurn("thread-1", "active-turn");
   client.interrupt = async (_threadId, origin) => {
     origins.push(origin);
@@ -386,10 +426,9 @@ test("app-server stream ignores unmapped same-thread notifications without tripp
 
   for (let index = 0; index < 1005; index += 1) {
     client.notifications.observe({
-      method: "experimental/progress",
+      method: "thread/queue/changed",
       params: {
         threadId: "thread-1",
-        data: `line ${index}`,
       },
     });
   }
@@ -397,11 +436,11 @@ test("app-server stream ignores unmapped same-thread notifications without tripp
     method: "turn/completed",
     params: {
       threadId: "thread-1",
-      turn: { id: "active-turn", status: { type: "completed" } },
+      turn: codexTurn("active-turn", { status: "completed" }),
     },
   });
 
-  const events = [];
+  const events: AppServerEvent["type"][] = [];
   for await (const event of client.eventsForTurn("thread-1", "active-turn")) {
     events.push(event.type);
   }
@@ -419,7 +458,7 @@ test("app-server stream still rejects explicitly mismatched lifecycle turn notif
       params: {
         threadId: "thread-1",
         turnId: "old-turn",
-        tokenUsage: null,
+        tokenUsage: noTokenUsage(),
       },
     });
   }
@@ -436,7 +475,7 @@ test("app-server stream still rejects explicitly mismatched lifecycle turn notif
 });
 
 test("an error notification reports Codex's own message, unless Codex is retrying", () => {
-  const error = (willRetry) => mapNotificationToSdkEvent({
+  const error = (willRetry: boolean) => mapNotificationToSdkEvent({
     method: "error",
     params: { error: { message: "Rate limit reached", codexErrorInfo: null, additionalDetails: null, misalignment: null }, willRetry, threadId: "thread-1", turnId: "turn-1" },
   });
@@ -445,11 +484,15 @@ test("an error notification reports Codex's own message, unless Codex is retryin
 });
 
 test("a file change shows a deletion as one, from the app-server and from exec", () => {
-  const names = (changes) => {
-    const blockSequence = [];
+  const names = (changes: readonly v2.FileUpdateChange[] | SdkFileChangeItem["changes"]) => {
+    const blockSequence: ResponseBlock[] = [];
     mapItemToBlocks({ type: "file_change", id: "item-1", changes }, { blockSequence, persistence: { appendBlockToPending() {} }, pendingResponseId: "pending-1" });
-    return blockSequence.map((block) => block.name);
+    return blockSequence.map((block) => ("name" in block ? block.name : undefined));
   };
-  assert.deepEqual(names([{ path: "a", kind: { type: "delete" } }, { path: "b", kind: { type: "update", move_path: null } }, { path: "c", kind: { type: "add" } }]), ["Delete", "Edit", "Edit"]);
+  assert.deepEqual(names([
+    { path: "a", kind: { type: "delete" }, diff: "" },
+    { path: "b", kind: { type: "update", move_path: null }, diff: "" },
+    { path: "c", kind: { type: "add" }, diff: "" },
+  ]), ["Delete", "Edit", "Edit"]);
   assert.deepEqual(names([{ path: "a", kind: "delete" }, { path: "b", kind: "update" }]), ["Delete", "Edit"]);
 });

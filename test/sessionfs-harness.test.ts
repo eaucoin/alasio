@@ -1,28 +1,145 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
+import type { v2 } from "../.types/codex/index.js";
+import { AppServerClient } from "../src/codex/app-server/client.ts";
+import type { AppServerScope } from "../src/codex/app-server/rpc-client.ts";
+import type { ThreadOptions, ThreadScope } from "../src/codex/app-server/thread-client.ts";
+import type { SessionFsCodex } from "../src/codex/sessionfs.ts";
+import { codexMcpServer } from "../src/codex/thread-config.ts";
 import { createCodexHarness } from "../src/harness/codex.ts";
 import { createClaudeHarness } from "../src/harness/claude/index.ts";
+import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
+import { createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
+import type { TurnPersistence } from "../src/harness/index.ts";
+import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
+import type { SessionFilesystems } from "../src/sandbox/index.ts";
+import { fakeQuery, initMessage, stamped, successResult } from "./support/claude-sdk.ts";
 
 // Both harnesses on a session filesystem, over a fake sandbox: what they run in, what they
 // are given, and which calls start the session's host.
 const WORKSPACE = "sessionfs:fs-abc123";
 const DIRECTORY = "/state/sessionfs/workspaces/fs-abc123";
-const BAYMA = { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer forward-token" } };
+const BAYMA: BaymaEndpoint = { url: "http://127.0.0.1:40000/mcp", headers: { Authorization: "Bearer forward-token" } };
+const CODEX_ENV = { CODEX_HOME: "/state/sessionfs/codex" };
 
-function fakeSandbox() {
-  const ensured = [];
+function fakeSandbox(): SessionFilesystems & { readonly ensured: string[] } {
+  const ensured: string[] = [];
+  const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
   return {
     ensured,
     enabled: true,
+    volumes: { create: unused, destroy: unused },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
     ensureSession: async (volumeId) => {
       ensured.push(volumeId);
       return { bayma: BAYMA };
     },
+    readFile: unused,
+    close: async () => undefined,
   };
+}
+
+/** An app-server call a harness made: its method, and what it named. */
+type AppServerCall =
+  | { readonly method: "listThreads" | "listModels"; readonly args: AppServerScope }
+  | { readonly method: "getGoal"; readonly args: ThreadScope }
+  | { readonly method: "startThread"; readonly args: ThreadOptions };
+
+const THREAD: v2.Thread = {
+  id: "thread-1",
+  extra: null,
+  sessionId: "thread-1",
+  forkedFromId: null,
+  parentThreadId: null,
+  preview: "",
+  ephemeral: false,
+  section: null,
+  sectionEnteredAt: null,
+  projectId: null,
+  historyMode: "paginated",
+  modelProvider: "openai",
+  model: null,
+  reasoningEffort: null,
+  createdAt: 1_790_000_000,
+  updatedAt: 1_790_000_000,
+  recencyAt: null,
+  status: { type: "notLoaded" },
+  path: null,
+  cwd: DIRECTORY,
+  cliVersion: "0.0.0",
+  source: "appServer",
+  canAcceptDirectInput: null,
+  threadSource: null,
+  agentNickname: null,
+  agentRole: null,
+  gitInfo: null,
+  name: "a thread",
+  turns: [],
+};
+
+const GOAL: v2.ThreadGoal = {
+  threadId: "thread-1",
+  objective: "ship it",
+  status: "active",
+  tokenBudget: null,
+  tokensUsed: 0,
+  timeUsedSeconds: 0,
+  createdAt: 1_790_000_000,
+  updatedAt: 1_790_000_000,
+};
+
+const MODEL: v2.Model = {
+  id: "m",
+  model: "m",
+  upgrade: null,
+  upgradeInfo: null,
+  availabilityNux: null,
+  displayName: "M",
+  description: "",
+  modelSpecialty: null,
+  hidden: false,
+  supportedReasoningEfforts: [],
+  defaultReasoningEffort: "medium",
+  inputModalities: [],
+  supportsPersonality: false,
+  multiAgentVersion: null,
+  additionalSpeedTiers: [],
+  serviceTiers: [],
+  defaultServiceTier: null,
+  isDefault: false,
+};
+
+/** The session filesystems' app-server, answering from fixtures and recording every call. */
+class RecordingAppServerClient extends AppServerClient {
+  readonly calls: AppServerCall[] = [];
+
+  constructor() {
+    super({ spawnProcess: () => assert.fail("no app-server runs in this test") });
+  }
+
+  override async listThreads(args: AppServerScope): Promise<v2.Thread[]> {
+    this.calls.push({ method: "listThreads", args });
+    return [THREAD];
+  }
+
+  override async getGoal(args: ThreadScope): Promise<v2.ThreadGoalGetResponse> {
+    this.calls.push({ method: "getGoal", args });
+    return { goal: GOAL };
+  }
+
+  override async listModels(args: AppServerScope): Promise<v2.Model[]> {
+    this.calls.push({ method: "listModels", args });
+    return [MODEL];
+  }
+
+  override async startThread(args: ThreadOptions): Promise<string> {
+    this.calls.push({ method: "startThread", args });
+    return "thread-2";
+  }
 }
 
 test("neither harness serves a session filesystem where the deployment does not enable them", () => {
@@ -32,64 +149,61 @@ test("neither harness serves a session filesystem where the deployment does not 
 
 test("Codex on a session filesystem runs on its own app-server, in the harness directory, with the session's bayma", async () => {
   const sandbox = fakeSandbox();
-  const calls = [];
-  const client = new Proxy({}, {
-    get: (_target, method) => async (args) => {
-      calls.push({ method, args });
-      if (method === "listThreads") return [{ id: "thread-1", name: "a thread", updatedAt: 1_790_000_000 }];
-      if (method === "getGoal") return { goal: { objective: "ship it", status: "active" } };
-      if (method === "listModels") return [{ id: "m", model: "m", displayName: "M", hidden: false }];
-      if (method === "startThread") return "thread-2";
-      return null;
-    },
-  });
-  const scopes = [];
-  const sessionFsCodex = {
+  const client = new RecordingAppServerClient();
+  const scopes: { directory: string; bayma: BaymaEndpoint }[] = [];
+  const sessionFsCodex: SessionFsCodex = {
+    home: "/state/sessionfs/codex",
     scope: async ({ directory, bayma }) => {
       scopes.push({ directory, bayma });
-      return { cwd: directory, codexEnv: { CODEX_HOME: "/state/sessionfs/codex" }, codexConfig: { mcp_servers: { bayma } }, client };
+      return { cwd: directory, codexEnv: CODEX_ENV, codexConfig: { developer_instructions: "", mcp_servers: { bayma: codexMcpServer(bayma) } }, client };
     },
-    listingScope: async ({ directory }) => ({ cwd: directory, codexEnv: { CODEX_HOME: "/state/sessionfs/codex" }, client }),
+    listingScope: async ({ directory }) => ({ cwd: directory, codexEnv: CODEX_ENV, client }),
+    stop: async () => undefined,
   };
   const harness = createCodexHarness({ workingDirectory: WORKSPACE, sandbox, sessionFsCodex });
 
   // Lists, goals, and models need no session host.
-  assert.equal((await harness.sessions.listSessions(1))[0].uuid, "thread-1");
-  assert.deepEqual(await harness.goals.read({ threadId: "thread-1" }), { objective: "ship it", status: "active" });
-  assert.equal((await harness.listModels())[0].id, "m");
+  assert.equal((await harness.sessions.listSessions(1))[0]?.uuid, "thread-1");
+  assert.deepEqual(await harness.goals?.read({ threadId: "thread-1" }), GOAL);
+  assert.equal((await harness.listModels())[0]?.id, "m");
   assert.deepEqual(sandbox.ensured, []);
-  for (const { args } of calls) {
+  for (const { args } of client.calls) {
     assert.equal(args.cwd, DIRECTORY); // never the sentinel, never the operator's folder
-    assert.equal(args.env.CODEX_HOME, "/state/sessionfs/codex"); // never the operator's Codex home
+    assert.equal(args.env["CODEX_HOME"], "/state/sessionfs/codex"); // never the operator's Codex home
   }
 
   // A thread's work starts the session's host and reaches it through its bayma.
   assert.equal(await harness.startFreshSession({ threadKey: "telegram:1" }), "thread-2");
   assert.deepEqual(sandbox.ensured, ["fs-abc123"]);
   assert.deepEqual(scopes, [{ directory: DIRECTORY, bayma: BAYMA }]);
-  const started = calls.find(({ method }) => method === "startThread").args;
-  assert.equal(started.cwd, DIRECTORY);
-  assert.deepEqual(started.config.mcp_servers.bayma, BAYMA);
+  const started = client.calls.find((call) => call.method === "startThread");
+  assert.ok(started?.method === "startThread", "a thread was started");
+  assert.equal(started.args.cwd, DIRECTORY);
+  assert.deepEqual(started.args.config.mcp_servers["bayma"], codexMcpServer(BAYMA));
 });
 
 test("Claude Code on a session filesystem runs in the harness directory, confined to the session's bayma", async () => {
   const sandbox = fakeSandbox();
-  const seen = { options: null, resumeAsked: null, processes: 0 };
-  const queryFactory = ({ prompt, options }) => {
+  const seen: { options: Options | null; resumeAsked: string | null; processes: number } = { options: null, resumeAsked: null, processes: 0 };
+  const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
     seen.options = options;
     seen.processes += 1;
-    const generator = (async function* run() {
-      yield { type: "system", subtype: "init", session_id: "s1", model: "m" };
+    return fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
+      yield initMessage("s1");
       for await (const message of prompt) {
-        yield { type: "result", subtype: "success", is_error: false, result: "done", session_id: "s1", user_message_uuids: [message.uuid] };
+        yield successResult({ result: "done", session_id: "s1", user_message_uuids: [stamped(message).uuid] });
       }
-    })();
-    generator.close = () => undefined;
-    return generator;
+    })());
   };
-  const sessionApi = { sessionExists: async (id) => { seen.resumeAsked = id; return true; } };
+  const sessionApi = {
+    ...createClaudeSessionApi({ workingDirectory: DIRECTORY }),
+    sessionExists: async (id: string) => {
+      seen.resumeAsked = id;
+      return true;
+    },
+  };
   const harness = createClaudeHarness({ workingDirectory: WORKSPACE, sandbox, sessionApi, queryFactory });
-  const persistence = {
+  const persistence: TurnPersistence = {
     createPendingResponse: () => "pending-1",
     markPendingAsPosted: () => undefined,
     updateActiveTurnPendingResponseId: () => undefined,
@@ -98,11 +212,12 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
     appendBlockToPending: () => undefined,
     markPendingResponseComplete: () => undefined,
     updateSessionUsage: () => undefined,
+    recordRestartEvent: () => undefined,
   };
   try {
     for (const prompt of ["hi", "again"]) {
       const result = await harness.executeTurn({
-        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: 1, messageId: 2,
+        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE,
         persistence, activeQueries: new Map(),
       });
       assert.equal(result.responseCompleted, true);
@@ -116,11 +231,12 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
   assert.deepEqual(sandbox.ensured, ["fs-abc123", "fs-abc123"]);
   assert.equal(seen.resumeAsked, "s1"); // resume is decided from its transcripts on this machine
   const { options } = seen;
+  assert.ok(options, "Claude Code was started");
   assert.equal(options.cwd, DIRECTORY);
   assert.equal(options.resume, "s1");
   assert.deepEqual(options.tools, [...SESSION_FS_CLAUDE_TOOLS]);
   assert.deepEqual(options.settingSources, []);
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(options.mcpServers, { bayma: { type: "http", ...BAYMA } });
-  assert.equal(options.env.HOME, process.env.HOME); // the operator's own login and Claude home
+  assert.equal(options.env?.["HOME"], process.env["HOME"]); // the operator's own login and Claude home
 });

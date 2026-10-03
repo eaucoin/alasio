@@ -1,18 +1,28 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+
+import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
+
 import { resolveCodexModelChoice, ALASIO_CODEX_MODEL, ALASIO_CODEX_REASONING_EFFORT } from "../src/codex/model.ts";
 import { getClaudeEffort, getClaudeModel, ALASIO_CLAUDE_MODEL } from "../src/harness/claude/model.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
-import { buildModelPanel, handleModelControlCallback, isModelControlAction } from "../src/operator/model-control.ts";
+import {
+  buildModelPanel,
+  handleModelControlCallback,
+  isModelControlAction,
+  type ModelControlCallback,
+  type ModelControlHarness,
+} from "../src/operator/model-control.ts";
+import type { CallbackAction } from "../src/persistence/callback-repository.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
+import type { TextMessageOptions } from "../src/telegram/client.ts";
 
-async function withStore(run) {
+async function withStore<T>(run: (store: SqliteStore, id: string) => T | Promise<T>): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), "alasio-model-"));
   const store = new SqliteStore(root);
   try {
@@ -25,23 +35,62 @@ async function withStore(run) {
   }
 }
 
-function fakeClient() {
-  const calls = [];
+/** A call the panels made on the Telegram client. */
+interface ClientCall {
+  readonly op: "edit" | "answer";
+  readonly text: string;
+  readonly options?: TextMessageOptions;
+}
+
+function fakeClient(): ModelControlCallback["client"] & { readonly calls: ClientCall[] } {
+  const calls: ClientCall[] = [];
   return {
     calls,
-    async sendMessage(chatId, text, options) { calls.push({ op: "send", text, options }); },
-    async editMessageText(chatId, messageId, text, options) { calls.push({ op: "edit", text, options }); },
-    async answerCallbackQuery(id, text) { calls.push({ op: "answer", text }); },
+    async editMessageText(_chatId, _messageId, text, options = {}) {
+      calls.push({ op: "edit", text, options });
+      return true;
+    },
+    async answerCallbackQuery(_id, text = "") {
+      calls.push({ op: "answer", text });
+      return true;
+    },
   };
 }
 
-const claudeHarness = {
+/** The buttons of a panel's keyboard, row after row. */
+function buttonsOf(markup: InlineKeyboardMarkup | undefined): InlineKeyboardButton[] {
+  return markup?.inline_keyboard.flat() ?? [];
+}
+
+/** The callback data of the panel button labelled `text`. */
+function callbackData(markup: InlineKeyboardMarkup | undefined, text: string): string {
+  const button = buttonsOf(markup).find((candidate) => candidate.text === text);
+  assert.ok(button && "callback_data" in button, `a ${text} button`);
+  return button.callback_data;
+}
+
+/** The action a pressed button carries, which the store hands out once. */
+function consume(store: SqliteStore, data: string): CallbackAction {
+  const action = store.consumeCallbackAction(data);
+  assert.ok(action, "the button's action is stored");
+  return action;
+}
+
+const claudeHarness: ModelControlHarness = {
   name: CLAUDE_HARNESS,
   displayName: "Claude",
   async listModels() {
     return [
-      { id: "opus[1m]", label: "Opus (1M context)", efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: null },
-      { id: "haiku", label: "Haiku", efforts: [], defaultEffort: null },
+      {
+        id: "opus[1m]",
+        label: "Opus (1M context)",
+        description: "",
+        resolvedModel: "opus[1m]",
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        defaultEffort: null,
+        isDefault: false,
+      },
+      { id: "haiku", label: "Haiku", description: "", resolvedModel: "haiku", efforts: [], defaultEffort: null, isDefault: false },
     ];
   },
   defaultModelChoice: () => ({ model: ALASIO_CLAUDE_MODEL, effort: "high" }),
@@ -95,19 +144,18 @@ test("/model walks model then effort, using the chosen model's own effort levels
   await withStore(async (store, id) => {
     const panel = await buildModelPanel({ store, harness: claudeHarness, conversationId: id });
     assert.match(panel.text, /Current: claude-opus-5-5\[1m\] at high effort \(default\)/);
-    const opusButton = panel.options.reply_markup.inline_keyboard.flat().find((b) => b.text === "Opus (1M context)");
-    const pick = store.consumeCallbackAction(opusButton.callback_data);
+    const pick = consume(store, callbackData(panel.options.reply_markup, "Opus (1M context)"));
     assert.ok(isModelControlAction(pick.kind));
 
     const client = fakeClient();
     await handleModelControlCallback({ client, store, action: pick, callbackQueryId: "q1", chatId: 42, messageId: 7 });
     const effortPanel = client.calls.find((call) => call.op === "edit");
-    const effortTexts = effortPanel.options.reply_markup.inline_keyboard.flat().map((b) => b.text);
+    const effortTexts = buttonsOf(effortPanel?.options?.reply_markup).map((b) => b.text);
     assert.deepEqual(effortTexts.filter((t) => t !== "Close"), ["low", "medium", "high", "xhigh", "max"]);
     assert.equal(store.getModelChoice(id, CLAUDE_HARNESS), null, "nothing is stored until an effort is chosen");
 
-    const maxButton = effortPanel.options.reply_markup.inline_keyboard.flat().find((b) => b.text === "max");
-    await handleModelControlCallback({ client, store, action: store.consumeCallbackAction(maxButton.callback_data), callbackQueryId: "q2", chatId: 42, messageId: 7 });
+    const max = callbackData(effortPanel?.options?.reply_markup, "max");
+    await handleModelControlCallback({ client, store, action: consume(store, max), callbackQueryId: "q2", chatId: 42, messageId: 7 });
     assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "opus[1m]", effort: "max" });
   });
 });
@@ -115,9 +163,9 @@ test("/model walks model then effort, using the chosen model's own effort levels
 test("a model without effort control is chosen in one step", async () => {
   await withStore(async (store, id) => {
     const panel = await buildModelPanel({ store, harness: claudeHarness, conversationId: id });
-    const haiku = panel.options.reply_markup.inline_keyboard.flat().find((b) => b.text === "Haiku");
+    const haiku = callbackData(panel.options.reply_markup, "Haiku");
     const client = fakeClient();
-    await handleModelControlCallback({ client, store, action: store.consumeCallbackAction(haiku.callback_data), callbackQueryId: "q", chatId: 42, messageId: 7 });
+    await handleModelControlCallback({ client, store, action: consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 });
     assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "haiku", effort: null });
   });
 });

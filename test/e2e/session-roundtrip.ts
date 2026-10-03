@@ -1,33 +1,70 @@
-// @ts-nocheck
 /**
  * Run inside alasio's pod (kubectl exec deploy/alasio -- node <this> <volumeId>): drives one
  * session through alasio's own Kubernetes driver and its ServiceAccount's permissions.
  * bayma answers over MCP with the session's token, writes a file in the workspace, which
  * alasio reads back through exec; the session is suspended, resumed, and the file is
  * still there. Prints one JSON line of what it saw.
+ *
+ * alasio's modules are imported by their paths in the repository, which inAlasio in
+ * alasio.test.ts rewrites to the image's as it pipes this in.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
-import { loadKubeTemplates } from "/opt/alasio/src/kube/config.ts";
-import { createKubeClient } from "/opt/alasio/src/kube/client.ts";
-import { createSandboxes } from "/opt/alasio/src/kube/sandboxes.ts";
-import { createSandbox } from "/opt/alasio/src/sandbox/index.ts";
+import { loadKubeTemplates } from "../../src/kube/config.ts";
+import { createKubeClient } from "../../src/kube/client.ts";
+import { createSandboxes, type BaymaEndpoint } from "../../src/kube/sandboxes.ts";
+import { createSandbox } from "../../src/sandbox/index.ts";
+
+/** What bayma's session.create answers, as far as the end-to-end scripts read it. */
+export interface BaymaSessionCreated {
+  readonly session: { readonly session_id: string };
+}
+
+/** What bayma's exec answers, as far as the end-to-end scripts read it. */
+export interface BaymaExecResult {
+  readonly result_text?: string;
+}
+
+/** What the round trip saw, as its last line prints it; what it could not read is left out. */
+export interface RoundtripSeen {
+  exec: string;
+  read?: string | undefined;
+  missing?: string | undefined;
+  outside: string;
+  suspendedPod: "still there" | "gone";
+  whileSuspended?: string | undefined;
+  resumeMs: number;
+  afterResume?: string | undefined;
+  execAfterResume?: string | undefined;
+}
 
 const volumeId = process.argv[2];
+if (!volumeId) throw new Error("usage: session-roundtrip.ts <volumeId>");
 const templates = loadKubeTemplates();
 const kube = createKubeClient();
-const sandbox = createSandbox({ templates, stateDir: "/tmp/roundtrip", kube, env: {}, createForwarder: async () => null });
-const seen = {};
+const sandbox = createSandbox({ templates, stateDir: "/tmp/roundtrip", kube, env: {} });
+if (!sandbox || !templates.sessions) throw new Error("the release renders no sessions template");
+const seen: Partial<RoundtripSeen> = {};
 
-async function exec(bayma, code) {
+/** The text of a part of a tool's answer, where bayma gives its JSON. */
+function text(part: ContentBlock | undefined): string {
+  if (part?.type !== "text") throw new Error(`bayma answered without text: ${JSON.stringify(part)}`);
+  return part.text;
+}
+
+async function exec(bayma: BaymaEndpoint, code: string): Promise<BaymaExecResult> {
   const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }));
+  // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
+  await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);
   try {
-    const created = await client.callTool({ name: "session.create", arguments: { runtime: "bun", title: "e2e", cwd: "/workspace" } });
-    const sessionId = JSON.parse(created.content[0].text).session.session_id;
-    const result = await client.callTool({ name: "exec", arguments: { session_id: sessionId, code } });
-    return result.structuredContent ?? JSON.parse(result.content.find((part) => part.type === "text").text);
+    // bayma answers in the current protocol, never with the old `toolResult`.
+    const created = (await client.callTool({ name: "session.create", arguments: { runtime: "bun", title: "e2e", cwd: "/workspace" } })) as CallToolResult;
+    const { session }: BaymaSessionCreated = JSON.parse(text(created.content[0]));
+    const result = (await client.callTool({ name: "exec", arguments: { session_id: session.session_id, code } })) as CallToolResult;
+    return result.structuredContent ?? JSON.parse(text(result.content.find((part) => part.type === "text")));
   } finally {
     await client.close();
   }

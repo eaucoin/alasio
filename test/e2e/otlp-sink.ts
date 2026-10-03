@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * A stand-in OTLP/HTTP endpoint for alasio's end-to-end tests: it accepts every export
  * and remembers, per request, its signal, its encoding and whether its bytes name a
@@ -13,17 +12,38 @@
  */
 import { createServer } from "node:http";
 import { gunzipSync } from "node:zlib";
+import type { Signal } from "../../src/telemetry/config.ts";
+
+/** An export the sink received. */
+interface ReceivedExport {
+  readonly signal: Signal;
+  readonly type: string | undefined;
+  readonly bytes: Buffer;
+  readonly at: number;
+}
+
+/** An export as /control/exports lists it: whether it contains the asked-for value, when one was. */
+export interface ListedExport {
+  readonly signal: Signal;
+  readonly type: string | undefined;
+  readonly size: number;
+  readonly at: number;
+  readonly contains?: boolean;
+}
 
 const PORT = Number(process.argv[2] ?? 4318);
-const exports = [];
+const exports: ReceivedExport[] = [];
 
 createServer(async (request, response) => {
-  const url = new URL(request.url, "http://sink");
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
+  // A server's requests always carry their URL.
+  const url = new URL(request.url!, "http://sink");
+  const chunks: Buffer[] = [];
+  // With no encoding set, a request reads as Buffers.
+  for await (const chunk of request as AsyncIterable<Buffer>) chunks.push(chunk);
   let body = Buffer.concat(chunks);
   if (request.headers["content-encoding"] === "gzip") body = gunzipSync(body);
-  const signal = /^\/v1\/(traces|metrics|logs)$/u.exec(url.pathname)?.[1];
+  // The pattern names a Signal alone.
+  const signal = /^\/v1\/(traces|metrics|logs)$/u.exec(url.pathname)?.[1] as Signal | undefined;
   if (signal && request.method === "POST") {
     exports.push({ signal, type: request.headers["content-type"], bytes: body, at: Date.now() });
     // A full success in the request's encoding: an empty message, or an empty object.
@@ -33,7 +53,7 @@ createServer(async (request, response) => {
   }
   if (url.pathname === "/control/exports") {
     const needle = url.searchParams.get("contains");
-    const listed = exports.map(({ signal, type, bytes, at }) => ({
+    const listed = exports.map(({ signal, type, bytes, at }): ListedExport => ({
       signal, type, size: bytes.length, at, ...(needle ? { contains: bytes.includes(needle) } : {}),
     }));
     response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(listed));

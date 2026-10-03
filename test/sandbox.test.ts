@@ -1,11 +1,14 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
+import type { AppServerProcessOptions } from "../src/codex/app-server/process.ts";
+import type { LoginRelay } from "../src/codex/login-relay.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
+import type { SessionsProfile } from "../src/kube/config.ts";
+import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { SESSION_FS_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import {
@@ -18,7 +21,7 @@ import { createSandbox } from "../src/sandbox/index.ts";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId } from "../src/sandbox/names.ts";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.ts";
 
-const dirs = [];
+const dirs: string[] = [];
 const tempDir = () => {
   const dir = mkdtempSync(join(tmpdir(), "alasio-sandbox-"));
   dirs.push(dir);
@@ -26,7 +29,13 @@ const tempDir = () => {
 };
 after(() => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); });
 
-const BAYMA = { url: "http://fs-abc123.alasio-sessions.svc.cluster.local:7290/mcp", headers: { Authorization: "Bearer fs-abc123.token" } };
+/** A login relay that records the login it was given and whether it was closed. */
+interface FakeRelay extends LoginRelay {
+  readonly authFile: string;
+  closed: boolean;
+}
+
+const BAYMA: BaymaEndpoint = { url: "http://fs-abc123.alasio-sessions.svc.cluster.local:7290/mcp", headers: { Authorization: "Bearer fs-abc123.token" } };
 
 test("volume ids are DNS labels, as the names of their Sandboxes must be", () => {
   assert.equal(isValidVolumeId("fs-1a2b3c4d5e"), true);
@@ -68,15 +77,19 @@ test("a session filesystem's Claude Code keeps only tools that stay off this mac
   assert.deepEqual(opts.settingSources, []); // none of the operator's settings, hooks, or skills
   assert.equal(opts.strictMcpConfig, true); // none of the operator's MCP servers
   assert.deepEqual(opts.mcpServers, { bayma: { type: "http", url: BAYMA.url, headers: BAYMA.headers } });
-  assert.match(opts.systemPrompt.append, new RegExp(SESSION_FS_INSTRUCTIONS.slice(0, 40)));
+  const { systemPrompt } = opts;
+  assert.ok(typeof systemPrompt === "object" && !Array.isArray(systemPrompt) && systemPrompt.type === "preset", "Claude Code's own prompt, appended to");
+  assert.match(systemPrompt.append ?? "", new RegExp(SESSION_FS_INSTRUCTIONS.slice(0, 40)));
   assert.equal(opts.spawnClaudeCodeProcess, undefined); // the CLI runs here, not in the sandbox
 
   // A folder workspace is as before: its own folder, the operator's settings, the usual tools.
-  const folder = buildClaudeQueryOptions({ workingDirectory: "/home/op/proj", claudeEnv: {}, mcpServers: { bayma: {} }, controller: new AbortController(), hooks: {} });
+  const folder = buildClaudeQueryOptions({
+    workingDirectory: "/home/op/proj", claudeEnv: {}, mcpServers: { bayma: { type: "http", ...BAYMA } }, controller: new AbortController(), hooks: {},
+  });
   assert.equal(folder.cwd, "/home/op/proj");
   assert.equal(folder.tools, undefined);
   assert.equal(folder.settingSources, undefined);
-  assert.ok(folder.disallowedTools.includes("Bash"));
+  assert.ok(folder.disallowedTools?.includes("Bash"));
 });
 
 test("the session-filesystem Codex home has no environment and the login relay as its one model provider", () => {
@@ -93,15 +106,15 @@ test("the session-filesystem Codex home has no environment and the login relay a
 
 test("the session-filesystem Codex writes its own home, carries none of the operator's env, and stops cleanly", async () => {
   const home = join(tempDir(), "codex");
-  const relays = [];
-  const spawned = [];
-  process.env.OPENAI_API_KEY_FOR_THIS_TEST = "operator-secret";
+  const relays: FakeRelay[] = [];
+  const spawned: AppServerProcessOptions[] = [];
+  process.env["OPENAI_API_KEY_FOR_THIS_TEST"] = "operator-secret";
   try {
     const codex = createSessionFsCodex({
       home,
       authFile: "/operator/.codex/auth.json",
       startRelay: async ({ authFile }) => {
-        const relay = { authFile, url: "http://127.0.0.1:41000/v1", bearer: "relay-bearer", closed: false, close: async () => { relay.closed = true; } };
+        const relay: FakeRelay = { authFile, url: "http://127.0.0.1:41000/v1", bearer: "relay-bearer", closed: false, close: async () => { relay.closed = true; } };
         relays.push(relay);
         return relay;
       },
@@ -110,33 +123,38 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
     const scope = await codex.scope({ directory: "/state/sessionfs/workspaces/fs-abc123", bayma: BAYMA });
     const listing = await codex.listingScope({ directory: "/state/sessionfs/workspaces/fs-abc123" });
     assert.equal(relays.length, 1); // one relay and app-server for every workspace
-    assert.equal(relays[0].authFile, "/operator/.codex/auth.json");
+    assert.equal(relays[0]?.authFile, "/operator/.codex/auth.json");
     assert.equal(scope.client, listing.client);
     assert.equal(scope.cwd, "/state/sessionfs/workspaces/fs-abc123");
     assert.deepEqual(scope.codexConfig, sessionFsThreadConfig(BAYMA));
-    assert.equal(listing.codexConfig, undefined);
+    // A listing scope's type has no config; this pins that it carries none.
+    assert.equal(Reflect.get(listing, "codexConfig"), undefined);
     assert.deepEqual(Object.keys(scope.codexEnv).sort(), ["CODEX_HOME", "HOME", "PATH", "ALASIO_CODEX_LOGIN"]);
-    assert.equal(scope.codexEnv.CODEX_HOME, home);
-    assert.equal(scope.codexEnv.HOME, join(home, "home")); // not the operator's home
-    assert.equal(scope.codexEnv.ALASIO_CODEX_LOGIN, "relay-bearer");
+    assert.equal(scope.codexEnv["CODEX_HOME"], home);
+    assert.equal(scope.codexEnv["HOME"], join(home, "home")); // not the operator's home
+    assert.equal(scope.codexEnv["ALASIO_CODEX_LOGIN"], "relay-bearer");
     assert.equal(readFileSync(join(home, "config.toml"), "utf8"), sessionFsCodexConfigToml("http://127.0.0.1:41000/v1"));
     assert.equal(readFileSync(join(home, "environments.toml"), "utf8"), SESSION_FS_ENVIRONMENTS_TOML);
 
     // The app-server process runs in the home, not in the directory of whichever workspace asked first.
     await assert.rejects(scope.client.listModels({ env: scope.codexEnv, cwd: scope.cwd }), /not spawned in this test/);
-    assert.equal(spawned[0].cwd, home);
+    assert.equal(spawned[0]?.cwd, home);
 
     await codex.stop();
-    assert.equal(relays[0].closed, true);
+    assert.equal(relays[0]?.closed, true);
   } finally {
-    delete process.env.OPENAI_API_KEY_FOR_THIS_TEST;
+    delete process.env["OPENAI_API_KEY_FOR_THIS_TEST"];
   }
 });
 
 test("a session's harness directory is its own, under the state directory, outside the sandbox", () => {
   const stateDir = tempDir();
-  const profile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
-  const sandbox = createSandbox({ templates: { sessions: profile }, stateDir, env: {}, kube: {} });
+  const profile: SessionsProfile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
+  // A session's harness directory is alasio's own; Kubernetes is never reached for it.
+  const unreachable = () => assert.fail("the harness directory reached Kubernetes");
+  const kube = { read: unreachable, create: unreachable, patch: unreachable, remove: unreachable, exec: unreachable };
+  const sandbox = createSandbox({ templates: { sessions: profile, host: null }, stateDir, env: {}, kube });
+  assert.ok(sandbox, "the deployment renders the sessions template");
   const directory = sandbox.harnessDirectory("fs-abc123");
   assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
   assert.ok(existsSync(directory));

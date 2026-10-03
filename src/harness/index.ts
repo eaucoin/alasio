@@ -58,6 +58,26 @@ export interface TransportTurn {
   readonly turnId: string | null | undefined;
 }
 
+/**
+ * What a turn records in alasio's store as it runs: its response, its session and usage,
+ * and any restart it causes; and, where the store keeps them, the conversation's model
+ * choices.
+ */
+export type TurnPersistence =
+  & Pick<
+    SqliteStore,
+    | "createPendingResponse"
+    | "updateActiveTurnPendingResponseId"
+    | "updatePendingSessionId"
+    | "updateActiveTurnSessionId"
+    | "appendBlockToPending"
+    | "markPendingResponseComplete"
+    | "markPendingAsPosted"
+    | "updateSessionUsage"
+    | "recordRestartEvent"
+  >
+  & Partial<Pick<SqliteStore, "getModelChoice">>;
+
 /** A turn to run: the operator's prompt, the session it resumes, and where it reports. */
 export interface TurnParams {
   readonly prompt: string;
@@ -66,7 +86,7 @@ export interface TurnParams {
   readonly chatId: string;
   readonly messageId: string;
   readonly workingDirectory: string;
-  readonly persistence: SqliteStore;
+  readonly persistence: TurnPersistence;
   readonly activeQueries: ActiveQueries;
   readonly attachedTurn?: AttachedTurn | null | undefined;
   /** Called as the turn starts and as each of its events arrives. */

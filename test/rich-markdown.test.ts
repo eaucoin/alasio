@@ -1,10 +1,10 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { workingStatusHtml } from "../src/codex/status-reporter.ts";
 import { Client } from "../src/telegram/client.ts";
 import { splitRichMarkdown, toRichMarkdown } from "../src/telegram/rich-markdown.ts";
+import { type BotCall, answerBotCalls, botApiError, paramsOf } from "./support/bot-api.ts";
 
 test("prose is escaped where Telegram's rich Markdown would read syntax the agent did not mean", () => {
   assert.equal(toRichMarkdown("Costs $5 to $10."), "Costs \\$5 to \\$10.");
@@ -63,33 +63,30 @@ test("long Markdown splits between blocks, and a long code block is closed and r
 
 test("a rich part Telegram rejects is sent the classic way; other failures still throw", async () => {
   const client = new Client("test-token");
-  const calls = [];
-  client.call = async (method, payload) => {
-    calls.push({ method, payload });
-    if (method === "sendRichMessage" && payload.rich_message.markdown.includes("reject")) {
-      const error = new Error("Bad Request");
-      error.status = 400;
-      throw error;
+  const calls: BotCall[] = [];
+  answerBotCalls(client, async (call) => {
+    calls.push(call);
+    if (call.method === "sendRichMessage" && call.params?.rich_message.markdown?.includes("reject")) {
+      throw botApiError("Bad Request", 400);
     }
     return { message_id: calls.length };
-  };
+  });
   const sent = await client.sendMessage(1, "| a |\n|---|\n| $5 |", { format: "rich" });
   assert.equal(sent.length, 1);
-  assert.equal(calls[0].method, "sendRichMessage");
-  assert.equal(calls[0].payload.rich_message.markdown, "| a |\n|---|\n| \\$5 |");
-  assert.equal(calls[0].payload.format, undefined); // alasio's own option is not sent to Telegram
+  const rich = paramsOf(calls[0], "sendRichMessage");
+  assert.equal(rich.rich_message.markdown, "| a |\n|---|\n| \\$5 |");
+  assert.equal("format" in rich, false); // alasio's own option is not sent to Telegram
 
   calls.length = 0;
   await client.sendMessage(1, "please reject **this**", { format: "rich" });
   assert.deepEqual(calls.map((c) => c.method), ["sendRichMessage", "sendMessage"]);
-  assert.equal(calls[1].payload.parse_mode, "HTML");
-  assert.match(calls[1].payload.text, /<b>this<\/b>/);
+  const classic = paramsOf(calls[1], "sendMessage");
+  assert.equal(classic.parse_mode, "HTML");
+  assert.match(classic.text, /<b>this<\/b>/);
 
-  client.call = async () => {
-    const error = new Error("Too Many Requests");
-    error.status = 429;
-    throw error;
-  };
+  answerBotCalls(client, async () => {
+    throw botApiError("Too Many Requests", 429);
+  });
   await assert.rejects(client.sendMessage(1, "x", { format: "rich" }), /Too Many Requests/); // the outbox retries
 });
 
@@ -99,7 +96,7 @@ test("the status line carries a relative start time the app keeps current", () =
   const waiting = workingStatusHtml({
     harnessName: "Codex",
     startedAtMs: 1_790_000_000_000,
-    workflowWait: { runId: "wf_<1>", waitType: "agent" },
+    workflowWait: { runId: "wf_<1>", waitType: "watch" },
   });
-  assert.match(waiting, /^Codex is watching workflow wf_&lt;1&gt; \(agent\) · started <tg-time/);
+  assert.match(waiting, /^Codex is watching workflow wf_&lt;1&gt; \(watch\) · started <tg-time/);
 });

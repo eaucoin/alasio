@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Codex's sessions end to end, against the real app-server binary alasio
  * runs: turns answered by a local stand-in for the Responses API, so no login
@@ -19,30 +18,48 @@ import pg from "pg";
 import { AppServerClient } from "../src/codex/app-server/client.ts";
 import { buildCodexEnv } from "../src/codex/env.ts";
 import { listRolloutFiles } from "../src/codex/rollouts/files.ts";
-import { startCodexRollouts } from "../src/codex/rollouts/index.ts";
+import { type CodexRollouts, startCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
-import { createCodexSessionApi } from "../src/codex/sessions.ts";
-import { dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
+import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
+import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
+import { type TestPostgres, dockerAvailable, startPostgres } from "./support/postgres.ts";
 
 const CODEX_BIN = new URL("../node_modules/.bin/codex", import.meta.url).pathname;
 const skip = !existsSync(CODEX_BIN)
   ? "needs the Codex binary alasio installs"
   : !dockerAvailable() && "needs Docker for a throwaway Postgres";
 
+/** An event the Responses API streams: its type, and what it carries. */
+interface ResponsesEvent {
+  readonly type: string;
+  readonly [field: string]: unknown;
+}
+
+/** The stand-in for the Responses API: its URL, the request bodies it was sent, and how to stop it. */
+interface ResponsesStandIn {
+  readonly url: string;
+  readonly requests: readonly string[];
+  close(): Promise<void>;
+}
+
+/** No config beyond what alasio itself sets on a thread. */
+const NO_CONFIG: CodexThreadConfig = { developer_instructions: "", mcp_servers: {} };
+
 /** Server-sent events as the Responses API streams them. */
-function sse(events) {
+function sse(events: readonly ResponsesEvent[]): string {
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
 /** A stand-in for the Responses API that answers the nth request "answer n", and keeps what each asked. */
-async function startResponses() {
-  const requests = [];
+async function startResponses(): Promise<ResponsesStandIn> {
+  const requests: string[] = [];
   const server = createServer((request, response) => {
-    const body = [];
-    request.on("data", (chunk) => body.push(chunk));
+    const body: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => body.push(chunk));
     request.on("end", () => {
-      if (request.method !== "POST" || !request.url.endsWith("/responses")) {
+      if (request.method !== "POST" || !request.url?.endsWith("/responses")) {
         response.writeHead(404).end();
         return;
       }
@@ -64,12 +81,14 @@ async function startResponses() {
       ]));
     });
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { url: `http://127.0.0.1:${server.address().port}/v1`, requests, close: () => new Promise((resolve) => server.close(resolve)) };
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object", "a TCP server's address");
+  return { url: `http://127.0.0.1:${address.port}/v1`, requests, close: () => new Promise((resolve) => server.close(() => resolve())) };
 }
 
 /** A Codex home of its own, whose only provider is the stand-in. */
-function makeCodexHome(root, name, providerUrl) {
+function makeCodexHome(root: string, name: string, providerUrl: string): string {
   const home = join(root, name);
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, "config.toml"), `
@@ -86,19 +105,18 @@ stream_max_retries = 0
 }
 
 test("sessions are labelled by name, else first prompt; turns without a prompt are no rewind point; an unreadable thread has none", async () => {
-  const turn = (id, prompt, answer) => ({
-    id,
+  const turn = (id: string, prompt: string | null, answer: string | null) => codexTurn(id, {
     startedAt: 1_790_000_000,
     items: [
-      ...(prompt === null ? [] : [{ type: "userMessage", content: [{ type: "image", url: "x" }, { type: "text", text: prompt }] }]),
-      ...(answer ? [{ type: "agentMessage", text: answer }] : []),
+      ...(prompt === null ? [] : [userMessage(`${id}-prompt`, [{ type: "image", url: "x" }, { type: "text", text: prompt, text_elements: [] }])]),
+      ...(answer ? [agentMessage(`${id}-answer`, answer)] : []),
     ],
   });
-  const client = {
+  const client: SessionListingScope["client"] = {
     listThreads: async () => [
-      { id: "named", name: "Named   thread", preview: "ignored", updatedAt: 1_790_000_000 },
-      { id: "prompted", name: null, preview: "a first prompt that is well over forty characters long", updatedAt: 0 },
-      { id: "empty-thread-id", name: null, preview: "", updatedAt: 1_790_000_000 },
+      codexThread("named", { name: "Named   thread", preview: "ignored", updatedAt: 1_790_000_000 }),
+      codexThread("prompted", { name: null, preview: "a first prompt that is well over forty characters long", updatedAt: 0 }),
+      codexThread("empty-thread-id", { name: null, preview: "", updatedAt: 1_790_000_000 }),
     ],
     listTurns: async ({ threadId }) => {
       if (threadId === "gone") throw new Error("thread not found");
@@ -121,13 +139,13 @@ test("sessions are labelled by name, else first prompt; turns without a prompt a
 });
 
 describe("Codex sessions through the app-server", { skip }, () => {
-  let root;
-  let responses;
-  let database;
-  let pool;
-  let client;
-  let rollouts;
-  const savedCodexHome = process.env.CODEX_HOME;
+  let root: string | undefined;
+  let responses: ResponsesStandIn | undefined;
+  let database: TestPostgres | undefined;
+  let pool: pg.Pool | undefined;
+  let appServer: AppServerClient | undefined;
+  let rollouts: CodexRollouts | undefined;
+  const savedCodexHome = process.env["CODEX_HOME"];
 
   before(async () => {
     root = mkdtempSync(join(tmpdir(), "alasio-codex-sessions-"));
@@ -138,45 +156,47 @@ describe("Codex sessions through the app-server", { skip }, () => {
 
   after(async () => {
     await rollouts?.close();
-    client?.stop();
+    appServer?.stop();
     await pool?.end();
     await database?.stop();
     await responses?.close();
-    if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
-    else process.env.CODEX_HOME = savedCodexHome;
-    rmSync(root, { recursive: true, force: true });
+    if (savedCodexHome === undefined) delete process.env["CODEX_HOME"];
+    else process.env["CODEX_HOME"] = savedCodexHome;
+    if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  /** One turn on a thread, run to its end. */
-  async function runTurn(threadId, prompt, cwd) {
-    const turnId = await client.startTurn({ threadId, prompt, cwd, env: buildCodexEnv(), config: {} });
+  /** One turn on a thread of conversation-1, the conversation every thread here is for, run to its end. */
+  async function runTurn(client: AppServerClient, threadId: string, prompt: string, cwd: string): Promise<void> {
+    const turnId = await client.startTurn({ threadId, threadKey: "conversation-1", prompt, cwd, env: buildCodexEnv(), config: NO_CONFIG });
     for await (const event of client.eventsForTurn(threadId, turnId)) {
       if (event.type === "turn.failed") throw new Error(event.error.message);
     }
   }
 
   test("sessions list, rewind forks, and a lost thread comes back whole from the store", async () => {
+    assert.ok(root && responses && pool, "set up before the tests");
     const workingDirectory = join(root, "work");
     mkdirSync(workingDirectory);
-    process.env.CODEX_HOME = makeCodexHome(root, "codex-home", responses.url);
-    client = new AppServerClient();
-    const forks = [];
+    const home = makeCodexHome(root, "codex-home", responses.url);
+    process.env["CODEX_HOME"] = home;
+    const client = new AppServerClient();
+    appServer = client;
+    const forks: string[] = [];
     const sessions = createCodexSessionApi({
       workingDirectory,
       listingScope: async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client }),
       fork: async ({ sessionId, beforeTurnId, threadKey }) => {
         forks.push(threadKey);
-        return await client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: {} });
+        return await client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
       },
     });
 
     // Mirrored from the start, as alasio does.
-    const home = process.env.CODEX_HOME;
     const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });
     await store.ensureSchema();
     rollouts = startCodexRollouts({ store, home });
     /** Whether the store holds exactly what a thread's files hold now. */
-    const heldExactly = async (id) => {
+    const heldExactly = async (id: string) => {
       const files = listRolloutFiles(home).filter((file) => file.name.includes(id));
       for (const file of files) {
         if (!(await store.read(file.name)).equals(readFileSync(join(home, file.path)))) return false;
@@ -184,9 +204,9 @@ describe("Codex sessions through the app-server", { skip }, () => {
       return files.length > 0;
     };
 
-    const threadId = await client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: {} });
+    const threadId = await client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
     for (const prompt of ["remember the heron", "and now the crane"]) {
-      await runTurn(threadId, prompt, workingDirectory);
+      await runTurn(client, threadId, prompt, workingDirectory);
       // What Codex wrote by the turn's end is all in the store once a flush returns.
       await rollouts.flush(threadId);
       assert.ok(await heldExactly(threadId));
@@ -194,6 +214,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
 
     assert.equal(await sessions.getTotalSessionPages(), 1);
     const [listed] = await sessions.listSessions(1);
+    assert.ok(listed);
     assert.equal(listed.uuid, threadId);
     assert.equal(listed.label, "remember the heron");
     assert.match(listed.timestamp, /^\d{4}-\d{2}-\d{2}$/);
@@ -208,7 +229,9 @@ describe("Codex sessions through the app-server", { skip }, () => {
     assert.equal(await sessions.getTotalRewindPages(threadId), 1);
 
     // Rewind to before the second message: a new thread with the first turn's history only.
-    const forkedId = await sessions.createForkedSession(threadId, messages[0].uuid, { threadKey: "conversation-1" });
+    const [latest] = messages;
+    assert.ok(latest);
+    const forkedId = await sessions.createForkedSession(threadId, latest.uuid, { threadKey: "conversation-1" });
     assert.ok(forkedId && forkedId !== threadId);
     assert.deepEqual(forks, ["conversation-1"]);
     assert.equal(await sessions.createForkedSession(threadId, "no-such-turn", { threadKey: "conversation-1" }), null);
@@ -224,21 +247,22 @@ describe("Codex sessions through the app-server", { skip }, () => {
 
     // Lose everything: the files, and every index Codex made from them.
     client.stop();
-    process.env.CODEX_HOME = makeCodexHome(root, "new-codex-home", responses.url);
-    const written = await restoreRollouts({ store, threadIds: [forkedId], home: process.env.CODEX_HOME });
+    const newHome = makeCodexHome(root, "new-codex-home", responses.url);
+    process.env["CODEX_HOME"] = newHome;
+    const written = await restoreRollouts({ store, threadIds: [forkedId], home: newHome });
     // The fork's history starts in the first thread's file, so both come back.
     assert.deepEqual(written.sort(), [...originals.keys()].sort());
     for (const [path, original] of originals) {
-      assert.deepEqual(readFileSync(join(process.env.CODEX_HOME, path)), original.bytes);
-      assert.equal(Math.round(statSync(join(process.env.CODEX_HOME, path)).mtimeMs), Math.round(original.modifiedMs));
+      assert.deepEqual(readFileSync(join(newHome, path)), original.bytes);
+      assert.equal(Math.round(statSync(join(newHome, path)).mtimeMs), Math.round(original.modifiedMs));
     }
 
     // Codex resumes the fork again, and its next turn carries the first
     // turn's history and not the rewound one. The client starts a new
     // app-server, on the new Codex home, as it does after any stop.
-    await client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: {} });
-    await runTurn(forkedId, "which bird?", workingDirectory);
-    const lastRequest = responses.requests.at(-1);
+    await client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
+    await runTurn(client, forkedId, "which bird?", workingDirectory);
+    const lastRequest = responses.requests.at(-1) ?? "";
     assert.match(lastRequest, /remember the heron/);
     assert.match(lastRequest, /answer 1/);
     assert.match(lastRequest, /which bird\?/);

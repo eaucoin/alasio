@@ -40,9 +40,15 @@ export interface ClaudeSessionSdk {
   readonly getSessionInfo: typeof getSessionInfo;
 }
 
+/**
+ * The transcript store the session api reads through: the SDK's store, which can also
+ * say which project holds a session and which subagent transcripts it has.
+ */
+export type ClaudeTranscriptStore = SessionStore & Pick<NeonSessionStore, "projectKeyOf" | "listSubkeys">;
+
 export interface ClaudeSessionApiOptions {
   readonly workingDirectory: string;
-  readonly store?: NeonSessionStore | null;
+  readonly store?: ClaudeTranscriptStore | null;
   readonly sdk?: ClaudeSessionSdk;
 }
 

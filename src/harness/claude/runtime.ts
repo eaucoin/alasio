@@ -11,7 +11,15 @@
  * work settles are delivered as their own replies.
  */
 import { randomUUID } from "node:crypto";
-import { query, type McpServerConfig, type Options, type SessionStore } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type McpServerConfig,
+  type Options,
+  type Query,
+  type SDKMessage,
+  type SDKUserMessage,
+  type SessionStore,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { TurnParams, TurnResult } from "../index.ts";
@@ -46,8 +54,17 @@ import { mirrorOnly } from "./session-store.ts";
 
 const log = createLogger("claude-runtime");
 
+/** What alasio starts a Claude Code query with: its streaming prompt, and its options. */
+export interface ClaudeQueryParams {
+  readonly prompt: AsyncIterable<SDKUserMessage>;
+  readonly options: Options;
+}
+
+/** A running Claude Code query, as alasio drives it: its messages, an interrupt, and a close. */
+export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, "interrupt" | "close">;
+
 /** Starts a Claude Code query: the SDK's `query`, or a test's stand-in. */
-export type ClaudeQueryFactory = typeof query;
+export type ClaudeQueryFactory = (params: ClaudeQueryParams) => ClaudeQuery;
 
 /** What buildClaudeQueryOptions is given. */
 export interface ClaudeQueryOptionsInput {
