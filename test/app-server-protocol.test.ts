@@ -433,3 +433,13 @@ test("app-server stream still rejects explicitly mismatched lifecycle turn notif
   );
   client.stop();
 });
+
+test("an error notification reports Codex's own message, unless Codex is retrying", () => {
+  const error = (willRetry) => mapNotificationToSdkEvent({
+    method: "error",
+    params: { error: { message: "Rate limit reached", codexErrorInfo: null, additionalDetails: null, misalignment: null }, willRetry, threadId: "thread-1", turnId: "turn-1" },
+  });
+  assert.deepEqual(error(false), { type: "error", message: "Rate limit reached" });
+  assert.equal(error(true), null);
+});
+

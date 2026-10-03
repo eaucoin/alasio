@@ -202,13 +202,6 @@ export interface NotificationIds extends IdFields {
   readonly item?: unknown;
 }
 
-/** An error notification's params as they are read for a message: by fields of their own. */
-interface ErrorMessageFields {
-  readonly message?: string;
-  readonly summary?: string;
-  readonly [field: string]: unknown;
-}
-
 function normalizeAppServerItem(item: v2.ThreadItem): AppServerItem {
   if (!item || typeof item !== "object") {
     return item;
@@ -347,13 +340,10 @@ export function mapNotificationToSdkEvent(message: AppServerNotification): AppSe
         type: "usage.updated",
         usage: params?.tokenUsage ?? null,
       };
-    case "error": {
-      const fields: ErrorMessageFields = params;
-      return {
-        type: "error",
-        message: fields?.message ?? fields?.summary ?? "Codex app-server error",
-      };
-    }
+    case "error":
+      // An error Codex is retrying is not the turn's: the turn goes on, and its outcome
+      // is reported as it ends.
+      return params.willRetry ? null : { type: "error", message: params.error.message };
     default:
       return null;
   }
