@@ -1,5 +1,5 @@
 /**
- * Queries the analytics lake, read-only (neon/lake/README.md):
+ * Queries the analytics lake, read-only (neon/lake/src/query.js):
  *
  *   npm run lake -- [--format table|csv|json] "<SQL>"
  *

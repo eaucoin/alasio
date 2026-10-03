@@ -5,7 +5,7 @@
  *
  * alasio's `npm run lake -- "<SQL>"` runs it in the lake's container. The lake is the
  * default database, so its tables and views are named as `claude.entries`,
- * `codex.turns`, and so on (see ../README.md). The lake is attached read-only, so a
+ * `codex.turns`, and so on (model.js). The lake is attached read-only, so a
  * query can change nothing.
  */
 import { loadConfig } from "./config.js";

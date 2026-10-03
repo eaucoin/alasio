@@ -1,5 +1,5 @@
 /**
- * alasio's side of the analytics lake (neon/lake/README.md): whether it runs, its role
+ * alasio's side of the analytics lake (neon/lake/src/model.js): whether it runs, its role
  * and catalog database, and what it may read.
  *
  * The role is made here, by alasio, rather than in the compute's spec: Neon makes every

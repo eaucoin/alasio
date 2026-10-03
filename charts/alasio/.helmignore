@@ -1,6 +1,3 @@
-# Not part of the packaged chart: the atlas's agent copies, and the chart's own tests
-# and CI values.
-AGENTS.md
-CLAUDE.md
+# Not part of the packaged chart: its own tests and CI values.
 tests/
 ci/

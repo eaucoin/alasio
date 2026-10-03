@@ -1,4 +1,4 @@
-# The lake service's image (see README.md): Node, DuckDB's Node API, and the DuckDB
+# The lake service's image (src/service.js): Node, DuckDB's Node API, and the DuckDB
 # extensions the lake loads, installed here so none is ever fetched at run time. The
 # base is glibc Debian because DuckDB's Node bindings are built for glibc. Published as
 # ghcr.io/eaucoin/alasio-lake by .github/workflows/release.yml.

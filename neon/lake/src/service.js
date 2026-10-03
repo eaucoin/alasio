@@ -1,11 +1,11 @@
 /**
  * The lake service: the stack's container that keeps the analytics lake loaded from
- * alasio's Neon (see ../README.md). One loads at a time, which a Postgres advisory
+ * alasio's Neon (model.js). One loads at a time, which a Postgres advisory
  * lock on the catalog makes sure of; DuckDB keeps nothing of its own, so the
  * container is replaceable at any moment, and the loader opens its connections again
  * whenever they fail, as when the compute restarts.
  *
- * It serves /healthz (the compose healthcheck) and /metrics (Prometheus, for the
+ * It serves /healthz (its pod's probes) and /metrics (Prometheus, for the
  * stack's telemetry collector) on LAKE_HTTP_PORT from the moment it starts, and logs a
  * JSON line per event.
  */

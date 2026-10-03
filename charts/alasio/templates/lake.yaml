@@ -1,6 +1,6 @@
 {{- if and .Values.lake.enabled .Values.neon.enabled -}}
 {{- $name := include "alasio.componentName" (dict "root" . "component" "lake") -}}
-# The analytics lake (neon/lake/README.md): every transcript entry and rollout line,
+# The analytics lake (neon/lake/src/model.js): every transcript entry and rollout line,
 # loaded from alasio's database into DuckLake, as role `lake`, which alasio makes. Query it
 # with `kubectl exec deploy/<release>-lake -- node src/query.js "<SQL>"`.
 apiVersion: v1
