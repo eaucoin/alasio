@@ -11,6 +11,7 @@ import {
   resolveHarnessName,
   resolveWorkingDirectory,
 } from "../harness/index.ts";
+import { errorsIn, type ResponseBlock } from "./event-projection.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 import { buildFilePromptSuffix } from "../shared/file-prompt.ts";
 import { CommandHandler } from "../operator/command-handler.ts";
@@ -118,6 +119,12 @@ export type ConcurrentPromptPayload = {
   readonly jobId: string | null;
   readonly prompt: string;
 };
+
+/** What a turn that ended without its answer shows: that it did not complete, and why, when the harness said. */
+function notCompleted(harnessName: string, blocks: readonly ResponseBlock[]): string {
+  const error = errorsIn(blocks).at(-1);
+  return error ? `${harnessName} did not complete: ${error}` : `${harnessName} did not complete.`;
+}
 
 export class TurnController {
   private readonly sandbox: SessionFilesystems | null;
@@ -607,6 +614,11 @@ export class TurnController {
       persistence: this.store,
       activeQueries: this.activeQueries,
       attachedTurn,
+      onPromptDispatched: () => {
+        if (jobId) {
+          this.store.markPromptJobDispatched(jobId);
+        }
+      },
       onTransportStarted: ({ sessionId, turnId }) => {
         if (jobId) {
           this.store.markPromptJobUpstreamStarted(jobId, sessionId, turnId);
@@ -656,7 +668,7 @@ export class TurnController {
         chatId,
         pendingResponseId,
         statusMessageId,
-        statusText: `${harness.displayName} did not complete.`,
+        statusText: notCompleted(harness.displayName, blockSequence),
       });
       this.store.clearActiveTurn(conversationId, pendingResponseId);
       this.store.clearRestartEvent(conversationId);

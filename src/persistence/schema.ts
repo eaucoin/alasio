@@ -170,6 +170,8 @@ const SQLITE_SCHEMA_SQL = `
     attempts integer not null default 0,
     upstream_session_id text,
     upstream_turn_id text,
+    -- when the prompt was sent to the agent, which may have acted on it since
+    upstream_dispatched_at real,
     upstream_started_at real,
     upstream_completed_at real,
     last_error text,
@@ -222,6 +224,9 @@ export function migrateSqliteSchema(db: Database, { legacyWorkingDirectory = nul
     }
     if (!promptJobColumns.has("traceparent")) {
       db.exec("alter table prompt_jobs add column traceparent text");
+    }
+    if (!promptJobColumns.has("upstream_dispatched_at")) {
+      db.exec("alter table prompt_jobs add column upstream_dispatched_at real");
     }
     if (!db.prepare<[], ColumnInfo>("pragma table_info(telegram_outbox)").all().some((column) => column.name === "traceparent")) {
       db.exec("alter table telegram_outbox add column traceparent text");

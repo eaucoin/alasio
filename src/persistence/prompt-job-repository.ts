@@ -22,6 +22,7 @@ export interface PromptJobRow {
   readonly attempts: number;
   readonly upstream_session_id: string | null;
   readonly upstream_turn_id: string | null;
+  readonly upstream_dispatched_at: number | null;
   readonly upstream_started_at: number | null;
   readonly upstream_completed_at: number | null;
   readonly last_error: string | null;
@@ -127,6 +128,11 @@ export class SqlitePromptJobRepository {
     this.setDisposition(id, "completed");
   }
 
+  /** Records that the job's prompt was sent to the agent, which may act on it from then on. */
+  markDispatched(id: string): void {
+    this.db.prepare<[dispatchedAt: number, id: string]>("update prompt_jobs set upstream_dispatched_at = ? where id = ?").run(Date.now() / 1000, id);
+  }
+
   markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): void {
     this.db.prepare<[sessionId: string | null, turnId: string | null, startedAt: number, id: string]>(`
       update prompt_jobs
@@ -165,6 +171,12 @@ export class SqlitePromptJobRepository {
     `).all().map((row) => row.conversation_id);
   }
 
+  /**
+   * Settles the jobs a restart found running: one whose turn the agent finished is
+   * completed; one never sent to the agent runs again; one sent to it is interrupted,
+   * never sent twice, since the agent may have acted on it (the turn's restart recovery
+   * continues it). Returns the conversations whose turn the agent finished.
+   */
   recoverAfterRestart(): string[] {
     const completed = this.db.prepare<[], Pick<PromptJobRow, "conversation_id">>(`
       select distinct conversation_id from prompt_jobs
@@ -176,11 +188,11 @@ export class SqlitePromptJobRepository {
     `).run(Date.now() / 1000);
     this.db.prepare<[]>(`
       update prompt_jobs set state = 'pending', started_at = null
-      where state = 'running' and upstream_started_at is null and upstream_completed_at is null
+      where state = 'running' and upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null
     `).run();
     this.db.prepare<[completedAt: number]>(`
       update prompt_jobs set state = 'interrupted', completed_at = ?
-      where state = 'running' and upstream_started_at is not null and upstream_completed_at is null
+      where state = 'running' and (upstream_dispatched_at is not null or upstream_started_at is not null) and upstream_completed_at is null
     `).run(Date.now() / 1000);
     return completed;
   }

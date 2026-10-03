@@ -78,6 +78,7 @@ export function createCodexHarness({
   sandbox = null,
   sessionFsCodex = null,
   sessionFsCodexRollouts = null,
+  folderBayma,
 }: HarnessOptions): Harness {
   const sessionFs = servedSessionFs(workingDirectory, sandbox, sessionFsCodex);
   const rollouts = sessionFs ? sessionFsCodexRollouts : codexRollouts;
@@ -126,7 +127,7 @@ export function createCodexHarness({
     sessions: createCodexSessionApi({
       workingDirectory,
       listingScope,
-      fork: (params) => forkCodexSession({ ...params, scope }),
+      fork: (params) => forkCodexSession({ ...params, scope, folderBayma }),
       beforeFork: ensureRollouts,
     }),
     /** Codex's goals on a thread, for operator/goal-control.ts. */
@@ -149,15 +150,15 @@ export function createCodexHarness({
       },
     },
     async startFreshSession({ threadKey }) {
-      return await startFreshCodexSession({ threadKey, workingDirectory, scope });
+      return await startFreshCodexSession({ threadKey, workingDirectory, scope, folderBayma });
     },
     async warmSession({ sessionId, threadKey }) {
       await ensureRollouts(sessionId);
-      return await warmCodexSession({ sessionId, threadKey, workingDirectory, scope });
+      return await warmCodexSession({ sessionId, threadKey, workingDirectory, scope, folderBayma });
     },
     async executeTurn(params) {
       await ensureRollouts(params.resumeSession);
-      return await executeCodexTurn({ ...params, workingDirectory, beforeResponseComplete: flushRollouts, scope });
+      return await executeCodexTurn({ ...params, workingDirectory, beforeResponseComplete: flushRollouts, scope, folderBayma });
     },
     async listModels() {
       const { cwd, codexEnv, client } = await listingScope();

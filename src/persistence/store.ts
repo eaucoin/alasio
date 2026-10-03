@@ -336,6 +336,10 @@ export class SqliteStore {
     this.promptJobs.complete(id);
   }
 
+  markPromptJobDispatched(id: string): void {
+    this.promptJobs.markDispatched(id);
+  }
+
   markPromptJobUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): void {
     this.promptJobs.markUpstreamStarted(id, sessionId, turnId);
   }

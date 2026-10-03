@@ -4,7 +4,7 @@
  * Owns alasio turn orchestration and local command guardrails.
  */
 import { buildCodexEnv } from "./env.ts";
-import { appendBlock, isVisibleCodexItem, mapItemToBlocks } from "./event-projection.ts";
+import { appendBlock, errorBlock, isVisibleCodexItem, mapItemToBlocks } from "./event-projection.ts";
 import {
     canWarmCodexSession,
     forkCodexTransportThread,
@@ -203,6 +203,7 @@ export async function executeCodexTurn(params: CodexTurnParams): Promise<TurnRes
             controller,
             turnTimer,
             client,
+            onPromptDispatched: params.onPromptDispatched,
         };
         const streamed = params.attachedTurn
             ? await openAttachedCodexEventStream({
@@ -280,17 +281,11 @@ export async function executeCodexTurn(params: CodexTurnParams): Promise<TurnRes
                     break;
                 case "turn.failed":
                     turnTimer("turn.failed", { error: event.error.message });
-                    appendBlock(blockSequence, persistence, pendingResponseId, {
-                        type: "text",
-                        content: `Error: ${event.error.message}`,
-                    });
+                    appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(event.error.message));
                     break;
                 case "error":
                     turnTimer("event.error", { error: event.message });
-                    appendBlock(blockSequence, persistence, pendingResponseId, {
-                        type: "text",
-                        content: `Error: ${event.message}`,
-                    });
+                    appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(event.message));
                     break;
                 default:
                     break;
@@ -313,10 +308,7 @@ export async function executeCodexTurn(params: CodexTurnParams): Promise<TurnRes
             else {
                 turnTimer("query.error", { error: errMsg });
                 log.error(`Error querying Codex: ${errMsg}`);
-                appendBlock(blockSequence, persistence, pendingResponseId, {
-                    type: "text",
-                    content: `Error: ${errMsg}`,
-                });
+                appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(errMsg));
             }
         }
     }

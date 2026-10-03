@@ -3,10 +3,12 @@ import type { ResponseBlock } from "../codex/event-projection.ts";
 import type { CodexRollouts } from "../codex/rollouts/index.ts";
 import type { SessionFsCodex } from "../codex/sessionfs.ts";
 import type { AlasioConfig } from "../config.ts";
+import type { folderBaymaServer } from "../mcp/bayma.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { SessionFilesystems } from "../sandbox/index.ts";
 import { createClaudeHarness } from "./claude/index.ts";
+import type { ClaudeQueryFactory } from "./claude/runtime.ts";
 import type { NeonSessionStore } from "./claude/session-store.ts";
 import type { ListedSession, RewindMessage } from "./claude/sessions.ts";
 import { createCodexHarness } from "./codex.ts";
@@ -91,6 +93,8 @@ export interface TurnParams {
   readonly attachedTurn?: AttachedTurn | null | undefined;
   /** Called as the turn starts and as each of its events arrives. */
   readonly onStarted?: (() => void) | undefined;
+  /** Called just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: (() => void) | undefined;
   readonly onTransportStarted?: ((turn: TransportTurn) => void) | undefined;
   readonly onTransportCompleted?: ((turn: TransportTurn) => void) | undefined;
   /** Called when a harness that runs on between prompts has a reply of its own to deliver. */
@@ -190,6 +194,10 @@ export interface HarnessOptions {
   readonly sandbox?: SessionFilesystems | null;
   readonly sessionFsCodex?: SessionFsCodex | null;
   readonly sessionFsCodexRollouts?: CodexRollouts | null;
+  /** A folder workspace's bayma: ../mcp/bayma.ts's, from the deployment's host profile, unless a test gives its own. */
+  readonly folderBayma?: typeof folderBaymaServer | undefined;
+  /** How Claude Code is started: the Agent SDK's `query`, unless a test gives its own. */
+  readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
 }
 
 /** Where a conversation's mounted harness and folder are read: alasio's store, or any part of it. */
@@ -242,7 +250,9 @@ export interface HarnessRegistry {
  * (test doubles) stand in for every folder of their harness but still require
  * a mounted folder so gating behaves the same as production. `sessionStore`
  * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts; `sandbox`,
- * `sessionFsCodex` and `sessionFsCodexRollouts` serve session-filesystem workspaces.
+ * `sessionFsCodex` and `sessionFsCodexRollouts` serve session-filesystem workspaces;
+ * `folderBayma` and `claudeQueryFactory`, when given, stand in for a folder
+ * workspace's bayma and for Claude Code in every adapter made.
  */
 export function createHarnessRegistry({
   config = {},
@@ -252,6 +262,8 @@ export function createHarnessRegistry({
   sandbox = null,
   sessionFsCodex = null,
   sessionFsCodexRollouts = null,
+  folderBayma,
+  claudeQueryFactory,
 }: HarnessRegistryOptions = {}): HarnessRegistry {
   const adapters = new Map<string, Harness>();
   const getFor = (name: string, workingDirectory: string | null | undefined): Harness => {
@@ -268,7 +280,7 @@ export function createHarnessRegistry({
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox, sessionFsCodex, sessionFsCodexRollouts });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox, sessionFsCodex, sessionFsCodexRollouts, folderBayma, claudeQueryFactory });
       adapters.set(key, adapter);
     }
     return adapter;

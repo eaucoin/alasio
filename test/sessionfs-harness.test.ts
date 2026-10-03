@@ -202,7 +202,7 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
       return true;
     },
   };
-  const harness = createClaudeHarness({ workingDirectory: WORKSPACE, sandbox, sessionApi, queryFactory });
+  const harness = createClaudeHarness({ workingDirectory: WORKSPACE, sandbox, sessionApi, claudeQueryFactory: queryFactory });
   const persistence: TurnPersistence = {
     createPendingResponse: () => "pending-1",
     markPendingAsPosted: () => undefined,

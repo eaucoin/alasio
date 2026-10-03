@@ -190,6 +190,25 @@ test("completed response recovery enqueues one final answer exactly once", async
   }
 });
 
+test("a reply waiting to be retried holds back the replies queued after it to its chat, and no other chat's", () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-outbox-order-"));
+  try {
+    const store = new SqliteStore(root);
+    for (const chatId of ["1", "2"]) store.setActiveHarness(store.upsertConversation({ chatId, user: { id: Number(chatId) } }), CODEX_HARNESS);
+    const first = store.enqueueOutboxText({ chatId: "1", text: "first" });
+    store.enqueueOutboxText({ chatId: "1", text: "second" });
+    store.enqueueOutboxText({ chatId: "2", text: "elsewhere" });
+    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["first", "elsewhere"]);
+    store.rescheduleOutbox(first, new Error("Bad Gateway"), 60_000);
+    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["elsewhere"]);
+    store.markOutboxSent(first);
+    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["second", "elsewhere"]);
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("outbox migration keeps sent evidence over a pending duplicate", () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-outbox-migration-"));
   try {
@@ -273,6 +292,28 @@ test("restart reconciliation preserves upstream-completed prompt jobs", () => {
     store.markPromptJobUpstreamCompleted(job.id, "session", "turn");
     assert.deepEqual(store.recoverPromptJobsAfterRestart(), [conversationId]);
     assert.equal(store.getPromptJob(job.id)?.state, "completed");
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restart reconciliation runs again only the prompts never sent to the agent", () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-dispatched-job-"));
+  try {
+    const store = new SqliteStore(root);
+    const jobs = new Map<string, string>();
+    for (const [chatId, dispatched] of [["1", false], ["2", true]] as const) {
+      const conversationId = store.upsertConversation({ chatId, user: { id: Number(chatId) } });
+      store.setActiveHarness(conversationId, CODEX_HARNESS);
+      const job = store.enqueuePromptJob({ conversationId, chatId, messageId: "10", prompt: "do it" });
+      store.claimNextPromptJob(conversationId);
+      if (dispatched) store.markPromptJobDispatched(job.id);
+      jobs.set(chatId, job.id);
+    }
+    assert.deepEqual(store.recoverPromptJobsAfterRestart(), []);
+    assert.equal(store.getPromptJob(jobs.get("1") ?? "")?.state, "pending");
+    assert.equal(store.getPromptJob(jobs.get("2") ?? "")?.state, "interrupted");
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

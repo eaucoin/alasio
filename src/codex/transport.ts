@@ -55,6 +55,8 @@ export interface CodexStreamParams extends CodexSessionOptions {
     readonly turnTimer: TurnTimer;
     /** Makes the Codex SDK client of the exec transport, for tests. */
     readonly codexFactory?: (() => CodexExecClient) | undefined;
+    /** Called just before the prompt is sent, after which the agent may act on it. */
+    readonly onPromptDispatched?: (() => void) | undefined;
 }
 
 /** A turn already running in the app-server (a goal's), to attach to. */
@@ -89,7 +91,7 @@ export function stopCodexTransport(): void {
     stopCodexAppServer();
 }
 
-async function createAppServerStream({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, controller, turnTimer, client = codexAppServerClient, }: CodexStreamParams): Promise<CodexEventStream> {
+async function createAppServerStream({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, controller, turnTimer, client = codexAppServerClient, onPromptDispatched, }: CodexStreamParams): Promise<CodexEventStream> {
     let sessionId = resumeSession;
     if (resumeSession) {
         sessionId = await client.ensureThread({
@@ -120,6 +122,7 @@ async function createAppServerStream({ resumeSession, threadKey, workingDirector
         config: codexConfig,
         model,
         effort,
+        onPromptDispatched,
     });
     turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
     return {
@@ -144,7 +147,7 @@ async function createAttachedAppServerStream({ sessionId, turnId, persistence, p
     };
 }
 
-async function createExecSdkStream({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, controller, turnTimer, }: CodexStreamParams): Promise<CodexEventStream> {
+async function createExecSdkStream({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, controller, turnTimer, onPromptDispatched, }: CodexStreamParams): Promise<CodexEventStream> {
     const codex = codexFactory
         ? codexFactory()
         : new Codex({
@@ -173,6 +176,7 @@ async function createExecSdkStream({ resumeSession, workingDirectory, codexEnv, 
             networkAccessEnabled: true,
         });
     turnTimer("thread.handle.created", { mode: resumeSession ? "resume" : "start" });
+    onPromptDispatched?.();
     const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
     turnTimer("run_streamed.returned");
     return {
