@@ -98,7 +98,7 @@ test("a reply Telegram rate-limits is sent again after the wait it asks for, onc
   assert.ok(refused && delivered && delivered.at - refused.at >= 1_000, "the reply waited out retry_after");
 });
 
-test("a reply Telegram refuses outright is retried by the outbox later, and a later reply overtakes it", { timeout: 30_000 }, async (t) => {
+test("a reply Telegram refuses outright is retried by the outbox later, and those queued after it wait for it", { timeout: 30_000 }, async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
   await twoQueuedPrompts(alasio, "First", "Second");
@@ -109,11 +109,9 @@ test("a reply Telegram refuses outright is retried by the outbox later, and a la
   await answerTurnStart(codex, "thread-1", "turn-2");
   answerTurn(codex, "thread-1", "turn-2", "Reply two");
   // The outbox retries a refused reply 10 seconds on, at its next pass every 5 seconds.
-  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Reply one" && call.status === 200, { timeoutMs: 20_000 });
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Reply two" && call.status === 200, { timeoutMs: 20_000 });
 
-  // characterizes current behaviour: replies keep their order only within one pass of the
-  // outbox; a reply deferred to a later pass is overtaken by one queued after it.
-  assert.deepEqual(replyAttempts(alasio), [["Reply one", 502], ["Reply two", 200], ["Reply one", 200]]);
-  const [refused, , retried] = telegram.callsTo("sendRichMessage");
+  assert.deepEqual(replyAttempts(alasio), [["Reply one", 502], ["Reply one", 200], ["Reply two", 200]]);
+  const [refused, retried] = telegram.callsTo("sendRichMessage");
   assert.ok(refused && retried && retried.at - refused.at >= 10_000, "the outbox waited its backoff");
 });

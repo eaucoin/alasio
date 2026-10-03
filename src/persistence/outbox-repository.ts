@@ -85,11 +85,20 @@ export class SqliteOutboxRepository {
     return enqueue();
   }
 
+  /**
+   * The replies due for delivery: each chat's in the order they were queued, so a reply
+   * waiting to be retried holds back those queued after it to the same chat.
+   */
   getDue(limit = 20): OutboxEntry[] {
     return this.db.prepare<[availableAt: number, limit: number], OutboxEntryRow>(`
-      select * from telegram_outbox
+      select * from telegram_outbox reply
       where state = 'pending' and available_at <= ?
-      order by available_at asc, created_at asc
+        and not exists (
+          select 1 from telegram_outbox earlier
+          where earlier.chat_id = reply.chat_id and earlier.state = 'pending'
+            and (earlier.created_at < reply.created_at or (earlier.created_at = reply.created_at and earlier.rowid < reply.rowid))
+        )
+      order by created_at asc, rowid asc
       limit ?
     `).all(Date.now() / 1000, limit).map((row) => ({
       ...row,
