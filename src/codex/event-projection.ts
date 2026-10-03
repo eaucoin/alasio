@@ -30,6 +30,14 @@ export interface FileChange {
   readonly kind: SdkFileChangeItem["changes"][number]["kind"] | v2.PatchChangeKind;
 }
 
+/**
+ * Whether a change deletes its file: Codex exec names the kind, the app-server's
+ * protocol describes it as an object.
+ */
+function isDeletion(kind: FileChange["kind"]): boolean {
+  return typeof kind === "string" ? kind === "delete" : kind.type === "delete";
+}
+
 /** Files the agent changed. */
 export interface FileChangeItem {
   readonly type: "file_change";
@@ -157,7 +165,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
                 for (const change of item.changes) {
                     appendBlock(blockSequence, persistence, pendingResponseId, {
                         type: "tool",
-                        name: change.kind === "delete" ? "Delete" : "Edit",
+                        name: isDeletion(change.kind) ? "Delete" : "Edit",
                     });
                 }
             }

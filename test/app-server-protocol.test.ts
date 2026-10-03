@@ -6,6 +6,7 @@ import { AppServerClient } from "../src/codex/app-server/client.ts";
 import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.ts";
 import { AppServerThreadClient } from "../src/codex/app-server/thread-client.ts";
 import { getNotificationTurnId, mapNotificationToSdkEvent, notificationMatchesTurn } from "../src/codex/app-server/protocol.ts";
+import { mapItemToBlocks } from "../src/codex/event-projection.ts";
 
 test("app-server protocol reads turn identity from direct and nested notification shapes", () => {
   assert.equal(getNotificationTurnId({ params: { turnId: "turn-direct" } }), "turn-direct");
@@ -443,3 +444,12 @@ test("an error notification reports Codex's own message, unless Codex is retryin
   assert.equal(error(true), null);
 });
 
+test("a file change shows a deletion as one, from the app-server and from exec", () => {
+  const names = (changes) => {
+    const blockSequence = [];
+    mapItemToBlocks({ type: "file_change", id: "item-1", changes }, { blockSequence, persistence: { appendBlockToPending() {} }, pendingResponseId: "pending-1" });
+    return blockSequence.map((block) => block.name);
+  };
+  assert.deepEqual(names([{ path: "a", kind: { type: "delete" } }, { path: "b", kind: { type: "update", move_path: null } }, { path: "c", kind: { type: "add" } }]), ["Delete", "Edit", "Edit"]);
+  assert.deepEqual(names([{ path: "a", kind: "delete" }, { path: "b", kind: "update" }]), ["Delete", "Edit"]);
+});
