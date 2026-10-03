@@ -1,12 +1,19 @@
-// @ts-nocheck
 import { buildRestartSyntheticText } from "../operator/restart-prompts.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+
+/** Where the turns a restart cut short, and the restarts themselves, are kept: alasio's store. */
+export type RestartRecoveryStore =
+  & Pick<SqliteStore, "getActiveTurns" | "getRestartEvent" | "recordRestartEvent" | "markPendingAsPosted" | "clearActiveTurn" | "stageRestartRecovery">
+  & Partial<Pick<SqliteStore, "getActiveHarness">>;
 
 export class RestartRecovery {
-  constructor({ store }) {
+  private readonly store: RestartRecoveryStore;
+
+  constructor({ store }: { readonly store: RestartRecoveryStore }) {
     this.store = store;
   }
 
-  async recoverInterruptedTurns() {
+  async recoverInterruptedTurns(): Promise<void> {
     const activeTurns = this.store.getActiveTurns();
     for (const turn of activeTurns) {
       const conversationId = turn.thread_key;
@@ -25,7 +32,7 @@ export class RestartRecovery {
     }
   }
 
-  recordExternalRestartEventsForActiveTurns() {
+  recordExternalRestartEventsForActiveTurns(): void {
     for (const turn of this.store.getActiveTurns()) {
       const conversationId = turn.thread_key;
       if (this.store.getRestartEvent(conversationId)) {

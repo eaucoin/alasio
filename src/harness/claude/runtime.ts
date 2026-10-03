@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Claude Code runtime adapter for alasio turns.
  *
@@ -12,8 +11,12 @@
  * work settles are delivered as their own replies.
  */
 import { randomUUID } from "node:crypto";
-import { CLAUDE_HARNESS } from "../names.ts";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type McpServerConfig, type Options, type SessionStore } from "@anthropic-ai/claude-agent-sdk";
+import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { ModelChoice } from "../../persistence/conversation-repository.ts";
+import type { TurnParams, TurnResult } from "../index.ts";
+import type { ClaudeLiveSessions } from "./live-sessions.ts";
+import type { ClaudeSessionApi } from "./sessions.ts";
 import { appendBlock, isVisibleCodexItem, mapItemToBlocks } from "../../codex/event-projection.ts";
 import { createTurnTimer } from "../../codex/turn-timing.ts";
 import {
@@ -43,16 +46,41 @@ import { mirrorOnly } from "./session-store.ts";
 
 const log = createLogger("claude-runtime");
 
-function getErrorMessage(error) {
+/** Starts a Claude Code query: the SDK's `query`, or a test's stand-in. */
+export type ClaudeQueryFactory = typeof query;
+
+/** What buildClaudeQueryOptions is given. */
+export interface ClaudeQueryOptionsInput {
+  readonly workingDirectory: string;
+  readonly claudeEnv: NonNullable<Options["env"]>;
+  /** None for a session filesystem, whose one server comes with its confinement. */
+  readonly mcpServers?: Record<string, McpServerConfig> | undefined;
+  readonly resumeSession?: string | null | undefined;
+  readonly resumeExists?: boolean | undefined;
+  readonly controller: AbortController;
+  readonly hooks: NonNullable<Options["hooks"]>;
+  readonly env?: Readonly<NodeJS.ProcessEnv>;
+  readonly modelChoice?: ModelChoice | null;
+  readonly sessionStore?: SessionStore | null;
+  readonly sessionFsBayma?: BaymaEndpoint | null;
+}
+
+/** A turn as the adapter hands it on, with the live sessions that run it. */
+export interface ClaudeTurnRequest extends TurnParams {
+  readonly sessions?: ClaudeSessionApi;
+  readonly liveSessions: ClaudeLiveSessions;
+}
+
+function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function isIntentionalTurnInterrupt(reason) {
+function isIntentionalTurnInterrupt(reason: unknown): boolean {
   const message = typeof reason === "string" ? reason : getErrorMessage(reason);
   return message === "Interrupted from Telegram" || message === "Telegram swerve";
 }
 
-export function startFreshClaudeSession({ threadKey }) {
+export function startFreshClaudeSession({ threadKey }: { readonly threadKey: string }): string {
   const sessionId = randomUUID();
   log.info(`new_session.reserved thread_key=${JSON.stringify(threadKey)} session=${JSON.stringify(sessionId.slice(0, 8))}`);
   return sessionId;
@@ -80,8 +108,8 @@ export function buildClaudeQueryOptions({
   modelChoice = null,
   sessionStore = null,
   sessionFsBayma = null,
-}) {
-  const options = {
+}: ClaudeQueryOptionsInput): Options {
+  const options: Options = {
     cwd: workingDirectory,
     env: claudeEnv,
     abortController: controller,
@@ -92,8 +120,10 @@ export function buildClaudeQueryOptions({
     persistSession: true,
     disallowedTools: [...CLAUDE_DISALLOWED_TOOLS],
     hooks,
-    mcpServers,
   };
+  if (mcpServers !== undefined) {
+    options.mcpServers = mcpServers;
+  }
   // A session filesystem's CLI keeps only the tools that stay off this machine, and
   // reaches its workspace through bayma alone (sessionfs.ts).
   if (sessionFsBayma) {
@@ -132,7 +162,7 @@ export function buildClaudeQueryOptions({
 /** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
 export const UNANSWERED_PROMPT_GRACE_MS = 15_000;
 
-export function isOperatorInterrupt(reason) {
+export function isOperatorInterrupt(reason: unknown): boolean {
   return isIntentionalTurnInterrupt(reason);
 }
 
@@ -163,7 +193,7 @@ export {
  * starting or replacing that process when the mounted session, folder or
  * model differs from the one it serves.
  */
-export async function executeClaudeTurn(params) {
+export async function executeClaudeTurn(params: ClaudeTurnRequest): Promise<TurnResult> {
   const liveSessions = params.liveSessions;
   if (!liveSessions) {
     throw new Error("executeClaudeTurn requires the adapter's live session registry");

@@ -1,5 +1,6 @@
-// @ts-nocheck
+import type { v2 } from "../../.types/codex/index.js";
 import {
+  type CodexScope,
   executeCodexTurn,
   forkCodexSession,
   shutdownCodexRuntime,
@@ -7,15 +8,18 @@ import {
   warmCodexSession,
 } from "../codex/runtime.ts";
 import { resolveCodexModelChoice } from "../codex/model.ts";
-import { createCodexSessionApi, folderListingScope } from "../codex/sessions.ts";
+import { type CodexListingScope, createCodexSessionApi, folderListingScope } from "../codex/sessions.ts";
+import type { SessionFsCodex } from "../codex/sessionfs.ts";
+import type { SessionFilesystems } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { createLogger } from "../shared/log.ts";
+import type { Harness, HarnessOptions, ModelOption } from "./index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "./names.ts";
 
 const log = createLogger("codex-harness");
 
 /** The app-server's model entry, in the shape /model shows for either harness. */
-function toModelOption(model) {
+function toModelOption(model: v2.Model): ModelOption {
   const efforts = (model.supportedReasoningEfforts ?? [])
     .map((entry) => (typeof entry === "string" ? entry : entry?.reasoningEffort))
     .filter(Boolean);
@@ -30,7 +34,30 @@ function toModelOption(model) {
   };
 }
 
-const errorText = (error) => (error instanceof Error ? error.message : String(error));
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** A session-filesystem workspace's volume, with the Sandbox and the app-server that serve it. */
+interface ServedSessionFs {
+  readonly volumeId: string;
+  readonly sandbox: SessionFilesystems;
+  readonly sessionFsCodex: SessionFsCodex;
+}
+
+/** What serves the workspace at `workingDirectory` if it is a session filesystem; null for a folder. */
+function servedSessionFs(
+  workingDirectory: string,
+  sandbox: SessionFilesystems | null,
+  sessionFsCodex: SessionFsCodex | null,
+): ServedSessionFs | null {
+  const workspace = parseWorkspace(workingDirectory);
+  if (workspace?.kind !== "sessionfs") {
+    return null;
+  }
+  if (!(sandbox && sessionFsCodex)) {
+    throw new Error("this conversation's workspace is a session filesystem, which this deployment does not enable");
+  }
+  return { volumeId: workspace.volumeId, sandbox, sessionFsCodex };
+}
 
 /**
  * Codex harness adapter over the app-server runtime, with its sessions as the
@@ -51,26 +78,22 @@ export function createCodexHarness({
   sandbox = null,
   sessionFsCodex = null,
   sessionFsCodexRollouts = null,
-}) {
-  const workspace = parseWorkspace(workingDirectory);
-  const sessionFs = workspace?.kind === "sessionfs";
-  if (sessionFs && !(sandbox && sessionFsCodex)) {
-    throw new Error("this conversation's workspace is a session filesystem, which this deployment does not enable");
-  }
+}: HarnessOptions): Harness {
+  const sessionFs = servedSessionFs(workingDirectory, sandbox, sessionFsCodex);
   const rollouts = sessionFs ? sessionFsCodexRollouts : codexRollouts;
-  const directory = sessionFs ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
+  const directory = sessionFs ? sessionFs.sandbox.harnessDirectory(sessionFs.volumeId) : workingDirectory;
 
   // What each call runs against: `scope()` for a thread's work (a session filesystem's
   // brings its Sandbox up; a folder's is built by the runtime), `listingScope()` for
   // thread and model lists and goals, which need no Sandbox.
   const scope = sessionFs
-    ? async () => sessionFsCodex.scope({ directory, bayma: (await sandbox.ensureSession(workspace.volumeId)).bayma })
+    ? async (): Promise<CodexScope> => sessionFs.sessionFsCodex.scope({ directory, bayma: (await sessionFs.sandbox.ensureSession(sessionFs.volumeId)).bayma })
     : null;
   const listingScope = sessionFs
-    ? async () => await sessionFsCodex.listingScope({ directory })
+    ? async (): Promise<CodexListingScope> => await sessionFs.sessionFsCodex.listingScope({ directory })
     : folderListingScope(workingDirectory);
 
-  async function ensureRollouts(sessionId) {
+  async function ensureRollouts(sessionId: string | null | undefined): Promise<void> {
     if (!rollouts || !sessionId) return;
     try {
       await rollouts.restore([sessionId]);
@@ -79,7 +102,7 @@ export function createCodexHarness({
     }
   }
 
-  async function flushRollouts(sessionId) {
+  async function flushRollouts(sessionId: string | null | undefined): Promise<void> {
     if (!rollouts || !sessionId) return;
     try {
       await rollouts.flush(sessionId);
@@ -88,9 +111,10 @@ export function createCodexHarness({
     }
   }
 
-  async function goalCall(method, args) {
+  /** The app-server goals are read and set through, and the directory and env each call names. */
+  async function goalScope() {
     const { cwd, codexEnv, client } = await listingScope();
-    return await client[method]({ ...args, cwd, env: codexEnv });
+    return { client, cwd, env: codexEnv };
   }
 
   return {
@@ -108,13 +132,16 @@ export function createCodexHarness({
     /** Codex's goals on a thread, for operator/goal-control.ts. */
     goals: {
       async read({ threadId }) {
-        return (await goalCall("getGoal", { threadId }))?.goal ?? null;
+        const { client, cwd, env } = await goalScope();
+        return (await client.getGoal({ threadId, cwd, env }))?.goal ?? null;
       },
       async set({ threadId, objective, status }) {
-        return (await goalCall("setGoal", { threadId, objective, status }))?.goal ?? null;
+        const { client, cwd, env } = await goalScope();
+        return (await client.setGoal({ threadId, objective, status, cwd, env }))?.goal ?? null;
       },
       async clear({ threadId }) {
-        return await goalCall("clearGoal", { threadId });
+        const { client, cwd, env } = await goalScope();
+        return await client.clearGoal({ threadId, cwd, env });
       },
       async waitForTurnId(threadId, timeoutMs) {
         const { client } = await listingScope();

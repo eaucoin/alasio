@@ -1,5 +1,23 @@
-// @ts-nocheck
-import { randomUUID } from "node:crypto";
+import { randomUUID, type UUID } from "node:crypto";
+
+import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+
+import type { Logger } from "../../shared/log.ts";
+
+/** The streaming prompt of a Claude Code query: messages pushed in until it is ended. */
+export interface PromptChannel {
+  readonly iterable: AsyncIterable<SDKUserMessage>;
+  /** Queues a message; false once the channel has ended. */
+  push(value: SDKUserMessage): boolean;
+  end(): void;
+  readonly ended: boolean;
+}
+
+/** What instrumentPromptChannel logs a channel's moves with. */
+export interface PromptChannelLogging {
+  readonly threadKey: string;
+  readonly log: Logger;
+}
 
 /**
  * Pushable async iterable used as the Claude Agent SDK streaming prompt.
@@ -8,39 +26,41 @@ import { randomUUID } from "node:crypto";
  * operator guidance can be pushed into the live session; ending the channel
  * after the result message lets the SDK generator complete normally.
  */
-export function createPromptChannel() {
-  const queue = [];
-  const waiters = [];
+export function createPromptChannel(): PromptChannel {
+  const queue: SDKUserMessage[] = [];
+  const waiters: ((result: IteratorResult<SDKUserMessage, undefined>) => void)[] = [];
   let ended = false;
 
-  function push(value) {
+  function push(value: SDKUserMessage): boolean {
     if (ended) {
       return false;
     }
-    if (waiters.length > 0) {
-      waiters.shift()({ value, done: false });
+    const waiter = waiters.shift();
+    if (waiter) {
+      waiter({ value, done: false });
     } else {
       queue.push(value);
     }
     return true;
   }
 
-  function end() {
+  function end(): void {
     if (ended) {
       return;
     }
     ended = true;
-    while (waiters.length > 0) {
-      waiters.shift()({ value: undefined, done: true });
+    for (const waiter of waiters.splice(0)) {
+      waiter({ value: undefined, done: true });
     }
   }
 
-  const iterable = {
+  const iterable: AsyncIterable<SDKUserMessage, undefined> = {
     [Symbol.asyncIterator]() {
       return {
         next() {
-          if (queue.length > 0) {
-            return Promise.resolve({ value: queue.shift(), done: false });
+          const queued = queue.shift();
+          if (queued) {
+            return Promise.resolve({ value: queued, done: false });
           }
           if (ended) {
             return Promise.resolve({ value: undefined, done: true });
@@ -67,7 +87,7 @@ export function createPromptChannel() {
   };
 }
 
-export function buildClaudeUserMessage(text, uuid = randomUUID()) {
+export function buildClaudeUserMessage(text: string, uuid: UUID = randomUUID()): SDKUserMessage {
   return {
     type: "user",
     uuid,
@@ -93,7 +113,7 @@ export function buildClaudeUserMessage(text, uuid = randomUUID()) {
  * our turn is still being planned, and the first tool call the model then
  * makes is cancelled.
  */
-export function promptUuidsAnsweredBy(message, promptUuids) {
+export function promptUuidsAnsweredBy(message: SDKMessage, promptUuids: string | Set<string>): string[] {
   const ours = promptUuids instanceof Set ? promptUuids : new Set([promptUuids]);
   if (ours.size === 0 || !message || message.type !== "result") {
     return [];
@@ -107,7 +127,7 @@ export function promptUuidsAnsweredBy(message, promptUuids) {
   return [];
 }
 
-export function resultAnswersPrompt(message, promptUuids) {
+export function resultAnswersPrompt(message: SDKMessage, promptUuids: string | Set<string>): boolean {
   return promptUuidsAnsweredBy(message, promptUuids).length > 0;
 }
 
@@ -123,7 +143,7 @@ export function resultAnswersPrompt(message, promptUuids) {
  * no record on our side of whether the channel moved at all, so a cancelled
  * call cannot be attributed.
  */
-export function instrumentPromptChannel(channel, { threadKey, log }) {
+export function instrumentPromptChannel(channel: PromptChannel, { threadKey, log }: PromptChannelLogging): PromptChannel {
   const at = () => new Date().toISOString();
   return {
     ...channel,

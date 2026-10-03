@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Codex for session-filesystem workspaces: one app-server for all of them, run by alasio
  * outside every sandbox, whose only way into a workspace is that workspace's bayma.
@@ -22,25 +21,29 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
+import type { BaymaEndpoint } from "../kube/sandboxes.ts";
 import { AppServerClient } from "./app-server/client.ts";
-import { startAppServerProcess } from "./app-server/process.ts";
-import { codexHome } from "./env.ts";
-import { startLoginRelay } from "./login-relay.ts";
+import { type SpawnAppServer, startAppServerProcess } from "./app-server/process.ts";
+import { type CodexEnv, codexHome } from "./env.ts";
+import { type LoginRelay, startLoginRelay } from "./login-relay.ts";
+import type { CodexScope } from "./runtime.ts";
+import type { CodexListingScope } from "./sessions.ts";
+import type { CodexThreadConfig } from "./thread-config.ts";
 import { getCodexTransportMode } from "../config.ts";
 
 /** The env var the relay's bearer is in, the model provider's `env_key`. */
 const LOGIN_BEARER_ENV = "ALASIO_CODEX_LOGIN";
 const PROVIDER = "alasio_login_relay";
 
-const toml = (value) => JSON.stringify(value);
+const toml = (value: string): string => JSON.stringify(value);
 
 /** Where the session-filesystem Codex keeps its home, under alasio's state directory. */
-export function sessionFsCodexHome(stateDir) {
+export function sessionFsCodexHome(stateDir: string): string {
   return join(stateDir, "sessionfs", "codex");
 }
 
 /** The `config.toml` of that home: the relay at `relayUrl` as the one model provider. */
-export function sessionFsCodexConfigToml(relayUrl) {
+export function sessionFsCodexConfigToml(relayUrl: string): string {
   return [
     `model_provider = ${toml(PROVIDER)}`,
     "",
@@ -57,13 +60,35 @@ export function sessionFsCodexConfigToml(relayUrl) {
 export const SESSION_FS_ENVIRONMENTS_TOML = "include_local = false\n";
 
 /** A thread's config in the workspace reached through `bayma` (`{ url, headers }`). */
-export function sessionFsThreadConfig(bayma) {
+export function sessionFsThreadConfig(bayma: BaymaEndpoint): CodexThreadConfig {
   return {
     developer_instructions: SESSION_FS_AGENT_INSTRUCTIONS,
     mcp_servers: {
       bayma: { url: bayma.url, http_headers: bayma.headers, startup_timeout_sec: 60 },
     },
   };
+}
+
+export interface SessionFsCodexOptions {
+  readonly home: string;
+  readonly authFile?: string;
+  readonly startRelay?: typeof startLoginRelay;
+  readonly spawnProcess?: SpawnAppServer;
+}
+
+/** The session-filesystem Codex, as createSessionFsCodex returns it. */
+export interface SessionFsCodex {
+  readonly home: string;
+  scope(params: { readonly directory: string; readonly bayma: BaymaEndpoint }): Promise<CodexScope>;
+  listingScope(params: { readonly directory: string }): Promise<CodexListingScope>;
+  stop(): Promise<void>;
+}
+
+/** What the first call that needs them starts: the relay, the app-server's env, and its client. */
+interface Started {
+  readonly relay: LoginRelay;
+  readonly env: CodexEnv;
+  readonly client: AppServerClient;
 }
 
 /**
@@ -77,19 +102,19 @@ export function createSessionFsCodex({
   authFile = join(codexHome(), "auth.json"),
   startRelay = startLoginRelay,
   spawnProcess = startAppServerProcess,
-}) {
+}: SessionFsCodexOptions): SessionFsCodex {
   // The app-server's HOME too, so nothing of the operator's home (skills under
   // ~/.agents, say) is found through it.
   const homeDir = join(home, "home");
-  let started = null;
+  let started: Promise<Started> | null = null;
 
-  function start() {
+  function start(): Promise<Started> {
     started ??= (async () => {
       const relay = await startRelay({ authFile });
       mkdirSync(homeDir, { recursive: true });
       writeFileSync(join(home, "config.toml"), sessionFsCodexConfigToml(relay.url));
       writeFileSync(join(home, "environments.toml"), SESSION_FS_ENVIRONMENTS_TOML);
-      const env = { PATH: process.env.PATH ?? "", HOME: homeDir, CODEX_HOME: home, [LOGIN_BEARER_ENV]: relay.bearer };
+      const env = { PATH: process.env["PATH"] ?? "", HOME: homeDir, CODEX_HOME: home, [LOGIN_BEARER_ENV]: relay.bearer };
       // The process runs in the home, not in the first workspace directory that asks.
       const client = new AppServerClient({ spawnProcess: (options) => spawnProcess({ ...options, cwd: home }) });
       return { relay, env, client };
@@ -118,7 +143,7 @@ export function createSessionFsCodex({
 
     async stop() {
       if (!started) return;
-      const { relay, client } = await started.catch(() => ({}));
+      const { relay, client } = await started.catch((): Partial<Started> => ({}));
       started = null;
       client?.stop();
       await relay?.close();

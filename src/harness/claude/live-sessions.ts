@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * One long-lived Claude Code process per conversation.
  *
@@ -20,8 +19,26 @@
  */
 import { randomUUID } from "node:crypto";
 
+import type {
+  HookCallback,
+  Query,
+  SDKBackgroundTasksChangedMessage,
+  SDKResultMessage,
+  SessionStore,
+} from "@anthropic-ai/claude-agent-sdk";
+
+import type { CommandEventPolicy } from "../../codex/command-event-policy.ts";
+import type { ResponseBlock } from "../../codex/event-projection.ts";
+import type { TurnTimer } from "../../codex/turn-timing.ts";
+import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import type { BaymaMcpServer, HostBaymaScope } from "../../mcp/bayma.ts";
+import type { SqliteStore } from "../../persistence/store.ts";
+import type { ActiveQueries, ActiveQuery, TransportTurn, TurnParams, TurnResult } from "../index.ts";
 import { CLAUDE_HARNESS } from "../names.ts";
+import type { PromptChannel } from "./prompt-channel.ts";
+import type { ClaudeSessionApi } from "./sessions.ts";
 import {
+  type ClaudeQueryFactory,
   appendBlock,
   buildClaudeEnv,
   buildClaudeQueryOptions,
@@ -57,17 +74,108 @@ import { claudeTelemetryEnv } from "./telemetry.ts";
 
 const log = createLogger("claude-live");
 
-function modelKey(persistence, threadKey) {
+/** A background task Claude Code reports live: a shell or agent it started that is still running. */
+export type BackgroundTask = SDKBackgroundTasksChangedMessage["tasks"][number];
+
+/**
+ * The turn an operator's prompt started on a live process: the prompts it waits on
+ * answers to (its own and any steered into it), the response it is building, and how
+ * it reports back when it ends.
+ */
+export interface OperatorTurn {
+  readonly promptUuids: Set<string>;
+  readonly blockSequence: ResponseBlock[];
+  readonly pendingResponseId: string;
+  readonly persistence: SqliteStore;
+  readonly turnTimer: TurnTimer;
+  readonly onStarted: (() => void) | undefined;
+  readonly onTransportCompleted: ((turn: TransportTurn) => void) | undefined;
+  responseCompleted: boolean;
+  interrupted: boolean;
+  /** The first command the database guardrail denied in this turn. */
+  blockedGuardrailCommand: string | null;
+  /** Bounds the wait for a steered prompt's answer once the turn's own prompt is answered. */
+  unansweredTimer: NodeJS.Timeout | undefined;
+  /** Steers that arrived before the process was ready, pushed after the prompt. */
+  readonly earlySteers: string[];
+  readonly commandPolicy: CommandEventPolicy;
+  readonly resolve: (result: TurnResult) => void;
+  readonly activeQuery: ActiveQuery;
+  firstEventLogged?: boolean;
+  firstVisibleItemLogged?: boolean;
+}
+
+/** A turn Claude Code started on its own, delivered as a reply of its own. */
+export interface CliTurn {
+  readonly pendingResponseId: string;
+  readonly blockSequence: ResponseBlock[];
+  /** Prompts steered into it. */
+  readonly promptUuids: Set<string>;
+  readonly activeQuery: ActiveQuery;
+}
+
+/** How a live process came to serve its session: resuming it, starting it under a reserved id, or starting a new one. */
+export type ClaudeHostMode = "resume" | "reserved" | "start";
+
+/** The live Claude Code process serving one conversation, and the turns it is running. */
+export interface ClaudeHost {
+  readonly threadKey: string;
+  /** The model and effort it runs on, as modelKey renders them. */
+  readonly key: string;
+  readonly baymaUrl: string | null;
+  sessionId: string | null;
+  readonly channel: PromptChannel;
+  readonly controller: AbortController;
+  sdkQuery: Query | null;
+  loop?: Promise<void>;
+  readonly mode: ClaudeHostMode;
+  initialized?: boolean;
+  closed: boolean;
+  closeReason: string | null;
+  current: OperatorTurn | null;
+  cliTurn: CliTurn | null;
+  backgroundTasks: BackgroundTask[];
+  /** Prompts of finished turns, whose late results are ignored. */
+  readonly retiredUuids: Set<string>;
+  readonly interruptedUuids: Set<string>;
+  persistence: SqliteStore;
+  activeQueries: ActiveQueries;
+  chatId: string;
+  messageId: string;
+  onBackgroundResponse: () => void;
+  notifyIdle: () => void;
+}
+
+/** What createClaudeLiveSessions is given. */
+export interface ClaudeLiveSessionsOptions {
+  readonly workingDirectory: string;
+  readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
+  readonly sessionStore?: SessionStore | null;
+  readonly sessionFsBayma?: (() => Promise<BaymaEndpoint>) | null;
+  readonly folderBayma?: (scope: Pick<HostBaymaScope, "threadKey">) => Promise<BaymaMcpServer>;
+  readonly queryFactory?: ClaudeQueryFactory | undefined;
+}
+
+/** The live Claude Code processes of one working directory, one per conversation. */
+export interface ClaudeLiveSessions {
+  runTurn(params: TurnParams): Promise<TurnResult>;
+  /** The live process serving a conversation, if any (for tests and diagnostics). */
+  get(threadKey: string): ClaudeHost | null;
+  close(threadKey: string, reason?: string): void;
+  closeAll(reason?: string): Promise<void>;
+}
+
+function modelKey(persistence: SqliteStore, threadKey: string): string {
   const choice = persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null;
   return JSON.stringify({ model: getClaudeModel(process.env, choice) ?? null, effort: getClaudeEffort(process.env, choice) ?? null });
 }
 
-function describeTasks(tasks) {
+function describeTasks(tasks: readonly BackgroundTask[]): string {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
 /** A folder conversation's bayma, from the deployment's host profile. */
-const defaultFolderBayma = ({ threadKey }) => folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey });
+const defaultFolderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) => folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey });
 
 /**
  * `workingDirectory` is where the CLI runs: a folder workspace itself, with the
@@ -82,10 +190,10 @@ export function createClaudeLiveSessions({
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
   queryFactory = defaultQueryFactory,
-} = {}) {
-  const hosts = new Map();
+}: ClaudeLiveSessionsOptions): ClaudeLiveSessions {
+  const hosts = new Map<string, ClaudeHost>();
 
-  function closeHost(host, reason) {
+  function closeHost(host: ClaudeHost, reason: string): void {
     if (host.closed) {
       return;
     }
@@ -113,7 +221,7 @@ export function createClaudeLiveSessions({
    * that was not answered reports the cause unless we closed the process on
    * purpose (shutdown or replacement), in which case recovery owns it.
    */
-  function settleOnExit(host, error) {
+  function settleOnExit(host: ClaudeHost, error: unknown): void {
     const current = host.current;
     if (current) {
       host.current = null;
@@ -139,7 +247,7 @@ export function createClaudeLiveSessions({
     }
   }
 
-  function finishOperatorTurn(host, current) {
+  function finishOperatorTurn(host: ClaudeHost, current: OperatorTurn): void {
     clearTimeout(current.unansweredTimer);
     for (const uuid of current.promptUuids) {
       host.retiredUuids.add(uuid);
@@ -166,7 +274,7 @@ export function createClaudeLiveSessions({
     host.notifyIdle();
   }
 
-  function releaseCliTurn(host, cliTurn) {
+  function releaseCliTurn(host: ClaudeHost, cliTurn: CliTurn): void {
     for (const uuid of cliTurn.promptUuids) {
       host.retiredUuids.add(uuid);
     }
@@ -176,9 +284,10 @@ export function createClaudeLiveSessions({
     host.notifyIdle();
   }
 
-  async function interrupt(host, reason) {
+  async function interrupt(host: ClaudeHost, reason: string): Promise<void> {
     try {
-      await host.sdkQuery.interrupt();
+      // startHost sets the query before the host serves any turn, and only turns interrupt.
+      await host.sdkQuery!.interrupt();
     } catch (error) {
       log.warn(`interrupt failed thread=${host.threadKey}; closing the process: ${getErrorMessage(error)}`);
       closeHost(host, reason);
@@ -186,35 +295,34 @@ export function createClaudeLiveSessions({
   }
 
   /** A turn Claude Code started on its own, typically to report a settled background task. */
-  function ensureCliTurn(host) {
+  function ensureCliTurn(host: ClaudeHost): CliTurn {
     if (host.cliTurn) {
       return host.cliTurn;
     }
     const pendingResponseId = host.persistence.createPendingResponse(host.chatId, `claude-cli-turn:${randomUUID()}`, host.sessionId);
-    const cliTurn = {
+    const cliTurn: CliTurn = {
       pendingResponseId,
       blockSequence: [],
       promptUuids: new Set(),
-      activeQuery: null,
-    };
-    cliTurn.activeQuery = {
-      cliInitiated: true,
-      abort: async (abortReason) => {
-        log.info(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
-        await interrupt(host, abortReason);
-        if (host.cliTurn === cliTurn) {
-          host.cliTurn = null;
-          host.persistence.markPendingAsPosted?.(cliTurn.pendingResponseId);
-          releaseCliTurn(host, cliTurn);
-        }
-      },
-      steer: async (steerPrompt) => {
-        if (host.closed || host.cliTurn !== cliTurn) {
-          return false;
-        }
-        const uuid = randomUUID();
-        cliTurn.promptUuids.add(uuid);
-        return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+      activeQuery: {
+        cliInitiated: true,
+        abort: async (abortReason) => {
+          log.info(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
+          await interrupt(host, abortReason);
+          if (host.cliTurn === cliTurn) {
+            host.cliTurn = null;
+            host.persistence.markPendingAsPosted?.(cliTurn.pendingResponseId);
+            releaseCliTurn(host, cliTurn);
+          }
+        },
+        steer: async (steerPrompt) => {
+          if (host.closed || host.cliTurn !== cliTurn) {
+            return false;
+          }
+          const uuid = randomUUID();
+          cliTurn.promptUuids.add(uuid);
+          return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+        },
       },
     };
     host.cliTurn = cliTurn;
@@ -226,7 +334,7 @@ export function createClaudeLiveSessions({
     return cliTurn;
   }
 
-  function finishCliTurn(host, message) {
+  function finishCliTurn(host: ClaudeHost, message: SDKResultMessage): void {
     const cliTurn = ensureCliTurn(host);
     host.cliTurn = null;
     const projected = projectResultMessage(message);
@@ -248,10 +356,10 @@ export function createClaudeLiveSessions({
     }
   }
 
-  function handleResult(host, message) {
+  function handleResult(host: ClaudeHost, message: SDKResultMessage): void {
     const current = host.current;
     const answered = current ? promptUuidsAnsweredBy(message, current.promptUuids) : [];
-    if (answered.length > 0) {
+    if (current && answered.length > 0) {
       const projected = projectResultMessage(message);
       host.sessionId = message.session_id ?? host.sessionId;
       if (projected?.ok) {
@@ -325,14 +433,14 @@ export function createClaudeLiveSessions({
     );
   }
 
-  async function consume(host) {
-    let exitError = null;
+  async function consume(host: ClaudeHost, sdkQuery: Query): Promise<void> {
+    let exitError: unknown = null;
     try {
-      for await (const message of host.sdkQuery) {
+      for await (const message of sdkQuery) {
         const current = host.current;
         if (current && !current.firstEventLogged) {
           current.firstEventLogged = true;
-          current.turnTimer("first_event", { event_type: `${message.type}${message.subtype ? `.${message.subtype}` : ""}` });
+          current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
         }
         current?.onStarted?.();
         if (message.type === "system" && message.subtype === "init") {
@@ -392,7 +500,7 @@ export function createClaudeLiveSessions({
     settleOnExit(host, exitError);
   }
 
-  async function startHost(params, key, bayma) {
+  async function startHost(params: TurnParams, key: string, bayma: BaymaEndpoint | null): Promise<ClaudeHost> {
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
     // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
@@ -403,7 +511,7 @@ export function createClaudeLiveSessions({
     const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
-    const host = {
+    const host: ClaudeHost = {
       threadKey,
       key,
       baymaUrl: bayma?.url ?? null,
@@ -411,6 +519,7 @@ export function createClaudeLiveSessions({
       channel,
       controller,
       sdkQuery: null,
+      mode: resumeSession ? (resumeExists ? "resume" : "reserved") : "start",
       closed: false,
       closeReason: null,
       current: null,
@@ -429,13 +538,17 @@ export function createClaudeLiveSessions({
     };
     // Bash is disabled, so shell work arrives as code sent to bayma exec; restart
     // provenance and the database guardrail inspect the commands embedded in it.
-    const execHook = async (input) => {
+    const execHook: HookCallback = async (input) => {
       if (input?.hook_event_name !== "PreToolUse") {
         return {};
       }
-      const code = typeof input.tool_input?.code === "string" ? input.tool_input.code : "";
+      const toolInput = input.tool_input;
+      const code = typeof toolInput === "object" && toolInput !== null && "code" in toolInput && typeof toolInput.code === "string"
+        ? toolInput.code
+        : "";
       const commands = extractShellCommands(code);
-      if (commands.length === 0) {
+      const [firstCommand] = commands;
+      if (firstCommand === undefined) {
         return {};
       }
       log.info(`exec-hook seen thread=${threadKey} at=${new Date().toISOString()} code=${JSON.stringify(code.slice(0, 120))}`);
@@ -464,7 +577,7 @@ export function createClaudeLiveSessions({
       // One call records at most one restart event, so inspect the most telling command.
       const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
         ?? commands.find((candidate) => detectWorkflowWait(candidate))
-        ?? commands[0];
+        ?? firstCommand;
       policy.inspectCommand({ command: primary, sessionId: host.sessionId });
       return {};
     };
@@ -482,12 +595,12 @@ export function createClaudeLiveSessions({
         PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
       },
     });
-    host.mode = resumeSession ? (resumeExists ? "resume" : "reserved") : "start";
     // The process outlives the turn that starts it, so it starts outside that turn's
     // trace: Claude Code's traces are its own, found from a turn by its session id.
     outsideTraces(() => {
-      host.sdkQuery = queryFactory({ prompt: channel.iterable, options });
-      host.loop = consume(host);
+      const sdkQuery = queryFactory({ prompt: channel.iterable, options });
+      host.sdkQuery = sdkQuery;
+      host.loop = consume(host, sdkQuery);
     });
     log.info(`started thread=${threadKey} session=${String(host.sessionId).slice(0, 8)} mode=${host.mode}`);
     return host;
@@ -498,7 +611,7 @@ export function createClaudeLiveSessions({
    * with the same model, replaced otherwise. A turn with no mounted session asks
    * for a new one, so it never reuses a process.
    */
-  async function hostFor(params) {
+  async function hostFor(params: TurnParams): Promise<ClaudeHost> {
     const key = modelKey(params.persistence, params.threadKey);
     // A session filesystem's Sandbox is made sure of before every turn, not only when the
     // process starts: the process outlives turns, and the Sandbox may have been suspended
@@ -516,7 +629,7 @@ export function createClaudeLiveSessions({
     return host;
   }
 
-  async function runTurn(params) {
+  async function runTurn(params: TurnParams): Promise<TurnResult> {
     const { prompt, threadKey, chatId, messageId, persistence, activeQueries, onStarted } = params;
     const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt, log });
     log.info(`Querying Claude Code (resume=${params.resumeSession})`);
@@ -524,11 +637,9 @@ export function createClaudeLiveSessions({
     onStarted?.();
     const pendingResponseId = persistence.createPendingResponse(chatId, messageId, params.resumeSession);
     persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
-    let resolve;
-    const done = new Promise((resolveDone) => {
-      resolve = resolveDone;
-    });
-    const current = {
+    const { promise: done, resolve } = Promise.withResolvers<TurnResult>();
+    let host: ClaudeHost | null = null;
+    const current: OperatorTurn = {
       promptUuids: new Set(),
       blockSequence: [],
       pendingResponseId,
@@ -539,7 +650,7 @@ export function createClaudeLiveSessions({
       responseCompleted: false,
       interrupted: false,
       blockedGuardrailCommand: null,
-      unansweredTimer: null,
+      unansweredTimer: undefined,
       earlySteers: [],
       commandPolicy: createCommandEventPolicy({
         persistence,
@@ -550,40 +661,39 @@ export function createClaudeLiveSessions({
         log,
       }),
       resolve,
-    };
-    let host = null;
-    current.activeQuery = {
-      abort: async (reason) => {
-        if (!host || host.current !== current) {
+      activeQuery: {
+        abort: async (reason) => {
+          if (!host || host.current !== current) {
+            await done;
+            return;
+          }
+          current.interrupted = isOperatorInterrupt(reason);
+          current.blockSequence.length = 0;
+          for (const uuid of current.promptUuids) {
+            host.interruptedUuids.add(uuid);
+          }
+          current.turnTimer("query.interrupted", { reason: getErrorMessage(reason) });
+          log.info(`Claude Code turn interrupted by operator control: ${getErrorMessage(reason)}`);
+          await interrupt(host, reason);
+          if (host.current === current) {
+            host.current = null;
+            finishOperatorTurn(host, current);
+          }
           await done;
-          return;
-        }
-        current.interrupted = isOperatorInterrupt(reason);
-        current.blockSequence.length = 0;
-        for (const uuid of current.promptUuids) {
-          host.interruptedUuids.add(uuid);
-        }
-        current.turnTimer("query.interrupted", { reason: getErrorMessage(reason) });
-        log.info(`Claude Code turn interrupted by operator control: ${getErrorMessage(reason)}`);
-        await interrupt(host, reason);
-        if (host.current === current) {
-          host.current = null;
-          finishOperatorTurn(host, current);
-        }
-        await done;
-      },
-      steer: async (steerPrompt) => {
-        if (!host) {
-          // The process is still starting; the steer follows the prompt once it is pushed.
-          current.earlySteers.push(steerPrompt);
-          return true;
-        }
-        if (host.closed || host.current !== current) {
-          return false;
-        }
-        const uuid = randomUUID();
-        current.promptUuids.add(uuid);
-        return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+        },
+        steer: async (steerPrompt) => {
+          if (!host) {
+            // The process is still starting; the steer follows the prompt once it is pushed.
+            current.earlySteers.push(steerPrompt);
+            return true;
+          }
+          if (host.closed || host.current !== current) {
+            return false;
+          }
+          const uuid = randomUUID();
+          current.promptUuids.add(uuid);
+          return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+        },
       },
     };
     // Registered before any await so the conversation reads as busy immediately.

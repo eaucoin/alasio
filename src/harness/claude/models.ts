@@ -1,6 +1,14 @@
-// @ts-nocheck
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+
+import type { ModelOption } from "../index.ts";
 import { buildClaudeEnv } from "./env.ts";
+import type { ClaudeQueryFactory } from "./runtime.ts";
+
+/** What listClaudeModels is given. */
+export interface ClaudeModelListOptions {
+  readonly workingDirectory: string;
+  readonly queryFactory?: ClaudeQueryFactory;
+}
 
 /**
  * The models this machine's Claude login can use, in the shape /model shows.
@@ -9,8 +17,8 @@ import { buildClaudeEnv } from "./env.ts";
  * not a turn: the prompt stream below never yields, and the process is closed
  * as soon as the list arrives.
  */
-export async function listClaudeModels({ workingDirectory, queryFactory = query } = {}) {
-  const idle = {
+export async function listClaudeModels({ workingDirectory, queryFactory = query }: ClaudeModelListOptions): Promise<ModelOption[]> {
+  const idle: AsyncIterable<SDKUserMessage> = {
     async *[Symbol.asyncIterator]() {
       await new Promise(() => {});
     },

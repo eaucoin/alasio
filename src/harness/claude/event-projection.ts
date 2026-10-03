@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Project Claude Agent SDK messages into the Codex-shaped items that
  * `codex/event-projection.ts` already knows how to persist as response blocks.
@@ -7,11 +6,59 @@
  * only text delivered to the operator, and intermediate assistant text stays
  * internal commentary exactly like Codex commentary.
  */
+import type { NonNullableUsage, SDKAssistantMessage, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+
+import type {
+  CodexItem,
+  CommandExecutionItem,
+  FileChangeItem,
+  McpToolCallItem,
+  WebSearchItem,
+} from "../../codex/event-projection.ts";
+
 const EDIT_TOOL_NAMES = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const SHELL_TOOL_NAMES = new Set(["Bash", "PowerShell"]);
 const MCP_TOOL_PREFIX = "mcp__";
 
-export function parseMcpToolName(toolName) {
+/** A tool call of an assistant message, as the Messages API carries it. */
+export type ToolUseBlock = Extract<SDKAssistantMessage["message"]["content"][number], { type: "tool_use" }>;
+
+/** The item a tool call is projected into. */
+export type ToolUseItem = CommandExecutionItem | FileChangeItem | WebSearchItem | McpToolCallItem;
+
+/** An MCP tool's server and tool, from Claude Code's `mcp__<server>__<tool>` name. */
+export interface McpToolName {
+  readonly server: string;
+  readonly tool: string;
+}
+
+/** A turn's result that answered: its text, and the turn's token usage. */
+export interface AnsweredResult {
+  readonly ok: true;
+  readonly text: string;
+  readonly usage: NonNullableUsage | null;
+}
+
+/** A turn's result that failed: why, and the turn's token usage. */
+export interface FailedResult {
+  readonly ok: false;
+  readonly error: string;
+  readonly usage: NonNullableUsage | null;
+}
+
+export type ProjectedResult = AnsweredResult | FailedResult;
+
+type MessageContent = SDKUserMessage["message"]["content"];
+type TextBlock = Extract<Exclude<MessageContent, string>[number], { type: "text" }>;
+
+/** A tool's input as the model sent it: an object of the tool's own parameters. */
+type ToolInput = Readonly<Record<string, unknown>>;
+
+function isToolInput(value: unknown): value is ToolInput {
+  return Boolean(value) && typeof value === "object";
+}
+
+export function parseMcpToolName(toolName: string): McpToolName | null {
   if (typeof toolName !== "string" || !toolName.startsWith(MCP_TOOL_PREFIX)) {
     return null;
   }
@@ -26,7 +73,7 @@ export function parseMcpToolName(toolName) {
   };
 }
 
-function textFromContent(content) {
+function textFromContent(content: MessageContent): string {
   if (typeof content === "string") {
     return content;
   }
@@ -34,26 +81,26 @@ function textFromContent(content) {
     return "";
   }
   return content
-    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .filter((block): block is TextBlock => Boolean(block) && block.type === "text" && typeof block.text === "string")
     .map((block) => block.text)
     .join("\n");
 }
 
-export function projectToolUseToItem(block) {
+export function projectToolUseToItem(block: ToolUseBlock): ToolUseItem | null {
   const name = typeof block?.name === "string" ? block.name : "";
-  const input = block?.input && typeof block.input === "object" ? block.input : {};
+  const input = isToolInput(block?.input) ? block.input : {};
   if (SHELL_TOOL_NAMES.has(name)) {
     return {
       type: "command_execution",
       id: block.id,
-      command: typeof input.command === "string" ? input.command : "",
+      command: typeof input["command"] === "string" ? input["command"] : "",
     };
   }
   if (EDIT_TOOL_NAMES.has(name)) {
     return {
       type: "file_change",
       id: block.id,
-      changes: [{ kind: "update", path: typeof input.file_path === "string" ? input.file_path : "" }],
+      changes: [{ kind: "update", path: typeof input["file_path"] === "string" ? input["file_path"] : "" }],
     };
   }
   if (name === "WebSearch") {
@@ -65,7 +112,7 @@ export function projectToolUseToItem(block) {
       id: block.id,
       server: "claude",
       tool: "AskUserQuestion",
-      arguments: { questions: Array.isArray(input.questions) ? input.questions : [] },
+      arguments: { questions: Array.isArray(input["questions"]) ? input["questions"] : [] },
     };
   }
   const mcp = parseMcpToolName(name);
@@ -90,7 +137,7 @@ export function projectToolUseToItem(block) {
   };
 }
 
-export function projectAssistantMessageToItems(message) {
+export function projectAssistantMessageToItems(message: SDKMessage): CodexItem[] {
   if (!message || message.type !== "assistant" || message.parent_tool_use_id) {
     return [];
   }
@@ -98,7 +145,7 @@ export function projectAssistantMessageToItems(message) {
   if (!Array.isArray(content)) {
     return [];
   }
-  const items = [];
+  const items: CodexItem[] = [];
   for (const block of content) {
     if (!block || typeof block !== "object") {
       continue;
@@ -115,15 +162,17 @@ export function projectAssistantMessageToItems(message) {
   return items;
 }
 
-export function projectResultMessage(message) {
+export function projectResultMessage(message: SDKMessage): ProjectedResult | null {
   if (!message || message.type !== "result") {
     return null;
   }
-  const errors = Array.isArray(message.errors) ? message.errors.filter((value) => typeof value === "string" && value.trim()) : [];
+  const errors = "errors" in message && Array.isArray(message.errors)
+    ? message.errors.filter((value) => typeof value === "string" && value.trim())
+    : [];
   if (message.subtype !== "success" || message.is_error) {
     const detail = errors.length > 0
       ? errors.join("\n")
-      : (typeof message.result === "string" && message.result.trim() ? message.result : `Claude ended with ${message.subtype}`);
+      : ("result" in message && typeof message.result === "string" && message.result.trim() ? message.result : `Claude ended with ${message.subtype}`);
     return { ok: false, error: detail, usage: message.usage ?? null };
   }
   return {
@@ -133,7 +182,7 @@ export function projectResultMessage(message) {
   };
 }
 
-export function cacheReadTokensFromUsage(usage) {
+export function cacheReadTokensFromUsage(usage: NonNullableUsage | null | undefined): number | undefined {
   const value = usage?.cache_read_input_tokens;
   return Number.isFinite(value) ? value : undefined;
 }

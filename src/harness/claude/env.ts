@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { homedir } from "node:os";
 
 import { withoutTelemetry } from "../../telemetry/index.ts";
@@ -14,13 +13,13 @@ import { withoutTelemetry } from "../../telemetry/index.ts";
  * Code's and reach bayma and everything run through it. The process itself gets
  * telemetry settings of its own (./telemetry.ts).
  */
-export function buildClaudeEnv() {
-  const env = {};
+export function buildClaudeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(withoutTelemetry(process.env))) {
     if (typeof value === "string") {
       env[key] = value;
     }
   }
-  env.HOME = env.HOME || homedir();
+  env["HOME"] = env["HOME"] || homedir();
   return env;
 }

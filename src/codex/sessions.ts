@@ -1,44 +1,62 @@
-// @ts-nocheck
 /**
  * Codex's sessions for the operator's session panels, as Codex's own
  * app-server reports them: the threads whose session ran in the working
  * directory, their turns as rewind points, and rewind as Codex's fork before
  * a turn. alasio reads and writes none of Codex's files for them.
  */
+import type { v2 } from "../../.types/codex/index.js";
+import type { HarnessSessions } from "../harness/index.ts";
 import { createLogger } from "../shared/log.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
 import { dateLabel, sessionLabel } from "../shared/session-labels.ts";
-import { codexAppServerClient } from "./app-server/client.ts";
-import { buildCodexEnv } from "./env.ts";
-import { forkCodexSession } from "./runtime.ts";
+import { type AppServerClient, codexAppServerClient } from "./app-server/client.ts";
+import { type CodexEnv, buildCodexEnv } from "./env.ts";
+import { type ForkCodexSessionParams, forkCodexSession } from "./runtime.ts";
 
 const log = createLogger("codex-sessions");
 
-const errorText = (error) => (error instanceof Error ? error.message : String(error));
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+type AgentMessage = Extract<v2.ThreadItem, { type: "agentMessage" }>;
+type TextInput = Extract<v2.UserInput, { type: "text" }>;
 
 /** What the operator wrote to start a turn. */
-function promptOf(turn) {
+function promptOf(turn: v2.Turn): string {
   return (turn.items ?? [])
     .filter((item) => item.type === "userMessage")
     .flatMap((item) => item.content ?? [])
-    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .filter((part): part is TextInput => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("\n")
     .trim();
 }
 
 /** What Codex last said in a turn, or "" if it said nothing. */
-function answerOf(turn) {
-  const messages = (turn.items ?? []).filter((item) => item.type === "agentMessage" && item.text?.trim());
+function answerOf(turn: v2.Turn): string {
+  const messages = (turn.items ?? []).filter((item): item is AgentMessage => item.type === "agentMessage" && Boolean(item.text?.trim()));
   return messages.at(-1)?.text.trim() ?? "";
+}
+
+/** The app-server and directory threads are listed from, and the environment the app-server runs with. */
+export interface CodexListingScope {
+  readonly cwd: string;
+  readonly codexEnv: CodexEnv;
+  readonly client: AppServerClient;
 }
 
 /**
  * The app-server and directory a folder workspace's threads are listed from: the shared
  * app-server, in the folder itself.
  */
-export function folderListingScope(workingDirectory) {
+export function folderListingScope(workingDirectory: string): () => Promise<CodexListingScope> {
   return async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client: codexAppServerClient });
+}
+
+export interface CodexSessionApiOptions {
+  readonly workingDirectory: string;
+  readonly listingScope?: () => Promise<CodexListingScope>;
+  readonly fork?: (params: ForkCodexSessionParams) => Promise<string>;
+  readonly beforeFork?: (sessionId: string) => Promise<void>;
 }
 
 /**
@@ -53,14 +71,14 @@ export function createCodexSessionApi({
   listingScope = folderListingScope(workingDirectory),
   fork = forkCodexSession,
   beforeFork = async () => {},
-}) {
+}: CodexSessionApiOptions): HarnessSessions {
   async function listAll() {
     const { cwd, codexEnv, client } = await listingScope();
     return await client.listThreads({ env: codexEnv, cwd });
   }
 
   /** A thread's turns, newest first; none for a thread Codex cannot read. */
-  async function turnsOf(sessionId) {
+  async function turnsOf(sessionId: string) {
     try {
       const { cwd, codexEnv, client } = await listingScope();
       return await client.listTurns({ threadId: sessionId, env: codexEnv, cwd });

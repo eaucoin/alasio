@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Claude Code's own telemetry, sent where alasio sends its. Claude Code exports when
  * CLAUDE_CODE_ENABLE_TELEMETRY is set and reads the standard variables for the rest,
@@ -14,16 +13,20 @@ import { conversationTelemetryEnv } from "../../telemetry/index.ts";
 /** Claude Code's own settings of what its telemetry includes, which the operator sets for it. */
 const CLAUDE_CODE_SETTING = /^OTEL_(LOG_.*|METRICS_INCLUDE_.*)$/u;
 
-export function claudeTelemetryEnv({ conversationId }, env = process.env) {
-  const settings = conversationTelemetryEnv({ conversationId }, env);
+/** The telemetry variables of one conversation's Claude Code process; nothing when alasio exports nothing. */
+export function claudeTelemetryEnv(
+  { conversationId }: { readonly conversationId: string },
+  env: Readonly<NodeJS.ProcessEnv> = process.env,
+): Record<string, string | undefined> {
+  const settings: Record<string, string | undefined> = conversationTelemetryEnv({ conversationId }, env);
   if (Object.keys(settings).length === 0) {
     return {};
   }
-  settings.CLAUDE_CODE_ENABLE_TELEMETRY = "1";
+  settings["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1";
   // Claude Code defaults to delta; the OpenTelemetry default, which alasio uses, is cumulative.
-  settings.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE = env.OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE ?? "cumulative";
-  if (settings.OTEL_TRACES_EXPORTER === "otlp") {
-    settings.CLAUDE_CODE_ENHANCED_TELEMETRY_BETA = "1";
+  settings["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] = env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] ?? "cumulative";
+  if (settings["OTEL_TRACES_EXPORTER"] === "otlp") {
+    settings["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] = "1";
   }
   for (const [name, value] of Object.entries(env)) {
     if (CLAUDE_CODE_SETTING.test(name)) settings[name] = value;

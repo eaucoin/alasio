@@ -1,11 +1,17 @@
-// @ts-nocheck
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.ts";
+import type { Harness, HarnessOptions } from "../index.ts";
 import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
 import { createClaudeLiveSessions } from "./live-sessions.ts";
-import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.ts";
-import { createClaudeSessionApi } from "./sessions.ts";
+import { executeClaudeTurn, startFreshClaudeSession, type ClaudeQueryFactory } from "./runtime.ts";
+import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
 import { parseWorkspace } from "../../workspace/kind.ts";
+
+/** What createClaudeHarness is given: a harness's options, and stand-ins for tests. */
+export interface ClaudeHarnessOptions extends HarnessOptions {
+  readonly sessionApi?: ClaudeSessionApi | null;
+  readonly queryFactory?: ClaudeQueryFactory | undefined;
+}
 
 /**
  * Claude Code harness adapter. Sessions live in the Claude project transcript
@@ -16,14 +22,15 @@ import { parseWorkspace } from "../../workspace/kind.ts";
  * A session-filesystem workspace's CLI runs in the workspace's harness directory, and
  * its sessions are that directory's, confined to the workspace's bayma (sessionfs.ts).
  */
-export function createClaudeHarness({ workingDirectory, sessionStore = null, sandbox = null, sessionApi = null, queryFactory = undefined }) {
+export function createClaudeHarness({ workingDirectory, sessionStore = null, sandbox = null, sessionApi = null, queryFactory = undefined }: ClaudeHarnessOptions): Harness {
   const workspace = parseWorkspace(workingDirectory);
   const sessionFs = workspace?.kind === "sessionfs";
   if (sessionFs && !sandbox) {
     throw new Error("this conversation's workspace is a session filesystem, which this deployment does not enable");
   }
-  const directory = sessionFs ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
-  const sessionFsBayma = sessionFs ? async () => (await sandbox.ensureSession(workspace.volumeId)).bayma : null;
+  // `sandbox` is there whenever `sessionFs` is, as just checked.
+  const directory = sessionFs && sandbox ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
+  const sessionFsBayma = sessionFs && sandbox ? async () => (await sandbox.ensureSession(workspace.volumeId)).bayma : null;
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory: directory, store: sessionStore });
   const liveSessions = createClaudeLiveSessions({ workingDirectory: directory, sessions, sessionStore, sessionFsBayma, queryFactory });
   return {
