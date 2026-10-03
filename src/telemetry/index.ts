@@ -16,6 +16,10 @@ import {
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
+// By module: the package's index also loads its browser SDK, which alasio has not.
+import * as OtelTracer from "@effect/opentelemetry/OtelTracer";
+import * as Resource from "@effect/opentelemetry/Resource";
+import { Layer } from "effect";
 
 export { SpanKind } from "@opentelemetry/api";
 export {
@@ -30,6 +34,13 @@ export {
   withoutTelemetry,
 } from "./config.ts";
 export type { Signal, SignalExporter, Telemetry } from "./config.ts";
+
+/**
+ * Effects' spans as OpenTelemetry spans of the SDK ./start.ts registers (none, when it
+ * registers none): they nest under the active span and become it, so the
+ * instrumented modules' spans nest under theirs.
+ */
+export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = OtelTracer.layerGlobal.pipe(Layer.provide(Resource.layerFromEnv()));
 
 /** Where inSpan puts a span, and what it records on it at the start. */
 export interface InSpanOptions {
