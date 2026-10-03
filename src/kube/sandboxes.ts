@@ -66,6 +66,12 @@ export interface Sandbox extends KubernetesObject {
   status?: SandboxStatus;
 }
 
+/** What sandboxReady reads of a Sandbox: its generation, and its status. */
+export interface SandboxReadiness {
+  readonly metadata: Pick<V1ObjectMeta, "generation">;
+  readonly status?: SandboxStatus;
+}
+
 /** A Sandbox the API server holds, which has given it its uid. */
 export interface StoredSandbox extends Sandbox {
   metadata: SandboxMetadata & { uid: string };
@@ -106,7 +112,7 @@ export interface Sandboxes {
 
 /** What createSandboxes is given. */
 export interface SandboxesOptions {
-  readonly kube: KubeClient;
+  readonly kube: Pick<KubeClient, "read" | "create" | "patch" | "remove">;
   readonly namespace: string;
   readonly port: number;
   readonly fetchImpl?: typeof fetch;
@@ -201,7 +207,7 @@ export function sandboxManifest({
 }
 
 /** The token Secret of `sandbox`, owned by it so it goes when the Sandbox does. Pure, for tests. */
-export function tokenSecretManifest(sandbox: StoredSandbox, token: string): V1Secret {
+export function tokenSecretManifest(sandbox: Pick<StoredSandbox, "metadata">, token: string): V1Secret {
   return {
     apiVersion: "v1",
     kind: "Secret",
@@ -223,7 +229,7 @@ export function tokenSecretManifest(sandbox: StoredSandbox, token: string): V1Se
   };
 }
 
-function condition(sandbox: Sandbox, type: string): V1Condition | null {
+function condition(sandbox: SandboxReadiness, type: string): V1Condition | null {
   return sandbox?.status?.conditions?.find((entry) => entry.type === type) ?? null;
 }
 
@@ -236,7 +242,7 @@ function stored(object: KubernetesObject): StoredSandbox {
 }
 
 /** Whether the Sandbox's pod is ready and its Service exists, for its current spec. */
-export function sandboxReady(sandbox: Sandbox): boolean {
+export function sandboxReady(sandbox: SandboxReadiness): boolean {
   const ready = condition(sandbox, "Ready");
   return ready?.status === "True" && (ready.observedGeneration ?? 0) >= (sandbox.metadata.generation ?? 0);
 }

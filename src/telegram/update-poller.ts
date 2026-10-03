@@ -15,14 +15,14 @@ export interface UpdatePollerOptions {
   client: Pick<Client, "getUpdates">;
   store: OffsetStore;
   processUpdate: ProcessUpdate;
-  log: Logger;
+  log: Pick<Logger, "error">;
 }
 
 export class UpdatePoller {
   private readonly client: Pick<Client, "getUpdates">;
   private readonly store: OffsetStore;
   private readonly processUpdate: ProcessUpdate;
-  private readonly log: Logger;
+  private readonly log: Pick<Logger, "error">;
   private abortController: AbortController;
   private promise: Promise<void> | null;
 

@@ -1,6 +1,6 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { createServer, type IncomingHttpHeaders, type OutgoingHttpHeaders, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import { gunzipSync } from "node:zlib";
 
@@ -10,23 +10,34 @@ import { createOtlpForwarder, retryAfterMs } from "../src/telemetry/forward.ts";
 // to each signal's endpoint, with its headers and compression, retrying what OTLP says
 // to retry. A stand-in OTLP server answers each request with the next queued status.
 
-let server;
-let base;
-const received = [];
-const statuses = [];
+/** A request as the server received it. */
+interface ReceivedRequest {
+  readonly url: string | undefined;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: Buffer;
+}
+
+/** An answer the server is to give: a status, and any headers. */
+type QueuedStatus = readonly [status: number, headers?: OutgoingHttpHeaders];
+
+let server: Server;
+let base: string;
+const received: ReceivedRequest[] = [];
+const statuses: QueuedStatus[] = [];
 
 before(async () => {
   server = createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       received.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
       const [status, headers = {}] = statuses.shift() ?? [200];
       res.writeHead(status, headers).end();
     });
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // Listening on a TCP port, the server's address is an AddressInfo.
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 after(() => new Promise((resolve) => server.close(resolve)));
 
@@ -53,6 +64,7 @@ test("each signal goes to its endpoint with its headers and compression, in the 
     forwarder.close();
   }
   const [traces, metrics, logs] = received;
+  assert.ok(traces && metrics && logs);
   assert.equal(traces.url, "/v1/traces");
   assert.equal(traces.headers["content-type"], "application/x-protobuf");
   assert.equal(traces.headers.authorization, "Bearer secret");
@@ -98,7 +110,7 @@ test("retries stop at the signal's timeout", async () => {
 });
 
 test("a signal alasio exports over gRPC, or not at all, is not forwarded", async () => {
-  const warnings = [];
+  const warnings: string[] = [];
   const forwarder = createOtlpForwarder({
     OTEL_EXPORTER_OTLP_ENDPOINT: base,
     OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: "grpc",

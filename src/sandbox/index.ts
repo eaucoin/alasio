@@ -71,7 +71,7 @@ export interface SandboxOptions {
   readonly templates: KubeTemplates | null;
   readonly stateDir: string;
   readonly env?: Readonly<NodeJS.ProcessEnv>;
-  readonly kube?: KubeClient | null;
+  readonly kube?: Pick<KubeClient, "read" | "create" | "patch" | "remove" | "exec"> | null;
   readonly createForwarder?: (env: Readonly<NodeJS.ProcessEnv>) => Promise<OtlpForwarder>;
   readonly startReceiver?: (options: TelemetryReceiverOptions) => Promise<TelemetryReceiver>;
   readonly resolve?: (hostname: string) => Promise<LookupAddress>;

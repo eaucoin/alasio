@@ -54,7 +54,7 @@ export interface TelemetryReceiverOptions {
   readonly port: number;
   readonly host?: string;
   readonly authenticate: (token: string) => Promise<string | null>;
-  readonly forwarder: OtlpForwarder;
+  readonly forwarder: Pick<OtlpForwarder, "protocols" | "export">;
   readonly stampFor: (volumeId: string) => ResourceStamp;
   readonly limiter?: RateLimiter;
 }

@@ -1,9 +1,11 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
+
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
-import { renderSecrets, secretNames, setupConfig, setupKube } from "../neon/control/kube-setup.ts";
+import { renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
+import type { SeaweedS3Config, StackSecrets, StoredSecrets } from "../neon/control/secrets.ts";
 
 const ENV = {
   NAMESPACE: "alasio",
@@ -17,36 +19,49 @@ const ENV = {
 };
 
 /** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
+function nameOf(object: V1Secret): string {
+  const name = object.metadata?.name;
+  assert.ok(name, "a Secret is written by name");
+  return name;
+}
+
 function fakeKube() {
-  const secrets = new Map();
-  const stored = (object, version) => ({
-    ...object,
-    metadata: { ...object.metadata, resourceVersion: String(version) },
-    data: Object.fromEntries(Object.entries(object.stringData).map(([k, v]) => [k, Buffer.from(v).toString("base64")])),
-    stringData: undefined,
-  });
+  const secrets = new Map<string, StoredSecret>();
+  const writes: [verb: "create" | "replace", name: string][] = [];
+  const stored = ({ stringData, ...object }: V1Secret, version: number): StoredSecret => {
+    assert.ok(stringData, "a Secret is written as string data");
+    return {
+      ...object,
+      metadata: { ...object.metadata, resourceVersion: String(version) },
+      data: Object.fromEntries(Object.entries(stringData).map(([k, v]) => [k, Buffer.from(v).toString("base64")])),
+    };
+  };
   let version = 0;
   return {
     secrets,
-    writes: [],
-    async read(apiVersion, kind, namespace, name) {
+    writes,
+    async read(_apiVersion: string, _kind: string, _namespace: string, name: string): Promise<KubernetesObject | null> {
       return structuredClone(secrets.get(name) ?? null);
     },
-    async create(object) {
-      if (secrets.has(object.metadata.name)) throw Object.assign(new Error("exists"), { code: 409 });
-      this.writes.push(["create", object.metadata.name]);
-      secrets.set(object.metadata.name, stored(object, ++version));
+    async create(object: V1Secret) {
+      if (secrets.has(nameOf(object))) throw Object.assign(new Error("exists"), { code: 409 });
+      writes.push(["create", nameOf(object)]);
+      secrets.set(nameOf(object), stored(object, ++version));
     },
-    async replace(object) {
-      const current = secrets.get(object.metadata.name);
-      assert.equal(object.metadata.resourceVersion, current.metadata.resourceVersion, "a replace names the version it read");
-      this.writes.push(["replace", object.metadata.name]);
-      secrets.set(object.metadata.name, stored(object, ++version));
+    async replace(object: V1Secret) {
+      const current = secrets.get(nameOf(object));
+      assert.equal(object.metadata?.resourceVersion, current?.metadata.resourceVersion, "a replace names the version it read");
+      writes.push(["replace", nameOf(object)]);
+      secrets.set(nameOf(object), stored(object, ++version));
     },
   };
 }
 
-const value = (kube, name, key) => Buffer.from(kube.secrets.get(name).data[key], "base64").toString();
+function value(kube: ReturnType<typeof fakeKube>, name: string, key: string): string {
+  const data = kube.secrets.get(name)?.data?.[key];
+  assert.ok(data !== undefined, `${name} has ${key}`);
+  return Buffer.from(data, "base64").toString();
+}
 
 test("the setup's configuration comes from the environment, checked", () => {
   const config = setupConfig(ENV);
@@ -56,7 +71,9 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.external, false);
   assert.throws(() => setupConfig({ ...ENV, NEON_COMPUTE_HOST: "" }), /NEON_COMPUTE_HOST must be set/);
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
-  assert.equal(setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" }).accessKey, "a");
+  const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" });
+  assert.ok(external.external);
+  assert.equal(external.accessKey, "a");
 });
 
 test("the stack's secrets are made once, and every service's rendered from them on each run", async () => {
@@ -65,7 +82,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   await setupKube({ kube, config, log: () => {} });
   const names = secretNames("q");
   assert.deepEqual([...kube.secrets.keys()].sort(), Object.values(names).sort());
-  const root = JSON.parse(value(kube, names.root, "secrets.json"));
+  const root: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   const publicKey = value(kube, names.root, "auth_public_key.pem");
 
   // Each service gets what it needs, signed with the stack's key.
@@ -76,8 +93,10 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /control_plane_api='http:\/\/q-neon-storage-controller:1234\/upcall\/v1\/'/u);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
-  assert.equal(JSON.parse(value(kube, names.pageserver, "metadata.json")).host, "q-neon-pageserver");
-  assert.deepEqual(JSON.parse(value(kube, names.seaweedfs, "s3.json")).identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
+  const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
+  assert.equal(metadata.host, "q-neon-pageserver");
+  const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -91,27 +110,38 @@ test("a root predating a secret gains it without losing the rest", async () => {
   const config = setupConfig(ENV);
   await setupKube({ kube, config, log: () => {} });
   const names = secretNames("q");
-  const root = JSON.parse(value(kube, names.root, "secrets.json"));
+  const root: StoredSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   delete root.computeControlToken;
   const current = kube.secrets.get(names.root);
+  assert.ok(current?.data);
   current.data["secrets.json"] = Buffer.from(JSON.stringify(root)).toString("base64");
   await setupKube({ kube, config, log: () => {} });
-  const completed = JSON.parse(value(kube, names.root, "secrets.json"));
+  const completed: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   assert.equal(completed.alasioPassword, root.alasioPassword);
   assert.match(completed.computeControlToken, /^[\w-]{32}$/u);
 });
 
 test("with an external object store, every service uses its credentials and no SeaweedFS identities are made", () => {
   const config = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "AK", S3_SECRET_KEY: "SK", S3_REGION: "eu-west-1", S3_BUCKET_NEON: "my-neon" });
+  // The bundled store's credentials, which the external store's are used instead of.
+  const bundled = { accessKey: "bundled-key", secretKey: "bundled-secret" };
   const rendered = renderSecrets({
-    secrets: { s3: {}, controllerDbPassword: "c", alasioPassword: "q", lakePassword: "l", computeControlToken: "t" },
+    secrets: {
+      tenantId: "tenant",
+      timelineId: "timeline",
+      s3: { neon: bundled, admin: bundled, lake: bundled },
+      controllerDbPassword: "c",
+      alasioPassword: "q",
+      lakePassword: "l",
+      computeControlToken: "t",
+    },
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
     config,
   });
   const names = secretNames("q");
   assert.equal(rendered[names.seaweedfs], undefined);
-  assert.equal(rendered[names.safekeeper].AWS_ACCESS_KEY_ID, "AK");
-  assert.equal(rendered[names.lake].LAKE_S3_SECRET, "SK");
-  assert.match(rendered[names.safekeeper].REMOTE_STORAGE, /bucket_name="my-neon", bucket_region="eu-west-1"/u);
+  assert.equal(rendered[names.safekeeper]?.["AWS_ACCESS_KEY_ID"], "AK");
+  assert.equal(rendered[names.lake]?.["LAKE_S3_SECRET"], "SK");
+  assert.match(rendered[names.safekeeper]?.["REMOTE_STORAGE"] ?? "",/bucket_name="my-neon", bucket_region="eu-west-1"/u);
 });

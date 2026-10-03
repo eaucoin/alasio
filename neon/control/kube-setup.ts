@@ -78,8 +78,15 @@ export type RenderedSecrets = Record<string, Record<string, string>>;
 /** A Secret as the API server returns it, which always has its metadata and version. */
 export type StoredSecret = V1Secret & { metadata: V1ObjectMeta & { resourceVersion: string } };
 
+/** What setupKube does through src/kube/client.ts's client: reads Secrets, and writes them without reading back what it wrote. */
+export interface SetupKubeClient {
+  read: KubeClient["read"];
+  create(object: V1Secret): Promise<unknown>;
+  replace(object: V1Secret): Promise<unknown>;
+}
+
 export interface SetupKubeOptions {
-  kube: Pick<KubeClient, "read" | "create" | "replace">;
+  kube: SetupKubeClient;
   config: SetupConfig;
   log?: (message: string) => void;
 }

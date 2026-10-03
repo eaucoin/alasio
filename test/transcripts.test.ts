@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -6,18 +5,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, test } from "node:test";
 
+import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import pg from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { adoptTranscripts, ensureLocalTranscript } from "../src/harness/claude/transcripts.ts";
-import { dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
 
-let database;
-let pool;
-let home;
-let previousHome;
+// Set by the first hook unless every test that uses them is skipped.
+let database: TestPostgres | undefined;
+let pool: pg.Pool;
+// Each case's Claude home, made before it.
+let home: string;
+let previousHome: string | undefined;
 let schemas = 0;
 
 before(async () => {
@@ -30,29 +32,34 @@ after(async () => {
   await pool?.end();
   await database?.stop();
   if (home) rmSync(home, { recursive: true, force: true });
-  if (previousHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-  else process.env.CLAUDE_CONFIG_DIR = previousHome;
+  if (previousHome === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+  else process.env["CLAUDE_CONFIG_DIR"] = previousHome;
 });
 
 // A fresh Claude home per case, where the SDK and alasio both look for it.
 beforeEach(() => {
   if (home) rmSync(home, { recursive: true, force: true });
-  else previousHome = process.env.CLAUDE_CONFIG_DIR;
+  else previousHome = process.env["CLAUDE_CONFIG_DIR"];
   home = mkdtempSync(join(tmpdir(), "alasio-claude-home-"));
-  process.env.CLAUDE_CONFIG_DIR = home;
+  process.env["CLAUDE_CONFIG_DIR"] = home;
 });
 
-async function makeStore() {
+async function makeStore(): Promise<NeonSessionStore> {
   const store = new NeonSessionStore(pool, { schema: `transcripts_${process.pid}_${++schemas}` });
   await store.ensureSchema();
   return store;
 }
 
-const readLines = (path) => readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-const message = (uuid, text) => ({ type: "user", uuid, message: { role: "user", content: text } });
+const readLines = (path: string): SessionStoreEntry[] => readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+const message = (uuid: string, text: string): SessionStoreEntry => ({ type: "user", uuid, message: { role: "user", content: text } });
 
 /** A local transcript as Claude Code writes one, in a project directory named like the SDK's. */
-function writeLocal(dir, sessionId, entries, subagents = {}) {
+function writeLocal(
+  dir: string,
+  sessionId: string,
+  entries: readonly SessionStoreEntry[],
+  subagents: Readonly<Record<string, readonly SessionStoreEntry[]>> = {},
+) {
   const projectKey = dir.replace(/[^a-zA-Z0-9]/gu, "-");
   const projectDir = join(home, "projects", projectKey);
   mkdirSync(projectDir, { recursive: true });
@@ -109,8 +116,8 @@ describe("claude transcripts against the store", { skip }, () => {
 
     await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
     const key = { projectKey, sessionId };
-    assert.equal((await store.load(key)).length, 2);
-    assert.equal((await store.load({ ...key, subpath: "subagents/agent-a" })).length, 1);
+    assert.equal((await store.load(key))?.length, 2);
+    assert.equal((await store.load({ ...key, subpath: "subagents/agent-a" }))?.length, 1);
 
     // The mirror missed two entries, and the metadata Claude Code writes as
     // it exits, outside the mirror; the summary already stored is not copied again.
@@ -124,7 +131,7 @@ describe("claude transcripts against the store", { skip }, () => {
     await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
     await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
     assert.deepEqual(
-      (await store.load(key)).map((e) => e.uuid ?? e.type),
+      (await store.load(key))?.map((e) => e.uuid ?? e.type),
       ["11111111-1111-4111-8111-111111111111", "summary", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "cost-state"],
     );
   });

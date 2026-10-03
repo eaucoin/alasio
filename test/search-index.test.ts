@@ -1,19 +1,19 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
-import pg from "pg";
+import pg, { type QueryResultRow } from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { startTranscriptSearch } from "../src/harness/claude/search/index.ts";
 import { SETTLE_MS, collectOrphans, indexBatch, settle } from "../src/harness/claude/search/indexer.ts";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.ts";
-import { dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
 
-let database;
-let pool;
+// Set by the first hook unless every test that uses them is skipped.
+let database: TestPostgres | undefined;
+let pool: pg.Pool;
 let schemas = 0;
 
 before(async () => {
@@ -33,7 +33,8 @@ async function makeSearch() {
   const store = new NeonSessionStore(pool, { schema });
   await store.ensureSchema();
   await ensureSearchSchema(pool, schema);
-  const q = async (text, values) => (await pool.query(text.replaceAll("S.", `${schema}.`), values)).rows;
+  const q = async <Row extends QueryResultRow = Record<string, unknown>>(text: string, values?: unknown[]) =>
+    (await pool.query<Row>(text.replaceAll("S.", `${schema}.`), values)).rows;
   const indexAll = async () => {
     let total = 0;
     for (let read; (read = await indexBatch(pool, schema)) > 0; ) total += read;
@@ -42,10 +43,10 @@ async function makeSearch() {
   return { schema, store, q, indexAll };
 }
 
-const prompt = (uuid, text, at = "2026-09-27T01:00:00Z") => ({ type: "user", uuid, timestamp: at, message: { role: "user", content: text } });
-const answer = (uuid, text, at = "2026-09-27T01:00:01Z") => ({ type: "assistant", uuid, timestamp: at, message: { content: [{ type: "text", text }] } });
-const output = (uuid, text, at = "2026-09-27T01:00:02Z") => ({ type: "user", uuid, timestamp: at, message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: text }] } });
-const key = (sessionId) => ({ projectKey: "-work", sessionId });
+const prompt = (uuid: string, text: string, at = "2026-09-27T01:00:00Z") => ({ type: "user", uuid, timestamp: at, message: { role: "user", content: text } });
+const answer = (uuid: string, text: string, at = "2026-09-27T01:00:01Z") => ({ type: "assistant", uuid, timestamp: at, message: { content: [{ type: "text", text }] } });
+const output = (uuid: string, text: string, at = "2026-09-27T01:00:02Z") => ({ type: "user", uuid, timestamp: at, message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: text }] } });
+const key = (sessionId: string) =>({ projectKey: "-work", sessionId });
 
 describe("indexing the store's entries", { skip }, () => {
   test("each distinct text is one passage, with an occurrence wherever it is written", async () => {
@@ -73,7 +74,7 @@ describe("indexing the store's entries", { skip }, () => {
     assert.equal(await indexBatch(pool, schema, { limit: 2 }), 2);
     assert.equal(await indexBatch(pool, schema, { limit: 2 }), 1);
     assert.equal(await indexBatch(pool, schema, { limit: 2 }), 0);
-    assert.deepEqual((await q("select text from S.passages order by id")).map((row) => row.text), ["one", "two", "three"]);
+    assert.deepEqual((await q<{ text: string }>("select text from S.passages order by id")).map((row) => row.text), ["one", "two", "three"]);
   });
 
   test("an entry holding a NUL is indexed with U+FFFD in its place", async () => {
@@ -88,8 +89,9 @@ describe("indexing the store's entries", { skip }, () => {
     await store.append(key("a"), [prompt("u1", "one"), prompt("u2", "two")]);
     await indexAll();
     await store.append(key("a"), [prompt("u3", "three")]);
-    const [first, second, third] = (await q("select seq from S.entries order by seq")).map((row) => Number(row.seq));
-    const settled = async () => Number((await q("select value from S.search_state where name = 'settled_seq'"))[0]?.value ?? 0);
+    const [first, second, third] = (await q<{ seq: string }>("select seq from S.entries order by seq")).map((row) => Number(row.seq));
+    assert.ok(first !== undefined && second !== undefined && third !== undefined);
+    const settled = async () => Number((await q<{ value: string }>("select value from S.search_state where name = 'settled_seq'"))[0]?.value ?? 0);
 
     await settle(pool, schema);
     assert.equal(await settled(), 0, "no entry is old enough yet");
@@ -126,11 +128,11 @@ describe("searching", { skip }, () => {
       answer("a3", "Bananas are yellow."),
     ]);
     await indexAll();
-    const top = async (query) => (await q("select kind, snippet from S.search($1)", [query]))[0];
+    const top = async (query: string) => (await q<{ kind: string; snippet: string }>("select kind, snippet from S.search($1)", [query]))[0];
 
     assert.deepEqual(await top("safekeeper rebuilding disks"), { kind: "assistant.text", snippet: "<b>Safekeepers</b> <b>rebuild</b> a lost <b>disk</b> from their peers" });
-    assert.equal((await top("projct-name")).kind, "assistant.tool_use");
-    assert.equal((await top("alasio-ne")).kind, "assistant.tool_use");
+    assert.equal((await top("projct-name"))?.kind, "assistant.tool_use");
+    assert.equal((await top("alasio-ne"))?.kind,"assistant.tool_use");
     assert.deepEqual(await q("select * from S.search('xylophone')"), []);
   });
 
@@ -139,7 +141,7 @@ describe("searching", { skip }, () => {
     await store.append(key("a"), [prompt("u1", "restart the neon stack", "2026-09-26T10:00:00Z"), output("t1", "restart the neon stack", "2026-09-26T10:00:05Z")]);
     await store.append(key("b"), [prompt("u2", "restart the neon stack", "2026-09-27T10:00:00Z")]);
     await indexAll();
-    const search = (args) => q("select kind, session_id, occurrences from S.search('restart neon'" + args + ")");
+    const search = (args: string) => q("select kind, session_id, occurrences from S.search('restart neon'" + args + ")");
 
     assert.deepEqual(await search(""), [{ kind: "user.text", session_id: "b", occurrences: "3" }]);
     assert.deepEqual(await search(", only_kinds => array['user.tool_result']"), [{ kind: "user.tool_result", session_id: "a", occurrences: "1" }]);
@@ -156,7 +158,7 @@ describe("searching", { skip }, () => {
       answer("a1", "The checkpoint is taken as bayma stops."),
     ]);
     await indexAll();
-    assert.deepEqual((await q("select kind from S.search('checkpoint')")).map((row) => row.kind), ["assistant.text", "user.tool_result", "attachment"]);
+    assert.deepEqual((await q<{ kind: string }>("select kind from S.search('checkpoint')")).map((row) => row.kind), ["assistant.text", "user.tool_result", "attachment"]);
   });
 });
 
@@ -167,7 +169,7 @@ describe("the indexer", { skip }, () => {
     try {
       await store.append(key("a"), [prompt("u1", "appended while indexing runs")]);
       const deadline = Date.now() + 15_000;
-      let found = [];
+      let found: Record<string, unknown>[] = [];
       while (found.length === 0 && Date.now() < deadline) {
         found = await q("select kind from S.search('appended while indexing')");
         if (found.length === 0) await new Promise((resolve) => setTimeout(resolve, 200));

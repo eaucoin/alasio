@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -10,17 +9,18 @@ import { forkSession, getSessionMessages, importSessionToStore, listSessions } f
 import pg from "pg";
 
 import { NeonSessionStore, docOf, mirrorOnly } from "../src/harness/claude/session-store.ts";
-import { dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
 import { E, KEY, expectEntries, sessionStoreConformance } from "./support/session-store-conformance.ts";
 
 const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
 
-let database;
-let pool;
+// Set by the first hook unless every test that uses them is skipped.
+let database: TestPostgres | undefined;
+let pool: pg.Pool;
 let schemas = 0;
 
 /** A store on its own schema: every case starts empty. */
-async function makeStore() {
+async function makeStore(): Promise<NeonSessionStore> {
   const store = new NeonSessionStore(pool, { schema: `test_${process.pid}_${++schemas}` });
   await store.ensureSchema();
   return store;
@@ -64,10 +64,11 @@ describe("alasio's session store", { skip }, () => {
     const store = await makeStore();
     const entry = { z: 1, type: "user", uuid: "u1", message: { content: "binary\u0000output" }, a: 2 };
     await store.append(KEY, [entry]);
-    const [loaded] = await store.load(KEY);
-    assert.equal(JSON.stringify(loaded), JSON.stringify(entry));
+    const loaded = await store.load(KEY);
+    assert.ok(loaded);
+    assert.equal(JSON.stringify(loaded[0]), JSON.stringify(entry));
     const [summary] = await store.listSessionSummaries("proj");
-    assert.equal(summary.sessionId, "sess");
+    assert.equal(summary?.sessionId, "sess");
   });
 
   test("each entry has a jsonb doc for SQL, which leaves the entry exactly as written", async () => {
@@ -79,6 +80,7 @@ describe("alasio's session store", { skip }, () => {
     await store.append(KEY, [nul, halfEmoji, whole]);
 
     const loaded = await store.load(KEY);
+    assert.ok(loaded);
     assert.deepEqual(loaded.map((entry) => JSON.stringify(entry)), [nul, halfEmoji, whole].map((entry) => JSON.stringify(entry)));
     const { rows } = await pool.query(`select doc->>'type' as type, doc->>'out' as out from ${schema}.entries order by seq`);
     assert.deepEqual(rows, [
@@ -123,8 +125,9 @@ describe("alasio's session store", { skip }, () => {
     const entries = Array.from({ length: 12_345 }, (_, n) => E("x", { uuid: `u${n}`, n }));
     await store.append(KEY, entries);
     const loaded = await store.load(KEY);
+    assert.ok(loaded);
     assert.equal(loaded.length, entries.length);
-    assert.ok(loaded.every((entry, n) => entry.n === n));
+    assert.ok(loaded.every((entry, n) => entry["n"] === n));
   });
 
   test("summaries fold what is new, and go with a deleted session", async () => {
@@ -132,6 +135,7 @@ describe("alasio's session store", { skip }, () => {
     await store.append(KEY, [E("user", { uuid: "u1" })]);
     await store.append({ ...KEY, subpath: "subagents/a" }, [E("user", { uuid: "s1" })]);
     const [summary] = await store.listSessionSummaries("proj");
+    assert.ok(summary);
     assert.equal(summary.sessionId, "sess");
     assert.ok(summary.mtime > 1e12);
     await store.delete(KEY);
@@ -157,18 +161,18 @@ describe("alasio's session store", { skip }, () => {
 });
 
 describe("the SDK's session helpers on the store", { skip }, () => {
-  let home;
-  let previousHome;
+  let home: string;
+  let previousHome: string | undefined;
 
   before(() => {
     home = mkdtempSync(join(tmpdir(), "alasio-claude-home-"));
-    previousHome = process.env.CLAUDE_CONFIG_DIR;
-    process.env.CLAUDE_CONFIG_DIR = home;
+    previousHome = process.env["CLAUDE_CONFIG_DIR"];
+    process.env["CLAUDE_CONFIG_DIR"] = home;
   });
 
   after(() => {
-    if (previousHome === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-    else process.env.CLAUDE_CONFIG_DIR = previousHome;
+    if (previousHome === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+    else process.env["CLAUDE_CONFIG_DIR"] = previousHome;
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -184,7 +188,7 @@ describe("the SDK's session helpers on the store", { skip }, () => {
       { ...base, type: "user", uuid: "11111111-1111-4111-8111-111111111111", parentUuid: null, timestamp: "2026-09-27T00:00:00.000Z", message: { role: "user", content: "remember the number 7" } },
       { ...base, type: "assistant", uuid: "22222222-2222-4222-8222-222222222222", parentUuid: "11111111-1111-4111-8111-111111111111", timestamp: "2026-09-27T00:00:01.000Z", message: { id: "msg_1", type: "message", role: "assistant", model: "claude", content: [{ type: "text", text: "7, noted" }], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } } },
       { ...base, type: "user", uuid: "33333333-3333-4333-8333-333333333333", parentUuid: "22222222-2222-4222-8222-222222222222", timestamp: "2026-09-27T00:00:02.000Z", message: { role: "user", content: "and 8" } },
-    ];
+    ] as const;
     writeFileSync(join(projectDir, `${sessionId}.jsonl`), lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
 
     await importSessionToStore(sessionId, store, { dir });
@@ -192,7 +196,7 @@ describe("the SDK's session helpers on the store", { skip }, () => {
 
     const listed = await listSessions({ dir, sessionStore: store });
     assert.deepEqual(listed.map((s) => s.sessionId), [sessionId]);
-    assert.equal(listed[0].firstPrompt, "remember the number 7");
+    assert.equal(listed[0]?.firstPrompt,"remember the number 7");
 
     const messages = await getSessionMessages(sessionId, { dir, sessionStore: store });
     assert.deepEqual(messages.map((m) => m.uuid), lines.map((line) => line.uuid));

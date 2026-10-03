@@ -1,10 +1,11 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+
 import { PASSAGE_CHARS, digest, passagesOf, split } from "../src/harness/claude/search/passages.ts";
 
-const texts = (entry) => passagesOf(entry).map(({ kind, prose, text }) => ({ kind, prose, text }));
+const texts = (entry: SessionStoreEntry) => passagesOf(entry).map(({ kind, prose, text }) => ({ kind, prose, text }));
 const UUID = "0b4fd7d3-5d6b-4c1e-9a55-2f0e1c7d3a11";
 
 test("a prompt and an answer are prose, each block of a message its own passage", () => {
@@ -104,6 +105,6 @@ test("long text is split at the widest boundary, never past the limit or between
 test("parts number an entry's passages in order, and the same text has the same digest wherever it is", () => {
   const passages = passagesOf({ type: "user", message: { content: [{ type: "text", text: "one" }, { type: "text", text: "two" }] } });
   assert.deepEqual(passages.map((passage) => passage.part), [0, 1]);
-  assert.equal(passages[0].digest, digest("one"));
-  assert.equal(passagesOf({ type: "queue-operation", content: "one more time" })[0].digest, digest("one more time"));
+  assert.equal(passages[0]?.digest, digest("one"));
+  assert.equal(passagesOf({ type: "queue-operation", content: "one more time" })[0]?.digest,digest("one more time"));
 });

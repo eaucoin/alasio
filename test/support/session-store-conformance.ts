@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The Agent SDK's SessionStore conformance suite
  * (claude-agent-sdk-typescript examples/session-stores/shared/conformance.ts),
@@ -6,13 +5,22 @@
  * fresh, empty store for each case.
  */
 import assert from "node:assert/strict";
-import { describe, test } from "node:test";
+import { describe, test, type TestOptions } from "node:test";
 
-export const KEY = { projectKey: "proj", sessionId: "sess" };
-export const E = (type, extra = {}) => ({ type, ...extra });
+import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+
+/** The store as the suite exercises it: the SDK's optional methods it checks are all there. */
+export type ConformingSessionStore = Required<Pick<SessionStore, "append" | "load" | "listSessions" | "delete" | "listSubkeys">>;
+
+export interface SessionStoreConformanceOptions {
+  readonly skip?: TestOptions["skip"];
+}
+
+export const KEY: SessionKey = { projectKey: "proj", sessionId: "sess" };
+export const E = (type: string, extra: Record<string, unknown> = {}): SessionStoreEntry => ({ type, ...extra });
 
 /** Sorted-key JSON, so deep-equality ignores the key order JSONB returns. */
-function canon(value) {
+function canon(value: unknown): string {
   return JSON.stringify(value, (_key, inner) =>
     inner && typeof inner === "object" && !Array.isArray(inner)
       ? Object.fromEntries(Object.entries(inner).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
@@ -20,9 +28,12 @@ function canon(value) {
   );
 }
 
-export const expectEntries = (actual, expected) => assert.equal(canon(actual), canon(expected));
+export const expectEntries = (actual: unknown, expected: unknown): void => assert.equal(canon(actual), canon(expected));
 
-export function sessionStoreConformance(makeStore, { skip = false } = {}) {
+export function sessionStoreConformance(
+  makeStore: () => Promise<ConformingSessionStore>,
+  { skip = false }: SessionStoreConformanceOptions = {},
+): void {
   describe("SessionStore conformance", { skip }, () => {
     test("append then load returns same entries in same order", async () => {
       const store = await makeStore();

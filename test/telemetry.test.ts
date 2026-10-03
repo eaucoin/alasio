@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -6,11 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import type { Message } from "@grammyjs/types";
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import { InMemoryLogRecordExporter, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
-import { MetricReader } from "@opentelemetry/sdk-metrics";
+import { DataPointType, type MetricData, MetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
-import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+
+import type { RequestId } from "../.types/codex/index.js";
+import type { Harness } from "../src/harness/index.ts";
+import type { HarnessName } from "../src/harness/names.ts";
+import type { HostProfile } from "../src/kube/config.ts";
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
 // load (as src/index.ts does) receives it. Here it keeps everything in memory.
@@ -20,8 +25,8 @@ for (const name of Object.keys(process.env)) {
   if (/^(OTEL_.*|TRACEPARENT|TRACESTATE)$/u.test(name)) delete process.env[name];
 }
 class CollectingReader extends MetricReader {
-  async onForceFlush() {}
-  async onShutdown() {}
+  protected override async onForceFlush(): Promise<void> {}
+  protected override async onShutdown(): Promise<void> {}
 }
 const spans = new InMemorySpanExporter();
 const logRecords = new InMemoryLogRecordExporter();
@@ -49,22 +54,35 @@ const { inSpan, resolveTelemetry, sharedResourceAttributes, withoutTelemetry } =
 const { Client } = await import("../src/telegram/client.ts");
 const { TelegramOutbox } = await import("../src/telegram/outbox.ts");
 
+type SendMessageArgs = Parameters<InstanceType<typeof Client>["sendMessage"]>;
+
 const ENDPOINT = { OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/" };
 
-function finishedSpan(name) {
+function finishedSpan(name: string): ReadableSpan {
   const span = spans.getFinishedSpans().findLast((candidate) => candidate.name === name);
   assert.ok(span, `no finished span ${name}`);
   return span;
 }
 
-async function metricPoints(name) {
+/** A point of a metric, of whichever kind the metric is. */
+type MetricPoint = MetricData["dataPoints"][number];
+
+async function metricData(name: string): Promise<MetricData[]> {
   const { resourceMetrics } = await metricReader.collect();
   return resourceMetrics.scopeMetrics.flatMap((scope) => scope.metrics)
-    .filter((metric) => metric.descriptor.name === name)
-    .flatMap((metric) => metric.dataPoints);
+    .filter((metric) => metric.descriptor.name === name);
 }
 
-function withEnv(overrides, run) {
+async function metricPoints(name: string): Promise<MetricPoint[]> {
+  return (await metricData(name)).flatMap((metric): MetricPoint[] => metric.dataPoints);
+}
+
+/** The points of a histogram metric. */
+async function histogramPoints(name: string) {
+  return (await metricData(name)).flatMap((metric) => (metric.dataPointType === DataPointType.HISTOGRAM ? metric.dataPoints : []));
+}
+
+function withEnv<T>(overrides: Readonly<Record<string, string>>, run: () => T): T {
   const saved = Object.fromEntries(Object.keys(overrides).map((name) => [name, process.env[name]]));
   Object.assign(process.env, overrides);
   try {
@@ -82,13 +100,13 @@ test("telemetry is off without an endpoint and otherwise follows the standard va
 
   const shared = resolveTelemetry({ ...ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS: "authorization=Bearer%20x" });
   assert.deepEqual(shared.traces, { endpoint: "http://collector:4318/v1/traces", protocol: "http/protobuf", headers: "authorization=Bearer%20x" });
-  assert.equal(shared.logs.endpoint, "http://collector:4318/v1/logs");
+  assert.equal(shared.logs?.endpoint,"http://collector:4318/v1/logs");
 
   const own = resolveTelemetry({ OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://metrics:9090/otlp/v1/metrics" });
   assert.deepEqual(own, { traces: null, metrics: { endpoint: "http://metrics:9090/otlp/v1/metrics", protocol: "http/protobuf", headers: null }, logs: null });
 
   const grpc = resolveTelemetry({ OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4317", OTEL_EXPORTER_OTLP_PROTOCOL: "grpc" });
-  assert.equal(grpc.traces.endpoint, "http://collector:4317");
+  assert.equal(grpc.traces?.endpoint,"http://collector:4317");
 
   assert.deepEqual(resolveTelemetry({ ...ENDPOINT, OTEL_SDK_DISABLED: "true" }), { traces: null, metrics: null, logs: null });
   const someOff = resolveTelemetry({ ...ENDPOINT, OTEL_TRACES_EXPORTER: "none", OTEL_LOGS_EXPORTER: "console" });
@@ -136,15 +154,17 @@ test("Claude Code exports each signal alasio exports, labelled with its conversa
 });
 
 test("a folder's bayma exports where alasio does, labelled with its conversation", () => {
-  const profile = { namespace: "alasio-host", port: 7290, stateRoot: "/s", podTemplate: { spec: { containers: [{ name: "bayma", args: [] }] } } };
-  const envOf = (env) => Object.fromEntries(
-    hostBaymaManifest({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", profile, env }).spec.podTemplate.spec.containers[0].env.map(({ name, value }) => [name, value]),
-  );
+  const profile: HostProfile = { namespace: "alasio-host", port: 7290, stateRoot: "/s", podTemplate: { spec: { containers: [{ name: "bayma", args: [] }] } } };
+  const envOf = (env: NodeJS.ProcessEnv) => {
+    const [bayma] = hostBaymaManifest({ harness: CLAUDE_HARNESS, threadKey: "telegram:7", profile, env }).spec.podTemplate.spec?.containers ?? [];
+    assert.ok(bayma?.env);
+    return Object.fromEntries(bayma.env.map(({ name, value }) => [name, value]));
+  };
   assert.deepEqual(envOf({ PATH: "/bin" }), {});
   const env = envOf({ ...ENDPOINT, OTEL_METRICS_EXPORTER: "none" });
-  assert.equal(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, "http://collector:4318/v1/traces");
-  assert.equal(env.OTEL_METRICS_EXPORTER, "none");
-  assert.equal(env.OTEL_RESOURCE_ATTRIBUTES, "alasio.conversation.id=telegram%3A7");
+  assert.equal(env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"], "http://collector:4318/v1/traces");
+  assert.equal(env["OTEL_METRICS_EXPORTER"], "none");
+  assert.equal(env["OTEL_RESOURCE_ATTRIBUTES"], "alasio.conversation.id=telegram%3A7");
 });
 
 test("Codex's app-server exports each signal alasio exports through its own config", () => {
@@ -166,21 +186,23 @@ test("log lines become records of the trace they are written in", async () => {
     return active;
   });
   const record = logRecords.getFinishedLogRecords().findLast((candidate) => candidate.body === "something to see");
+  assert.ok(record);
   assert.equal(record.severityText, "WARN");
   assert.equal(record.instrumentationScope.name, "telemetry-test");
   assert.equal(record.attributes["alasio.conversation.id"], "telegram:1");
-  assert.equal(record.spanContext.traceId, span.spanContext().traceId);
+  assert.equal(record.spanContext?.traceId, span.spanContext().traceId);
 });
 
 test("Bot API calls are client spans that never carry the bot token", async (t) => {
-  const responses = [
+  const responses: { status: number; body: object }[] = [
     { status: 429, body: { ok: false, parameters: { retry_after: 0.001 } } },
     { status: 200, body: { ok: true, result: { message_id: 5 } } },
     { status: 200, body: { ok: true, result: [] } },
   ];
   t.mock.method(globalThis, "fetch", async () => {
-    const { status, body } = responses.shift();
-    return new Response(JSON.stringify(body), { status });
+    const next = responses.shift();
+    assert.ok(next, "a response for every call");
+    return new Response(JSON.stringify(next.body), { status: next.status });
   });
   const client = new Client("123:SECRET-TOKEN");
   spans.reset();
@@ -188,30 +210,52 @@ test("Bot API calls are client spans that never carry the bot token", async (t) 
   await client.getUpdates({ offset: 1 });
   const [call] = spans.getFinishedSpans();
   assert.equal(spans.getFinishedSpans().length, 1, "the long poll is not a span");
+  assert.ok(call);
   assert.equal(call.name, "telegram/sendMessage");
   assert.equal(call.kind, SpanKind.CLIENT);
   assert.equal(call.attributes["rpc.method"], "sendMessage");
   assert.equal(call.attributes["http.response.status_code"], 200);
   assert.deepEqual(call.events.map((event) => event.name), ["rate_limited"]);
   assert.equal(JSON.stringify({ attributes: call.attributes, events: call.events }).includes("SECRET"), false);
-  const [duration] = (await metricPoints("rpc.client.call.duration")).filter((point) => point.attributes["rpc.method"] === "sendMessage");
-  assert.equal(duration.value.count, 1);
+  const [duration] = (await histogramPoints("rpc.client.call.duration")).filter((point) => point.attributes["rpc.method"] === "sendMessage");
+  assert.equal(duration?.value.count, 1);
 });
 
+/** A request the client wrote to the app-server, as far as this test reads it. */
+interface WrittenRequest {
+  readonly id: RequestId;
+  readonly trace?: { readonly traceparent: string };
+}
+
 test("Codex app-server requests carry their span's trace context", async () => {
-  const written = [];
+  const written: WrittenRequest[] = [];
   const client = new AppServerRpcClient({ log: createLogger("test"), onNotification: () => undefined, onFailure: () => undefined });
-  client.process = { child: { stdin: { write: (line) => written.push(JSON.parse(line)) } }, stop: () => undefined };
+  client.process = {
+    child: {
+      killed: false,
+      stdin: {
+        write: (line: string) => {
+          written.push(JSON.parse(line));
+          return true;
+        },
+      },
+    },
+    stop: () => undefined,
+  };
   const result = await inSpan("test.codex", {}, async () => {
     const pending = client.request("thread/start", { cwd: "/tmp" });
-    client.handleLine(JSON.stringify({ id: written[0].id, result: { thread: { id: "t-1" } } }));
+    const [start] = written;
+    assert.ok(start);
+    client.handleLine(JSON.stringify({ id: start.id, result: { thread: { id: "t-1" } } }));
     return await pending;
   });
   assert.deepEqual(result, { thread: { id: "t-1" } });
   const request = finishedSpan("codex/thread/start");
+  const [sent] = written;
+  assert.ok(sent);
   assert.equal(request.attributes["rpc.system.name"], "jsonrpc");
-  assert.equal(request.attributes["rpc.jsonrpc.request_id"], String(written[0].id));
-  assert.equal(written[0].trace.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
+  assert.equal(request.attributes["rpc.jsonrpc.request_id"], String(sent.id));
+  assert.equal(sent.trace?.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
 });
 
 test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async () => {
@@ -224,32 +268,53 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     const conversationId = store.upsertConversation({ chatId: "42", user: { id: 42 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
     store.setWorkingDirectory(conversationId, folder);
-    const sent = [];
+    const sent: SendMessageArgs[] = [];
     const telegram = {
-      async sendMessage(...args) {
+      async sendMessage(...args: SendMessageArgs): Promise<Message[]> {
         sent.push(args);
-        return [{ message_id: sent.length }];
+        return [{ message_id: sent.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } }];
       },
-      async editMessageText() {},
+      // What the Bot API answers for an edit it makes without returning the message.
+      async editMessageText(): Promise<true> {
+        return true;
+      },
     };
-    const harness = (name) => ({
-      name,
-      displayName: name,
-      supportsGoals: false,
-      supportsWarmup: false,
-      supportsSteer: false,
-      sessions: {},
-      async executeTurn() {
-        return {
-          blockSequence: [{ type: "text", phase: "final_answer", content: "done" }],
-          sessionId: "thread-1",
-          pendingResponseId: "pending-1",
-          interrupted: false,
-          responseCompleted: true,
-        };
-      },
-      shutdown() {},
-    });
+    // A harness that only runs turns: what else a harness does, a turn does not use.
+    const harness = (name: HarnessName): Harness => {
+      const unused = (): never => {
+        throw new Error(`the test's ${name} harness only runs turns`);
+      };
+      return {
+        name,
+        displayName: name,
+        supportsGoals: false,
+        supportsWarmup: false,
+        supportsSteer: false,
+        sessions: {
+          listSessions: unused,
+          getTotalSessionPages: unused,
+          getSessionByNumber: unused,
+          getSessionLastMessage: unused,
+          listSessionMessages: unused,
+          getTotalRewindPages: unused,
+          createForkedSession: unused,
+        },
+        startFreshSession: unused,
+        warmSession: unused,
+        listModels: unused,
+        defaultModelChoice: unused,
+        async executeTurn() {
+          return {
+            blockSequence: [{ type: "text", phase: "final_answer", content: "done" }],
+            sessionId: "thread-1",
+            pendingResponseId: "pending-1",
+            interrupted: false,
+            responseCompleted: true,
+          };
+        },
+        shutdown() {},
+      };
+    };
     const outbox = new TelegramOutbox({ client: telegram, store, log: createLogger("test") });
     const turns = new TurnController({
       config: { workspaceRoot: root },
@@ -263,8 +328,9 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
       harnesses: createHarnessRegistry({ config: {}, overrides: { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) } }),
     });
     spans.reset();
-    await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: "9", text: "hello", filePaths: [] }));
-    await turns.promptWorkers.get(conversationId);
+    await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }));
+    // The conversation's prompt worker, already running: it resolves once the prompt is done.
+    await turns.scheduleConversation(conversationId);
     await outbox.flushDue();
 
     const update = finishedSpan("alasio.update");
@@ -272,19 +338,21 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     const delivery = finishedSpan("alasio.delivery");
     const traceId = update.spanContext().traceId;
     assert.equal(turn.spanContext().traceId, traceId);
-    assert.equal(turn.parentSpanContext.spanId, update.spanContext().spanId);
+    assert.equal(turn.parentSpanContext?.spanId, update.spanContext().spanId);
     assert.equal(turn.attributes["alasio.harness"], CODEX_HARNESS);
     assert.equal(turn.attributes["alasio.turn.outcome"], "completed");
     assert.equal(turn.attributes["alasio.session.id"], "thread-1");
     assert.equal(delivery.spanContext().traceId, traceId);
-    assert.equal(delivery.parentSpanContext.spanId, turn.spanContext().spanId);
+    assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
     assert.ok(sent.some(([, text]) => text === "done"));
 
     const [duration] = (await metricPoints("alasio.turn.duration")).filter((point) => point.attributes["alasio.turn.outcome"] === "completed");
-    assert.equal(duration.attributes["alasio.harness"], CODEX_HARNESS);
+    assert.equal(duration?.attributes["alasio.harness"], CODEX_HARNESS);
     assert.equal((await metricPoints("alasio.prompt.wait")).length, 1);
     assert.equal((await metricPoints("alasio.delivery.lag")).length, 1);
-    assert.equal((await metricPoints("alasio.turn.active"))[0].value, 0);
+    const [active] = await metricPoints("alasio.turn.active");
+    assert.ok(active);
+    assert.equal(active.value, 0);
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
@@ -305,7 +373,7 @@ test("a deferred delivery records what stopped it and keeps its trace", async ()
       return span;
     });
     const delivery = finishedSpan("alasio.delivery");
-    assert.equal(delivery.parentSpanContext.spanId, turn.spanContext().spanId);
+    assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
     assert.equal(delivery.status.code, SpanStatusCode.ERROR);
     assert.equal(delivery.attributes["alasio.delivery.attempt"], 1);
     assert.equal(store.getPendingOutboxCount(), 1);

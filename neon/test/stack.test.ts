@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * alasio's Neon as the Helm chart runs it: a release installed in a cluster, its
  * components killed, the whole stack stopped at once, a safekeeper's volume lost, with
@@ -11,33 +10,36 @@
  * `npm run test:neon`.
  */
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { type ChildProcessByStdio, execFile, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
+import type { Readable } from "node:stream";
 import { after, before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import pg from "pg";
+import type { V1ConfigMap, V1Pod, V1PodSpec } from "@kubernetes/client-node";
+import pg, { type QueryResultRow } from "pg";
 
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { signToken } from "../control/jwt.ts";
+import type { TimelineRecord } from "../control/service.ts";
 
 const run = promisify(execFile);
 const CHART = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "charts", "alasio");
-const NAMESPACE = process.env.ALASIO_E2E_NAMESPACE ?? "alasio";
-const RELEASE = process.env.ALASIO_E2E_RELEASE ?? "alasio";
+const NAMESPACE = process.env["ALASIO_E2E_NAMESPACE"] ?? "alasio";
+const RELEASE = process.env["ALASIO_E2E_RELEASE"] ?? "alasio";
 const FULL = RELEASE.includes("alasio") ? RELEASE : `${RELEASE}-alasio`;
-const skip = !process.env.KUBECONFIG && "needs a cluster with a release installed: set KUBECONFIG";
+const skip = !process.env["KUBECONFIG"] && "needs a cluster with a release installed: set KUBECONFIG";
 
-const neonName = (component) => `${FULL}-neon-${component}`;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const neonName = (component: string) => `${FULL}-neon-${component}`;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-const kubectl = async (...args) => (await run("kubectl", ["--namespace", NAMESPACE, ...args], { maxBuffer: 64 * 1024 * 1024 })).stdout;
+const kubectl = async (...args: string[]) => (await run("kubectl", ["--namespace", NAMESPACE, ...args], { maxBuffer: 64 * 1024 * 1024 })).stdout;
 
-async function secret(name, key) {
+async function secret(name: string, key: string) {
   return Buffer.from(await kubectl("get", "secret", name, "-o", `jsonpath={.data.${key.replaceAll(".", "\\.")}}`), "base64").toString("utf8");
 }
 
@@ -49,7 +51,7 @@ async function freePort() {
   for (;;) {
     const port = 20000 + Math.floor(Math.random() * 12000);
     const server = createServer();
-    const free = await new Promise((resolve) => {
+    const free = await new Promise<boolean>((resolve) => {
       server.once("error", () => resolve(false));
       server.listen(port, "127.0.0.1", () => resolve(true));
     });
@@ -64,13 +66,13 @@ async function freePort() {
  * A port on this machine forwarded to the compute's Service, kept up: a forward ends
  * with the pod it reached, so it is started again whenever it exits.
  */
-function computeForward(port) {
-  let child = null;
+function computeForward(port: number) {
+  let child: ChildProcessByStdio<null, null, Readable> | null = null;
   let stopped = false;
   const start = () => {
     child = spawn("kubectl", ["--namespace", NAMESPACE, "port-forward", `service/${neonName("compute")}`, `${port}:55433`], { stdio: ["ignore", "ignore", "pipe"] });
     let said = "";
-    child.stderr.on("data", (chunk) => { said = String(chunk).trim() || said; });
+    child.stderr.on("data", (chunk: Buffer) => { said = String(chunk).trim() || said; });
     child.on("exit", (code) => {
       if (stopped) return;
       console.error(`# the forward to the compute exited ${code}${said ? `: ${said}` : ""}; starting it again`);
@@ -81,12 +83,17 @@ function computeForward(port) {
   return { stop: () => ((stopped = true), child?.kill()) };
 }
 
-let forward;
-let databaseUrl;
-let pool;
+// Set by the first hook unless every test that uses them is skipped.
+let forward: ReturnType<typeof computeForward> | undefined;
+let databaseUrl: string;
+let pool: pg.Pool;
 
 /** A query on a connection of its own, retried while the stack comes back. */
-async function query(sql, params, { attempts = 60 } = {}) {
+async function query<Row extends QueryResultRow = Record<string, unknown>>(
+  sql: string,
+  params?: unknown[],
+  { attempts = 60 }: { readonly attempts?: number } = {},
+): Promise<Row[]> {
   for (let attempt = 1; ; attempt++) {
     const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000, query_timeout: 300_000 });
     client.on("error", () => {});
@@ -94,7 +101,7 @@ async function query(sql, params, { attempts = 60 } = {}) {
     try {
       await client.connect();
       connected = true;
-      return (await client.query(sql, params)).rows;
+      return (await client.query<Row>(sql, params)).rows;
     } catch (error) {
       // Connecting is retried; a query that reached the database is not.
       if (connected || attempt >= attempts) throw error;
@@ -112,32 +119,33 @@ async function up() {
   await query("select 1");
 }
 
-const killPod = (name) => kubectl("delete", "pod", name, "--grace-period=0", "--force", "--wait=false");
-const podOf = async (component) => (await kubectl("get", "pods", "-l", `app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=${component}`, "-o", "jsonpath={.items[0].metadata.name}")).trim();
+const killPod = (name: string) => kubectl("delete", "pod", name, "--grace-period=0", "--force", "--wait=false");
+const podOf = async (component: string) =>(await kubectl("get", "pods", "-l", `app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=${component}`, "-o", "jsonpath={.items[0].metadata.name}")).trim();
 
-let privateKey;
-const token = (scope) => signToken(privateKey, scope);
+let privateKey: string;
+const token = (scope: string) => signToken(privateKey, scope);
 
 /** An HTTP call from inside a pod of the stack, whose image has curl. */
-async function inside(pod, method, url, scope, body) {
+async function inside(pod: string, method: string, url: string, scope: string, body?: unknown) {
   const args = ["exec", pod, "--", "curl", "-sS", "-X", method, "-H", `authorization: Bearer ${token(scope)}`];
   if (body !== undefined) args.push("-H", "content-type: application/json", "-d", JSON.stringify(body));
   return await kubectl(...args, url);
 }
 
-async function record() {
+/** What neon-control bootstrapped, which it has once the stack is up. */
+async function record(): Promise<TimelineRecord> {
   return JSON.parse(await kubectl("exec", `deployment/${neonName("control")}`, "--", "cat", "/state/bootstrap.json"));
 }
 
-async function pageserverMetric(name) {
+async function pageserverMetric(name: string) {
   const metrics = await inside(`${neonName("pageserver")}-0`, "GET", "http://127.0.0.1:9898/metrics", "pageserverapi");
   const line = metrics.split("\n").find((l) => l.startsWith(`${name} `));
   return Number(line?.split(" ")[1] ?? NaN);
 }
 
 /** Writes rows until stopped, counting only those whose commit returned. */
-function writer(table) {
-  const committed = [];
+function writer(table: string) {
+  const committed: number[] = [];
   let stopping = false;
   let next = 1;
   const done = (async () => {
@@ -162,12 +170,12 @@ function writer(table) {
 }
 
 /** Applies `object`, as `kubectl apply` reads it. */
-async function apply(object) {
+async function apply(object: V1Pod | V1ConfigMap) {
   const child = spawn("kubectl", ["--namespace", NAMESPACE, "apply", "-f", "-"], { stdio: ["pipe", "ignore", "pipe"] });
   let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk; });
   child.stdin.end(JSON.stringify(object));
-  const code = await new Promise((resolve) => child.on("exit", resolve));
+  const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
   if (code !== 0) throw new Error(`kubectl apply exited ${code}: ${stderr}`);
 }
 
@@ -177,8 +185,8 @@ async function apply(object) {
  * One that fails, or does not finish within `timeoutMs`, fails with its logs and its
  * last events.
  */
-async function runPod(name, spec, { timeoutMs = 300_000 } = {}) {
-  const nodeSelector = JSON.parse((await kubectl("get", `deployment/${neonName("compute")}`, "-o", "jsonpath={.spec.template.spec.nodeSelector}")).trim() || "{}");
+async function runPod(name: string, spec: V1PodSpec,{ timeoutMs = 300_000 }: { readonly timeoutMs?: number } = {}) {
+  const nodeSelector: Record<string, string> = JSON.parse((await kubectl("get", `deployment/${neonName("compute")}`, "-o", "jsonpath={.spec.template.spec.nodeSelector}")).trim() || "{}");
   await apply({
     apiVersion: "v1",
     kind: "Pod",
@@ -192,7 +200,7 @@ async function runPod(name, spec, { timeoutMs = 300_000 } = {}) {
       await sleep(2000);
       phase = (await kubectl("get", "pod", name, "-o", "jsonpath={.status.phase}")).trim();
     }
-    const logs = await kubectl("logs", name, "--all-containers").catch((error) => error.message);
+    const logs = await kubectl("logs", name, "--all-containers").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
     if (phase !== "Succeeded") {
       const events = await kubectl("describe", "pod", name).catch(() => "");
       throw new Error(`pod ${name} ended ${phase || "unstarted"}:\n${logs}\n${events.split("\n").slice(-15).join("\n")}`);
@@ -203,7 +211,7 @@ async function runPod(name, spec, { timeoutMs = 300_000 } = {}) {
   }
 }
 
-const image = async (workload, container = 0) => (await kubectl("get", workload, "-o", `jsonpath={.spec.template.spec.containers[${container}].image}`)).trim();
+const image = async (workload: string, container = 0) => (await kubectl("get", workload, "-o", `jsonpath={.spec.template.spec.containers[${container}].image}`)).trim();
 const restricted = { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } };
 
 before(async () => {
@@ -234,6 +242,24 @@ sessionStoreConformance(
   },
   { skip },
 );
+
+/** The pageserver's answer to which LSN a moment was at. */
+interface LsnAtTimestamp {
+  readonly kind: string;
+  readonly lsn: string;
+}
+
+/** What neon-control serves a compute, as far as this test changes it. */
+interface ServedComputeConfig {
+  status?: unknown;
+  spec: {
+    mode: unknown;
+    safekeeper_connstrings: string[];
+    safekeepers_generation?: number;
+    [field: string]: unknown;
+  };
+  [field: string]: unknown;
+}
 
 describe("alasio's Neon on Kubernetes", { skip }, () => {
   test("bootstraps its tenant and a timeline on three safekeepers", async () => {
@@ -266,7 +292,7 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
       await sleep(15_000);
       await rows.stop();
       await up();
-      const present = new Set((await query(`select id from ${table}`)).map((row) => row.id));
+      const present = new Set((await query<{ id: number }>(`select id from ${table}`)).map((row) => row.id));
       assert.ok(rows.committed.length > 0);
       assert.deepEqual(rows.committed.filter((id) => !present.has(id)), []);
     });
@@ -329,7 +355,7 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     } catch (error) {
       const logs = await kubectl("logs", `job/${job}`, "--all-containers").catch(() => "");
       const store = await kubectl("logs", `statefulset/${FULL}-seaweedfs`, "-c", "seaweedfs", "--tail=30").catch(() => "");
-      throw new Error(`${error.message}\n${logs}\nthe object store:\n${store}`);
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\n${logs}\nthe object store:\n${store}`);
     } finally {
       await kubectl("delete", "job", job, "--wait=false").catch(() => {});
     }
@@ -366,7 +392,7 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     await query("insert into history select g from generate_series(101, 200) g");
 
     const { tenantId, timelineId } = await record();
-    const found = JSON.parse(await inside(
+    const found: LsnAtTimestamp = JSON.parse(await inside(
       `${neonName("pageserver")}-0`,
       "GET",
       `http://127.0.0.1:9898/v1/tenant/${tenantId}/timeline/${timelineId}/get_lsn_by_timestamp?timestamp=${encodeURIComponent(moment)}`,
@@ -377,7 +403,7 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
     // A read-only compute pinned to that moment's LSN, given as a file the spec
     // neon-control serves the compute.
     const computeToken = await secret(neonName("compute"), "NEON_CONTROL_PLANE_TOKEN");
-    const config = JSON.parse(await kubectl(
+    const config: ServedComputeConfig = JSON.parse(await kubectl(
       "exec", `deployment/${neonName("control")}`, "--", "node", "-e",
       'fetch("http://127.0.0.1:8080/compute/api/v2/computes/alasio/spec", { headers: { authorization: "Bearer " + process.argv[1] } }).then((r) => r.text()).then((t) => process.stdout.write(t))',
       computeToken,
@@ -413,16 +439,16 @@ describe("alasio's Neon on Kubernetes", { skip }, () => {
 });
 
 /** A read-only query of the lake, run in its pod as `kubectl exec` runs one. */
-async function lakeQuery(sql) {
+async function lakeQuery(sql: string) {
   const stdout = await kubectl("exec", `deployment/${FULL}-lake`, "--", "node", "src/query.ts", "--format", "json", sql);
-  return stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  return stdout.trim().split("\n").filter(Boolean).map((line): Record<string, unknown> => JSON.parse(line));
 }
 
-async function untilLoaded(check, what) {
+async function untilLoaded(check: () => Promise<boolean>, what: string) {
   const deadline = Date.now() + 300_000;
-  let last;
+  let last: unknown;
   while (Date.now() < deadline) {
-    last = await check().catch((error) => error);
+    last = await check().catch((error: unknown) => error);
     if (last === true) return;
     await sleep(3000);
   }
@@ -431,9 +457,17 @@ async function untilLoaded(check, what) {
 
 describe("alasio's analytics lake on Kubernetes", { skip }, () => {
   const KEY = { projectKey: "-kube-stack-test", sessionId: "33333333-3333-4333-8333-333333333333" };
-  const entry = (n) => ({ type: "user", uuid: `kube-stack-${n}`, timestamp: new Date(1790000000000 + n).toISOString(), message: { role: "user", content: `entry ${n}` } });
-  const sourceCount = async () => (await query("select count(*)::int as n from claude_sessions.entries"))[0].n;
-  const lakeCounts = async () => (await lakeQuery("select count(*) as n, count(distinct seq) as seqs from claude.entries"))[0];
+  const entry = (n: number) => ({ type: "user", uuid: `kube-stack-${n}`, timestamp: new Date(1790000000000 + n).toISOString(), message: { role: "user", content: `entry ${n}` } });
+  const sourceCount = async () => {
+    const [counted] = await query<{ n: number }>("select count(*)::int as n from claude_sessions.entries");
+    assert.ok(counted);
+    return counted.n;
+  };
+  const lakeCounts = async () => {
+    const [counts] = await lakeQuery("select count(*) as n, count(distinct seq) as seqs from claude.entries");
+    assert.ok(counts);
+    return counts;
+  };
 
   test("loads what alasio's stores hold, as it starts and as it runs", async () => {
     const store = new NeonSessionStore(pool);
@@ -447,7 +481,7 @@ describe("alasio's analytics lake on Kubernetes", { skip }, () => {
     await kubectl("rollout", "restart", `deployment/${FULL}-lake`);
     await kubectl("rollout", "status", `deployment/${FULL}-lake`, "--timeout=300s");
     const expected = await sourceCount();
-    await untilLoaded(async () => Number((await lakeCounts()).n) === expected, `held all ${expected} entries`);
+    await untilLoaded(async () => Number((await lakeCounts())["n"]) === expected, `held all ${expected} entries`);
     const lines = await lakeQuery("select type, thread_id from codex.lines where thread_id = 'thread-k'");
     assert.deepEqual(lines, [{ type: "session_meta", thread_id: "thread-k" }]);
   });

@@ -1,32 +1,41 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { loginUpstream, startLoginRelay } from "../src/codex/login-relay.ts";
+import { loginUpstream, startLoginRelay, type LoginUpstream } from "../src/codex/login-relay.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "alasio-login-relay-"));
 const authFile = join(dir, "auth.json");
-const writeAuth = (auth) => writeFileSync(authFile, JSON.stringify(auth));
+const writeAuth = (auth: unknown) => writeFileSync(authFile, JSON.stringify(auth));
+
+/** What a request arrived at the upstream with. */
+interface UpstreamRequest {
+  readonly path: string | undefined;
+  readonly auth: string | null;
+  readonly accountId: string | string[] | null;
+  readonly body: string;
+}
 
 // A stand-in upstream that records what each request arrived with.
-let upstream;
-let upstreamOrigin;
-const seen = [];
+let upstream: Server;
+let upstreamOrigin: string;
+const seen: UpstreamRequest[] = [];
 before(async () => {
   upstream = createServer((req, res) => {
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       seen.push({ path: req.url, auth: req.headers.authorization ?? null, accountId: req.headers["chatgpt-account-id"] ?? null, body: Buffer.concat(chunks).toString() });
       res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
     });
   });
-  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
-  upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  // Listening on a TCP port, the server's address is an AddressInfo.
+  upstreamOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 });
 after(async () => {
   await new Promise((resolve) => upstream.close(resolve));
@@ -53,12 +62,12 @@ test("a ChatGPT login goes to the Codex backend with its account id; an API key 
 
 test("the relay takes only its own bearer and the model API's paths, and reads the login fresh each time", async () => {
   // The real login resolution, pointed at the stand-in upstream.
-  const upstreamFor = (file, path) => {
+  const upstreamFor = (file: string, path: string): LoginUpstream | null => {
     const real = loginUpstream(file, path);
     return real && { ...real, origin: upstreamOrigin };
   };
   const relay = await startLoginRelay({ authFile, bearer: "relay-bearer", upstreamFor });
-  const call = (path, bearer, body = "{}") =>
+  const call = (path: string, bearer?: string, body = "{}") =>
     fetch(`${relay.url.replace(/\/v1$/, "")}${path}`, { method: "POST", headers: bearer ? { authorization: `Bearer ${bearer}` } : {}, body });
   try {
     assert.match(relay.url, /^http:\/\/127\.0\.0\.1:\d+\/v1$/);
@@ -72,7 +81,7 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
     // A token the operator's Codex refreshes on disk is used from the next request on.
     writeAuth({ tokens: { access_token: "token-2", account_id: "acct-1" } });
     await call("/v1/responses", "relay-bearer");
-    assert.equal(seen.at(-1).auth, "Bearer token-2");
+    assert.equal(seen.at(-1)?.auth,"Bearer token-2");
 
     const before = seen.length;
     assert.equal((await call("/v1/responses", "guessed")).status, 401);

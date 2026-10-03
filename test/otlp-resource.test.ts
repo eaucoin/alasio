@@ -1,9 +1,10 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { Attributes } from "@opentelemetry/api";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import {
+  type ISerializer,
   JsonLogsSerializer,
   JsonMetricsSerializer,
   JsonTraceSerializer,
@@ -15,9 +16,11 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { MeterProvider, MetricReader } from "@opentelemetry/sdk-metrics";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import protobuf from "protobufjs";
+import protobuf, { type Long } from "protobufjs";
 
 import { MalformedRequest, stampResources } from "../src/sandbox/otlp-resource.ts";
+import { SIGNALS, type Signal } from "../src/telemetry/config.ts";
+import type { OtlpEncoding } from "../src/telemetry/forward.ts";
 
 // Requests as OpenTelemetry's own SDK and serializers make them, from a resource that
 // claims to be something it is not, are stamped, and their resources read back with an
@@ -44,29 +47,73 @@ const { root } = protobuf.parse(`
 `);
 const Request = root.lookupType("Request");
 
-const anyValue = (value) =>
+/** An attribute's value, as either decoder gives it: an int64 is a Long from protobufjs, a string or number in JSON. */
+interface AnyValue {
+  readonly stringValue?: string;
+  readonly boolValue?: boolean;
+  readonly intValue?: Long | string | number;
+  readonly doubleValue?: number;
+}
+
+interface Resource {
+  readonly attributes: readonly { readonly key: string; readonly value: AnyValue }[];
+}
+
+/** The `Request` above as protobufjs's toObject gives it, defaults included. */
+interface DecodedRequest {
+  readonly parts: readonly { readonly resource: Resource | null; readonly scopes: readonly Uint8Array[]; readonly schemaUrl: string }[];
+}
+
+/** A part of an OTLP JSON request: its resource, and its scopes under the signal's name for them. */
+interface JsonPart {
+  readonly resource: Resource;
+  readonly [field: string]: unknown;
+}
+
+/** An OTLP JSON request: its parts under the signal's name for them. */
+type JsonRequest = Readonly<Partial<Record<string, readonly JsonPart[]>>>;
+
+const anyValue = (value: AnyValue) =>
   value.stringValue ?? value.boolValue ?? (value.intValue === undefined ? value.doubleValue : Number(value.intValue));
 
 /** Each part of a binary request: its resource's attributes, its scopes' bytes, its schema URL. */
-function decode(bytes) {
-  return Request.toObject(Request.decode(bytes), { defaults: true }).parts.map((part) => ({
+function decode(bytes: Uint8Array) {
+  // toObject's result has the shape of the message the schema above declares.
+  const request = Request.toObject(Request.decode(bytes), { defaults: true }) as DecodedRequest;
+  return request.parts.map((part) => ({
     attributes: Object.fromEntries((part.resource?.attributes ?? []).map(({ key, value }) => [key, anyValue(value)])),
     scopes: part.scopes.map((scope) => Buffer.from(scope).toString("hex")),
     schemaUrl: part.schemaUrl,
   }));
 }
 
-function attributesOf(jsonResource) {
+function attributesOf(jsonResource: Resource) {
   return Object.fromEntries(jsonResource.attributes.map(({ key, value }) => [key, anyValue(value)]));
 }
 
 class CollectingReader extends MetricReader {
-  async onForceFlush() {}
-  async onShutdown() {}
+  protected override async onForceFlush(): Promise<void> {}
+  protected override async onShutdown(): Promise<void> {}
+}
+
+/** A signal's request, serialized either way, and the JSON names of its parts and of the scopes within. */
+interface SignalRequest {
+  serialize(encoding: OtlpEncoding): Uint8Array | undefined;
+  readonly list: string;
+  readonly scopes: string;
+}
+
+function signalRequest<T>(
+  serializers: Readonly<Record<OtlpEncoding, ISerializer<T, unknown>>>,
+  data: T,
+  list: string,
+  scopes: string,
+): SignalRequest {
+  return { serialize: (encoding) => serializers[encoding].serializeRequest(data), list, scopes };
 }
 
 /** One request of each signal, from a resource with `attributes`. */
-async function requests(attributes) {
+async function requests(attributes: Attributes): Promise<Record<Signal, SignalRequest>> {
   const resource = resourceFromAttributes(attributes);
   const spans = new InMemorySpanExporter();
   const tracer = new BasicTracerProvider({ resource, spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("bayma");
@@ -83,18 +130,22 @@ async function requests(attributes) {
   await loggerProvider.forceFlush();
 
   return {
-    traces: { protobuf: ProtobufTraceSerializer, json: JsonTraceSerializer, data: spans.getFinishedSpans(), list: "resourceSpans", scopes: "scopeSpans" },
-    metrics: { protobuf: ProtobufMetricsSerializer, json: JsonMetricsSerializer, data: resourceMetrics, list: "resourceMetrics", scopes: "scopeMetrics" },
-    logs: { protobuf: ProtobufLogsSerializer, json: JsonLogsSerializer, data: logs.getFinishedLogRecords(), list: "resourceLogs", scopes: "scopeLogs" },
+    traces: signalRequest({ protobuf: ProtobufTraceSerializer, json: JsonTraceSerializer }, spans.getFinishedSpans(), "resourceSpans", "scopeSpans"),
+    metrics: signalRequest({ protobuf: ProtobufMetricsSerializer, json: JsonMetricsSerializer }, resourceMetrics, "resourceMetrics", "scopeMetrics"),
+    logs: signalRequest({ protobuf: ProtobufLogsSerializer, json: JsonLogsSerializer }, logs.getFinishedLogRecords(), "resourceLogs", "scopeLogs"),
   };
 }
 
 test("a binary request's resources are stamped and every other byte of it is kept", async () => {
-  for (const [signal, request] of Object.entries(await requests(FORGED))) {
-    const body = Buffer.from(request.protobuf.serializeRequest(request.data));
+  const all = await requests(FORGED);
+  for (const signal of SIGNALS) {
+    const serialized = all[signal].serialize("protobuf");
+    assert.ok(serialized, signal);
+    const body = Buffer.from(serialized);
     const stamped = stampResources(signal, "protobuf", body, STAMP);
     const [before] = decode(body);
     const [after] = decode(stamped);
+    assert.ok(before && after, signal);
     assert.deepEqual(after.attributes, STAMPED, signal);
     assert.deepEqual(after.scopes, before.scopes, signal);
     assert.ok(after.scopes.length > 0, signal);
@@ -103,21 +154,27 @@ test("a binary request's resources are stamped and every other byte of it is kep
 });
 
 test("a JSON request's resources are stamped and its scopes kept", async () => {
-  for (const [signal, request] of Object.entries(await requests(FORGED))) {
-    const body = Buffer.from(request.json.serializeRequest(request.data));
-    const original = JSON.parse(body.toString("utf8"));
-    const stamped = JSON.parse(stampResources(signal, "json", body, STAMP).toString("utf8"));
+  const all = await requests(FORGED);
+  for (const signal of SIGNALS) {
+    const request = all[signal];
+    const serialized = request.serialize("json");
+    assert.ok(serialized, signal);
+    const body = Buffer.from(serialized);
+    const original: JsonRequest = JSON.parse(body.toString("utf8"));
+    const stamped: JsonRequest = JSON.parse(stampResources(signal, "json", body, STAMP).toString("utf8"));
     assert.deepEqual(Object.keys(stamped), [request.list], signal);
-    const [part] = stamped[request.list];
+    const [part] = stamped[request.list] ?? [];
+    const [originalPart] = original[request.list] ?? [];
+    assert.ok(part && originalPart, signal);
     assert.deepEqual(attributesOf(part.resource), STAMPED, signal);
-    assert.deepEqual(part[request.scopes], original[request.list][0][request.scopes], signal);
+    assert.deepEqual(part[request.scopes], originalPart[request.scopes], signal);
   }
 });
 
 test("a stamp replaces every resource a request repeats and gives one to a part without", () => {
   // Field 1, length-delimited, at each level: a part, a resource, an attribute (all short).
-  const field1 = (...bytes) => Buffer.concat([Buffer.from([0x0a, Buffer.concat(bytes).length]), ...bytes]);
-  const attribute = (key, value) =>
+  const field1 = (...bytes: Buffer[]) => Buffer.concat([Buffer.from([0x0a, Buffer.concat(bytes).length]), ...bytes]);
+  const attribute = (key: string, value: string) =>
     field1(Buffer.from(root.lookupType("KeyValue").encode({ key, value: { stringValue: value } }).finish()));
   const scope = Buffer.from([0x12, 0x01, 0x00]);
   // Protobuf merges a message field given twice, so a second resource would otherwise
@@ -153,7 +210,7 @@ test("a JSON request keeps no second spelling of a resource", () => {
 });
 
 test("a request that does not parse is refused", () => {
-  const malformed = [
+  const malformed: [OtlpEncoding, Buffer][] = [
     ["protobuf", Buffer.from([0x0a, 0x05, 0x01])], // a part longer than the request
     ["protobuf", Buffer.from([0x0b])], // a group, which OTLP never uses
     ["protobuf", Buffer.from([0x08, 0x01])], // a part that is not a message

@@ -1,3 +1,5 @@
+import type { Writable } from "node:stream";
+
 import type { ClientNotification, RequestId, ServerRequest } from "../../../.types/codex/index.js";
 import type { Logger } from "../../shared/log.ts";
 import { rpcCall, type TraceCarrier, traceCarrier } from "../../telemetry/index.ts";
@@ -13,6 +15,11 @@ import {
 
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const START_TIMEOUT_MS = 20 * 1000;
+
+/** The app-server process as the client drives it: whether it was killed, its input, and its stop. */
+export interface AppServerConnection extends Pick<AppServerProcess, "stop"> {
+  readonly child: Pick<AppServerProcess["child"], "killed"> & { readonly stdin: Pick<Writable, "write"> };
+}
 
 /** Where the app-server process runs: its environment and working directory. */
 export interface AppServerScope {
@@ -57,7 +64,7 @@ export class AppServerRpcClient {
   private readonly onNotification: (message: AppServerNotification) => void;
   private readonly onFailure: (error: Error) => void;
   private readonly spawnProcess: SpawnAppServer;
-  process: AppServerProcess | null;
+  process: AppServerConnection | null;
   private nextId: number;
   private readonly pending: Map<RequestId, PendingRequest>;
   private initialized: boolean;

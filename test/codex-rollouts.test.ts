@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,10 +8,10 @@ import pg from "pg";
 
 import { listRolloutFiles, parseRolloutName } from "../src/codex/rollouts/files.ts";
 import { startCodexRollouts } from "../src/codex/rollouts/index.ts";
-import { mirrorRollout } from "../src/codex/rollouts/mirror.ts";
+import { type KnownRollouts, mirrorRollout } from "../src/codex/rollouts/mirror.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
-import { dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
 
@@ -20,11 +19,11 @@ const THREAD_A = "01a0cadd-b753-7d42-84a0-15a98e372686";
 const THREAD_B = "01a0e957-a6ff-7691-8d31-ed8d7315fa68";
 const REVISION = "01a0e93a-28f1-7af0-92b6-2ac47098a852";
 const THREAD_C = "01a0e93a-37f1-7342-b4ae-5e02dd4dba61";
-const fileName = (threadId, rolloutId) => `rollout-2026-09-28T18-47-10-${threadId}${rolloutId ? `_${rolloutId}` : ""}.jsonl`;
+const fileName = (threadId: string, rolloutId?: string) =>`rollout-2026-09-28T18-47-10-${threadId}${rolloutId ? `_${rolloutId}` : ""}.jsonl`;
 const DAY = "sessions/2026/09/28";
 
 /** A rollout's first line, Codex's session_meta, with the one field the store reads. */
-const meta = (id, historyBase = null) =>
+const meta = (id: string, historyBase: string | null = null) =>
   `${JSON.stringify({ type: "session_meta", payload: { id, ...(historyBase ? { history_base: { thread_id: historyBase, end_ordinal_exclusive: 1, end_byte_offset: 10 } } : {}) } })}\n`;
 
 test("rollout names are Codex's: a thread id, and a reverted thread's rollout id after it", () => {
@@ -54,10 +53,11 @@ test("rollout files are found under sessions and archived_sessions, compressed o
 });
 
 describe("the rollout store", { skip }, () => {
-  let database;
-  let pool;
+  // Set by the first hook, which runs unless the suite is skipped.
+  let database: TestPostgres | undefined;
+  let pool: pg.Pool;
   let schemas = 0;
-  const homes = [];
+  const homes: string[] = [];
 
   before(async () => {
     database = await startPostgres();
@@ -78,7 +78,7 @@ describe("the rollout store", { skip }, () => {
     await store.ensureSchema();
     const home = mkdtempSync(join(tmpdir(), "alasio-rollouts-"));
     homes.push(home);
-    const known = new Map();
+    const known: KnownRollouts = new Map();
     /** Mirrors every file, as the check does. Returns how many had bytes mirrored. */
     const pass = async () => {
       let mirrored = 0;
@@ -87,15 +87,16 @@ describe("the rollout store", { skip }, () => {
       }
       return mirrored;
     };
-    const write = (path, text) => {
+    const write = (path: string, text: string) => {
       mkdirSync(dirname(join(home, path)), { recursive: true });
       writeFileSync(join(home, path), text);
     };
-    const chunkCount = async () => (await pool.query(`select count(*)::int as count from ${schema}.rollout_chunks`)).rows[0].count;
+    const chunkCount = async () =>
+      (await pool.query<{ count: number }>(`select count(*)::int as count from ${schema}.rollout_chunks`)).rows[0]?.count;
     return { store, home, known, pass, write, chunkCount };
   }
 
-  const read = (home, path) => readFileSync(join(home, path));
+  const read = (home: string, path: string) =>readFileSync(join(home, path));
 
   test("a new file is kept whole, and a grown one gets only its new bytes", async () => {
     const { store, home, known, pass, write, chunkCount } = await makeMirror();
@@ -106,7 +107,7 @@ describe("the rollout store", { skip }, () => {
     appendFileSync(join(home, path), '{"type":"response_item"}\n{"type":"event_');
     assert.equal(await pass(), 1);
     assert.deepEqual(await store.read(fileName(THREAD_A)), read(home, path));
-    assert.equal(known.get(fileName(THREAD_A)).size, statSync(join(home, path)).size);
+    assert.equal(known.get(fileName(THREAD_A))?.size,statSync(join(home, path)).size);
     assert.equal(await chunkCount(), 2);
   });
 
@@ -179,7 +180,7 @@ describe("the rollout store", { skip }, () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     write(join(DAY, fileName(THREAD_A)), meta(THREAD_A));
     try {
-      const mirrored = async (name, path) => {
+      const mirrored = async (name: string, path: string) => {
         const deadline = Date.now() + 3_000;
         while (Date.now() < deadline) {
           const kept = (await store.list()).find((row) => row.name === name);

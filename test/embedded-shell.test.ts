@@ -1,4 +1,3 @@
-// @ts-nocheck
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -6,8 +5,8 @@ import { isBlockedDbCommand } from "../src/policy/db-guardrail.ts";
 import { extractShellCommands } from "../src/policy/embedded-shell.ts";
 import { looksLikeSelfRestartCommand } from "../src/policy/restart-command.ts";
 
-const restarts = (code) => extractShellCommands(code).some((command) => looksLikeSelfRestartCommand(command, { env: {} }));
-const blocked = (code) => extractShellCommands(code).some(isBlockedDbCommand);
+const restarts = (code: string) => extractShellCommands(code).some((command) => looksLikeSelfRestartCommand(command, { env: {} }));
+const blocked = (code: string) =>extractShellCommands(code).some(isBlockedDbCommand);
 
 test("shell commands are recovered from Bun shell, spawn and exec calls and bare command lines", () => {
   assert.equal(restarts("await $`kubectl -n alasio rollout restart deployment/alasio`"), true);

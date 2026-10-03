@@ -41,7 +41,7 @@ interface Placement {
 }
 
 /** What it bootstrapped: the timeline, and where it was placed. */
-interface TimelineRecord {
+export interface TimelineRecord {
   tenantId: string;
   timelineId: string;
   safekeepers: Placement;

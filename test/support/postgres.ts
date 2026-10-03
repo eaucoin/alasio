@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * A throwaway Postgres for tests: the controller database's pinned image, on
  * a random local port, removed when stopped. Tests that need one skip where
@@ -13,7 +12,13 @@ import pg from "pg";
 const run = promisify(execFile);
 const IMAGE = "postgres:17-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652";
 
-export function dockerAvailable() {
+/** A running throwaway Postgres: where to connect, and how to remove it. */
+export interface TestPostgres {
+  readonly url: string;
+  stop(): Promise<void>;
+}
+
+export function dockerAvailable(): boolean {
   try {
     execFileSync("docker", ["info"], { stdio: "ignore" });
     return true;
@@ -22,7 +27,7 @@ export function dockerAvailable() {
   }
 }
 
-export async function startPostgres() {
+export async function startPostgres(): Promise<TestPostgres> {
   const password = randomBytes(12).toString("hex");
   const { stdout } = await run("docker", [
     "run", "--detach", "--rm",
@@ -32,7 +37,9 @@ export async function startPostgres() {
   ]);
   const id = stdout.trim();
   // --volumes: the image's data volume goes with it, rather than being left behind.
-  const stop = () => run("docker", ["rm", "--force", "--volumes", id]).catch(() => {});
+  const stop = async () => {
+    await run("docker", ["rm", "--force", "--volumes", id]).catch(() => {});
+  };
   try {
     const { stdout: port } = await run("docker", ["port", id, "5432/tcp"]);
     const url = `postgresql://postgres:${password}@${port.trim().split("\n")[0]}/postgres`;
