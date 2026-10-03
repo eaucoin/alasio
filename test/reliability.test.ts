@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+import { Context } from "effect";
 import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { AppServerThreadClient } from "../src/codex/app-server/thread-client.ts";
@@ -12,6 +14,7 @@ import { RestartRecovery } from "../src/codex/restart-recovery.ts";
 import { StatusReporter, type StatusReporterOptions } from "../src/codex/status-reporter.ts";
 import type { ActiveQueries } from "../src/harness/index.ts";
 import { SqliteStore } from "../src/persistence/store.ts";
+import { effectRunner } from "../src/shared/effects.ts";
 import type { Logger } from "../src/shared/log.ts";
 import { TelegramCodexApp } from "../src/telegram/app.ts";
 import { Client, TelegramApiError } from "../src/telegram/client.ts";
@@ -271,6 +274,7 @@ test("Telegram app wires the durable outbox into final response delivery", () =>
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
+      effects: effectRunner(Context.empty()),
     });
     // The wiring is private to the turn controller and its reporter, so read through it.
     assert.equal(app.turns["status"]["outbox"], app.outbox);

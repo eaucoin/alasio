@@ -3,8 +3,7 @@
  * when the process is told to stop (SIGTERM, SIGINT) or what it runs fails, after which
  * the telemetry it holds is flushed and the process exits.
  */
-import { NodeRuntime } from "@effect/platform-node";
-import { Cause, Effect, Exit, Layer } from "effect";
+import { Cause, Effect } from "effect";
 
 import { loadAlasioConfig } from "./config.ts";
 import { codexHome } from "./codex/env.ts";
@@ -15,10 +14,8 @@ import { startTranscriptSearch } from "./harness/claude/search/index.ts";
 import { loadKubeTemplates } from "./kube/config.ts";
 import { syncLakeReads } from "./neon/lake.ts";
 import { connectNeon } from "./neon/connect.ts";
-import { AlasioLoggerLayer, withLogScope } from "./shared/log.ts";
-import { TracingLayer } from "./telemetry/index.ts";
-import { stopTelemetry } from "./telemetry/start.ts";
-import { TelegramCodexApp } from "./telegram/app.ts";
+import { runAlasio, serveAlasio } from "./alasio.ts";
+import { withLogScope } from "./shared/log.ts";
 
 const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
@@ -50,14 +47,7 @@ const alasio = Effect.gen(function*() {
       (rollouts) => Effect.promise(() => rollouts.close()),
     )
     : null;
-  yield* Effect.acquireRelease(
-    Effect.promise(async () => {
-      const app = new TelegramCodexApp({ ...config, sessionStore: neon.store, codexRollouts, sessionFsCodexRollouts, kubeTemplates });
-      await app.start();
-      return app;
-    }),
-    (app) => Effect.logInfo("Shutting down...").pipe(Effect.andThen(Effect.promise(() => app.stop()))),
-  );
+  yield* serveAlasio({ ...config, sessionStore: neon.store, codexRollouts, sessionFsCodexRollouts, kubeTemplates });
   yield* Effect.logInfo("Telegram Alasio bot is running");
   // Once the bot serves: the indexer's first pass reads every stored entry.
   yield* Effect.acquireRelease(
@@ -69,15 +59,4 @@ const alasio = Effect.gen(function*() {
   withLogScope("index"),
 );
 
-/**
- * Exits once the telemetry is flushed: 0 when alasio was stopped, 1 when what it runs
- * failed.
- */
-function teardown<E, A>(exit: Exit.Exit<A, E>, onExit: (code: number) => void): void {
-  void stopTelemetry().finally(() => onExit(Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause) ? 1 : 0));
-}
-
-Layer.launch(Layer.effectDiscard(alasio)).pipe(
-  Effect.provide([AlasioLoggerLayer, TracingLayer]),
-  NodeRuntime.runMain({ disableErrorReporting: true, teardown }),
-);
+runAlasio(alasio);

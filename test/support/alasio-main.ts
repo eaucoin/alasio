@@ -8,13 +8,15 @@
  *
  *   node alasio-main.ts <AlasioProcessConfig as JSON>
  *
- * It tells its parent when alasio has started, and stops on SIGTERM as main does.
+ * It tells its parent when alasio has started, and is run, and stopped on SIGTERM, as main runs alasio.
  */
 import { join } from "node:path";
 
+import { Effect } from "effect";
+
 import { createHarnessRegistry } from "../../src/harness/index.ts";
 import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
-import { TelegramCodexApp } from "../../src/telegram/app.ts";
+import { runAlasio, serveAlasio } from "../../src/alasio.ts";
 import { bridgedQueryFactory } from "./claude.ts";
 
 /** What the test runs alasio with. */
@@ -36,7 +38,7 @@ if (import.meta.main) {
   if (encoded === undefined) throw new Error("usage: alasio-main.ts <config as JSON>");
   // The test writes the configuration.
   const config = JSON.parse(encoded) as AlasioProcessConfig;
-  const app = new TelegramCodexApp({
+  const alasio = serveAlasio({
     telegramBotToken: "123:test",
     allowedUserIds: config.allowedUserIds,
     workingDirectory: null,
@@ -51,15 +53,5 @@ if (import.meta.main) {
       claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
     }),
   });
-  // As main's shutdown, without the telemetry and Neon it does not start.
-  process.on("SIGTERM", async () => {
-    try {
-      await app.stop();
-    } catch (error) {
-      console.error(`Error during shutdown: ${error}`);
-    }
-    process.exit(0);
-  });
-  await app.start();
-  process.send?.(READY);
+  runAlasio(alasio.pipe(Effect.andThen(Effect.sync(() => process.send?.(READY)))));
 }

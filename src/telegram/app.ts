@@ -20,6 +20,7 @@ import { MessageHandler } from "./message-handler.ts";
 import { UpdatePoller } from "./update-poller.ts";
 import { TelegramOutbox } from "./outbox.ts";
 import { type WorkflowWait, type WorkflowWakeEvent, startWorkflowHookServer } from "../workflow/hook-server.ts";
+import type { AlasioEffects } from "../alasio.ts";
 import { createLogger } from "../shared/log.ts";
 import { inSpan, SpanKind } from "../telemetry/index.ts";
 
@@ -37,6 +38,8 @@ export interface TelegramCodexAppConfig extends AlasioConfig {
   readonly sandbox?: SessionFilesystems | null;
   readonly sessionFsCodex?: SessionFsCodex | null;
   readonly harnesses?: HarnessRegistry | null;
+  /** What runs the effects of alasio's services for the app (src/alasio.ts). */
+  readonly effects: AlasioEffects;
 }
 
 export class TelegramCodexApp {
