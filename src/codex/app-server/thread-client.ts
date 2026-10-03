@@ -44,6 +44,8 @@ export interface StartTurnOptions {
   readonly cwd: string;
   readonly model?: string | undefined;
   readonly effort?: string | null | undefined;
+  /** Called just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: (() => void) | undefined;
 }
 
 export interface SteerTurnOptions {
@@ -179,7 +181,7 @@ export class AppServerThreadClient {
     return all;
   }
 
-  async startTurn({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT }: StartTurnOptions): Promise<string> {
+  async startTurn({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT, onPromptDispatched }: StartTurnOptions): Promise<string> {
     const previousTurnId = this.notifications.getCurrentTurnId(threadId);
     if (previousTurnId) {
       this.log.warn(`interrupting leftover app-server turn before starting a new one thread=${threadId.slice(0, 8)} turn=${previousTurnId}`);
@@ -191,6 +193,7 @@ export class AppServerThreadClient {
     }
     this.notifications.beginTurn(threadId);
     const startedAt = process.hrtime.bigint();
+    onPromptDispatched?.();
     const response = await this.rpc.request("turn/start", {
       threadId,
       input: [{ type: "text", text: prompt, text_elements: [] }],

@@ -55,6 +55,8 @@ export interface AppServerTurnOptions extends EnsureThreadOptions {
   readonly prompt: string;
   readonly model?: string | undefined;
   readonly effort?: string | null | undefined;
+  /** Called just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: (() => void) | undefined;
 }
 
 export class AppServerClient {
@@ -92,9 +94,9 @@ export class AppServerClient {
     return await this.threads.startThread({ threadKey, cwd, env, config });
   }
 
-  async startTurn({ threadId, threadKey, prompt, cwd, env, config, model, effort }: AppServerTurnOptions): Promise<string> {
+  async startTurn({ threadId, threadKey, prompt, cwd, env, config, model, effort, onPromptDispatched }: AppServerTurnOptions): Promise<string> {
     try {
-      return await this.threads.startTurn({ threadId, prompt, cwd, model, effort });
+      return await this.threads.startTurn({ threadId, prompt, cwd, model, effort, onPromptDispatched });
     } catch (error) {
       if (!(error instanceof StaleTurnCleanupError)) {
         throw error;
@@ -102,7 +104,7 @@ export class AppServerClient {
       log.warn(`recycling app-server after stale turn cleanup failure thread=${threadId.slice(0, 8)}`);
       this.stop();
       const resumedThreadId = await this.ensureThread({ threadId, threadKey, cwd, env, config });
-      return await this.threads.startTurn({ threadId: resumedThreadId, prompt, cwd, model, effort });
+      return await this.threads.startTurn({ threadId: resumedThreadId, prompt, cwd, model, effort, onPromptDispatched });
     }
   }
 

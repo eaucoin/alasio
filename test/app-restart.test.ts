@@ -110,7 +110,7 @@ test("a turn alasio stops during is recovered after the restart, with unknown pr
   assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-3")), "Yes");
 });
 
-test("a prompt whose turn alasio had asked for but not heard back on when it stopped runs again after the restart, after the recovery turn", async (t) => {
+test("a prompt alasio had sent to Codex but not heard back on when it stopped is not run again after the restart; the recovery turn continues it", async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
   await mount(alasio, "codex", "alpha");
@@ -124,15 +124,12 @@ test("a prompt whose turn alasio had asked for but not heard back on when it sto
   const recovery = await recoveryTurn(alasio);
   assert.equal(inputText(recovery), EXTERNAL_RESTART);
   answerTurn(codex, "thread-1", "turn-2", "alasio restarted. Should I carry on?");
+  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "alasio restarted. Should I carry on?", { mark });
+  // Codex may have acted on the prompt, so it is not sent again: the next turn is the
+  // operator's next prompt.
+  telegram.say("Yes");
   await answerLoadedThreads(codex, ["thread-1"]);
-  // characterizes current behaviour: Codex may have started the prompt's turn before the
-  // stop, yet alasio runs the prompt again once the recovery turn, which already asks the
-  // operator how to go on, is over.
-  const rerun = await answerTurnStart(codex, "thread-1", "turn-3");
-  assert.equal(inputText(rerun), "Apply the change and restart");
-  answerTurn(codex, "thread-1", "turn-3", "Applied.");
-  await telegram.waitFor("sendRichMessage", (call) => call.params.rich_message.markdown === "Applied.", { mark });
-  assert.deepEqual(telegram.callsTo("sendRichMessage", mark).map((call) => call.params.rich_message.markdown), ["alasio restarted. Should I carry on?", "Applied."]);
+  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-3")), "Yes");
 });
 
 test("a turn that ran alasio's rollout restart is continued after it as one the agent caused", async (t) => {

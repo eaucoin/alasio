@@ -298,6 +298,28 @@ test("restart reconciliation preserves upstream-completed prompt jobs", () => {
   }
 });
 
+test("restart reconciliation runs again only the prompts never sent to the agent", () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-dispatched-job-"));
+  try {
+    const store = new SqliteStore(root);
+    const jobs = new Map<string, string>();
+    for (const [chatId, dispatched] of [["1", false], ["2", true]] as const) {
+      const conversationId = store.upsertConversation({ chatId, user: { id: Number(chatId) } });
+      store.setActiveHarness(conversationId, CODEX_HARNESS);
+      const job = store.enqueuePromptJob({ conversationId, chatId, messageId: "10", prompt: "do it" });
+      store.claimNextPromptJob(conversationId);
+      if (dispatched) store.markPromptJobDispatched(job.id);
+      jobs.set(chatId, job.id);
+    }
+    assert.deepEqual(store.recoverPromptJobsAfterRestart(), []);
+    assert.equal(store.getPromptJob(jobs.get("1") ?? "")?.state, "pending");
+    assert.equal(store.getPromptJob(jobs.get("2") ?? "")?.state, "interrupted");
+    store.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("self-restart recovery stages a distinct durable continuation", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-restart-continuation-"));
   try {

@@ -614,6 +614,11 @@ export class TurnController {
       persistence: this.store,
       activeQueries: this.activeQueries,
       attachedTurn,
+      onPromptDispatched: () => {
+        if (jobId) {
+          this.store.markPromptJobDispatched(jobId);
+        }
+      },
       onTransportStarted: ({ sessionId, turnId }) => {
         if (jobId) {
           this.store.markPromptJobUpstreamStarted(jobId, sessionId, turnId);

@@ -710,6 +710,7 @@ export function createClaudeLiveSessions({
     host.interruptedUuids.clear();
     const uuid = randomUUID();
     current.promptUuids.add(uuid);
+    params.onPromptDispatched?.();
     host.channel.push(buildClaudeUserMessage(prompt, uuid));
     for (const steerPrompt of current.earlySteers.splice(0)) {
       await current.activeQuery.steer(steerPrompt);

@@ -93,6 +93,8 @@ export interface TurnParams {
   readonly attachedTurn?: AttachedTurn | null | undefined;
   /** Called as the turn starts and as each of its events arrives. */
   readonly onStarted?: (() => void) | undefined;
+  /** Called just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: (() => void) | undefined;
   readonly onTransportStarted?: ((turn: TransportTurn) => void) | undefined;
   readonly onTransportCompleted?: ((turn: TransportTurn) => void) | undefined;
   /** Called when a harness that runs on between prompts has a reply of its own to deliver. */

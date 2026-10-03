@@ -203,6 +203,7 @@ export async function executeCodexTurn(params: CodexTurnParams): Promise<TurnRes
             controller,
             turnTimer,
             client,
+            onPromptDispatched: params.onPromptDispatched,
         };
         const streamed = params.attachedTurn
             ? await openAttachedCodexEventStream({
