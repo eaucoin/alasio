@@ -380,6 +380,7 @@ test("the receiver takes a session's OTLP with its token only, stamped with what
     assert.equal((await post("/v1/traces", { token: "fs-abc123.bad" })).status, 401);
     assert.equal((await post("/v1/spans")).status, 404);
     assert.equal((await post("/v1/traces", { type: "text/plain" })).status, 415);
+    assert.equal((await post("/v1/traces", { type: "constructor" })).status, 415);
     assert.equal((await post("/v1/traces", { body: Buffer.from([0x0a, 0xff]) })).status, 400);
     assert.equal((await post("/v1/logs")).status, 200);
     assert.equal(exported.length, 0);

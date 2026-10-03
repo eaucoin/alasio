@@ -30,7 +30,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 // through alasio.
 const RATE_BYTES_PER_SECOND = 128 * 1024;
 const BURST_BYTES = 16 * 1024 * 1024;
-const ENCODINGS: Partial<Record<string, OtlpEncoding>> = { "application/x-protobuf": "protobuf", "application/json": "json" };
+const ENCODINGS: ReadonlyMap<string, OtlpEncoding> = new Map([["application/x-protobuf", "protobuf"], ["application/json", "json"]]);
 
 const requests = meter.createCounter("alasio.sandbox.telemetry.received", {
   description: "OTLP requests received from bayma inside session sandboxes, by outcome",
@@ -137,7 +137,7 @@ export async function startTelemetryReceiver({
     }
     const [mediaType = ""] = (request.headers["content-type"] ?? "").split(";");
     const type = mediaType.trim();
-    const encoding = ENCODINGS[type];
+    const encoding = ENCODINGS.get(type);
     if (!encoding) return [415];
     // A full success, in the request's own encoding: an empty message, or an empty object.
     const ok: Reply = [200, { "content-type": type }, encoding === "json" ? "{}" : ""];
