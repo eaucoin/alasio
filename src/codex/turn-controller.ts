@@ -247,7 +247,7 @@ export class TurnController {
     if (this.activeQueries.has(conversationId)) {
       return `${this.harnessLabel(conversationId)} is currently working. Stop the active turn before switching services.`;
     }
-    if (this.store.hasOpenPromptJobs?.(conversationId)) {
+    if (this.store.hasOpenPromptJobs(conversationId)) {
       return "Queued prompts are still waiting for the current service. Let them finish or discard them before switching.";
     }
     return null;
@@ -458,7 +458,7 @@ export class TurnController {
   }
 
   async askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText }: ConversationChat & {
-    readonly job: { readonly id: string | null; readonly prompt: string };
+    readonly job: Pick<PromptJob, "id" | "prompt">;
     readonly visibleText: string;
   }): Promise<void> {
     const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
@@ -495,9 +495,7 @@ export class TurnController {
 
   async runGoalTurn({ conversationId, chatId, messageId, sessionId, turnId, prompt }: GoalTurnRequest): Promise<boolean> {
     if (this.activeQueries.has(conversationId)) {
-      const job = this.store.enqueuePromptJob
-        ? this.store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" })
-        : { id: null, prompt };
+      const job = this.store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
       await this.askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
       return true;
     }

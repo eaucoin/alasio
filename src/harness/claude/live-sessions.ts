@@ -241,7 +241,7 @@ export function createClaudeLiveSessions({
     if (host.cliTurn) {
       const cliTurn = host.cliTurn;
       host.cliTurn = null;
-      host.persistence.markPendingAsPosted?.(cliTurn.pendingResponseId);
+      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
       releaseCliTurn(host, cliTurn);
     }
   }
@@ -310,7 +310,7 @@ export function createClaudeLiveSessions({
           await interrupt(host, abortReason);
           if (host.cliTurn === cliTurn) {
             host.cliTurn = null;
-            host.persistence.markPendingAsPosted?.(cliTurn.pendingResponseId);
+            host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
             releaseCliTurn(host, cliTurn);
           }
         },
@@ -346,7 +346,7 @@ export function createClaudeLiveSessions({
       });
       host.persistence.markPendingResponseComplete(cliTurn.pendingResponseId);
     } else {
-      host.persistence.markPendingAsPosted?.(cliTurn.pendingResponseId);
+      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
     }
     log.info(`cli-turn.done thread=${host.threadKey} delivered=${Boolean(text)}`);
     releaseCliTurn(host, cliTurn);

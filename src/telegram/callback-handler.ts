@@ -93,7 +93,7 @@ export class CallbackHandler {
     if (!action.kind.endsWith(":close")
       && !isServiceControlAction(action.kind)
       && isHarnessName(action.payload?.["expectedHarness"])
-      && this.store.getActiveHarness?.(action.conversationId) !== action.payload["expectedHarness"]) {
+      && this.store.getActiveHarness(action.conversationId) !== action.payload["expectedHarness"]) {
       await this.client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
       return;
     }
