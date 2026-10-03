@@ -627,6 +627,32 @@ test("service callbacks switch harness and surface refusals in the panel", async
   });
 });
 
+test("choosing a service from its panel chains into a folder picker that offers a new empty workspace", async () => {
+  await withStore(async (store, paths) => {
+    const conversationId = store.upsertConversation({ chatId: "10", user: { id: 10 } });
+    const actionId = store.createCallbackAction({ conversationId, kind: "service:use", payload: { harness: CLAUDE_HARNESS } });
+    const client = createClient();
+    const handler = new CallbackHandler({
+      authorizer: { isAuthorizedCallbackQuery: () => true },
+      client,
+      config: { workspaceRoot: paths.workspaceRoot },
+      store,
+      turns: {
+        harnessFor: () => null,
+        switchHarness: async ({ harness }) => {
+          store.setActiveHarness(conversationId, harness);
+          return { switched: true, previous: null, next: harness, sessionId: null, workingDirectory: null };
+        },
+        sandboxEnabled: true,
+      },
+      activeQueries: new Map(),
+    });
+    await handler.handle({ id: "cb-10", data: actionId, from: { id: 10 }, message: { chat: { id: 10 }, message_id: 4 } });
+    const picker = client.calls.sendMessage.at(-1);
+    assert.ok(picker[2].reply_markup.inline_keyboard.flat().some((button) => button.text === "New empty workspace…"));
+  });
+});
+
 test("callback handler rejects panels created under another harness", async () => {
   await withStore(async (store) => {
     const conversationId = store.upsertConversation({ chatId: "9", user: { id: 9 } });

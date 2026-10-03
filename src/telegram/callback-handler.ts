@@ -135,6 +135,7 @@ export class CallbackHandler {
               conversationId: action.conversationId,
               chatId,
               workspaceRoot: this.config.workspaceRoot,
+              sandboxEnabled: this.turns.sandboxEnabled,
             });
           }
         },
