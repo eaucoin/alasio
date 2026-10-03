@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
+import { Effect, Exit, Logger, Scope } from "effect";
+
 import { loginUpstream, startLoginRelay, type LoginUpstream } from "../src/codex/login-relay.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "alasio-login-relay-"));
@@ -66,7 +68,11 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
     const real = loginUpstream(file, path);
     return real && { ...real, origin: upstreamOrigin };
   };
-  const relay = await startLoginRelay({ authFile, bearer: "relay-bearer", upstreamFor });
+  const listening = Effect.runSync(Scope.make());
+  const relay = await Effect.runPromise(startLoginRelay({ authFile, bearer: "relay-bearer", upstreamFor }).pipe(
+    Scope.provide(listening),
+    Effect.provide(Logger.layer([])),
+  ));
   const call = (path: string, bearer?: string, body = "{}") =>
     fetch(`${relay.url.replace(/\/v1$/, "")}${path}`, { method: "POST", headers: bearer ? { authorization: `Bearer ${bearer}` } : {}, body });
   try {
@@ -92,6 +98,8 @@ test("the relay takes only its own bearer and the model API's paths, and reads t
     writeAuth({});
     assert.equal((await call("/v1/responses", "relay-bearer")).status, 503);
   } finally {
-    await relay.close();
+    await Effect.runPromise(Scope.close(listening, Exit.void));
   }
+  // Closed with its scope.
+  await assert.rejects(fetch(relay.url));
 });

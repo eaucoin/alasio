@@ -11,9 +11,8 @@
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities are made here otherwise.
  */
-import type { V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
+import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
-import type { KubeClient } from "../../src/kube/client.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
@@ -80,7 +79,7 @@ export type StoredSecret = V1Secret & { metadata: V1ObjectMeta & { resourceVersi
 
 /** What setupKube does through src/kube/client.ts's client: reads Secrets, and writes them without reading back what it wrote. */
 export interface SetupKubeClient {
-  read: KubeClient["read"];
+  read(apiVersion: string, kind: string, namespace: string, name: string): Promise<KubernetesObject | null>;
   create(object: V1Secret): Promise<unknown>;
   replace(object: V1Secret): Promise<unknown>;
 }
@@ -245,8 +244,16 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { createKubeClient } = await import("../../src/kube/client.ts");
-  setupKube({ kube: createKubeClient(), config: setupConfig() }).catch((error: unknown) => {
+  const { Effect } = await import("effect");
+  const { KubeClient } = await import("../../src/kube/client.ts");
+  // The job is one call after another, each run as the promise setupKube awaits.
+  const kube = Effect.runSync(Effect.provide(KubeClient, KubeClient.layer));
+  const client: SetupKubeClient = {
+    read: (apiVersion, kind, namespace, name) => Effect.runPromise(kube.read(apiVersion, kind, namespace, name)),
+    create: (object) => Effect.runPromise(kube.create(object)),
+    replace: (object) => Effect.runPromise(kube.replace(object)),
+  };
+  setupKube({ kube: client, config: setupConfig() }).catch((error: unknown) => {
     console.error(`setting up the stack failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   });

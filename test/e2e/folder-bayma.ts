@@ -11,7 +11,11 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
-import { folderBaymaServer } from "../../src/mcp/bayma.ts";
+import { Effect } from "effect";
+
+import { KubeClient } from "../../src/kube/client.ts";
+import { loadKubeTemplates } from "../../src/kube/config.ts";
+import { HostBayma } from "../../src/mcp/bayma.ts";
 import type { BaymaExecResult, BaymaSessionCreated } from "./session-roundtrip.ts";
 
 /** What the folder's bayma saw, as the last line prints it. */
@@ -26,7 +30,14 @@ function text(part: ContentBlock | undefined): string {
   return part.text;
 }
 
-const bayma = await folderBaymaServer({ harness: "claude", threadKey: "e2e:folder" });
+const bayma = await Effect.runPromise(Effect.gen(function*() {
+  const { host } = yield* loadKubeTemplates;
+  if (!host) return yield* Effect.die(new Error("the release renders no host template"));
+  return yield* HostBayma.pipe(
+    Effect.flatMap((hostBayma) => hostBayma.ensure({ harness: "claude", threadKey: "e2e:folder" })),
+    Effect.provide(HostBayma.layer(host)),
+  );
+}).pipe(Effect.provide(KubeClient.layer)));
 const client = new Client({ name: "alasio-e2e", version: "1.0.0" });
 // The transport is one; the SDK declares its sessionId `string | undefined` where Transport has it optional.
 await client.connect(new StreamableHTTPClientTransport(new URL(bayma.url), { requestInit: { headers: bayma.headers } }) as Transport);

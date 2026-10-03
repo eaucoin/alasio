@@ -5,7 +5,7 @@ per Sandbox: its name and labels, bayma's token, and a session's network mode.
 */ -}}
 {{- define "alasio.sessionsProfile" -}}
 {{- $agent := include "alasio.image" (dict "image" .Values.images.agent "root" .) -}}
-namespace: {{ include "alasio.sessionsNamespace" . }}
+namespace: {{ include "alasio.sessionsNamespace" . | quote }}
 port: 7290
 workspaceDir: /workspace
 egressGate: {{ .Values.sessions.egressGate }}
@@ -81,7 +81,7 @@ volumeClaimTemplates:
 {{- end -}}
 
 {{- define "alasio.hostProfile" -}}
-namespace: {{ include "alasio.hostNamespace" . }}
+namespace: {{ include "alasio.hostNamespace" . | quote }}
 port: 7290
 stateRoot: {{ .Values.host.stateRoot }}
 podTemplate:

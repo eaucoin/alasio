@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { Context, Effect, Exit, Scope } from "effect";
 
 import type { v2 } from "../.types/codex/index.js";
-import { AppServerClient } from "../src/codex/app-server/client.ts";
+import { type AppServer, CodexAppServer, makeAppServer } from "../src/codex/app-server/client.ts";
 import type { AppServerScope } from "../src/codex/app-server/rpc-client.ts";
 import type { ThreadOptions, ThreadScope } from "../src/codex/app-server/thread-client.ts";
-import type { SessionFsCodex } from "../src/codex/sessionfs.ts";
+import { SessionFsCodex } from "../src/codex/sessionfs.ts";
 import { codexMcpServer } from "../src/codex/thread-config.ts";
 import { createCodexHarness } from "../src/harness/codex.ts";
 import { createClaudeHarness } from "../src/harness/claude/index.ts";
@@ -17,6 +18,7 @@ import { createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
 import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
 import type { SessionFilesystems } from "../src/sandbox/index.ts";
+import { effectRunner } from "../src/shared/effects.ts";
 import { fakeQuery, initMessage, stamped, successResult } from "./support/claude-sdk.ts";
 
 // Both harnesses on a session filesystem, over a fake sandbox: what they run in, what they
@@ -39,7 +41,6 @@ function fakeSandbox(): SessionFilesystems & { readonly ensured: string[] } {
       return { bayma: BAYMA };
     },
     readFile: unused,
-    close: async () => undefined,
   };
 }
 
@@ -113,33 +114,32 @@ const MODEL: v2.Model = {
   isDefault: false,
 };
 
+/** An app-server no process runs for: any call that would start one fails the test. */
+const idleAppServer = makeAppServer({ spawn: () => Effect.sync(() => assert.fail("no app-server runs in this test")) });
+
 /** The session filesystems' app-server, answering from fixtures and recording every call. */
-class RecordingAppServerClient extends AppServerClient {
-  readonly calls: AppServerCall[] = [];
-
-  constructor() {
-    super({ spawnProcess: () => assert.fail("no app-server runs in this test") });
-  }
-
-  override async listThreads(args: AppServerScope): Promise<v2.Thread[]> {
-    this.calls.push({ method: "listThreads", args });
-    return [THREAD];
-  }
-
-  override async getGoal(args: ThreadScope): Promise<v2.ThreadGoalGetResponse> {
-    this.calls.push({ method: "getGoal", args });
-    return { goal: GOAL };
-  }
-
-  override async listModels(args: AppServerScope): Promise<v2.Model[]> {
-    this.calls.push({ method: "listModels", args });
-    return [MODEL];
-  }
-
-  override async startThread(args: ThreadOptions): Promise<string> {
-    this.calls.push({ method: "startThread", args });
-    return "thread-2";
-  }
+function recordingAppServer(idle: AppServer): AppServer & { readonly calls: readonly AppServerCall[] } {
+  const calls: AppServerCall[] = [];
+  return {
+    ...idle,
+    calls,
+    listThreads: (args) => Effect.sync(() => {
+      calls.push({ method: "listThreads", args });
+      return [THREAD];
+    }),
+    getGoal: (args) => Effect.sync(() => {
+      calls.push({ method: "getGoal", args });
+      return { goal: GOAL };
+    }),
+    listModels: (args) => Effect.sync(() => {
+      calls.push({ method: "listModels", args });
+      return [MODEL];
+    }),
+    startThread: (args) => Effect.sync(() => {
+      calls.push({ method: "startThread", args });
+      return "thread-2";
+    }),
+  };
 }
 
 test("neither harness serves a session filesystem where the deployment does not enable them", () => {
@@ -147,20 +147,25 @@ test("neither harness serves a session filesystem where the deployment does not 
   assert.throws(() => createClaudeHarness({ workingDirectory: WORKSPACE }), /does not enable/);
 });
 
-test("Codex on a session filesystem runs on its own app-server, in the harness directory, with the session's bayma", async () => {
+test("Codex on a session filesystem runs on its own app-server, in the harness directory, with the session's bayma", async (t) => {
   const sandbox = fakeSandbox();
-  const client = new RecordingAppServerClient();
+  const scope = Effect.runSync(Scope.make());
+  t.after(() => Effect.runPromise(Scope.close(scope, Exit.void)));
+  // The operator's app-server is there, and never used; the session filesystems' answers.
+  const operatorAppServer = await Effect.runPromise(idleAppServer.pipe(Scope.provide(scope)));
+  const client = recordingAppServer(await Effect.runPromise(idleAppServer.pipe(Scope.provide(scope))));
   const scopes: { directory: string; bayma: BaymaEndpoint }[] = [];
-  const sessionFsCodex: SessionFsCodex = {
+  const sessionFsCodex = SessionFsCodex.of({
     home: "/state/sessionfs/codex",
-    scope: async ({ directory, bayma }) => {
+    scope: ({ directory, bayma }) => Effect.sync(() => {
       scopes.push({ directory, bayma });
-      return { cwd: directory, codexEnv: CODEX_ENV, codexConfig: { developer_instructions: "", mcp_servers: { bayma: codexMcpServer(bayma) } }, client };
-    },
-    listingScope: async ({ directory }) => ({ cwd: directory, codexEnv: CODEX_ENV, client }),
-    stop: async () => undefined,
-  };
-  const harness = createCodexHarness({ workingDirectory: WORKSPACE, sandbox, sessionFsCodex });
+      return { cwd: directory, codexEnv: CODEX_ENV, codexConfig: { developer_instructions: "", mcp_servers: { bayma: codexMcpServer(bayma) } }, appServer: client };
+    }),
+    listingScope: ({ directory }) => Effect.succeed({ cwd: directory, codexEnv: CODEX_ENV, appServer: client }),
+    stop: Effect.void,
+  });
+  const effects = effectRunner(Context.make(CodexAppServer, operatorAppServer).pipe(Context.add(SessionFsCodex, sessionFsCodex)));
+  const harness = createCodexHarness({ workingDirectory: WORKSPACE, sandbox, effects });
 
   // Lists, goals, and models need no session host.
   assert.equal((await harness.sessions.listSessions(1))[0]?.uuid, "thread-1");

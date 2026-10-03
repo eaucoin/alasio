@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Effect, Layer } from "effect";
-import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.ts";
+import { Array as Arr, Effect, Layer, Logger as EffectLogger } from "effect";
+import { makeAppServerNotifications } from "../src/codex/app-server/notification-queue.ts";
+import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
-import { AppServerThreadClient } from "../src/codex/app-server/thread-client.ts";
+import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
 import { interruptCodexTurn } from "../src/codex/runtime.ts";
 import { RestartRecovery } from "../src/codex/restart-recovery.ts";
@@ -52,18 +53,21 @@ test("stop remains active until transport cleanup finishes", async () => {
 
 test("failed app-server interrupt forgets local turn ownership", async () => {
   const infoLogs: string[] = [];
-  const notifications = new AppServerNotificationQueue({ log: silentLog });
-  notifications.rememberTurn("thread", "stale-turn");
-  const client = new AppServerThreadClient({
-    notifications,
-    log: { ...silentLog, info: (message) => infoLogs.push(message) },
-    rpc: {
-      start: async () => assert.fail("an interrupt starts no app-server"),
-      request: async () => { throw new Error("no interrupt response"); },
-    },
+  const logger = EffectLogger.make(({ message }) => {
+    infoLogs.push(Arr.ensure(message).join(" "));
   });
-  await assert.rejects(client.interrupt("thread", "stream-error"), /no interrupt response/);
-  assert.equal(notifications.getCurrentTurnId("thread"), undefined);
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const notifications = yield* makeAppServerNotifications;
+    yield* notifications.rememberTurn("thread", "stale-turn");
+    const client = makeAppServerThreads({
+      start: () => Effect.sync(() => assert.fail("an interrupt starts no app-server")),
+      request: () => Effect.fail(new AppServerRequestTimeout({ method: "turn/interrupt" })),
+      whenGone: Effect.succeed(Effect.never),
+    }, notifications);
+    const interrupted = yield* Effect.flip(client.interrupt("thread", "stream-error"));
+    assert.equal(interrupted.message, "Codex app-server request timed out: turn/interrupt");
+    assert.equal(yield* notifications.currentTurnId("thread"), undefined);
+  })).pipe(Effect.provide(EffectLogger.layer([logger]))));
   assert.match(infoLogs[0] ?? "", /origin=stream-error/);
 });
 

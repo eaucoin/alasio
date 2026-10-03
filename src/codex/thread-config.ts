@@ -28,7 +28,7 @@ export type CodexThreadConfig = {
   readonly mcp_servers: Readonly<Record<string, CodexMcpServer>>;
 };
 
-/** A bayma server (../mcp/bayma.ts folderBaymaServer) in Codex's MCP config shape. */
+/** A bayma server (../mcp/bayma.ts HostBayma) in Codex's MCP config shape. */
 export function codexMcpServer(server: BaymaEndpoint): CodexMcpServer {
   return { url: server.url, http_headers: server.headers, startup_timeout_sec: BAYMA_STARTUP_TIMEOUT_MS / 1000 };
 }

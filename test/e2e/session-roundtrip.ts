@@ -13,10 +13,12 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
-import { loadKubeTemplates } from "../../src/kube/config.ts";
-import { createKubeClient } from "../../src/kube/client.ts";
-import { createSandboxes, type BaymaEndpoint } from "../../src/kube/sandboxes.ts";
-import { createSandbox } from "../../src/sandbox/index.ts";
+import { Effect, Schedule } from "effect";
+
+import { KubeClient } from "../../src/kube/client.ts";
+import { loadKubeTemplates, type SessionsProfile } from "../../src/kube/config.ts";
+import { type BaymaEndpoint, makeSandboxes } from "../../src/kube/sandboxes.ts";
+import { SessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** What bayma's session.create answers, as far as the end-to-end scripts read it. */
 export interface BaymaSessionCreated {
@@ -43,11 +45,6 @@ export interface RoundtripSeen {
 
 const volumeId = process.argv[2];
 if (!volumeId) throw new Error("usage: session-roundtrip.ts <volumeId>");
-const templates = loadKubeTemplates();
-const kube = createKubeClient();
-const sandbox = createSandbox({ templates, stateDir: "/tmp/roundtrip", kube, env: {} });
-if (!sandbox || !templates.sessions) throw new Error("the release renders no sessions template");
-const seen: Partial<RoundtripSeen> = {};
 
 /** The text of a part of a tool's answer, where bayma gives its JSON. */
 function text(part: ContentBlock | undefined): string {
@@ -70,26 +67,40 @@ async function exec(bayma: BaymaEndpoint, code: string): Promise<BaymaExecResult
   }
 }
 
-let { bayma } = await sandbox.ensureSession(volumeId);
-const wrote = await exec(bayma, 'await Bun.write("/workspace/out/hello.txt", "hello from " + require("os").release()); "written"');
-seen.exec = wrote.result_text || JSON.stringify(wrote).slice(0, 300);
-seen.read = (await sandbox.readFile(volumeId, "out/hello.txt", 1024)).bytes?.toString("utf8");
-seen.missing = (await sandbox.readFile(volumeId, "out/nope.txt", 1024)).note;
-seen.outside = (await sandbox.readFile(volumeId, "/etc/passwd", 4096)).bytes ? "read /etc/passwd of the sandbox, not the host" : "refused";
+/** The round trip, through alasio's session filesystems on the `sessions` profile. */
+const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
+  const sessions = yield* SessionSandboxes;
+  const kube = yield* KubeClient;
+  const seen: Partial<RoundtripSeen> = {};
+  const read = (path: string, maxBytes: number) => sessions.readFile(volumeId, path, maxBytes);
 
-const sandboxes = createSandboxes({ kube, namespace: templates.sessions.namespace, port: templates.sessions.port });
-await sandboxes.suspend(volumeId);
-for (let i = 0; i < 60; i++) {
-  if (!(await kube.read("v1", "Pod", templates.sessions.namespace, volumeId))) break;
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-}
-seen.suspendedPod = (await kube.read("v1", "Pod", templates.sessions.namespace, volumeId)) ? "still there" : "gone";
-seen.whileSuspended = (await sandbox.readFile(volumeId, "out/hello.txt", 1024)).note;
-const resumedAt = Date.now();
-({ bayma } = await sandbox.ensureSession(volumeId));
-seen.resumeMs = Date.now() - resumedAt;
-seen.afterResume = (await sandbox.readFile(volumeId, "out/hello.txt", 1024)).bytes?.toString("utf8");
-const again = await exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")');
-seen.execAfterResume = again.result_text;
+  let { bayma } = yield* sessions.ensureSession(volumeId);
+  const wrote = yield* Effect.promise(() => exec(bayma, 'await Bun.write("/workspace/out/hello.txt", "hello from " + require("os").release()); "written"'));
+  seen.exec = wrote.result_text || JSON.stringify(wrote).slice(0, 300);
+  seen.read = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
+  seen.missing = (yield* read("out/nope.txt", 1024)).note;
+  seen.outside = (yield* read("/etc/passwd", 4096)).bytes ? "read /etc/passwd of the sandbox, not the host" : "refused";
+
+  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
+  yield* sandboxes.suspend(volumeId);
+  // The pod goes within a minute of the suspension.
+  const pod = yield* kube.read("v1", "Pod", profile.namespace, volumeId).pipe(
+    Effect.repeat({ schedule: Schedule.spaced("1 second"), times: 59, while: (pod) => pod !== null }),
+  );
+  seen.suspendedPod = pod ? "still there" : "gone";
+  seen.whileSuspended = (yield* read("out/hello.txt", 1024)).note;
+  const resumedAt = Date.now();
+  ({ bayma } = yield* sessions.ensureSession(volumeId));
+  seen.resumeMs = Date.now() - resumedAt;
+  seen.afterResume = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
+  const again = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
+  seen.execAfterResume = again.result_text;
+  return seen;
+});
+
+const seen = await Effect.runPromise(Effect.gen(function*() {
+  const { sessions } = yield* loadKubeTemplates;
+  if (!sessions) return yield* Effect.die(new Error("the release renders no sessions template"));
+  return yield* roundtrip(sessions).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/roundtrip", env: {} })));
+}).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));
 console.log(JSON.stringify(seen));
-await sandbox.close();

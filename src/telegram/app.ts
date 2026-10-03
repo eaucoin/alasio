@@ -1,14 +1,14 @@
-import type { Server } from "node:http";
 import type { Update } from "@grammyjs/types";
 import { Fiber } from "effect";
 import { TurnController } from "../codex/turn-controller.ts";
 import type { CodexRolloutsFacade } from "../codex/rollouts/index.ts";
-import { type SessionFsCodex, createSessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { type AdoptedSession, adoptTranscripts } from "../harness/claude/transcripts.ts";
 import type { KubeTemplates } from "../kube/config.ts";
-import { type SessionFilesystems, createSandbox } from "../sandbox/index.ts";
+import type { ClaudeQueryFactory } from "../harness/claude/runtime.ts";
+import { type FolderBayma, folderBaymaFacade } from "../mcp/bayma.ts";
+import { type SessionFilesystems, sessionFilesystemsFacade } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { type ActiveQueries, type HarnessRegistry, createHarnessRegistry } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
@@ -20,7 +20,7 @@ import { MediaGroupBuffer } from "./media-group-buffer.ts";
 import { MessageHandler } from "./message-handler.ts";
 import { pollUpdates } from "./update-poller.ts";
 import { type TelegramOutbox, outboxFacade } from "./outbox.ts";
-import { type WorkflowWait, type WorkflowWakeEvent, startWorkflowHookServer } from "../workflow/hook-server.ts";
+import { type WorkflowWait, type WorkflowWakeEvent, WorkflowHooks } from "../workflow/hook-server.ts";
 import type { AlasioEffects } from "../alasio.ts";
 import { createLogger } from "../shared/log.ts";
 import { inSpan, SpanKind } from "../telemetry/index.ts";
@@ -37,8 +37,10 @@ export interface TelegramCodexAppConfig extends AlasioConfig {
   readonly kubeTemplates?: KubeTemplates | null;
   /** Stand-ins (test doubles) for what the app otherwise builds itself. */
   readonly sandbox?: SessionFilesystems | null;
-  readonly sessionFsCodex?: SessionFsCodex | null;
   readonly harnesses?: HarnessRegistry | null;
+  /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses the app makes. */
+  readonly folderBayma?: FolderBayma | undefined;
+  readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
   /** What runs the effects of alasio's services for the app (src/alasio.ts). */
   readonly effects: AlasioEffects;
 }
@@ -49,13 +51,11 @@ export class TelegramCodexApp {
   readonly store: SqliteStore;
   readonly outbox: TelegramOutbox;
   readonly activeQueries: ActiveQueries;
-  readonly workflowWaits: Map<string, WorkflowWait>;
-  readonly workflowWakeEvents: Map<string, WorkflowWakeEvent>;
-  private hookServer: Server | null;
+  readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
+  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
   private isStopping: boolean;
   readonly authorizer: Authorizer;
   readonly sandbox: SessionFilesystems | null;
-  readonly sessionFsCodex: SessionFsCodex | null;
   readonly harnesses: HarnessRegistry;
   readonly turns: TurnController;
   readonly callbacks: CallbackHandler;
@@ -71,27 +71,27 @@ export class TelegramCodexApp {
     this.store = config.effects.runSync(Store);
     this.outbox = outboxFacade(config.effects);
     this.activeQueries = new Map();
-    this.workflowWaits = new Map();
-    this.workflowWakeEvents = new Map();
-    this.hookServer = null;
+    const workflowHooks = config.effects.runSync(WorkflowHooks);
+    this.workflowWaits = workflowHooks.waits;
+    this.workflowWakeEvents = workflowHooks.wakeEvents;
     this.isStopping = false;
     this.authorizer = new Authorizer({
       allowedUserIds: config.allowedUserIds,
       store: this.store,
       log,
     });
-    // Session filesystems, on when the deployment renders their template (createSandbox
-    // returns null otherwise), with the Codex app-server that serves them.
-    this.sandbox = config.sandbox ?? createSandbox({ templates: config.kubeTemplates ?? null, stateDir: config.stateDir });
-    this.sessionFsCodex = config.sessionFsCodex
-      ?? (this.sandbox ? createSessionFsCodex({ home: sessionFsCodexHome(config.stateDir) }) : null);
+    // Session filesystems, on when the deployment renders their template (alasio then
+    // has SessionSandboxes, and SessionFsCodex for the Codex app-server that serves them).
+    this.sandbox = config.sandbox ?? sessionFilesystemsFacade(config.effects);
     this.harnesses = config.harnesses ?? createHarnessRegistry({
       config,
       sessionStore: config.sessionStore ?? null,
       codexRollouts: config.codexRollouts ?? null,
       sandbox: this.sandbox,
-      sessionFsCodex: this.sessionFsCodex,
       sessionFsCodexRollouts: config.sessionFsCodexRollouts ?? null,
+      folderBayma: config.folderBayma ?? folderBaymaFacade(config.effects),
+      claudeQueryFactory: config.claudeQueryFactory,
+      effects: config.effects,
     });
     this.turns = new TurnController({
       config: this.config,
@@ -141,7 +141,6 @@ export class TelegramCodexApp {
     log.info(`  Session filesystems: ${this.sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
     await this.client.deleteWebhook(false);
     await this.configureNativeCommands();
-    this.startHookServer();
     this.turns.reconcilePersistentState();
     await this.turns.flushCompletedResponses();
     await this.mediaGroups.flushDue();
@@ -209,19 +208,12 @@ export class TelegramCodexApp {
       this.completedResponseRecoveryTimer = null;
     }
     this.turns.recordExternalRestartEventsForActiveTurns();
-    const { hookServer } = this;
-    if (hookServer) {
-      await new Promise<Error | undefined>((resolve) => hookServer.close(resolve));
-      this.hookServer = null;
-    }
     const { poller } = this;
     if (poller) {
       await this.config.effects.runPromise(Fiber.interrupt(poller));
       this.poller = null;
     }
     await this.harnesses.shutdownAll();
-    await this.sessionFsCodex?.stop();
-    await this.sandbox?.close();
   }
 
   async configureNativeCommands(): Promise<void> {
@@ -282,16 +274,6 @@ export class TelegramCodexApp {
         }
       }
     }
-  }
-
-  startHookServer(): void {
-    this.hookServer = startWorkflowHookServer({
-      port: this.config.hookPort,
-      store: this.store,
-      workflowWaits: this.workflowWaits,
-      workflowWakeEvents: this.workflowWakeEvents,
-      log,
-    });
   }
 
   /**

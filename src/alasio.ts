@@ -6,7 +6,12 @@
 import { NodeRuntime } from "@effect/platform-node";
 import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 
+import { CodexAppServer } from "./codex/app-server/client.ts";
+import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
+import { KubeClient } from "./kube/client.ts";
+import { HostBayma } from "./mcp/bayma.ts";
 import { Store } from "./persistence/store.ts";
+import { SessionSandboxes } from "./sandbox/index.ts";
 import { AlasioLoggerLayer } from "./shared/log.ts";
 import { type EffectRunner, effectRunnerHere } from "./shared/effects.ts";
 import { TracingLayer } from "./telemetry/index.ts";
@@ -14,18 +19,48 @@ import { stopTelemetry } from "./telemetry/start.ts";
 import { TelegramCodexApp, type TelegramCodexAppConfig } from "./telegram/app.ts";
 import { TelegramClient } from "./telegram/client.ts";
 import { Outbox } from "./telegram/outbox.ts";
+import { WorkflowHooks } from "./workflow/hook-server.ts";
 
 /** The services alasio runs on, which its app's code not yet written in Effect reaches through an EffectRunner. */
-export type AlasioServices = Store | TelegramClient | Outbox;
+export type AlasioServices = Store | TelegramClient | Outbox | WorkflowHooks | CodexAppServer;
 
 /** What alasio is made with: the app's configuration, but for what alasio makes itself. */
 export type AlasioOptions = Omit<TelegramCodexAppConfig, "effects">;
 
 /** alasio's services, made for `options`. */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices> {
-  return Outbox.layer.pipe(
+  return Layer.mergeAll(Outbox.layer, WorkflowHooks.layer(options.hookPort), workspaceServices(options), codexServices(options)).pipe(
     Layer.provideMerge(Layer.mergeAll(Store.layer(options), TelegramClient.layer(options.telegramBotToken))),
   );
+}
+
+/**
+ * The services of the workspaces the deployment's templates offer, each made only where
+ * its template is rendered, on one KubeClient: session filesystems (SessionSandboxes)
+ * and folder workspaces' bayma (HostBayma). They are not among AlasioServices, which are
+ * always there; what uses them asks whether they are.
+ */
+function workspaceServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<never> {
+  const sessions = kubeTemplates?.sessions ?? null;
+  const host = kubeTemplates?.host ?? null;
+  if (!sessions && !host) return Layer.empty;
+  return Layer.mergeAll(
+    // Settings the deployment gives wrongly stop alasio as it starts.
+    sessions ? Layer.orDie(SessionSandboxes.layer({ profile: sessions, stateDir })) : Layer.empty,
+    host ? HostBayma.layer(host) : Layer.empty,
+  ).pipe(Layer.provide(KubeClient.layer));
+}
+
+/**
+ * Codex's app-servers: the operator's (CodexAppServer), which folder workspaces' turns
+ * run on, and where the deployment offers session filesystems, theirs (SessionFsCodex),
+ * from a Codex home of alasio's own; that one is not among AlasioServices, and what uses
+ * it asks whether it is.
+ */
+function codexServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<CodexAppServer> {
+  return kubeTemplates?.sessions
+    ? Layer.merge(CodexAppServer.layer, SessionFsCodex.layer({ home: sessionFsCodexHome(stateDir) }))
+    : CodexAppServer.layer;
 }
 
 /** What runs the effects of alasio's code not yet written in Effect, in alasio's services. */

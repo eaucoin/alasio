@@ -1,8 +1,18 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+/**
+ * The workflow hook server: where an agent's session reports that it waits on a GitHub
+ * Actions run (../policy/workflow-wait.ts notifyWorkflowWait), so the turn's status can
+ * say so. It listens on localhost while alasio runs.
+ */
+import { createServer } from "node:http";
 
+import { NodeHttpServer } from "@effect/platform-node";
+import { Clock, Context, Effect, Layer, Schema, type Scope } from "effect";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
+
+import { Store } from "../persistence/store.ts";
 import type { Turn } from "../persistence/turn-repository.ts";
-import type { WorkflowHookNotification, WorkflowWaitType } from "../policy/workflow-wait.ts";
-import type { Logger } from "../shared/log.ts";
+import type { WorkflowWaitType } from "../policy/workflow-wait.ts";
+import { withLogScope } from "../shared/log.ts";
 
 /** A wait on a workflow run an agent reported for its session, shown in the turn's status. */
 export interface WorkflowWait {
@@ -24,13 +34,15 @@ export interface ActiveTurnSource {
   getActiveTurns(): readonly Pick<Turn, "session_id" | "thread_key">[];
 }
 
-export interface WorkflowHookServerOptions {
-  readonly port: number;
-  readonly store: ActiveTurnSource;
-  readonly workflowWaits: Map<string, WorkflowWait>;
-  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
-  readonly log: Logger;
-}
+/** What notifyWorkflowWait posts, as the server decodes it. */
+const WorkflowHookNotification = Schema.Struct({
+  session_id: Schema.NonEmptyString,
+  run_id: Schema.NonEmptyString,
+  wait_type: Schema.optional(Schema.Literals(["watch", "poll", "check"])),
+  command: Schema.optional(Schema.String),
+});
+
+const HOOK_PATH = "/hook/workflow";
 
 function findThreadKeyBySessionId(store: ActiveTurnSource, sessionId: string): string {
   for (const turn of store.getActiveTurns()) {
@@ -41,58 +53,53 @@ function findThreadKeyBySessionId(store: ActiveTurnSource, sessionId: string): s
   return "";
 }
 
-function readJsonBody(request: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    request.on("data", (chunk: Buffer) => {
-      body += chunk.toString();
-    });
-    request.on("end", () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    request.on("error", reject);
-  });
+/**
+ * The workflow waits agents report, by session, as the hook server on localhost:`port`
+ * records them while the service lasts; a report wakes the session's status loop
+ * (`wakeEvents`) at once.
+ */
+export class WorkflowHooks extends Context.Service<WorkflowHooks, {
+  /** The port the server listens on: the one it was given, or the one it was assigned for 0. */
+  readonly port: number;
+  readonly waits: ReadonlyMap<string, WorkflowWait>;
+  readonly wakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
+}>()("alasio/workflow/WorkflowHooks") {
+  static readonly layer = (port: number): Layer.Layer<WorkflowHooks, never, Store> =>
+    Layer.effect(WorkflowHooks, serveWorkflowHooks(port));
 }
 
-export function startWorkflowHookServer({ port, store, workflowWaits, workflowWakeEvents, log }: WorkflowHookServerOptions): Server {
-  const server = createServer(async (request, response) => {
-    if (request.method !== "POST" || request.url !== "/hook/workflow") {
-      response.writeHead(404);
-      response.end("Not found");
-      return;
-    }
-    try {
-      // The body is what notifyWorkflowWait posts; its fields are checked or defaulted below.
-      const data = await readJsonBody(request) as Partial<WorkflowHookNotification>;
-      const sessionId = data.session_id;
-      const runId = data.run_id;
-      if (!sessionId || !runId) {
-        response.writeHead(400);
-        response.end("Missing session_id or run_id");
-        return;
-      }
-      workflowWaits.set(sessionId, {
-        runId,
-        waitType: data.wait_type ?? "unknown",
-        command: data.command ?? "",
-        threadKey: findThreadKeyBySessionId(store, sessionId),
-        startedAt: Date.now() / 1000,
-      });
-      workflowWakeEvents.get(sessionId)?.resolve();
-      response.writeHead(200);
-      response.end("OK");
-    } catch (error) {
-      log.error(`Error handling workflow hook: ${error}`);
-      response.writeHead(500);
-      response.end(String(error));
-    }
-  });
-  server.listen(port, "localhost", () => {
-    log.info(`Hook server started on localhost:${port}`);
-  });
-  return server;
-}
+const serveWorkflowHooks = Effect.fnUntraced(function*(port: number): Effect.fn.Return<WorkflowHooks["Service"], never, Store | Scope.Scope> {
+  const store = yield* Store;
+  const waits = new Map<string, WorkflowWait>();
+  const wakeEvents = new Map<string, WorkflowWakeEvent>();
+
+  const record = Effect.gen(function*() {
+    const notification = yield* HttpServerRequest.schemaBodyJson(WorkflowHookNotification);
+    waits.set(notification.session_id, {
+      runId: notification.run_id,
+      waitType: notification.wait_type ?? "unknown",
+      command: notification.command ?? "",
+      threadKey: findThreadKeyBySessionId(store, notification.session_id),
+      startedAt: (yield* Clock.currentTimeMillis) / 1000,
+    });
+    wakeEvents.get(notification.session_id)?.resolve();
+    return HttpServerResponse.text("OK");
+  }).pipe(
+    Effect.catchTag("SchemaError", () => Effect.succeed(HttpServerResponse.text("Missing session_id or run_id", { status: 400 }))),
+    Effect.catchTag("HttpServerError", (error) =>
+      Effect.logError(`Error handling workflow hook: ${error}`).pipe(Effect.as(HttpServerResponse.text(String(error), { status: 500 })))),
+  );
+
+  const handle = HttpServerRequest.HttpServerRequest.pipe(
+    Effect.flatMap((request) =>
+      request.method === "POST" && request.url === HOOK_PATH ? record : Effect.succeed(HttpServerResponse.text("Not found", { status: 404 }))
+    ),
+    withLogScope("telegram-app"),
+  );
+
+  // A port taken or refused is a deployment alasio cannot run in.
+  const server = yield* Effect.orDie(NodeHttpServer.make(() => createServer(), { port, host: "localhost" }));
+  yield* server.serve(handle);
+  yield* Effect.logInfo(`Hook server started on localhost:${port}`).pipe(withLogScope("telegram-app"));
+  return WorkflowHooks.of({ port: server.address._tag === "UnixPathAddress" ? port : server.address.port, waits, wakeEvents });
+});

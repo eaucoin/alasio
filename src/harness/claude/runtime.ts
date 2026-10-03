@@ -11,45 +11,24 @@
  * work settles are delivered as their own replies.
  */
 import { randomUUID } from "node:crypto";
-import {
-  query,
-  type McpServerConfig,
-  type Options,
-  type Query,
-  type SDKMessage,
-  type SDKUserMessage,
-  type SessionStore,
+import type {
+  McpServerConfig,
+  Options,
+  Query,
+  SDKMessage,
+  SDKUserMessage,
+  SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
+import { type Effect, Schema } from "effect";
 import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { TurnParams, TurnResult } from "../index.ts";
 import type { ClaudeLiveSessions } from "./live-sessions.ts";
 import type { ClaudeSessionApi } from "./sessions.ts";
-import { appendBlock, isVisibleCodexItem, mapItemToBlocks } from "../../codex/event-projection.ts";
-import { createTurnTimer } from "../../codex/turn-timing.ts";
-import {
-  buildDbGuardrailFallbackText,
-  buildDbGuardrailSyntheticText,
-  createCommandEventPolicy,
-} from "../../codex/command-event-policy.ts";
-import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { createLogger } from "../../shared/log.ts";
-import { buildClaudeEnv } from "./env.ts";
-import {
-  cacheReadTokensFromUsage,
-  projectAssistantMessageToItems,
-  projectResultMessage,
-} from "./event-projection.ts";
-import { claudeMcpServers } from "./mcp.ts";
 import { sessionFsQueryOptions } from "./sessionfs.ts";
 import { REPLY_INSTRUCTIONS } from "../reply-instructions.ts";
 import { getClaudeBinaryOverride, getClaudeEffort, getClaudeModel } from "./model.ts";
-import {
-  buildClaudeUserMessage,
-  createPromptChannel,
-  instrumentPromptChannel,
-  promptUuidsAnsweredBy,
-} from "./prompt-channel.ts";
 import { mirrorOnly } from "./session-store.ts";
 
 const log = createLogger("claude-runtime");
@@ -88,8 +67,17 @@ export interface ClaudeTurnRequest extends TurnParams {
   readonly liveSessions: ClaudeLiveSessions;
 }
 
-function getErrorMessage(error: unknown): string {
+export function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** What Claude Code, or starting or asking it, failed with, as it said. */
+export class ClaudeCodeError extends Schema.TaggedError<ClaudeCodeError>()("ClaudeCodeError", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return getErrorMessage(this.cause);
+  }
 }
 
 function isIntentionalTurnInterrupt(reason: unknown): boolean {
@@ -176,44 +164,13 @@ export function buildClaudeQueryOptions({
   return options;
 }
 
-/** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
-export const UNANSWERED_PROMPT_GRACE_MS = 15_000;
-
 export function isOperatorInterrupt(reason: unknown): boolean {
   return isIntentionalTurnInterrupt(reason);
 }
-
-export {
-  appendBlock,
-  buildClaudeEnv,
-  buildDbGuardrailFallbackText,
-  buildDbGuardrailSyntheticText,
-  cacheReadTokensFromUsage,
-  claudeMcpServers,
-  createCommandEventPolicy,
-  createTurnTimer,
-  getErrorMessage,
-  isBlockedDbCommand,
-  isVisibleCodexItem,
-  mapItemToBlocks,
-  projectAssistantMessageToItems,
-  projectResultMessage,
-  promptUuidsAnsweredBy,
-  buildClaudeUserMessage,
-  createPromptChannel,
-  instrumentPromptChannel,
-  query as defaultQueryFactory,
-};
 
 /**
  * Run one operator prompt on the conversation's live Claude Code process,
  * starting or replacing that process when the mounted session, folder or
  * model differs from the one it serves.
  */
-export async function executeClaudeTurn(params: ClaudeTurnRequest): Promise<TurnResult> {
-  const liveSessions = params.liveSessions;
-  if (!liveSessions) {
-    throw new Error("executeClaudeTurn requires the adapter's live session registry");
-  }
-  return await liveSessions.runTurn(params);
-}
+export const executeClaudeTurn = (params: ClaudeTurnRequest): Effect.Effect<TurnResult> => params.liveSessions.runTurn(params);

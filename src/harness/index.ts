@@ -1,12 +1,12 @@
 import type { v2 } from "../../.types/codex/index.js";
 import type { ResponseBlock } from "../codex/event-projection.ts";
 import type { CodexRolloutsFacade } from "../codex/rollouts/index.ts";
-import type { SessionFsCodex } from "../codex/sessionfs.ts";
 import type { AlasioConfig } from "../config.ts";
-import type { folderBaymaServer } from "../mcp/bayma.ts";
+import type { FolderBayma } from "../mcp/bayma.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { SessionFilesystems } from "../sandbox/index.ts";
+import type { EffectRunner } from "../shared/effects.ts";
 import { createClaudeHarness } from "./claude/index.ts";
 import type { ClaudeQueryFactory } from "./claude/runtime.ts";
 import type { NeonSessionStore } from "./claude/session-store.ts";
@@ -192,12 +192,13 @@ export interface HarnessOptions {
   /** Codex's rollouts in Neon. */
   readonly codexRollouts?: CodexRolloutsFacade | null;
   readonly sandbox?: SessionFilesystems | null;
-  readonly sessionFsCodex?: SessionFsCodex | null;
   readonly sessionFsCodexRollouts?: CodexRolloutsFacade | null;
   /** A folder workspace's bayma: ../mcp/bayma.ts's, from the deployment's host profile, unless a test gives its own. */
-  readonly folderBayma?: typeof folderBaymaServer | undefined;
+  readonly folderBayma?: FolderBayma | undefined;
   /** How Claude Code is started: the Agent SDK's `query`, unless a test gives its own. */
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
+  /** What runs a harness's effects: alasio's (src/alasio.ts), so they log and trace as it does; Effect's own where a test leaves it out. */
+  readonly effects?: EffectRunner<never> | undefined;
 }
 
 /** Where a conversation's mounted harness and folder are read: alasio's store, or any part of it. */
@@ -249,10 +250,11 @@ export interface HarnessRegistry {
  * created lazily per (harness, working directory) pair and cached; overrides
  * (test doubles) stand in for every folder of their harness but still require
  * a mounted folder so gating behaves the same as production. `sessionStore`
- * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts; `sandbox`,
- * `sessionFsCodex` and `sessionFsCodexRollouts` serve session-filesystem workspaces;
- * `folderBayma` and `claudeQueryFactory`, when given, stand in for a folder
- * workspace's bayma and for Claude Code in every adapter made.
+ * keeps Claude Code's transcripts and `codexRollouts` Codex's rollouts; `sandbox`
+ * and `sessionFsCodexRollouts` serve session-filesystem workspaces; `folderBayma`
+ * and `claudeQueryFactory`, when given, stand in for a folder workspace's bayma and
+ * for Claude Code in every adapter made; `effects` runs the adapters' effects, in
+ * alasio's services where the adapters use them (the Codex harness's app-servers).
  */
 export function createHarnessRegistry({
   config = {},
@@ -260,10 +262,10 @@ export function createHarnessRegistry({
   sessionStore = null,
   codexRollouts = null,
   sandbox = null,
-  sessionFsCodex = null,
   sessionFsCodexRollouts = null,
   folderBayma,
   claudeQueryFactory,
+  effects,
 }: HarnessRegistryOptions = {}): HarnessRegistry {
   const adapters = new Map<string, Harness>();
   const getFor = (name: string, workingDirectory: string | null | undefined): Harness => {
@@ -280,7 +282,7 @@ export function createHarnessRegistry({
     const key = `${name}\0${workingDirectory}`;
     let adapter = adapters.get(key);
     if (!adapter) {
-      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox, sessionFsCodex, sessionFsCodexRollouts, folderBayma, claudeQueryFactory });
+      adapter = FACTORIES[name]({ workingDirectory, sessionStore, codexRollouts, sandbox, sessionFsCodexRollouts, folderBayma, claudeQueryFactory, effects });
       adapters.set(key, adapter);
     }
     return adapter;

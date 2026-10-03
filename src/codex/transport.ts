@@ -1,8 +1,11 @@
 import { CODEX_HARNESS } from "../harness/names.ts";
 import { resolveCodexModelChoice } from "./model.ts";
 import { Codex, type Thread, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
-import { type AppServerClient, codexAppServerClient, stopCodexAppServer } from "./app-server/client.ts";
+import { Effect, Schema, type Scope, Stream } from "effect";
+import type { AppServer, AppServerEventsError } from "./app-server/client.ts";
 import type { AppServerEvent } from "./app-server/protocol.ts";
+import type { AppServerRequestError, AppServerStartError } from "./app-server/rpc-client.ts";
+import type { NoActiveTurn, StaleTurnCleanupError, ThreadIdMissing } from "./app-server/thread-client.ts";
 import {
     ALASIO_CODEX_MODEL,
     withAlasioCodexModelConfig,
@@ -18,11 +21,31 @@ const CODEX_TRANSPORT = getCodexTransportMode();
 /** What a turn reports: the Codex SDK's thread events from exec, or the app-server's in their shape. */
 export type CodexEvent = ThreadEvent | AppServerEvent;
 
+/** The exec transport's Codex failed, as the Codex SDK reported it. */
+export class CodexExecError extends Schema.TaggedError<CodexExecError>()("CodexExecError", {
+    cause: Schema.Defect(),
+}) {
+    override get message(): string {
+        return this.cause instanceof Error ? this.cause.message : String(this.cause);
+    }
+}
+
+/** What was asked of the transport is something it does not do. */
+export class CodexTransportRefused extends Schema.TaggedError<CodexTransportRefused>()("CodexTransportRefused", {
+    message: Schema.String,
+}) {}
+
+/** How a turn's events stop before its end. */
+export type CodexEventsError = AppServerEventsError | CodexExecError;
+
+/** How opening a turn's events fails. */
+export type CodexOpenError = AppServerStartError | ThreadIdMissing | StaleTurnCleanupError | CodexExecError | CodexTransportRefused;
+
 /** A turn's events as they stream, with the session and turn they belong to, as far as they are known. */
 export interface CodexEventStream {
     readonly sessionId: string | null | undefined;
     readonly turnId: string | null;
-    readonly events: AsyncIterable<CodexEvent>;
+    readonly events: Stream.Stream<CodexEvent, CodexEventsError>;
 }
 
 /** Where a transport records the session a turn runs in, and reads the conversation's model choice. */
@@ -30,13 +53,13 @@ export type TurnSessionStore =
     & Pick<SqliteStore, "updatePendingSessionId" | "updateActiveTurnSessionId">
     & Partial<Pick<SqliteStore, "getModelChoice">>;
 
-/** A Codex session's location: its app-server client, and the directory, environment, and config it runs with. */
+/** A Codex session's location: its app-server, and the directory, environment, and config it runs with. */
 export interface CodexSessionOptions {
     readonly threadKey: string;
     readonly workingDirectory: string;
     readonly codexEnv: CodexEnv;
     readonly codexConfig: CodexThreadConfig;
-    readonly client?: AppServerClient | undefined;
+    readonly appServer: AppServer;
 }
 
 /** What the exec transport uses of the Codex SDK's client: threads to stream a turn in. */
@@ -51,7 +74,6 @@ export interface CodexStreamParams extends CodexSessionOptions {
     readonly prompt: string;
     readonly persistence: TurnSessionStore;
     readonly pendingResponseId: string;
-    readonly controller: AbortController;
     readonly turnTimer: TurnTimer;
     /** Makes the Codex SDK client of the exec transport, for tests. */
     readonly codexFactory?: (() => CodexExecClient) | undefined;
@@ -69,7 +91,7 @@ export interface SteerCodexTurnOptions {
     readonly sessionId: string;
     readonly turnId: string | null | undefined;
     readonly prompt: string;
-    readonly client?: AppServerClient | undefined;
+    readonly appServer: AppServer;
 }
 
 /** A session to fork before one of its turns. */
@@ -87,157 +109,107 @@ export function canWarmCodexSession(): boolean {
     return CODEX_TRANSPORT !== "exec";
 }
 
-export function stopCodexTransport(): void {
-    stopCodexAppServer();
-}
-
-async function createAppServerStream({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, controller, turnTimer, client = codexAppServerClient, onPromptDispatched, }: CodexStreamParams): Promise<CodexEventStream> {
-    let sessionId = resumeSession;
-    if (resumeSession) {
-        sessionId = await client.ensureThread({
-            threadId: resumeSession,
-            threadKey,
-            cwd: workingDirectory,
-            env: codexEnv,
-            config: codexConfig,
-        });
-    }
-    else {
-        sessionId = await client.startThread({
-            threadKey,
-            cwd: workingDirectory,
-            env: codexEnv,
-            config: codexConfig,
-        });
-    }
+const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, turnTimer, appServer, onPromptDispatched }: CodexStreamParams) {
+    const scope = { threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig };
+    const sessionId = resumeSession
+        ? yield* appServer.ensureThread({ threadId: resumeSession, ...scope })
+        : yield* appServer.startThread(scope);
     persistence.updatePendingSessionId(pendingResponseId, sessionId);
     persistence.updateActiveTurnSessionId(threadKey, sessionId);
     const { model, effort } = resolveCodexModelChoice(persistence.getModelChoice?.(threadKey, CODEX_HARNESS) ?? null);
-    const turnId = await client.startTurn({
-        threadId: sessionId,
-        threadKey,
-        prompt,
-        cwd: workingDirectory,
-        env: codexEnv,
-        config: codexConfig,
-        model,
-        effort,
-        onPromptDispatched,
-    });
+    const turnId = yield* appServer.startTurn({ threadId: sessionId, prompt, model, effort, onPromptDispatched, ...scope });
     turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
-    return {
-        sessionId,
-        turnId,
-        events: client.eventsForTurn(sessionId, turnId, controller.signal),
-    };
-}
+    const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
+    return stream;
+});
 
-async function createAttachedAppServerStream({ sessionId, turnId, persistence, pendingResponseId, controller, turnTimer, threadKey, client = codexAppServerClient, }: AttachedCodexStreamParams): Promise<CodexEventStream> {
+const createAttachedAppServerStream = Effect.fnUntraced(function*({ sessionId, turnId, persistence, pendingResponseId, turnTimer, threadKey, appServer }: AttachedCodexStreamParams) {
     if (!sessionId || !turnId) {
-        throw new Error("Cannot attach to a Codex goal turn without both session and turn ids");
+        return yield* new CodexTransportRefused({ message: "Cannot attach to a Codex goal turn without both session and turn ids" });
     }
     persistence.updatePendingSessionId(pendingResponseId, sessionId);
     persistence.updateActiveTurnSessionId(threadKey, sessionId);
-    client.claimTurn(sessionId, turnId);
+    yield* appServer.claimTurn(sessionId, turnId);
     turnTimer("app_server.goal_turn.attached", { turn_id: turnId });
-    return {
-        sessionId,
-        turnId,
-        events: client.eventsForTurn(sessionId, turnId, controller.signal),
-    };
-}
+    const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
+    return stream;
+});
 
-async function createExecSdkStream({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, controller, turnTimer, onPromptDispatched, }: CodexStreamParams): Promise<CodexEventStream> {
-    const codex = codexFactory
-        ? codexFactory()
-        : new Codex({
-            env: codexEnv,
-            config: {
-                ...withAlasioCodexModelConfig(codexConfig),
-                "features.plugins": false,
-            },
-        });
+/** The exec transport's turn: a Codex SDK thread run with the prompt, stopped when the scope closes. */
+const createExecSdkStream = Effect.fnUntraced(function*({ resumeSession, workingDirectory, codexEnv, codexConfig, prompt, codexFactory, turnTimer, onPromptDispatched }: CodexStreamParams) {
+    const codex = yield* Effect.try({
+        try: () => codexFactory
+            ? codexFactory()
+            : new Codex({
+                env: codexEnv,
+                config: {
+                    ...withAlasioCodexModelConfig(codexConfig),
+                    "features.plugins": false,
+                },
+            }),
+        catch: (cause) => new CodexExecError({ cause }),
+    });
     turnTimer("codex.client.created");
-    const thread = resumeSession
-        ? codex.resumeThread(resumeSession, {
-            model: ALASIO_CODEX_MODEL,
-            workingDirectory,
-            skipGitRepoCheck: true,
-            sandboxMode: "danger-full-access",
-            approvalPolicy: "never",
-            networkAccessEnabled: true,
-        })
-        : codex.startThread({
-            model: ALASIO_CODEX_MODEL,
-            workingDirectory,
-            skipGitRepoCheck: true,
-            sandboxMode: "danger-full-access",
-            approvalPolicy: "never",
-            networkAccessEnabled: true,
-        });
+    const threadOptions: ThreadOptions = {
+        model: ALASIO_CODEX_MODEL,
+        workingDirectory,
+        skipGitRepoCheck: true,
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+        networkAccessEnabled: true,
+    };
+    const thread = resumeSession ? codex.resumeThread(resumeSession, threadOptions) : codex.startThread(threadOptions);
     turnTimer("thread.handle.created", { mode: resumeSession ? "resume" : "start" });
     onPromptDispatched?.();
-    const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+    // Codex runs as long as its events are read, until the turn's scope closes.
+    const signal = yield* Effect.abortSignal;
+    const streamed = yield* Effect.tryPromise({
+        try: () => thread.runStreamed(prompt, { signal }),
+        catch: (cause) => new CodexExecError({ cause }),
+    });
     turnTimer("run_streamed.returned");
-    return {
+    const stream: CodexEventStream = {
         sessionId: resumeSession,
         turnId: null,
-        events: streamed.events,
+        events: Stream.fromAsyncIterable(streamed.events, (cause) => new CodexExecError({ cause })),
     };
-}
+    return stream;
+});
 
-export async function openCodexEventStream(params: CodexStreamParams): Promise<CodexEventStream> {
+/** The turn's events, from the app-server unless the exec transport is chosen (or a test's Codex SDK given). */
+export function openCodexEventStream(params: CodexStreamParams): Effect.Effect<CodexEventStream, CodexOpenError, Scope.Scope> {
     if (!params.codexFactory && CODEX_TRANSPORT !== "exec") {
-        return await createAppServerStream(params);
+        return createAppServerStream(params);
     }
-    return await createExecSdkStream(params);
+    return createExecSdkStream(params);
 }
 
-export async function openAttachedCodexEventStream(params: AttachedCodexStreamParams): Promise<CodexEventStream> {
+export function openAttachedCodexEventStream(params: AttachedCodexStreamParams): Effect.Effect<CodexEventStream, CodexOpenError> {
     if (CODEX_TRANSPORT === "exec") {
-        throw new Error("Attached Codex goal turns require the app-server transport");
+        return Effect.fail(new CodexTransportRefused({ message: "Attached Codex goal turns require the app-server transport" }));
     }
-    return await createAttachedAppServerStream(params);
+    return createAttachedAppServerStream(params);
 }
 
-export async function steerCodexTransportTurn({ sessionId, turnId, prompt, client = codexAppServerClient }: SteerCodexTurnOptions): Promise<boolean> {
+export function steerCodexTransportTurn({ sessionId, turnId, prompt, appServer }: SteerCodexTurnOptions): Effect.Effect<boolean, AppServerRequestError | NoActiveTurn | CodexTransportRefused> {
     if (CODEX_TRANSPORT === "exec") {
-        throw new Error("Steering active Codex turns requires the app-server transport");
+        return Effect.fail(new CodexTransportRefused({ message: "Steering active Codex turns requires the app-server transport" }));
     }
-    await client.steerTurn({ threadId: sessionId, turnId, prompt });
-    return true;
+    return appServer.steerTurn({ threadId: sessionId, turnId, prompt }).pipe(Effect.as(true));
 }
 
-export async function startCodexTransportThread({ threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }: CodexSessionOptions): Promise<string> {
+export function startCodexTransportThread({ threadKey, workingDirectory, codexEnv, codexConfig, appServer }: CodexSessionOptions): Effect.Effect<string, AppServerStartError | ThreadIdMissing | CodexTransportRefused> {
     if (CODEX_TRANSPORT === "exec") {
-        throw new Error("Starting an empty Codex session requires the app-server transport");
+        return Effect.fail(new CodexTransportRefused({ message: "Starting an empty Codex session requires the app-server transport" }));
     }
-    return await client.startThread({
-        threadKey,
-        cwd: workingDirectory,
-        env: codexEnv,
-        config: codexConfig,
-    });
+    return appServer.startThread({ threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig });
 }
 
 /** Forks through the app-server under either transport: the fork is a rollout like any other, which exec resumes too. */
-export async function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }: ForkCodexSessionOptions): Promise<string> {
-    return await client.forkThread({
-        threadId: sessionId,
-        beforeTurnId,
-        threadKey,
-        cwd: workingDirectory,
-        env: codexEnv,
-        config: codexConfig,
-    });
+export function forkCodexTransportThread({ sessionId, beforeTurnId, threadKey, workingDirectory, codexEnv, codexConfig, appServer }: ForkCodexSessionOptions): Effect.Effect<string, AppServerStartError | ThreadIdMissing> {
+    return appServer.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig });
 }
 
-export async function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig, client = codexAppServerClient }: WarmCodexSessionOptions): Promise<string> {
-    return await client.ensureThread({
-        threadId: sessionId,
-        threadKey,
-        cwd: workingDirectory,
-        env: codexEnv,
-        config: codexConfig,
-    });
+export function warmCodexTransportThread({ sessionId, threadKey, workingDirectory, codexEnv, codexConfig, appServer }: WarmCodexSessionOptions): Effect.Effect<string, AppServerStartError | ThreadIdMissing> {
+    return appServer.ensureThread({ threadId: sessionId, threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig });
 }

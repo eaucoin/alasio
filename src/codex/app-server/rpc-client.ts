@@ -1,10 +1,10 @@
-import type { Writable } from "node:stream";
-
 import type { ClientNotification, RequestId, ServerRequest } from "../../../.types/codex/index.js";
-import type { Logger } from "../../shared/log.ts";
-import { rpcCall, type TraceCarrier, traceCarrier } from "../../telemetry/index.ts";
+import { Clock, Deferred, type Duration, Effect, Exit, Option, Schema, type Scope, ScopedRef, Semaphore, Stream } from "effect";
+
+import { withLogScope } from "../../shared/log.ts";
+import { traceCarrier, type TraceCarrier, withRpcCall } from "../../telemetry/index.ts";
 import type { CodexEnv } from "../env.ts";
-import { type AppServerProcess, elapsedMs, type SpawnAppServer, startAppServerProcess } from "./process.ts";
+import type { AppServerEnded, AppServerProcess, AppServerSpawnFailed, CodexBinaryMissing, SpawnAppServer } from "./process.ts";
 import {
   type AppServerMethod,
   type AppServerNotification,
@@ -13,13 +13,8 @@ import {
   serverRequestResponse,
 } from "./protocol.ts";
 
-const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const START_TIMEOUT_MS = 20 * 1000;
-
-/** The app-server process as the client drives it: whether it was killed, its input, and its stop. */
-export interface AppServerConnection extends Pick<AppServerProcess, "stop"> {
-  readonly child: Pick<AppServerProcess["child"], "killed"> & { readonly stdin: Pick<Writable, "write"> };
-}
+const REQUEST_TIMEOUT = "5 minutes";
+const START_TIMEOUT = "20 seconds";
 
 /** Where the app-server process runs: its environment and working directory. */
 export interface AppServerScope {
@@ -27,21 +22,59 @@ export interface AppServerScope {
   readonly cwd: string;
 }
 
-export interface AppServerRpcClientOptions {
-  readonly log: Logger;
-  readonly onNotification: (message: AppServerNotification) => void;
-  readonly onFailure: (error: Error) => void;
-  readonly spawnProcess?: SpawnAppServer | undefined;
+/** The app-server a request or a wait was for was stopped, or replaced. */
+export class AppServerStopped extends Schema.TaggedError<AppServerStopped>()("AppServerStopped", {}) {
+  override get message(): string {
+    return "Codex app-server stopped";
+  }
 }
 
-/** A JSON-RPC message the app-server writes, before it is known which kind it is. */
-interface IncomingMessage {
-  readonly id?: RequestId | null;
-  readonly method?: string;
-  readonly params?: unknown;
-  readonly result?: unknown;
-  readonly error?: { readonly message?: string };
+/** A request was made with no app-server running. */
+export class AppServerNotRunning extends Schema.TaggedError<AppServerNotRunning>()("AppServerNotRunning", {}) {
+  override get message(): string {
+    return "Codex app-server is not running";
+  }
 }
+
+/** The app-server did not answer a request in time. */
+export class AppServerRequestTimeout extends Schema.TaggedError<AppServerRequestTimeout>()("AppServerRequestTimeout", {
+  method: Schema.String,
+}) {
+  override get message(): string {
+    return `Codex app-server request timed out: ${this.method}`;
+  }
+}
+
+/** The app-server answered a request with a JSON-RPC error. */
+export class AppServerRequestFailed extends Schema.TaggedError<AppServerRequestFailed>()("AppServerRequestFailed", {
+  error: Schema.Record(Schema.String, Schema.Unknown),
+}) {
+  override get message(): string {
+    return typeof this.error["message"] === "string" ? this.error["message"] : JSON.stringify(this.error);
+  }
+}
+
+/** Why the app-server a request or a wait was for is gone. */
+export type AppServerGone = AppServerEnded | AppServerStopped;
+
+/** How a request fails. */
+export type AppServerRequestError = AppServerGone | AppServerNotRunning | AppServerRequestTimeout | AppServerRequestFailed;
+
+/** How starting the app-server fails: it would not start, or not answer `initialize`. */
+export type AppServerStartError = CodexBinaryMissing | AppServerSpawnFailed | AppServerRequestError;
+
+/** A line the app-server writes: a JSON-RPC message, of whichever kind. */
+const AppServerMessage = Schema.Struct({
+  id: Schema.optional(Schema.NullOr(Schema.Union([Schema.String, Schema.Number]))),
+  method: Schema.optional(Schema.String),
+  params: Schema.optional(Schema.Unknown),
+  result: Schema.optional(Schema.Unknown),
+  error: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+});
+type AppServerMessage = typeof AppServerMessage.Type;
+
+const decodeJson = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
+const decodeMessage = Schema.decodeUnknownExit(AppServerMessage);
 
 /** A JSON-RPC message alasio writes: a request, a notification, or an answer to the app-server's request. */
 interface OutgoingMessage {
@@ -52,66 +85,131 @@ interface OutgoingMessage {
   readonly trace?: TraceCarrier;
 }
 
-/** A request awaiting the app-server's response. */
-interface PendingRequest {
-  readonly resolve: (result: unknown) => void;
-  readonly reject: (error: Error) => void;
-  readonly timer: NodeJS.Timeout;
+/** A started app-server: its process, the requests it has yet to answer, and its end. */
+interface Connection {
+  readonly process: AppServerProcess;
+  readonly pending: Map<RequestId, Deferred.Deferred<unknown, AppServerRequestFailed>>;
+  /** Fails with why the app-server is gone, once it is. */
+  readonly gone: Deferred.Deferred<never, AppServerGone>;
 }
 
-export class AppServerRpcClient {
-  private readonly log: Logger;
-  private readonly onNotification: (message: AppServerNotification) => void;
-  private readonly onFailure: (error: Error) => void;
-  private readonly spawnProcess: SpawnAppServer;
-  process: AppServerConnection | null;
-  private nextId: number;
-  private readonly pending: Map<RequestId, PendingRequest>;
-  private initialized: boolean;
-  private startPromise: Promise<void> | null;
+/** JSON-RPC with an app-server process, started when asked for and again once it is gone. */
+export interface AppServerRpc {
+  /** Starts the app-server in `scope`, unless one is running; one that is gone is replaced. */
+  readonly start: (scope: AppServerScope) => Effect.Effect<void, AppServerStartError>;
+  /**
+   * A request, as a client span named by its method. The request carries the span's
+   * trace context, so what the app-server does for it joins alasio's trace.
+   */
+  readonly request: <M extends AppServerMethod>(method: M, params: AppServerParams<M>, timeout?: Duration.Input) => Effect.Effect<AppServerResult<M>, AppServerRequestError>;
+  /** Stops the app-server running, if one is. */
+  readonly stop: Effect.Effect<void>;
+  /**
+   * What fails once the app-server running now is gone, with why; it waits forever
+   * when none is running.
+   */
+  readonly whenGone: Effect.Effect<Effect.Effect<never, AppServerGone>>;
+}
 
-  constructor({ log, onNotification, onFailure, spawnProcess = startAppServerProcess }: AppServerRpcClientOptions) {
-    this.log = log;
-    this.onNotification = onNotification;
-    this.onFailure = onFailure;
-    // How the app-server process is created. The default spawns the local codex
-    // binary; the session-filesystem client injects one that runs it in its own Codex
-    // home's directory (see codex/sessionfs.ts).
-    this.spawnProcess = spawnProcess;
-    this.process = null;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.initialized = false;
-    this.startPromise = null;
-  }
+export interface AppServerRpcOptions {
+  /** How the app-server process is started. */
+  readonly spawn: SpawnAppServer;
+  /** What is done with each notification the app-server sends, in order. */
+  readonly onNotification: (message: AppServerNotification) => Effect.Effect<void>;
+}
 
-  async start({ env, cwd }: AppServerScope): Promise<void> {
-    if (this.process?.child && !this.process.child.killed && this.initialized) {
-      return;
+/**
+ * JSON-RPC with an app-server process, until the scope closes. The process is held in
+ * a ScopedRef: each process lives in a scope of its own, which replacing it closes
+ * before the next is started, and the ScopedRef's own scope closes the last. A ScopedRef
+ * rather than an RcRef, because the process is started in the directory and environment
+ * of the call that needs it, where an RcRef acquires with one fixed effect, and because
+ * alasio stops and replaces it on its own terms, not when no one holds it.
+ */
+export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotification }: AppServerRpcOptions): Effect.fn.Return<AppServerRpc, never, Scope.Scope> {
+  const current = yield* ScopedRef.make(Option.none<Connection>);
+  // One start at a time: whoever comes while one runs finds its app-server.
+  const starting = yield* Semaphore.make(1);
+  let nextId = 1;
+
+  const running = (connection: Option.Option<Connection>) => Option.filter(connection, ({ gone }) => !Deferred.isDoneUnsafe(gone));
+
+  const write = (connection: Connection, message: OutgoingMessage) => connection.process.write(JSON.stringify(message));
+
+  const call = <M extends AppServerMethod>(
+    connect: Effect.Effect<Connection, AppServerNotRunning>,
+    method: M,
+    params: AppServerParams<M>,
+    timeout: Duration.Input,
+  ): Effect.Effect<AppServerResult<M>, AppServerRequestError> =>
+    Effect.gen(function*() {
+      const connection = yield* connect;
+      const id = nextId;
+      nextId += 1;
+      yield* Effect.annotateCurrentSpan("rpc.jsonrpc.request_id", String(id));
+      const reply = yield* Deferred.make<unknown, AppServerRequestFailed>();
+      connection.pending.set(id, reply);
+      const trace = traceCarrier();
+      yield* write(connection, { id, method, params, ...(trace ? { trace } : {}) });
+      const result = yield* Deferred.await(reply).pipe(
+        Effect.raceFirst(Deferred.await(connection.gone)),
+        Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.fail(new AppServerRequestTimeout({ method })) }),
+        Effect.ensuring(Effect.sync(() => connection.pending.delete(id))),
+      );
+      // The app-server answers a request with its method's result.
+      return result as AppServerResult<M>;
+    }).pipe(withRpcCall({ system: "jsonrpc", service: "codex", method }));
+
+  const handleMessage = (connection: Connection, message: AppServerMessage): Effect.Effect<void> => {
+    const { id, method } = message;
+    const reply = id == null ? undefined : connection.pending.get(id);
+    if (reply) {
+      return Deferred.done(reply, message.error ? Exit.fail(new AppServerRequestFailed({ error: message.error })) : Exit.succeed(message.result)).pipe(Effect.asVoid);
     }
-    if (this.startPromise) {
-      return this.startPromise;
+    if (id != null && method) {
+      // A message with an id and a method is a request of the app-server's, in its protocol.
+      return write(connection, { id, result: serverRequestResponse(method as ServerRequest["method"]) });
     }
-    this.startPromise = this.startInner({ env, cwd }).finally(() => {
-      this.startPromise = null;
-    });
-    return this.startPromise;
-  }
+    if (method) {
+      // A message with a method and no id is a notification, in the app-server's protocol.
+      return onNotification(message as AppServerNotification);
+    }
+    return Effect.void;
+  };
 
-  private async startInner({ env, cwd }: AppServerScope) {
-    this.stop();
-    const startedAt = process.hrtime.bigint();
-    // A process stopped or replaced may still report its exit, late: only
-    // the current one's events count.
-    const started = this.spawnProcess({
-      cwd,
-      env,
-      onLine: (line) => this.process === started && this.handleLine(line),
-      onExit: (code, signal) => this.process === started && this.handleExit(code, signal),
-      onError: (error) => this.process === started && this.handleSpawnError(error),
-    });
-    this.process = started;
-    const init = await this.request("initialize", {
+  const handleLine = (connection: Connection, line: string): Effect.Effect<void> => {
+    if (!line.trim()) {
+      return Effect.void;
+    }
+    const json = decodeJson(line);
+    if (Exit.isFailure(json)) {
+      return Effect.logWarning(`Ignoring non-JSON app-server line: ${line.slice(0, 200)}`);
+    }
+    const message = decodeMessage(json.value);
+    if (Exit.isFailure(message)) {
+      return Effect.logWarning(`Ignoring app-server line that is no JSON-RPC message: ${line.slice(0, 200)}`);
+    }
+    return handleMessage(connection, message.value);
+  };
+
+  /** Starts an app-server and initializes it, in the scope the ScopedRef gives it. */
+  const connect = Effect.fnUntraced(function*({ env, cwd }: AppServerScope) {
+    const startedAt = yield* Clock.currentTimeNanos;
+    const connection: Connection = {
+      process: yield* spawn({ cwd, env }),
+      pending: new Map(),
+      gone: yield* Deferred.make<never, AppServerGone>(),
+    };
+    yield* Effect.addFinalizer(() => Deferred.fail(connection.gone, new AppServerStopped()));
+    yield* connection.process.lines.pipe(Stream.runForEach((line) => handleLine(connection, line)), Effect.forkScoped);
+    yield* connection.process.ended.pipe(
+      Effect.catch((ended) => (ended._tag === "AppServerExited"
+        ? Effect.logWarning(`app-server exited code=${ended.code} signal=${ended.signal}`)
+        : Effect.logError(`app-server spawn failed: ${ended.message}`)
+      ).pipe(Effect.andThen(Deferred.fail(connection.gone, ended)))),
+      Effect.forkScoped,
+    );
+    const init = yield* call(Effect.succeed(connection), "initialize", {
       clientInfo: {
         name: "alasio_telegram",
         title: "Alasio Telegram",
@@ -120,118 +218,39 @@ export class AppServerRpcClient {
       capabilities: {
         experimentalApi: true,
       },
-    }, START_TIMEOUT_MS);
-    this.notify("initialized", null);
-    this.initialized = true;
-    this.log.info(`initialized ms=${elapsedMs(startedAt).toFixed(1)} user_agent=${JSON.stringify(init.userAgent)}`);
-  }
+    }, START_TIMEOUT);
+    const notification: ClientNotification["method"] = "initialized";
+    yield* write(connection, { method: notification, params: null });
+    const elapsedMs = Number((yield* Clock.currentTimeNanos) - startedAt) / 1_000_000;
+    yield* Effect.logInfo(`initialized ms=${elapsedMs.toFixed(1)} user_agent=${JSON.stringify(init.userAgent)}`);
+    return Option.some(connection);
+  });
 
-  stop(): void {
-    if (this.process) {
-      this.process.stop();
-      this.process = null;
-    }
-    this.initialized = false;
-    this.failPending(new Error("Codex app-server stopped"));
-  }
+  const stop = ScopedRef.set(current, Effect.succeedNone);
 
-  private handleExit(code: number | null, signal: NodeJS.Signals | null) {
-    this.log.warn(`app-server exited code=${code} signal=${signal}`);
-    this.failPending(new Error(`Codex app-server exited code=${code} signal=${signal}`));
-    this.initialized = false;
-    this.process = null;
-  }
+  return {
+    start: (scope) => starting.withPermit(Effect.gen(function*() {
+      if (Option.isSome(running(yield* ScopedRef.get(current)))) {
+        return;
+      }
+      // The app-server that is gone is let go of before the next starts.
+      yield* stop;
+      yield* ScopedRef.set(current, connect(scope));
+    })).pipe(withLogScope("codex-app-server")),
 
-  private handleSpawnError(error: Error) {
-    this.log.error(`app-server spawn failed: ${error instanceof Error ? error.message : String(error)}`);
-    this.failPending(error);
-    this.initialized = false;
-    this.process = null;
-  }
+    request: (method, params, timeout = REQUEST_TIMEOUT) =>
+      call(
+        Effect.flatMap(ScopedRef.get(current), (connection) => Effect.fromOption(running(connection)).pipe(Effect.mapError(() => new AppServerNotRunning()))),
+        method,
+        params,
+        timeout,
+      ),
 
-  private failPending(error: Error) {
-    for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
-      entry.reject(error);
-    }
-    this.pending.clear();
-    this.onFailure(error);
-  }
+    stop,
 
-  handleLine(line: string): void {
-    if (!line.trim()) {
-      return;
-    }
-    // The app-server writes JSON-RPC messages, one per line.
-    let message: IncomingMessage;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      this.log.warn(`Ignoring non-JSON app-server line: ${line.slice(0, 200)}`);
-      return;
-    }
-    if (message.id != null && this.pending.has(message.id)) {
-      this.resolvePending(message.id, message);
-      return;
-    }
-    if (message.id != null && message.method) {
-      // A message with an id and a method is a request of the app-server's, in its protocol.
-      this.respondToServerRequest(message as ServerRequest);
-      return;
-    }
-    if (message.method) {
-      // A message with a method and no id is a notification, in the app-server's protocol.
-      this.onNotification(message as AppServerNotification);
-    }
-  }
-
-  private resolvePending(id: RequestId, message: IncomingMessage) {
-    // handleLine resolves only an id it has pending.
-    const entry = this.pending.get(id)!;
-    this.pending.delete(id);
-    clearTimeout(entry.timer);
-    if (message.error) {
-      entry.reject(new Error(message.error.message ?? JSON.stringify(message.error)));
-    } else {
-      entry.resolve(message.result);
-    }
-  }
-
-  private respondToServerRequest(message: ServerRequest) {
-    const result = serverRequestResponse(message.method);
-    this.write({ id: message.id, result });
-  }
-
-  private write(payload: OutgoingMessage) {
-    if (!this.process?.child?.stdin) {
-      throw new Error("Codex app-server is not running");
-    }
-    this.process.child.stdin.write(`${JSON.stringify(payload)}\n`);
-  }
-
-  /**
-   * A request, as a client span named by its method. The request carries the span's
-   * trace context, so what the app-server does for it joins alasio's trace.
-   */
-  request<M extends AppServerMethod>(method: M, params: AppServerParams<M>, timeoutMs = REQUEST_TIMEOUT_MS): Promise<AppServerResult<M>> {
-    return rpcCall({ system: "jsonrpc", service: "codex", method }, (span) => {
-      const id = this.nextId;
-      this.nextId += 1;
-      span.setAttribute("rpc.jsonrpc.request_id", String(id));
-      const trace = traceCarrier();
-      this.write({ id, method, params, ...(trace ? { trace } : {}) });
-      return new Promise<AppServerResult<M>>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.pending.delete(id);
-          reject(new Error(`Codex app-server request timed out: ${method}`));
-        }, timeoutMs);
-        // The app-server answers a request with its method's result.
-        this.pending.set(id, { resolve: (result) => resolve(result as AppServerResult<M>), reject, timer });
-      });
-    });
-  }
-
-  notify(method: ClientNotification["method"], params: null): void {
-    this.write({ method, params });
-  }
-}
+    whenGone: Effect.map(ScopedRef.get(current), (connection) => Option.match(running(connection), {
+      onNone: () => Effect.never,
+      onSome: ({ gone }) => Deferred.await(gone),
+    })),
+  };
+});

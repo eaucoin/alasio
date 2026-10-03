@@ -12,7 +12,6 @@ import { DataPointType, type MetricData, MetricReader } from "@opentelemetry/sdk
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
-import type { RequestId } from "../.types/codex/index.js";
 import type { Harness } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
@@ -46,7 +45,8 @@ const { claudeTelemetryEnv } = await import("../src/harness/claude/telemetry.ts"
 const { buildClaudeEnv } = await import("../src/harness/claude/env.ts");
 const { buildCodexEnv } = await import("../src/codex/env.ts");
 const { codexTelemetryArgs, codexTelemetryEnv } = await import("../src/codex/app-server/telemetry.ts");
-const { AppServerRpcClient } = await import("../src/codex/app-server/rpc-client.ts");
+const { makeAppServerRpc } = await import("../src/codex/app-server/rpc-client.ts");
+const { appServerProcess } = await import("./support/app-server-process.ts");
 const { hostBaymaManifest } = await import("../src/mcp/bayma.ts");
 const { TurnController } = await import("../src/codex/turn-controller.ts");
 const { createHarnessRegistry } = await import("../src/harness/index.ts");
@@ -245,37 +245,17 @@ test("Bot API calls are client spans that never carry the bot token", async () =
   assert.equal(duration?.value.count, 1);
 });
 
-/** A request the client wrote to the app-server, as far as this test reads it. */
-interface WrittenRequest {
-  readonly id: RequestId;
-  readonly trace?: { readonly traceparent: string };
-}
-
 test("Codex app-server requests carry their span's trace context", async () => {
-  const written: WrittenRequest[] = [];
-  const client = new AppServerRpcClient({ log: createLogger("test"), onNotification: () => undefined, onFailure: () => undefined });
-  client.process = {
-    child: {
-      killed: false,
-      stdin: {
-        write: (line: string) => {
-          written.push(JSON.parse(line));
-          return true;
-        },
-      },
-    },
-    stop: () => undefined,
-  };
-  const result = await inSpan("test.codex", {}, async () => {
-    const pending = client.request("thread/start", { cwd: "/tmp" });
-    const [start] = written;
-    assert.ok(start);
-    client.handleLine(JSON.stringify({ id: start.id, result: { thread: { id: "t-1" } } }));
-    return await pending;
-  });
+  const appServer = appServerProcess();
+  appServer.answer("thread/start", () => ({ thread: { id: "t-1" } }));
+  const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const rpc = yield* makeAppServerRpc({ spawn: appServer.spawn, onNotification: () => Effect.void });
+    yield* rpc.start({ cwd: "/tmp", env: {} });
+    return yield* rpc.request("thread/start", { cwd: "/tmp" });
+  }).pipe(withAlasioSpan("test.codex"))).pipe(Effect.provide(TracingLayer)));
   assert.deepEqual(result, { thread: { id: "t-1" } });
   const request = finishedSpan("codex/thread/start");
-  const [sent] = written;
+  const sent = appServer.written.find(({ method }) => method === "thread/start");
   assert.ok(sent);
   assert.equal(request.attributes["rpc.system.name"], "jsonrpc");
   assert.equal(request.attributes["rpc.jsonrpc.request_id"], String(sent.id));

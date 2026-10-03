@@ -11,7 +11,6 @@
  * NetworkPolicy that admits only alasio applies to its new pod.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { setTimeout as sleep } from "node:timers/promises";
 
 import type {
   KubernetesObject,
@@ -23,12 +22,12 @@ import type {
   V1PodTemplateSpec,
   V1Secret,
 } from "@kubernetes/client-node";
+import { Clock, Duration, Effect, Fiber, FiberMap, Option, Schedule, Schema, type Scope } from "effect";
+import { FetchHttpClient } from "effect/http";
 
-import { createLogger } from "../shared/log.ts";
-import { inSpan } from "../telemetry/index.ts";
-import { isStatus, type KubeClient } from "./client.ts";
-
-const log = createLogger("sandboxes");
+import { withLogScope } from "../shared/log.ts";
+import { withAlasioSpan } from "../telemetry/index.ts";
+import { hasStatus, type KubeApiError, KubeClient } from "./client.ts";
 
 export const SANDBOX_API_VERSION = "agents.x-k8s.io/v1beta1";
 export const SANDBOX_KIND = "Sandbox";
@@ -100,24 +99,75 @@ export interface BaymaEndpoint {
   readonly headers: Readonly<Record<string, string>>;
 }
 
-/** The Sandboxes of one namespace; see createSandboxes. */
-export interface Sandboxes {
-  readonly namespace: string;
-  ensure(name: string, manifest: () => Sandbox): Promise<BaymaEndpoint>;
-  token(name: string): Promise<string | null>;
-  exists(name: string): Promise<boolean>;
-  suspend(name: string): Promise<void>;
-  remove(name: string): Promise<void>;
+/** A Sandbox did not become ready in time: what its Ready condition last said, if anything. */
+export class SandboxNotReady extends Schema.TaggedError<SandboxNotReady>()("SandboxNotReady", {
+  namespace: Schema.String,
+  name: Schema.String,
+  /** How long it was given, in seconds. */
+  within: Schema.Number,
+  reason: Schema.optional(Schema.String),
+}) {
+  override get message(): string {
+    return `Sandbox ${this.namespace}/${this.name} did not become ready within ${this.within}s${this.reason ? `: ${this.reason}` : ""}`;
+  }
 }
 
-/** What createSandboxes is given. */
+/** A Sandbox was deleted while alasio made it, or while it started. */
+export class SandboxGone extends Schema.TaggedError<SandboxGone>()("SandboxGone", {
+  namespace: Schema.String,
+  name: Schema.String,
+  during: Schema.Literals(["was made", "started"]),
+}) {
+  override get message(): string {
+    return `Sandbox ${this.namespace}/${this.name} was deleted while it ${this.during}`;
+  }
+}
+
+/** A ready Sandbox had no token Secret to reach its bayma with. */
+export class SandboxTokenMissing extends Schema.TaggedError<SandboxTokenMissing>()("SandboxTokenMissing", {
+  namespace: Schema.String,
+  name: Schema.String,
+}) {
+  override get message(): string {
+    return `Sandbox ${this.namespace}/${this.name} has no token Secret`;
+  }
+}
+
+/** bayma in a ready Sandbox did not answer over its Service in time: why it last did not. */
+export class BaymaNotAnswering extends Schema.TaggedError<BaymaNotAnswering>()("BaymaNotAnswering", {
+  url: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `bayma in ${this.url} did not answer: ${this.reason}`;
+  }
+}
+
+/** How bringing a Sandbox's bayma up fails. */
+export type SandboxError = KubeApiError | SandboxNotReady | SandboxGone | SandboxTokenMissing | BaymaNotAnswering;
+
+/** The Sandboxes of one namespace; see makeSandboxes. */
+export interface Sandboxes {
+  readonly namespace: string;
+  /**
+   * Makes sure the Sandbox exists (made from `manifest()` when it does not), runs, and
+   * its bayma answers: the MCP endpoint and the bearer to reach it with. Callers asking
+   * at once share one bring-up.
+   */
+  readonly ensure: (name: string, manifest: () => Sandbox) => Effect.Effect<BaymaEndpoint, SandboxError>;
+  /** The Sandbox's token, or null when it has none. */
+  readonly token: (name: string) => Effect.Effect<string | null, KubeApiError>;
+  readonly exists: (name: string) => Effect.Effect<boolean, KubeApiError>;
+  readonly suspend: (name: string) => Effect.Effect<void, KubeApiError>;
+  readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
+}
+
+/** What makeSandboxes is given: where, bayma's port in every one, and how long and how often to wait for one. */
 export interface SandboxesOptions {
-  readonly kube: Pick<KubeClient, "read" | "create" | "patch" | "remove">;
   readonly namespace: string;
   readonly port: number;
-  readonly fetchImpl?: typeof fetch;
-  readonly readyTimeoutMs?: number;
-  readonly pollMs?: number;
+  readonly readyTimeout?: Duration.Input;
+  readonly poll?: Duration.Input;
 }
 
 /** The container in every Sandbox's pod that runs bayma. */
@@ -132,8 +182,10 @@ export const MANAGED_BY = { "app.kubernetes.io/managed-by": "alasio" };
 export const SANDBOX_LABEL = "alasio.dev/sandbox";
 
 // A first start pulls the image and provisions the volume, so it is given minutes.
-const READY_TIMEOUT_MS = 300_000;
-const POLL_MS = 500;
+const READY_TIMEOUT: Duration.Input = "5 minutes";
+const POLL: Duration.Input = "500 millis";
+/** How long one look at whether bayma answers may take. */
+const ANSWER_TIMEOUT_MS = 5000;
 
 /** The name of a Sandbox's token Secret. */
 export function tokenSecretName(name: string): string {
@@ -142,22 +194,16 @@ export function tokenSecretName(name: string): string {
 
 /**
  * A token that names its Sandbox, `<name>.<random>`, so what presents one can be looked
- * up by it (../sandbox/telemetry-receiver.ts) without a table of tokens.
+ * up by it (../sandbox/names.ts SessionToken) without a table of tokens.
  */
 export function newToken(name: string, random: () => string = () => randomBytes(32).toString("base64url")): string {
   return `${name}.${random()}`;
 }
 
-/** The Sandbox's name in `token`, or null for one that names none. */
-export function tokenSandboxName(token: string): string | null {
-  const dot = typeof token === "string" ? token.indexOf(".") : -1;
-  return dot > 0 ? token.slice(0, dot) : null;
-}
-
 /** Whether `presented` is `expected`, compared in constant time. */
 export function sameToken(presented: string, expected: string): boolean {
-  const a = Buffer.from(String(presented));
-  const b = Buffer.from(String(expected));
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -230,7 +276,7 @@ export function tokenSecretManifest(sandbox: Pick<StoredSandbox, "metadata">, to
 }
 
 function condition(sandbox: SandboxReadiness, type: string): V1Condition | null {
-  return sandbox?.status?.conditions?.find((entry) => entry.type === type) ?? null;
+  return sandbox.status?.conditions?.find((entry) => entry.type === type) ?? null;
 }
 
 /**
@@ -248,151 +294,160 @@ export function sandboxReady(sandbox: SandboxReadiness): boolean {
 }
 
 /**
- * The Sandboxes of one namespace. `kube` is ./client.ts's client; `port` is
- * bayma's in every one; `fetchImpl` reaches bayma to see that it answers.
- *
- * - `ensure(name, manifest)`: makes sure the Sandbox exists (made from `manifest()`
- *   when it does not), runs, and its bayma answers; resolves `{ url, headers }`, the
- *   MCP endpoint and the bearer to reach it with. Callers asking at once share one.
- * - `token(name)`: the Sandbox's token, or null when it has none.
- * - `suspend(name)`, `remove(name)`, `exists(name)`.
+ * The Sandboxes of `namespace`, on the KubeClient, whose bayma serves on `port`; bayma
+ * is reached with FetchHttpClient.Fetch to see that it answers. Bring-ups run in the
+ * scope this is made in, which interrupts any still running as it closes.
  */
-export function createSandboxes({
-  kube,
+export const makeSandboxes = Effect.fnUntraced(function*({
   namespace,
   port,
-  fetchImpl = fetch,
-  readyTimeoutMs = READY_TIMEOUT_MS,
-  pollMs = POLL_MS,
-}: SandboxesOptions): Sandboxes {
-  const ensuring = new Map<string, Promise<BaymaEndpoint>>();
+  readyTimeout = READY_TIMEOUT,
+  poll = POLL,
+}: SandboxesOptions): Effect.fn.Return<Sandboxes, never, KubeClient | Scope.Scope> {
+  const kube = yield* KubeClient;
+  const fetch = yield* FetchHttpClient.Fetch;
+  const ensuring = yield* FiberMap.make<string, BaymaEndpoint, SandboxError>();
+  // A token never changes once its Secret exists, so each is read once.
   const tokens = new Map<string, string>();
 
-  const read = async (name: string): Promise<StoredSandbox | null> => {
-    const object = await kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name);
-    return object && stored(object);
-  };
+  const read = (name: string): Effect.Effect<StoredSandbox | null, KubeApiError> =>
+    kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name).pipe(Effect.map((object) => object && stored(object)));
 
-  async function token(name: string): Promise<string | null> {
+  const token = Effect.fnUntraced(function*(name: string): Effect.fn.Return<string | null, KubeApiError> {
     const known = tokens.get(name);
     if (known !== undefined) return known;
     // A core Secret, as the API server returns one.
-    const secret = (await kube.read("v1", "Secret", namespace, tokenSecretName(name))) as V1Secret | null;
+    const secret = (yield* kube.read("v1", "Secret", namespace, tokenSecretName(name))) as V1Secret | null;
     const encoded = secret?.data?.[TOKEN_KEY];
     const value = encoded ? Buffer.from(encoded, "base64").toString("utf8") : null;
     if (value) tokens.set(name, value);
     return value;
-  }
+  });
 
   /** The Sandbox, made from `manifest()` when it does not exist. */
-  async function readOrCreate(name: string, manifest: () => Sandbox): Promise<StoredSandbox | null> {
-    const existing = await read(name);
+  const readOrCreate = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxGone> {
+    const existing = yield* read(name);
     if (existing) return existing;
-    try {
-      const created = stored(await kube.create(manifest()));
-      log.info(`created Sandbox ${namespace}/${name}`);
-      return created;
-    } catch (error) {
-      if (!isStatus(error, 409)) throw error;
-      return await read(name);
-    }
-  }
+    const created = yield* kube.create(manifest()).pipe(
+      Effect.map(stored),
+      Effect.tap(() => Effect.logInfo(`created Sandbox ${namespace}/${name}`)),
+      // Made meanwhile by another alasio: that one is it.
+      Effect.catchIf(hasStatus(409), () => read(name)),
+    );
+    return created ?? (yield* new SandboxGone({ namespace, name, during: "was made" }));
+  });
 
   /**
    * Makes the Sandbox's token Secret unless it has one. Its pod waits for the Secret,
    * so one made just after the Sandbox, or by a later alasio after a failure between
    * the two, starts it.
    */
-  async function ensureToken(sandbox: StoredSandbox): Promise<void> {
+  const ensureToken = Effect.fnUntraced(function*(sandbox: StoredSandbox): Effect.fn.Return<void, KubeApiError> {
     const name = sandbox.metadata.name;
-    if (await token(name)) return;
+    if (yield* token(name)) return;
     const value = newToken(name);
-    try {
-      await kube.create(tokenSecretManifest(sandbox, value));
-      tokens.set(name, value);
-    } catch (error) {
-      if (!isStatus(error, 409)) throw error;
-    }
-  }
+    yield* kube.create(tokenSecretManifest(sandbox, value)).pipe(
+      Effect.andThen(Effect.sync(() => tokens.set(name, value))),
+      Effect.catchIf(hasStatus(409), () => Effect.void),
+    );
+  });
 
-  /** Waits until bayma in the Sandbox answers over its Service. */
-  async function answering(url: string, headers: Readonly<Record<string, string>>, deadline: number): Promise<void> {
-    let last: unknown = null;
-    while (Date.now() < deadline) {
-      try {
-        // Any response is bayma answering: a GET without a session is refused.
-        const response = await fetchImpl(url, { method: "GET", headers, signal: AbortSignal.timeout(5000) });
-        await response.body?.cancel();
-        if (response.status !== 401) return;
-        last = new Error("bayma refused the Sandbox's token");
-      } catch (error) {
-        last = error;
-      }
-      await sleep(pollMs);
-    }
-    throw new Error(`bayma in ${url} did not answer: ${last instanceof Error ? last.message : "timed out"}`);
-  }
-
-  async function bringUp(name: string, manifest: () => Sandbox): Promise<BaymaEndpoint> {
-    return await inSpan("alasio.sandbox.ensure", { attributes: { "alasio.sandbox.name": name, "k8s.namespace.name": namespace } }, async () => {
-      let sandbox = await readOrCreate(name, manifest);
-      if (!sandbox) throw new Error(`Sandbox ${namespace}/${name} was deleted while it was made`);
-      await ensureToken(sandbox);
-      if (sandbox.spec?.operatingMode === "Suspended") {
-        sandbox = stored(await kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
-        log.info(`resumed Sandbox ${namespace}/${name}`);
-      }
-      const deadline = Date.now() + readyTimeoutMs;
-      while (!sandboxReady(sandbox)) {
-        if (Date.now() > deadline) {
-          const ready = condition(sandbox, "Ready");
-          throw new Error(`Sandbox ${namespace}/${name} did not become ready within ${readyTimeoutMs / 1000}s${ready?.message ? `: ${ready.message}` : ""}`);
-        }
-        await sleep(pollMs);
-        sandbox = await read(name);
-        if (!sandbox) throw new Error(`Sandbox ${namespace}/${name} was deleted while it started`);
-      }
-      const value = await token(name);
-      if (!value) throw new Error(`Sandbox ${namespace}/${name} has no token Secret`);
-      const host = sandbox.status?.serviceFQDN ?? `${name}.${namespace}.svc`;
-      const url = `http://${host}:${port}/mcp`;
-      const headers = { Authorization: `Bearer ${value}` };
-      await answering(url, headers, deadline);
-      return { url, headers };
+  const notReady = (sandbox: StoredSandbox): SandboxNotReady =>
+    new SandboxNotReady({
+      namespace,
+      name: sandbox.metadata.name,
+      within: Duration.toSeconds(readyTimeout),
+      reason: condition(sandbox, "Ready")?.message || undefined,
     });
-  }
+
+  /** The Sandbox once its controller says it is ready, looked at every `poll` for `readyTimeout`. */
+  const awaitReady = (initial: StoredSandbox): Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> => {
+    const name = initial.metadata.name;
+    const check = (sandbox: StoredSandbox): Effect.Effect<StoredSandbox, SandboxNotReady> =>
+      sandboxReady(sandbox) ? Effect.succeed(sandbox) : Effect.fail(notReady(sandbox));
+    const again: Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> = Effect.sleep(poll).pipe(
+      Effect.andThen(read(name)),
+      Effect.flatMap((sandbox): Effect.Effect<StoredSandbox, SandboxNotReady | SandboxGone> =>
+        sandbox ? check(sandbox) : Effect.fail(new SandboxGone({ namespace, name, during: "started" }))
+      ),
+    );
+    return check(initial).pipe(
+      Effect.catchTag("SandboxNotReady", () =>
+        again.pipe(Effect.retry({ schedule: Schedule.during(readyTimeout), while: (error) => error._tag === "SandboxNotReady" }))),
+    );
+  };
+
+  /** Waits, for up to `remaining`, until bayma in the Sandbox answers over its Service. */
+  const awaitAnswer = (url: string, headers: Readonly<Record<string, string>>, remaining: Duration.Duration): Effect.Effect<void, BaymaNotAnswering> => {
+    if (!Duration.isGreaterThan(remaining, Duration.zero)) return Effect.fail(new BaymaNotAnswering({ url, reason: "timed out" }));
+    const answered = Effect.tryPromise({
+      try: async (signal) => {
+        const response = await fetch(url, { method: "GET", headers, signal: AbortSignal.any([signal, AbortSignal.timeout(ANSWER_TIMEOUT_MS)]) });
+        await response.body?.cancel();
+        return response.status;
+      },
+      catch: (cause) => new BaymaNotAnswering({ url, reason: cause instanceof Error ? cause.message : String(cause) }),
+    }).pipe(
+      // Any response is bayma answering: a GET without a session is refused.
+      Effect.filterOrFail((status) => status !== 401, () => new BaymaNotAnswering({ url, reason: "bayma refused the Sandbox's token" })),
+    );
+    return answered.pipe(Effect.retry(Schedule.max([Schedule.spaced(poll), Schedule.during(remaining)])), Effect.asVoid);
+  };
+
+  const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
+    let sandbox = yield* readOrCreate(name, manifest);
+    yield* ensureToken(sandbox);
+    if (sandbox.spec?.operatingMode === "Suspended") {
+      sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
+      yield* Effect.logInfo(`resumed Sandbox ${namespace}/${name}`);
+    }
+    // Readiness and bayma's answer share one deadline.
+    const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(readyTimeout);
+    sandbox = yield* awaitReady(sandbox);
+    const value = yield* token(name);
+    if (!value) return yield* new SandboxTokenMissing({ namespace, name });
+    const host = sandbox.status?.serviceFQDN ?? `${name}.${namespace}.svc`;
+    const url = `http://${host}:${port}/mcp`;
+    const headers = { Authorization: `Bearer ${value}` };
+    yield* awaitAnswer(url, headers, Duration.millis(deadline - (yield* Clock.currentTimeMillis)));
+    return { url, headers };
+  });
 
   return {
     namespace,
 
-    ensure(name, manifest) {
-      let pending = ensuring.get(name);
-      if (!pending) {
-        pending = bringUp(name, manifest).finally(() => ensuring.delete(name));
-        ensuring.set(name, pending);
-      }
-      return pending;
-    },
+    ensure: (name, manifest) =>
+      Effect.suspend(() =>
+        Option.match(FiberMap.getUnsafe(ensuring, name), {
+          onSome: Effect.succeed,
+          onNone: () =>
+            FiberMap.run(
+              ensuring,
+              name,
+              bringUp(name, manifest).pipe(
+                withAlasioSpan("alasio.sandbox.ensure", { attributes: { "alasio.sandbox.name": name, "k8s.namespace.name": namespace } }),
+                withLogScope("sandboxes"),
+              ),
+            ),
+        })
+      ).pipe(Effect.flatMap(Fiber.join)),
 
     token,
 
-    async exists(name) {
-      return (await read(name)) !== null;
-    },
+    exists: (name) => read(name).pipe(Effect.map((sandbox) => sandbox !== null)),
 
-    async suspend(name) {
-      try {
-        await kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } });
-        log.info(`suspended Sandbox ${namespace}/${name}`);
-      } catch (error) {
-        if (!isStatus(error, 404)) throw error;
-      }
-    },
+    suspend: (name) =>
+      kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
+        Effect.andThen(Effect.logInfo(`suspended Sandbox ${namespace}/${name}`)),
+        Effect.catchIf(hasStatus(404), () => Effect.void),
+        withLogScope("sandboxes"),
+      ),
 
-    async remove(name) {
-      tokens.delete(name);
-      await kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name);
-      log.info(`deleted Sandbox ${namespace}/${name}`);
-    },
+    remove: (name) =>
+      Effect.sync(() => tokens.delete(name)).pipe(
+        Effect.andThen(kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name)),
+        Effect.andThen(Effect.logInfo(`deleted Sandbox ${namespace}/${name}`)),
+        withLogScope("sandboxes"),
+      ),
   };
-}
+});

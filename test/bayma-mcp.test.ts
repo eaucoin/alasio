@@ -1,22 +1,29 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { Context, Effect, Layer } from "effect";
+import { FetchHttpClient } from "effect/http";
+
 import { buildCodexThreadConfig, codexMcpServer } from "../src/codex/thread-config.ts";
 import { claudeMcpServers } from "../src/harness/claude/mcp.ts";
-import type { HostProfile, SessionsProfile } from "../src/kube/config.ts";
-import { type BaymaMcpServer, createHostBayma, hostBaymaManifest, hostBaymaName, hostBaymaStateDir } from "../src/mcp/bayma.ts";
+import { KubeClient } from "../src/kube/client.ts";
+import type { HostProfile } from "../src/kube/config.ts";
+import {
+  type BaymaMcpServer,
+  folderBaymaFacade,
+  HostBayma,
+  hostBaymaManifest,
+  hostBaymaName,
+  hostBaymaStateDir,
+  noFolderBayma,
+} from "../src/mcp/bayma.ts";
+import { effectRunner } from "../src/shared/effects.ts";
 
 const host: HostProfile = {
   namespace: "alasio-host",
   port: 7290,
   stateRoot: "/home/op/.alasio/bayma",
   podTemplate: { spec: { containers: [{ name: "bayma", image: "bayma@sha256:1", args: ["mcp-http", "--port", "7290"] }] } },
-};
-const sessions: SessionsProfile = {
-  namespace: "alasio-sessions",
-  port: 7290,
-  workspaceDir: "/workspace",
-  podTemplate: { spec: { containers: [{ name: "bayma" }] } },
 };
 const BAYMA: BaymaMcpServer = { type: "http", url: "http://bayma-1.alasio-host.svc.cluster.local:7290/mcp", headers: { Authorization: "Bearer bayma-1.t" } };
 
@@ -47,8 +54,39 @@ test("each harness and conversation gets its own bayma and state directory", () 
   assert.equal(hostBaymaStateDir(host, "claude", "../x"), "/home/op/.alasio/bayma/claude/x");
 });
 
-test("a deployment without the host profile offers no folder bayma", () => {
-  assert.equal(createHostBayma({ templates: { sessions, host: null } }), null);
+test("a deployment without the host profile offers no folder bayma", async () => {
+  const folderBayma = folderBaymaFacade(effectRunner(Context.empty()));
+  assert.equal(folderBayma, noFolderBayma);
+  await assert.rejects(folderBayma({ harness: "claude", threadKey: "telegram:42" }), /this deployment offers no folder workspaces: its templates have no host profile/u);
+});
+
+test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Code's shape", async () => {
+  const made: string[] = [];
+  const kube = KubeClient.of({
+    read: () => Effect.succeed(null),
+    create: (object) =>
+      Effect.sync(() => {
+        made.push(`${object.kind}/${object.metadata?.name}`);
+        // Made as asked, ready at once, as agent-sandbox would have it by the next look.
+        return { ...object, metadata: { ...object.metadata, uid: "u1" }, status: { conditions: [{ type: "Ready", status: "True" }] } };
+      }),
+    replace: () => Effect.die("alasio replaces no object"),
+    patch: () => Effect.die("nothing is patched"),
+    remove: () => Effect.die("nothing is removed"),
+    exec: () => Effect.die("nothing is run"),
+  });
+  const layer = HostBayma.layer(host, {}).pipe(
+    Layer.provide(Layer.succeed(KubeClient, kube)),
+    Layer.provide(Layer.succeed(FetchHttpClient.Fetch, async () => new Response(null, { status: 400 }))),
+  );
+  const server = await Effect.runPromise(Effect.scoped(Layer.build(layer).pipe(
+    Effect.flatMap((services) => Effect.promise(() => folderBaymaFacade(effectRunner(services))({ harness: "claude", threadKey: "telegram:42" }))),
+  )));
+  const name = hostBaymaName("claude", "telegram:42");
+  assert.deepEqual(made, [`Sandbox/${name}`, `Secret/${name}-bayma-token`]);
+  assert.equal(server.type, "http");
+  assert.equal(server.url, `http://${name}.alasio-host.svc:7290/mcp`);
+  assert.match(server.headers["Authorization"] ?? "", new RegExp(`^Bearer ${name}\\.`, "u"));
 });
 
 test("alasio adds bayma to Claude Code's servers, in its shape", () => {

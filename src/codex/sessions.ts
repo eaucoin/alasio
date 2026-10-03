@@ -5,17 +5,16 @@
  * a turn. alasio reads and writes none of Codex's files for them.
  */
 import type { v2 } from "../../.types/codex/index.js";
+import { Effect } from "effect";
+
 import type { HarnessSessions } from "../harness/index.ts";
-import { createLogger } from "../shared/log.ts";
+import type { EffectRunner } from "../shared/effects.ts";
+import { withLogScope } from "../shared/log.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
 import { dateLabel, sessionLabel } from "../shared/session-labels.ts";
-import { type AppServerClient, codexAppServerClient } from "./app-server/client.ts";
+import type { AppServer } from "./app-server/client.ts";
 import { type CodexEnv, buildCodexEnv } from "./env.ts";
-import { type ForkCodexSessionParams, forkCodexSession } from "./runtime.ts";
-
-const log = createLogger("codex-sessions");
-
-const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+import type { CodexScopeError, CodexSessionError } from "./runtime.ts";
 
 type AgentMessage = Extract<v2.ThreadItem, { type: "agentMessage" }>;
 type TextInput = Extract<v2.UserInput, { type: "text" }>;
@@ -41,93 +40,53 @@ function answerOf(turn: v2.Turn): string {
 export interface CodexListingScope {
   readonly cwd: string;
   readonly codexEnv: CodexEnv;
-  readonly client: AppServerClient;
+  readonly appServer: AppServer;
 }
 
-/** What the session panels read of a listing scope: its directory and env, and its client's thread and turn lists. */
-export interface SessionListingScope extends Omit<CodexListingScope, "client"> {
-  readonly client: Pick<AppServerClient, "listThreads" | "listTurns">;
+/** What the session panels read of a listing scope: its directory and env, and its app-server's thread and turn lists. */
+export interface SessionListingScope extends Omit<CodexListingScope, "appServer"> {
+  readonly appServer: Pick<AppServer, "listThreads" | "listTurns">;
 }
 
-/**
- * The app-server and directory a folder workspace's threads are listed from: the shared
- * app-server, in the folder itself.
- */
-export function folderListingScope(workingDirectory: string): () => Promise<CodexListingScope> {
-  return async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client: codexAppServerClient });
+/** A thread forked before one of its turns, for the conversation `threadKey`: the new thread's id. */
+export type ForkSession = (params: { readonly sessionId: string; readonly beforeTurnId: string; readonly threadKey: string }) => Effect.Effect<string, CodexSessionError>;
+
+/** The listing scope of a folder workspace: the operator's app-server, in the folder itself. */
+export function folderListingScope(workingDirectory: string, appServer: AppServer): Effect.Effect<CodexListingScope> {
+  return Effect.sync(() => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), appServer }));
 }
 
 export interface CodexSessionApiOptions {
-  readonly workingDirectory: string;
-  readonly listingScope?: () => Promise<SessionListingScope>;
-  readonly fork?: (params: ForkCodexSessionParams) => Promise<string>;
-  readonly beforeFork?: (sessionId: string) => Promise<void>;
+  /** The app-server and directory the threads are listed from (`{ cwd, codexEnv, appServer }`). */
+  readonly listingScope: Effect.Effect<SessionListingScope, CodexScopeError>;
+  /** Makes a rewind's thread. */
+  readonly fork: ForkSession;
+  /** Runs first with the thread forked from, for the rollout store to write back any file of it missing here. */
+  readonly beforeFork?: ((sessionId: string) => Effect.Effect<void>) | undefined;
+  /** What runs the panels' effects for their promise interface. */
+  readonly effects: EffectRunner<never>;
 }
 
 /**
- * `listingScope()` gives the app-server and directory the threads are listed from
- * (`{ cwd, codexEnv, client }`), and `fork` makes a rewind's thread; both default to
- * a folder workspace's, and a session filesystem's harness passes its own. `beforeFork`
- * runs first with the thread forked from, for the rollout store to write back any file
- * of it missing here.
+ * The session panels' view of the threads `listingScope` lists, which a folder workspace's
+ * harness and a session filesystem's each give: listings, previews, rewind points, and
+ * rewind, as promises run by `effects`.
  */
-export function createCodexSessionApi({
-  workingDirectory,
-  listingScope = folderListingScope(workingDirectory),
-  fork = forkCodexSession,
-  beforeFork = async () => {},
-}: CodexSessionApiOptions): HarnessSessions {
-  async function listAll() {
-    const { cwd, codexEnv, client } = await listingScope();
-    return await client.listThreads({ env: codexEnv, cwd });
-  }
+export function createCodexSessionApi({ listingScope, fork, beforeFork, effects }: CodexSessionApiOptions): HarnessSessions {
+  const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => effects.runPromise(effect.pipe(withLogScope("codex-sessions")));
+
+  const listAll = Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listThreads({ env: codexEnv, cwd }));
 
   /** A thread's turns, newest first; none for a thread Codex cannot read. */
-  async function turnsOf(sessionId: string) {
-    try {
-      const { cwd, codexEnv, client } = await listingScope();
-      return await client.listTurns({ threadId: sessionId, env: codexEnv, cwd });
-    } catch (error) {
-      log.warn(`could not list the turns of ${sessionId}: ${errorText(error)}`);
-      return [];
-    }
-  }
+  const turnsOf = (sessionId: string): Effect.Effect<v2.Turn[]> =>
+    Effect.flatMap(listingScope, ({ cwd, codexEnv, appServer }) => appServer.listTurns({ threadId: sessionId, env: codexEnv, cwd })).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not list the turns of ${sessionId}: ${error.message}`).pipe(Effect.as([]))),
+    );
 
-  return {
-    async listSessions(page = 1) {
-      const all = await listAll();
-      const startIdx = (page - 1) * SESSIONS_PER_PAGE;
-      return all.slice(startIdx, startIdx + SESSIONS_PER_PAGE).map((thread) => ({
-        uuid: thread.id,
-        timestamp: dateLabel(thread.updatedAt * 1000),
-        label: sessionLabel(thread.name || thread.preview || thread.id),
-      }));
-    },
-
-    async getTotalSessionPages() {
-      const all = await listAll();
-      return Math.ceil(all.length / SESSIONS_PER_PAGE) || 1;
-    },
-
-    async getSessionByNumber(num) {
-      const all = await listAll();
-      return all[num - 1]?.id ?? null;
-    },
-
-    async getSessionLastMessage(sessionId) {
-      for (const turn of await turnsOf(sessionId)) {
-        const answer = answerOf(turn);
-        if (answer) {
-          return answer;
-        }
-      }
-      return null;
-    },
-
-    /** The operator's prompts, newest first, each a point to rewind to: its uuid is its turn's id. */
-    async listSessionMessages(sessionId) {
-      const turns = await turnsOf(sessionId);
-      return turns
+  /** The operator's prompts, newest first, each a point to rewind to: its uuid is its turn's id. */
+  const sessionMessages = (sessionId: string) =>
+    Effect.map(turnsOf(sessionId), (turns) =>
+      turns
         .map((turn) => ({ turn, text: promptOf(turn) }))
         .filter(({ text }) => text)
         .map(({ turn, text }, index) => ({
@@ -135,23 +94,38 @@ export function createCodexSessionApi({
           timestamp: turn.startedAt ? new Date(turn.startedAt * 1000).toISOString() : "",
           text,
           uuid: turn.id,
-        }));
-    },
+        })));
 
-    async getTotalRewindPages(sessionId) {
-      const messages = await this.listSessionMessages(sessionId);
-      return Math.ceil(messages.length / SESSIONS_PER_PAGE) || 1;
-    },
+  return {
+    listSessions: (page = 1) =>
+      run(Effect.map(listAll, (all) => {
+        const startIdx = (page - 1) * SESSIONS_PER_PAGE;
+        return all.slice(startIdx, startIdx + SESSIONS_PER_PAGE).map((thread) => ({
+          uuid: thread.id,
+          timestamp: dateLabel(thread.updatedAt * 1000),
+          label: sessionLabel(thread.name || thread.preview || thread.id),
+        }));
+      })),
+
+    getTotalSessionPages: () => run(Effect.map(listAll, (all) => Math.ceil(all.length / SESSIONS_PER_PAGE) || 1)),
+
+    getSessionByNumber: (num) => run(Effect.map(listAll, (all) => all[num - 1]?.id ?? null)),
+
+    getSessionLastMessage: (sessionId) =>
+      run(Effect.map(turnsOf(sessionId), (turns) => turns.map(answerOf).find((answer) => answer) ?? null)),
+
+    listSessionMessages: (sessionId) => run(sessionMessages(sessionId)),
+
+    getTotalRewindPages: (sessionId) =>
+      run(Effect.map(sessionMessages(sessionId), (messages) => Math.ceil(messages.length / SESSIONS_PER_PAGE) || 1)),
 
     /** A new thread holding the session's history before the turn `beforeUuid`, for the conversation `threadKey`. */
-    async createForkedSession(sessionId, beforeUuid, { threadKey }) {
-      try {
-        await beforeFork(sessionId);
-        return await fork({ sessionId, beforeTurnId: beforeUuid, threadKey, workingDirectory });
-      } catch (error) {
-        log.warn(`could not fork ${sessionId} before turn ${beforeUuid}: ${errorText(error)}`);
-        return null;
-      }
-    },
+    createForkedSession: (sessionId, beforeUuid, { threadKey }) =>
+      run(Effect.gen(function*() {
+        if (beforeFork) yield* beforeFork(sessionId);
+        return yield* fork({ sessionId, beforeTurnId: beforeUuid, threadKey });
+      }).pipe(
+        Effect.catch((error) => Effect.logWarning(`could not fork ${sessionId} before turn ${beforeUuid}: ${error.message}`).pipe(Effect.as(null))),
+      )),
   };
 }

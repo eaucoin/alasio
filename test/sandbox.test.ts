@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import type { AppServerProcessOptions } from "../src/codex/app-server/process.ts";
+import { ConfigProvider, Effect, Exit, Layer, Scope } from "effect";
+
+import { type AppServerProcessOptions, AppServerSpawnFailed } from "../src/codex/app-server/process.ts";
 import type { LoginRelay } from "../src/codex/login-relay.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import type { SessionsProfile } from "../src/kube/config.ts";
@@ -12,12 +14,13 @@ import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { SESSION_FS_INSTRUCTIONS } from "../src/harness/workspace-instructions.ts";
 import {
-  createSessionFsCodex,
+  makeSessionFsCodex,
   SESSION_FS_ENVIRONMENTS_TOML,
   sessionFsCodexConfigToml,
   sessionFsThreadConfig,
 } from "../src/codex/sessionfs.ts";
-import { createSandbox } from "../src/sandbox/index.ts";
+import { KubeClient } from "../src/kube/client.ts";
+import { SessionSandboxes } from "../src/sandbox/index.ts";
 import { assertValidVolumeId, isValidVolumeId, newVolumeId } from "../src/sandbox/names.ts";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../src/workspace/kind.ts";
 
@@ -109,22 +112,28 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
   const relays: FakeRelay[] = [];
   const spawned: AppServerProcessOptions[] = [];
   process.env["OPENAI_API_KEY_FOR_THIS_TEST"] = "operator-secret";
+  const running = Effect.runSync(Scope.make());
   try {
-    const codex = createSessionFsCodex({
+    const codex = await Effect.runPromise(makeSessionFsCodex({
       home,
       authFile: "/operator/.codex/auth.json",
-      startRelay: async ({ authFile }) => {
-        const relay: FakeRelay = { authFile, url: "http://127.0.0.1:41000/v1", bearer: "relay-bearer", closed: false, close: async () => { relay.closed = true; } };
-        relays.push(relay);
-        return relay;
-      },
-      spawnProcess: (options) => { spawned.push(options); throw new Error("not spawned in this test"); },
-    });
-    const scope = await codex.scope({ directory: "/state/sessionfs/workspaces/fs-abc123", bayma: BAYMA });
-    const listing = await codex.listingScope({ directory: "/state/sessionfs/workspaces/fs-abc123" });
+      startRelay: ({ authFile }) => Effect.acquireRelease(
+        Effect.sync(() => {
+          const relay: FakeRelay = { authFile, url: "http://127.0.0.1:41000/v1", bearer: "relay-bearer", closed: false };
+          relays.push(relay);
+          return relay;
+        }),
+        (relay) => Effect.sync(() => { relay.closed = true; }),
+      ),
+      spawnProcess: (options) => Effect.sync(() => spawned.push(options)).pipe(
+        Effect.andThen(Effect.fail(new AppServerSpawnFailed({ cause: new Error("not spawned in this test") }))),
+      ),
+    }).pipe(Scope.provide(running)));
+    const scope = await Effect.runPromise(codex.scope({ directory: "/state/sessionfs/workspaces/fs-abc123", bayma: BAYMA }));
+    const listing = await Effect.runPromise(codex.listingScope({ directory: "/state/sessionfs/workspaces/fs-abc123" }));
     assert.equal(relays.length, 1); // one relay and app-server for every workspace
     assert.equal(relays[0]?.authFile, "/operator/.codex/auth.json");
-    assert.equal(scope.client, listing.client);
+    assert.equal(scope.appServer, listing.appServer);
     assert.equal(scope.cwd, "/state/sessionfs/workspaces/fs-abc123");
     assert.deepEqual(scope.codexConfig, sessionFsThreadConfig(BAYMA));
     // A listing scope's type has no config; this pins that it carries none.
@@ -137,26 +146,34 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
     assert.equal(readFileSync(join(home, "environments.toml"), "utf8"), SESSION_FS_ENVIRONMENTS_TOML);
 
     // The app-server process runs in the home, not in the directory of whichever workspace asked first.
-    await assert.rejects(scope.client.listModels({ env: scope.codexEnv, cwd: scope.cwd }), /not spawned in this test/);
+    await assert.rejects(Effect.runPromise(scope.appServer.listModels({ env: scope.codexEnv, cwd: scope.cwd })), /not spawned in this test/);
     assert.equal(spawned[0]?.cwd, home);
 
-    await codex.stop();
+    await Effect.runPromise(Scope.close(running, Exit.void));
     assert.equal(relays[0]?.closed, true);
   } finally {
+    await Effect.runPromise(Scope.close(running, Exit.void));
     delete process.env["OPENAI_API_KEY_FOR_THIS_TEST"];
   }
 });
 
-test("a session's harness directory is its own, under the state directory, outside the sandbox", () => {
+test("a session's harness directory is its own, under the state directory, outside the sandbox", async () => {
   const stateDir = tempDir();
   const profile: SessionsProfile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
   // A session's harness directory is alasio's own; Kubernetes is never reached for it.
-  const unreachable = () => assert.fail("the harness directory reached Kubernetes");
-  const kube = { read: unreachable, create: unreachable, patch: unreachable, remove: unreachable, exec: unreachable };
-  const sandbox = createSandbox({ templates: { sessions: profile, host: null }, stateDir, env: {}, kube });
-  assert.ok(sandbox, "the deployment renders the sessions template");
-  const directory = sandbox.harnessDirectory("fs-abc123");
-  assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
-  assert.ok(existsSync(directory));
-  assert.throws(() => sandbox.harnessDirectory("../escape"), /invalid session volume id/);
+  const unreachable = () => Effect.die("the harness directory reached Kubernetes");
+  const kube = Layer.succeed(KubeClient, KubeClient.of({ read: unreachable, create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable }));
+  const layer = SessionSandboxes.layer({ profile, stateDir, env: {} }).pipe(
+    Layer.provide(kube),
+    Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+  );
+  await Effect.runPromise(SessionSandboxes.pipe(
+    Effect.map((sessions) => {
+      const directory = sessions.harnessDirectory("fs-abc123");
+      assert.equal(directory, join(stateDir, "sessionfs", "workspaces", "fs-abc123"));
+      assert.ok(existsSync(directory));
+      assert.throws(() => sessions.harnessDirectory("../escape"), /invalid session volume id/);
+    }),
+    Effect.provide(layer),
+  ));
 });

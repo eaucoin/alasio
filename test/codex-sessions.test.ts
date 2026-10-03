@@ -13,16 +13,18 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
 
-import { Effect, Exit, Scope } from "effect";
+import { Context, Effect, Exit, Logger, Scope, Stream } from "effect";
 import pg from "pg";
 
-import { AppServerClient } from "../src/codex/app-server/client.ts";
+import { type AppServer, makeAppServer } from "../src/codex/app-server/client.ts";
+import { AppServerRequestFailed } from "../src/codex/app-server/rpc-client.ts";
 import { buildCodexEnv } from "../src/codex/env.ts";
 import { listRolloutFiles } from "../src/codex/rollouts/files.ts";
 import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
+import { effectRunner } from "../src/shared/effects.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
 import { type TestPostgres, dockerAvailable, startPostgres } from "./support/postgres.ts";
@@ -44,6 +46,9 @@ interface ResponsesStandIn {
   readonly requests: readonly string[];
   close(): Promise<void>;
 }
+
+/** What runs the session panels' effects, their log lines dropped. */
+const effects = effectRunner(Context.make(Logger.CurrentLoggers, new Set()));
 
 /** No config beyond what alasio itself sets on a thread. */
 const NO_CONFIG: CodexThreadConfig = { developer_instructions: "", mcp_servers: {} };
@@ -113,18 +118,22 @@ test("sessions are labelled by name, else first prompt; turns without a prompt a
       ...(answer ? [agentMessage(`${id}-answer`, answer)] : []),
     ],
   });
-  const client: SessionListingScope["client"] = {
-    listThreads: async () => [
+  const appServer: SessionListingScope["appServer"] = {
+    listThreads: () => Effect.succeed([
       codexThread("named", { name: "Named   thread", preview: "ignored", updatedAt: 1_790_000_000 }),
       codexThread("prompted", { name: null, preview: "a first prompt that is well over forty characters long", updatedAt: 0 }),
       codexThread("empty-thread-id", { name: null, preview: "", updatedAt: 1_790_000_000 }),
-    ],
-    listTurns: async ({ threadId }) => {
-      if (threadId === "gone") throw new Error("thread not found");
-      return [turn("t3", null, "continued on its own"), turn("t2", "second", null), turn("t1", "first", "answered")];
-    },
+    ]),
+    listTurns: ({ threadId }) =>
+      threadId === "gone"
+        ? Effect.fail(new AppServerRequestFailed({ error: { message: "thread not found" } }))
+        : Effect.succeed([turn("t3", null, "continued on its own"), turn("t2", "second", null), turn("t1", "first", "answered")]),
   };
-  const sessions = createCodexSessionApi({ workingDirectory: "/work", listingScope: async () => ({ cwd: "/work", codexEnv: {}, client }) });
+  const sessions = createCodexSessionApi({
+    listingScope: Effect.succeed({ cwd: "/work", codexEnv: {}, appServer }),
+    fork: () => Effect.sync(() => assert.fail("nothing is forked")),
+    effects,
+  });
   assert.deepEqual(await sessions.listSessions(1), [
     { uuid: "named", timestamp: "2026-09-21", label: "Named thread" },
     { uuid: "prompted", timestamp: "-", label: "a first prompt that is well over fort..." },
@@ -144,7 +153,8 @@ describe("Codex sessions through the app-server", { skip }, () => {
   let responses: ResponsesStandIn | undefined;
   let database: TestPostgres | undefined;
   let pool: pg.Pool | undefined;
-  let appServer: AppServerClient | undefined;
+  /** The scope the app-server runs in, as alasio runs it. */
+  let running: Scope.Closeable | undefined;
   /** The scope the rollouts are kept in, as alasio keeps them while it runs. */
   let mirroring: Scope.Closeable | undefined;
   const savedCodexHome = process.env["CODEX_HOME"];
@@ -158,7 +168,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
 
   after(async () => {
     if (mirroring) await Effect.runPromise(Scope.close(mirroring, Exit.void));
-    appServer?.stop();
+    if (running) await Effect.runPromise(Scope.close(running, Exit.void));
     await pool?.end();
     await database?.stop();
     await responses?.close();
@@ -168,11 +178,12 @@ describe("Codex sessions through the app-server", { skip }, () => {
   });
 
   /** One turn on a thread of conversation-1, the conversation every thread here is for, run to its end. */
-  async function runTurn(client: AppServerClient, threadId: string, prompt: string, cwd: string): Promise<void> {
-    const turnId = await client.startTurn({ threadId, threadKey: "conversation-1", prompt, cwd, env: buildCodexEnv(), config: NO_CONFIG });
-    for await (const event of client.eventsForTurn(threadId, turnId)) {
-      if (event.type === "turn.failed") throw new Error(event.error.message);
-    }
+  async function runTurn(client: AppServer, threadId: string, prompt: string, cwd: string): Promise<void> {
+    await effects.runPromise(Effect.gen(function*() {
+      const turnId = yield* client.startTurn({ threadId, threadKey: "conversation-1", prompt, cwd, env: buildCodexEnv(), config: NO_CONFIG });
+      yield* Stream.runForEach(client.eventsForTurn(threadId, turnId), (event) =>
+        event.type === "turn.failed" ? Effect.sync(() => assert.fail(event.error.message)) : Effect.void);
+    }));
   }
 
   test("sessions list, rewind forks, and a lost thread comes back whole from the store", async () => {
@@ -181,16 +192,16 @@ describe("Codex sessions through the app-server", { skip }, () => {
     mkdirSync(workingDirectory);
     const home = makeCodexHome(root, "codex-home", responses.url);
     process.env["CODEX_HOME"] = home;
-    const client = new AppServerClient();
-    appServer = client;
+    running = Effect.runSync(Scope.make());
+    const client = await effects.runPromise(makeAppServer().pipe(Scope.provide(running)));
     const forks: string[] = [];
     const sessions = createCodexSessionApi({
-      workingDirectory,
-      listingScope: async () => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), client }),
-      fork: async ({ sessionId, beforeTurnId, threadKey }) => {
+      listingScope: Effect.sync(() => ({ cwd: workingDirectory, codexEnv: buildCodexEnv(), appServer: client })),
+      fork: ({ sessionId, beforeTurnId, threadKey }) => {
         forks.push(threadKey);
-        return await client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
+        return client.forkThread({ threadId: sessionId, beforeTurnId, threadKey, cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
       },
+      effects,
     });
 
     // Mirrored from the start, as alasio does.
@@ -208,7 +219,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
       return files.length > 0;
     };
 
-    const threadId = await client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
+    const threadId = await effects.runPromise(client.startThread({ threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
     for (const prompt of ["remember the heron", "and now the crane"]) {
       await runTurn(client, threadId, prompt, workingDirectory);
       // What Codex wrote by the turn's end is all in the store once a flush returns.
@@ -250,7 +261,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
     await Effect.runPromise(Scope.close(scope, Exit.void));
 
     // Lose everything: the files, and every index Codex made from them.
-    client.stop();
+    await effects.runPromise(client.stop);
     const newHome = makeCodexHome(root, "new-codex-home", responses.url);
     process.env["CODEX_HOME"] = newHome;
     const written = await Effect.runPromise(restoreRollouts({ store, threadIds: [forkedId], home: newHome }));
@@ -264,7 +275,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
     // Codex resumes the fork again, and its next turn carries the first
     // turn's history and not the rewound one. The client starts a new
     // app-server, on the new Codex home, as it does after any stop.
-    await client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG });
+    await effects.runPromise(client.ensureThread({ threadId: forkedId, threadKey: "conversation-1", cwd: workingDirectory, env: buildCodexEnv(), config: NO_CONFIG }));
     await runTurn(client, forkedId, "which bird?", workingDirectory);
     const lastRequest = responses.requests.at(-1) ?? "";
     assert.match(lastRequest, /remember the heron/);

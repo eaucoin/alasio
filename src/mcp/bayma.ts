@@ -14,9 +14,12 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
-import { createKubeClient, type KubeClient } from "../kube/client.ts";
-import { type HostProfile, type KubeTemplates, loadKubeTemplates } from "../kube/config.ts";
-import { type BaymaEndpoint, createSandboxes, type Sandbox, sandboxManifest } from "../kube/sandboxes.ts";
+import { Context, Effect, Layer, Option } from "effect";
+
+import type { KubeClient } from "../kube/client.ts";
+import type { HostProfile } from "../kube/config.ts";
+import { type BaymaEndpoint, makeSandboxes, type Sandbox, type SandboxError, sandboxManifest } from "../kube/sandboxes.ts";
+import type { EffectRunner } from "../shared/effects.ts";
 import { conversationTelemetryEnv } from "../telemetry/index.ts";
 
 export const BAYMA_SERVER_NAME = "bayma";
@@ -35,24 +38,6 @@ export interface HostBaymaScope {
 /** What hostBaymaManifest is given. */
 export interface HostBaymaManifestOptions extends HostBaymaScope {
   readonly profile: HostProfile;
-  readonly env?: Readonly<NodeJS.ProcessEnv>;
-}
-
-/** What createHostBayma is given. */
-export interface HostBaymaOptions {
-  readonly templates: KubeTemplates | null;
-  readonly kube?: KubeClient | null;
-  readonly env?: Readonly<NodeJS.ProcessEnv>;
-  readonly fetchImpl?: typeof fetch;
-}
-
-/** The folder workspaces' bayma; see createHostBayma. */
-export interface HostBayma {
-  ensure(scope: HostBaymaScope): Promise<BaymaEndpoint>;
-}
-
-/** What folderBaymaServer is given. */
-export interface FolderBaymaOptions extends HostBaymaScope {
   readonly env?: Readonly<NodeJS.ProcessEnv>;
 }
 
@@ -107,30 +92,46 @@ export function hostBaymaManifest({ harness, threadKey, profile, env = process.e
 }
 
 /**
- * The folder workspaces' bayma, or null when the deployment renders no `host` template.
- * `ensure({ harness, threadKey })` resolves `{ url, headers }` once that conversation's
- * bayma answers.
+ * The folder workspaces' bayma, on the KubeClient, for a deployment that renders the
+ * `host` template (../kube/config.ts); without one there is no such service, and no
+ * folder workspace has a bayma. `env` is alasio's own, whose telemetry settings the
+ * harnesses' environments leave out.
  */
-export function createHostBayma({ templates, kube = null, env = process.env, fetchImpl = fetch }: HostBaymaOptions): HostBayma | null {
-  const profile = templates?.host;
-  if (!profile) return null;
-  const sandboxes = createSandboxes({ kube: kube ?? createKubeClient(), namespace: profile.namespace, port: profile.port, fetchImpl });
-  return {
-    async ensure({ harness, threadKey }) {
-      return await sandboxes.ensure(hostBaymaName(harness, threadKey), () => hostBaymaManifest({ harness, threadKey, profile, env }));
-    },
-  };
+export class HostBayma extends Context.Service<HostBayma, {
+  /** The bayma MCP server of one conversation under one harness, once it answers. */
+  readonly ensure: (scope: HostBaymaScope) => Effect.Effect<BaymaMcpServer, SandboxError>;
+}>()("alasio/mcp/HostBayma") {
+  static readonly layer = (profile: HostProfile, env: Readonly<NodeJS.ProcessEnv> = process.env): Layer.Layer<HostBayma, never, KubeClient> =>
+    Layer.effect(
+      HostBayma,
+      Effect.gen(function*() {
+        const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
+        return HostBayma.of({
+          ensure: ({ harness, threadKey }) =>
+            sandboxes.ensure(hostBaymaName(harness, threadKey), () => hostBaymaManifest({ harness, threadKey, profile, env })).pipe(
+              Effect.map((endpoint) => ({ type: "http", ...endpoint })),
+            ),
+        });
+      }),
+    );
 }
-
-let hostBayma: HostBayma | null = null;
 
 /**
  * The bayma MCP server a folder workspace's conversation gets under `harness`, once it
- * answers: `{ type: "http", url, headers }`, in Claude Code's MCP config shape. `env`
- * is alasio's own, whose telemetry settings the harnesses' environments leave out.
+ * answers: `{ type: "http", url, headers }`, in Claude Code's MCP config shape. The
+ * harnesses, not yet written in Effect, are given it as a promise (folderBaymaFacade).
  */
-export async function folderBaymaServer({ harness, threadKey, env = process.env }: FolderBaymaOptions): Promise<BaymaMcpServer> {
-  hostBayma ??= createHostBayma({ templates: loadKubeTemplates(env), env });
-  if (!hostBayma) throw new Error("this deployment offers no folder workspaces: its templates have no host profile");
-  return { type: "http", ...(await hostBayma.ensure({ harness, threadKey })) };
+export type FolderBayma = (scope: HostBaymaScope) => Promise<BaymaMcpServer>;
+
+/** The folder bayma of a deployment that offers no folder workspaces. */
+export const noFolderBayma: FolderBayma = async () => {
+  throw new Error("this deployment offers no folder workspaces: its templates have no host profile");
+};
+
+/** The promise façade of the HostBayma `effects` runs in, or noFolderBayma where the deployment has none. It goes when its last caller moves. */
+export function folderBaymaFacade(effects: EffectRunner<never>): FolderBayma {
+  return Option.match(effects.runSync(Effect.serviceOption(HostBayma)), {
+    onNone: () => noFolderBayma,
+    onSome: (hostBayma) => (scope) => effects.runPromise(hostBayma.ensure(scope)),
+  });
 }

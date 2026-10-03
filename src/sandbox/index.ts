@@ -23,26 +23,29 @@ import { lookup } from "node:dns/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { createKubeClient, type KubeClient } from "../kube/client.ts";
-import type { KubeTemplates, SessionsProfile } from "../kube/config.ts";
+import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schema } from "effect";
+
+import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
+import type { SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
   type BaymaEndpoint,
-  createSandboxes,
+  makeSandboxes,
+  SANDBOX_API_VERSION,
+  SANDBOX_KIND,
   type Sandbox,
+  type SandboxError,
   sameToken,
   sandboxManifest,
-  tokenSandboxName,
   tokenSecretName,
 } from "../kube/sandboxes.ts";
-import { createLogger } from "../shared/log.ts";
+import type { EffectRunner } from "../shared/effects.ts";
+import { withLogScope } from "../shared/log.ts";
 import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
-import { assertValidVolumeId, isValidVolumeId } from "./names.ts";
+import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
-import { startTelemetryReceiver, type TelemetryReceiver, type TelemetryReceiverOptions } from "./telemetry-receiver.ts";
-
-const log = createLogger("sandbox");
+import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
 /** A session's internet: none, or the internet's public addresses. */
 export type NetMode = "none" | "full";
@@ -66,29 +69,31 @@ export type FileRead =
   | { readonly bytes: Buffer; readonly note?: never }
   | { readonly note: string; readonly bytes?: never };
 
-/** What createSandbox is given; see there. */
-export interface SandboxOptions {
-  readonly templates: KubeTemplates | null;
-  readonly stateDir: string;
-  readonly env?: Readonly<NodeJS.ProcessEnv>;
-  readonly kube?: Pick<KubeClient, "read" | "create" | "patch" | "remove" | "exec"> | null;
-  readonly createForwarder?: (env: Readonly<NodeJS.ProcessEnv>) => Promise<OtlpForwarder>;
-  readonly startReceiver?: (options: TelemetryReceiverOptions) => Promise<TelemetryReceiver>;
-  readonly resolve?: (hostname: string) => Promise<LookupAddress>;
-  readonly fetchImpl?: typeof fetch;
+/** Sessions' telemetry could not be received: its forwarder or its receiver did not start, or the receiver's address is unknown. */
+export class SessionTelemetryUnavailable extends Schema.TaggedError<SessionTelemetryUnavailable>()("SessionTelemetryUnavailable", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
 }
 
-/** The session-filesystem subsystem; see createSandbox. */
-export interface SessionFilesystems {
-  readonly enabled: true;
-  readonly volumes: {
-    create(volumeId: string, netMode?: NetMode): Promise<{ volumeId: string; netMode: NetMode }>;
-    destroy(volumeId: string): Promise<void>;
-  };
-  harnessDirectory(volumeId: string): string;
-  ensureSession(volumeId: string): Promise<{ bayma: BaymaEndpoint }>;
-  readFile(volumeId: string, path: string, maxBytes: number): Promise<FileRead>;
-  close(): Promise<void>;
+/** Reading a file in a session came to neither its bytes nor a reason it has none. */
+export class SessionFileError extends Schema.TaggedError<SessionFileError>()("SessionFileError", {
+  message: Schema.String,
+}) {}
+
+/** How making a session's Sandbox and reaching its bayma fails. */
+export type SessionError = SandboxError | SessionTelemetryUnavailable;
+
+/** What SessionSandboxes is made with; see there. */
+export interface SessionSandboxesOptions {
+  readonly profile: SessionsProfile;
+  readonly stateDir: string;
+  /** The standard OpenTelemetry variables alasio exports its own telemetry with. */
+  readonly env?: Readonly<NodeJS.ProcessEnv>;
+  readonly createForwarder?: (env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void) => Promise<OtlpForwarder>;
+  readonly resolve?: (hostname: string) => Promise<LookupAddress>;
 }
 
 export const NET_MODE_LABEL = "alasio.dev/net-mode";
@@ -96,6 +101,10 @@ export const WORKLOAD_LABEL = "alasio.dev/workload";
 const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
 // The token's environment variable in bayma's container, which the OTLP headers expand.
 const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";
+
+/** Where sessions' telemetry is received: the receiver's Service, when sessions export any, and its port. */
+const ReceiverService = Config.String("ALASIO_TELEMETRY_RECEIVER_SERVICE").pipe(Config.map((service) => service.trim()), Config.withDefault(""));
+const ReceiverPort = Config.Port("ALASIO_TELEMETRY_RECEIVER_PORT").pipe(Config.withDefault(4318));
 
 /**
  * The egress gate's program: exits once three connections in a row to the API server
@@ -159,157 +168,196 @@ export function sessionSandboxManifest({ volumeId, netMode, profile, telemetry }
   });
 }
 
-/** The address sessions export telemetry to: alasio's receiver Service, by IP, since "none" has no DNS. */
-async function receiverEndpoint(service: string, port: number, resolve: (hostname: string) => Promise<LookupAddress> = lookup): Promise<string> {
-  const { address } = await resolve(service);
-  return `http://${address}:${port}`;
-}
-
 /** The forwarder sessions' telemetry is exported through, loaded only once it is needed. */
-async function loadForwarder(env: Readonly<NodeJS.ProcessEnv>): Promise<OtlpForwarder> {
+async function loadForwarder(env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void): Promise<OtlpForwarder> {
   const { createOtlpForwarder } = await import("../telemetry/forward.ts");
-  return createOtlpForwarder(env, { warn: (message) => log.warn(message) });
+  return createOtlpForwarder(env, { warn });
 }
 
 /**
- * The session-filesystem subsystem, or null when the deployment renders no `sessions`
- * template (../kube/config.ts), and callers then offer only folders. `stateDir` is
- * alasio's state directory, under which each session's harness directory lives. `env`
- * holds the standard OpenTelemetry variables and `ALASIO_TELEMETRY_RECEIVER_SERVICE` and
- * `_PORT`, where sessions' telemetry is received when alasio exports any.
+ * Session filesystems, on the KubeClient, for a deployment that renders the `sessions`
+ * template (../kube/config.ts); without one there is no such service, and callers offer
+ * only folders. `stateDir` is alasio's state directory, under which each session's
+ * harness directory lives. Sessions' telemetry is received, while the service lasts,
+ * when alasio exports any (`env`'s standard OpenTelemetry variables) and
+ * `ALASIO_TELEMETRY_RECEIVER_SERVICE` (and `_PORT`) say where.
  */
-export function createSandbox({
-  templates,
+export class SessionSandboxes extends Context.Service<SessionSandboxes, {
+  readonly volumes: {
+    /** A new session's Sandbox, made now so its volume is ready by its first turn. */
+    readonly create: (volumeId: string, netMode?: NetMode) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError>;
+    readonly destroy: (volumeId: string) => Effect.Effect<void, KubeApiError>;
+  };
+  /**
+   * The directory in alasio a session's harness runs in: empty, the session's own, and
+   * none of the workspace's, which is only in the session. Its path keys the harness's
+   * sessions to the workspace (Claude Code's project, Codex's thread list). Made as it
+   * is asked for; synchronous, as making a directory is.
+   */
+  readonly harnessDirectory: (volumeId: string) => string;
+  /**
+   * Makes sure the session's Sandbox runs and bayma answers in it, resuming one that
+   * was suspended; one that is gone is made again, empty, with no internet.
+   */
+  readonly ensureSession: (volumeId: string) => Effect.Effect<{ readonly bayma: BaymaEndpoint }, SessionError>;
+  /**
+   * A file from the session as its agent sees it: read by the agent's own user in its
+   * container, relative to the workspace, so its path and symlinks reach only the
+   * session's files. `{ bytes }`, or `{ note }` saying why not.
+   */
+  readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, KubeApiError | KubeExecError | SessionFileError>;
+}>()("alasio/sandbox/SessionSandboxes") {
+  static readonly layer = (options: SessionSandboxesOptions): Layer.Layer<SessionSandboxes, Config.ConfigError, KubeClient> =>
+    Layer.effect(SessionSandboxes, makeSessionSandboxes(options));
+}
+
+const makeSessionSandboxes = Effect.fnUntraced(function*({
+  profile,
   stateDir,
   env = process.env,
-  kube = null,
   createForwarder = loadForwarder,
-  startReceiver = startTelemetryReceiver,
   resolve = lookup,
-  fetchImpl = fetch,
-}: SandboxOptions): SessionFilesystems | null {
-  const profile = templates?.sessions;
-  if (!profile) return null;
-  kube ??= createKubeClient();
-  const sandboxes = createSandboxes({ kube, namespace: profile.namespace, port: profile.port, fetchImpl });
+}: SessionSandboxesOptions) {
+  const kube = yield* KubeClient;
+  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);
-  const receiverPort = Number(env["ALASIO_TELEMETRY_RECEIVER_PORT"] || 4318);
-  const receiverService = env["ALASIO_TELEMETRY_RECEIVER_SERVICE"]?.trim();
+  const receiverPort = yield* ReceiverPort;
+  const receiverService = yield* ReceiverService;
   const exportsTelemetry = Object.keys(telemetryEnv).length > 0 && Boolean(receiverService);
   if (Object.keys(telemetryEnv).length > 0 && !receiverService) {
-    log.warn("sessions' telemetry is not received: ALASIO_TELEMETRY_RECEIVER_SERVICE is not set");
+    yield* Effect.logWarning("sessions' telemetry is not received: ALASIO_TELEMETRY_RECEIVER_SERVICE is not set");
   }
+  // The forwarder's warnings, which it gives as it is made, logged here.
+  const runFork = yield* FiberSet.makeRuntime();
+  const warn = (message: string): void => {
+    runFork(Effect.logWarning(message).pipe(withLogScope("sandbox")));
+  };
 
-  // The receiver, and the forwarder it exports through, once started.
-  let receiving: Promise<{ forwarder: OtlpForwarder; receiver: TelemetryReceiver }> | null = null;
-  function receive() {
-    receiving ??= (async () => {
-      const forwarder = await createForwarder(env);
-      const receiver = await startReceiver({
+  /**
+   * The receiver, and the forwarder it exports through, started once they are first
+   * needed and kept until the service stops; a start that fails is tried again by the
+   * next session that needs them. Sessions keep running past alasio, and their exporters
+   * retry what they could not send meanwhile.
+   */
+  const receiving = yield* RcRef.make({
+    acquire: Effect.gen(function*() {
+      const forwarder = yield* Effect.acquireRelease(
+        Effect.tryPromise({ try: () => createForwarder(env, warn), catch: (cause) => new SessionTelemetryUnavailable({ cause }) }),
+        (forwarder) => Effect.sync(() => forwarder.close()),
+      );
+      yield* serveTelemetryReceiver({
         port: receiverPort,
         forwarder,
         stampFor: (volumeId) => sandboxResource(volumeId, env),
-        async authenticate(token) {
-          const name = tokenSandboxName(token);
-          if (!isValidVolumeId(name)) return null;
-          const expected = await sandboxes.token(name).catch(() => null);
-          return expected && sameToken(token, expected) ? name : null;
-        },
-      });
-      return { forwarder, receiver };
-    })().catch((error: unknown) => {
-      receiving = null;
-      throw error;
-    });
-    return receiving;
-  }
+        authenticate: (token) =>
+          Option.match(Schema.decodeUnknownOption(SessionToken)(token), {
+            onNone: () => Effect.succeed(null),
+            onSome: ([volumeId]) =>
+              sandboxes.token(volumeId).pipe(
+                Effect.map((expected) => (expected && sameToken(token, expected) ? volumeId : null)),
+                Effect.orElseSucceed(() => null),
+              ),
+          }),
+      }).pipe(Effect.mapError((cause) => new SessionTelemetryUnavailable({ cause })));
+    }),
+    idleTimeToLive: Duration.infinity,
+  });
+  const receive = Effect.scoped(RcRef.get(receiving));
 
   // Sessions that outlived the last alasio export as soon as this one is up.
   if (exportsTelemetry) {
-    receive().catch((error: unknown) => log.warn(`cannot receive sessions' telemetry: ${error instanceof Error ? error.message : String(error)}`));
+    yield* receive.pipe(
+      Effect.catchTag("SessionTelemetryUnavailable", (error) => Effect.logWarning(`cannot receive sessions' telemetry: ${error.message}`)),
+      Effect.forkScoped,
+    );
   }
 
-  async function telemetry(): Promise<SessionTelemetry | null> {
-    if (!receiverService || !exportsTelemetry) return null;
-    await receive();
-    return { endpoint: await receiverEndpoint(receiverService, receiverPort, resolve), env: telemetryEnv };
-  }
-
-  const manifest = async (volumeId: string, netMode: NetMode) =>
-    sessionSandboxManifest({ volumeId, netMode, profile, telemetry: await telemetry() });
+  /** Where a session's bayma exports, by IP since "none" has no DNS; null when alasio exports nothing. */
+  const telemetry: Effect.Effect<SessionTelemetry | null, SessionTelemetryUnavailable> = exportsTelemetry
+    ? receive.pipe(
+      Effect.andThen(Effect.tryPromise({ try: () => resolve(receiverService), catch: (cause) => new SessionTelemetryUnavailable({ cause }) })),
+      Effect.map(({ address }) => ({ endpoint: `http://${address}:${receiverPort}`, env: telemetryEnv })),
+    )
+    : Effect.succeed(null);
 
   /** Makes the Sandbox, with what it is made from resolved first. */
-  async function ensure(volumeId: string, netMode: NetMode) {
-    const made = await manifest(volumeId, netMode);
-    return await sandboxes.ensure(volumeId, () => made);
-  }
+  const ensure = (volumeId: string, netMode: NetMode): Effect.Effect<BaymaEndpoint, SessionError> =>
+    telemetry.pipe(
+      Effect.map((telemetry) => sessionSandboxManifest({ volumeId, netMode, profile, telemetry })),
+      Effect.flatMap((made) => sandboxes.ensure(volumeId, () => made)),
+    );
 
-  return {
-    enabled: true,
+  const readFile = Effect.fnUntraced(function*(volumeId: string, path: string, maxBytes: number): Effect.fn.Return<FileRead, KubeApiError | KubeExecError | SessionFileError> {
+    // A Sandbox, as the API server returns one.
+    const sandbox = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(volumeId))) as Sandbox | null;
+    if (!sandbox || sandbox.spec?.operatingMode === "Suspended") return { note: "the session is not running" };
+    const script = 'cd "$3" || exit 3; f="$1"; [ -f "$f" ] || exit 3; s=$(stat -L -c %s -- "$f") || exit 3; [ "$s" -le "$2" ] || { printf %s "$s" >&2; exit 4; }; exec cat -- "$f"';
+    const { exitCode, stdout, stderr } = yield* kube.exec(
+      profile.namespace,
+      volumeId,
+      BAYMA_CONTAINER,
+      ["sh", "-c", script, "sh", path, String(maxBytes), profile.workspaceDir],
+      { maxBytes: maxBytes + 1 },
+    );
+    if (exitCode === 0) return { bytes: stdout };
+    if (exitCode === 3) return { note: "file not found" };
+    if (exitCode === 4) return { note: overLimitNote(Number(stderr.trim()), maxBytes) };
+    return yield* new SessionFileError({ message: `reading ${path} in session ${volumeId} failed (exit ${exitCode}): ${stderr.trim()}` });
+  });
 
+  return SessionSandboxes.of({
     volumes: {
-      /** A new session's Sandbox, made now so its volume is ready by its first turn. */
-      async create(volumeId, netMode: NetMode = "none") {
-        await ensure(volumeId, netMode);
-        log.info(`created session ${volumeId} (${netMode} internet)`);
-        return { volumeId, netMode };
-      },
-      async destroy(volumeId) {
-        await sandboxes.remove(assertValidVolumeId(volumeId));
-      },
+      create: (volumeId, netMode = "none") =>
+        Effect.suspend(() => ensure(volumeId, netMode)).pipe(
+          Effect.andThen(Effect.logInfo(`created session ${volumeId} (${netMode} internet)`)),
+          Effect.as({ volumeId, netMode }),
+          withLogScope("sandbox"),
+        ),
+      destroy: (volumeId) => Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))),
     },
 
-    /**
-     * The directory in alasio a session's harness runs in: empty, the session's own, and
-     * none of the workspace's, which is only in the session. Its path keys the harness's
-     * sessions to the workspace (Claude Code's project, Codex's thread list).
-     */
-    harnessDirectory(volumeId) {
+    harnessDirectory: (volumeId) => {
       const directory = join(stateDir, "sessionfs", "workspaces", assertValidVolumeId(volumeId));
       mkdirSync(directory, { recursive: true });
       return directory;
     },
 
-    /**
-     * Makes sure the session's Sandbox runs and bayma answers in it, resuming one that
-     * was suspended; one that is gone is made again, empty, with no internet.
-     */
-    async ensureSession(volumeId) {
-      return { bayma: await ensure(assertValidVolumeId(volumeId), "none") };
-    },
+    ensureSession: (volumeId) =>
+      Effect.suspend(() => ensure(assertValidVolumeId(volumeId), "none")).pipe(Effect.map((bayma) => ({ bayma }))),
 
-    /**
-     * A file from the session as its agent sees it: read by the agent's own user in its
-     * container, relative to the workspace, so its path and symlinks reach only the
-     * session's files. `{ bytes }`, or `{ note }` saying why not.
-     */
-    async readFile(volumeId, path, maxBytes) {
-      // A Sandbox, as the API server returns one.
-      const sandbox = (await kube.read("agents.x-k8s.io/v1beta1", "Sandbox", profile.namespace, assertValidVolumeId(volumeId))) as Sandbox | null;
-      if (!sandbox || sandbox.spec?.operatingMode === "Suspended") return { note: "the session is not running" };
-      const script = 'cd "$3" || exit 3; f="$1"; [ -f "$f" ] || exit 3; s=$(stat -L -c %s -- "$f") || exit 3; [ "$s" -le "$2" ] || { printf %s "$s" >&2; exit 4; }; exec cat -- "$f"';
-      const { exitCode, stdout, stderr } = await kube.exec(
-        profile.namespace,
-        volumeId,
-        BAYMA_CONTAINER,
-        ["sh", "-c", script, "sh", path, String(maxBytes), profile.workspaceDir],
-        { maxBytes: maxBytes + 1 },
-      );
-      if (exitCode === 0) return { bytes: stdout };
-      if (exitCode === 3) return { note: "file not found" };
-      if (exitCode === 4) return { note: overLimitNote(Number(stderr.trim()), maxBytes) };
-      throw new Error(`reading ${path} in session ${volumeId} failed (exit ${exitCode}): ${stderr.trim()}`);
-    },
+    readFile,
+  });
+}, withLogScope("sandbox"));
 
-    /**
-     * alasio is shutting down: stop receiving. Sessions keep running for the next alasio,
-     * and their exporters retry what they could not send meanwhile.
-     */
-    async close() {
-      const started = await receiving?.catch(() => null);
-      receiving = null;
-      await started?.receiver.close();
-      await started?.forwarder.close();
-    },
+/**
+ * SessionSandboxes as promises, for alasio's code not yet written in Effect (the
+ * harnesses, operator controls, reply media), which reaches it through alasio's
+ * EffectRunner (src/alasio.ts). It goes when its last caller moves.
+ */
+export interface SessionFilesystems {
+  readonly enabled: true;
+  readonly volumes: {
+    create(volumeId: string, netMode?: NetMode): Promise<{ readonly volumeId: string; readonly netMode: NetMode }>;
+    destroy(volumeId: string): Promise<void>;
   };
+  harnessDirectory(volumeId: string): string;
+  ensureSession(volumeId: string): Promise<{ readonly bayma: BaymaEndpoint }>;
+  readFile(volumeId: string, path: string, maxBytes: number): Promise<FileRead>;
+}
+
+/** The promise façade of the SessionSandboxes `effects` runs in, or null where the deployment has none. */
+export function sessionFilesystemsFacade(effects: EffectRunner<never>): SessionFilesystems | null {
+  return Option.match(effects.runSync(Effect.serviceOption(SessionSandboxes)), {
+    onNone: () => null,
+    onSome: (sessions) => ({
+      enabled: true,
+      volumes: {
+        create: (volumeId, netMode) => effects.runPromise(sessions.volumes.create(volumeId, netMode)),
+        destroy: (volumeId) => effects.runPromise(sessions.volumes.destroy(volumeId)),
+      },
+      harnessDirectory: sessions.harnessDirectory,
+      ensureSession: (volumeId) => effects.runPromise(sessions.ensureSession(volumeId)),
+      readFile: (volumeId, path, maxBytes) => effects.runPromise(sessions.readFile(volumeId, path, maxBytes)),
+    }),
+  });
 }

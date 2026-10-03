@@ -1,7 +1,8 @@
-import type { Logger } from "../../shared/log.ts";
+import { type Duration, Effect, PubSub, Queue, type Scope, Semaphore } from "effect";
+
 import { type AppServerNotification, getNotificationTurnId, itemIds, type NotificationIds } from "./protocol.ts";
 
-const TURN_WAIT_TIMEOUT_MS = 5 * 1000;
+const TURN_WAIT_TIMEOUT = "5 seconds";
 
 /** The turn a thread is in, as its notifications and requests name it. */
 interface ThreadTurn {
@@ -10,30 +11,10 @@ interface ThreadTurn {
   completed: boolean;
 }
 
-/** A wait for a thread's next notification. */
-interface NotificationWaiter {
+/** A thread's turn, now known by `turnId`, which a wait for the thread's turn id is told of. */
+interface RememberedTurn {
   readonly threadId: string;
-  readonly resolve: (message: AppServerNotification) => void;
-  readonly reject: (error: Error) => void;
-  cleanup?: () => void;
-}
-
-/** A wait for the id of a thread's turn. */
-interface TurnIdWaiter {
-  readonly threadId: string;
-  readonly resolve: (turnId: string | null) => void;
-  readonly reject: (error: Error) => void;
-  readonly timer: NodeJS.Timeout;
-  cleanup?: () => void;
-}
-
-export interface NotificationQueueOptions {
-  readonly log: Logger;
-}
-
-export interface TurnIdWaitOptions {
-  readonly timeoutMs?: number | undefined;
-  readonly signal?: AbortSignal;
+  readonly turnId: string | null;
 }
 
 export function getNotificationThreadId(message: AppServerNotification): string | null {
@@ -54,110 +35,72 @@ export function getNotificationThreadId(message: AppServerNotification): string 
     ?? null;
 }
 
-function belongsToThread(message: AppServerNotification, threadId: string) {
-  const notificationThreadId = getNotificationThreadId(message);
-  return !notificationThreadId || notificationThreadId === threadId;
+/**
+ * An app-server's notifications, routed to the threads they are about, and the turn each
+ * thread is in as they and alasio's requests name it.
+ */
+export interface AppServerNotifications {
+  /** Takes in a notification: what it says of its thread's turn, and its place in the thread's queue. */
+  readonly observe: (message: AppServerNotification) => Effect.Effect<void>;
+  /** The thread's next notification, waiting for one as long as it takes. */
+  readonly nextForThread: (threadId: string) => Effect.Effect<AppServerNotification>;
+  /** The id of the thread's running turn, once it has one; null if none starts within `timeout`. */
+  readonly waitForTurnId: (threadId: string, timeout?: Duration.Input) => Effect.Effect<string | null>;
+  /** The id of the thread's running turn; undefined when its last turn completed or none is known. */
+  readonly currentTurnId: (threadId: string) => Effect.Effect<string | null | undefined>;
+  /** Every id the thread's current or last turn is known by. */
+  readonly turnAliases: (threadId: string) => Effect.Effect<Set<string>>;
+  /** Starts a new turn of the thread, its ids not yet known. */
+  readonly beginTurn: (threadId: string) => Effect.Effect<void>;
+  /** Adds `turnId` to the ids of the thread's turn, its preferred one if `prefer`; the preferred id after. */
+  readonly rememberTurn: (threadId: string, turnId: string | null | undefined, options?: { readonly prefer?: boolean }) => Effect.Effect<string | null>;
+  readonly forgetTurn: (threadId: string) => Effect.Effect<void>;
+  /** Drops the thread's queued notifications of turns other than `turnId`'s; how many it dropped. */
+  readonly discardStaleForTurn: (threadId: string, turnId: string | null | undefined) => Effect.Effect<number>;
+  /** Forgets every thread's turn and queued notifications. */
+  readonly clear: Effect.Effect<void>;
 }
 
-function interruptionError(signal: AbortSignal) {
-  return new Error(String(signal.reason ?? "Interrupted"));
-}
+/**
+ * Notification routing for one app-server: each thread's notifications in a queue of
+ * its own, taken by whoever follows the thread's turn, and each turn id learned
+ * published to whoever waits for one. A notification that names no thread belongs to
+ * no turn, so no thread's stream would map it to an event: it is not queued.
+ */
+export const makeAppServerNotifications: Effect.Effect<AppServerNotifications, never, Scope.Scope> = Effect.gen(function*() {
+  const turnByThread = new Map<string, ThreadTurn>();
+  let queues = new Map<string, Queue.Queue<AppServerNotification>>();
+  const remembered = yield* Effect.acquireRelease(PubSub.unbounded<RememberedTurn>(), PubSub.shutdown);
+  // A queue is added to, or sorted through, by one fiber at a time, so its order holds.
+  const routing = yield* Semaphore.make(1);
 
-export class AppServerNotificationQueue {
-  private readonly log: Logger;
-  private notifications: AppServerNotification[];
-  waiters: NotificationWaiter[];
-  private turnWaiters: TurnIdWaiter[];
-  private readonly turnByThread: Map<string, ThreadTurn>;
+  const queueOf = Effect.fnUntraced(function*(threadId: string) {
+    const existing = queues.get(threadId);
+    if (existing) return existing;
+    const created = yield* Queue.unbounded<AppServerNotification>();
+    // Made after a wait: another fiber may have made the thread's queue meanwhile.
+    const raced = queues.get(threadId);
+    if (raced) return raced;
+    queues.set(threadId, created);
+    return created;
+  });
 
-  constructor({ log }: NotificationQueueOptions) {
-    this.log = log;
-    this.notifications = [];
-    this.waiters = [];
-    this.turnWaiters = [];
-    this.turnByThread = new Map();
-  }
-
-  clear(): void {
-    this.notifications = [];
-    this.waiters = [];
-    this.turnWaiters = [];
-    this.turnByThread.clear();
-  }
-
-  fail(error: Error): void {
-    for (const waiter of this.waiters) {
-      waiter.cleanup?.();
-      waiter.reject(error);
-    }
-    this.waiters = [];
-    for (const waiter of this.turnWaiters) {
-      clearTimeout(waiter.timer);
-      waiter.cleanup?.();
-      waiter.reject(error);
-    }
-    this.turnWaiters = [];
-  }
-
-  observe(message: AppServerNotification): void {
-    const threadId = getNotificationThreadId(message);
-    if (message.method === "turn/started" && threadId && message.params?.turn?.id) {
-      const turn = this.turnByThread.get(threadId);
-      if (turn?.completed && !turn.ids.has(message.params.turn.id)) {
-        this.beginTurn(threadId);
-      }
-      this.rememberTurn(threadId, message.params.turn.id, { prefer: true });
-    }
-    if (message.method === "thread/goal/updated" && threadId && message.params?.turnId) {
-      const turn = this.turnByThread.get(threadId);
-      if (turn?.completed && !turn.ids.has(message.params.turnId)) {
-        this.beginTurn(threadId);
-      }
-      this.rememberTurn(threadId, message.params.turnId, { prefer: true });
-    }
-    if (message.method === "turn/completed" && threadId) {
-      const completedTurnId = getNotificationTurnId(message);
-      const turn = this.turnByThread.get(threadId);
-      if (!turn && completedTurnId) {
-        this.turnByThread.set(threadId, {
-          preferredId: completedTurnId,
-          ids: new Set([completedTurnId]),
-          completed: true,
-        });
-      } else if (turn && (!completedTurnId || turn.ids.has(completedTurnId))) {
-        turn.completed = true;
-      }
-    }
-    this.notifications.push(message);
-    this.flushWaiters();
-  }
-
-  getCurrentTurnId(threadId: string): string | null | undefined {
-    const turn = this.turnByThread.get(threadId);
+  const currentTurnIdNow = (threadId: string): string | null | undefined => {
+    const turn = turnByThread.get(threadId);
     return turn?.completed ? undefined : turn?.preferredId;
-  }
+  };
 
-  getTurnAliases(threadId: string): Set<string> {
-    return new Set(this.turnByThread.get(threadId)?.ids ?? []);
-  }
+  const turnAliasesNow = (threadId: string): Set<string> => new Set(turnByThread.get(threadId)?.ids ?? []);
 
-  beginTurn(threadId: string): void {
-    this.turnByThread.set(threadId, {
-      preferredId: null,
-      ids: new Set(),
-      completed: false,
-    });
-  }
+  const beginTurnNow = (threadId: string): void => {
+    turnByThread.set(threadId, { preferredId: null, ids: new Set(), completed: false });
+  };
 
-  rememberTurn(threadId: string, turnId: string | null | undefined, { prefer = false }: { readonly prefer?: boolean } = {}): string | null {
+  const rememberTurnNow = (threadId: string, turnId: string | null | undefined, { prefer = false }: { readonly prefer?: boolean } = {}): string | null => {
     if (!turnId) {
       return null;
     }
-    const turn = this.turnByThread.get(threadId) ?? {
-      preferredId: turnId,
-      ids: new Set<string>(),
-      completed: false,
-    };
+    const turn = turnByThread.get(threadId) ?? { preferredId: turnId, ids: new Set<string>(), completed: false };
     turn.ids.add(turnId);
     if (prefer) {
       turn.preferredId = turnId;
@@ -165,121 +108,96 @@ export class AppServerNotificationQueue {
     if (!turn.preferredId) {
       turn.preferredId = turnId;
     }
-    this.turnByThread.set(threadId, turn);
+    turnByThread.set(threadId, turn);
     if (!turn.completed) {
-      this.resolveTurnWaiters(threadId, turn.preferredId);
+      PubSub.publishUnsafe(remembered, { threadId, turnId: turn.preferredId });
     }
     return turn.preferredId;
-  }
+  };
 
-  forgetTurn(threadId: string): void {
-    this.turnByThread.delete(threadId);
-  }
+  /** Whether `message` is of the turn `accepted` names, or of none. */
+  const ofTurn = (message: AppServerNotification, accepted: ReadonlySet<string>) => {
+    const notificationTurnId = getNotificationTurnId(message);
+    return !notificationTurnId || accepted.has(notificationTurnId);
+  };
 
-  discardStaleForTurn(threadId: string, turnId: string | null | undefined): number {
-    if (!turnId) {
-      return 0;
-    }
-    const acceptedTurnIds = this.getTurnAliases(threadId);
-    acceptedTurnIds.add(turnId);
-    const before = this.notifications.length;
-    this.notifications = this.notifications.filter((message) => {
-      if (!belongsToThread(message, threadId)) {
-        return true;
+  return {
+    observe: Effect.fnUntraced(function*(message) {
+      const threadId = getNotificationThreadId(message);
+      if (message.method === "turn/started" && threadId && message.params?.turn?.id) {
+        const turn = turnByThread.get(threadId);
+        if (turn?.completed && !turn.ids.has(message.params.turn.id)) {
+          beginTurnNow(threadId);
+        }
+        rememberTurnNow(threadId, message.params.turn.id, { prefer: true });
       }
-      const notificationTurnId = getNotificationTurnId(message);
-      return !notificationTurnId || acceptedTurnIds.has(notificationTurnId);
-    });
-    const discarded = before - this.notifications.length;
-    if (discarded > 0) {
-      this.log.info(`discarded ${discarded} stale app-server notifications thread=${threadId.slice(0, 8)} turn=${turnId}`);
-    }
-    return discarded;
-  }
-
-  nextForThread(threadId: string, signal?: AbortSignal | undefined): Promise<AppServerNotification> {
-    if (signal?.aborted) {
-      return Promise.reject(interruptionError(signal));
-    }
-    const existingIndex = this.notifications.findIndex((message) => belongsToThread(message, threadId));
-    if (existingIndex >= 0) {
-      // findIndex found it.
-      const [message] = this.notifications.splice(existingIndex, 1);
-      return Promise.resolve(message!);
-    }
-    return new Promise((resolve, reject) => {
-      const waiter: NotificationWaiter = {
-        threadId,
-        resolve,
-        reject,
-      };
-      if (signal) {
-        const onAbort = () => {
-          this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
-          reject(interruptionError(signal));
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-        waiter.cleanup = () => signal.removeEventListener("abort", onAbort);
+      if (message.method === "thread/goal/updated" && threadId && message.params?.turnId) {
+        const turn = turnByThread.get(threadId);
+        if (turn?.completed && !turn.ids.has(message.params.turnId)) {
+          beginTurnNow(threadId);
+        }
+        rememberTurnNow(threadId, message.params.turnId, { prefer: true });
       }
-      this.waiters.push(waiter);
-    });
-  }
-
-  waitForTurnId(threadId: string, { timeoutMs = TURN_WAIT_TIMEOUT_MS, signal }: TurnIdWaitOptions = {}): Promise<string | null> {
-    if (signal?.aborted) {
-      return Promise.reject(interruptionError(signal));
-    }
-    const currentTurnId = this.getCurrentTurnId(threadId);
-    if (currentTurnId) {
-      return Promise.resolve(currentTurnId);
-    }
-    return new Promise((resolve, reject) => {
-      const waiter: TurnIdWaiter = {
-        threadId,
-        resolve,
-        reject,
-        timer: setTimeout(() => {
-          this.turnWaiters = this.turnWaiters.filter((candidate) => candidate !== waiter);
-          waiter.cleanup?.();
-          resolve(null);
-        }, timeoutMs),
-      };
-      if (signal) {
-        const onAbort = () => {
-          clearTimeout(waiter.timer);
-          this.turnWaiters = this.turnWaiters.filter((candidate) => candidate !== waiter);
-          reject(interruptionError(signal));
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-        waiter.cleanup = () => signal.removeEventListener("abort", onAbort);
+      if (message.method === "turn/completed" && threadId) {
+        const completedTurnId = getNotificationTurnId(message);
+        const turn = turnByThread.get(threadId);
+        if (!turn && completedTurnId) {
+          turnByThread.set(threadId, { preferredId: completedTurnId, ids: new Set([completedTurnId]), completed: true });
+        } else if (turn && (!completedTurnId || turn.ids.has(completedTurnId))) {
+          turn.completed = true;
+        }
       }
-      this.turnWaiters.push(waiter);
-    });
-  }
-
-  private resolveTurnWaiters(threadId: string, turnId: string | null): void {
-    for (const waiter of [...this.turnWaiters]) {
-      if (waiter.threadId !== threadId) {
-        continue;
+      if (threadId) {
+        yield* routing.withPermit(Effect.flatMap(queueOf(threadId), (queue) => Queue.offer(queue, message)));
       }
-      this.turnWaiters = this.turnWaiters.filter((candidate) => candidate !== waiter);
-      clearTimeout(waiter.timer);
-      waiter.cleanup?.();
-      waiter.resolve(turnId);
-    }
-  }
+    }),
 
-  private flushWaiters(): void {
-    for (const waiter of [...this.waiters]) {
-      const index = this.notifications.findIndex((message) => belongsToThread(message, waiter.threadId));
-      if (index === -1) {
-        continue;
+    nextForThread: (threadId) => Effect.flatMap(queueOf(threadId), Queue.take),
+
+    waitForTurnId: (threadId, timeout = TURN_WAIT_TIMEOUT) =>
+      Effect.scoped(Effect.gen(function*() {
+        // Subscribed before looking, so a turn remembered in between is not missed.
+        const turns = yield* PubSub.subscribe(remembered);
+        const current = currentTurnIdNow(threadId);
+        if (current) {
+          return current;
+        }
+        while (true) {
+          const turn = yield* PubSub.take(turns);
+          if (turn.threadId === threadId) return turn.turnId;
+        }
+      }).pipe(Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.succeed(null) }))),
+
+    currentTurnId: (threadId) => Effect.sync(() => currentTurnIdNow(threadId)),
+    turnAliases: (threadId) => Effect.sync(() => turnAliasesNow(threadId)),
+    beginTurn: (threadId) => Effect.sync(() => beginTurnNow(threadId)),
+    rememberTurn: (threadId, turnId, options) => Effect.sync(() => rememberTurnNow(threadId, turnId, options)),
+    forgetTurn: (threadId) => Effect.sync(() => void turnByThread.delete(threadId)),
+
+    discardStaleForTurn: Effect.fnUntraced(function*(threadId, turnId) {
+      const queue = queues.get(threadId);
+      if (!turnId || !queue) {
+        return 0;
       }
-      // findIndex found it.
-      const [message] = this.notifications.splice(index, 1);
-      this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
-      waiter.cleanup?.();
-      waiter.resolve(message!);
-    }
-  }
-}
+      const accepted = turnAliasesNow(threadId);
+      accepted.add(turnId);
+      const discarded = yield* routing.withPermit(Effect.gen(function*() {
+        const queued = yield* Queue.clear(queue);
+        const kept = queued.filter((message) => ofTurn(message, accepted));
+        yield* Queue.offerAll(queue, kept);
+        return queued.length - kept.length;
+      }));
+      if (discarded > 0) {
+        yield* Effect.logInfo(`discarded ${discarded} stale app-server notifications thread=${threadId.slice(0, 8)} turn=${turnId}`);
+      }
+      return discarded;
+    }),
+
+    clear: Effect.sync(() => {
+      // A wait on a forgotten queue goes on until the wait for the app-server it was on
+      // (whose stop clears these) ends it.
+      queues = new Map();
+      turnByThread.clear();
+    }),
+  };
+});

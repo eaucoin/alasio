@@ -20,16 +20,20 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+import { Context, Effect, Layer, RcRef, type Scope } from "effect";
+
+import { getCodexTransportMode } from "../config.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../harness/workspace-instructions.ts";
 import type { BaymaEndpoint } from "../kube/sandboxes.ts";
-import { AppServerClient } from "./app-server/client.ts";
-import { type SpawnAppServer, startAppServerProcess } from "./app-server/process.ts";
+import { makeAppServer } from "./app-server/client.ts";
+import { type SpawnAppServer, spawnAppServer } from "./app-server/process.ts";
 import { type CodexEnv, codexHome } from "./env.ts";
-import { type LoginRelay, startLoginRelay } from "./login-relay.ts";
-import type { CodexScope } from "./runtime.ts";
+import { type StartLoginRelay, startLoginRelay } from "./login-relay.ts";
+import { type CodexScope, CodexScopeError } from "./runtime.ts";
 import type { CodexListingScope } from "./sessions.ts";
 import type { CodexThreadConfig } from "./thread-config.ts";
-import { getCodexTransportMode } from "../config.ts";
+import { CodexTransportRefused } from "./transport.ts";
 
 /** The env var the relay's bearer is in, the model provider's `env_key`. */
 const LOGIN_BEARER_ENV = "ALASIO_CODEX_LOGIN";
@@ -71,82 +75,80 @@ export function sessionFsThreadConfig(bayma: BaymaEndpoint): CodexThreadConfig {
 
 export interface SessionFsCodexOptions {
   readonly home: string;
-  readonly authFile?: string;
-  readonly startRelay?: typeof startLoginRelay;
-  readonly spawnProcess?: SpawnAppServer;
+  /** The operator's Codex login; their Codex home's `auth.json` when absent. */
+  readonly authFile?: string | undefined;
+  /** Starts the login relay; ./login-relay.ts's when absent. */
+  readonly startRelay?: StartLoginRelay | undefined;
+  /** Starts the app-server process; the local codex binary's when absent. */
+  readonly spawnProcess?: SpawnAppServer | undefined;
 }
 
-/** The session-filesystem Codex, as createSessionFsCodex returns it. */
-export interface SessionFsCodex {
+/** What a session filesystem's call in `directory` runs against, its workspace reached through `bayma`. */
+export interface SessionFsScopeParams {
+  readonly directory: string;
+  readonly bayma: BaymaEndpoint;
+}
+
+/**
+ * Codex for session-filesystem workspaces, on when the deployment offers them: one
+ * app-server, in a Codex home of alasio's own, for all of them.
+ */
+export class SessionFsCodex extends Context.Service<SessionFsCodex, {
+  /** Its Codex home. */
   readonly home: string;
-  scope(params: { readonly directory: string; readonly bayma: BaymaEndpoint }): Promise<CodexScope>;
-  listingScope(params: { readonly directory: string }): Promise<CodexListingScope>;
-  stop(): Promise<void>;
-}
-
-/** What the first call that needs them starts: the relay, the app-server's env, and its client. */
-interface Started {
-  readonly relay: LoginRelay;
-  readonly env: CodexEnv;
-  readonly client: AppServerClient;
+  /** The scope a call in the workspace reached through `bayma` runs against, in `directory`. */
+  readonly scope: (params: SessionFsScopeParams) => Effect.Effect<CodexScope, CodexScopeError | CodexTransportRefused>;
+  /** The scope a thread list, a model list, or a goal read runs against: no workspace needed. */
+  readonly listingScope: (params: { readonly directory: string }) => Effect.Effect<CodexListingScope, CodexScopeError>;
+  /** Stops its app-server, if one runs; the next call starts another. */
+  readonly stop: Effect.Effect<void>;
+}>()("alasio/codex/SessionFsCodex") {
+  /** The session-filesystem Codex whose home is `home`, stopped with the layer. */
+  static readonly layer = (options: SessionFsCodexOptions): Layer.Layer<SessionFsCodex> => Layer.effect(SessionFsCodex, makeSessionFsCodex(options));
 }
 
 /**
  * The session-filesystem Codex: `home` is its Codex home, `authFile` the operator's
- * login. The app-server and the relay start with the first call that needs them.
- * Returns `{ scope({ directory, bayma }), listingScope({ directory }), stop() }`, where a
- * scope is what ./runtime.ts runs a call against.
+ * login. The relay and the home's files are made by the first call that needs them (and
+ * again by the next, if that fails), and kept until the scope closes; the app-server
+ * runs in the home, not in the directory of whichever workspace asked first.
  */
-export function createSessionFsCodex({
+export const makeSessionFsCodex = Effect.fnUntraced(function*({
   home,
   authFile = join(codexHome(), "auth.json"),
   startRelay = startLoginRelay,
-  spawnProcess = startAppServerProcess,
-}: SessionFsCodexOptions): SessionFsCodex {
+  spawnProcess = spawnAppServer,
+}: SessionFsCodexOptions): Effect.fn.Return<SessionFsCodex["Service"], never, Scope.Scope> {
   // The app-server's HOME too, so nothing of the operator's home (skills under
   // ~/.agents, say) is found through it.
   const homeDir = join(home, "home");
-  let started: Promise<Started> | null = null;
+  const appServer = yield* makeAppServer({ spawn: (options) => spawnProcess({ ...options, cwd: home }) });
+  // The app-server's environment, with the bearer of the relay started for it.
+  const started = yield* RcRef.make({
+    acquire: Effect.gen(function*() {
+      const relay = yield* startRelay({ authFile });
+      yield* Effect.try({
+        try: () => {
+          mkdirSync(homeDir, { recursive: true });
+          writeFileSync(join(home, "config.toml"), sessionFsCodexConfigToml(relay.url));
+          writeFileSync(join(home, "environments.toml"), SESSION_FS_ENVIRONMENTS_TOML);
+        },
+        catch: (cause) => new CodexScopeError({ cause }),
+      });
+      const env: CodexEnv = { PATH: process.env["PATH"] ?? "", HOME: homeDir, CODEX_HOME: home, [LOGIN_BEARER_ENV]: relay.bearer };
+      return env;
+    }).pipe(Effect.catchTag("LoginRelayError", (cause) => Effect.fail(new CodexScopeError({ cause })))),
+    idleTimeToLive: "Infinity",
+  });
+  const start = Effect.scoped(RcRef.get(started));
 
-  function start(): Promise<Started> {
-    started ??= (async () => {
-      const relay = await startRelay({ authFile });
-      mkdirSync(homeDir, { recursive: true });
-      writeFileSync(join(home, "config.toml"), sessionFsCodexConfigToml(relay.url));
-      writeFileSync(join(home, "environments.toml"), SESSION_FS_ENVIRONMENTS_TOML);
-      const env = { PATH: process.env["PATH"] ?? "", HOME: homeDir, CODEX_HOME: home, [LOGIN_BEARER_ENV]: relay.bearer };
-      // The process runs in the home, not in the first workspace directory that asks.
-      const client = new AppServerClient({ spawnProcess: (options) => spawnProcess({ ...options, cwd: home }) });
-      return { relay, env, client };
-    })();
-    started.catch(() => { started = null; });
-    return started;
-  }
-
-  return {
+  return SessionFsCodex.of({
     home,
-
-    /** The scope a call in the workspace reached through `bayma` runs against, in `directory`. */
-    async scope({ directory, bayma }) {
-      if (getCodexTransportMode() === "exec") {
-        throw new Error("session-filesystem workspaces run Codex through its app-server; unset ALASIO_CODEX_TRANSPORT=exec");
-      }
-      const { env, client } = await start();
-      return { cwd: directory, codexEnv: env, codexConfig: sessionFsThreadConfig(bayma), client };
-    },
-
-    /** The scope a thread list, a model list, or a goal read runs against: no workspace needed. */
-    async listingScope({ directory }) {
-      const { env, client } = await start();
-      return { cwd: directory, codexEnv: env, client };
-    },
-
-    async stop() {
-      if (!started) return;
-      const { relay, client } = await started.catch((): Partial<Started> => ({}));
-      started = null;
-      client?.stop();
-      await relay?.close();
-    },
-  };
-}
+    scope: ({ directory, bayma }) =>
+      getCodexTransportMode() === "exec"
+        ? Effect.fail(new CodexTransportRefused({ message: "session-filesystem workspaces run Codex through its app-server; unset ALASIO_CODEX_TRANSPORT=exec" }))
+        : Effect.map(start, (codexEnv) => ({ cwd: directory, codexEnv, codexConfig: sessionFsThreadConfig(bayma), appServer })),
+    listingScope: ({ directory }) => Effect.map(start, (codexEnv) => ({ cwd: directory, codexEnv, appServer })),
+    stop: appServer.stop,
+  });
+});

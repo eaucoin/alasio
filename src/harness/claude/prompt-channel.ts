@@ -1,91 +1,31 @@
 import { randomUUID, type UUID } from "node:crypto";
 
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-
-import type { Logger } from "../../shared/log.ts";
+import { type Cause, Clock, Effect, Queue, Stream } from "effect";
 
 /** The streaming prompt of a Claude Code query: messages pushed in until it is ended. */
 export interface PromptChannel {
-  readonly iterable: AsyncIterable<SDKUserMessage>;
+  /** What Claude Code reads: the messages pushed, then the end. A reader that stops reading ends the channel. */
+  readonly prompts: AsyncIterable<SDKUserMessage>;
   /** Queues a message; false once the channel has ended. */
-  push(value: SDKUserMessage): boolean;
-  end(): void;
-  readonly ended: boolean;
-}
-
-/** What instrumentPromptChannel logs a channel's moves with. */
-export interface PromptChannelLogging {
-  readonly threadKey: string;
-  readonly log: Logger;
+  readonly push: (message: SDKUserMessage) => Effect.Effect<boolean>;
+  /** Ends the channel once what is queued is read; true if this ended it. */
+  readonly end: Effect.Effect<boolean>;
 }
 
 /**
- * Pushable async iterable used as the Claude Agent SDK streaming prompt.
+ * A queue of prompts read as the Claude Agent SDK's streaming prompt.
  *
  * Streaming input keeps the Claude Code process attached for the whole turn so
  * operator guidance can be pushed into the live session; ending the channel
  * after the result message lets the SDK generator complete normally.
  */
-export function createPromptChannel(): PromptChannel {
-  const queue: SDKUserMessage[] = [];
-  const waiters: ((result: IteratorResult<SDKUserMessage, undefined>) => void)[] = [];
-  let ended = false;
-
-  function push(value: SDKUserMessage): boolean {
-    if (ended) {
-      return false;
-    }
-    const waiter = waiters.shift();
-    if (waiter) {
-      waiter({ value, done: false });
-    } else {
-      queue.push(value);
-    }
-    return true;
-  }
-
-  function end(): void {
-    if (ended) {
-      return;
-    }
-    ended = true;
-    for (const waiter of waiters.splice(0)) {
-      waiter({ value: undefined, done: true });
-    }
-  }
-
-  const iterable: AsyncIterable<SDKUserMessage, undefined> = {
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          const queued = queue.shift();
-          if (queued) {
-            return Promise.resolve({ value: queued, done: false });
-          }
-          if (ended) {
-            return Promise.resolve({ value: undefined, done: true });
-          }
-          return new Promise((resolve) => {
-            waiters.push(resolve);
-          });
-        },
-        return() {
-          end();
-          return Promise.resolve({ value: undefined, done: true });
-        },
-      };
-    },
-  };
-
-  return {
-    iterable,
-    push,
-    end,
-    get ended() {
-      return ended;
-    },
-  };
-}
+export const makePromptChannel: Effect.Effect<PromptChannel> = Effect.gen(function*() {
+  const queue = yield* Queue.unbounded<SDKUserMessage, Cause.Done>();
+  const end = Queue.end(queue);
+  const prompts = yield* Stream.fromQueue(queue).pipe(Stream.ensuring(end), Stream.toAsyncIterableEffect);
+  return { prompts, push: (message) => Queue.offer(queue, message), end };
+});
 
 export function buildClaudeUserMessage(text: string, uuid: UUID = randomUUID()): SDKUserMessage {
   return {
@@ -131,6 +71,9 @@ export function resultAnswersPrompt(message: SDKMessage, promptUuids: string | S
   return promptUuidsAnsweredBy(message, promptUuids).length > 0;
 }
 
+/** Now, as a log line gives it. */
+const at = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
+
 /**
  * Wrap a prompt channel so every push and end is logged with a millisecond
  * timestamp.
@@ -143,24 +86,13 @@ export function resultAnswersPrompt(message: SDKMessage, promptUuids: string | S
  * no record on our side of whether the channel moved at all, so a cancelled
  * call cannot be attributed.
  */
-export function instrumentPromptChannel(channel: PromptChannel, { threadKey, log }: PromptChannelLogging): PromptChannel {
-  const at = () => new Date().toISOString();
+export function instrumentPromptChannel(channel: PromptChannel, threadKey: string): PromptChannel {
   return {
-    ...channel,
-    push(value) {
-      const accepted = channel.push(value);
-      log.info(`prompt-channel push thread=${threadKey} at=${at()} accepted=${accepted}`);
-      return accepted;
-    },
-    end() {
-      const alreadyEnded = channel.ended;
-      channel.end();
-      if (!alreadyEnded) {
-        log.info(`prompt-channel end thread=${threadKey} at=${at()}`);
-      }
-    },
-    get ended() {
-      return channel.ended;
-    },
+    prompts: channel.prompts,
+    push: (message) =>
+      Effect.tap(channel.push(message), (accepted) =>
+        Effect.flatMap(at, (now) => Effect.logInfo(`prompt-channel push thread=${threadKey} at=${now} accepted=${accepted}`))),
+    end: Effect.tap(channel.end, (ended) =>
+      ended ? Effect.flatMap(at, (now) => Effect.logInfo(`prompt-channel end thread=${threadKey} at=${now}`)) : Effect.void),
   };
 }

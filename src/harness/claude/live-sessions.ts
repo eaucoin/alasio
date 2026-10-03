@@ -16,62 +16,77 @@
  *     Steer, and its answer is delivered as its own durable reply;
  *   - the process is replaced when the mounted session, folder or model
  *     changes, and closed at shutdown or when it exits on its own.
+ *
+ * Each process lives in a scope of its own, forked from the live sessions' scope:
+ * closing it ends the prompt channel and aborts and closes the query. What the
+ * process writes is read as a Stream by a fiber that runs until the query ends,
+ * which it does once closed, so whatever turn the process was serving is settled
+ * however it went; shutdown closes every process and waits for those fibers.
+ *
+ * The processes are kept by conversation in a Map rather than an RcMap or LayerMap:
+ * a process is not shared by holders whose count decides its life; it lives until
+ * it is replaced, closed, or exits. It is started with what the turn that needs it
+ * brings (the session it resumes, the workspace's bayma endpoint, the model choice),
+ * which a lookup by key is not given, and whether it is replaced depends on what it
+ * has learnt since (the session its init named). Every change to the Map is
+ * synchronous, so a process exiting as a turn replaces it cannot remove its successor.
  */
 import { randomUUID } from "node:crypto";
 
-import type {
-  HookCallback,
-  SDKBackgroundTasksChangedMessage,
-  SDKResultMessage,
-  SessionStore,
-} from "@anthropic-ai/claude-agent-sdk";
-
-import type { CommandEventPolicy } from "../../codex/command-event-policy.ts";
-import { errorBlock, type ResponseBlock } from "../../codex/event-projection.ts";
-import type { TurnTimer } from "../../codex/turn-timing.ts";
-import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
-import type { BaymaMcpServer, HostBaymaScope } from "../../mcp/bayma.ts";
-import type { ActiveQueries, ActiveQuery, TransportTurn, TurnParams, TurnPersistence, TurnResult } from "../index.ts";
-import { CLAUDE_HARNESS } from "../names.ts";
-import type { PromptChannel } from "./prompt-channel.ts";
-import type { ClaudeSessionApi } from "./sessions.ts";
 import {
-  type ClaudeQuery,
-  type ClaudeQueryFactory,
-  appendBlock,
-  buildClaudeEnv,
-  buildClaudeQueryOptions,
-  buildClaudeUserMessage,
+  query,
+  type HookCallback,
+  type HookInput,
+  type HookJSONOutput,
+  type SDKBackgroundTasksChangedMessage,
+  type SDKMessage,
+  type SDKResultMessage,
+  type SessionStore,
+} from "@anthropic-ai/claude-agent-sdk";
+import { Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, Scope, Stream } from "effect";
+
+import {
   buildDbGuardrailFallbackText,
   buildDbGuardrailSyntheticText,
-  cacheReadTokensFromUsage,
-  claudeMcpServers,
+  type CommandEventPolicy,
   createCommandEventPolicy,
-  createPromptChannel,
-  createTurnTimer,
-  defaultQueryFactory,
-  getErrorMessage,
-  instrumentPromptChannel,
-  isBlockedDbCommand,
-  isOperatorInterrupt,
-  isVisibleCodexItem,
-  mapItemToBlocks,
-  projectAssistantMessageToItems,
-  projectResultMessage,
-  promptUuidsAnsweredBy,
-  UNANSWERED_PROMPT_GRACE_MS,
-} from "./runtime.ts";
-import { getClaudeEffort, getClaudeModel } from "./model.ts";
-import { BAYMA_EXEC_TOOL } from "./runtime.ts";
-import { folderBaymaServer } from "../../mcp/bayma.ts";
+} from "../../codex/command-event-policy.ts";
+import { appendBlock, errorBlock, isVisibleCodexItem, mapItemToBlocks, type ResponseBlock } from "../../codex/event-projection.ts";
+import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
+import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
+import { type BaymaMcpServer, type HostBaymaScope, noFolderBayma } from "../../mcp/bayma.ts";
+import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
 import { looksLikeSelfRestartCommand } from "../../policy/restart-command.ts";
 import { detectWorkflowWait } from "../../policy/workflow-wait.ts";
-import { createLogger } from "../../shared/log.ts";
+import { effectRunnerHere } from "../../shared/effects.ts";
+import { createLogger, withLogScope } from "../../shared/log.ts";
 import { outsideTraces } from "../../telemetry/index.ts";
+import type { ActiveQueries, ActiveQuery, TransportTurn, TurnParams, TurnPersistence, TurnResult } from "../index.ts";
+import { CLAUDE_HARNESS } from "../names.ts";
+import { buildClaudeEnv } from "./env.ts";
+import { cacheReadTokensFromUsage, projectAssistantMessageToItems, projectResultMessage } from "./event-projection.ts";
+import { claudeMcpServers } from "./mcp.ts";
+import { getClaudeEffort, getClaudeModel } from "./model.ts";
+import { buildClaudeUserMessage, instrumentPromptChannel, makePromptChannel, type PromptChannel, promptUuidsAnsweredBy } from "./prompt-channel.ts";
+import {
+  BAYMA_EXEC_TOOL,
+  buildClaudeQueryOptions,
+  ClaudeCodeError,
+  type ClaudeQuery,
+  type ClaudeQueryFactory,
+  getErrorMessage,
+  isOperatorInterrupt,
+} from "./runtime.ts";
+import type { ClaudeSessionApi } from "./sessions.ts";
 import { claudeTelemetryEnv } from "./telemetry.ts";
 
-const log = createLogger("claude-live");
+const LOG_SCOPE = "claude-live";
+/** The scope's lines, for the helpers that log through a logger of their own (the turn timer, the command policy). */
+const log = createLogger(LOG_SCOPE);
+
+/** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
+const UNANSWERED_PROMPT_GRACE = "15 seconds";
 
 /** A background task Claude Code reports live: a shell or agent it started that is still running. */
 export type BackgroundTask = SDKBackgroundTasksChangedMessage["tasks"][number];
@@ -94,11 +109,12 @@ export interface OperatorTurn {
   /** The first command the database guardrail denied in this turn. */
   blockedGuardrailCommand: string | null;
   /** Bounds the wait for a steered prompt's answer once the turn's own prompt is answered. */
-  unansweredTimer: NodeJS.Timeout | undefined;
+  unansweredGrace: Fiber.Fiber<void> | undefined;
   /** Steers that arrived before the process was ready, pushed after the prompt. */
   readonly earlySteers: string[];
   readonly commandPolicy: CommandEventPolicy;
-  readonly resolve: (result: TurnResult) => void;
+  /** How the turn ended, once it has. */
+  readonly done: Deferred.Deferred<TurnResult>;
   readonly activeQuery: ActiveQuery;
   firstEventLogged?: boolean;
   firstVisibleItemLogged?: boolean;
@@ -124,9 +140,11 @@ export interface ClaudeHost {
   readonly baymaUrl: string | null;
   sessionId: string | null;
   readonly channel: PromptChannel;
+  /** Aborts the process; the Agent SDK is given it to stop the process with. */
   readonly controller: AbortController;
-  sdkQuery: ClaudeQuery | null;
-  loop?: Promise<void>;
+  readonly sdkQuery: ClaudeQuery;
+  /** What the process lives in: closing it closes the process. */
+  readonly scope: Scope.Closeable;
   readonly mode: ClaudeHostMode;
   initialized?: boolean;
   closed: boolean;
@@ -145,7 +163,7 @@ export interface ClaudeHost {
   notifyIdle: () => void;
 }
 
-/** What createClaudeLiveSessions is given. */
+/** What makeClaudeLiveSessions is given. */
 export interface ClaudeLiveSessionsOptions {
   readonly workingDirectory: string;
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
@@ -155,13 +173,13 @@ export interface ClaudeLiveSessionsOptions {
   readonly queryFactory?: ClaudeQueryFactory | undefined;
 }
 
-/** The live Claude Code processes of one working directory, one per conversation. */
+/** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
-  runTurn(params: TurnParams): Promise<TurnResult>;
+  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult>;
   /** The live process serving a conversation, if any (for tests and diagnostics). */
-  get(threadKey: string): ClaudeHost | null;
-  close(threadKey: string, reason?: string): void;
-  closeAll(reason?: string): Promise<void>;
+  readonly get: (threadKey: string) => ClaudeHost | null;
+  /** Ends the live process of a conversation, if it has one. */
+  readonly close: (threadKey: string, reason?: string) => Effect.Effect<void>;
 }
 
 function modelKey(persistence: TurnPersistence, threadKey: string): string {
@@ -173,26 +191,52 @@ function describeTasks(tasks: readonly BackgroundTask[]): string {
   return tasks.map((task) => task.description || task.task_type || task.task_id).join("; ");
 }
 
-/** A folder conversation's bayma, from the deployment's host profile. */
-const defaultFolderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) => folderBaymaServer({ harness: CLAUDE_HARNESS, threadKey });
+/** A folder conversation's bayma where none is given: a deployment's without folder workspaces. */
+const defaultFolderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) => noFolderBayma({ harness: CLAUDE_HARNESS, threadKey });
+
+/** A promise of what starting Claude Code needs, failing as starting it fails. */
+const attempt = <A>(evaluate: () => Promise<A>): Effect.Effect<A, ClaudeCodeError> =>
+  Effect.tryPromise({ try: evaluate, catch: (cause) => new ClaudeCodeError({ cause }) });
+
+/** Now, as a log line gives it. */
+const now = Effect.map(Clock.currentTimeMillis, (millis) => new Date(millis).toISOString());
+
+function releaseCliTurn(host: ClaudeHost, cliTurn: CliTurn): void {
+  for (const uuid of cliTurn.promptUuids) {
+    host.retiredUuids.add(uuid);
+  }
+  if (host.activeQueries.get(host.threadKey) === cliTurn.activeQuery) {
+    host.activeQueries.delete(host.threadKey);
+  }
+  host.notifyIdle();
+}
 
 /**
- * `workingDirectory` is where the CLI runs: a folder workspace itself, with the
- * conversation's bayma from `folderBayma()`, or a session filesystem's harness
+ * The live processes of `workingDirectory`, for as long as the scope they are made in
+ * is open. `workingDirectory` is where the CLI runs: a folder workspace itself, with
+ * the conversation's bayma from `folderBayma()`, or a session filesystem's harness
  * directory, when `sessionFsBayma()` gives the workspace's bayma endpoint (bringing its
  * Sandbox up) and the CLI is confined to it (sessionfs.ts).
  */
-export function createClaudeLiveSessions({
+export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   workingDirectory,
   sessions,
   sessionStore = null,
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
-  queryFactory = defaultQueryFactory,
-}: ClaudeLiveSessionsOptions): ClaudeLiveSessions {
+  queryFactory = query,
+}: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope> {
+  const scope = yield* Effect.scope;
+  // Runs the effects of the promise callbacks handed on: operator controls, Claude Code's hooks.
+  const run = yield* effectRunnerHere(Context.empty());
   const hosts = new Map<string, ClaudeHost>();
+  const consumers = yield* FiberSet.make<void>();
+  // At shutdown the processes, whose scopes are forked from this one, are closed first;
+  // then every turn they served is settled as their consumers end.
+  yield* Scope.addFinalizer(scope, FiberSet.awaitEmpty(consumers));
 
-  function closeHost(host: ClaudeHost, reason: string): void {
+  /** Closes the process: its prompt ends, its query is aborted and closed, and its consumer then ends. */
+  const closeProcess = Effect.fnUntraced(function*(host: ClaudeHost, reason: string) {
     if (host.closed) {
       return;
     }
@@ -202,49 +246,28 @@ export function createClaudeLiveSessions({
       hosts.delete(host.threadKey);
     }
     const live = host.backgroundTasks.filter((task) => !task.ambient);
-    log.info(
+    yield* Effect.logInfo(
       `closing thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} reason=${JSON.stringify(reason)}`
         + (live.length > 0 ? ` stopping_background_tasks=${JSON.stringify(describeTasks(live))}` : ""),
     );
-    host.channel.end();
+    yield* host.channel.end;
     host.controller.abort(reason);
     try {
-      host.sdkQuery?.close?.();
+      host.sdkQuery.close();
     } catch {
       // Already closed.
     }
-  }
+  });
 
-  /**
-   * Finish whatever turn is open when the process goes away. An operator turn
-   * that was not answered reports the cause unless we closed the process on
-   * purpose (shutdown or replacement), in which case recovery owns it.
-   */
-  function settleOnExit(host: ClaudeHost, error: unknown): void {
-    const current = host.current;
-    if (current) {
-      host.current = null;
-      if (!current.responseCompleted && !current.interrupted) {
-        const deliberate = host.closed && host.closeReason !== "process exited";
-        if (!deliberate) {
-          const message = error ? getErrorMessage(error) : "Claude Code exited before answering";
-          current.turnTimer("query.error", { error: message });
-          log.error(`Claude Code ended during a turn thread=${host.threadKey}: ${message}`);
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message));
-        }
-      }
-      finishOperatorTurn(host, current);
-    }
-    if (host.cliTurn) {
-      const cliTurn = host.cliTurn;
-      host.cliTurn = null;
-      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
-      releaseCliTurn(host, cliTurn);
-    }
-  }
+  const closeHost = (host: ClaudeHost, reason: string): Effect.Effect<void> =>
+    Effect.andThen(closeProcess(host, reason), Scope.close(host.scope, Exit.void));
 
-  function finishOperatorTurn(host: ClaudeHost, current: OperatorTurn): void {
-    clearTimeout(current.unansweredTimer);
+  const finishOperatorTurn = Effect.fnUntraced(function*(host: ClaudeHost, current: OperatorTurn) {
+    const grace = current.unansweredGrace;
+    current.unansweredGrace = undefined;
+    if (grace) {
+      yield* Fiber.interrupt(grace);
+    }
     for (const uuid of current.promptUuids) {
       host.retiredUuids.add(uuid);
     }
@@ -259,8 +282,8 @@ export function createClaudeLiveSessions({
       });
     }
     current.turnTimer("query.finished", { guardrail_blocked: Boolean(current.blockedGuardrailCommand) });
-    log.info(`turn.done completed=${current.responseCompleted} interrupted=${current.interrupted}`);
-    current.resolve({
+    yield* Effect.logInfo(`turn.done completed=${current.responseCompleted} interrupted=${current.interrupted}`);
+    yield* Deferred.succeed(current.done, {
       blockSequence: current.blockSequence,
       sessionId: host.sessionId,
       pendingResponseId: current.pendingResponseId,
@@ -268,57 +291,76 @@ export function createClaudeLiveSessions({
       responseCompleted: current.responseCompleted,
     });
     host.notifyIdle();
-  }
+  });
 
-  function releaseCliTurn(host: ClaudeHost, cliTurn: CliTurn): void {
-    for (const uuid of cliTurn.promptUuids) {
-      host.retiredUuids.add(uuid);
+  /**
+   * Finish whatever turn is open when the process goes away. An operator turn
+   * that was not answered reports the cause unless we closed the process on
+   * purpose (shutdown or replacement), in which case recovery owns it.
+   */
+  const settleOnExit = Effect.fnUntraced(function*(host: ClaudeHost, error: unknown) {
+    const current = host.current;
+    if (current) {
+      host.current = null;
+      if (!current.responseCompleted && !current.interrupted) {
+        const deliberate = host.closed && host.closeReason !== "process exited";
+        if (!deliberate) {
+          const message = error ? getErrorMessage(error) : "Claude Code exited before answering";
+          current.turnTimer("query.error", { error: message });
+          yield* Effect.logError(`Claude Code ended during a turn thread=${host.threadKey}: ${message}`);
+          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message));
+        }
+      }
+      yield* finishOperatorTurn(host, current);
     }
-    if (host.activeQueries.get(host.threadKey) === cliTurn.activeQuery) {
-      host.activeQueries.delete(host.threadKey);
+    if (host.cliTurn) {
+      const cliTurn = host.cliTurn;
+      host.cliTurn = null;
+      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
+      releaseCliTurn(host, cliTurn);
     }
-    host.notifyIdle();
-  }
+  });
 
-  async function interrupt(host: ClaudeHost, reason: string): Promise<void> {
-    try {
-      // startHost sets the query before the host serves any turn, and only turns interrupt.
-      await host.sdkQuery!.interrupt();
-    } catch (error) {
-      log.warn(`interrupt failed thread=${host.threadKey}; closing the process: ${getErrorMessage(error)}`);
-      closeHost(host, reason);
-    }
-  }
+  /** Interrupts the turn the process is running, closing the process if it cannot. */
+  const interrupt = (host: ClaudeHost, reason: string): Effect.Effect<void> =>
+    attempt(() => host.sdkQuery.interrupt()).pipe(
+      Effect.catchTag("ClaudeCodeError", (error) =>
+        Effect.logWarning(`interrupt failed thread=${host.threadKey}; closing the process: ${error.message}`).pipe(
+          Effect.andThen(closeHost(host, reason)),
+        )),
+    );
 
   /** A turn Claude Code started on its own, typically to report a settled background task. */
-  function ensureCliTurn(host: ClaudeHost): CliTurn {
+  const ensureCliTurn = Effect.fnUntraced(function*(host: ClaudeHost) {
     if (host.cliTurn) {
       return host.cliTurn;
     }
     const pendingResponseId = host.persistence.createPendingResponse(host.chatId, `claude-cli-turn:${randomUUID()}`, host.sessionId);
+    const abort = Effect.fnUntraced(function*(abortReason: string) {
+      yield* Effect.logInfo(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
+      yield* interrupt(host, abortReason);
+      if (host.cliTurn === cliTurn) {
+        host.cliTurn = null;
+        host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
+        releaseCliTurn(host, cliTurn);
+      }
+    });
+    const steer = Effect.fnUntraced(function*(steerPrompt: string) {
+      if (host.closed || host.cliTurn !== cliTurn) {
+        return false;
+      }
+      const uuid = randomUUID();
+      cliTurn.promptUuids.add(uuid);
+      return yield* host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+    });
     const cliTurn: CliTurn = {
       pendingResponseId,
       blockSequence: [],
       promptUuids: new Set(),
       activeQuery: {
         cliInitiated: true,
-        abort: async (abortReason) => {
-          log.info(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
-          await interrupt(host, abortReason);
-          if (host.cliTurn === cliTurn) {
-            host.cliTurn = null;
-            host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
-            releaseCliTurn(host, cliTurn);
-          }
-        },
-        steer: async (steerPrompt) => {
-          if (host.closed || host.cliTurn !== cliTurn) {
-            return false;
-          }
-          const uuid = randomUUID();
-          cliTurn.promptUuids.add(uuid);
-          return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
-        },
+        abort: (abortReason) => run.runPromise(abort(abortReason)),
+        steer: (steerPrompt) => run.runPromise(steer(steerPrompt)),
       },
     };
     host.cliTurn = cliTurn;
@@ -326,12 +368,12 @@ export function createClaudeLiveSessions({
     if (!host.activeQueries.has(host.threadKey)) {
       host.activeQueries.set(host.threadKey, cliTurn.activeQuery);
     }
-    log.info(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
+    yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
     return cliTurn;
-  }
+  });
 
-  function finishCliTurn(host: ClaudeHost, message: SDKResultMessage): void {
-    const cliTurn = ensureCliTurn(host);
+  const finishCliTurn = Effect.fnUntraced(function*(host: ClaudeHost, message: SDKResultMessage) {
+    const cliTurn = yield* ensureCliTurn(host);
     host.cliTurn = null;
     const projected = projectResultMessage(message);
     const text = projected?.ok ? projected.text?.trim() : `Error: ${projected?.error ?? "Claude did not complete"}`;
@@ -345,14 +387,14 @@ export function createClaudeLiveSessions({
     } else {
       host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
     }
-    log.info(`cli-turn.done thread=${host.threadKey} delivered=${Boolean(text)}`);
+    yield* Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=${Boolean(text)}`);
     releaseCliTurn(host, cliTurn);
     if (text) {
       host.onBackgroundResponse();
     }
-  }
+  });
 
-  function handleResult(host: ClaudeHost, message: SDKResultMessage): void {
+  const handleResult = Effect.fnUntraced(function*(host: ClaudeHost, message: SDKResultMessage) {
     const current = host.current;
     const answered = current ? promptUuidsAnsweredBy(message, current.promptUuids) : [];
     if (current && answered.length > 0) {
@@ -384,19 +426,29 @@ export function createClaudeLiveSessions({
       }
       if (current.promptUuids.size === 0) {
         host.current = null;
-        finishOperatorTurn(host, current);
+        yield* finishOperatorTurn(host, current);
       } else {
         // A steered prompt is still unanswered; wait for it, but bounded, because the
         // CLI may have folded it into the answer it just gave.
-        clearTimeout(current.unansweredTimer);
-        current.unansweredTimer = setTimeout(() => {
-          if (host.current === current) {
-            log.info(`unanswered prompt grace elapsed thread=${host.threadKey} pending=${current.promptUuids.size}`);
-            host.current = null;
-            finishOperatorTurn(host, current);
-          }
-        }, UNANSWERED_PROMPT_GRACE_MS);
-        current.unansweredTimer.unref?.();
+        const previous = current.unansweredGrace;
+        if (previous) {
+          yield* Fiber.interrupt(previous);
+        }
+        current.unansweredGrace = yield* Effect.sleep(UNANSWERED_PROMPT_GRACE).pipe(
+          Effect.andThen(Effect.uninterruptible(Effect.suspend(() => {
+            if (host.current !== current) {
+              return Effect.void;
+            }
+            current.unansweredGrace = undefined;
+            return Effect.logInfo(`unanswered prompt grace elapsed thread=${host.threadKey} pending=${current.promptUuids.size}`).pipe(
+              Effect.andThen(Effect.sync(() => {
+                host.current = null;
+              })),
+              Effect.andThen(finishOperatorTurn(host, current)),
+            );
+          }))),
+          Effect.forkIn(host.scope),
+        );
       }
       return;
     }
@@ -406,101 +458,175 @@ export function createClaudeLiveSessions({
       : typeof message.user_message_uuid === "string" ? [message.user_message_uuid] : [];
     if (named.some((uuid) => host.interruptedUuids.has(uuid))) {
       host.interruptedUuids.clear();
-      log.info(`interrupted turn closed thread=${host.threadKey}`);
+      yield* Effect.logInfo(`interrupted turn closed thread=${host.threadKey}`);
       return;
     }
     if (cliUuids.length > 0 || named.length === 0) {
       // Unattributed: a turn the CLI started itself. Attributed to a prompt steered into
       // such a turn: the same turn. Either way it is a reply of its own.
-      finishCliTurn(host, message);
+      yield* finishCliTurn(host, message);
       return;
     }
     if (named.some((uuid) => host.retiredUuids.has(uuid))) {
-      log.info(`late result for a finished turn ignored thread=${host.threadKey}`);
+      yield* Effect.logInfo(`late result for a finished turn ignored thread=${host.threadKey}`);
       return;
     }
     // A resumed session re-runs a turn an earlier worker left interrupted and stamps
     // that turn's prompt; it is not ours and not new.
-    log.info(
+    yield* Effect.logInfo(
       `result for another turn ignored thread=${host.threadKey} uuid=${named[0] ?? "none"} resume_reason=${message.resume_reason ?? "none"}`,
     );
-  }
+  });
 
-  async function consume(host: ClaudeHost, sdkQuery: ClaudeQuery): Promise<void> {
-    let exitError: unknown = null;
-    try {
-      for await (const message of sdkQuery) {
-        const current = host.current;
-        if (current && !current.firstEventLogged) {
-          current.firstEventLogged = true;
-          current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
-        }
-        current?.onStarted?.();
-        if (message.type === "system" && message.subtype === "init") {
-          host.initialized = true;
-          host.sessionId = message.session_id ?? host.sessionId;
-          if (current && host.sessionId) {
-            current.persistence.updatePendingSessionId(current.pendingResponseId, host.sessionId);
-            current.persistence.updateActiveTurnSessionId(host.threadKey, host.sessionId);
-          }
-          continue;
-        }
-        if (message.type === "system" && message.subtype === "mirror_error") {
-          // The store missed a batch; startup reconciliation fills it in.
-          log.warn(`transcript mirror dropped a batch thread=${host.threadKey}: ${message.error ?? JSON.stringify(message).slice(0, 300)}`);
-        }
-        if (message.type === "system" && message.subtype === "background_tasks_changed") {
-          host.backgroundTasks = Array.isArray(message.tasks) ? message.tasks : [];
-          log.info(`background-tasks thread=${host.threadKey} live=${host.backgroundTasks.length}${host.backgroundTasks.length ? ` ${JSON.stringify(describeTasks(host.backgroundTasks))}` : ""}`);
-          continue;
-        }
-        if (message.type === "assistant") {
-          if (!current && !host.cliTurn && host.interruptedUuids.size > 0) {
-            continue;
-          }
-          const target = current ?? ensureCliTurn(host);
-          for (const item of projectAssistantMessageToItems(message)) {
-            if (current && !current.firstVisibleItemLogged && isVisibleCodexItem(item)) {
-              current.firstVisibleItemLogged = true;
-              current.turnTimer("first_visible_item", { item_type: item.type });
-            }
-            mapItemToBlocks(item, {
-              blockSequence: target.blockSequence,
-              persistence: current?.persistence ?? host.persistence,
-              pendingResponseId: target.pendingResponseId,
-            });
-          }
-          continue;
-        }
-        if (message.type === "result") {
-          handleResult(host, message);
-          continue;
-        }
-        if (message.type === "auth_status" && message.error && current) {
-          current.turnTimer("event.error", { error: message.error });
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message.error));
-        }
+  const handleMessage = Effect.fnUntraced(function*(host: ClaudeHost, message: SDKMessage) {
+    const current = host.current;
+    if (current && !current.firstEventLogged) {
+      current.firstEventLogged = true;
+      current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
+    }
+    current?.onStarted?.();
+    if (message.type === "system" && message.subtype === "init") {
+      host.initialized = true;
+      host.sessionId = message.session_id ?? host.sessionId;
+      if (current && host.sessionId) {
+        current.persistence.updatePendingSessionId(current.pendingResponseId, host.sessionId);
+        current.persistence.updateActiveTurnSessionId(host.threadKey, host.sessionId);
       }
-    } catch (error) {
-      exitError = error;
+      return;
     }
-    if (!host.closed) {
-      closeHost(host, "process exited");
+    if (message.type === "system" && message.subtype === "mirror_error") {
+      // The store missed a batch; startup reconciliation fills it in.
+      yield* Effect.logWarning(`transcript mirror dropped a batch thread=${host.threadKey}: ${message.error ?? JSON.stringify(message).slice(0, 300)}`);
     }
-    settleOnExit(host, exitError);
-  }
+    if (message.type === "system" && message.subtype === "background_tasks_changed") {
+      host.backgroundTasks = Array.isArray(message.tasks) ? message.tasks : [];
+      yield* Effect.logInfo(`background-tasks thread=${host.threadKey} live=${host.backgroundTasks.length}${host.backgroundTasks.length ? ` ${JSON.stringify(describeTasks(host.backgroundTasks))}` : ""}`);
+      return;
+    }
+    if (message.type === "assistant") {
+      if (!current && !host.cliTurn && host.interruptedUuids.size > 0) {
+        return;
+      }
+      const target = current ?? (yield* ensureCliTurn(host));
+      for (const item of projectAssistantMessageToItems(message)) {
+        if (current && !current.firstVisibleItemLogged && isVisibleCodexItem(item)) {
+          current.firstVisibleItemLogged = true;
+          current.turnTimer("first_visible_item", { item_type: item.type });
+        }
+        mapItemToBlocks(item, {
+          blockSequence: target.blockSequence,
+          persistence: current?.persistence ?? host.persistence,
+          pendingResponseId: target.pendingResponseId,
+        });
+      }
+      return;
+    }
+    if (message.type === "result") {
+      yield* handleResult(host, message);
+      return;
+    }
+    if (message.type === "auth_status" && message.error && current) {
+      current.turnTimer("event.error", { error: message.error });
+      appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message.error));
+    }
+  });
 
-  async function startHost(params: TurnParams, key: string, bayma: BaymaEndpoint | null): Promise<ClaudeHost> {
+  /** Reads what the process writes until it ends, then settles what it was serving. */
+  const consume = Effect.fnUntraced(function*(host: ClaudeHost) {
+    const exitError = yield* Stream.fromAsyncIterable(host.sdkQuery, (cause) => new ClaudeCodeError({ cause })).pipe(
+      Stream.runForEach((message) => handleMessage(host, message)),
+      Effect.as(null),
+      Effect.catchTag("ClaudeCodeError", (error) => Effect.succeed(error.cause)),
+      // Failing to handle what it wrote ends the process too, and the turn reports why.
+      Effect.catchDefect(Effect.succeed),
+    );
+    if (!host.closed) {
+      yield* closeHost(host, "process exited");
+    }
+    yield* settleOnExit(host, exitError);
+  });
+
+  /**
+   * Bash is disabled, so shell work arrives as code sent to bayma exec; restart
+   * provenance and the database guardrail inspect the commands embedded in it.
+   */
+  const execHook = Effect.fnUntraced(function*(host: ClaudeHost, input: HookInput): Effect.fn.Return<HookJSONOutput> {
+    if (input?.hook_event_name !== "PreToolUse") {
+      return {};
+    }
+    const toolInput = input.tool_input;
+    const code = typeof toolInput === "object" && toolInput !== null && "code" in toolInput && typeof toolInput.code === "string"
+      ? toolInput.code
+      : "";
+    const commands = extractShellCommands(code);
+    const [firstCommand] = commands;
+    if (firstCommand === undefined) {
+      return {};
+    }
+    yield* Effect.logInfo(`exec-hook seen thread=${host.threadKey} at=${yield* now} code=${JSON.stringify(code.slice(0, 120))}`);
+    const command = commands.find((candidate) => isBlockedDbCommand(candidate));
+    if (command) {
+      if (host.current) {
+        host.current.blockedGuardrailCommand = host.current.blockedGuardrailCommand ?? command;
+      }
+      yield* Effect.logWarning("DB guardrail denied a Claude Code Bash command");
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: buildDbGuardrailSyntheticText(command),
+        },
+      };
+    }
+    const policy = host.current?.commandPolicy ?? createCommandEventPolicy({
+      persistence: host.persistence,
+      threadKey: host.threadKey,
+      chatId: host.chatId,
+      messageId: host.messageId,
+      controller: { abort: () => undefined },
+      log,
+    });
+    // One call records at most one restart event, so inspect the most telling command.
+    const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
+      ?? commands.find((candidate) => detectWorkflowWait(candidate))
+      ?? firstCommand;
+    policy.inspectCommand({ command: primary, sessionId: host.sessionId });
+    return {};
+  });
+
+  const startHost = Effect.fnUntraced(function*(params: TurnParams, key: string, bayma: BaymaEndpoint | null): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const { threadKey, resumeSession, persistence } = params;
     const claudeEnv = buildClaudeEnv();
     // A session filesystem's bayma runs in its sandbox; a folder's is the conversation's
     // own, in a host-profile Sandbox of its own.
     const mcpServers = bayma
       ? undefined
-      : claudeMcpServers(await folderBayma({ threadKey }));
-    const resumeExists = resumeSession ? await sessions.sessionExists(resumeSession) : false;
+      : claudeMcpServers(yield* attempt(() => folderBayma({ threadKey })));
+    const resumeExists = resumeSession ? yield* attempt(() => sessions.sessionExists(resumeSession)) : false;
     const controller = new AbortController();
-    const channel = instrumentPromptChannel(createPromptChannel(), { threadKey, log });
+    const channel = instrumentPromptChannel(yield* makePromptChannel, threadKey);
+    // Claude Code calls it only once the process runs, by when `host` is made.
+    const hook: HookCallback = (input) => run.runPromise(execHook(host, input));
+    const options = buildClaudeQueryOptions({
+      workingDirectory,
+      modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
+      claudeEnv: { ...claudeEnv, ...claudeTelemetryEnv({ conversationId: threadKey }) },
+      mcpServers,
+      resumeSession,
+      resumeExists,
+      controller,
+      sessionStore,
+      sessionFsBayma: bayma,
+      hooks: {
+        PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [hook] }],
+      },
+    });
+    // The process outlives the turn that starts it, so it starts outside that turn's
+    // trace: Claude Code's traces are its own, found from a turn by its session id.
+    const sdkQuery = yield* Effect.try({
+      try: () => outsideTraces(() => queryFactory({ prompt: channel.prompts, options })),
+      catch: (cause) => new ClaudeCodeError({ cause }),
+    });
     const host: ClaudeHost = {
       threadKey,
       key,
@@ -508,7 +634,8 @@ export function createClaudeLiveSessions({
       sessionId: resumeSession ?? null,
       channel,
       controller,
-      sdkQuery: null,
+      sdkQuery,
+      scope: yield* Scope.fork(scope),
       mode: resumeSession ? (resumeExists ? "resume" : "reserved") : "start",
       closed: false,
       closeReason: null,
@@ -526,109 +653,80 @@ export function createClaudeLiveSessions({
       onBackgroundResponse: () => undefined,
       notifyIdle: () => undefined,
     };
-    // Bash is disabled, so shell work arrives as code sent to bayma exec; restart
-    // provenance and the database guardrail inspect the commands embedded in it.
-    const execHook: HookCallback = async (input) => {
-      if (input?.hook_event_name !== "PreToolUse") {
-        return {};
-      }
-      const toolInput = input.tool_input;
-      const code = typeof toolInput === "object" && toolInput !== null && "code" in toolInput && typeof toolInput.code === "string"
-        ? toolInput.code
-        : "";
-      const commands = extractShellCommands(code);
-      const [firstCommand] = commands;
-      if (firstCommand === undefined) {
-        return {};
-      }
-      log.info(`exec-hook seen thread=${threadKey} at=${new Date().toISOString()} code=${JSON.stringify(code.slice(0, 120))}`);
-      const command = commands.find((candidate) => isBlockedDbCommand(candidate));
-      if (command) {
-        if (host.current) {
-          host.current.blockedGuardrailCommand = host.current.blockedGuardrailCommand ?? command;
-        }
-        log.warn("DB guardrail denied a Claude Code Bash command");
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: buildDbGuardrailSyntheticText(command),
-          },
-        };
-      }
-      const policy = host.current?.commandPolicy ?? createCommandEventPolicy({
-        persistence: host.persistence,
-        threadKey,
-        chatId: host.chatId,
-        messageId: host.messageId,
-        controller: { abort: () => undefined },
-        log,
-      });
-      // One call records at most one restart event, so inspect the most telling command.
-      const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
-        ?? commands.find((candidate) => detectWorkflowWait(candidate))
-        ?? firstCommand;
-      policy.inspectCommand({ command: primary, sessionId: host.sessionId });
-      return {};
-    };
-    const options = buildClaudeQueryOptions({
-      workingDirectory,
-      modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
-      claudeEnv: { ...claudeEnv, ...claudeTelemetryEnv({ conversationId: threadKey }) },
-      mcpServers,
-      resumeSession,
-      resumeExists,
-      controller,
-      sessionStore,
-      sessionFsBayma: bayma,
-      hooks: {
-        PreToolUse: [{ matcher: BAYMA_EXEC_TOOL, hooks: [execHook] }],
-      },
-    });
-    // The process outlives the turn that starts it, so it starts outside that turn's
-    // trace: Claude Code's traces are its own, found from a turn by its session id.
-    outsideTraces(() => {
-      const sdkQuery = queryFactory({ prompt: channel.iterable, options });
-      host.sdkQuery = sdkQuery;
-      host.loop = consume(host, sdkQuery);
-    });
-    log.info(`started thread=${threadKey} session=${String(host.sessionId).slice(0, 8)} mode=${host.mode}`);
+    yield* Scope.addFinalizer(host.scope, closeProcess(host, "shutdown"));
+    // Read outside the turn's trace too, for as long as the process runs.
+    yield* FiberSet.add(consumers, outsideTraces(() => run.runFork(consume(host))));
+    yield* Effect.logInfo(`started thread=${threadKey} session=${String(host.sessionId).slice(0, 8)} mode=${host.mode}`);
     return host;
-  }
+  });
 
   /**
    * The live process for this turn: reused when it serves the mounted session
    * with the same model, replaced otherwise. A turn with no mounted session asks
    * for a new one, so it never reuses a process.
    */
-  async function hostFor(params: TurnParams): Promise<ClaudeHost> {
+  const hostFor = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
     const key = modelKey(params.persistence, params.threadKey);
     // A session filesystem's Sandbox is made sure of before every turn, not only when the
     // process starts: the process outlives turns, and the Sandbox may have been suspended
     // in between. Its bayma is reached at the same address either way.
-    const bayma = sessionFsBayma ? await sessionFsBayma() : null;
+    const bayma = sessionFsBayma ? yield* attempt(sessionFsBayma) : null;
     const existing = hosts.get(params.threadKey);
     if (existing && !existing.closed) {
       if (params.resumeSession && existing.sessionId === params.resumeSession && existing.key === key && existing.baymaUrl === (bayma?.url ?? null)) {
         return existing;
       }
-      closeHost(existing, "mounted session, model, or workspace door changed");
+      yield* closeHost(existing, "mounted session, model, or workspace door changed");
     }
-    const host = await startHost(params, key, bayma);
+    const host = yield* startHost(params, key, bayma);
     hosts.set(params.threadKey, host);
     return host;
-  }
+  });
 
-  async function runTurn(params: TurnParams): Promise<TurnResult> {
+  const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult> {
     const { prompt, threadKey, chatId, messageId, persistence, activeQueries, onStarted } = params;
     const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt, log });
-    log.info(`Querying Claude Code (resume=${params.resumeSession})`);
+    yield* Effect.logInfo(`Querying Claude Code (resume=${params.resumeSession})`);
     turnTimer("query.start");
     onStarted?.();
     const pendingResponseId = persistence.createPendingResponse(chatId, messageId, params.resumeSession);
     persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
-    const { promise: done, resolve } = Promise.withResolvers<TurnResult>();
+    const done = yield* Deferred.make<TurnResult>();
     let host: ClaudeHost | null = null;
+    const abort = Effect.fnUntraced(function*(reason: string) {
+      const live = host;
+      if (!live || live.current !== current) {
+        yield* Deferred.await(done);
+        return;
+      }
+      current.interrupted = isOperatorInterrupt(reason);
+      current.blockSequence.length = 0;
+      for (const uuid of current.promptUuids) {
+        live.interruptedUuids.add(uuid);
+      }
+      current.turnTimer("query.interrupted", { reason: getErrorMessage(reason) });
+      yield* Effect.logInfo(`Claude Code turn interrupted by operator control: ${getErrorMessage(reason)}`);
+      yield* interrupt(live, reason);
+      if (live.current === current) {
+        live.current = null;
+        yield* finishOperatorTurn(live, current);
+      }
+      yield* Deferred.await(done);
+    });
+    const steer = Effect.fnUntraced(function*(steerPrompt: string) {
+      const live = host;
+      if (!live) {
+        // The process is still starting; the steer follows the prompt once it is pushed.
+        current.earlySteers.push(steerPrompt);
+        return true;
+      }
+      if (live.closed || live.current !== current) {
+        return false;
+      }
+      const uuid = randomUUID();
+      current.promptUuids.add(uuid);
+      return yield* live.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
+    });
     const current: OperatorTurn = {
       promptUuids: new Set(),
       blockSequence: [],
@@ -640,7 +738,7 @@ export function createClaudeLiveSessions({
       responseCompleted: false,
       interrupted: false,
       blockedGuardrailCommand: null,
-      unansweredTimer: undefined,
+      unansweredGrace: undefined,
       earlySteers: [],
       commandPolicy: createCommandEventPolicy({
         persistence,
@@ -650,98 +748,61 @@ export function createClaudeLiveSessions({
         controller: { abort: () => undefined },
         log,
       }),
-      resolve,
+      done,
       activeQuery: {
-        abort: async (reason) => {
-          if (!host || host.current !== current) {
-            await done;
-            return;
-          }
-          current.interrupted = isOperatorInterrupt(reason);
-          current.blockSequence.length = 0;
-          for (const uuid of current.promptUuids) {
-            host.interruptedUuids.add(uuid);
-          }
-          current.turnTimer("query.interrupted", { reason: getErrorMessage(reason) });
-          log.info(`Claude Code turn interrupted by operator control: ${getErrorMessage(reason)}`);
-          await interrupt(host, reason);
-          if (host.current === current) {
-            host.current = null;
-            finishOperatorTurn(host, current);
-          }
-          await done;
-        },
-        steer: async (steerPrompt) => {
-          if (!host) {
-            // The process is still starting; the steer follows the prompt once it is pushed.
-            current.earlySteers.push(steerPrompt);
-            return true;
-          }
-          if (host.closed || host.current !== current) {
-            return false;
-          }
-          const uuid = randomUUID();
-          current.promptUuids.add(uuid);
-          return host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
-        },
+        abort: (reason) => run.runPromise(abort(reason)),
+        steer: (steerPrompt) => run.runPromise(steer(steerPrompt)),
       },
     };
-    // Registered before any await so the conversation reads as busy immediately.
+    // Registered before the process is made sure of, so the conversation reads as busy at once.
     activeQueries.set(threadKey, current.activeQuery);
-    try {
-      turnTimer("env.built");
-      host = await hostFor(params);
-      turnTimer("query.created", { mode: host.mode });
-    } catch (error) {
-      activeQueries.delete(threadKey);
-      const message = getErrorMessage(error);
-      turnTimer("query.error", { error: message });
-      log.error(`Error starting Claude Code: ${message}`);
-      appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(message));
+    turnTimer("env.built");
+    const started = yield* hostFor(params).pipe(
+      Effect.catchTag("ClaudeCodeError", (error) => {
+        activeQueries.delete(threadKey);
+        turnTimer("query.error", { error: error.message });
+        return Effect.logError(`Error starting Claude Code: ${error.message}`).pipe(
+          Effect.andThen(Effect.sync(() => appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(error.message)))),
+          Effect.as(null),
+        );
+      }),
+    );
+    if (started === null) {
       return { blockSequence: current.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
     }
-    host.persistence = persistence;
-    host.activeQueries = activeQueries;
-    host.chatId = chatId;
-    host.messageId = messageId;
-    host.onBackgroundResponse = params.onBackgroundResponse ?? (() => undefined);
-    host.notifyIdle = params.onIdle ?? (() => undefined);
-    host.current = current;
-    host.interruptedUuids.clear();
+    turnTimer("query.created", { mode: started.mode });
+    host = started;
+    started.persistence = persistence;
+    started.activeQueries = activeQueries;
+    started.chatId = chatId;
+    started.messageId = messageId;
+    started.onBackgroundResponse = params.onBackgroundResponse ?? (() => undefined);
+    started.notifyIdle = params.onIdle ?? (() => undefined);
+    started.current = current;
+    started.interruptedUuids.clear();
     const uuid = randomUUID();
     current.promptUuids.add(uuid);
     params.onPromptDispatched?.();
-    host.channel.push(buildClaudeUserMessage(prompt, uuid));
+    yield* started.channel.push(buildClaudeUserMessage(prompt, uuid));
     for (const steerPrompt of current.earlySteers.splice(0)) {
-      await current.activeQuery.steer(steerPrompt);
+      yield* steer(steerPrompt);
     }
     // A reused process sends no new init, so the turn learns its session here.
-    if (host.initialized && host.sessionId) {
-      persistence.updatePendingSessionId(pendingResponseId, host.sessionId);
-      persistence.updateActiveTurnSessionId(threadKey, host.sessionId);
+    if (started.initialized && started.sessionId) {
+      persistence.updatePendingSessionId(pendingResponseId, started.sessionId);
+      persistence.updateActiveTurnSessionId(threadKey, started.sessionId);
     }
-    params.onTransportStarted?.({ sessionId: host.sessionId, turnId: null });
-    return await done;
-  }
+    params.onTransportStarted?.({ sessionId: started.sessionId, turnId: null });
+    return yield* Deferred.await(done);
+  }, withLogScope(LOG_SCOPE));
 
   return {
     runTurn,
-    /** The live process serving a conversation, if any (for tests and diagnostics). */
-    get(threadKey) {
-      return hosts.get(threadKey) ?? null;
-    },
-    close(threadKey, reason = "closed") {
-      const host = hosts.get(threadKey);
-      if (host) {
-        closeHost(host, reason);
-      }
-    },
-    async closeAll(reason = "shutdown") {
-      const all = [...hosts.values()];
-      for (const host of all) {
-        closeHost(host, reason);
-      }
-      await Promise.all(all.map((host) => host.loop?.catch(() => undefined)));
-    },
+    get: (threadKey) => hosts.get(threadKey) ?? null,
+    close: (threadKey, reason = "closed") =>
+      Effect.suspend(() => {
+        const host = hosts.get(threadKey);
+        return host ? closeHost(host, reason) : Effect.void;
+      }).pipe(withLogScope(LOG_SCOPE)),
   };
-}
+}, withLogScope(LOG_SCOPE));

@@ -20,9 +20,10 @@ import { readFileSync } from "node:fs";
 import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions } from "node:http";
 import httpsClient from "node:https";
 import type { AddressInfo } from "node:net";
-import { createLogger } from "../shared/log.ts";
 
-const log = createLogger("codex-login-relay");
+import { Effect, Schema, type Scope } from "effect";
+
+import { withLogScope } from "../shared/log.ts";
 
 /** Codex's `auth.json`, as the relay reads it: any of its fields may be missing or of another type. */
 interface CodexAuthFile {
@@ -43,11 +44,10 @@ export interface LoginRelayOptions {
   readonly upstreamFor?: (authFile: string, path: string) => LoginUpstream | null;
 }
 
-/** A running relay: the base URL a Codex model provider is given, the bearer it presents, and a close. */
+/** A running relay: the base URL a Codex model provider is given, and the bearer it presents. */
 export interface LoginRelay {
   readonly url: string;
   readonly bearer: string;
-  close(): Promise<void>;
 }
 
 /** The paths a Codex model provider calls: the Responses API (with its subpaths) and the model list. */
@@ -88,12 +88,24 @@ function sameSecret(presented: string | undefined, expected: string) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** The relay could not listen on alasio's loopback. */
+export class LoginRelayError extends Schema.TaggedError<LoginRelayError>()("LoginRelayError", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
+}
+
+/** Starts the relay of a login: startLoginRelay, or a test's stand-in for it. */
+export type StartLoginRelay = (options: LoginRelayOptions) => Effect.Effect<LoginRelay, LoginRelayError, Scope.Scope>;
+
 /**
- * Start the relay for the login in `authFile`. Returns `{ url, bearer, close }`: the base
- * URL a Codex model provider is given (its `/v1` included), the bearer it must present,
- * and a close. `upstreamFor` resolves the upstream request, for tests.
+ * The relay for the login in `authFile`, listening until the scope closes: the base URL
+ * a Codex model provider is given (its `/v1` included), and the bearer it must present.
+ * `upstreamFor` resolves the upstream request, for tests.
  */
-export async function startLoginRelay({ authFile, bearer = randomBytes(32).toString("hex"), upstreamFor = loginUpstream }: LoginRelayOptions): Promise<LoginRelay> {
+export const startLoginRelay: StartLoginRelay = Effect.fnUntraced(function*({ authFile, bearer = randomBytes(32).toString("hex"), upstreamFor = loginUpstream }: LoginRelayOptions) {
   const request = (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
   const expected = `Bearer ${bearer}`;
   const server = createServer((req, res) => {
@@ -118,16 +130,17 @@ export async function startLoginRelay({ authFile, bearer = randomBytes(32).toStr
     });
     req.pipe(upstreamReq);
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
+  yield* Effect.acquireRelease(
+    Effect.callback<void, LoginRelayError>((resume) => {
+      server.once("error", (cause) => resume(Effect.fail(new LoginRelayError({ cause }))));
+      server.listen(0, "127.0.0.1", () => resume(Effect.void));
+    }),
+    () => Effect.callback<void>((resume) => {
+      server.close(() => resume(Effect.void));
+    }),
+  );
   // A server listening on a TCP port has an AddressInfo address.
   const { port } = server.address() as AddressInfo;
-  log.info(`relaying the Codex login in ${authFile} on 127.0.0.1:${port}`);
-  return {
-    url: `http://127.0.0.1:${port}/v1`,
-    bearer,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-  };
-}
+  yield* Effect.logInfo(`relaying the Codex login in ${authFile} on 127.0.0.1:${port}`);
+  return { url: `http://127.0.0.1:${port}/v1`, bearer };
+}, withLogScope("codex-login-relay"));

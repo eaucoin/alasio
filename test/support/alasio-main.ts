@@ -14,7 +14,6 @@ import { join } from "node:path";
 
 import { Effect } from "effect";
 
-import { createHarnessRegistry } from "../../src/harness/index.ts";
 import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
 import { runAlasio, serveAlasio } from "../../src/alasio.ts";
 import { bridgedQueryFactory } from "./claude.ts";
@@ -38,6 +37,7 @@ if (import.meta.main) {
   if (encoded === undefined) throw new Error("usage: alasio-main.ts <config as JSON>");
   // The test writes the configuration.
   const config = JSON.parse(encoded) as AlasioProcessConfig;
+  // The harnesses alasio makes run their effects in its services, as the app's own do.
   const alasio = serveAlasio({
     telegramBotToken: "123:test",
     allowedUserIds: config.allowedUserIds,
@@ -48,10 +48,8 @@ if (import.meta.main) {
     hookPort: 0,
     warmLinkedSessions: false,
     defaultHarness: null,
-    harnesses: createHarnessRegistry({
-      folderBayma: async () => config.folderBayma,
-      claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
-    }),
+    folderBayma: async () => config.folderBayma,
+    claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
   });
   runAlasio(alasio.pipe(Effect.andThen(Effect.sync(() => process.send?.(READY)))));
 }

@@ -1,8 +1,11 @@
+import { Context, Exit, Scope } from "effect";
+
+import { effectRunner } from "../../shared/effects.ts";
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.ts";
 import type { Harness, HarnessOptions } from "../index.ts";
 import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
-import { createClaudeLiveSessions } from "./live-sessions.ts";
+import { makeClaudeLiveSessions } from "./live-sessions.ts";
 import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.ts";
 import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
 import { parseWorkspace } from "../../workspace/kind.ts";
@@ -20,6 +23,10 @@ export interface ClaudeHarnessOptions extends HarnessOptions {
  *
  * A session-filesystem workspace's CLI runs in the workspace's harness directory, and
  * its sessions are that directory's, confined to the workspace's bayma (sessionfs.ts).
+ *
+ * The harness is the promise façade of its live sessions (live-sessions.ts), whose
+ * effects `effects` runs: they last from the harness's making to its shutdown, in a
+ * scope of their own until harnesses run in alasio's.
  */
 export function createClaudeHarness({
   workingDirectory,
@@ -28,6 +35,7 @@ export function createClaudeHarness({
   sessionApi = null,
   folderBayma,
   claudeQueryFactory,
+  effects = effectRunner(Context.empty()),
 }: ClaudeHarnessOptions): Harness {
   const workspace = parseWorkspace(workingDirectory);
   const sessionFs = workspace?.kind === "sessionfs";
@@ -38,14 +46,15 @@ export function createClaudeHarness({
   const directory = sessionFs && sandbox ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
   const sessionFsBayma = sessionFs && sandbox ? async () => (await sandbox.ensureSession(workspace.volumeId)).bayma : null;
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory: directory, store: sessionStore });
-  const liveSessions = createClaudeLiveSessions({
+  const scope = Scope.makeUnsafe();
+  const liveSessions = effects.runSync(Scope.provide(scope)(makeClaudeLiveSessions({
     workingDirectory: directory,
     sessions,
     sessionStore,
     sessionFsBayma,
     ...(folderBayma ? { folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }) } : {}),
     queryFactory: claudeQueryFactory,
-  });
+  })));
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),
@@ -59,11 +68,11 @@ export function createClaudeHarness({
     async warmSession() {
       return false;
     },
-    async executeTurn(params) {
-      return await executeClaudeTurn({ ...params, workingDirectory: directory, sessions, liveSessions });
+    executeTurn(params) {
+      return effects.runPromise(executeClaudeTurn({ ...params, workingDirectory: directory, sessions, liveSessions }));
     },
-    async listModels() {
-      return await listClaudeModels({ workingDirectory: directory });
+    listModels() {
+      return effects.runPromise(listClaudeModels({ workingDirectory: directory }));
     },
     /** What a turn runs on when no /model choice is stored. */
     defaultModelChoice() {
@@ -71,10 +80,11 @@ export function createClaudeHarness({
     },
     /** Live processes are replaced on demand; this ends one when its conversation is unmounted. */
     closeLiveSession(threadKey, reason) {
-      liveSessions.close(threadKey, reason);
+      effects.runFork(liveSessions.close(threadKey, reason));
     },
+    /** Closes every live process, and resolves once each has ended and its turns are settled. */
     shutdown() {
-      return liveSessions.closeAll("shutdown");
+      return effects.runPromise(Scope.close(scope, Exit.void));
     },
   };
 }

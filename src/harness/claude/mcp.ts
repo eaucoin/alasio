@@ -4,7 +4,7 @@ import { BAYMA_SERVER_NAME, type BaymaMcpServer } from "../../mcp/bayma.ts";
 
 /**
  * The MCP servers alasio adds to a Claude Code query in a folder workspace: `bayma`, the
- * conversation's server (../../mcp/bayma.ts folderBaymaServer), which is already in
+ * conversation's server (../../mcp/bayma.ts HostBayma), which is already in
  * Claude Code's shape. Claude Code loads the operator's own servers (user and project
  * `.mcp.json` files and claude.ai connectors) alongside it.
  */

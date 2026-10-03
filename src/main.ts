@@ -19,7 +19,7 @@ import { withLogScope } from "./shared/log.ts";
 const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
   // What the deployment makes workspaces from, checked before anything else starts.
-  const kubeTemplates = loadKubeTemplates();
+  const kubeTemplates = yield* loadKubeTemplates;
   // Claude Code's transcripts and Codex's rollouts are kept in alasio's Neon, which the
   // deployment runs, and Codex's are mirrored from the start so no turn runs unmirrored.
   // Neon may take minutes to answer, and a stop meanwhile stops the wait.
