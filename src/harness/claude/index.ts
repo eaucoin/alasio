@@ -3,14 +3,13 @@ import type { Harness, HarnessOptions } from "../index.ts";
 import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
 import { createClaudeLiveSessions } from "./live-sessions.ts";
-import { executeClaudeTurn, startFreshClaudeSession, type ClaudeQueryFactory } from "./runtime.ts";
+import { executeClaudeTurn, startFreshClaudeSession } from "./runtime.ts";
 import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
 import { parseWorkspace } from "../../workspace/kind.ts";
 
-/** What createClaudeHarness is given: a harness's options, and stand-ins for tests. */
+/** What createClaudeHarness is given: a harness's options, and a stand-in session api for tests. */
 export interface ClaudeHarnessOptions extends HarnessOptions {
   readonly sessionApi?: ClaudeSessionApi | null;
-  readonly queryFactory?: ClaudeQueryFactory | undefined;
 }
 
 /**
@@ -22,7 +21,14 @@ export interface ClaudeHarnessOptions extends HarnessOptions {
  * A session-filesystem workspace's CLI runs in the workspace's harness directory, and
  * its sessions are that directory's, confined to the workspace's bayma (sessionfs.ts).
  */
-export function createClaudeHarness({ workingDirectory, sessionStore = null, sandbox = null, sessionApi = null, queryFactory = undefined }: ClaudeHarnessOptions): Harness {
+export function createClaudeHarness({
+  workingDirectory,
+  sessionStore = null,
+  sandbox = null,
+  sessionApi = null,
+  folderBayma,
+  claudeQueryFactory,
+}: ClaudeHarnessOptions): Harness {
   const workspace = parseWorkspace(workingDirectory);
   const sessionFs = workspace?.kind === "sessionfs";
   if (sessionFs && !sandbox) {
@@ -32,7 +38,14 @@ export function createClaudeHarness({ workingDirectory, sessionStore = null, san
   const directory = sessionFs && sandbox ? sandbox.harnessDirectory(workspace.volumeId) : workingDirectory;
   const sessionFsBayma = sessionFs && sandbox ? async () => (await sandbox.ensureSession(workspace.volumeId)).bayma : null;
   const sessions = sessionApi ?? createClaudeSessionApi({ workingDirectory: directory, store: sessionStore });
-  const liveSessions = createClaudeLiveSessions({ workingDirectory: directory, sessions, sessionStore, sessionFsBayma, queryFactory });
+  const liveSessions = createClaudeLiveSessions({
+    workingDirectory: directory,
+    sessions,
+    sessionStore,
+    sessionFsBayma,
+    ...(folderBayma ? { folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }) } : {}),
+    queryFactory: claudeQueryFactory,
+  });
   return {
     name: CLAUDE_HARNESS,
     displayName: harnessDisplayName(CLAUDE_HARNESS),
