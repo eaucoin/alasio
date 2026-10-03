@@ -26,5 +26,5 @@
 
     "skipLibCheck": true
   },
-  "include": ["src", "test", "neon/control", "neon/lake/src", "neon/test"]
+  "include": ["src", "test", "neon/control", "neon/lake/src", "neon/test", "tooling"]
 }

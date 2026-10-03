@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node ./src/index.ts",
     "doctor:telegram": "node ./src/telegram/doctor.ts",
-    "typecheck": "tsc -p .",
+    "typecheck": "node tooling/codex-protocol-types.ts && tsc -p .",
     "test": "node --test test/*.test.ts",
     "test:neon": "node --test --test-concurrency=1 --test-timeout=1800000 neon/test/stack.test.ts",
     "lake": "node ./src/neon/lake-query.ts"
@@ -37,6 +37,7 @@
   },
   "devDependencies": {
     "@duckdb/node-api": "1.5.6-r.1",
+    "@grammyjs/types": "^5.0.0",
     "@opentelemetry/otlp-transformer": "^0.222.0",
     "@opentelemetry/sdk-logs": "^0.222.0",
     "@opentelemetry/sdk-metrics": "^2.11.0",
