@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { type TestContext, test } from "node:test";
 
 import type { Message } from "@grammyjs/types";
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
@@ -16,6 +16,9 @@ import type { RequestId } from "../.types/codex/index.js";
 import type { Harness } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
+import type { EffectRunner } from "../src/shared/effects.ts";
+import type { Client } from "../src/telegram/client.ts";
+import type { BotAnswer } from "./support/bot-api.ts";
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
 // load (as src/index.ts does) receives it. Here it keeps everything in memory.
@@ -51,11 +54,26 @@ const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts"
 const { SqliteStore } = await import("../src/persistence/store.ts");
 const { createLogger } = await import("../src/shared/log.ts");
 const { inSpan, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
-const { Effect, Schema } = await import("effect");
-const { Client } = await import("../src/telegram/client.ts");
-const { TelegramOutbox } = await import("../src/telegram/outbox.ts");
+const { Effect, Exit, Layer, Schema, Scope } = await import("effect");
+const { FetchHttpClient } = await import("effect/http");
+const { Store } = await import("../src/persistence/store.ts");
+const { effectRunnerHere } = await import("../src/shared/effects.ts");
+const { TelegramClient } = await import("../src/telegram/client.ts");
+const { Outbox, outboxFacade } = await import("../src/telegram/outbox.ts");
+const { botApiLayer, paramsOf } = await import("./support/bot-api.ts");
 
-type SendMessageArgs = Parameters<InstanceType<typeof Client>["sendMessage"]>;
+type SendMessageArgs = Parameters<Client["sendMessage"]>;
+
+/**
+ * The Outbox over `store` and a Bot API `answer` answers, built in a scope `t` closes,
+ * with the tracing alasio runs with; and the EffectRunner that runs effects in it.
+ */
+async function outboxFor(t: TestContext, store: InstanceType<typeof SqliteStore>, answer: BotAnswer): Promise<EffectRunner<InstanceType<typeof Outbox>>> {
+  const scope = await Effect.runPromise(Scope.make());
+  t.after(() => Effect.runPromise(Scope.close(scope, Exit.void)));
+  const layer = Outbox.layer.pipe(Layer.provide([botApiLayer(answer), Layer.succeed(Store, store)]));
+  return await Effect.runPromise(Layer.buildWithScope(layer, scope).pipe(Effect.flatMap(effectRunnerHere), Effect.provide(TracingLayer)));
+}
 
 const ENDPOINT = { OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/" };
 
@@ -194,21 +212,26 @@ test("log lines become records of the trace they are written in", async () => {
   assert.equal(record.spanContext?.traceId, span.spanContext().traceId);
 });
 
-test("Bot API calls are client spans that never carry the bot token", async (t) => {
+test("Bot API calls are client spans that never carry the bot token", async () => {
   const responses: { status: number; body: object }[] = [
     { status: 429, body: { ok: false, parameters: { retry_after: 0.001 } } },
     { status: 200, body: { ok: true, result: { message_id: 5 } } },
     { status: 200, body: { ok: true, result: [] } },
   ];
-  t.mock.method(globalThis, "fetch", async () => {
+  const fetch = async (): Promise<Response> => {
     const next = responses.shift();
     assert.ok(next, "a response for every call");
     return new Response(JSON.stringify(next.body), { status: next.status });
-  });
-  const client = new Client("123:SECRET-TOKEN");
+  };
   spans.reset();
-  await client.sendMessage(1, "hi", { format: "plain" });
-  await client.getUpdates({ offset: 1 });
+  await Effect.runPromise(Effect.gen(function*() {
+    const client = yield* TelegramClient;
+    yield* client.sendMessage(1, "hi", { format: "plain" });
+    yield* client.getUpdates({ offset: 1 });
+  }).pipe(
+    Effect.provide(TelegramClient.layer("123:SECRET-TOKEN").pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetch)))),
+    Effect.provide(TracingLayer),
+  ));
   const [call] = spans.getFinishedSpans();
   assert.equal(spans.getFinishedSpans().length, 1, "the long poll is not a span");
   assert.ok(call);
@@ -259,7 +282,7 @@ test("Codex app-server requests carry their span's trace context", async () => {
   assert.equal(sent.trace?.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
 });
 
-test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async () => {
+test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
   const folder = join(root, "repo");
   mkdirSync(folder);
@@ -316,7 +339,12 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
         shutdown() {},
       };
     };
-    const outbox = new TelegramOutbox({ client: telegram, store, log: createLogger("test") });
+    const delivered: string[] = [];
+    const effects = await outboxFor(t, store, async (call) => {
+      delivered.push(paramsOf(call, "sendRichMessage").rich_message.markdown ?? "");
+      return { message_id: 100 + delivered.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
+    });
+    const outbox = outboxFacade(effects);
     const turns = new TurnController({
       config: { workspaceRoot: root },
       client: telegram,
@@ -332,7 +360,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     await inSpan("alasio.update", { parent: null }, () => turns.processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }));
     // The conversation's prompt worker, already running: it resolves once the prompt is done.
     await turns.scheduleConversation(conversationId);
-    await outbox.flushDue();
+    await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
 
     const update = finishedSpan("alasio.update");
     const turn = finishedSpan("alasio.turn");
@@ -345,7 +373,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     assert.equal(turn.attributes["alasio.session.id"], "thread-1");
     assert.equal(delivery.spanContext().traceId, traceId);
     assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
-    assert.ok(sent.some(([, text]) => text === "done"));
+    assert.deepEqual(delivered, ["done"]);
 
     const [duration] = (await metricPoints("alasio.turn.duration")).filter((point) => point.attributes["alasio.turn.outcome"] === "completed");
     assert.equal(duration?.attributes["alasio.harness"], CODEX_HARNESS);
@@ -360,17 +388,19 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
   }
 });
 
-test("a deferred delivery records what stopped it and keeps its trace", async () => {
+test("a deferred delivery records what stopped it and keeps its trace", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
   const store = new SqliteStore(root, join(root, "alasio.sqlite"));
   try {
     store.upsertConversation({ chatId: "43", user: { id: 43 } });
-    const failing = { async sendMessage() { throw new Error("Telegram is down"); } };
-    const outbox = new TelegramOutbox({ client: failing, store, log: createLogger("test") });
+    const effects = await outboxFor(t, store, async () => {
+      throw new Error("Telegram is down");
+    });
+    const outbox = outboxFacade(effects);
     spans.reset();
     const turn = await inSpan("test.turn", { parent: null }, async (span) => {
       outbox.enqueueText({ chatId: "43", text: "reply" });
-      await outbox.flushDue();
+      await effects.runPromise(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
       return span;
     });
     const delivery = finishedSpan("alasio.delivery");

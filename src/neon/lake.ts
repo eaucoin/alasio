@@ -8,14 +8,16 @@
  * and its database exist whether or not the lake runs, so turning the lake on or off
  * restarts nothing but the lake; it may read alasio's data only while it runs.
  */
+import { Config } from "effect";
 import type { Pool } from "pg";
 
 import { scramVerifier } from "../../neon/control/scram.ts";
 
 /** Whether the lake runs: `ALASIO_LAKE_ENABLED=1`. Off unless set. */
-export function lakeEnabled(env: Readonly<NodeJS.ProcessEnv> = process.env): boolean {
-  return env["ALASIO_LAKE_ENABLED"]?.trim() === "1";
-}
+export const lakeEnabled: Config.Config<boolean> = Config.String("ALASIO_LAKE_ENABLED").pipe(
+  Config.map((value) => value.trim() === "1"),
+  Config.withDefault(false),
+);
 
 /** The role the lake connects as, and the database its catalog is kept in. */
 export const LAKE_ROLE = "lake";

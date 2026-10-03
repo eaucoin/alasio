@@ -13,12 +13,13 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { zstdDecompressSync } from "node:zlib";
 
+import { Effect, Exit, Scope } from "effect";
 import pg from "pg";
 
 import { AppServerClient } from "../src/codex/app-server/client.ts";
 import { buildCodexEnv } from "../src/codex/env.ts";
 import { listRolloutFiles } from "../src/codex/rollouts/files.ts";
-import { type CodexRollouts, startCodexRollouts } from "../src/codex/rollouts/index.ts";
+import { makeCodexRollouts } from "../src/codex/rollouts/index.ts";
 import { restoreRollouts } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
@@ -144,7 +145,8 @@ describe("Codex sessions through the app-server", { skip }, () => {
   let database: TestPostgres | undefined;
   let pool: pg.Pool | undefined;
   let appServer: AppServerClient | undefined;
-  let rollouts: CodexRollouts | undefined;
+  /** The scope the rollouts are kept in, as alasio keeps them while it runs. */
+  let mirroring: Scope.Closeable | undefined;
   const savedCodexHome = process.env["CODEX_HOME"];
 
   before(async () => {
@@ -155,7 +157,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
   });
 
   after(async () => {
-    await rollouts?.close();
+    if (mirroring) await Effect.runPromise(Scope.close(mirroring, Exit.void));
     appServer?.stop();
     await pool?.end();
     await database?.stop();
@@ -194,7 +196,9 @@ describe("Codex sessions through the app-server", { skip }, () => {
     // Mirrored from the start, as alasio does.
     const store = new NeonRolloutStore(pool, { schema: "codex_sessions_e2e" });
     await store.ensureSchema();
-    rollouts = startCodexRollouts({ store, home });
+    const scope = Effect.runSync(Scope.make());
+    mirroring = scope;
+    const rollouts = await Effect.runPromise(makeCodexRollouts({ store, home }).pipe(Scope.provide(scope)));
     /** Whether the store holds exactly what a thread's files hold now. */
     const heldExactly = async (id: string) => {
       const files = listRolloutFiles(home).filter((file) => file.name.includes(id));
@@ -208,7 +212,7 @@ describe("Codex sessions through the app-server", { skip }, () => {
     for (const prompt of ["remember the heron", "and now the crane"]) {
       await runTurn(client, threadId, prompt, workingDirectory);
       // What Codex wrote by the turn's end is all in the store once a flush returns.
-      await rollouts.flush(threadId);
+      await Effect.runPromise(rollouts.flush(threadId));
       assert.ok(await heldExactly(threadId));
     }
 
@@ -243,13 +247,13 @@ describe("Codex sessions through the app-server", { skip }, () => {
     const files = listRolloutFiles(home);
     assert.equal(files.length, 2);
     const originals = new Map(files.map((file) => [file.path, { bytes: readFileSync(join(home, file.path)), modifiedMs: file.modifiedMs }]));
-    await rollouts.close();
+    await Effect.runPromise(Scope.close(scope, Exit.void));
 
     // Lose everything: the files, and every index Codex made from them.
     client.stop();
     const newHome = makeCodexHome(root, "new-codex-home", responses.url);
     process.env["CODEX_HOME"] = newHome;
-    const written = await restoreRollouts({ store, threadIds: [forkedId], home: newHome });
+    const written = await Effect.runPromise(restoreRollouts({ store, threadIds: [forkedId], home: newHome }));
     // The fork's history starts in the first thread's file, so both come back.
     assert.deepEqual(written.sort(), [...originals.keys()].sort());
     for (const [path, original] of originals) {

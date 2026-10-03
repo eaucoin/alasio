@@ -1,12 +1,10 @@
 import { createHash } from "node:crypto";
 import { setDefaultResultOrder } from "node:dns";
-import { createWriteStream, readFileSync } from "node:fs";
+import { createWriteStream, mkdtempSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtempSync } from "node:fs";
 import { setDefaultAutoSelectFamily } from "node:net";
 import { pipeline } from "node:stream/promises";
-import type { Span } from "@opentelemetry/api";
 import type {
   ApiMethods,
   ApiResponse,
@@ -18,7 +16,10 @@ import type {
   Opts,
   Update,
 } from "@grammyjs/types";
-import { rpcCall } from "../telemetry/index.ts";
+import { Clock, Config, Context, Effect, Layer, Schema, Semaphore } from "effect";
+import { FetchHttpClient } from "effect/http";
+import type { EffectRunner } from "../shared/effects.ts";
+import { withRpcCall } from "../telemetry/index.ts";
 import { renderTelegramHtml } from "./markdown.ts";
 import { splitRichMarkdown, toRichMarkdown } from "./rich-markdown.ts";
 import { type MediaKind, mediaIdsIn, withoutMediaLines } from "./rich-media.ts";
@@ -85,17 +86,6 @@ interface TextPayload extends TextMessageParams {
   disable_web_page_preview: boolean;
 }
 
-/** How a Bot API call is made. */
-export interface RequestOptions {
-  /** How many times a call Telegram rate-limits is retried after the wait it asks for. */
-  readonly rateLimitRetries?: number | undefined;
-  readonly signal?: AbortSignal | undefined;
-}
-
-export interface ClientOptions {
-  readonly apiRoot?: string | undefined;
-}
-
 /** An upload of a multipart call: the file at `path`, as the part `name`. */
 export interface Upload {
   readonly name: string;
@@ -106,7 +96,6 @@ export interface GetUpdatesOptions {
   readonly offset?: number | undefined;
   readonly timeout?: number | undefined;
   readonly allowedUpdates?: BotParams<"getUpdates">["allowed_updates"] | undefined;
-  readonly signal?: AbortSignal | undefined;
 }
 
 /** A Telegram file downloaded to a temporary directory of its own. */
@@ -122,6 +111,61 @@ interface RequestBody {
   readonly headers?: Record<string, string>;
   readonly body: string | FormData;
 }
+
+/** How a Bot API call is posted. */
+interface SendOptions {
+  /** Whether the call is a span of its own, which records its HTTP status and rate limits. */
+  readonly traced: boolean;
+  /** How many times a call Telegram rate-limits is retried after the wait it asks for. */
+  readonly rateLimitRetries: number;
+}
+
+/** Telegram refused a call: its HTTP status, what it answered, and the wait it asked for. */
+export class TelegramApiError extends Schema.TaggedError<TelegramApiError>()("TelegramApiError", {
+  method: Schema.String,
+  status: Schema.Number,
+  /** Telegram's description of the refusal, when it gave one. */
+  description: Schema.optional(Schema.String),
+  /** The wait Telegram asked for before a retry, when it rate-limited the call; 0 otherwise. */
+  retryAfterMs: Schema.Number,
+  message: Schema.String,
+}) {
+  /** The refusal `data` (null for a body that was not JSON) answered `method` with. */
+  static fromResponse(method: string, status: number, data: ApiResponse<unknown> | null): TelegramApiError {
+    const refusal = data && !data.ok ? data : undefined;
+    return new TelegramApiError({
+      method,
+      status,
+      ...(refusal?.description === undefined ? {} : { description: refusal.description }),
+      retryAfterMs: Number(refusal?.parameters?.retry_after ?? 0) * 1000,
+      message: `Telegram ${method} failed: HTTP ${status} ${JSON.stringify(data)}`,
+    });
+  }
+}
+
+/** A call that never reached Telegram, or whose answer never came back: fetch failed, or its upload could not be read. */
+export class TelegramTransportError extends Schema.TaggedError<TelegramTransportError>()("TelegramTransportError", {
+  method: Schema.String,
+  message: Schema.String,
+  cause: Schema.Defect(),
+}) {
+  static of(method: string, cause: unknown): TelegramTransportError {
+    return new TelegramTransportError({ method, message: cause instanceof Error ? cause.message : String(cause), cause });
+  }
+
+  // Read as the failure it wraps, as the logs and the outbox's last_error always have.
+  override toString(): string {
+    return String(this.cause);
+  }
+}
+
+/** A Telegram file that could not be downloaded. */
+export class TelegramFileError extends Schema.TaggedError<TelegramFileError>()("TelegramFileError", {
+  message: Schema.String,
+}) {}
+
+/** How a Bot API call fails. */
+export type TelegramError = TelegramApiError | TelegramTransportError;
 
 function buildTextPayload(chatId: ChatId, text: string, options: TextMessageOptions): TextPayload {
   const { format = "markdown", ...telegramOptions } = options;
@@ -148,74 +192,127 @@ function telegramMediaType(item: MediaAttachment): "animation" | "photo" | "vide
   return item.kind === "photo" ? "photo" : "video";
 }
 
-function shouldRetryAsPlainText(error: unknown, options: TextMessageOptions): boolean {
-  return (options.format ?? "markdown") === "markdown" && !options.parse_mode && String(error).includes("can't parse entities");
+/** Whether Telegram refused Markdown rendered as HTML, which goes again as plain text. */
+const shouldRetryAsPlainText = (options: TextMessageOptions) => (error: TelegramError): boolean =>
+  (options.format ?? "markdown") === "markdown" && !options.parse_mode
+  && error._tag === "TelegramApiError" && error.description?.includes("can't parse entities") === true;
+
+function isExpiredCallbackQueryError(error: TelegramError): boolean {
+  return error._tag === "TelegramApiError" && error.description?.includes("query is too old and response timeout expired or query ID is invalid") === true;
 }
 
-function isExpiredCallbackQueryError(error: unknown): boolean {
-  return String(error).includes("query is too old and response timeout expired or query ID is invalid");
+/** Whether Telegram refused a call as a bad request (HTTP 400). */
+function isBadRequest(error: TelegramError): boolean {
+  return error._tag === "TelegramApiError" && error.status === 400;
 }
 
-/** Whether Telegram refused a call as a bad request (HTTP 400), as a TelegramApiError's status says. */
-function isBadRequest(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "status" in error && error.status === 400;
-}
-
-export class TelegramApiError extends Error {
-  readonly status: number;
-  /** The wait Telegram asked for before a retry, when it rate-limited the call; 0 otherwise. */
-  readonly retryAfterMs: number;
-
-  constructor(method: string, response: Pick<Response, "status">, data: ApiResponse<unknown> | null) {
-    super(`Telegram ${method} failed: HTTP ${response.status} ${JSON.stringify(data)}`);
-    this.name = "TelegramApiError";
-    this.status = response.status;
-    const parameters = data && !data.ok ? data.parameters : undefined;
-    this.retryAfterMs = Number(parameters?.retry_after ?? 0) * 1000;
-  }
-}
+/** Records on the call's span that Telegram rate-limited it. */
+const recordRateLimit = (retryAfterMs: number): Effect.Effect<void> =>
+  Effect.currentSpan.pipe(
+    Effect.flatMap((span) => Clock.currentTimeNanos.pipe(
+      Effect.map((now) => span.event("rate_limited", now, { "telegram.retry_after_ms": retryAfterMs })),
+    )),
+    Effect.catchTag("NoSuchElementError", () => Effect.void),
+  );
 
 /**
  * The Bot API server alasio talks to: Telegram's own unless TELEGRAM_API_ROOT names
  * another, such as a self-hosted telegram-bot-api server or a test's stand-in.
  */
-export function telegramApiRoot(env: NodeJS.ProcessEnv = process.env): string {
-  return (env["TELEGRAM_API_ROOT"]?.trim() || "https://api.telegram.org").replace(/\/+$/u, "");
-}
+const TelegramApiRoot: Config.Config<string> = Config.String("TELEGRAM_API_ROOT").pipe(
+  Config.withDefault(""),
+  Config.map((root) => (root.trim() || "https://api.telegram.org").replace(/\/+$/u, "")),
+);
 
-export class Client {
-  readonly token: string;
-  private readonly apiBase: string;
-  private readonly fileBase: string;
-  private outboundTail: Promise<unknown>;
-
-  constructor(token: string, { apiRoot = telegramApiRoot() }: ClientOptions = {}) {
-    if (!token) {
-      throw new Error("TELEGRAM_BOT_TOKEN is required");
-    }
-    this.token = token;
-    this.apiBase = `${apiRoot}/bot${token}`;
-    this.fileBase = `${apiRoot}/file/bot${token}`;
-    this.outboundTail = Promise.resolve();
-  }
-
-  enqueueOutbound<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.outboundTail.then(operation, operation);
-    this.outboundTail = result.catch(() => undefined);
-    return result;
-  }
-
-  async call<M extends BotMethod>(method: M, payload?: BotParams<M>, options: RequestOptions = {}): Promise<BotResult<M>> {
-    return await this.request(method, () => jsonBody(payload), options);
-  }
-
+/** The Telegram Bot API, as alasio calls it. */
+export class TelegramClient extends Context.Service<TelegramClient, {
+  /** A JSON call. */
+  readonly call: <M extends BotMethod>(method: M, payload?: BotParams<M>) => Effect.Effect<BotResult<M>, TelegramError>;
   /**
    * A call with files: `fields` are sent as form fields (objects JSON-encoded, as the Bot
-   * API reads them) and each of `files` (`{ name, path }`) as an upload, referenced from
-   * the fields as `attach://<name>`.
+   * API reads them) and each of `files` as an upload, referenced from the fields as
+   * `attach://<name>`.
    */
-  async callMultipart<M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[], options: RequestOptions = {}): Promise<BotResult<M>> {
-    return await this.request(method, () => {
+  readonly callMultipart: <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[]) => Effect.Effect<BotResult<M>, TelegramError>;
+  readonly getMe: Effect.Effect<BotResult<"getMe">, TelegramError>;
+  readonly deleteWebhook: (dropPendingUpdates?: boolean) => Effect.Effect<BotResult<"deleteWebhook">, TelegramError>;
+  readonly setMyCommands: (commands: readonly BotCommand[]) => Effect.Effect<BotResult<"setMyCommands">, TelegramError>;
+  readonly setChatMenuButton: (menuButton?: MenuButton) => Effect.Effect<BotResult<"setChatMenuButton">, TelegramError>;
+  /**
+   * A long poll: it lasts as long as Telegram has nothing to deliver, which says nothing
+   * of the Bot API's latency, so it is sent without a span or a duration.
+   */
+  readonly getUpdates: (options?: GetUpdatesOptions) => Effect.Effect<readonly Update[], TelegramError>;
+  /**
+   * Sends text, after the messages sent or edited before it. `format` is "markdown" (the
+   * default: a Markdown subset as Telegram HTML), "plain", or "rich": Markdown as Telegram
+   * rich messages, which render tables, headings, lists, and code natively, in parts of
+   * up to ~30k characters.
+   */
+  readonly sendMessage: (chatId: ChatId, text: string, options?: SendMessageOptions) => Effect.Effect<readonly Message[], TelegramError>;
+  /** Edits a message's text, after the messages sent or edited before it. */
+  readonly editMessageText: (chatId: ChatId, messageId: number, text: string, options?: TextMessageOptions) => Effect.Effect<BotResult<"editMessageText">, TelegramError>;
+  readonly deleteMessage: (chatId: ChatId, messageId: number) => Effect.Effect<BotResult<"deleteMessage">, TelegramError>;
+  /** Answers a callback query; null when the query is too old to answer. */
+  readonly answerCallbackQuery: (callbackQueryId: string, text?: string) => Effect.Effect<BotResult<"answerCallbackQuery"> | null, TelegramError>;
+  readonly getFile: (fileId: string) => Effect.Effect<File, TelegramError>;
+  readonly downloadTelegramFile: (file: Pick<File, "file_id">, preferredName?: string) => Effect.Effect<DownloadedFile, TelegramError | TelegramFileError>;
+  /** A document upload, sent as it is: no span, and no retry when Telegram rate-limits it. */
+  readonly sendDocument: (chatId: ChatId, filePath: string, caption?: string) => Effect.Effect<BotResult<"sendDocument">, TelegramError>;
+}>()("alasio/telegram/TelegramClient") {
+  /** The Bot API for the bot `token`, at TELEGRAM_API_ROOT, called with FetchHttpClient.Fetch. */
+  static readonly layer = (token: string): Layer.Layer<TelegramClient> => Layer.effect(TelegramClient, makeTelegramClient(token));
+}
+
+const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn.Return<TelegramClient["Service"]> {
+  if (!token) {
+    return yield* Effect.die(new Error("TELEGRAM_BOT_TOKEN is required"));
+  }
+  const apiRoot = yield* Effect.orDie(TelegramApiRoot);
+  const fetch = yield* FetchHttpClient.Fetch;
+  const apiBase = `${apiRoot}/bot${token}`;
+  const fileBase = `${apiRoot}/file/bot${token}`;
+  // Messages go out one at a time, in the order they are sent or edited.
+  const outbound = yield* Semaphore.make(1);
+
+  /**
+   * Posts `method` to the Bot API, waiting out and retrying the rate limits it reports.
+   * The URL holds the bot token, so only the method, never the URL, reaches the call's
+   * span, if it has one.
+   */
+  const send = <M extends BotMethod>(method: M, makeBody: () => RequestBody, { traced, rateLimitRetries }: SendOptions): Effect.Effect<BotResult<M>, TelegramError> => {
+    const attempt = (retriesLeft: number): Effect.Effect<BotResult<M>, TelegramError> => Effect.gen(function*() {
+      const body = yield* Effect.try({ try: makeBody, catch: (cause) => TelegramTransportError.of(method, cause) });
+      const response = yield* Effect.tryPromise({
+        try: (signal) => fetch(`${apiBase}/${method}`, { method: "POST", ...body, signal }),
+        catch: (cause) => TelegramTransportError.of(method, cause),
+      });
+      if (traced) yield* Effect.annotateCurrentSpan("http.response.status_code", response.status);
+      // The Bot API answers every call with an ApiResponse; anything else reads as null.
+      const data = yield* Effect.promise(() => response.json().catch(() => null) as Promise<ApiResponse<BotResult<M>> | null>);
+      if (response.ok && data?.ok) {
+        return data.result;
+      }
+      const error = TelegramApiError.fromResponse(method, response.status, data);
+      if (!error.retryAfterMs || retriesLeft === 0) {
+        return yield* error;
+      }
+      if (traced) yield* recordRateLimit(error.retryAfterMs);
+      yield* Effect.sleep(error.retryAfterMs + 100);
+      return yield* attempt(retriesLeft - 1);
+    });
+    return attempt(rateLimitRetries);
+  };
+
+  /** A Bot API call, as a client span and a duration named by its method. */
+  const request = <M extends BotMethod>(method: M, makeBody: () => RequestBody): Effect.Effect<BotResult<M>, TelegramError> =>
+    send(method, makeBody, { traced: true, rateLimitRetries: 3 }).pipe(withRpcCall({ system: "telegram", service: "telegram", method }));
+
+  const call = <M extends BotMethod>(method: M, payload?: BotParams<M>): Effect.Effect<BotResult<M>, TelegramError> =>
+    request(method, () => jsonBody(payload));
+
+  const callMultipart = <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[]): Effect.Effect<BotResult<M>, TelegramError> =>
+    request(method, () => {
       const form = new FormData();
       for (const [key, value] of Object.entries(fields)) {
         if (value === undefined) continue;
@@ -225,115 +322,76 @@ export class Client {
         form.append(file.name, new Blob([readFileSync(file.path)]), basename(file.path));
       }
       return { body: form };
-    }, options);
-  }
-
-  /** A Bot API call, as a client span and a duration named by its method. */
-  async request<M extends BotMethod>(method: M, makeBody: () => RequestBody, options: RequestOptions = {}): Promise<BotResult<M>> {
-    return await rpcCall({ system: "telegram", service: "telegram", method }, (span) => this.send(method, makeBody, options, span));
-  }
-
-  /**
-   * Posts `method` to the Bot API, waiting out and retrying the rate limits it reports.
-   * The URL holds the bot token, so only the method, never the URL, reaches the call's
-   * `span`, if it has one.
-   */
-  async send<M extends BotMethod>(method: M, makeBody: () => RequestBody, options: RequestOptions = {}, span: Span | null = null): Promise<BotResult<M>> {
-    const maxRateLimitRetries = options.rateLimitRetries ?? 3;
-    for (let attempt = 0; ; attempt += 1) {
-      const response = await fetch(`${this.apiBase}/${method}`, {
-        method: "POST",
-        ...makeBody(),
-        signal: options.signal ?? null,
-      });
-      span?.setAttribute("http.response.status_code", response.status);
-      // The Bot API answers every call with an ApiResponse; anything else reads as null.
-      const data = await response.json().catch(() => null) as ApiResponse<BotResult<M>> | null;
-      if (response.ok && data?.ok) {
-        return data.result;
-      }
-      const error = new TelegramApiError(method, response, data);
-      if (!error.retryAfterMs || attempt >= maxRateLimitRetries) {
-        throw error;
-      }
-      span?.addEvent("rate_limited", { "telegram.retry_after_ms": error.retryAfterMs });
-      await new Promise<void>((resolve, reject) => {
-        let onAbort: (() => void) | undefined;
-        const finish = () => {
-          if (onAbort) {
-            options.signal?.removeEventListener("abort", onAbort);
-          }
-          resolve();
-        };
-        const timer = setTimeout(finish, error.retryAfterMs + 100);
-        if (options.signal) {
-          onAbort = () => {
-            clearTimeout(timer);
-            reject(options.signal?.reason ?? new Error("Telegram request aborted"));
-          };
-          if (options.signal.aborted) {
-            onAbort();
-            return;
-          }
-          options.signal.addEventListener("abort", onAbort, { once: true });
-        }
-      });
-    }
-  }
-
-  async getMe(): Promise<BotResult<"getMe">> {
-    return this.call("getMe");
-  }
-
-  async deleteWebhook(dropPendingUpdates = false): Promise<BotResult<"deleteWebhook">> {
-    return this.call("deleteWebhook", { drop_pending_updates: dropPendingUpdates });
-  }
-
-  async setMyCommands(commands: readonly BotCommand[]): Promise<BotResult<"setMyCommands">> {
-    return this.call("setMyCommands", { commands });
-  }
-
-  async setChatMenuButton(menuButton: MenuButton = { type: "commands" }): Promise<BotResult<"setChatMenuButton">> {
-    return this.call("setChatMenuButton", { menu_button: menuButton });
-  }
-
-  /**
-   * A long poll: it lasts as long as Telegram has nothing to deliver, which says nothing
-   * of the Bot API's latency, so it is sent without a span or a duration.
-   */
-  async getUpdates({ offset, timeout = 50, allowedUpdates = ["message", "callback_query"], signal }: GetUpdatesOptions = {}): Promise<Update[]> {
-    return this.send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { signal });
-  }
-
-  /**
-   * Send text. `format` is "markdown" (the default: a Markdown subset as Telegram HTML),
-   * "plain", or "rich": Markdown as Telegram rich messages, which render tables, headings,
-   * lists, and code natively, in parts of up to ~30k characters.
-   */
-  async sendMessage(chatId: ChatId, text: string, options: SendMessageOptions = {}): Promise<Message[]> {
-    return await this.enqueueOutbound(async () => {
-      if (options.format === "rich") {
-        return await this.sendRichParts(chatId, text, options);
-      }
-      return await this.sendTextChunks(chatId, text, options);
     });
-  }
 
-  async sendTextChunks(chatId: ChatId, text: string, options: TextMessageOptions): Promise<Message[]> {
+  const sendTextChunks = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: TextMessageOptions): Effect.fn.Return<Message[], TelegramError> {
     const sent: Message[] = [];
     for (const chunk of splitTelegramText(text)) {
-      const payload = buildTextPayload(chatId, chunk, options);
-      try {
-        sent.push(await this.call("sendMessage", payload));
-      } catch (error) {
-        if (!shouldRetryAsPlainText(error, options)) {
-          throw error;
-        }
-        sent.push(await this.call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" })));
-      }
+      sent.push(yield* call("sendMessage", buildTextPayload(chatId, chunk, options)).pipe(
+        Effect.catchIf(shouldRetryAsPlainText(options), () => call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" }))),
+      ));
     }
     return sent;
-  }
+  });
+
+  const sendRichPart = (chatId: ChatId, part: string, partMedia: readonly MediaAttachment[], telegramOptions: TextMessageParams): Effect.Effect<Message, TelegramError> => {
+    const richMessage: InputRichMessage<never> = { markdown: toRichMarkdown(part) || " " };
+    if (!partMedia.length) {
+      return call("sendRichMessage", { chat_id: chatId, rich_message: richMessage, ...telegramOptions });
+    }
+    richMessage.media = partMedia.map((item) => ({ id: item.id, media: { type: telegramMediaType(item), media: `attach://${item.id}` } }));
+    return callMultipart(
+      "sendRichMessage",
+      { chat_id: chatId, rich_message: richMessage, ...telegramOptions },
+      partMedia.map((item) => ({ name: item.id, path: item.file })),
+    );
+  };
+
+  /** One media item as its own message: a photo, video, or animation, or a document when Telegram will not take it as media. */
+  const sendMediaItem = (chatId: ChatId, item: MediaAttachment): Effect.Effect<Message, TelegramError> => {
+    const media = `attach://${item.id}`;
+    const files = [{ name: item.id, path: item.file }];
+    const asMedia = (): Effect.Effect<Message, TelegramError> => {
+      switch (telegramMediaType(item)) {
+        case "photo":
+          return callMultipart("sendPhoto", { chat_id: chatId, photo: media, disable_notification: true }, files);
+        case "video":
+          return callMultipart("sendVideo", { chat_id: chatId, video: media, disable_notification: true }, files);
+        case "animation":
+          return callMultipart("sendAnimation", { chat_id: chatId, animation: media, disable_notification: true }, files);
+      }
+    };
+    return asMedia().pipe(
+      Effect.catchIf(isBadRequest, () => callMultipart("sendDocument", { chat_id: chatId, document: media, disable_notification: true }, files)),
+    );
+  };
+
+  /**
+   * Media sent as their own messages (the fallback): one as a photo, video, or animation,
+   * several as albums of up to ten, silently, since the text before them notified.
+   */
+  const sendMediaClassic = Effect.fnUntraced(function*(chatId: ChatId, items: readonly MediaAttachment[]): Effect.fn.Return<Message[], TelegramError> {
+    const sent: Message[] = [];
+    // Albums take photos and videos; an animation goes alone.
+    const albumable = items.filter((item) => !item.animation);
+    for (const item of items.filter((item) => item.animation)) sent.push(yield* sendMediaItem(chatId, item));
+    for (let i = 0; i < albumable.length; i += 10) {
+      const group = albumable.slice(i, i + 10);
+      const [only] = group;
+      if (only !== undefined && group.length === 1) {
+        sent.push(yield* sendMediaItem(chatId, only));
+        continue;
+      }
+      sent.push(...yield* callMultipart(
+        "sendMediaGroup",
+        { chat_id: chatId, media: group.map((item) => ({ type: item.kind, media: `attach://${item.id}` })), disable_notification: true },
+        group.map((item) => ({ name: item.id, path: item.file })),
+      ).pipe(
+        Effect.catchIf(isBadRequest, () => Effect.forEach(group, (item) => sendMediaItem(chatId, item))),
+      ));
+    }
+    return sent;
+  });
 
   /**
    * Each part goes as a rich message, uploading the media it shows (`options.media`, see
@@ -342,171 +400,117 @@ export class Client {
    * instead, its media following as photos, videos, or an album, so a response is never
    * lost to its formatting.
    */
-  async sendRichParts(chatId: ChatId, text: string, options: SendMessageOptions): Promise<Message[]> {
+  const sendRichParts = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: SendMessageOptions): Effect.fn.Return<Message[], TelegramError> {
     const { format: _format, media = [], mediaDir: _mediaDir, ...telegramOptions } = options;
     const byId = new Map(media.map((item) => [item.id, item]));
     const sent: Message[] = [];
     for (const part of splitRichMarkdown(text || " ")) {
       const partMedia = [...new Set(mediaIdsIn(part))].map((id) => byId.get(id)).filter((item): item is MediaAttachment => Boolean(item));
-      try {
-        sent.push(await this.sendRichPart(chatId, part, partMedia, telegramOptions));
-      } catch (error) {
-        if (!isBadRequest(error)) {
-          throw error;
-        }
-        sent.push(...await this.sendTextChunks(chatId, withoutMediaLines(part), { ...telegramOptions, format: "markdown" }));
-        sent.push(...await this.sendMediaClassic(chatId, partMedia));
-      }
+      sent.push(...yield* sendRichPart(chatId, part, partMedia, telegramOptions).pipe(
+        Effect.map((message) => [message]),
+        Effect.catchIf(isBadRequest, () => Effect.all([
+          sendTextChunks(chatId, withoutMediaLines(part), { ...telegramOptions, format: "markdown" }),
+          sendMediaClassic(chatId, partMedia),
+        ]).pipe(Effect.map(([texts, media]) => [...texts, ...media]))),
+      ));
     }
     return sent;
-  }
+  });
 
-  async sendRichPart(chatId: ChatId, part: string, partMedia: readonly MediaAttachment[], telegramOptions: TextMessageParams): Promise<BotResult<"sendRichMessage">> {
-    const richMessage: InputRichMessage<never> = { markdown: toRichMarkdown(part) || " " };
-    if (!partMedia.length) {
-      return await this.call("sendRichMessage", { chat_id: chatId, rich_message: richMessage, ...telegramOptions });
-    }
-    richMessage.media = partMedia.map((item) => ({ id: item.id, media: { type: telegramMediaType(item), media: `attach://${item.id}` } }));
-    return await this.callMultipart(
-      "sendRichMessage",
-      { chat_id: chatId, rich_message: richMessage, ...telegramOptions },
-      partMedia.map((item) => ({ name: item.id, path: item.file })),
-    );
-  }
+  const getFile = (fileId: string): Effect.Effect<File, TelegramError> => call("getFile", { file_id: fileId });
 
-  /**
-   * Media sent as their own messages (the fallback): one as a photo, video, or animation,
-   * several as albums of up to ten, silently, since the text before them notified. A file
-   * Telegram will not take as media goes as a document.
-   */
-  async sendMediaClassic(chatId: ChatId, items: readonly MediaAttachment[]): Promise<Message[]> {
-    const sent: Message[] = [];
-    const single = async (item: MediaAttachment): Promise<Message> => {
-      const media = `attach://${item.id}`;
-      const files = [{ name: item.id, path: item.file }];
-      try {
-        switch (telegramMediaType(item)) {
-          case "photo":
-            return await this.callMultipart("sendPhoto", { chat_id: chatId, photo: media, disable_notification: true }, files);
-          case "video":
-            return await this.callMultipart("sendVideo", { chat_id: chatId, video: media, disable_notification: true }, files);
-          case "animation":
-            return await this.callMultipart("sendAnimation", { chat_id: chatId, animation: media, disable_notification: true }, files);
-        }
-      } catch (error) {
-        if (!isBadRequest(error)) throw error;
-        return await this.callMultipart("sendDocument", { chat_id: chatId, document: media, disable_notification: true }, files);
-      }
-    };
-    // Albums take photos and videos; an animation goes alone.
-    const albumable = items.filter((item) => !item.animation);
-    for (const item of items.filter((item) => item.animation)) sent.push(await single(item));
-    for (let i = 0; i < albumable.length; i += 10) {
-      const group = albumable.slice(i, i + 10);
-      if (group.length === 1) {
-        // A group of one has its item.
-        sent.push(await single(group[0]!));
-        continue;
-      }
-      try {
-        sent.push(...await this.callMultipart(
-          "sendMediaGroup",
-          { chat_id: chatId, media: group.map((item) => ({ type: item.kind, media: `attach://${item.id}` })), disable_notification: true },
-          group.map((item) => ({ name: item.id, path: item.file })),
-        ));
-      } catch (error) {
-        if (!isBadRequest(error)) throw error;
-        for (const item of group) sent.push(await single(item));
-      }
-    }
-    return sent;
-  }
-
-  async editMessageText(chatId: ChatId, messageId: number, text: string, options: TextMessageOptions = {}): Promise<BotResult<"editMessageText">> {
-    return await this.enqueueOutbound(async () => {
+  return TelegramClient.of({
+    call,
+    callMultipart,
+    getMe: call("getMe"),
+    deleteWebhook: (dropPendingUpdates = false) => call("deleteWebhook", { drop_pending_updates: dropPendingUpdates }),
+    setMyCommands: (commands) => call("setMyCommands", { commands }),
+    setChatMenuButton: (menuButton = { type: "commands" }) => call("setChatMenuButton", { menu_button: menuButton }),
+    getUpdates: ({ offset, timeout = 50, allowedUpdates = ["message", "callback_query"] } = {}) =>
+      send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { traced: false, rateLimitRetries: 3 }),
+    sendMessage: (chatId, text, options = {}) =>
+      outbound.withPermit(options.format === "rich" ? sendRichParts(chatId, text, options) : sendTextChunks(chatId, text, options)),
+    editMessageText: (chatId, messageId, text, options = {}) => {
       const chunk = splitTelegramText(text)[0] || " ";
-      const payload = {
-        ...buildTextPayload(chatId, chunk, options),
-        message_id: messageId,
-      };
-      try {
-        return await this.call("editMessageText", payload);
-      } catch (error) {
-        if (!shouldRetryAsPlainText(error, options)) {
-          throw error;
+      const edit = (format: TextMessageOptions) => call("editMessageText", { ...buildTextPayload(chatId, chunk, format), message_id: messageId });
+      return outbound.withPermit(edit(options).pipe(
+        Effect.catchIf(shouldRetryAsPlainText(options), () => edit({ ...options, format: "plain" })),
+      ));
+    },
+    deleteMessage: (chatId, messageId) => call("deleteMessage", { chat_id: chatId, message_id: messageId }),
+    answerCallbackQuery: (callbackQueryId, text = "") => {
+      const payload: BotParams<"answerCallbackQuery"> = { callback_query_id: callbackQueryId };
+      if (text) {
+        payload.text = text;
+      }
+      return call("answerCallbackQuery", payload).pipe(
+        Effect.catchIf(isExpiredCallbackQueryError, () => Effect.succeed(null)),
+      );
+    },
+    getFile,
+    downloadTelegramFile: Effect.fnUntraced(function*(file: Pick<File, "file_id">, preferredName = "download"): Effect.fn.Return<DownloadedFile, TelegramError | TelegramFileError> {
+      const remote = yield* getFile(file.file_id);
+      const filePath = remote.file_path;
+      if (!filePath) {
+        return yield* new TelegramFileError({ message: `Telegram file ${file.file_id} had no file_path` });
+      }
+      const ext = extname(preferredName) || extname(filePath) || "";
+      const safeBase = basename(preferredName, ext).replace(/[^A-Za-z0-9_.-]+/g, "-") || "download";
+      const localPath = join(mkdtempSync(join(tmpdir(), "telegram-file-")), `${safeBase}${ext}`);
+      const response = yield* Effect.tryPromise({
+        try: (signal) => fetch(`${fileBase}/${filePath}`, { signal }),
+        catch: (cause) => TelegramTransportError.of("getFile", cause),
+      });
+      const { body } = response;
+      if (!response.ok || !body) {
+        return yield* new TelegramFileError({ message: `Telegram file download failed: HTTP ${response.status}` });
+      }
+      const fileError = (cause: unknown) => new TelegramFileError({ message: cause instanceof Error ? cause.message : String(cause) });
+      yield* Effect.tryPromise({ try: () => pipeline(body, createWriteStream(localPath)), catch: fileError });
+      const sha256 = yield* Effect.try({ try: () => createHash("sha256").update(readFileSync(localPath)).digest("hex"), catch: fileError });
+      return { localPath, sha256, remote };
+    }),
+    sendDocument: (chatId, filePath, caption) =>
+      send("sendDocument", () => {
+        const form = new FormData();
+        form.append("chat_id", String(chatId));
+        if (caption) {
+          form.append("caption", caption.slice(0, 1024));
         }
-        return this.call("editMessageText", {
-          ...buildTextPayload(chatId, chunk, { ...options, format: "plain" }),
-          message_id: messageId,
-        });
-      }
-    });
-  }
+        form.append("document", new Blob([readFileSync(filePath)]), basename(filePath));
+        return { body: form };
+      }, { traced: false, rateLimitRetries: 0 }),
+  });
+});
 
-  async deleteMessage(chatId: ChatId, messageId: number): Promise<BotResult<"deleteMessage">> {
-    return this.call("deleteMessage", {
-      chat_id: chatId,
-      message_id: messageId,
-    });
-  }
+/**
+ * TelegramClient as promises, for alasio's code not yet written in Effect, which reaches
+ * it through alasio's EffectRunner (src/alasio.ts). It goes when its last caller moves.
+ */
+export interface Client {
+  readonly getMe: () => Promise<BotResult<"getMe">>;
+  readonly deleteWebhook: (dropPendingUpdates?: boolean) => Promise<BotResult<"deleteWebhook">>;
+  readonly setMyCommands: (commands: readonly BotCommand[]) => Promise<BotResult<"setMyCommands">>;
+  readonly setChatMenuButton: (menuButton?: MenuButton) => Promise<BotResult<"setChatMenuButton">>;
+  readonly sendMessage: (chatId: ChatId, text: string, options?: SendMessageOptions) => Promise<readonly Message[]>;
+  readonly editMessageText: (chatId: ChatId, messageId: number, text: string, options?: TextMessageOptions) => Promise<BotResult<"editMessageText">>;
+  readonly deleteMessage: (chatId: ChatId, messageId: number) => Promise<BotResult<"deleteMessage">>;
+  readonly answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<BotResult<"answerCallbackQuery"> | null>;
+  readonly downloadTelegramFile: (file: Pick<File, "file_id">, preferredName?: string) => Promise<DownloadedFile>;
+}
 
-  /** Answers a callback query; null when the query is too old to answer. */
-  async answerCallbackQuery(callbackQueryId: string, text = ""): Promise<BotResult<"answerCallbackQuery"> | null> {
-    const payload: BotParams<"answerCallbackQuery"> = {
-      callback_query_id: callbackQueryId,
-    };
-    if (text) {
-      payload.text = text;
-    }
-    try {
-      return await this.call("answerCallbackQuery", payload);
-    } catch (error) {
-      if (!isExpiredCallbackQueryError(error)) {
-        throw error;
-      }
-      return null;
-    }
-  }
-
-  async getFile(fileId: string): Promise<File> {
-    return this.call("getFile", { file_id: fileId });
-  }
-
-  async downloadTelegramFile(file: Pick<File, "file_id">, preferredName = "download"): Promise<DownloadedFile> {
-    const remote = await this.getFile(file.file_id);
-    if (!remote.file_path) {
-      throw new Error(`Telegram file ${file.file_id} had no file_path`);
-    }
-    const ext = extname(preferredName) || extname(remote.file_path) || "";
-    const safeBase = basename(preferredName, ext).replace(/[^A-Za-z0-9_.-]+/g, "-") || "download";
-    const tmpDir = mkdtempSync(join(tmpdir(), "telegram-file-"));
-    const localPath = join(tmpDir, `${safeBase}${ext}`);
-    const response = await fetch(`${this.fileBase}/${remote.file_path}`);
-    if (!response.ok || !response.body) {
-      throw new Error(`Telegram file download failed: HTTP ${response.status}`);
-    }
-    await pipeline(response.body, createWriteStream(localPath));
-    const hash = createHash("sha256").update(readFileSync(localPath)).digest("hex");
-    return { localPath, sha256: hash, remote };
-  }
-
-  async sendDocument(chatId: ChatId, filePath: string, caption?: string): Promise<BotResult<"sendDocument">> {
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    if (caption) {
-      form.append("caption", caption.slice(0, 1024));
-    }
-    const file = new Blob([readFileSync(filePath)]);
-    form.append("document", file, basename(filePath));
-    const response = await fetch(`${this.apiBase}/sendDocument`, {
-      method: "POST",
-      body: form,
-    });
-    // The Bot API answers every call with an ApiResponse; anything else reads as null.
-    const data = await response.json().catch(() => null) as ApiResponse<BotResult<"sendDocument">> | null;
-    if (!response.ok || !data?.ok) {
-      throw new Error(`Telegram sendDocument failed: HTTP ${response.status} ${JSON.stringify(data)}`);
-    }
-    return data.result;
-  }
+/** The promise façade of the TelegramClient `effects` runs in. */
+export function telegramClientFacade(effects: EffectRunner<TelegramClient>): Client {
+  const client = effects.runSync(TelegramClient);
+  return {
+    getMe: () => effects.runPromise(client.getMe),
+    deleteWebhook: (dropPendingUpdates) => effects.runPromise(client.deleteWebhook(dropPendingUpdates)),
+    setMyCommands: (commands) => effects.runPromise(client.setMyCommands(commands)),
+    setChatMenuButton: (menuButton) => effects.runPromise(client.setChatMenuButton(menuButton)),
+    sendMessage: (chatId, text, options) => effects.runPromise(client.sendMessage(chatId, text, options)),
+    editMessageText: (chatId, messageId, text, options) => effects.runPromise(client.editMessageText(chatId, messageId, text, options)),
+    deleteMessage: (chatId, messageId) => effects.runPromise(client.deleteMessage(chatId, messageId)),
+    answerCallbackQuery: (callbackQueryId, text) => effects.runPromise(client.answerCallbackQuery(callbackQueryId, text)),
+    downloadTelegramFile: (file, preferredName) => effects.runPromise(client.downloadTelegramFile(file, preferredName)),
+  };
 }

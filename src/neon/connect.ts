@@ -7,106 +7,177 @@
  * revokes them.
  */
 import { readFileSync } from "node:fs";
-import { setTimeout as sleep } from "node:timers/promises";
 
+import { Config, Context, Effect, FiberSet, Redacted, Schedule, Schema, type Scope } from "effect";
 import pg, { type Pool } from "pg";
 
-import { NeonRolloutStore } from "../codex/rollouts/store.ts";
+import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
-import { createLogger } from "../shared/log.ts";
-import { inSpan } from "../telemetry/index.ts";
+import { withLogScope } from "../shared/log.ts";
+import { withAlasioSpan } from "../telemetry/index.ts";
 import { ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 
-const log = createLogger("neon");
+/** What Neon failed with, as the database or the driver said it. */
+export class NeonUnavailable extends Schema.TaggedError<NeonUnavailable>()("NeonUnavailable", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
+}
+
+/** A setting Neon is reached with that the deployment did not give, or gave in a file alasio could not read. */
+export class NeonSettingError extends Schema.TaggedError<NeonSettingError>()("NeonSettingError", {
+  key: Schema.String,
+  cause: Schema.optional(Schema.Defect()),
+}) {
+  override get message(): string {
+    if (this.cause === undefined) return `${this.key} or ${this.key}_FILE must be set`;
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
+}
 
 /** How to reach a deployment's Neon, and whether the lake runs. */
 interface NeonAccess {
-  readonly databaseUrl: string;
-  readonly lakePassword: string;
+  readonly databaseUrl: Redacted.Redacted;
+  readonly lakePassword: Redacted.Redacted;
   readonly lake: boolean;
 }
 
 /** alasio's stores in an open Neon, on the pool they share. */
 interface OpenNeon {
   readonly pool: Pool;
-  readonly store: NeonSessionStore;
+  readonly sessionStore: NeonSessionStore;
   readonly rollouts: NeonRolloutStore;
 }
 
-/** alasio's connection to its deployment's Neon, as connectNeon makes it. */
-export interface Neon extends OpenNeon {
+/** alasio's Neon once connected, as the Neon service gives it. */
+export interface ConnectedNeon extends OpenNeon {
   /** Whether the analytics lake runs. */
   readonly lake: boolean;
-  close(): Promise<void>;
+  /** The session-filesystem Codex home's rollout store, made in Neon (and for the lake to read) when asked for. */
+  readonly sessionFsRollouts: Effect.Effect<NeonRolloutStore, NeonUnavailable>;
 }
 
-export interface ConnectNeonOptions {
-  readonly env?: Readonly<NodeJS.ProcessEnv>;
-  readonly lake?: boolean;
-  readonly timeoutMs?: number;
-}
+/** What connecting to Neon fails with: a setting missing, or Neon not answering in time. */
+export type NeonError = NeonUnavailable | NeonSettingError | Config.ConfigError;
+
+/** How long alasio waits for a deployment's Neon to answer as it starts, and how often it asks. */
+const CONNECT_PATIENCE = "10 minutes";
+const CONNECT_RETRY = "5 seconds";
+/** How many of the retries go by between one "waiting for Neon" line and the next: a minute's. */
+const RETRIES_PER_REPORT = 12;
+
+/** A setting's value, trimmed, or empty when it is not set. */
+const setting = (name: string): Config.Config<string> =>
+  Config.String(name).pipe(Config.map((value) => value.trim()), Config.withDefault(""));
+
+/** A secret the deployment gives in the file `<key>_FILE` names, or else as `<key>` itself. */
+const deploymentSecret = Effect.fnUntraced(function*(key: string): Effect.fn.Return<Redacted.Redacted, NeonSettingError | Config.ConfigError> {
+  const file = yield* setting(`${key}_FILE`);
+  if (file) {
+    return yield* Effect.try({
+      try: () => Redacted.make(readFileSync(file, "utf8").trim()),
+      catch: (cause) => new NeonSettingError({ key, cause }),
+    });
+  }
+  const value = yield* setting(key);
+  if (!value) return yield* new NeonSettingError({ key });
+  return Redacted.make(value);
+});
+
+/** A promise on Neon, its rejection a NeonUnavailable. */
+const onNeon = <A>(query: () => Promise<A>): Effect.Effect<A, NeonUnavailable> =>
+  Effect.tryPromise({ try: query, catch: (cause) => new NeonUnavailable({ cause }) });
+
+/** Ends a pool that is of no more use, whatever it says. */
+const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pipe(Effect.ignore);
 
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
- * and rollout stores' schemas, and the lake's role and reads.
+ * and rollout stores' schemas, and the lake's role and reads. A pool that cannot is
+ * ended: before the next attempt when this one fails, and in the background when a
+ * stop ends the wait, which does not wait for it.
  */
-async function openNeon({ databaseUrl, lakePassword, lake }: NeonAccess): Promise<OpenNeon> {
+const openNeon = Effect.fnUntraced(function*(
+  { databaseUrl, lakePassword, lake }: NeonAccess,
+  onIdleError: (error: Error) => void,
+): Effect.fn.Return<OpenNeon, NeonUnavailable> {
   const pool = new pg.Pool({
-    connectionString: databaseUrl,
+    connectionString: Redacted.value(databaseUrl),
     max: 8,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 30_000,
   });
   // An idle connection dies with the compute when it restarts; the pool
   // replaces it on the next checkout.
-  pool.on("error", (error) => log.warn(`idle database connection lost: ${error.message}`));
-  try {
-    const store = new NeonSessionStore(pool);
-    await store.ensureSchema();
-    const rollouts = new NeonRolloutStore(pool);
+  pool.on("error", onIdleError);
+  const sessionStore = new NeonSessionStore(pool);
+  const rollouts = new NeonRolloutStore(pool);
+  yield* onNeon(async () => {
+    await sessionStore.ensureSchema();
     await rollouts.ensureSchema();
-    await ensureLakeRole(pool, lakePassword);
+    await ensureLakeRole(pool, Redacted.value(lakePassword));
     await syncLakeReads(pool, lake);
-    return { pool, store, rollouts };
-  } catch (error) {
-    await pool.end().catch(() => {});
-    throw error;
-  }
-}
+  }).pipe(
+    Effect.tapError(() => endPool(pool)),
+    Effect.onInterrupt(() => Effect.forkDetach(endPool(pool))),
+  );
+  return { pool, sessionStore, rollouts };
+});
 
-/** How long alasio waits for a deployment's Neon to answer as it starts. */
-const CONNECT_TIMEOUT_MS = 600_000;
-
-function fileOrValue(env: Readonly<NodeJS.ProcessEnv>, key: string): string {
-  const file = env[`${key}_FILE`]?.trim();
-  if (file) return readFileSync(file, "utf8").trim();
-  const value = env[key]?.trim();
-  if (!value) throw new Error(`${key} or ${key}_FILE must be set`);
-  return value;
-}
+/**
+ * Neon's patience as alasio starts: every five seconds for ten minutes, saying why the
+ * first time and once a minute after.
+ */
+const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.during(CONNECT_PATIENCE)]).pipe(
+  Schedule.setInputType<NeonUnavailable>(),
+  Schedule.tap(({ attempt, input }) =>
+    attempt === 1 || attempt % RETRIES_PER_REPORT === 0 ? Effect.logInfo(`waiting for Neon: ${input.message}`) : Effect.void
+  ),
+);
 
 /**
  * Connects to the Neon the deployment provides, from `ALASIO_DATABASE_URL` and
- * `ALASIO_LAKE_PASSWORD` or their `_FILE` forms. The stack starts beside alasio, so it
- * is waited for, up to ten minutes, retrying while it does not answer. Returns `{ pool,
- * store, rollouts, lake, close }`: `store` keeps Claude Code's transcripts, `rollouts`
- * Codex's rollout files, and `lake` says whether the analytics lake runs.
+ * `ALASIO_LAKE_PASSWORD` or their `_FILE` forms, until the scope closes. The stack starts
+ * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
+ * answer; a stop meanwhile stops the wait.
  */
-export async function connectNeon({ env = process.env, lake = lakeEnabled(env), timeoutMs = CONNECT_TIMEOUT_MS }: ConnectNeonOptions = {}): Promise<Neon> {
-  const databaseUrl = fileOrValue(env, "ALASIO_DATABASE_URL");
-  const lakePassword = fileOrValue(env, "ALASIO_LAKE_PASSWORD");
-  const deadline = Date.now() + timeoutMs;
-  const { pool, store, rollouts } = await inSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }, async () => {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        return await openNeon({ databaseUrl, lakePassword, lake });
-      } catch (error) {
-        if (Date.now() + 5000 > deadline) throw error;
-        if (attempt === 1 || attempt % 12 === 0) log.info(`waiting for Neon: ${error instanceof Error ? error.message : String(error)}`);
-        await sleep(5000);
-      }
-    }
-  });
-  log.info("connected to Neon");
-  return { pool, store, rollouts, lake, close: () => pool.end() };
-}
+const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect.gen(function*() {
+  const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
+  const lakePassword = yield* deploymentSecret("ALASIO_LAKE_PASSWORD");
+  const lake = yield* lakeEnabled;
+  const runFork = yield* FiberSet.makeRuntime();
+  const onIdleError = (error: Error): void => {
+    runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
+  };
+  const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
+    openNeon({ databaseUrl, lakePassword, lake }, onIdleError).pipe(
+      Effect.retry(whileNeonStarts),
+      withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
+      Effect.interruptible,
+    ),
+    ({ pool }) => Effect.promise(() => pool.end()),
+  );
+  yield* Effect.logInfo("connected to Neon");
+  return {
+    pool,
+    sessionStore,
+    rollouts,
+    lake,
+    sessionFsRollouts: onNeon(async () => {
+      const store = new NeonRolloutStore(pool, { schema: SESSION_FS_SCHEMA });
+      await store.ensureSchema();
+      // The analytics lake loads this home too, once it may read it.
+      await syncLakeReads(pool, lake);
+      return store;
+    }),
+  };
+}).pipe(withLogScope("neon"));
+
+/**
+ * alasio's connection to its deployment's Neon, open while the scope `Neon.make` is run in
+ * lasts: `sessionStore` keeps Claude Code's transcripts, `rollouts` Codex's rollout
+ * files, and `lake` says whether the analytics lake runs.
+ */
+export class Neon extends Context.Service<Neon, ConnectedNeon>()("alasio/neon/Neon", { make: connectNeon }) {}

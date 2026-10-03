@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import type { Update } from "@grammyjs/types";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { Context, Effect, Layer } from "effect";
+import type { AlasioConfig } from "../config.ts";
 import type { HarnessName } from "../harness/names.ts";
 import { type CallbackAction, type NewCallbackAction, SqliteCallbackRepository } from "./callback-repository.ts";
 import {
@@ -415,4 +417,16 @@ export class SqliteStore {
   getSessionTokens(sessionId: string): number {
     return this.usage.getSessionTokens(sessionId);
   }
+}
+
+/**
+ * alasio's state, open while alasio runs and closed after everything using it has
+ * stopped. SQLite is synchronous, so the service is the store itself.
+ */
+export class Store extends Context.Service<Store, SqliteStore>()("alasio/persistence/Store") {
+  static readonly layer = ({ stateDir, dbPath, workingDirectory }: Pick<AlasioConfig, "stateDir" | "dbPath" | "workingDirectory">): Layer.Layer<Store> =>
+    Layer.effect(Store, Effect.acquireRelease(
+      Effect.sync(() => new SqliteStore(stateDir, dbPath, { defaultWorkingDirectory: workingDirectory })),
+      (store) => Effect.sync(() => store.close()),
+    ));
 }

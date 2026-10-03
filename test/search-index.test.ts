@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
+import { Array as Arr, Effect, Exit, Logger, Scope } from "effect";
+import { TestClock } from "effect/testing";
 import pg, { type QueryResultRow } from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
-import { startTranscriptSearch } from "../src/harness/claude/search/index.ts";
+import { indexTranscripts } from "../src/harness/claude/search/index.ts";
 import { SETTLE_MS, collectOrphans, indexBatch, settle } from "../src/harness/claude/search/indexer.ts";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.ts";
 import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
@@ -163,9 +165,10 @@ describe("searching", { skip }, () => {
 });
 
 describe("the indexer", { skip }, () => {
-  test("indexes what is appended while it runs, and stops when closed", async () => {
+  test("indexes what is appended while it runs, and stops when its scope closes", async () => {
     const { schema, store, q } = await makeSearch();
-    const search = startTranscriptSearch({ pool, schema });
+    const scope = Effect.runSync(Scope.make());
+    await Effect.runPromise(indexTranscripts({ pool, schema }).pipe(Scope.provide(scope)));
     try {
       await store.append(key("a"), [prompt("u1", "appended while indexing runs")]);
       const deadline = Date.now() + 15_000;
@@ -177,8 +180,35 @@ describe("the indexer", { skip }, () => {
       assert.deepEqual(found, [{ kind: "user.text" }]);
     } finally {
       const closing = Date.now();
-      await search.close();
-      assert.ok(Date.now() - closing < 5_000, "close does not wait out its sleep");
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+      assert.ok(Date.now() - closing < 5_000, "stopping does not wait out its sleep");
     }
+  });
+
+  test("a failure is said once and retried every minute, until indexing runs again, which is said too", async () => {
+    // No store in the schema yet, so indexing fails.
+    const schema = `search_${process.pid}_${++schemas}`;
+    const lines: string[] = [];
+    const logger = Logger.make(({ message }) => {
+      lines.push(Arr.ensure(message).join(" "));
+    });
+    /** Real time, for the indexer's queries to run, while its clock stands still. */
+    const meanwhile = Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 500)));
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* indexTranscripts({ pool, schema });
+      yield* meanwhile;
+      yield* TestClock.adjust("30 seconds");
+      yield* meanwhile;
+      assert.equal(lines.length, 1);
+      assert.match(lines[0] ?? "", /^indexing failed, and retries every 60s: schema "search_\d+_\d+" does not exist$/);
+
+      yield* Effect.promise(() => new NeonSessionStore(pool, { schema }).ensureSchema());
+      yield* TestClock.adjust("29 seconds");
+      yield* meanwhile;
+      assert.equal(lines.length, 1, "not retried before the minute is up");
+      yield* TestClock.adjust("1 second");
+      yield* meanwhile;
+      assert.deepEqual(lines.slice(1), ["every stored entry is indexed", "indexing is running again"]);
+    }).pipe(Effect.provide([TestClock.layer(), Logger.layer([logger])]))));
   });
 });

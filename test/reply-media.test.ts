@@ -4,19 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { Effect, Layer } from "effect";
+
 import { tomlRootString, operatorDeveloperInstructions } from "../src/codex/config-toml.ts";
 import { ReplyMedia } from "../src/codex/reply-media.ts";
 import { buildCodexThreadConfig } from "../src/codex/thread-config.ts";
 import { buildClaudeQueryOptions } from "../src/harness/claude/runtime.ts";
 import { REPLY_INSTRUCTIONS, withReplyInstructions } from "../src/harness/reply-instructions.ts";
-import type { OutboxEntry } from "../src/persistence/outbox-repository.ts";
+import { SqliteStore, Store } from "../src/persistence/store.ts";
 import type { SessionFilesystems } from "../src/sandbox/index.ts";
-import { Client, type MediaAttachment } from "../src/telegram/client.ts";
-import { type OutboxStore, TelegramOutbox } from "../src/telegram/outbox.ts";
+import type { MediaAttachment } from "../src/telegram/client.ts";
+import { Outbox } from "../src/telegram/outbox.ts";
 import { findMediaEmbeds, mediaIdsIn, placeMedia, sniffMedia, withoutMediaLines } from "../src/telegram/rich-media.ts";
 import { toRichMarkdown } from "../src/telegram/rich-markdown.ts";
 import { sessionFsWorkspace } from "../src/workspace/kind.ts";
-import { type BotCall, answerBotCalls, botApiError, paramsOf } from "./support/bot-api.ts";
+import { type BotCall, botApiClient, botApiError, botApiLayer, paramsOf } from "./support/bot-api.ts";
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0]);
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -164,10 +166,9 @@ test("a rich part uploads its media with it; when rejected, text then media go t
     { id: "m3", kind: "video", animation: true, file: gif },
   ];
   const text = "Look:\n\n<tg-collage>\n![](tg://photo?id=m1)\n![](tg://video?id=m2)\n</tg-collage>\n\n![](tg://video?id=m3 \"loop\")";
-  const client = new Client("test-token");
   const calls: BotCall[] = [];
   let reject = false;
-  answerBotCalls(client, async (call) => {
+  const client = await botApiClient(async (call) => {
     calls.push(call);
     if (reject && call.files && call.method === "sendRichMessage") {
       throw botApiError("Bad Request", 400);
@@ -175,7 +176,7 @@ test("a rich part uploads its media with it; when rejected, text then media go t
     return call.method === "sendMediaGroup" ? [{ message_id: 1 }, { message_id: 2 }] : { message_id: calls.length };
   });
 
-  await client.sendMessage(7, text, { format: "rich", media, mediaDir: dir });
+  await Effect.runPromise(client.sendMessage(7, text, { format: "rich", media, mediaDir: dir }));
   assert.equal(calls.length, 1);
   const [rich] = calls;
   const richParams = paramsOf(rich, "sendRichMessage");
@@ -184,13 +185,13 @@ test("a rich part uploads its media with it; when rejected, text then media go t
     ["m2", "video", "attach://m2"],
     ["m3", "animation", "attach://m3"],
   ]);
-  assert.deepEqual(rich?.files?.map((f) => f.name), ["m1", "m2", "m3"]);
+  assert.deepEqual(rich?.files, ["m1", "m2", "m3"]);
   assert.equal("mediaDir" in richParams, false); // alasio's own options stay home
   assert.equal("media" in richParams, false);
 
   calls.length = 0;
   reject = true;
-  await client.sendMessage(7, text, { format: "rich", media, mediaDir: dir });
+  await Effect.runPromise(client.sendMessage(7, text, { format: "rich", media, mediaDir: dir }));
   assert.deepEqual(calls.map((c) => c.method), ["sendRichMessage", "sendMessage", "sendAnimation", "sendMediaGroup"]);
   assert.doesNotMatch(paramsOf(calls[1], "sendMessage").text, /tg:\/\/|tg-collage/);
   const album = paramsOf(calls[3], "sendMediaGroup");
@@ -202,36 +203,22 @@ test("a sent reply's media copies are deleted", () => withDir(async (dir) => {
   const mediaDir = join(dir, "reply-media", "k");
   mkdirSync(mediaDir, { recursive: true });
   writeFileSync(join(mediaDir, "m1.png"), PNG);
-  const sent: string[] = [];
-  const options = { format: "rich", mediaDir } as const;
-  const due: OutboxEntry = {
-    id: "o1",
-    conversation_id: null,
-    chat_id: "7",
-    kind: "text",
-    text: "x",
-    options_json: JSON.stringify(options),
-    options,
-    pending_response_id: null,
-    state: "pending",
-    attempts: 0,
-    available_at: 0,
-    last_error: null,
-    traceparent: null,
-    created_at: new Date().toISOString(),
-    sent_at: null,
-  };
-  const store: OutboxStore = {
-    enqueueOutboxText: () => assert.fail("not enqueued"),
-    getDueOutbox: () => [due],
-    markOutboxSent: (id) => sent.push(id),
-    rescheduleOutbox: () => assert.fail("not rescheduled"),
-    getPendingOutboxCount: () => 1,
-  };
-  const outbox = new TelegramOutbox({ client: { sendMessage: async () => [] }, store, log: { info() {}, warn() {}, error() {} } });
-  await outbox.flushDue();
-  assert.deepEqual(sent, ["o1"]);
-  assert.equal(existsSync(mediaDir), false);
+  const store = new SqliteStore(dir);
+  try {
+    const telegram = botApiLayer(async (call) => {
+      assert.equal(call.method, "sendRichMessage");
+      return { message_id: 1 };
+    });
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const outbox = yield* Outbox;
+      yield* outbox.enqueueText({ chatId: "7", text: "x", options: { format: "rich", mediaDir } });
+      yield* outbox.deliverDue;
+    })).pipe(Effect.provide(Outbox.layer.pipe(Layer.provide([telegram, Layer.succeed(Store, store)])))));
+    assert.equal(store.getPendingOutboxCount(), 0);
+    assert.equal(existsSync(mediaDir), false);
+  } finally {
+    store.close();
+  }
 }));
 
 test("the operator's own Codex developer instructions are read in every TOML string form", () => {

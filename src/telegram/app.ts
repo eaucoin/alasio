@@ -1,7 +1,8 @@
 import type { Server } from "node:http";
 import type { Update } from "@grammyjs/types";
+import { Fiber } from "effect";
 import { TurnController } from "../codex/turn-controller.ts";
-import type { CodexRollouts } from "../codex/rollouts/index.ts";
+import type { CodexRolloutsFacade } from "../codex/rollouts/index.ts";
 import { type SessionFsCodex, createSessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { NeonSessionStore } from "../harness/claude/session-store.ts";
@@ -11,14 +12,14 @@ import { type SessionFilesystems, createSandbox } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { type ActiveQueries, type HarnessRegistry, createHarnessRegistry } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
-import { SqliteStore } from "../persistence/store.ts";
+import { type SqliteStore, Store } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
 import { CallbackHandler } from "./callback-handler.ts";
-import { Client } from "./client.ts";
+import { type Client, telegramClientFacade } from "./client.ts";
 import { MediaGroupBuffer } from "./media-group-buffer.ts";
 import { MessageHandler } from "./message-handler.ts";
-import { UpdatePoller } from "./update-poller.ts";
-import { TelegramOutbox } from "./outbox.ts";
+import { pollUpdates } from "./update-poller.ts";
+import { type TelegramOutbox, outboxFacade } from "./outbox.ts";
 import { type WorkflowWait, type WorkflowWakeEvent, startWorkflowHookServer } from "../workflow/hook-server.ts";
 import type { AlasioEffects } from "../alasio.ts";
 import { createLogger } from "../shared/log.ts";
@@ -31,8 +32,8 @@ export interface TelegramCodexAppConfig extends AlasioConfig {
   /** Claude Code's transcripts in Neon. */
   readonly sessionStore?: NeonSessionStore | null;
   /** Codex's rollouts in Neon, for the operator's Codex home and the session-filesystem one. */
-  readonly codexRollouts?: CodexRollouts | null;
-  readonly sessionFsCodexRollouts?: CodexRollouts | null;
+  readonly codexRollouts?: CodexRolloutsFacade | null;
+  readonly sessionFsCodexRollouts?: CodexRolloutsFacade | null;
   readonly kubeTemplates?: KubeTemplates | null;
   /** Stand-ins (test doubles) for what the app otherwise builds itself. */
   readonly sandbox?: SessionFilesystems | null;
@@ -61,13 +62,14 @@ export class TelegramCodexApp {
   readonly mediaGroups: MediaGroupBuffer;
   private completedResponseRecoveryTimer: ReturnType<typeof setInterval> | null;
   readonly messages: MessageHandler;
-  readonly poller: UpdatePoller;
+  /** Polling Telegram for updates, from start to stop. */
+  private poller: Fiber.Fiber<never> | null;
 
   constructor(config: TelegramCodexAppConfig) {
     this.config = config;
-    this.client = new Client(config.telegramBotToken);
-    this.store = new SqliteStore(config.stateDir, config.dbPath, { defaultWorkingDirectory: config.workingDirectory });
-    this.outbox = new TelegramOutbox({ client: this.client, store: this.store, log });
+    this.client = telegramClientFacade(config.effects);
+    this.store = config.effects.runSync(Store);
+    this.outbox = outboxFacade(config.effects);
     this.activeQueries = new Map();
     this.workflowWaits = new Map();
     this.workflowWakeEvents = new Map();
@@ -125,12 +127,7 @@ export class TelegramCodexApp {
       mediaGroups: this.mediaGroups,
       log,
     });
-    this.poller = new UpdatePoller({
-      client: this.client,
-      store: this.store,
-      processUpdate: (update) => this.processUpdate(update),
-      log,
-    });
+    this.poller = null;
   }
 
   async start(): Promise<void> {
@@ -147,13 +144,12 @@ export class TelegramCodexApp {
     this.startHookServer();
     this.turns.reconcilePersistentState();
     await this.turns.flushCompletedResponses();
-    this.outbox.start();
     await this.mediaGroups.flushDue();
     await this.adoptClaudeTranscripts();
     await this.restoreCodexRollouts();
     await this.turns.recoverInterruptedTurns();
     this.turns.resumePendingPrompts();
-    this.poller.start();
+    this.poller = this.config.effects.runFork(pollUpdates((update) => this.processUpdate(update)));
     this.startCompletedResponseRecovery();
     this.warmLinkedSessions().catch((error: unknown) => {
       log.warn(`Linked Codex session warmup failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -212,18 +208,20 @@ export class TelegramCodexApp {
       clearInterval(this.completedResponseRecoveryTimer);
       this.completedResponseRecoveryTimer = null;
     }
-    this.outbox.stop();
     this.turns.recordExternalRestartEventsForActiveTurns();
     const { hookServer } = this;
     if (hookServer) {
       await new Promise<Error | undefined>((resolve) => hookServer.close(resolve));
       this.hookServer = null;
     }
-    await this.poller.stop();
+    const { poller } = this;
+    if (poller) {
+      await this.config.effects.runPromise(Fiber.interrupt(poller));
+      this.poller = null;
+    }
     await this.harnesses.shutdownAll();
     await this.sessionFsCodex?.stop();
     await this.sandbox?.close();
-    this.store.close();
   }
 
   async configureNativeCommands(): Promise<void> {

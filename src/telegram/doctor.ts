@@ -1,16 +1,17 @@
 import "dotenv/config";
+import { Effect } from "effect";
 import { loadAlasioConfig } from "../config.ts";
-import { Client } from "./client.ts";
-import { SqliteStore } from "../persistence/store.ts";
+import { TelegramClient } from "./client.ts";
+import { Store } from "../persistence/store.ts";
 
 const args = new Set(process.argv.slice(2));
 const config = loadAlasioConfig();
-const client = new Client(config.telegramBotToken);
-const store = new SqliteStore(config.stateDir, config.dbPath, { defaultWorkingDirectory: config.workingDirectory });
 
-try {
-  const me = await client.getMe();
-  const webhookInfo = await client.call("getWebhookInfo");
+const doctor = Effect.gen(function*() {
+  const client = yield* TelegramClient;
+  const store = yield* Store;
+  const me = yield* client.getMe;
+  const webhookInfo = yield* client.call("getWebhookInfo");
   console.log(JSON.stringify({
     ok: true,
     bot: {
@@ -33,9 +34,9 @@ try {
   }, null, 2));
 
   if (args.has("--delete-webhook")) {
-    await client.deleteWebhook(false);
+    yield* client.deleteWebhook(false);
     console.log("Deleted webhook without dropping pending updates.");
   }
-} finally {
-  store.close();
-}
+});
+
+await Effect.runPromise(doctor.pipe(Effect.provide([TelegramClient.layer(config.telegramBotToken), Store.layer(config)])));

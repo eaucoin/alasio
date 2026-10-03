@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
+import { ConfigProvider, Effect } from "effect";
 import pg from "pg";
 
 import { syncClaude } from "../neon/lake/src/claude.ts";
@@ -549,9 +550,10 @@ test("a failing load is tried again soon, and the loader turns unhealthy only on
 });
 
 test("the lake is off unless ALASIO_LAKE_ENABLED is 1", () => {
-  assert.equal(lakeEnabled({}), false);
-  assert.equal(lakeEnabled({ ALASIO_LAKE_ENABLED: "0" }), false);
-  assert.equal(lakeEnabled({ ALASIO_LAKE_ENABLED: "1" }), true);
+  const enabled = (env: Record<string, string>) => Effect.runSync(lakeEnabled.parse(ConfigProvider.fromEnv({ env })));
+  assert.equal(enabled({}), false);
+  assert.equal(enabled({ ALASIO_LAKE_ENABLED: "0" }), false);
+  assert.equal(enabled({ ALASIO_LAKE_ENABLED: " 1 " }), true);
 });
 
 test("the lake's configuration names what is missing and refuses what is malformed", () => {

@@ -1,6 +1,6 @@
 import type { v2 } from "../../.types/codex/index.js";
 import type { ResponseBlock } from "../codex/event-projection.ts";
-import type { CodexRollouts } from "../codex/rollouts/index.ts";
+import type { CodexRolloutsFacade } from "../codex/rollouts/index.ts";
 import type { SessionFsCodex } from "../codex/sessionfs.ts";
 import type { AlasioConfig } from "../config.ts";
 import type { folderBaymaServer } from "../mcp/bayma.ts";
@@ -190,10 +190,10 @@ export interface HarnessOptions {
   /** Claude Code's transcripts in Neon. */
   readonly sessionStore?: NeonSessionStore | null;
   /** Codex's rollouts in Neon. */
-  readonly codexRollouts?: CodexRollouts | null;
+  readonly codexRollouts?: CodexRolloutsFacade | null;
   readonly sandbox?: SessionFilesystems | null;
   readonly sessionFsCodex?: SessionFsCodex | null;
-  readonly sessionFsCodexRollouts?: CodexRollouts | null;
+  readonly sessionFsCodexRollouts?: CodexRolloutsFacade | null;
   /** A folder workspace's bayma: ../mcp/bayma.ts's, from the deployment's host profile, unless a test gives its own. */
   readonly folderBayma?: typeof folderBaymaServer | undefined;
   /** How Claude Code is started: the Agent SDK's `query`, unless a test gives its own. */

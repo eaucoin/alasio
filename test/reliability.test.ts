@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Context } from "effect";
+import { Effect, Layer } from "effect";
 import { AppServerNotificationQueue } from "../src/codex/app-server/notification-queue.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { AppServerThreadClient } from "../src/codex/app-server/thread-client.ts";
@@ -13,13 +13,14 @@ import { interruptCodexTurn } from "../src/codex/runtime.ts";
 import { RestartRecovery } from "../src/codex/restart-recovery.ts";
 import { StatusReporter, type StatusReporterOptions } from "../src/codex/status-reporter.ts";
 import type { ActiveQueries } from "../src/harness/index.ts";
-import { SqliteStore } from "../src/persistence/store.ts";
-import { effectRunner } from "../src/shared/effects.ts";
+import { SqliteStore, Store } from "../src/persistence/store.ts";
+import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
+import { effectRunnerHere } from "../src/shared/effects.ts";
 import type { Logger } from "../src/shared/log.ts";
 import { TelegramCodexApp } from "../src/telegram/app.ts";
-import { Client, TelegramApiError } from "../src/telegram/client.ts";
+import { TelegramApiError } from "../src/telegram/client.ts";
 import type { OutboxText } from "../src/telegram/outbox.ts";
-import { answerBotCalls, paramsOf } from "./support/bot-api.ts";
+import { botApiClient, paramsOf } from "./support/bot-api.ts";
 
 const silentLog: Logger = { info() {}, warn() {}, error() {} };
 
@@ -261,10 +262,10 @@ test("SQLite prompt jobs and outbox survive process boundaries", () => {
   }
 });
 
-test("Telegram app wires the durable outbox into final response delivery", () => {
+test("Telegram app wires the durable outbox into final response delivery", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-composition-"));
   try {
-    const app = new TelegramCodexApp({
+    const options: AlasioOptions = {
       telegramBotToken: "test-token",
       allowedUserIds: "",
       workingDirectory: root,
@@ -274,11 +275,14 @@ test("Telegram app wires the durable outbox into final response delivery", () =>
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
-      effects: effectRunner(Context.empty()),
-    });
-    // The wiring is private to the turn controller and its reporter, so read through it.
-    assert.equal(app.turns["status"]["outbox"], app.outbox);
-    app.store.close();
+    };
+    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      const effects = yield* effectRunnerHere(yield* Layer.build(alasioServices(options)));
+      const app = new TelegramCodexApp({ ...options, effects });
+      // The wiring is private to the turn controller and its reporter, so read through it.
+      assert.equal(app.turns["status"]["outbox"], app.outbox);
+      assert.equal(app.store, effects.runSync(Store));
+    })));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -433,25 +437,28 @@ test("callback actions capture the mounted session generation", () => {
 });
 
 test("Telegram API error exposes retry_after", () => {
-  const error = new TelegramApiError("sendMessage", { status: 429 }, {
+  const error = TelegramApiError.fromResponse("sendMessage", 429, {
     ok: false,
     error_code: 429,
     description: "Too Many Requests: retry after 3",
     parameters: { retry_after: 3 },
   });
   assert.equal(error.retryAfterMs, 3000);
+  assert.equal(error.message, 'Telegram sendMessage failed: HTTP 429 {"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3","parameters":{"retry_after":3}}');
 });
 
 test("Telegram client serializes concurrent outbound messages", async () => {
-  const client = new Client("test-token");
   const calls: string[] = [];
-  answerBotCalls(client, async (call) => {
+  const client = await botApiClient(async (call) => {
     const { text } = paramsOf(call, "sendMessage");
     calls.push(`start:${text}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
     calls.push(`end:${text}`);
     return { message_id: calls.length };
   });
-  await Promise.all([client.sendMessage("1", "first", { format: "plain" }), client.sendMessage("1", "second", { format: "plain" })]);
+  await Effect.runPromise(Effect.all([
+    client.sendMessage("1", "first", { format: "plain" }),
+    client.sendMessage("1", "second", { format: "plain" }),
+  ], { concurrency: "unbounded" }));
   assert.deepEqual(calls, ["start:first", "end:first", "start:second", "end:second"]);
 });

@@ -5,11 +5,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { File, Message } from "@grammyjs/types";
+import { Array as Arr, Effect, Fiber, Layer, Logger } from "effect";
 
-import { SqliteStore } from "../src/persistence/store.ts";
-import type { Client, DownloadedFile, GetUpdatesOptions } from "../src/telegram/client.ts";
+import { SqliteStore, Store } from "../src/persistence/store.ts";
+import type { Client, DownloadedFile } from "../src/telegram/client.ts";
 import { type IncomingPrompt, MessageHandler, type MessageHandlerOptions, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
-import { UpdatePoller } from "../src/telegram/update-poller.ts";
+import { pollUpdates } from "../src/telegram/update-poller.ts";
+import { botApiLayer, paramsOf } from "./support/bot-api.ts";
 
 const CHAT = { id: 5, type: "private", first_name: "Operator" } as const;
 const OPERATOR = { id: 5, is_bot: false, first_name: "Operator" };
@@ -109,35 +111,27 @@ test("the poller advances past an update whose processing throws", async () => {
   await withStore(async (store) => {
     const seen: number[] = [];
     const errors: string[] = [];
-    let batch = 0;
-    const poller = new UpdatePoller({
-      client: {
-        async getUpdates({ offset }: GetUpdatesOptions) {
-          batch += 1;
-          if (batch === 1) {
-            assert.equal(offset, undefined);
-            return [{ update_id: 100 }, { update_id: 101 }];
-          }
-          if (batch === 2) {
-            assert.equal(offset, 102);
-            void poller.stop();
-          }
-          return [];
-        },
-      },
-      store,
-      processUpdate: async (update) => {
-        seen.push(update.update_id);
-        if (update.update_id === 100) {
-          throw new Error("poison");
-        }
-      },
-      log: { error: (message) => errors.push(message) },
+    const offsets: (number | undefined)[] = [];
+    const { promise: polledAgain, resolve: pollAgain } = Promise.withResolvers<void>();
+    const telegram = botApiLayer(async (call) => {
+      offsets.push(paramsOf(call, "getUpdates").offset);
+      if (offsets.length === 1) return [{ update_id: 100 }, { update_id: 101 }];
+      pollAgain();
+      return await new Promise<never>(() => {}); // a long poll that lasts until polling stops
     });
-    await poller.start();
+    const logged = Logger.layer([Logger.make(({ message }) => errors.push(Arr.ensure(message).join(" ")))]);
+    const poller = Effect.runFork(pollUpdates(async (update) => {
+      seen.push(update.update_id);
+      if (update.update_id === 100) {
+        throw new Error("poison");
+      }
+    }).pipe(Effect.provide([telegram, Layer.succeed(Store, store), logged])));
+    await polledAgain;
+    await Effect.runPromise(Fiber.interrupt(poller));
+    assert.deepEqual(offsets, [undefined, 102]);
     assert.deepEqual(seen, [100, 101]);
     assert.equal(store.getTelegramOffset(), 102);
     assert.equal(errors.length, 1);
-    assert.match(errors[0] ?? "",/Skipping update 100 after processing failure: Error: poison/);
+    assert.match(errors[0] ?? "", /Skipping update 100 after processing failure: Error: poison/);
   });
 });
