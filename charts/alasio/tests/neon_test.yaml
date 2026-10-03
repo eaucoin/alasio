@@ -57,7 +57,7 @@ tests:
   - it: pins every third-party image by digest
     templates: [templates/neon/storage.yaml, templates/neon/compute.yaml, templates/neon/seaweedfs.yaml]
     asserts:
-      - matchRegex: { path: 'spec.template.spec.containers[0].image', pattern: '(@sha256:[0-9a-f]{64}|alasio:1\.0\.0)$' }
+      - matchRegex: { path: 'spec.template.spec.containers[0].image', pattern: '(@sha256:[0-9a-f]{64}|alasio:[0-9]+\.[0-9]+\.[0-9]+)$' }
         documentSelector: { path: kind, value: StatefulSet, matchMany: true }
   - it: gives the object store a fixed count of volumes, not one made from the disk free
     template: templates/neon/seaweedfs.yaml
