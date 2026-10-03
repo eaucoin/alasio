@@ -1,31 +1,62 @@
-// @ts-nocheck
+import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
 import {
+  type ActiveQueries,
   CLAUDE_HARNESS,
   CODEX_HARNESS,
   HARNESS_NAMES,
+  type MountStore,
   harnessDisplayName,
   normalizeHarnessName,
   resolveHarnessName,
 } from "../harness/index.ts";
+import type { HarnessName } from "../harness/names.ts";
+import type { CallbackPayload } from "../persistence/callback-repository.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { ChatId, Client } from "../telegram/client.ts";
+import type { ControlCallback, ControlPanel, ControlPanelOptions } from "./session-control.ts";
 import { truncateText } from "./text.ts";
+
+/** The outcome of mounting a service on a conversation. */
+export interface HarnessSwitch {
+  /** Whether the service changed; false when it was already the active one. */
+  readonly switched: boolean;
+  readonly previous: HarnessName | null;
+  readonly next: HarnessName;
+  readonly sessionId: string | null;
+  readonly workingDirectory?: string | null | undefined;
+}
+
+/** Mounts `harness` on the conversation, or throws why it cannot be switched now. */
+export type SwitchHarness = (request: { readonly conversationId: string; readonly harness: HarnessName }) => Promise<HarnessSwitch>;
+
+/** The store's mounts, sessions, and callback actions, as the service panel reads them. */
+export type ServiceControlStore = MountStore
+  & Pick<SqliteStore, "createCallbackAction">
+  & Partial<Pick<SqliteStore, "getHarnessSessionId">>;
 
 const SERVICE_KIND_PREFIX = "service:";
 
 export const CHOOSE_SERVICE_NOTICE = "No service is mounted. Choose Codex or Claude to start; your message was not queued.";
 
-function serviceKind(kind) {
+function serviceKind(kind: string): string {
   return `${SERVICE_KIND_PREFIX}${kind}`;
 }
 
-export function isServiceControlAction(kind) {
+export function isServiceControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(SERVICE_KIND_PREFIX);
 }
 
-function shortSessionId(sessionId) {
+function shortSessionId(sessionId: string | null): string {
   return sessionId ? sessionId.slice(0, 8) : "-";
 }
 
-function createButton(store, conversationId, text, kind, payload = {}) {
+function createButton(
+  store: ServiceControlStore,
+  conversationId: string,
+  text: string,
+  kind: string,
+  payload: CallbackPayload = {},
+): InlineKeyboardButton.CallbackButton {
   return {
     text,
     callback_data: store.createCallbackAction({
@@ -36,19 +67,26 @@ function createButton(store, conversationId, text, kind, payload = {}) {
   };
 }
 
-function buildPanelOptions(replyMarkup) {
+function buildPanelOptions(replyMarkup: InlineKeyboardMarkup): ControlPanelOptions {
   return {
     format: "plain",
     reply_markup: replyMarkup,
   };
 }
 
-function mountedLine(store, conversationId, harness) {
+function mountedLine(store: ServiceControlStore, conversationId: string, harness: HarnessName): string {
   const sessionId = store.getHarnessSessionId?.(conversationId, harness) ?? null;
   return `${harnessDisplayName(harness)}: ${sessionId ? `session ${shortSessionId(sessionId)}` : "no mounted session"}`;
 }
 
-export function buildServicePanel({ store, activeQueries, conversationId, notice = "" }) {
+export interface ServicePanelRequest {
+  readonly store: ServiceControlStore;
+  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly conversationId: string;
+  readonly notice?: string | undefined;
+}
+
+export function buildServicePanel({ store, activeQueries, conversationId, notice = "" }: ServicePanelRequest): ControlPanel {
   const active = resolveHarnessName(store, conversationId);
   const working = activeQueries?.has?.(conversationId) ?? false;
   const lines = [
@@ -70,7 +108,7 @@ export function buildServicePanel({ store, activeQueries, conversationId, notice
   const switchRow = HARNESS_NAMES
     .filter((harness) => harness !== active)
     .map((harness) => createButton(store, conversationId, `Use ${harnessDisplayName(harness)}`, "use", { harness }));
-  const keyboard = [];
+  const keyboard: InlineKeyboardButton.CallbackButton[][] = [];
   if (switchRow.length > 0) {
     keyboard.push(switchRow);
   }
@@ -81,23 +119,32 @@ export function buildServicePanel({ store, activeQueries, conversationId, notice
   };
 }
 
+export interface SendServicePanelRequest {
+  readonly client: Pick<Client, "sendMessage">;
+  readonly store: ServiceControlStore;
+  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly conversationId: string;
+  readonly chatId: ChatId;
+}
+
 /**
  * Reply used whenever a prompt or control arrives before any service is mounted.
  * It is the only thing alasio says in that state.
  */
-export async function sendChooseServicePanel({ client, store, activeQueries, conversationId, chatId }) {
+export async function sendChooseServicePanel({ client, store, activeQueries, conversationId, chatId }: SendServicePanelRequest): Promise<void> {
   const panel = buildServicePanel({ store, activeQueries, conversationId, notice: CHOOSE_SERVICE_NOTICE });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-function describeSwitch(result, harness) {
+function describeSwitch(result: HarnessSwitch, harness: HarnessName): string {
   if (!result.switched) {
     return `${harnessDisplayName(harness)} is already active.`;
   }
   return result.previous ? `Switched to ${harnessDisplayName(harness)}.` : `Mounted ${harnessDisplayName(harness)}. Send a message to start.`;
 }
 
-export function resolveServiceTarget(target) {
+/** The service a /service argument or a button's payload names, or null when it names none. */
+export function resolveServiceTarget(target: unknown): HarnessName | null {
   if (!target) {
     return null;
   }
@@ -108,7 +155,15 @@ export function resolveServiceTarget(target) {
   return null;
 }
 
-export async function handleServiceTextCommand({ client, store, activeQueries, conversationId, chatId, target, switchHarness, onMounted = null }) {
+export interface ServiceTextCommand extends SendServicePanelRequest {
+  /** The service named after /service; empty for the panel alone. */
+  readonly target: string;
+  readonly switchHarness: SwitchHarness;
+  /** Called once a service has been newly mounted. */
+  readonly onMounted?: (() => Promise<void>) | null | undefined;
+}
+
+export async function handleServiceTextCommand({ client, store, activeQueries, conversationId, chatId, target, switchHarness, onMounted = null }: ServiceTextCommand): Promise<void> {
   if (target) {
     const harness = resolveServiceTarget(target);
     if (!harness) {
@@ -135,7 +190,7 @@ export async function handleServiceTextCommand({ client, store, activeQueries, c
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-async function editPanel(client, chatId, messageId, panel) {
+async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
   try {
     await client.editMessageText(chatId, messageId, panel.text, panel.options);
   } catch (error) {
@@ -143,6 +198,15 @@ async function editPanel(client, chatId, messageId, panel) {
       throw error;
     }
   }
+}
+
+export interface ServiceControlCallback extends ControlCallback {
+  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage">;
+  readonly store: ServiceControlStore;
+  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly switchHarness: SwitchHarness;
+  /** Called once a service has been newly mounted. */
+  readonly onMounted?: (() => Promise<void>) | null | undefined;
 }
 
 export async function handleServiceControlCallback({
@@ -155,7 +219,7 @@ export async function handleServiceControlCallback({
   chatId,
   messageId,
   onMounted = null,
-}) {
+}: ServiceControlCallback): Promise<void> {
   const kind = action.kind.slice(SERVICE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   if (kind === "close") {
@@ -168,7 +232,7 @@ export async function handleServiceControlCallback({
     return;
   }
   if (kind === "use") {
-    const harness = resolveServiceTarget(payload.harness);
+    const harness = resolveServiceTarget(payload["harness"]);
     if (!harness) {
       await client.answerCallbackQuery(callbackQueryId, "Unknown service.");
       return;

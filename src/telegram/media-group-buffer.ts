@@ -1,3 +1,4 @@
+import type { TurnController } from "../codex/turn-controller.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { Logger } from "../shared/log.ts";
 
@@ -9,19 +10,8 @@ type MediaGroupStore = Pick<
   "upsertMediaGroup" | "getPendingMediaGroupsDue" | "getMediaGroupMessages" | "getFilesForMessages" | "markMediaGroupFlushed"
 >;
 
-// The call the buffer makes on the turn controller, narrowed to what it uses
-// (codex/turn-controller.ts).
-interface MediaGroupPrompt {
-  conversationId: string;
-  chatId: number | string;
-  messageId: number;
-  text: string;
-  filePaths: string[];
-}
-
-interface MediaGroupTurns {
-  processPrompt(prompt: MediaGroupPrompt): Promise<void>;
-}
+/** What the buffer calls on the turn controller. */
+export type MediaGroupTurns = Pick<TurnController, "processPrompt">;
 
 export interface MediaGroupBufferOptions {
   store: MediaGroupStore;

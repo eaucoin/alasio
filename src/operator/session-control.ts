@@ -1,29 +1,70 @@
-// @ts-nocheck
-import { interruptActiveTurn } from "../harness/index.ts";
+import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
+import type { ListedSession } from "../harness/claude/sessions.ts";
+import { type ActiveQueries, type Harness, interruptActiveTurn } from "../harness/index.ts";
+import type { CallbackAction, CallbackPayload } from "../persistence/callback-repository.ts";
+import type { SqliteStore } from "../persistence/store.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
+import type { ChatId, Client, TextMessageOptions } from "../telegram/client.ts";
 import { truncateText } from "./text.ts";
+
+/** How an operator panel is sent or edited: as plain text, under its inline keyboard. */
+export interface ControlPanelOptions extends TextMessageOptions {
+  readonly format: "plain";
+  readonly reply_markup: InlineKeyboardMarkup;
+}
+
+/** An operator panel: a message and the buttons under it. */
+export interface ControlPanel {
+  readonly text: string;
+  readonly options: ControlPanelOptions;
+}
+
+/** A pressed panel button, as the callback handler hands it to a control. */
+export interface ControlCallback {
+  readonly action: CallbackAction;
+  readonly callbackQueryId: string;
+  readonly chatId: ChatId;
+  readonly messageId: number;
+}
+
+/** Starts and mounts a new session for the conversation; resolves to its id. */
+export type StartNewSession = (request: { readonly conversationId: string }) => Promise<string>;
+
+/** The store's sessions and callback actions, as the session panels read and change them. */
+export type SessionControlStore = Pick<SqliteStore, "getSessionId" | "setSessionId" | "getSessionTokens" | "createCallbackAction">;
+
+/** The mounted harness, as the session panels list, rewind, and resume its sessions. */
+export type SessionControlHarness = Pick<Harness, "displayName" | "sessions">;
 
 const CONTROL_KIND_PREFIX = "control:";
 
-function controlKind(kind) {
+function controlKind(kind: string): string {
   return `${CONTROL_KIND_PREFIX}${kind}`;
 }
 
-export function isSessionControlAction(kind) {
+export function isSessionControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(CONTROL_KIND_PREFIX);
 }
 
-function normalizePage(page, totalPages) {
+// A page arrives from a button's payload, which has been through JSON, so any value
+// is read leniently.
+function normalizePage(page: unknown, totalPages: number): number {
   const parsed = Number.parseInt(String(page ?? 1), 10);
   const safePage = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
   return Math.min(Math.max(safePage, 1), totalPages);
 }
 
-function shortSessionId(sessionId) {
+function shortSessionId(sessionId: string | null | undefined): string {
   return sessionId ? sessionId.slice(0, 8) : "-";
 }
 
-function createButton(store, conversationId, text, kind, payload = {}) {
+function createButton(
+  store: Pick<SqliteStore, "createCallbackAction">,
+  conversationId: string,
+  text: string,
+  kind: string,
+  payload: CallbackPayload = {},
+): InlineKeyboardButton.CallbackButton {
   return {
     text,
     callback_data: store.createCallbackAction({
@@ -34,23 +75,33 @@ function createButton(store, conversationId, text, kind, payload = {}) {
   };
 }
 
-function buildPanelOptions(replyMarkup) {
+function buildPanelOptions(replyMarkup: InlineKeyboardMarkup): ControlPanelOptions {
   return {
     format: "plain",
     reply_markup: replyMarkup,
   };
 }
 
-function closeRow(store, conversationId) {
+function closeRow(store: Pick<SqliteStore, "createCallbackAction">, conversationId: string): InlineKeyboardButton.CallbackButton[] {
   return [createButton(store, conversationId, "Close", "close")];
 }
 
-function describeSession(session, mountedSessionId) {
+function stringField(payload: CallbackPayload, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function numberField(payload: CallbackPayload, key: string): number | undefined {
+  const value = payload[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function describeSession(session: ListedSession, mountedSessionId: string | undefined): string {
   const marker = session.uuid === mountedSessionId ? "* " : "";
   return `${marker}${session.timestamp || "-"} - ${session.label || shortSessionId(session.uuid)}`;
 }
 
-async function buildMountedSummary(store, harness, conversationId) {
+async function buildMountedSummary(store: SessionControlStore, harness: SessionControlHarness, conversationId: string): Promise<string[]> {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return ["Mounted", `No mounted ${harness.displayName} session.`];
@@ -64,7 +115,15 @@ async function buildMountedSummary(store, harness, conversationId) {
   ];
 }
 
-export async function buildSessionsPanel({ store, harness, conversationId, page = 1 }) {
+export interface SessionsPanelRequest {
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly conversationId: string;
+  /** The page to show; normalized into range, so a button's payload is passed as it is. */
+  readonly page?: unknown;
+}
+
+export async function buildSessionsPanel({ store, harness, conversationId, page = 1 }: SessionsPanelRequest): Promise<ControlPanel> {
   const mountedSessionId = store.getSessionId(conversationId);
   const totalPages = await harness.sessions.getTotalSessionPages();
   const safePage = normalizePage(page, totalPages);
@@ -116,7 +175,14 @@ export async function buildSessionsPanel({ store, harness, conversationId, page 
   };
 }
 
-export async function buildCurrentSessionPanel({ store, harness, activeQueries, conversationId }) {
+export interface CurrentSessionPanelRequest {
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly activeQueries: ActiveQueries;
+  readonly conversationId: string;
+}
+
+export async function buildCurrentSessionPanel({ store, harness, activeQueries, conversationId }: CurrentSessionPanelRequest): Promise<ControlPanel> {
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {
     return {
@@ -166,7 +232,13 @@ export async function buildCurrentSessionPanel({ store, harness, activeQueries, 
   };
 }
 
-async function buildSessionPreviewPanel({ store, harness, conversationId, sessionId, page = 1 }) {
+async function buildSessionPreviewPanel({ store, harness, conversationId, sessionId, page = 1 }: {
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly conversationId: string;
+  readonly sessionId: string;
+  readonly page?: unknown;
+}): Promise<ControlPanel> {
   const lastMessage = await harness.sessions.getSessionLastMessage(sessionId);
   const mountedSessionId = store.getSessionId(conversationId);
   const lines = [
@@ -192,7 +264,15 @@ async function buildSessionPreviewPanel({ store, harness, conversationId, sessio
   };
 }
 
-async function buildRewindPanel({ store, harness, activeQueries, conversationId, page = 1, sessionId = null }) {
+async function buildRewindPanel({ store, harness, activeQueries, conversationId, page = 1, sessionId = null }: {
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly activeQueries: ActiveQueries;
+  readonly conversationId: string;
+  readonly page?: unknown;
+  /** The session to rewind; the mounted one when left out. */
+  readonly sessionId?: string | null | undefined;
+}): Promise<ControlPanel> {
   const targetSessionId = sessionId ?? store.getSessionId(conversationId);
   if (!targetSessionId) {
     return await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId });
@@ -239,7 +319,14 @@ async function buildRewindPanel({ store, harness, activeQueries, conversationId,
   };
 }
 
-async function buildRewindPreviewPanel({ store, harness, conversationId, sessionId, index, page = 1 }) {
+async function buildRewindPreviewPanel({ store, harness, conversationId, sessionId, index, page = 1 }: {
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly conversationId: string;
+  readonly sessionId: string;
+  readonly index: number | undefined;
+  readonly page?: unknown;
+}): Promise<ControlPanel> {
   const messages = await harness.sessions.listSessionMessages(sessionId);
   const target = messages.find((message) => message.index === index);
   if (!target) {
@@ -263,7 +350,7 @@ async function buildRewindPreviewPanel({ store, harness, conversationId, session
   };
 }
 
-async function editPanel(client, chatId, messageId, panel) {
+async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
   try {
     await client.editMessageText(chatId, messageId, panel.text, panel.options);
   } catch (error) {
@@ -273,14 +360,32 @@ async function editPanel(client, chatId, messageId, panel) {
   }
 }
 
-export async function sendSessionsPanel({ client, store, harness, conversationId, chatId, page = 1 }) {
+export interface SendSessionsPanelRequest extends SessionsPanelRequest {
+  readonly client: Pick<Client, "sendMessage">;
+  readonly chatId: ChatId;
+}
+
+export async function sendSessionsPanel({ client, store, harness, conversationId, chatId, page = 1 }: SendSessionsPanelRequest): Promise<void> {
   const panel = await buildSessionsPanel({ store, harness, conversationId, page });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-export async function sendCurrentSessionPanel({ client, store, harness, activeQueries, conversationId, chatId }) {
+export interface SendCurrentSessionPanelRequest extends CurrentSessionPanelRequest {
+  readonly client: Pick<Client, "sendMessage">;
+  readonly chatId: ChatId;
+}
+
+export async function sendCurrentSessionPanel({ client, store, harness, activeQueries, conversationId, chatId }: SendCurrentSessionPanelRequest): Promise<void> {
   const panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId });
   await client.sendMessage(chatId, panel.text, panel.options);
+}
+
+export interface SessionControlCallback extends ControlCallback {
+  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage">;
+  readonly store: SessionControlStore;
+  readonly harness: SessionControlHarness;
+  readonly activeQueries: ActiveQueries;
+  readonly startNewSession: StartNewSession;
 }
 
 export async function handleSessionControlCallback({
@@ -293,14 +398,16 @@ export async function handleSessionControlCallback({
   callbackQueryId,
   chatId,
   messageId,
-}) {
+}: SessionControlCallback): Promise<void> {
   const kind = action.kind.slice(CONTROL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
-  let panel = null;
+  // Every button of these panels that names a session carries it as a string.
+  const payloadSessionId = stringField(payload, "sessionId");
+  let panel: ControlPanel | null = null;
   let notice = "";
 
   if (kind === "sessions") {
-    panel = await buildSessionsPanel({ store, harness, conversationId: action.conversationId, page: payload.page });
+    panel = await buildSessionsPanel({ store, harness, conversationId: action.conversationId, page: payload["page"] });
   } else if (kind === "current") {
     panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
   } else if (kind === "new") {
@@ -312,16 +419,16 @@ export async function handleSessionControlCallback({
       notice = `New session mounted: ${shortSessionId(sessionId)}.`;
       panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
     }
-  } else if (kind === "preview") {
+  } else if (kind === "preview" && payloadSessionId !== undefined) {
     panel = await buildSessionPreviewPanel({
       store,
       harness,
       conversationId: action.conversationId,
-      sessionId: payload.sessionId,
-      page: payload.page,
+      sessionId: payloadSessionId,
+      page: payload["page"],
     });
-  } else if (kind === "mount") {
-    store.setSessionId(action.conversationId, payload.sessionId);
+  } else if (kind === "mount" && payloadSessionId !== undefined) {
+    store.setSessionId(action.conversationId, payloadSessionId);
     notice = "Mounted.";
     panel = await buildCurrentSessionPanel({ store, harness, activeQueries, conversationId: action.conversationId });
   } else if (kind === "rewind") {
@@ -330,23 +437,24 @@ export async function handleSessionControlCallback({
       harness,
       activeQueries,
       conversationId: action.conversationId,
-      sessionId: payload.sessionId,
-      page: payload.page,
+      sessionId: payloadSessionId,
+      page: payload["page"],
     });
-  } else if (kind === "rewind_preview") {
+  } else if (kind === "rewind_preview" && payloadSessionId !== undefined) {
     panel = await buildRewindPreviewPanel({
       store,
       harness,
       conversationId: action.conversationId,
-      sessionId: payload.sessionId,
-      index: payload.index,
-      page: payload.page,
+      sessionId: payloadSessionId,
+      index: numberField(payload, "index"),
+      page: payload["page"],
     });
-  } else if (kind === "rewind_fork") {
-    const messages = await harness.sessions.listSessionMessages(payload.sessionId);
-    const target = messages.find((message) => message.index === payload.index);
+  } else if (kind === "rewind_fork" && payloadSessionId !== undefined) {
+    const index = numberField(payload, "index");
+    const messages = await harness.sessions.listSessionMessages(payloadSessionId);
+    const target = messages.find((message) => message.index === index);
     const forkedId = target
-      ? await harness.sessions.createForkedSession(payload.sessionId, target.uuid, { threadKey: action.conversationId })
+      ? await harness.sessions.createForkedSession(payloadSessionId, target.uuid, { threadKey: action.conversationId })
       : null;
     if (forkedId) {
       store.setSessionId(action.conversationId, forkedId);
@@ -359,7 +467,7 @@ export async function handleSessionControlCallback({
         harness,
         activeQueries,
         conversationId: action.conversationId,
-        sessionId: payload.sessionId,
+        sessionId: payloadSessionId,
         page: 1,
       });
     }

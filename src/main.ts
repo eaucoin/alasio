@@ -1,26 +1,25 @@
-// @ts-nocheck
 import { loadAlasioConfig } from "./config.ts";
 import { codexHome } from "./codex/env.ts";
-import { startCodexRollouts } from "./codex/rollouts/index.ts";
+import { type CodexRollouts, startCodexRollouts } from "./codex/rollouts/index.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "./codex/rollouts/store.ts";
 import { sessionFsCodexHome } from "./codex/sessionfs.ts";
-import { startTranscriptSearch } from "./harness/claude/search/index.ts";
+import { type TranscriptSearch, startTranscriptSearch } from "./harness/claude/search/index.ts";
 import { loadKubeTemplates } from "./kube/config.ts";
 import { syncLakeReads } from "./neon/lake.ts";
-import { connectNeon } from "./neon/connect.ts";
+import { type Neon, connectNeon } from "./neon/connect.ts";
 import { createLogger } from "./shared/log.ts";
 import { stopTelemetry } from "./telemetry/start.ts";
 import { TelegramCodexApp } from "./telegram/app.ts";
 
 const log = createLogger("index");
 const config = loadAlasioConfig();
-let neon = null;
-let app = null;
-let search = null;
-let codexRollouts = null;
-let sessionFsCodexRollouts = null;
+let neon: Neon | null = null;
+let app: TelegramCodexApp | null = null;
+let search: TranscriptSearch | null = null;
+let codexRollouts: CodexRollouts | null = null;
+let sessionFsCodexRollouts: CodexRollouts | null = null;
 
-async function main() {
+async function main(): Promise<void> {
   // What the deployment makes workspaces from, checked before anything else starts.
   const kubeTemplates = loadKubeTemplates();
   // Claude Code's transcripts and Codex's rollouts are kept in alasio's Neon, which the
@@ -44,7 +43,7 @@ async function main() {
   search = startTranscriptSearch({ pool: neon.pool });
 }
 
-async function shutdown(signal) {
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
   log.info(`Received ${signal}, shutting down...`);
   try {
     await app?.stop();
@@ -62,7 +61,7 @@ async function shutdown(signal) {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-main().catch(async (error) => {
+main().catch(async (error: unknown) => {
   log.error(`Fatal error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
   await stopTelemetry();
   process.exit(1);

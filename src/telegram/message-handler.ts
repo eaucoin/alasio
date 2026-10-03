@@ -1,4 +1,5 @@
 import type { Message } from "@grammyjs/types";
+import type { TurnController } from "../codex/turn-controller.ts";
 import type { SqliteStore } from "../persistence/store.ts";
 import type { Logger } from "../shared/log.ts";
 import type { Authorizer } from "./authorizer.ts";
@@ -9,22 +10,10 @@ import { type IncomingFile, getMessageFiles, getMessageText } from "./message.ts
 /** Bot API getFile refuses anything larger than this, regardless of plan. */
 export const TELEGRAM_BOT_FILE_LIMIT_BYTES = 20 * 1024 * 1024;
 
-// What the handler calls on the turn controller (codex/turn-controller.ts), narrowed to
-// what it uses until that module exports its own types.
-interface IncomingPrompt {
-  conversationId: string;
-  chatId: number;
-  messageId: number;
-  text: string;
-  filePaths: string[];
-}
+export type { IncomingPrompt } from "../codex/turn-controller.ts";
 
-interface MessageTurns {
-  /** Sends the next step of the conversation's setup, if it has one left; whether it did. */
-  sendNextSetupStep(target: { conversationId: string; chatId: number }): Promise<boolean>;
-  processPrompt(prompt: IncomingPrompt): Promise<void>;
-  harnessLabel?(conversationId: string): string;
-}
+/** What the handler calls on the turn controller; its harness label only when it has one. */
+export type MessageTurns = Pick<TurnController, "sendNextSetupStep" | "processPrompt"> & Partial<Pick<TurnController, "harnessLabel">>;
 
 /** The store's conversations, messages, and files, as the handler records them. */
 type MessageStore = Pick<SqliteStore, "upsertConversation" | "insertMessage" | "getSessionId" | "insertFile">;
@@ -35,7 +24,7 @@ export interface MessageHandlerOptions {
   store: MessageStore;
   turns: MessageTurns;
   mediaGroups: Pick<MediaGroupBuffer, "buffer">;
-  log: Logger;
+  log: Pick<Logger, "warn" | "error">;
 }
 
 function describeDownloadFailure(file: IncomingFile, error: unknown): string {
@@ -54,7 +43,7 @@ export class MessageHandler {
   private readonly store: MessageStore;
   private readonly turns: MessageTurns;
   private readonly mediaGroups: Pick<MediaGroupBuffer, "buffer">;
-  private readonly log: Logger;
+  private readonly log: Pick<Logger, "warn" | "error">;
 
   constructor({ authorizer, client, store, turns, mediaGroups, log }: MessageHandlerOptions) {
     this.authorizer = authorizer;

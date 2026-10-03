@@ -1,10 +1,15 @@
-// @ts-nocheck
+import type { Server } from "node:http";
+import type { Update } from "@grammyjs/types";
 import { TurnController } from "../codex/turn-controller.ts";
-import { createSessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
-import { adoptTranscripts } from "../harness/claude/transcripts.ts";
-import { createSandbox } from "../sandbox/index.ts";
+import type { CodexRollouts } from "../codex/rollouts/index.ts";
+import { type SessionFsCodex, createSessionFsCodex, sessionFsCodexHome } from "../codex/sessionfs.ts";
+import type { AlasioConfig } from "../config.ts";
+import type { NeonSessionStore } from "../harness/claude/session-store.ts";
+import { type AdoptedSession, adoptTranscripts } from "../harness/claude/transcripts.ts";
+import type { KubeTemplates } from "../kube/config.ts";
+import { type SessionFilesystems, createSandbox } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
-import { createHarnessRegistry } from "../harness/index.ts";
+import { type ActiveQueries, type HarnessRegistry, createHarnessRegistry } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import { SqliteStore } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
@@ -14,14 +19,48 @@ import { MediaGroupBuffer } from "./media-group-buffer.ts";
 import { MessageHandler } from "./message-handler.ts";
 import { UpdatePoller } from "./update-poller.ts";
 import { TelegramOutbox } from "./outbox.ts";
-import { startWorkflowHookServer } from "../workflow/hook-server.ts";
+import { type WorkflowWait, type WorkflowWakeEvent, startWorkflowHookServer } from "../workflow/hook-server.ts";
 import { createLogger } from "../shared/log.ts";
 import { inSpan, SpanKind } from "../telemetry/index.ts";
 
 const log = createLogger("telegram-app");
 
+/** What the app is built from: alasio's configuration, and what main starts before it. */
+export interface TelegramCodexAppConfig extends AlasioConfig {
+  /** Claude Code's transcripts in Neon. */
+  readonly sessionStore?: NeonSessionStore | null;
+  /** Codex's rollouts in Neon, for the operator's Codex home and the session-filesystem one. */
+  readonly codexRollouts?: CodexRollouts | null;
+  readonly sessionFsCodexRollouts?: CodexRollouts | null;
+  readonly kubeTemplates?: KubeTemplates | null;
+  /** Stand-ins (test doubles) for what the app otherwise builds itself. */
+  readonly sandbox?: SessionFilesystems | null;
+  readonly sessionFsCodex?: SessionFsCodex | null;
+  readonly harnesses?: HarnessRegistry | null;
+}
+
 export class TelegramCodexApp {
-  constructor(config) {
+  readonly config: TelegramCodexAppConfig;
+  readonly client: Client;
+  readonly store: SqliteStore;
+  readonly outbox: TelegramOutbox;
+  readonly activeQueries: ActiveQueries;
+  readonly workflowWaits: Map<string, WorkflowWait>;
+  readonly workflowWakeEvents: Map<string, WorkflowWakeEvent>;
+  private hookServer: Server | null;
+  private isStopping: boolean;
+  readonly authorizer: Authorizer;
+  readonly sandbox: SessionFilesystems | null;
+  readonly sessionFsCodex: SessionFsCodex | null;
+  readonly harnesses: HarnessRegistry;
+  readonly turns: TurnController;
+  readonly callbacks: CallbackHandler;
+  readonly mediaGroups: MediaGroupBuffer;
+  private completedResponseRecoveryTimer: ReturnType<typeof setInterval> | null;
+  readonly messages: MessageHandler;
+  readonly poller: UpdatePoller;
+
+  constructor(config: TelegramCodexAppConfig) {
     this.config = config;
     this.client = new Client(config.telegramBotToken);
     this.store = new SqliteStore(config.stateDir, config.dbPath, { defaultWorkingDirectory: config.workingDirectory });
@@ -91,7 +130,7 @@ export class TelegramCodexApp {
     });
   }
 
-  async start() {
+  async start(): Promise<void> {
     const me = await this.client.getMe();
     log.info(`Starting Telegram alasio bot as @${me.username ?? me.id}`);
     log.info(`  State database: ${this.config.dbPath}`);
@@ -113,7 +152,7 @@ export class TelegramCodexApp {
     this.turns.resumePendingPrompts();
     this.poller.start();
     this.startCompletedResponseRecovery();
-    this.warmLinkedSessions().catch((error) => {
+    this.warmLinkedSessions().catch((error: unknown) => {
       log.warn(`Linked Codex session warmup failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
@@ -122,14 +161,14 @@ export class TelegramCodexApp {
    * Brings every Claude session alasio points at into the session store before
    * any turn resumes one: imported whole the first time, then reconciled.
    */
-  async adoptClaudeTranscripts() {
+  async adoptClaudeTranscripts(): Promise<void> {
     const sessionStore = this.config.sessionStore;
     if (!sessionStore) {
       return;
     }
     const sessions = this.store.listHarnessSessionReferences(CLAUDE_HARNESS)
       .map(({ sessionId, workingDirectory }) => ({ sessionId, workingDirectory: this.harnessDirectoryOf(workingDirectory) }))
-      .filter(({ workingDirectory }) => workingDirectory);
+      .filter((session): session is AdoptedSession => Boolean(session.workingDirectory));
     log.info(`  Session store: adopting ${sessions.length} Claude session(s)`);
     await adoptTranscripts({ store: sessionStore, sessions });
   }
@@ -139,7 +178,7 @@ export class TelegramCodexApp {
    * filesystem's harness directory; null for a session filesystem this deployment does
    * not enable.
    */
-  harnessDirectoryOf(workingDirectory) {
+  harnessDirectoryOf(workingDirectory: string): string | null {
     const workspace = parseWorkspace(workingDirectory);
     if (workspace?.kind !== "sessionfs") return workingDirectory;
     return this.sandbox?.harnessDirectory(workspace.volumeId) ?? null;
@@ -149,11 +188,11 @@ export class TelegramCodexApp {
    * Writes back from Neon every Codex rollout file a thread alasio points at
    * needs and this machine lacks, before any turn resumes one.
    */
-  async restoreCodexRollouts() {
+  async restoreCodexRollouts(): Promise<void> {
     const references = this.store.listHarnessSessionReferences(CODEX_HARNESS);
     // Each thread goes back to the Codex home it runs from: the operator's for a folder,
     // the session-filesystem app-server's for a session filesystem.
-    for (const [rollouts, sessionFs] of [[this.config.codexRollouts, false], [this.config.sessionFsCodexRollouts, true]]) {
+    for (const [rollouts, sessionFs] of [[this.config.codexRollouts, false], [this.config.sessionFsCodexRollouts, true]] as const) {
       if (!rollouts) continue;
       const threadIds = references
         .filter(({ workingDirectory }) => (parseWorkspace(workingDirectory)?.kind === "sessionfs") === sessionFs)
@@ -163,7 +202,7 @@ export class TelegramCodexApp {
     }
   }
 
-  async stop() {
+  async stop(): Promise<void> {
     this.isStopping = true;
     this.mediaGroups.stop();
     if (this.completedResponseRecoveryTimer) {
@@ -172,8 +211,9 @@ export class TelegramCodexApp {
     }
     this.outbox.stop();
     this.turns.recordExternalRestartEventsForActiveTurns();
-    if (this.hookServer) {
-      await new Promise((resolve) => this.hookServer.close(resolve));
+    const { hookServer } = this;
+    if (hookServer) {
+      await new Promise<Error | undefined>((resolve) => hookServer.close(resolve));
       this.hookServer = null;
     }
     await this.poller.stop();
@@ -183,7 +223,7 @@ export class TelegramCodexApp {
     this.store.close();
   }
 
-  async configureNativeCommands() {
+  async configureNativeCommands(): Promise<void> {
     try {
       await this.client.setMyCommands([
         { command: "service", description: "Switch between Codex and Claude" },
@@ -200,19 +240,19 @@ export class TelegramCodexApp {
     }
   }
 
-  startCompletedResponseRecovery() {
+  startCompletedResponseRecovery(): void {
     if (this.completedResponseRecoveryTimer) {
       return;
     }
     this.completedResponseRecoveryTimer = setInterval(() => {
-      this.turns.flushCompletedResponses().catch((error) => {
+      this.turns.flushCompletedResponses().catch((error: unknown) => {
         log.warn(`Completed response recovery failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     }, 30_000);
     this.completedResponseRecoveryTimer.unref?.();
   }
 
-  async warmLinkedSessions() {
+  async warmLinkedSessions(): Promise<void> {
     if (!this.config.warmLinkedSessions) {
       log.info("Skipping session warmup because warmLinkedSessions is false");
       return;
@@ -243,7 +283,7 @@ export class TelegramCodexApp {
     }
   }
 
-  startHookServer() {
+  startHookServer(): void {
     this.hookServer = startWorkflowHookServer({
       port: this.config.hookPort,
       store: this.store,
@@ -257,7 +297,7 @@ export class TelegramCodexApp {
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
    */
-  async processUpdate(update) {
+  async processUpdate(update: Update): Promise<void> {
     this.store.recordTelegramUpdate(update);
     const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
     await inSpan("alasio.update", {
@@ -270,9 +310,10 @@ export class TelegramCodexApp {
       },
     }, async () => {
       try {
-        if (update.callback_query) {
-          this.callbacks.handle(update.callback_query).catch((error) => {
-            log.error(`Failed to process callback ${update.callback_query.id}: ${error instanceof Error ? error.message : String(error)}`);
+        const callbackQuery = update.callback_query;
+        if (callbackQuery) {
+          this.callbacks.handle(callbackQuery).catch((error: unknown) => {
+            log.error(`Failed to process callback ${callbackQuery.id}: ${error instanceof Error ? error.message : String(error)}`);
           });
         } else if (update.message) {
           await this.messages.handle(update.message, update.update_id);

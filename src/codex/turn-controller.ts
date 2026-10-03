@@ -1,11 +1,29 @@
-// @ts-nocheck
 import { RestartRecovery } from "./restart-recovery.ts";
-import { NO_WORKSPACE_MOUNTED, createHarnessRegistry, harnessDisplayName, isHarnessName, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
+import {
+  type ActiveQueries,
+  type AttachedTurn,
+  type Harness,
+  type HarnessRegistry,
+  NO_WORKSPACE_MOUNTED,
+  createHarnessRegistry,
+  harnessDisplayName,
+  isHarnessName,
+  resolveHarnessName,
+  resolveWorkingDirectory,
+} from "../harness/index.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 import { buildFilePromptSuffix } from "../shared/file-prompt.ts";
 import { CommandHandler } from "../operator/command-handler.ts";
-import { sendChooseServicePanel } from "../operator/service-control.ts";
-import { sendChooseWorkspacePanel } from "../operator/workspace-control.ts";
+import type { GoalTurnRequest } from "../operator/goal-control.ts";
+import { type HarnessSwitch, sendChooseServicePanel } from "../operator/service-control.ts";
+import { type WorkspaceChange, sendChooseWorkspacePanel } from "../operator/workspace-control.ts";
+import type { AlasioConfig } from "../config.ts";
+import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { NetMode, SessionFilesystems } from "../sandbox/index.ts";
+import type { ChatId, Client } from "../telegram/client.ts";
+import type { TelegramOutbox } from "../telegram/outbox.ts";
+import type { WorkflowWait, WorkflowWakeEvent } from "../workflow/hook-server.ts";
 import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.ts";
 import { sessionFsWorkspace } from "../workspace/kind.ts";
 import { newVolumeId } from "../sandbox/names.ts";
@@ -30,8 +48,92 @@ const promptWait = meter.createHistogram("alasio.prompt.wait", {
   unit: "s",
 });
 
+/**
+ * The configuration the controller reads: the workspace root, the pre-mounted folder if
+ * any, and the state directory a reply's media are copied under, without which replies
+ * go as text only.
+ */
+export type TurnControllerConfig = Pick<AlasioConfig, "workspaceRoot"> & Partial<Pick<AlasioConfig, "workingDirectory" | "stateDir">>;
+
+/** The Telegram calls the controller makes, and the panels and status messages it sends make. */
+export type TurnControllerClient = Pick<Client, "sendMessage" | "editMessageText">;
+
+export interface TurnControllerOptions {
+  readonly config: TurnControllerConfig;
+  readonly client: TurnControllerClient;
+  readonly store: SqliteStore;
+  readonly outbox: Pick<TelegramOutbox, "enqueueText">;
+  readonly activeQueries: ActiveQueries;
+  readonly workflowWaits: ReadonlyMap<string, WorkflowWait>;
+  readonly workflowWakeEvents: ReadonlyMap<string, WorkflowWakeEvent>;
+  readonly isStopping: () => boolean;
+  readonly harnesses?: HarnessRegistry | null;
+  readonly sandbox?: SessionFilesystems | null;
+}
+
+/** A conversation and the chat it is in, as the setup pickers are sent to. */
+export interface ConversationChat {
+  readonly conversationId: string;
+  readonly chatId: ChatId;
+}
+
+/** A prompt as it arrives from Telegram: its text, and the files sent with it. */
+export interface IncomingPrompt extends ConversationChat {
+  readonly messageId: number;
+  readonly text: string;
+  readonly filePaths: readonly string[];
+}
+
+/** A turn to run on the conversation's mounted session. */
+export interface TurnRequest extends ConversationChat {
+  readonly messageId: number | string;
+  readonly prompt: string;
+  /** The prompt job the turn runs, if it runs one. */
+  readonly jobId?: string | null | undefined;
+  /** The trace to continue: a queued prompt's, or null for a trace of its own; the active span when absent. */
+  readonly traceparent?: string | null | undefined;
+}
+
+/** A turn on a given session, attached to a turn already running upstream or not. */
+interface SessionTurn extends TurnRequest {
+  readonly existingSession: string | null;
+  readonly attachedTurn: AttachedTurn | null;
+}
+
+/** How a turn ended; see runTurn. */
+export type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
+
+interface SettledTurn {
+  readonly outcome: TurnOutcome;
+  /** Whether the response completed; undefined while alasio stops. */
+  readonly result: boolean | undefined;
+}
+
+/**
+ * What a concurrent prompt's buttons (steer, queue, swerve, discard) carry: its prompt
+ * job, when one was queued, and its prompt. A type rather than an interface, so that it
+ * is a CallbackPayload.
+ */
+export type ConcurrentPromptPayload = {
+  readonly jobId: string | null;
+  readonly prompt: string;
+};
+
 export class TurnController {
-  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null, sandbox = null }) {
+  private readonly sandbox: SessionFilesystems | null;
+  private readonly config: TurnControllerConfig;
+  private readonly client: TurnControllerClient;
+  private readonly store: SqliteStore;
+  private readonly activeQueries: ActiveQueries;
+  private readonly isStopping: () => boolean;
+  private readonly queuedMessages: Map<string, string[]>;
+  private readonly promptWorkers: Map<string, Promise<void>>;
+  private readonly harnesses: HarnessRegistry;
+  private readonly commands: CommandHandler;
+  private readonly status: StatusReporter;
+  private readonly recovery: RestartRecovery;
+
+  constructor({ config, client, store, outbox, activeQueries, workflowWaits, workflowWakeEvents, isStopping, harnesses = null, sandbox = null }: TurnControllerOptions) {
     this.sandbox = sandbox;
     this.config = config;
     this.client = client;
@@ -78,24 +180,24 @@ export class TurnController {
     this.recovery = new RestartRecovery({ store });
   }
 
-  harnessFor(conversationId) {
+  harnessFor(conversationId: string): Harness | null {
     return this.harnesses.forConversation(this.store, conversationId);
   }
 
-  requireHarness(conversationId) {
+  requireHarness(conversationId: string): Harness {
     return this.harnesses.requireForConversation(this.store, conversationId);
   }
 
-  harnessLabel(conversationId) {
+  harnessLabel(conversationId: string): string {
     const name = resolveHarnessName(this.store, conversationId);
     return name ? harnessDisplayName(name) : "No service";
   }
 
-  workingDirectoryFor(conversationId) {
+  workingDirectoryFor(conversationId: string): string | null {
     return resolveWorkingDirectory(this.store, conversationId);
   }
 
-  requireWorkingDirectory(conversationId) {
+  requireWorkingDirectory(conversationId: string): string {
     const workingDirectory = this.workingDirectoryFor(conversationId);
     if (!workingDirectory) {
       throw new Error(NO_WORKSPACE_MOUNTED);
@@ -103,7 +205,7 @@ export class TurnController {
     return workingDirectory;
   }
 
-  async sendChooseServicePanel({ conversationId, chatId }) {
+  async sendChooseServicePanel({ conversationId, chatId }: ConversationChat): Promise<void> {
     await sendChooseServicePanel({
       client: this.client,
       store: this.store,
@@ -113,7 +215,7 @@ export class TurnController {
     });
   }
 
-  async sendChooseWorkspacePanel({ conversationId, chatId }) {
+  async sendChooseWorkspacePanel({ conversationId, chatId }: ConversationChat): Promise<void> {
     await sendChooseWorkspacePanel({
       client: this.client,
       store: this.store,
@@ -129,7 +231,7 @@ export class TurnController {
    * Service first, then folder. Sends the picker for the first missing layer and
    * reports whether one was sent, so ingress can stop there.
    */
-  async sendNextSetupStep({ conversationId, chatId }) {
+  async sendNextSetupStep({ conversationId, chatId }: ConversationChat): Promise<boolean> {
     if (!resolveHarnessName(this.store, conversationId)) {
       await this.sendChooseServicePanel({ conversationId, chatId });
       return true;
@@ -141,7 +243,7 @@ export class TurnController {
     return false;
   }
 
-  describeSwitchBlocker(conversationId) {
+  describeSwitchBlocker(conversationId: string): string | null {
     if (this.activeQueries.has(conversationId)) {
       return `${this.harnessLabel(conversationId)} is currently working. Stop the active turn before switching services.`;
     }
@@ -151,7 +253,7 @@ export class TurnController {
     return null;
   }
 
-  async switchHarness({ conversationId, harness }) {
+  async switchHarness({ conversationId, harness }: { readonly conversationId: string; readonly harness: string }): Promise<HarnessSwitch> {
     if (!isHarnessName(harness)) {
       throw new Error(`Unknown service: ${String(harness)}`);
     }
@@ -174,7 +276,7 @@ export class TurnController {
     };
   }
 
-  async switchWorkspace({ conversationId, target }) {
+  async switchWorkspace({ conversationId, target }: { readonly conversationId: string; readonly target: string }): Promise<WorkspaceChange> {
     const workingDirectory = await resolveWorkspacePath({ root: this.config.workspaceRoot, candidate: target });
     const previous = this.workingDirectoryFor(conversationId);
     if (previous === workingDirectory) {
@@ -189,7 +291,7 @@ export class TurnController {
     return { switched: true, previous, workingDirectory };
   }
 
-  async createWorkspace({ conversationId, name }) {
+  async createWorkspace({ conversationId, name }: { readonly conversationId: string; readonly name: string }): Promise<WorkspaceChange> {
     const blocker = this.describeSwitchBlocker(conversationId);
     if (blocker) {
       throw new Error(blocker);
@@ -202,7 +304,7 @@ export class TurnController {
   }
 
   /** Whether this deployment offers session filesystems (the sandbox is configured). */
-  get sandboxEnabled() {
+  get sandboxEnabled(): boolean {
     return Boolean(this.sandbox);
   }
 
@@ -212,7 +314,7 @@ export class TurnController {
    * parks and restores like any other workspace; its volume and sandbox come up when a
    * turn first needs them.
    */
-  async createSessionWorkspace({ conversationId, netMode }) {
+  async createSessionWorkspace({ conversationId, netMode }: { readonly conversationId: string; readonly netMode: NetMode }): Promise<WorkspaceChange> {
     if (!this.sandbox) {
       throw new Error("Session filesystems are not enabled on this deployment.");
     }
@@ -229,7 +331,7 @@ export class TurnController {
     return { switched: true, created: true, previous, workingDirectory };
   }
 
-  enqueueMessage(conversationId, prompt, front = false) {
+  enqueueMessage(conversationId: string, prompt: string, front = false): void {
     const queue = this.queuedMessages.get(conversationId) ?? [];
     if (front) {
       queue.unshift(prompt);
@@ -239,7 +341,7 @@ export class TurnController {
     this.queuedMessages.set(conversationId, queue);
   }
 
-  async processPrompt({ conversationId, chatId, messageId, text, filePaths }) {
+  async processPrompt({ conversationId, chatId, messageId, text, filePaths }: IncomingPrompt): Promise<void> {
     const effectiveText = text || (filePaths.length > 0 ? "Please inspect the attached file(s)." : "");
     const handledCommand = await this.commands.handleTextCommand({
       text: effectiveText,
@@ -275,7 +377,7 @@ export class TurnController {
     void this.scheduleConversation(conversationId);
   }
 
-  scheduleConversation(conversationId) {
+  scheduleConversation(conversationId: string): Promise<void> {
     const existing = this.promptWorkers.get(conversationId);
     if (existing) {
       return existing;
@@ -287,7 +389,7 @@ export class TurnController {
     return worker;
   }
 
-  async drainConversation(conversationId) {
+  async drainConversation(conversationId: string): Promise<void> {
     while (!this.activeQueries.has(conversationId) && !this.isStopping()) {
       const job = this.store.claimNextPromptJob(conversationId);
       if (!job) {
@@ -297,7 +399,8 @@ export class TurnController {
       if (job.harness && job.harness !== activeHarness) {
         log.warn(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
       }
-      promptWait.record(job.started_at - job.created_at, { "alasio.harness": activeHarness });
+      // Claiming a job stamps its start, so a claimed job's started_at is set.
+      promptWait.record(job.started_at! - job.created_at, { "alasio.harness": activeHarness });
       try {
         const completed = await this.runCodexTurn({
           conversationId,
@@ -318,13 +421,13 @@ export class TurnController {
     }
   }
 
-  resumePendingPrompts() {
+  resumePendingPrompts(): void {
     for (const conversationId of this.store.listPendingPromptConversations()) {
       void this.scheduleConversation(conversationId);
     }
   }
 
-  reconcilePersistentState() {
+  reconcilePersistentState(): void {
     const completedConversations = this.store.recoverPromptJobsAfterRestart();
     for (const conversationId of completedConversations) {
       this.store.clearActiveTurn(conversationId);
@@ -332,7 +435,7 @@ export class TurnController {
     }
   }
 
-  setPromptDisposition(jobId, state, priority = 0) {
+  setPromptDisposition(jobId: string, state: PromptJobState, priority = 0): PromptJob | null {
     this.store.setPromptJobDisposition(jobId, state, priority);
     const job = this.store.getPromptJob(jobId);
     if (state === "pending" && job) {
@@ -341,7 +444,7 @@ export class TurnController {
     return job;
   }
 
-  async startNewSession({ conversationId }) {
+  async startNewSession({ conversationId }: { readonly conversationId: string }): Promise<string> {
     const harness = this.requireHarness(conversationId);
     if (this.activeQueries.has(conversationId)) {
       throw new Error(`${harness.displayName} is currently working. Stop the active turn before starting a new session.`);
@@ -354,8 +457,11 @@ export class TurnController {
     return sessionId;
   }
 
-  async askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText }) {
-    const payload = { jobId: job.id, prompt: job.prompt };
+  async askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText }: ConversationChat & {
+    readonly job: { readonly id: string | null; readonly prompt: string };
+    readonly visibleText: string;
+  }): Promise<void> {
+    const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
     const queueAction = this.store.createCallbackAction({ conversationId, kind: "queue", payload });
     const steerAction = this.store.createCallbackAction({ conversationId, kind: "steer", payload });
     const swerveAction = this.store.createCallbackAction({ conversationId, kind: "swerve", payload });
@@ -373,7 +479,7 @@ export class TurnController {
     });
   }
 
-  async runCodexTurn({ conversationId, chatId, messageId, prompt, jobId = null, traceparent }) {
+  async runCodexTurn({ conversationId, chatId, messageId, prompt, jobId = null, traceparent }: TurnRequest): Promise<boolean | undefined> {
     const existingSession = this.store.getSessionId(conversationId);
     return await this.runCodexTurnWithSession({
       conversationId,
@@ -387,7 +493,7 @@ export class TurnController {
     });
   }
 
-  async runGoalTurn({ conversationId, chatId, messageId, sessionId, turnId, prompt }) {
+  async runGoalTurn({ conversationId, chatId, messageId, sessionId, turnId, prompt }: GoalTurnRequest): Promise<boolean> {
     if (this.activeQueries.has(conversationId)) {
       const job = this.store.enqueuePromptJob
         ? this.store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" })
@@ -413,11 +519,12 @@ export class TurnController {
    * prompt's; null for a trace of its own) and the active span otherwise; its outcome
    * labels it and its duration.
    */
-  async runCodexTurnWithSession({ traceparent, ...turn }) {
+  async runCodexTurnWithSession({ traceparent, ...turn }: SessionTurn): Promise<boolean | undefined> {
     const harness = this.requireHarness(turn.conversationId);
     const labels = { "alasio.harness": harness.name };
     const startedAt = performance.now();
-    let outcome = "failed";
+    // Widened, since the span's callback sets it and the checker does not follow it there.
+    let outcome = "failed" as TurnOutcome | "failed";
     activeTurns.add(1, labels);
     let result;
     try {
@@ -465,7 +572,7 @@ export class TurnController {
    * result }`, where `result` is whether the response completed (undefined while
    * alasio stops) and `outcome` one of completed, incomplete, interrupted, or stopped.
    */
-  async runTurn(harness, { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }) {
+  async runTurn(harness: Harness, { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }: Omit<SessionTurn, "traceparent">): Promise<SettledTurn> {
     if (attachedTurn && !harness.supportsGoals) {
       throw new Error(`${harness.displayName} does not support attached goal turns.`);
     }
@@ -480,8 +587,8 @@ export class TurnController {
       startedAt: Date.now() / 1000,
     });
     const statusAbortController = new AbortController();
-    let statusMessageId = null;
-    let statusStartTime = null;
+    let statusMessageId: number | null = null;
+    let statusStartTime: number | null = null;
     const statusPromise = this.status.postStatusUpdates({
       chatId,
       signal: statusAbortController.signal,
@@ -515,7 +622,7 @@ export class TurnController {
       // A harness that keeps running between prompts (Claude Code background work)
       // produces replies of its own and frees the conversation when they finish.
       onBackgroundResponse: () => {
-        this.flushCompletedResponses().catch((error) => {
+        this.flushCompletedResponses().catch((error: unknown) => {
           log.warn(`Background response delivery deferred for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`);
         });
       },
@@ -526,7 +633,6 @@ export class TurnController {
     statusAbortController.abort();
     await statusPromise.catch(() => undefined);
     const { blockSequence, sessionId: newSessionId, pendingResponseId, interrupted, responseCompleted } = queryResult;
-    const sessionId = newSessionId ?? existingSession ?? null;
     if (this.isStopping()) {
       if (responseCompleted) {
         this.store.clearActiveTurn(conversationId, pendingResponseId);
@@ -570,15 +676,15 @@ export class TurnController {
     return { outcome: responseCompleted ? "completed" : "incomplete", result: responseCompleted };
   }
 
-  async flushCompletedResponses() {
+  async flushCompletedResponses(): Promise<void> {
     await this.status.flushCompletedResponses();
   }
 
-  async recoverInterruptedTurns() {
+  async recoverInterruptedTurns(): Promise<void> {
     await this.recovery.recoverInterruptedTurns();
   }
 
-  recordExternalRestartEventsForActiveTurns() {
+  recordExternalRestartEventsForActiveTurns(): void {
     this.recovery.recordExternalRestartEventsForActiveTurns();
   }
 }

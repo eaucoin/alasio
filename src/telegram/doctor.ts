@@ -1,4 +1,3 @@
-// @ts-nocheck
 import "dotenv/config";
 import { loadAlasioConfig } from "../config.ts";
 import { Client } from "./client.ts";

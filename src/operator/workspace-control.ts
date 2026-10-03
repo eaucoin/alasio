@@ -1,26 +1,60 @@
-// @ts-nocheck
-import { resolveWorkingDirectory } from "../harness/index.ts";
+import type { InlineKeyboardButton } from "@grammyjs/types";
+import { type ActiveQueries, type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
+import type { CallbackPayload } from "../persistence/callback-repository.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { NetMode } from "../sandbox/index.ts";
+import type { ChatId, Client } from "../telegram/client.ts";
 import {
   MAX_LISTED_WORKSPACES,
+  type WorkspaceCandidate,
   WorkspaceError,
   listWorkspaceCandidates,
   workspaceLabel,
 } from "../workspace/policy.ts";
+import type { ControlCallback, ControlPanel } from "./session-control.ts";
 import { truncateText } from "./text.ts";
+
+/** The outcome of mounting a folder on a conversation, or of creating one and mounting it. */
+export interface WorkspaceChange {
+  /** Whether the folder changed; false when it was already the mounted one. */
+  readonly switched: boolean;
+  /** Set when the folder was newly created. */
+  readonly created?: boolean | undefined;
+  readonly previous: string | null;
+  readonly workingDirectory: string;
+}
+
+/** Mounts the folder `target` names under the workspace root, or throws why it cannot. */
+export type SwitchWorkspace = (request: { readonly conversationId: string; readonly target: string }) => Promise<WorkspaceChange>;
+
+/** Creates a git-initialized folder `name` under the workspace root and mounts it, or throws why it cannot. */
+export type CreateWorkspace = (request: { readonly conversationId: string; readonly name: string }) => Promise<WorkspaceChange>;
+
+/** Creates an empty session filesystem with internet access `netMode` and mounts it, or throws why it cannot. */
+export type CreateSessionWorkspace = (request: { readonly conversationId: string; readonly netMode: NetMode }) => Promise<WorkspaceChange>;
+
+/** The store's mounts and callback actions, as the workspace panel reads them. */
+export type WorkspaceControlStore = MountStore & Pick<SqliteStore, "createCallbackAction">;
 
 const WORKSPACE_KIND_PREFIX = "workspace:";
 
 export const CHOOSE_WORKSPACE_NOTICE = "No folder is mounted. Choose a folder to work in, or create one; your message was not queued.";
 
-function workspaceKind(kind) {
+function workspaceKind(kind: string): string {
   return `${WORKSPACE_KIND_PREFIX}${kind}`;
 }
 
-export function isWorkspaceControlAction(kind) {
+export function isWorkspaceControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(WORKSPACE_KIND_PREFIX);
 }
 
-function createButton(store, conversationId, text, kind, payload = {}) {
+function createButton(
+  store: WorkspaceControlStore,
+  conversationId: string,
+  text: string,
+  kind: string,
+  payload: CallbackPayload = {},
+): InlineKeyboardButton.CallbackButton {
   return {
     text,
     callback_data: store.createCallbackAction({
@@ -31,7 +65,7 @@ function createButton(store, conversationId, text, kind, payload = {}) {
   };
 }
 
-function pairs(items) {
+function pairs<T>(items: readonly T[]): T[][] {
   const rows = [];
   for (let index = 0; index < items.length; index += 2) {
     rows.push(items.slice(index, index + 2));
@@ -39,15 +73,25 @@ function pairs(items) {
   return rows;
 }
 
+export interface WorkspacePanelRequest {
+  readonly store: WorkspaceControlStore;
+  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly conversationId: string;
+  readonly workspaceRoot: string;
+  readonly notice?: string | undefined;
+  /** Whether to offer a new session filesystem: the deployment has a sandbox. */
+  readonly sandboxEnabled?: boolean | undefined;
+}
+
 /**
  * Telegram-native folder picker. Lists top-level folders under the workspace
  * root (git repositories first) as buttons; anything beyond the button cap is
  * still reachable with `/workspace <name>`.
  */
-export async function buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }) {
+export async function buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): Promise<ControlPanel> {
   const current = resolveWorkingDirectory(store, conversationId);
   const working = activeQueries?.has?.(conversationId) ?? false;
-  let candidates = [];
+  let candidates: WorkspaceCandidate[] = [];
   let listingError = null;
   try {
     candidates = await listWorkspaceCandidates(workspaceRoot);
@@ -95,15 +139,20 @@ export async function buildWorkspacePanel({ store, activeQueries, conversationId
   };
 }
 
+export interface SendWorkspacePanelRequest extends Omit<WorkspacePanelRequest, "notice"> {
+  readonly client: Pick<Client, "sendMessage">;
+  readonly chatId: ChatId;
+}
+
 /**
  * Reply used whenever a prompt or control arrives before a folder is mounted.
  */
-export async function sendChooseWorkspacePanel({ client, store, activeQueries, conversationId, chatId, workspaceRoot, sandboxEnabled = false }) {
+export async function sendChooseWorkspacePanel({ client, store, activeQueries, conversationId, chatId, workspaceRoot, sandboxEnabled = false }: SendWorkspacePanelRequest): Promise<void> {
   const panel = await buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice: CHOOSE_WORKSPACE_NOTICE, sandboxEnabled });
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-function describeOutcome(result) {
+function describeOutcome(result: WorkspaceChange): string {
   if (result.created) {
     return `Created and mounted ${workspaceLabel(result.workingDirectory)} (${result.workingDirectory}). Send a message to start.`;
   }
@@ -115,7 +164,7 @@ function describeOutcome(result) {
     : `Mounted ${workspaceLabel(result.workingDirectory)} (${result.workingDirectory}). Send a message to start.`;
 }
 
-async function applyWorkspaceChange(run) {
+async function applyWorkspaceChange(run: () => Promise<WorkspaceChange>): Promise<string> {
   try {
     return describeOutcome(await run());
   } catch (error) {
@@ -126,16 +175,30 @@ async function applyWorkspaceChange(run) {
   }
 }
 
-export function parseWorkspaceArgs(args) {
+/** What /workspace was asked to do: show the panel, mount a folder, or create one. */
+export type WorkspaceArgs =
+  | { readonly action: "panel" }
+  | { readonly action: "create"; readonly name: string }
+  | { readonly action: "use"; readonly target: string };
+
+export function parseWorkspaceArgs(args: string | null | undefined): WorkspaceArgs {
   const trimmed = String(args ?? "").trim();
   if (!trimmed) {
     return { action: "panel" };
   }
   const create = /^new\s+(\S+)\s*$/i.exec(trimmed);
   if (create) {
-    return { action: "create", name: create[1] };
+    // The group is not optional, so every match fills it and the `?? ""` never applies.
+    return { action: "create", name: create[1] ?? "" };
   }
   return { action: "use", target: trimmed };
+}
+
+export interface WorkspaceTextCommand extends SendWorkspacePanelRequest {
+  /** What followed /workspace. */
+  readonly args: string;
+  readonly switchWorkspace: SwitchWorkspace;
+  readonly createWorkspace: CreateWorkspace;
 }
 
 export async function handleWorkspaceTextCommand({
@@ -149,7 +212,7 @@ export async function handleWorkspaceTextCommand({
   switchWorkspace,
   createWorkspace,
   sandboxEnabled = false,
-}) {
+}: WorkspaceTextCommand): Promise<void> {
   const parsed = parseWorkspaceArgs(args);
   let notice = "";
   if (parsed.action === "use") {
@@ -161,7 +224,7 @@ export async function handleWorkspaceTextCommand({
   await client.sendMessage(chatId, panel.text, panel.options);
 }
 
-async function editPanel(client, chatId, messageId, panel) {
+async function editPanel(client: Pick<Client, "editMessageText">, chatId: ChatId, messageId: number, panel: ControlPanel): Promise<void> {
   try {
     await client.editMessageText(chatId, messageId, panel.text, panel.options);
   } catch (error) {
@@ -169,6 +232,17 @@ async function editPanel(client, chatId, messageId, panel) {
       throw error;
     }
   }
+}
+
+export interface WorkspaceControlCallback extends ControlCallback {
+  readonly client: Pick<Client, "answerCallbackQuery" | "editMessageText" | "deleteMessage" | "sendMessage">;
+  readonly store: WorkspaceControlStore;
+  readonly activeQueries?: ActiveQueries | null | undefined;
+  readonly workspaceRoot: string;
+  readonly switchWorkspace: SwitchWorkspace;
+  /** Present when the deployment offers session filesystems. */
+  readonly createSessionWorkspace?: CreateSessionWorkspace | null | undefined;
+  readonly sandboxEnabled?: boolean | undefined;
 }
 
 export async function handleWorkspaceControlCallback({
@@ -183,11 +257,11 @@ export async function handleWorkspaceControlCallback({
   callbackQueryId,
   chatId,
   messageId,
-}) {
+}: WorkspaceControlCallback): Promise<void> {
   const kind = action.kind.slice(WORKSPACE_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   const conversationId = action.conversationId;
-  const panel = (notice) => buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
+  const panel = (notice: string) => buildWorkspacePanel({ store, activeQueries, conversationId, workspaceRoot, notice, sandboxEnabled });
   if (kind === "sessionfs") {
     // Offer the internet choice before creating the empty workspace.
     await client.answerCallbackQuery(callbackQueryId, "Choose internet access.");
@@ -213,7 +287,7 @@ export async function handleWorkspaceControlCallback({
       await client.answerCallbackQuery(callbackQueryId, "Session filesystems are not enabled.");
       return;
     }
-    const notice = await applyWorkspaceChange(() => createSessionWorkspace({ conversationId, netMode: payload.net === "full" ? "full" : "none" }));
+    const notice = await applyWorkspaceChange(() => createSessionWorkspace({ conversationId, netMode: payload["net"] === "full" ? "full" : "none" }));
     await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
     await editPanel(client, chatId, messageId, await panel(notice));
     return;
@@ -238,11 +312,12 @@ export async function handleWorkspaceControlCallback({
     return;
   }
   if (kind === "use") {
-    if (typeof payload.path !== "string" || !payload.path) {
+    const path = payload["path"];
+    if (typeof path !== "string" || !path) {
       await client.answerCallbackQuery(callbackQueryId, "Unknown folder.");
       return;
     }
-    const notice = await applyWorkspaceChange(() => switchWorkspace({ conversationId, target: payload.path }));
+    const notice = await applyWorkspaceChange(() => switchWorkspace({ conversationId, target: path }));
     await client.answerCallbackQuery(callbackQueryId, truncateText(notice, 180));
     await editPanel(client, chatId, messageId, await panel(notice));
     return;

@@ -1,19 +1,106 @@
-// @ts-nocheck
-import { sendModelPanel } from "./model-control.ts";
-import { createHarnessRegistry, interruptActiveTurn, resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
-import { parseCommand } from "./command-parser.ts";
-import { handleGoalTextCommand } from "./goal-control.ts";
-import { handleServiceTextCommand, sendChooseServicePanel } from "./service-control.ts";
-import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
-import { sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.ts";
+import { type ModelControlStore, sendModelPanel } from "./model-control.ts";
+import type { AlasioConfig } from "../config.ts";
+import {
+  type ActiveQueries,
+  type Harness,
+  type HarnessRegistry,
+  createHarnessRegistry,
+  interruptActiveTurn,
+  resolveHarnessName,
+  resolveWorkingDirectory,
+} from "../harness/index.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { ChatId, Client } from "../telegram/client.ts";
+import { type OperatorCommand, parseCommand } from "./command-parser.ts";
+import { type GoalControlStore, type RunGoalTurn, handleGoalTextCommand } from "./goal-control.ts";
+import { type ServiceControlStore, type SwitchHarness, handleServiceTextCommand, sendChooseServicePanel } from "./service-control.ts";
+import {
+  type CreateWorkspace,
+  type SwitchWorkspace,
+  type WorkspaceControlStore,
+  handleWorkspaceTextCommand,
+  sendChooseWorkspacePanel,
+} from "./workspace-control.ts";
+import { type SessionControlStore, type StartNewSession, sendCurrentSessionPanel, sendSessionsPanel } from "./session-control.ts";
 import { truncateText } from "./text.ts";
 import { formatRewindForTelegram, formatSessionsForTelegram } from "./session-replies.ts";
 
-function shortSessionId(sessionId) {
+/** A turn on the conversation's mounted session, started by a command (`!resume <#> <prompt>`). */
+export interface CommandTurnRequest {
+  readonly conversationId: string;
+  readonly chatId: ChatId;
+  readonly messageId: number;
+  readonly prompt: string;
+}
+
+/** Runs a turn on the conversation's mounted session; what it resolves to is not read. */
+export type RunCommandTurn = (request: CommandTurnRequest) => Promise<unknown>;
+
+/** The store, as the commands and the panels they open read and change it. */
+export type CommandStore = ModelControlStore
+  & ServiceControlStore
+  & WorkspaceControlStore
+  & SessionControlStore
+  & GoalControlStore
+  & Pick<SqliteStore, "getActiveHarness" | "getWorkingDirectory">;
+
+/**
+ * What the command handler is built with: the Telegram client, the store, and the
+ * host's (the turn controller's) operations that commands start.
+ */
+export interface CommandHandlerOptions {
+  readonly client: Pick<Client, "sendMessage" | "editMessageText">;
+  readonly config: Pick<AlasioConfig, "workspaceRoot"> & Partial<Pick<AlasioConfig, "workingDirectory">>;
+  readonly store: CommandStore;
+  readonly activeQueries: ActiveQueries;
+  readonly harnesses?: HarnessRegistry | null | undefined;
+  readonly runCodexTurn: RunCommandTurn;
+  readonly runGoalTurn: RunGoalTurn;
+  readonly startNewSession: StartNewSession;
+  /** Without it, /service says switching is not available. */
+  readonly switchHarness?: SwitchHarness | null | undefined;
+  /** Without it or createWorkspace, /workspace says selection is not available. */
+  readonly switchWorkspace?: SwitchWorkspace | null | undefined;
+  readonly createWorkspace?: CreateWorkspace | null | undefined;
+  /** Whether the workspace panel offers new session filesystems. */
+  readonly sandboxEnabled?: boolean | undefined;
+}
+
+/** A prompt that may be a command; one with files attached never is. */
+export interface CommandText {
+  readonly text: string;
+  readonly filePaths: readonly string[];
+  readonly conversationId: string;
+  readonly chatId: ChatId;
+  readonly messageId: number;
+}
+
+/** A parsed command, and the conversation and message it came in. */
+export interface CommandRequest {
+  readonly cmd: OperatorCommand;
+  readonly conversationId: string;
+  readonly chatId: ChatId;
+  readonly messageId: number;
+}
+
+function shortSessionId(sessionId: string): string {
   return sessionId ? sessionId.slice(0, 8) : "-";
 }
 
 export class CommandHandler {
+  private readonly client: CommandHandlerOptions["client"];
+  private readonly config: CommandHandlerOptions["config"];
+  private readonly store: CommandStore;
+  private readonly activeQueries: ActiveQueries;
+  private readonly harnesses: HarnessRegistry;
+  private readonly runCodexTurn: RunCommandTurn;
+  private readonly runGoalTurn: RunGoalTurn;
+  private readonly startNewSession: StartNewSession;
+  private readonly switchHarness: SwitchHarness | null;
+  private readonly switchWorkspace: SwitchWorkspace | null;
+  private readonly createWorkspace: CreateWorkspace | null;
+  private readonly sandboxEnabled: boolean;
+
   constructor({
     client,
     config,
@@ -27,7 +114,7 @@ export class CommandHandler {
     switchWorkspace = null,
     createWorkspace = null,
     sandboxEnabled = false,
-  }) {
+  }: CommandHandlerOptions) {
     this.client = client;
     this.config = config;
     this.store = store;
@@ -42,11 +129,12 @@ export class CommandHandler {
     this.sandboxEnabled = sandboxEnabled;
   }
 
-  harnessFor(conversationId) {
+  harnessFor(conversationId: string): Harness | null {
     return this.harnesses.forConversation(this.store, conversationId);
   }
 
-  async handleTextCommand({ text, filePaths, conversationId, chatId, messageId }) {
+  /** Handles `text` if it is a command; resolves to whether it was. */
+  async handleTextCommand({ text, filePaths, conversationId, chatId, messageId }: CommandText): Promise<boolean> {
     const cmd = parseCommand(text);
     if (!cmd || filePaths.length > 0) {
       return false;
@@ -54,10 +142,10 @@ export class CommandHandler {
     return await this.handleCommand({ cmd, conversationId, chatId, messageId });
   }
 
-  async handleCommand({ cmd, conversationId, chatId, messageId }) {
+  /** Handles a parsed command; resolves to whether it was one this handler knows. */
+  async handleCommand({ cmd, conversationId, chatId, messageId }: CommandRequest): Promise<boolean> {
     const harnessName = resolveHarnessName(this.store, conversationId);
     const harness = this.harnessFor(conversationId);
-    const sessions = harness?.sessions;
     const label = harness?.displayName ?? "The agent";
     if (cmd.type === "stop") {
       if (!this.activeQueries.has(conversationId)) {
@@ -144,6 +232,7 @@ export class CommandHandler {
       });
       return true;
     }
+    const sessions = harness.sessions;
     if (cmd.type === "sessions") {
       const sessionList = await sessions.listSessions(cmd.page);
       const totalPages = await sessions.getTotalSessionPages();
@@ -172,7 +261,8 @@ export class CommandHandler {
       return true;
     }
     if (cmd.type === "goal") {
-      if (!harness.supportsGoals) {
+      // A harness that supports goals has them; the check on goals only narrows.
+      if (!harness.supportsGoals || !harness.goals) {
         await this.client.sendMessage(chatId, `Goals are a Codex feature. ${harness.displayName} is active; use /service codex to switch back.`);
         return true;
       }
