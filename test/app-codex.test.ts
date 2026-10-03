@@ -346,7 +346,7 @@ test("/stop with no turn running says so", async (t) => {
   assert.deepEqual(await alasio.telegram.waitForShown(1, { mark }), [{ method: "sendMessage", text: "No active query to stop." }]);
 });
 
-test("an error Codex does not retry ends the turn as not completed, and its message is not shown", async (t) => {
+test("an error Codex does not retry ends the turn as not completed, saying what the error was", async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;
   await runningTurn(alasio);
@@ -355,10 +355,7 @@ test("an error Codex does not retry ends the turn as not completed, and its mess
     turnError("thread-1", "turn-1", "Rate limit reached", false),
     turnCompleted("thread-1", codexTurn("turn-1", { status: "failed", error: { message: "Rate limit reached", codexErrorInfo: null, additionalDetails: null, misalignment: null } })),
   );
-  // characterizes current behaviour: the error is kept in the turn's response but never
-  // reaches the operator, who sees only that Codex did not complete; only final-answer
-  // text is ever delivered.
-  assert.deepEqual(await telegram.waitForShown(1, { mark }), [{ method: "editMessageText", text: "Codex did not complete." }]);
+  assert.deepEqual(await telegram.waitForShown(1, { mark }), [{ method: "editMessageText", text: "Codex did not complete: Rate limit reached" }]);
 
   telegram.say("Again");
   await answerLoadedThreads(codex, ["thread-1"]);
@@ -390,7 +387,7 @@ test("the app-server exiting mid-turn fails the turn visibly, and the next promp
 
   let mark = telegram.mark();
   codex.exit(1);
-  assert.deepEqual(await telegram.waitForShown(1, { mark }), [{ method: "editMessageText", text: "Codex did not complete." }]);
+  assert.deepEqual(await telegram.waitForShown(1, { mark }), [{ method: "editMessageText", text: "Codex did not complete: Codex app-server exited code=1 signal=null" }]);
   await codex.allExited();
 
   mark = telegram.mark();

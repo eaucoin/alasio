@@ -27,7 +27,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import type { CommandEventPolicy } from "../../codex/command-event-policy.ts";
-import type { ResponseBlock } from "../../codex/event-projection.ts";
+import { errorBlock, type ResponseBlock } from "../../codex/event-projection.ts";
 import type { TurnTimer } from "../../codex/turn-timing.ts";
 import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../../mcp/bayma.ts";
@@ -230,10 +230,7 @@ export function createClaudeLiveSessions({
           const message = error ? getErrorMessage(error) : "Claude Code exited before answering";
           current.turnTimer("query.error", { error: message });
           log.error(`Claude Code ended during a turn thread=${host.threadKey}: ${message}`);
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
-            type: "text",
-            content: `Error: ${message}`,
-          });
+          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message));
         }
       }
       finishOperatorTurn(host, current);
@@ -375,10 +372,7 @@ export function createClaudeLiveSessions({
         current.onTransportCompleted?.({ sessionId: host.sessionId, turnId: null });
       } else {
         current.turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
-        appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
-          type: "text",
-          content: `Error: ${projected?.error ?? "Claude did not complete"}`,
-        });
+        appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(projected?.error ?? "Claude did not complete"));
       }
       const cacheRead = cacheReadTokensFromUsage(projected?.usage);
       if (host.sessionId && cacheRead !== undefined) {
@@ -484,10 +478,7 @@ export function createClaudeLiveSessions({
         }
         if (message.type === "auth_status" && message.error && current) {
           current.turnTimer("event.error", { error: message.error });
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
-            type: "text",
-            content: `Error: ${message.error}`,
-          });
+          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message.error));
         }
       }
     } catch (error) {
@@ -706,7 +697,7 @@ export function createClaudeLiveSessions({
       const message = getErrorMessage(error);
       turnTimer("query.error", { error: message });
       log.error(`Error starting Claude Code: ${message}`);
-      appendBlock(current.blockSequence, persistence, pendingResponseId, { type: "text", content: `Error: ${message}` });
+      appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(message));
       return { blockSequence: current.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
     }
     host.persistence = persistence;

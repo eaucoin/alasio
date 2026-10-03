@@ -86,6 +86,18 @@ export interface AskedQuestion {
   readonly header?: string;
 }
 
+const ERROR_PREFIX = "Error: ";
+
+/** A block reporting what stopped a turn, as every harness records it. */
+export function errorBlock(message: string): ResponseBlock {
+  return { type: "text", content: `${ERROR_PREFIX}${message}` };
+}
+
+/** The messages of the error blocks among a turn's blocks, in order. */
+export function errorsIn(blocks: readonly ResponseBlock[]): string[] {
+  return blocks.flatMap((block) => (block.type === "text" && !block.phase && block.content.startsWith(ERROR_PREFIX) ? [block.content.slice(ERROR_PREFIX.length)] : []));
+}
+
 /**
  * One block of a turn's response, as it is shown and stored: text (the final answer's
  * phase marks the text delivered to the operator), a tool the agent used, or questions
@@ -202,10 +214,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
             break;
         case "error":
             if (item.message?.trim()) {
-                appendBlock(blockSequence, persistence, pendingResponseId, {
-                    type: "text",
-                    content: `Error: ${item.message}`,
-                });
+                appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(item.message));
             }
             break;
         default:
