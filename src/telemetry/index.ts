@@ -19,7 +19,7 @@ import {
 // By module: the package's index also loads its browser SDK, which alasio has not.
 import * as OtelTracer from "@effect/opentelemetry/OtelTracer";
 import * as Resource from "@effect/opentelemetry/Resource";
-import { Layer } from "effect";
+import { Cause, Effect, Exit, Layer, type Tracer } from "effect";
 
 export { SpanKind } from "@opentelemetry/api";
 export {
@@ -141,6 +141,74 @@ export async function rpcCall<T>(
     });
   }
 }
+
+/** Effect's name for an OpenTelemetry span kind. */
+function effectSpanKind(kind: SpanKind): Tracer.SpanKind {
+  switch (kind) {
+    case SpanKind.SERVER:
+      return "server";
+    case SpanKind.CLIENT:
+      return "client";
+    case SpanKind.PRODUCER:
+      return "producer";
+    case SpanKind.CONSUMER:
+      return "consumer";
+    case SpanKind.INTERNAL:
+      return "internal";
+  }
+}
+
+/** Labels the active span with the type of what `cause` failed with, as inSpan does. */
+const labelFailure = <E>(cause: Cause.Cause<E>): Effect.Effect<void> =>
+  OtelTracer.currentOtelSpan.pipe(
+    Effect.flatMap((span) => Effect.sync(() => span.setAttribute("error.type", errorType(Cause.squash(cause))))),
+    Effect.ignore,
+  );
+
+/**
+ * `effect` in a span, as inSpan runs a function in one: its parent the active span,
+ * unless `parent` is given (a traceparent to continue, or null to start a trace of its
+ * own), and what it fails with recorded on it.
+ */
+export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attributes = {}, parent }: InSpanOptions = {}) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => {
+    const spanned = effect.pipe(
+      Effect.tapCause(labelFailure),
+      Effect.withSpan(name, { kind: effectSpanKind(kind), attributes, ...(parent === null ? { root: true } : {}) }),
+    );
+    if (parent === null) return spanned;
+    // Effect makes a span with no parent of its own a root, so the active span (the
+    // caller's, or the effect's own as the tracer keeps it active) is made its parent.
+    return Effect.suspend(() => {
+      const continued = trace.getSpanContext(parent === undefined ? context.active() : contextOf(parent));
+      return continued ? spanned.pipe(OtelTracer.withSpanContext(continued)) : spanned;
+    });
+  };
+
+/**
+ * A call alasio makes to `service`, as rpcCall records one: a client span named
+ * `<service>/<method>` and its duration, labelled with the error it failed with.
+ */
+export const withRpcCall = ({ system, service, method, attributes = {} }: RpcCallOptions) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.suspend(() => {
+      const startedAt = performance.now();
+      return effect.pipe(
+        withAlasioSpan(`${service}/${method}`, {
+          kind: SpanKind.CLIENT,
+          attributes: { "rpc.system.name": system, "rpc.service": service, "rpc.method": method, ...attributes },
+        }),
+        Effect.onExit((exit) => Effect.sync(() => {
+          const failure = Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause) ? errorType(Cause.squash(exit.cause)) : null;
+          rpcDuration.record((performance.now() - startedAt) / 1000, {
+            "rpc.system.name": system,
+            "rpc.service": service,
+            "rpc.method": method,
+            ...(failure ? { "error.type": failure } : {}),
+          });
+        })),
+      );
+    });
 
 /** The active span, or a span that records nothing when none is. */
 export function currentSpan(): Span {

@@ -50,7 +50,8 @@ const { createHarnessRegistry } = await import("../src/harness/index.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
 const { createLogger } = await import("../src/shared/log.ts");
-const { inSpan, resolveTelemetry, sharedResourceAttributes, withoutTelemetry } = await import("../src/telemetry/index.ts");
+const { inSpan, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
+const { Effect, Schema } = await import("effect");
 const { Client } = await import("../src/telegram/client.ts");
 const { TelegramOutbox } = await import("../src/telegram/outbox.ts");
 
@@ -383,4 +384,63 @@ test("a deferred delivery records what stopped it and keeps its trace", async ()
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+class EffectProbeError extends Schema.TaggedError<EffectProbeError>()("EffectProbeError", { message: Schema.String }) {}
+
+test("an effect's span is a span of alasio's, as inSpan makes one: named, kinded, attributed, and labelled with its failure", async () => {
+  await Effect.runPromise(Effect.void.pipe(
+    withAlasioSpan("alasio.effect.ok", { kind: SpanKind.CONSUMER, attributes: { "alasio.probe": "yes" } }),
+    Effect.provide(TracingLayer),
+  ));
+  const ok = finishedSpan("alasio.effect.ok");
+  assert.equal(ok.kind, SpanKind.CONSUMER);
+  assert.equal(ok.attributes["alasio.probe"], "yes");
+  assert.notEqual(ok.status.code, SpanStatusCode.ERROR);
+
+  const failed = await Effect.runPromise(Effect.fail(new EffectProbeError({ message: "broke" })).pipe(
+    withAlasioSpan("alasio.effect.failed"),
+    Effect.flip,
+    Effect.provide(TracingLayer),
+  ));
+  assert.equal(failed.message, "broke");
+  const span = finishedSpan("alasio.effect.failed");
+  assert.equal(span.status.code, SpanStatusCode.ERROR);
+  assert.equal(span.attributes["error.type"], "EffectProbeError");
+});
+
+test("an effect's span continues a traceparent, starts a trace of its own for null, and is the parent of spans made inside it", async () => {
+  const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+  await Effect.runPromise(Effect.void.pipe(withAlasioSpan("alasio.effect.continued", { parent: traceparent }), Effect.provide(TracingLayer)));
+  const continued = finishedSpan("alasio.effect.continued");
+  assert.equal(continued.spanContext().traceId, "0af7651916cd43dd8448eb211c80319c");
+  assert.equal(continued.parentSpanContext?.spanId, "b7ad6b7169203331");
+
+  await inSpan("alasio.outer", {}, async () => {
+    await Effect.runPromise(Effect.void.pipe(withAlasioSpan("alasio.effect.root", { parent: null }), Effect.provide(TracingLayer)));
+    await Effect.runPromise(Effect.promise(() => inSpan("alasio.effect.inner", {}, () => undefined)).pipe(
+      withAlasioSpan("alasio.effect.nested"),
+      Effect.provide(TracingLayer),
+    ));
+  });
+  const outer = finishedSpan("alasio.outer");
+  assert.notEqual(finishedSpan("alasio.effect.root").spanContext().traceId, outer.spanContext().traceId);
+  const nested = finishedSpan("alasio.effect.nested");
+  assert.equal(nested.parentSpanContext?.spanId, outer.spanContext().spanId);
+  assert.equal(finishedSpan("alasio.effect.inner").parentSpanContext?.spanId, nested.spanContext().spanId);
+});
+
+test("an effect's call is a call of alasio's, as rpcCall records one: a client span and a duration labelled with its failure", async () => {
+  await Effect.runPromise(Effect.fail(new EffectProbeError({ message: "refused" })).pipe(
+    withRpcCall({ system: "telegram", service: "telegram", method: "effectProbe" }),
+    Effect.ignore,
+    Effect.provide(TracingLayer),
+  ));
+  const span = finishedSpan("telegram/effectProbe");
+  assert.equal(span.kind, SpanKind.CLIENT);
+  assert.deepEqual([span.attributes["rpc.system.name"], span.attributes["rpc.service"], span.attributes["rpc.method"]], ["telegram", "telegram", "effectProbe"]);
+  assert.equal(span.attributes["error.type"], "EffectProbeError");
+  const points = (await histogramPoints("rpc.client.call.duration")).filter((point) => point.attributes["rpc.method"] === "effectProbe");
+  assert.equal(points.length, 1);
+  assert.equal(points[0]?.attributes["error.type"], "EffectProbeError");
 });
