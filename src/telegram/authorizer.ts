@@ -1,20 +1,15 @@
 import type { CallbackQuery, Chat, Message, User } from "@grammyjs/types";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { Logger } from "../shared/log.ts";
 
-/** The bot state the Authorizer keeps the bootstrapped operator in (SqliteStore). */
-interface OperatorStateStore {
-  getState(key: string): string | null;
-  setState(key: string, value: string): void;
-}
-
-interface AuthorizerLog {
-  info(message: string): void;
-}
+/** The bot state the Authorizer keeps the bootstrapped operator in. */
+type OperatorStateStore = Pick<SqliteStore, "getState" | "setState">;
 
 export interface AuthorizerOptions {
   /** Comma-separated Telegram user ids; empty lets the first private user bootstrap as the operator. */
   allowedUserIds: string;
   store: OperatorStateStore;
-  log: AuthorizerLog;
+  log: Logger;
 }
 
 /** Who an update came from and where, and whether it may claim an empty allowlist. */
@@ -36,7 +31,7 @@ function parseAllowedUserIds(raw: string) {
 export class Authorizer {
   private readonly allowedUserIds: Set<string>;
   private readonly store: OperatorStateStore;
-  private readonly log: AuthorizerLog;
+  private readonly log: Logger;
 
   constructor({ allowedUserIds, store, log }: AuthorizerOptions) {
     this.allowedUserIds = parseAllowedUserIds(allowedUserIds);

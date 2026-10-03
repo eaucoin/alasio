@@ -1,16 +1,50 @@
-// @ts-nocheck
-import { getNotificationTurnId } from "./protocol.ts";
+import type { Logger } from "../../shared/log.ts";
+import { type AppServerNotification, getNotificationTurnId, itemIds, type NotificationIds } from "./protocol.ts";
 
 const TURN_WAIT_TIMEOUT_MS = 5 * 1000;
 
-export function getNotificationThreadId(message) {
-  const params = message?.params ?? {};
+/** The turn a thread is in, as its notifications and requests name it. */
+interface ThreadTurn {
+  preferredId: string | null;
+  readonly ids: Set<string>;
+  completed: boolean;
+}
+
+/** A wait for a thread's next notification. */
+interface NotificationWaiter {
+  readonly threadId: string;
+  readonly resolve: (message: AppServerNotification) => void;
+  readonly reject: (error: Error) => void;
+  cleanup?: () => void;
+}
+
+/** A wait for the id of a thread's turn. */
+interface TurnIdWaiter {
+  readonly threadId: string;
+  readonly resolve: (turnId: string | null) => void;
+  readonly reject: (error: Error) => void;
+  readonly timer: NodeJS.Timeout;
+  cleanup?: () => void;
+}
+
+export interface NotificationQueueOptions {
+  readonly log: Logger;
+}
+
+export interface TurnIdWaitOptions {
+  readonly timeoutMs?: number | undefined;
+  readonly signal?: AbortSignal;
+}
+
+export function getNotificationThreadId(message: AppServerNotification): string | null {
+  const params: NotificationIds = message?.params ?? {};
+  const item = itemIds(params.item);
   return params.threadId
     ?? params.thread_id
     ?? params.thread?.id
-    ?? params.item?.threadId
-    ?? params.item?.thread_id
-    ?? params.item?.thread?.id
+    ?? item?.threadId
+    ?? item?.thread_id
+    ?? item?.thread?.id
     ?? params.event?.threadId
     ?? params.event?.thread_id
     ?? params.event?.thread?.id
@@ -20,17 +54,23 @@ export function getNotificationThreadId(message) {
     ?? null;
 }
 
-function belongsToThread(message, threadId) {
+function belongsToThread(message: AppServerNotification, threadId: string) {
   const notificationThreadId = getNotificationThreadId(message);
   return !notificationThreadId || notificationThreadId === threadId;
 }
 
-function interruptionError(signal) {
+function interruptionError(signal: AbortSignal) {
   return new Error(String(signal.reason ?? "Interrupted"));
 }
 
 export class AppServerNotificationQueue {
-  constructor({ log }) {
+  private readonly log: Logger;
+  private notifications: AppServerNotification[];
+  waiters: NotificationWaiter[];
+  private turnWaiters: TurnIdWaiter[];
+  private readonly turnByThread: Map<string, ThreadTurn>;
+
+  constructor({ log }: NotificationQueueOptions) {
     this.log = log;
     this.notifications = [];
     this.waiters = [];
@@ -38,14 +78,14 @@ export class AppServerNotificationQueue {
     this.turnByThread = new Map();
   }
 
-  clear() {
+  clear(): void {
     this.notifications = [];
     this.waiters = [];
     this.turnWaiters = [];
     this.turnByThread.clear();
   }
 
-  fail(error) {
+  fail(error: Error): void {
     for (const waiter of this.waiters) {
       waiter.cleanup?.();
       waiter.reject(error);
@@ -59,7 +99,7 @@ export class AppServerNotificationQueue {
     this.turnWaiters = [];
   }
 
-  observe(message) {
+  observe(message: AppServerNotification): void {
     const threadId = getNotificationThreadId(message);
     if (message.method === "turn/started" && threadId && message.params?.turn?.id) {
       const turn = this.turnByThread.get(threadId);
@@ -92,16 +132,16 @@ export class AppServerNotificationQueue {
     this.flushWaiters();
   }
 
-  getCurrentTurnId(threadId) {
+  getCurrentTurnId(threadId: string): string | null | undefined {
     const turn = this.turnByThread.get(threadId);
     return turn?.completed ? undefined : turn?.preferredId;
   }
 
-  getTurnAliases(threadId) {
+  getTurnAliases(threadId: string): Set<string> {
     return new Set(this.turnByThread.get(threadId)?.ids ?? []);
   }
 
-  beginTurn(threadId) {
+  beginTurn(threadId: string): void {
     this.turnByThread.set(threadId, {
       preferredId: null,
       ids: new Set(),
@@ -109,13 +149,13 @@ export class AppServerNotificationQueue {
     });
   }
 
-  rememberTurn(threadId, turnId, { prefer = false } = {}) {
+  rememberTurn(threadId: string, turnId: string | null | undefined, { prefer = false }: { readonly prefer?: boolean } = {}): string | null {
     if (!turnId) {
       return null;
     }
     const turn = this.turnByThread.get(threadId) ?? {
       preferredId: turnId,
-      ids: new Set(),
+      ids: new Set<string>(),
       completed: false,
     };
     turn.ids.add(turnId);
@@ -132,11 +172,11 @@ export class AppServerNotificationQueue {
     return turn.preferredId;
   }
 
-  forgetTurn(threadId) {
+  forgetTurn(threadId: string): void {
     this.turnByThread.delete(threadId);
   }
 
-  discardStaleForTurn(threadId, turnId) {
+  discardStaleForTurn(threadId: string, turnId: string | null | undefined): number {
     if (!turnId) {
       return 0;
     }
@@ -157,17 +197,18 @@ export class AppServerNotificationQueue {
     return discarded;
   }
 
-  nextForThread(threadId, signal) {
+  nextForThread(threadId: string, signal?: AbortSignal | undefined): Promise<AppServerNotification> {
     if (signal?.aborted) {
       return Promise.reject(interruptionError(signal));
     }
     const existingIndex = this.notifications.findIndex((message) => belongsToThread(message, threadId));
     if (existingIndex >= 0) {
+      // findIndex found it.
       const [message] = this.notifications.splice(existingIndex, 1);
-      return Promise.resolve(message);
+      return Promise.resolve(message!);
     }
     return new Promise((resolve, reject) => {
-      const waiter = {
+      const waiter: NotificationWaiter = {
         threadId,
         resolve,
         reject,
@@ -184,7 +225,7 @@ export class AppServerNotificationQueue {
     });
   }
 
-  waitForTurnId(threadId, { timeoutMs = TURN_WAIT_TIMEOUT_MS, signal } = {}) {
+  waitForTurnId(threadId: string, { timeoutMs = TURN_WAIT_TIMEOUT_MS, signal }: TurnIdWaitOptions = {}): Promise<string | null> {
     if (signal?.aborted) {
       return Promise.reject(interruptionError(signal));
     }
@@ -193,7 +234,7 @@ export class AppServerNotificationQueue {
       return Promise.resolve(currentTurnId);
     }
     return new Promise((resolve, reject) => {
-      const waiter = {
+      const waiter: TurnIdWaiter = {
         threadId,
         resolve,
         reject,
@@ -216,7 +257,7 @@ export class AppServerNotificationQueue {
     });
   }
 
-  resolveTurnWaiters(threadId, turnId) {
+  private resolveTurnWaiters(threadId: string, turnId: string | null): void {
     for (const waiter of [...this.turnWaiters]) {
       if (waiter.threadId !== threadId) {
         continue;
@@ -228,16 +269,17 @@ export class AppServerNotificationQueue {
     }
   }
 
-  flushWaiters() {
+  private flushWaiters(): void {
     for (const waiter of [...this.waiters]) {
       const index = this.notifications.findIndex((message) => belongsToThread(message, waiter.threadId));
       if (index === -1) {
         continue;
       }
+      // findIndex found it.
       const [message] = this.notifications.splice(index, 1);
       this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
       waiter.cleanup?.();
-      waiter.resolve(message);
+      waiter.resolve(message!);
     }
   }
 }

@@ -1,10 +1,15 @@
-// @ts-nocheck
-import { elapsedMs } from "./process.ts";
+import type { v2 } from "../../../.types/codex/index.js";
+import type { Logger } from "../../shared/log.ts";
 import {
   ALASIO_CODEX_MODEL,
   ALASIO_CODEX_REASONING_EFFORT,
   withAlasioCodexModelConfig,
 } from "../model.ts";
+import type { CodexThreadConfig } from "../thread-config.ts";
+import type { AppServerNotificationQueue } from "./notification-queue.ts";
+import { elapsedMs } from "./process.ts";
+import type { AppServerParams, AppServerResult } from "./protocol.ts";
+import type { AppServerRpcClient, AppServerScope } from "./rpc-client.ts";
 
 const INTERRUPT_TIMEOUT_MS = 5_000;
 /** Threads or turns one list request asks for. */
@@ -14,21 +19,72 @@ const LIST_PAGE_SIZE = 100;
  * which include alasio's app-server threads, and alasio's exec transport's.
  * Sub-agent threads are left out.
  */
-const LISTED_SOURCE_KINDS = ["cli", "vscode", "exec"];
+const LISTED_SOURCE_KINDS: v2.ThreadSourceKind[] = ["cli", "vscode", "exec"];
+
+/** The app-server's paginated lists alasio reads whole, each a page of its items at a time. */
+type ListMethod = "thread/list" | "thread/turns/list" | "model/list";
+
+/** A thread alasio loads in the app-server, under the conversation's thread key. */
+export interface ThreadOptions extends AppServerScope {
+  readonly threadKey: string;
+  readonly config: CodexThreadConfig;
+}
+
+export interface EnsureThreadOptions extends ThreadOptions {
+  readonly threadId: string;
+}
+
+export interface ForkThreadOptions extends EnsureThreadOptions {
+  readonly beforeTurnId: string;
+}
+
+export interface StartTurnOptions {
+  readonly threadId: string;
+  readonly prompt: string;
+  readonly cwd: string;
+  readonly model?: string | undefined;
+  readonly effort?: string | null | undefined;
+}
+
+export interface SteerTurnOptions {
+  readonly threadId: string;
+  readonly turnId: string | null | undefined;
+  readonly prompt: string;
+}
+
+/** A call about one thread, in the scope of the app-server that holds it. */
+export interface ThreadScope extends AppServerScope {
+  readonly threadId: string;
+}
+
+export interface SetGoalOptions extends ThreadScope {
+  readonly objective?: string | null | undefined;
+  readonly status?: v2.ThreadGoalStatus | null | undefined;
+  readonly tokenBudget?: number | null | undefined;
+}
+
+export interface AppServerThreadClientOptions {
+  readonly rpc: Pick<AppServerRpcClient, "start" | "request">;
+  readonly notifications: AppServerNotificationQueue;
+  readonly log: Logger;
+}
 
 /** What every thread alasio starts, resumes, or forks is loaded with. */
-function threadOverrides({ cwd, config }) {
+function threadOverrides({ cwd, config }: { readonly cwd: string; readonly config: CodexThreadConfig }) {
+  // Typed as an object type rather than as model.ts's interface, so the protocol's types
+  // take it as the JSON object it is.
+  const threadConfig: CodexThreadConfig & { readonly model_reasoning_effort: string } = withAlasioCodexModelConfig(config);
   return {
     cwd,
     model: ALASIO_CODEX_MODEL,
     approvalPolicy: "never",
     sandbox: "danger-full-access",
-    config: withAlasioCodexModelConfig(config),
-  };
+    config: threadConfig,
+  } as const;
 }
 
 export class StaleTurnCleanupError extends Error {
-  constructor(threadId, turnId, cause) {
+  constructor(threadId: string, turnId: string, cause: unknown) {
     super(`Failed to clean up stale Codex turn ${turnId} for thread ${threadId}: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = "StaleTurnCleanupError";
     this.cause = cause;
@@ -36,13 +92,17 @@ export class StaleTurnCleanupError extends Error {
 }
 
 export class AppServerThreadClient {
-  constructor({ rpc, notifications, log }) {
+  private readonly rpc: Pick<AppServerRpcClient, "start" | "request">;
+  private readonly notifications: AppServerNotificationQueue;
+  private readonly log: Logger;
+
+  constructor({ rpc, notifications, log }: AppServerThreadClientOptions) {
     this.rpc = rpc;
     this.notifications = notifications;
     this.log = log;
   }
 
-  async ensureThread({ threadId, threadKey, cwd, env, config }) {
+  async ensureThread({ threadId, threadKey, cwd, env, config }: EnsureThreadOptions): Promise<string> {
     await this.rpc.start({ env, cwd });
     const startedAt = process.hrtime.bigint();
     const loaded = await this.rpc.request("thread/loaded/list", {});
@@ -60,7 +120,7 @@ export class AppServerThreadClient {
     return resumedId;
   }
 
-  async startThread({ threadKey, cwd, env, config }) {
+  async startThread({ threadKey, cwd, env, config }: ThreadOptions): Promise<string> {
     await this.rpc.start({ env, cwd });
     const startedAt = process.hrtime.bigint();
     const response = await this.rpc.request("thread/start", threadOverrides({ cwd, config }));
@@ -77,7 +137,7 @@ export class AppServerThreadClient {
    * one out: Codex's own fork, into a new thread loaded as a resume loads
    * one. Returns the new thread's id.
    */
-  async forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config }) {
+  async forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config }: ForkThreadOptions): Promise<string> {
     await this.rpc.start({ env, cwd });
     const startedAt = process.hrtime.bigint();
     const response = await this.rpc.request("thread/fork", {
@@ -95,7 +155,7 @@ export class AppServerThreadClient {
   }
 
   /** The threads whose session ran in `cwd`, most recently updated first, without their turns. */
-  async listThreads({ env, cwd }) {
+  async listThreads({ env, cwd }: AppServerScope): Promise<v2.Thread[]> {
     await this.rpc.start({ env, cwd });
     return await this.#listAll("thread/list", {
       cwd,
@@ -105,24 +165,24 @@ export class AppServerThreadClient {
   }
 
   /** A thread's turns, newest first, each with a summary of its items. */
-  async listTurns({ threadId, env, cwd }) {
+  async listTurns({ threadId, env, cwd }: ThreadScope): Promise<v2.Turn[]> {
     await this.rpc.start({ env, cwd });
     return await this.#listAll("thread/turns/list", { threadId });
   }
 
   /** Every page of one of the app-server's paginated lists. */
-  async #listAll(method, params) {
-    const all = [];
-    let cursor = null;
+  async #listAll<M extends ListMethod>(method: M, params: AppServerParams<M>): Promise<AppServerResult<M>["data"][number][]> {
+    const all: AppServerResult<M>["data"][number][] = [];
+    let cursor: string | null = null;
     do {
-      const page = await this.rpc.request(method, { ...params, limit: LIST_PAGE_SIZE, ...(cursor ? { cursor } : {}) });
+      const page: AppServerResult<M> = await this.rpc.request(method, { ...params, limit: LIST_PAGE_SIZE, ...(cursor ? { cursor } : {}) });
       all.push(...(page?.data ?? []));
       cursor = page?.nextCursor ?? null;
     } while (cursor);
     return all;
   }
 
-  async startTurn({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT }) {
+  async startTurn({ threadId, prompt, cwd, model = ALASIO_CODEX_MODEL, effort = ALASIO_CODEX_REASONING_EFFORT }: StartTurnOptions): Promise<string> {
     const previousTurnId = this.notifications.getCurrentTurnId(threadId);
     if (previousTurnId) {
       this.log.warn(`interrupting leftover app-server turn before starting a new one thread=${threadId.slice(0, 8)} turn=${previousTurnId}`);
@@ -152,12 +212,12 @@ export class AppServerThreadClient {
   }
 
   /** The models this machine's Codex login can use, as the app-server reports them. */
-  async listModels({ env, cwd }) {
+  async listModels({ env, cwd }: AppServerScope): Promise<v2.Model[]> {
     await this.rpc.start({ env, cwd });
     return await this.#listAll("model/list", { includeHidden: false });
   }
 
-  claimTurn(threadId, turnId) {
+  claimTurn(threadId: string, turnId: string): void {
     if (!this.notifications.getCurrentTurnId(threadId)
       && !this.notifications.getTurnAliases(threadId).has(turnId)) {
       this.notifications.beginTurn(threadId);
@@ -166,11 +226,11 @@ export class AppServerThreadClient {
     this.notifications.discardStaleForTurn(threadId, turnId);
   }
 
-  async waitForTurnId(threadId, timeoutMs) {
+  async waitForTurnId(threadId: string, timeoutMs?: number): Promise<string | null> {
     return await this.notifications.waitForTurnId(threadId, { timeoutMs });
   }
 
-  async steerTurn({ threadId, turnId, prompt }) {
+  async steerTurn({ threadId, turnId, prompt }: SteerTurnOptions): Promise<v2.TurnSteerResponse> {
     const activeTurnId = this.notifications.getCurrentTurnId(threadId) ?? turnId;
     if (!activeTurnId) {
       throw new Error("Cannot steer Codex without an active turn id");
@@ -182,7 +242,7 @@ export class AppServerThreadClient {
     });
   }
 
-  async interrupt(threadId, origin = "unspecified") {
+  async interrupt(threadId: string, origin = "unspecified"): Promise<boolean> {
     const turnId = this.notifications.getCurrentTurnId(threadId);
     if (!turnId) {
       return false;
@@ -193,14 +253,14 @@ export class AppServerThreadClient {
     return true;
   }
 
-  async getGoal({ threadId, cwd, env }) {
+  async getGoal({ threadId, cwd, env }: ThreadScope): Promise<v2.ThreadGoalGetResponse> {
     await this.rpc.start({ env, cwd });
     return await this.rpc.request("thread/goal/get", { threadId });
   }
 
-  async setGoal({ threadId, cwd, env, objective, status, tokenBudget }) {
+  async setGoal({ threadId, cwd, env, objective, status, tokenBudget }: SetGoalOptions): Promise<v2.ThreadGoalSetResponse> {
     await this.rpc.start({ env, cwd });
-    const params = { threadId };
+    const params: v2.ThreadGoalSetParams = { threadId };
     if (objective !== undefined) {
       params.objective = objective;
     }
@@ -213,7 +273,7 @@ export class AppServerThreadClient {
     return await this.rpc.request("thread/goal/set", params);
   }
 
-  async clearGoal({ threadId, cwd, env }) {
+  async clearGoal({ threadId, cwd, env }: ThreadScope): Promise<v2.ThreadGoalClearResponse> {
     await this.rpc.start({ env, cwd });
     return await this.rpc.request("thread/goal/clear", { threadId });
   }

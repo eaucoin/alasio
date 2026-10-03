@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Sandboxes: agent-sandbox's `Sandbox` objects (agents.x-k8s.io/v1beta1), each one pod
  * running bayma's MCP over HTTP, with its own Service, volumes and bearer token, which
@@ -14,14 +13,106 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import type {
+  KubernetesObject,
+  V1Condition,
+  V1Container,
+  V1ObjectMeta,
+  V1PersistentVolumeClaim,
+  V1PodSpec,
+  V1PodTemplateSpec,
+  V1Secret,
+} from "@kubernetes/client-node";
+
 import { createLogger } from "../shared/log.ts";
 import { inSpan } from "../telemetry/index.ts";
-import { isStatus } from "./client.ts";
+import { isStatus, type KubeClient } from "./client.ts";
 
 const log = createLogger("sandboxes");
 
 export const SANDBOX_API_VERSION = "agents.x-k8s.io/v1beta1";
 export const SANDBOX_KIND = "Sandbox";
+
+/** Whether a Sandbox's pod runs; suspending one keeps its volumes. */
+export type SandboxOperatingMode = "Running" | "Suspended";
+
+/** A Sandbox's metadata, which always names it and its namespace. */
+export interface SandboxMetadata extends V1ObjectMeta {
+  name: string;
+  namespace: string;
+}
+
+/** What alasio sets of a Sandbox's spec (charts/agent-sandbox/crds). */
+export interface SandboxSpec {
+  operatingMode?: SandboxOperatingMode;
+  /** Whether agent-sandbox gives the Sandbox a Service of its own. */
+  service?: boolean;
+  podTemplate: V1PodTemplateSpec;
+  readonly volumeClaimTemplates?: readonly V1PersistentVolumeClaim[];
+}
+
+/** What alasio reads of a Sandbox's status. */
+export interface SandboxStatus {
+  conditions?: V1Condition[];
+  serviceFQDN?: string;
+}
+
+/** An agent-sandbox Sandbox, as far as alasio makes and reads one. */
+export interface Sandbox extends KubernetesObject {
+  apiVersion: typeof SANDBOX_API_VERSION;
+  kind: typeof SANDBOX_KIND;
+  metadata: SandboxMetadata;
+  spec: SandboxSpec;
+  status?: SandboxStatus;
+}
+
+/** A Sandbox the API server holds, which has given it its uid. */
+export interface StoredSandbox extends Sandbox {
+  metadata: SandboxMetadata & { uid: string };
+}
+
+/** What a Sandbox is made from: a profile's templates (./config.ts). */
+export interface SandboxTemplate {
+  readonly podTemplate?: V1PodTemplateSpec;
+  readonly volumeClaimTemplates?: readonly V1PersistentVolumeClaim[] | undefined;
+}
+
+/** What sandboxManifest is given. */
+export interface SandboxManifestOptions {
+  readonly name: string;
+  readonly namespace: string;
+  readonly template: SandboxTemplate;
+  readonly labels?: Readonly<Record<string, string>>;
+  readonly annotations?: Readonly<Record<string, string>>;
+  /** Adds what is the caller's own to the pod spec, whose bayma container is `bayma`, and returns the spec. */
+  readonly configure?: (spec: V1PodSpec, bayma: V1Container) => V1PodSpec;
+}
+
+/** Where a Sandbox's bayma serves MCP, and the bearer to reach it with. */
+export interface BaymaEndpoint {
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+/** The Sandboxes of one namespace; see createSandboxes. */
+export interface Sandboxes {
+  readonly namespace: string;
+  ensure(name: string, manifest: () => Sandbox): Promise<BaymaEndpoint>;
+  token(name: string): Promise<string | null>;
+  exists(name: string): Promise<boolean>;
+  suspend(name: string): Promise<void>;
+  remove(name: string): Promise<void>;
+}
+
+/** What createSandboxes is given. */
+export interface SandboxesOptions {
+  readonly kube: KubeClient;
+  readonly namespace: string;
+  readonly port: number;
+  readonly fetchImpl?: typeof fetch;
+  readonly readyTimeoutMs?: number;
+  readonly pollMs?: number;
+}
 
 /** The container in every Sandbox's pod that runs bayma. */
 export const BAYMA_CONTAINER = "bayma";
@@ -39,7 +130,7 @@ const READY_TIMEOUT_MS = 300_000;
 const POLL_MS = 500;
 
 /** The name of a Sandbox's token Secret. */
-export function tokenSecretName(name) {
+export function tokenSecretName(name: string): string {
   return `${name}-bayma-token`;
 }
 
@@ -47,18 +138,18 @@ export function tokenSecretName(name) {
  * A token that names its Sandbox, `<name>.<random>`, so what presents one can be looked
  * up by it (../sandbox/telemetry-receiver.ts) without a table of tokens.
  */
-export function newToken(name, random = () => randomBytes(32).toString("base64url")) {
+export function newToken(name: string, random: () => string = () => randomBytes(32).toString("base64url")): string {
   return `${name}.${random()}`;
 }
 
 /** The Sandbox's name in `token`, or null for one that names none. */
-export function tokenSandboxName(token) {
+export function tokenSandboxName(token: string): string | null {
   const dot = typeof token === "string" ? token.indexOf(".") : -1;
   return dot > 0 ? token.slice(0, dot) : null;
 }
 
 /** Whether `presented` is `expected`, compared in constant time. */
-export function sameToken(presented, expected) {
+export function sameToken(presented: string, expected: string): boolean {
   const a = Buffer.from(String(presented));
   const b = Buffer.from(String(expected));
   return a.length === b.length && timingSafeEqual(a, b);
@@ -67,12 +158,19 @@ export function sameToken(presented, expected) {
 /**
  * The Sandbox for `name` from a profile's `template` (`{ podTemplate,
  * volumeClaimTemplates }`, rendered by the chart), with what every Sandbox needs: its
- * labels, Running, its Service, and bayma given its token. `configure(podSpec)` adds
- * what is the caller's own and returns the spec. Pure, for tests.
+ * labels, Running, its Service, and bayma given its token. `configure(podSpec, bayma)`
+ * adds what is the caller's own and returns the spec. Pure, for tests.
  */
-export function sandboxManifest({ name, namespace, template, labels = {}, annotations = {}, configure = (spec) => spec }) {
-  const podTemplate = structuredClone(template.podTemplate ?? {});
-  const spec = podTemplate.spec ?? {};
+export function sandboxManifest({
+  name,
+  namespace,
+  template,
+  labels = {},
+  annotations = {},
+  configure = (spec) => spec,
+}: SandboxManifestOptions): Sandbox {
+  const podTemplate: V1PodTemplateSpec = structuredClone(template.podTemplate ?? {});
+  const spec: V1PodSpec = podTemplate.spec ?? { containers: [] };
   const containers = spec.containers ?? [];
   const bayma = containers.find((container) => container.name === BAYMA_CONTAINER);
   if (!bayma) throw new Error(`the Sandbox template for ${namespace} has no container named ${JSON.stringify(BAYMA_CONTAINER)}`);
@@ -88,7 +186,7 @@ export function sandboxManifest({ name, namespace, template, labels = {}, annota
     ...podTemplate.metadata,
     labels: { ...podTemplate.metadata?.labels, ...allLabels },
   };
-  podTemplate.spec = configure(spec);
+  podTemplate.spec = configure(spec, bayma);
   return {
     apiVersion: SANDBOX_API_VERSION,
     kind: SANDBOX_KIND,
@@ -103,7 +201,7 @@ export function sandboxManifest({ name, namespace, template, labels = {}, annota
 }
 
 /** The token Secret of `sandbox`, owned by it so it goes when the Sandbox does. Pure, for tests. */
-export function tokenSecretManifest(sandbox, token) {
+export function tokenSecretManifest(sandbox: StoredSandbox, token: string): V1Secret {
   return {
     apiVersion: "v1",
     kind: "Secret",
@@ -125,12 +223,20 @@ export function tokenSecretManifest(sandbox, token) {
   };
 }
 
-function condition(sandbox, type) {
+function condition(sandbox: Sandbox, type: string): V1Condition | null {
   return sandbox?.status?.conditions?.find((entry) => entry.type === type) ?? null;
 }
 
+/**
+ * `object` as the Sandbox it is: what the API server returns for a Sandbox is one it
+ * stores, in its CRD's schema and with the server's own metadata.
+ */
+function stored(object: KubernetesObject): StoredSandbox {
+  return object as StoredSandbox;
+}
+
 /** Whether the Sandbox's pod is ready and its Service exists, for its current spec. */
-export function sandboxReady(sandbox) {
+export function sandboxReady(sandbox: Sandbox): boolean {
   const ready = condition(sandbox, "Ready");
   return ready?.status === "True" && (ready.observedGeneration ?? 0) >= (sandbox.metadata.generation ?? 0);
 }
@@ -145,26 +251,39 @@ export function sandboxReady(sandbox) {
  * - `token(name)`: the Sandbox's token, or null when it has none.
  * - `suspend(name)`, `remove(name)`, `exists(name)`.
  */
-export function createSandboxes({ kube, namespace, port, fetchImpl = fetch, readyTimeoutMs = READY_TIMEOUT_MS, pollMs = POLL_MS }) {
-  const ensuring = new Map();
-  const tokens = new Map();
+export function createSandboxes({
+  kube,
+  namespace,
+  port,
+  fetchImpl = fetch,
+  readyTimeoutMs = READY_TIMEOUT_MS,
+  pollMs = POLL_MS,
+}: SandboxesOptions): Sandboxes {
+  const ensuring = new Map<string, Promise<BaymaEndpoint>>();
+  const tokens = new Map<string, string>();
 
-  const read = (name) => kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name);
+  const read = async (name: string): Promise<StoredSandbox | null> => {
+    const object = await kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name);
+    return object && stored(object);
+  };
 
-  async function token(name) {
-    if (tokens.has(name)) return tokens.get(name);
-    const secret = await kube.read("v1", "Secret", namespace, tokenSecretName(name));
-    const value = secret?.data?.[TOKEN_KEY] ? Buffer.from(secret.data[TOKEN_KEY], "base64").toString("utf8") : null;
+  async function token(name: string): Promise<string | null> {
+    const known = tokens.get(name);
+    if (known !== undefined) return known;
+    // A core Secret, as the API server returns one.
+    const secret = (await kube.read("v1", "Secret", namespace, tokenSecretName(name))) as V1Secret | null;
+    const encoded = secret?.data?.[TOKEN_KEY];
+    const value = encoded ? Buffer.from(encoded, "base64").toString("utf8") : null;
     if (value) tokens.set(name, value);
     return value;
   }
 
   /** The Sandbox, made from `manifest()` when it does not exist. */
-  async function readOrCreate(name, manifest) {
+  async function readOrCreate(name: string, manifest: () => Sandbox): Promise<StoredSandbox | null> {
     const existing = await read(name);
     if (existing) return existing;
     try {
-      const created = await kube.create(manifest());
+      const created = stored(await kube.create(manifest()));
       log.info(`created Sandbox ${namespace}/${name}`);
       return created;
     } catch (error) {
@@ -178,7 +297,7 @@ export function createSandboxes({ kube, namespace, port, fetchImpl = fetch, read
    * so one made just after the Sandbox, or by a later alasio after a failure between
    * the two, starts it.
    */
-  async function ensureToken(sandbox) {
+  async function ensureToken(sandbox: StoredSandbox): Promise<void> {
     const name = sandbox.metadata.name;
     if (await token(name)) return;
     const value = newToken(name);
@@ -191,8 +310,8 @@ export function createSandboxes({ kube, namespace, port, fetchImpl = fetch, read
   }
 
   /** Waits until bayma in the Sandbox answers over its Service. */
-  async function answering(url, headers, deadline) {
-    let last = null;
+  async function answering(url: string, headers: Readonly<Record<string, string>>, deadline: number): Promise<void> {
+    let last: unknown = null;
     while (Date.now() < deadline) {
       try {
         // Any response is bayma answering: a GET without a session is refused.
@@ -205,16 +324,16 @@ export function createSandboxes({ kube, namespace, port, fetchImpl = fetch, read
       }
       await sleep(pollMs);
     }
-    throw new Error(`bayma in ${url} did not answer: ${last?.message ?? "timed out"}`);
+    throw new Error(`bayma in ${url} did not answer: ${last instanceof Error ? last.message : "timed out"}`);
   }
 
-  async function bringUp(name, manifest) {
+  async function bringUp(name: string, manifest: () => Sandbox): Promise<BaymaEndpoint> {
     return await inSpan("alasio.sandbox.ensure", { attributes: { "alasio.sandbox.name": name, "k8s.namespace.name": namespace } }, async () => {
       let sandbox = await readOrCreate(name, manifest);
       if (!sandbox) throw new Error(`Sandbox ${namespace}/${name} was deleted while it was made`);
       await ensureToken(sandbox);
       if (sandbox.spec?.operatingMode === "Suspended") {
-        sandbox = await kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } });
+        sandbox = stored(await kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
         log.info(`resumed Sandbox ${namespace}/${name}`);
       }
       const deadline = Date.now() + readyTimeoutMs;
@@ -241,10 +360,12 @@ export function createSandboxes({ kube, namespace, port, fetchImpl = fetch, read
     namespace,
 
     ensure(name, manifest) {
-      if (!ensuring.has(name)) {
-        ensuring.set(name, bringUp(name, manifest).finally(() => ensuring.delete(name)));
+      let pending = ensuring.get(name);
+      if (!pending) {
+        pending = bringUp(name, manifest).finally(() => ensuring.delete(name));
+        ensuring.set(name, pending);
       }
-      return ensuring.get(name);
+      return pending;
     },
 
     token,

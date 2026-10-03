@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * bayma's telemetry from session sandboxes, received over OTLP/HTTP and exported where
  * alasio exports its own. A session's one permitted egress without internet is this
@@ -11,13 +10,17 @@
  * dropped, and each session is held to a byte rate, past which it is answered 429 so
  * its exporter backs off and retries.
  */
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type OutgoingHttpHeaders } from "node:http";
+import type { AddressInfo } from "node:net";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
+import type { Attributes } from "@opentelemetry/api";
+
 import { createLogger } from "../shared/log.ts";
+import type { OtlpEncoding, OtlpForwarder } from "../telemetry/forward.ts";
 import { meter, SIGNALS } from "../telemetry/index.ts";
-import { MalformedRequest, stampResources } from "./otlp-resource.ts";
+import { MalformedRequest, type ResourceStamp, stampResources } from "./otlp-resource.ts";
 
 const log = createLogger("sandbox-telemetry-receiver");
 const gunzipAsync = promisify(gunzip);
@@ -27,16 +30,52 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 // through alasio.
 const RATE_BYTES_PER_SECOND = 128 * 1024;
 const BURST_BYTES = 16 * 1024 * 1024;
-const ENCODINGS = { "application/x-protobuf": "protobuf", "application/json": "json" };
+const ENCODINGS: Partial<Record<string, OtlpEncoding>> = { "application/x-protobuf": "protobuf", "application/json": "json" };
 
 const requests = meter.createCounter("alasio.sandbox.telemetry.received", {
   description: "OTLP requests received from bayma inside session sandboxes, by outcome",
   unit: "{request}",
 });
 
+/** What createRateLimiter is given: bytes per second, the most a budget holds, and the clock in ms. */
+export interface RateLimiterOptions {
+  readonly rate?: number;
+  readonly burst?: number;
+  readonly now?: () => number;
+}
+
+/** Per-session byte budgets; see createRateLimiter. */
+export interface RateLimiter {
+  take(key: string, bytes: number): number;
+}
+
+/** What startTelemetryReceiver is given; see there. */
+export interface TelemetryReceiverOptions {
+  readonly port: number;
+  readonly host?: string;
+  readonly authenticate: (token: string) => Promise<string | null>;
+  readonly forwarder: OtlpForwarder;
+  readonly stampFor: (volumeId: string) => ResourceStamp;
+  readonly limiter?: RateLimiter;
+}
+
+/** A listening receiver. */
+export interface TelemetryReceiver {
+  readonly port: number;
+  close(): Promise<void>;
+}
+
+/** An answer to a request: its status, and headers and body if it has any. */
+type Reply = readonly [status: number, headers?: OutgoingHttpHeaders, body?: string];
+
+/** A failure to read a request that carries the status to answer it with. */
+interface RequestError extends Error {
+  status?: number;
+}
+
 /** A per-session byte budget refilled at `rate` up to `burst`. */
-export function createRateLimiter({ rate = RATE_BYTES_PER_SECOND, burst = BURST_BYTES, now = () => performance.now() } = {}) {
-  const buckets = new Map();
+export function createRateLimiter({ rate = RATE_BYTES_PER_SECOND, burst = BURST_BYTES, now = () => performance.now() }: RateLimiterOptions = {}): RateLimiter {
+  const buckets = new Map<string, { tokens: number; at: number }>();
   return {
     /** Takes `bytes` from `key`'s budget; the seconds to wait first when it lacks them, else 0. */
     take(key, bytes) {
@@ -52,14 +91,14 @@ export function createRateLimiter({ rate = RATE_BYTES_PER_SECOND, burst = BURST_
   };
 }
 
-function readBody(request, limit) {
+function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks = [];
+    const chunks: Buffer[] = [];
     let size = 0;
-    request.on("data", (chunk) => {
+    request.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > limit) {
-        reject(Object.assign(new Error("request body too large"), { status: 413 }));
+        reject(Object.assign(new Error("request body too large"), { status: 413 }) satisfies RequestError);
         request.resume();
         return;
       }
@@ -76,11 +115,18 @@ function readBody(request, limit) {
  * (../telemetry/forward.ts); `stampFor(volumeId)` is what that session's resources
  * are stamped with. Resolves `{ port, close() }` once listening.
  */
-export async function startTelemetryReceiver({ port, host = "0.0.0.0", authenticate, forwarder, stampFor, limiter = createRateLimiter() }) {
-  const count = (outcome, attributes = {}) => requests.add(1, { outcome, ...attributes });
+export async function startTelemetryReceiver({
+  port,
+  host = "0.0.0.0",
+  authenticate,
+  forwarder,
+  stampFor,
+  limiter = createRateLimiter(),
+}: TelemetryReceiverOptions): Promise<TelemetryReceiver> {
+  const count = (outcome: string, attributes: Attributes = {}) => requests.add(1, { outcome, ...attributes });
   let failing = false;
 
-  async function handle(request) {
+  async function handle(request: IncomingMessage): Promise<Reply> {
     const signal = SIGNALS.find((name) => request.url === `/v1/${name}`);
     if (request.method !== "POST" || !signal) return [404];
     const bearer = /^Bearer (.+)$/u.exec(request.headers.authorization ?? "")?.[1];
@@ -89,12 +135,13 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
       count("refused", { reason: "unauthenticated" });
       return [401];
     }
-    const type = (request.headers["content-type"] ?? "").split(";")[0].trim();
+    const [mediaType = ""] = (request.headers["content-type"] ?? "").split(";");
+    const type = mediaType.trim();
     const encoding = ENCODINGS[type];
     if (!encoding) return [415];
     // A full success, in the request's own encoding: an empty message, or an empty object.
-    const ok = [200, { "content-type": type }, encoding === "json" ? "{}" : ""];
-    let body = await readBody(request, MAX_BODY_BYTES);
+    const ok: Reply = [200, { "content-type": type }, encoding === "json" ? "{}" : ""];
+    let body: Buffer | null = await readBody(request, MAX_BODY_BYTES);
     const wait = limiter.take(volumeId, body.length);
     if (wait > 0) {
       count("refused", { signal, reason: "rate" });
@@ -109,7 +156,7 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
     }
     // A signal alasio does not export is accepted and let go, as the exporter expects.
     if (!forwarder.protocols[signal]) return ok;
-    let stamped;
+    let stamped: Buffer;
     try {
       stamped = stampResources(signal, encoding, body, stampFor(volumeId));
     } catch (error) {
@@ -130,7 +177,8 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
       ([status, headers = {}, body = ""]) => {
         response.writeHead(status, headers).end(body);
       },
-      (error) => {
+      // What handle rejects with is an Error: readBody's, or one of what it calls.
+      (error: RequestError) => {
         const status = error.status ?? 500;
         if (status === 500) log.warn(`receiving sessions' telemetry failed: ${error.message}`);
         response.writeHead(status).end();
@@ -138,13 +186,14 @@ export async function startTelemetryReceiver({ port, host = "0.0.0.0", authentic
     );
   });
   server.requestTimeout = 30_000;
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
   });
   return {
-    port: server.address().port,
-    close: () => new Promise((resolve) => {
+    // Listening on a TCP port, its address is one.
+    port: (server.address() as AddressInfo).port,
+    close: () => new Promise<void>((resolve) => {
       server.close(() => resolve());
       server.closeAllConnections();
     }),

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Codex's rollout files in alasio's Neon database, byte for byte.
  *
@@ -8,12 +7,13 @@
  * chunks in order: a file that grows gets its new bytes as one more chunk,
  * and one rewritten gets all of them again. The bytes are never interpreted.
  */
+import type { Pool, PoolClient } from "pg";
 
 export const DEFAULT_SCHEMA = "codex_sessions";
 /** Where the session-filesystem Codex home's rollouts are kept (codex/sessionfs.ts). */
 export const SESSION_FS_SCHEMA = "codex_sessionfs_sessions";
 
-const ddl = (SCHEMA) => `
+const ddl = (SCHEMA: string): string => `
 create schema if not exists ${SCHEMA};
 create table if not exists ${SCHEMA}.rollouts (
   name text primary key,
@@ -45,12 +45,51 @@ create table if not exists ${SCHEMA}.rollout_chunks (
 /** The most bytes one chunk holds, so that no statement carries more. */
 const CHUNK_BYTES = 8 * 1024 * 1024;
 
+/** A rollout as the store keeps it, enough to tell whether its file changed: as `list()` gives it. */
+export interface KeptRollout {
+  readonly name: string;
+  path: string;
+  readonly size: number;
+  readonly headDigest: string;
+}
+
+/** A rollout file to keep, as `save()` takes it. */
+export interface Rollout {
+  readonly name: string;
+  readonly path: string;
+  readonly threadId: string;
+  readonly rolloutId: string;
+  /** The rollout id of the file this one's history starts in, if any. */
+  readonly historyBase: string | null;
+  readonly size: number;
+  readonly headDigest: string;
+  readonly modifiedMs: number;
+}
+
+/** Bytes of a rollout file, from `start` to its end. */
+export interface RolloutBytes {
+  readonly start: number;
+  readonly bytes: Buffer;
+}
+
+/** A rollout a thread's resume needs, as `lineage()` gives it: where its file goes back, and how. */
+export interface RestorableRollout {
+  readonly name: string;
+  readonly path: string;
+  readonly size: number;
+  readonly modifiedMs: number;
+}
+
+export interface NeonRolloutStoreOptions {
+  readonly schema?: string;
+}
+
 export class NeonRolloutStore {
-  #pool;
-  #schema;
+  #pool: Pool;
+  #schema: string;
 
   /** `schema` is where the tables live: alasio's, or a test's own. */
-  constructor(pool, { schema = DEFAULT_SCHEMA } = {}) {
+  constructor(pool: Pool, { schema = DEFAULT_SCHEMA }: NeonRolloutStoreOptions = {}) {
     if (!/^[a-z_][a-z0-9_]*$/u.test(schema)) {
       throw new Error(`invalid schema name: ${schema}`);
     }
@@ -59,13 +98,15 @@ export class NeonRolloutStore {
   }
 
   /** Creates the tables if they are missing. Idempotent. */
-  async ensureSchema() {
+  async ensureSchema(): Promise<void> {
     await this.#pool.query(ddl(this.#schema));
   }
 
   /** Every rollout kept: `{ name, path, size, headDigest }`. */
-  async list() {
-    const { rows } = await this.#pool.query(`select name, path, size, head_digest from ${this.#schema}.rollouts`);
+  async list(): Promise<KeptRollout[]> {
+    const { rows } = await this.#pool.query<{ name: string; path: string; size: string; head_digest: string }>(
+      `select name, path, size, head_digest from ${this.#schema}.rollouts`,
+    );
     return rows.map((row) => ({ name: row.name, path: row.path, size: Number(row.size), headDigest: row.head_digest }));
   }
 
@@ -74,7 +115,7 @@ export class NeonRolloutStore {
    * replacing what was kept, or its new ones from where the kept ones end.
    * `rollout` is `{ name, path, threadId, rolloutId, historyBase, size, headDigest, modifiedMs }`.
    */
-  async save(rollout, { start, bytes }) {
+  async save(rollout: Rollout, { start, bytes }: RolloutBytes): Promise<void> {
     if (start + bytes.length !== rollout.size) {
       throw new Error(`${rollout.name}: ${bytes.length} bytes from ${start} do not make ${rollout.size}`);
     }
@@ -100,7 +141,7 @@ export class NeonRolloutStore {
   }
 
   /** Records that a rollout's file is now at `path`, as archiving moves it. */
-  async move(name, path) {
+  async move(name: string, path: string): Promise<void> {
     await this.#pool.query(`update ${this.#schema}.rollouts set path = $2 where name = $1`, [name, path]);
   }
 
@@ -109,8 +150,8 @@ export class NeonRolloutStore {
    * in, transitively: `{ name, path, size, modifiedMs }`, the files resuming
    * them needs.
    */
-  async lineage(threadIds) {
-    const { rows } = await this.#pool.query(
+  async lineage(threadIds: readonly string[]): Promise<RestorableRollout[]> {
+    const { rows } = await this.#pool.query<{ name: string; path: string; size: string; modified_ms: string }>(
       `with recursive lineage as (
          select name, path, size, modified_ms, history_base from ${this.#schema}.rollouts where thread_id = any($1)
          union
@@ -124,15 +165,15 @@ export class NeonRolloutStore {
   }
 
   /** A rollout's bytes, whole. */
-  async read(name) {
-    const { rows } = await this.#pool.query(
+  async read(name: string): Promise<Buffer> {
+    const { rows } = await this.#pool.query<{ bytes: Buffer }>(
       `select bytes from ${this.#schema}.rollout_chunks where name = $1 order by start`,
       [name],
     );
     return Buffer.concat(rows.map((row) => row.bytes));
   }
 
-  async #transaction(work) {
+  async #transaction(work: (client: PoolClient) => Promise<void>): Promise<void> {
     const client = await this.#pool.connect();
     try {
       await client.query("begin");

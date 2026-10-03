@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Where transcript search lives: beside the session store's entries, in the
  * same schema, and written only by the indexer here, never on the SDK's path.
@@ -10,8 +9,9 @@
  * - indexed: the entries the indexer has read, whatever they held;
  * - search(): the one way in, from any SQL client.
  */
+import type { Pool } from "pg";
 
-export const searchDdl = (SCHEMA) => `
+export const searchDdl = (SCHEMA: string): string => `
 create extension if not exists pg_trgm;
 
 create table if not exists ${SCHEMA}.passages (
@@ -139,6 +139,6 @@ $$;
 `;
 
 /** Creates search's tables, indexes, and functions if they are missing. Idempotent. */
-export async function ensureSearchSchema(pool, schema) {
+export async function ensureSearchSchema(pool: Pool, schema: string): Promise<void> {
   await pool.query(searchDdl(schema));
 }

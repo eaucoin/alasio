@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Claude Code's transcripts in alasio's Neon database, through the Agent SDK's
  * SessionStore contract (@anthropic-ai/claude-agent-sdk, `SessionStore`).
@@ -21,11 +20,18 @@
  * entry and never read here. Where Postgres will not take even that as
  * `jsonb`, `doc` is null and the entry is stored all the same.
  */
-import { foldSessionSummary } from "@anthropic-ai/claude-agent-sdk";
+import {
+  foldSessionSummary,
+  type SessionKey,
+  type SessionStore,
+  type SessionStoreEntry,
+  type SessionSummaryEntry,
+} from "@anthropic-ai/claude-agent-sdk";
+import type { Pool, QueryResult } from "pg";
 
 export const DEFAULT_SCHEMA = "claude_sessions";
 
-const ddl = (SCHEMA) => `
+const ddl = (SCHEMA: string): string => `
 create schema if not exists ${SCHEMA};
 create table if not exists ${SCHEMA}.entries (
   seq bigint generated always as identity primary key,
@@ -67,16 +73,30 @@ end $$;
 /** Rows one insert takes, so that a large append, an import's, is a few statements of bounded size. */
 const ROWS_PER_INSERT = 5000;
 
-const subpathOf = (key) => key.subpath ?? "";
+const subpathOf = (key: SessionKey): string => key.subpath ?? "";
 
 /** Rows given their doc at a time, for rows stored before doc existed. */
 const DOCS_PER_UPDATE = 500;
+
+/** A session the store keeps, as `listSessions()` gives it: its id and when it last changed. */
+export interface StoredSession {
+  readonly sessionId: string;
+  /** Milliseconds since the epoch. */
+  readonly mtime: number;
+}
+
+/** A session's transcripts, main and subagents alike, as `listSubkeys()` takes it. */
+export type SessionTranscripts = Omit<SessionKey, "subpath">;
+
+export interface NeonSessionStoreOptions {
+  readonly schema?: string;
+}
 
 /**
  * Text as Postgres can hold it, in `text` or in `jsonb`: NUL and any
  * surrogate without its other half as U+FFFD.
  */
-export function storable(text) {
+export function storable(text: string): string {
   return text.replaceAll("\0", "\ufffd").toWellFormed();
 }
 
@@ -85,21 +105,21 @@ export function storable(text) {
  * values alike), which is all that keeps jsonb from taking it. Text that only
  * writes about those escapes is left as it is.
  */
-export function docOf(value) {
+export function docOf(value: unknown): unknown {
   if (typeof value === "string") return storable(value);
   if (Array.isArray(value)) return value.map(docOf);
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([name, item]) => [docOf(name), docOf(item)]));
+    return Object.fromEntries(Object.entries(value).map(([name, item]: [string, unknown]) => [storable(name), docOf(item)]));
   }
   return value;
 }
 
-export class NeonSessionStore {
-  #pool;
-  #schema;
+export class NeonSessionStore implements SessionStore {
+  #pool: Pool;
+  #schema: string;
 
   /** `schema` is where the tables live: alasio's, or a test's own. */
-  constructor(pool, { schema = DEFAULT_SCHEMA } = {}) {
+  constructor(pool: Pool, { schema = DEFAULT_SCHEMA }: NeonSessionStoreOptions = {}) {
     if (!/^[a-z_][a-z0-9_]*$/u.test(schema)) {
       throw new Error(`invalid schema name: ${schema}`);
     }
@@ -108,35 +128,36 @@ export class NeonSessionStore {
   }
 
   /** Creates the tables if they are missing, and fills in any missing doc. Idempotent. */
-  async ensureSchema() {
+  async ensureSchema(): Promise<void> {
     await this.#pool.query(ddl(this.#schema));
     // Rows stored before doc existed, and any whose doc Postgres would not
     // take before, which it is offered once more.
-    for (let after = 0; ; ) {
-      const { rows } = await this.#pool.query(
+    for (let after: number | string = 0; ; ) {
+      const { rows }: QueryResult<{ seq: string; entry: SessionStoreEntry }> = await this.#pool.query(
         `select seq, entry from ${this.#schema}.entries where doc is null and seq > $1 order by seq limit $2`,
         [after, DOCS_PER_UPDATE],
       );
-      if (rows.length === 0) return;
+      const last = rows.at(-1);
+      if (last === undefined) return;
       await this.#pool.query(
         `update ${this.#schema}.entries as e set doc = ${this.#schema}.as_doc(d.doc)
          from unnest($1::bigint[], $2::text[]) as d(seq, doc) where e.seq = d.seq`,
         [rows.map((row) => row.seq), rows.map((row) => JSON.stringify(docOf(row.entry)))],
       );
-      after = rows.at(-1).seq;
+      after = last.seq;
     }
   }
 
-  async append(key, entries) {
+  async append(key: SessionKey, entries: readonly SessionStoreEntry[]): Promise<void> {
     if (entries.length === 0) return;
     const mtime = Date.now();
     const client = await this.#pool.connect();
     try {
       await client.query("begin");
-      const inserted = [];
+      const inserted: SessionStoreEntry[] = [];
       for (let start = 0; start < entries.length; start += ROWS_PER_INSERT) {
         const batch = entries.slice(start, start + ROWS_PER_INSERT);
-        const { rows } = await client.query(
+        const { rows } = await client.query<{ entry: SessionStoreEntry }>(
           `insert into ${this.#schema}.entries (project_key, session_id, subpath, uuid, entry, mtime, doc)
            select $1, $2, $3, u, e, $4, ${this.#schema}.as_doc(d)
            from unnest($5::text[], $6::json[], $7::text[]) with ordinality as t(u, e, d, n)
@@ -163,15 +184,17 @@ export class NeonSessionStore {
            values ($1, $2, 0, '{}') on conflict do nothing`,
           [key.projectKey, key.sessionId],
         );
-        const { rows } = await client.query(
+        const { rows } = await client.query<{ mtime: string; data: SessionSummaryEntry["data"] }>(
           `select mtime, data from ${this.#schema}.summaries
            where project_key = $1 and session_id = $2 for update`,
           [key.projectKey, key.sessionId],
         );
+        // The insert above made the row if it was missing.
+        const summary = rows[0]!;
         const previous =
-          rows[0].mtime === "0"
+          summary.mtime === "0"
             ? undefined
-            : { sessionId: key.sessionId, mtime: Number(rows[0].mtime), data: rows[0].data };
+            : { sessionId: key.sessionId, mtime: Number(summary.mtime), data: summary.data };
         const next = foldSessionSummary(previous, key, inserted, { mtime });
         await client.query(
           `update ${this.#schema}.summaries set mtime = $3, data = $4
@@ -188,8 +211,8 @@ export class NeonSessionStore {
     }
   }
 
-  async load(key) {
-    const { rows } = await this.#pool.query(
+  async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {
+    const { rows } = await this.#pool.query<{ entry: SessionStoreEntry }>(
       `select entry from ${this.#schema}.entries
        where project_key = $1 and session_id = $2 and subpath = $3 order by seq`,
       [key.projectKey, key.sessionId, subpathOf(key)],
@@ -197,8 +220,8 @@ export class NeonSessionStore {
     return rows.length > 0 ? rows.map((row) => row.entry) : null;
   }
 
-  async listSessions(projectKey) {
-    const { rows } = await this.#pool.query(
+  async listSessions(projectKey: string): Promise<StoredSession[]> {
+    const { rows } = await this.#pool.query<{ session_id: string; mtime: string }>(
       `select session_id, max(mtime) as mtime from ${this.#schema}.entries
        where project_key = $1 and subpath = ''
        group by session_id order by 2 desc`,
@@ -207,8 +230,8 @@ export class NeonSessionStore {
     return rows.map((row) => ({ sessionId: row.session_id, mtime: Number(row.mtime) }));
   }
 
-  async listSessionSummaries(projectKey) {
-    const { rows } = await this.#pool.query(
+  async listSessionSummaries(projectKey: string): Promise<SessionSummaryEntry[]> {
+    const { rows } = await this.#pool.query<{ session_id: string; mtime: string; data: SessionSummaryEntry["data"] }>(
       `select session_id, mtime, data from ${this.#schema}.summaries
        where project_key = $1 and mtime > 0 order by mtime desc`,
       [projectKey],
@@ -216,7 +239,7 @@ export class NeonSessionStore {
     return rows.map((row) => ({ sessionId: row.session_id, mtime: Number(row.mtime), data: row.data }));
   }
 
-  async delete(key) {
+  async delete(key: SessionKey): Promise<void> {
     if (key.subpath === undefined) {
       await this.#pool.query(
         `with gone as (delete from ${this.#schema}.entries where project_key = $1 and session_id = $2)
@@ -231,8 +254,8 @@ export class NeonSessionStore {
     );
   }
 
-  async listSubkeys(key) {
-    const { rows } = await this.#pool.query(
+  async listSubkeys(key: SessionTranscripts): Promise<string[]> {
+    const { rows } = await this.#pool.query<{ subpath: string }>(
       `select distinct subpath from ${this.#schema}.entries
        where project_key = $1 and session_id = $2 and subpath <> '' order by subpath`,
       [key.projectKey, key.sessionId],
@@ -241,8 +264,8 @@ export class NeonSessionStore {
   }
 
   /** The project a session's transcript is kept under, if it is here. */
-  async projectKeyOf(sessionId) {
-    const { rows } = await this.#pool.query(
+  async projectKeyOf(sessionId: string): Promise<string | null> {
+    const { rows } = await this.#pool.query<{ project_key: string }>(
       `select project_key from ${this.#schema}.entries where session_id = $1 and subpath = '' limit 1`,
       [sessionId],
     );
@@ -250,8 +273,8 @@ export class NeonSessionStore {
   }
 
   /** The uuids of a transcript's entries that have one. */
-  async uuidsOf(key) {
-    const { rows } = await this.#pool.query(
+  async uuidsOf(key: SessionKey): Promise<Set<string>> {
+    const { rows } = await this.#pool.query<{ uuid: string }>(
       `select uuid from ${this.#schema}.entries
        where project_key = $1 and session_id = $2 and subpath = $3 and uuid is not null`,
       [key.projectKey, key.sessionId, subpathOf(key)],
@@ -260,8 +283,8 @@ export class NeonSessionStore {
   }
 
   /** A transcript's entries that have no uuid, in order. */
-  async uuidlessEntriesOf(key) {
-    const { rows } = await this.#pool.query(
+  async uuidlessEntriesOf(key: SessionKey): Promise<SessionStoreEntry[]> {
+    const { rows } = await this.#pool.query<{ entry: SessionStoreEntry }>(
       `select entry from ${this.#schema}.entries
        where project_key = $1 and session_id = $2 and subpath = $3 and uuid is null order by seq`,
       [key.projectKey, key.sessionId, subpathOf(key)],
@@ -278,7 +301,7 @@ export class NeonSessionStore {
  * than in a throwaway directory built from the store. transcripts.ts makes
  * sure that local transcript exists before any resume.
  */
-export function mirrorOnly(store) {
+export function mirrorOnly(store: SessionStore): SessionStore {
   return {
     append: (key, entries) => store.append(key, entries),
     load: async () => null,

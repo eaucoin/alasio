@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * What alasio tells an agent working in a session filesystem, on top of the reply
  * instructions: its workspace is not where its harness runs. The harness (Claude Code,

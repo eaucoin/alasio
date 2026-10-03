@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * What alasio tells each agent about its replies, on top of the harness's own prompt:
  * how to show the operator an image or video (telegram/rich-media.ts). Claude Code gets
@@ -7,7 +6,7 @@
  */
 import { MEDIA_LIMITS } from "../telegram/rich-media.ts";
 
-const mb = (bytes) => bytes / (1024 * 1024);
+const mb = (bytes: number) => bytes / (1024 * 1024);
 
 export const REPLY_INSTRUCTIONS = [
   "Your replies reach the operator in Telegram through alasio.",
@@ -19,7 +18,7 @@ export const REPLY_INSTRUCTIONS = [
 ].join(" ");
 
 /** `existing` instructions followed by alasio's, or alasio's alone. */
-export function withReplyInstructions(existing) {
+export function withReplyInstructions(existing: unknown): string {
   const own = typeof existing === "string" ? existing.trim() : "";
   return own ? `${own}\n\n${REPLY_INSTRUCTIONS}` : REPLY_INSTRUCTIONS;
 }

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Transcript search: keeps the session store's entries searchable, from
  * beside the store. While alasio runs, the indexer reads new entries into
@@ -10,6 +9,8 @@
  * claude_sessions.search() (schema.ts), for any client to call.
  */
 import { setTimeout as sleep } from "node:timers/promises";
+
+import type { Pool } from "pg";
 
 import { createLogger } from "../../../shared/log.ts";
 import { DEFAULT_SCHEMA } from "../session-store.ts";
@@ -25,8 +26,19 @@ const RETRY_MS = 60_000;
 /** How often passages no entry holds are dropped. */
 const ORPHANS_EVERY_MS = 60 * 60 * 1000;
 
+/** The session store's pool, and the schema its entries are in. */
+export interface TranscriptSearchOptions {
+  readonly pool: Pool;
+  readonly schema?: string;
+}
+
+/** Transcript search running, as startTranscriptSearch starts it. */
+export interface TranscriptSearch {
+  close(): Promise<void>;
+}
+
 /** Starts transcript search on the store's pool. Returns `{ close }`. */
-export function startTranscriptSearch({ pool, schema = DEFAULT_SCHEMA }) {
+export function startTranscriptSearch({ pool, schema = DEFAULT_SCHEMA }: TranscriptSearchOptions): TranscriptSearch {
   const controller = new AbortController();
   const { signal } = controller;
   let ready = false;
@@ -34,7 +46,7 @@ export function startTranscriptSearch({ pool, schema = DEFAULT_SCHEMA }) {
   let orphansAt = 0;
 
   /** One pass: a batch of entries, or when there are none, upkeep. Returns the delay before the next. */
-  async function step() {
+  async function step(): Promise<number> {
     if (!ready) {
       await ensureSearchSchema(pool, schema);
       ready = true;
@@ -55,7 +67,7 @@ export function startTranscriptSearch({ pool, schema = DEFAULT_SCHEMA }) {
   const running = (async () => {
     let failing = false;
     while (!signal.aborted) {
-      let delay;
+      let delay: number;
       try {
         delay = await step();
         if (failing) log.info("indexing is running again");

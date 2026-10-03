@@ -1,6 +1,7 @@
 import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
 
 import type { MessagePhase, v2 } from "../../.types/codex/index.js";
+import type { PassedThroughItem } from "./app-server/protocol.ts";
 
 /*
  * Codex-shaped items: what a harness reports an agent did, in the shape of the Codex SDK's
@@ -58,9 +59,9 @@ export interface ErrorItem {
   readonly message: string;
 }
 
-/** Items no response block shows. */
+/** Items no response block shows, the app-server's with no Codex SDK counterpart among them. */
 export interface UnshownItem {
-  readonly type: "reasoning" | "todo_list" | "context_compaction";
+  readonly type: "reasoning" | "todo_list" | "context_compaction" | PassedThroughItem["type"];
 }
 
 export type CodexItem =

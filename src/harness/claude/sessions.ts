@@ -1,17 +1,87 @@
-// @ts-nocheck
 import { randomUUID } from "node:crypto";
 import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
   listSessions as listSdkSessions,
+  type SDKAssistantMessage,
+  type SDKUserMessage,
+  type SessionMessage,
+  type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createLogger } from "../../shared/log.ts";
 import { SESSIONS_PER_PAGE } from "../../shared/runtime-constants.ts";
 import { dateLabel, sessionLabel } from "../../shared/session-labels.ts";
+import type { NeonSessionStore } from "./session-store.ts";
 import { ensureLocalTranscript } from "./transcripts.ts";
 
 const log = createLogger("claude-sessions");
+
+/** A session as a harness lists it for !sessions: its id, its date label, and its one-line label. */
+export interface ListedSession {
+  readonly uuid: string;
+  readonly timestamp: string;
+  readonly label: string;
+}
+
+/** An operator message of a session that !rewind can rewind to: by its index, newest first from -1. */
+export interface RewindMessage {
+  readonly index: number;
+  readonly timestamp: string;
+  readonly text: string;
+  readonly uuid: string;
+}
+
+/** The SDK's session helpers the session api reads through: the SDK's own, or a test's. */
+export interface ClaudeSessionSdk {
+  readonly listSessions: typeof listSdkSessions;
+  readonly getSessionMessages: typeof getSessionMessages;
+  readonly forkSession: typeof forkSession;
+  readonly getSessionInfo: typeof getSessionInfo;
+}
+
+export interface ClaudeSessionApiOptions {
+  readonly workingDirectory: string;
+  readonly store?: NeonSessionStore | null;
+  readonly sdk?: ClaudeSessionSdk;
+}
+
+/** Claude Code's sessions of one working directory, as the operator's commands list, rewind, and resume them. */
+export interface ClaudeSessionApi {
+  listSessions(page?: number): Promise<ListedSession[]>;
+  getTotalSessionPages(): Promise<number>;
+  getSessionByNumber(num: number): Promise<string | null>;
+  getSessionLastMessage(sessionId: string): Promise<string | null>;
+  listSessionMessages(sessionId: string): Promise<RewindMessage[]>;
+  getTotalRewindPages(sessionId: string): Promise<number>;
+  createForkedSession(sessionId: string, beforeUuid: string): Promise<string | null>;
+  sessionExists(sessionId: string): Promise<boolean>;
+}
+
+/** Where the SDK's helpers read transcripts: the working directory's local files, or the store. */
+interface TranscriptSource {
+  readonly dir: string;
+  readonly sessionStore?: SessionStore;
+}
+
+/**
+ * A message of a transcript as the SDK reads it. The SDK leaves `message`
+ * untyped; Claude Code writes the Messages API's.
+ */
+type TranscriptMessage = SDKUserMessage["message"] | SDKAssistantMessage["message"];
+type MessageContent = TranscriptMessage["content"];
+type TextBlock = Extract<Exclude<MessageContent, string>[number], { type: "text" }>;
+
+/**
+ * A session message as read here. The SDK's messages carry no `timestamp`,
+ * though the rewind list reads one.
+ */
+type ReadMessage = SessionMessage & { readonly timestamp?: string };
+
+function contentOf(entry: SessionMessage): MessageContent | undefined {
+  // The protocol's message, which the SDK types as unknown.
+  return (entry.message as TranscriptMessage | null | undefined)?.content;
+}
 
 /**
  * Claude Code session discovery, scoped to the alasio working directory so the
@@ -20,7 +90,7 @@ const log = createLogger("claude-sessions");
  * copy; without one, or while it cannot be reached, the local transcripts
  * under `~/.claude/projects/<cwd-slug>/`.
  */
-function textFromMessageContent(content) {
+function textFromMessageContent(content: MessageContent | undefined): string {
   if (typeof content === "string") {
     return content;
   }
@@ -28,16 +98,16 @@ function textFromMessageContent(content) {
     return "";
   }
   return content
-    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .filter((block): block is TextBlock => Boolean(block) && block.type === "text" && typeof block.text === "string")
     .map((block) => block.text)
     .join("\n");
 }
 
-function isOperatorUserMessage(entry) {
+function isOperatorUserMessage(entry: SessionMessage): boolean {
   if (!entry || entry.type !== "user" || entry.parent_tool_use_id) {
     return false;
   }
-  const content = entry.message?.content;
+  const content = contentOf(entry);
   if (Array.isArray(content) && content.some((block) => block?.type === "tool_result")) {
     return false;
   }
@@ -48,11 +118,11 @@ export function createClaudeSessionApi({
   workingDirectory,
   store = null,
   sdk = { listSessions: listSdkSessions, getSessionMessages, forkSession, getSessionInfo },
-}) {
-  const local = { dir: workingDirectory };
+}: ClaudeSessionApiOptions): ClaudeSessionApi {
+  const local: TranscriptSource = { dir: workingDirectory };
 
   /** Runs an SDK helper against the store, or the local files without one. */
-  async function fromStore(what, call) {
+  async function fromStore<T>(what: string, call: (options: TranscriptSource) => Promise<T>): Promise<T> {
     if (!store) return call(local);
     try {
       return await call({ ...local, sessionStore: store });
@@ -67,7 +137,7 @@ export function createClaudeSessionApi({
     return [...sessions].sort((a, b) => Number(b.lastModified ?? 0) - Number(a.lastModified ?? 0));
   }
 
-  async function readMessages(sessionId) {
+  async function readMessages(sessionId: string): Promise<ReadMessage[]> {
     try {
       return await fromStore("reading a session", (options) => sdk.getSessionMessages(sessionId, options));
     } catch {
@@ -97,7 +167,7 @@ export function createClaudeSessionApi({
       if (idx < 0 || idx >= all.length) {
         return null;
       }
-      return all[idx].sessionId;
+      return all[idx]?.sessionId ?? null;
     },
 
     async getSessionLastMessage(sessionId) {
@@ -107,7 +177,7 @@ export function createClaudeSessionApi({
         if (entry?.type !== "assistant" || entry.parent_tool_use_id) {
           continue;
         }
-        const text = textFromMessageContent(entry.message?.content).trim();
+        const text = textFromMessageContent(contentOf(entry)).trim();
         if (text) {
           return text;
         }
@@ -121,7 +191,7 @@ export function createClaudeSessionApi({
         .filter(isOperatorUserMessage)
         .map((entry) => ({
           timestamp: entry.timestamp ?? "",
-          text: textFromMessageContent(entry.message?.content).trim(),
+          text: textFromMessageContent(contentOf(entry)).trim(),
           uuid: entry.uuid,
         }));
       return [...userMessages].reverse().map((message, index) => ({
@@ -146,9 +216,11 @@ export function createClaudeSessionApi({
       if (targetIndex === 0) {
         return randomUUID();
       }
+      // targetIndex is at least 1 here, so the message before it is there.
+      const previous = messages[targetIndex - 1]!;
       try {
         const forked = await fromStore("forking a session", (options) =>
-          sdk.forkSession(sessionId, { ...options, upToMessageId: messages[targetIndex - 1].uuid }),
+          sdk.forkSession(sessionId, { ...options, upToMessageId: previous.uuid }),
         );
         return forked?.sessionId ?? null;
       } catch {

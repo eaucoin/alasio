@@ -1,14 +1,24 @@
-// @ts-nocheck
+import type { v2 } from "../../../.types/codex/index.js";
 import { AppServerNotificationQueue } from "./notification-queue.ts";
-import { StaleTurnCleanupError } from "./thread-client.ts";
+import type { SpawnAppServer } from "./process.ts";
 import {
+  type AppServerEvent,
   getNotificationTurnId,
   isIgnorableNotification,
   mapNotificationToSdkEvent,
   notificationMatchesTurn,
 } from "./protocol.ts";
-import { AppServerRpcClient } from "./rpc-client.ts";
-import { AppServerThreadClient } from "./thread-client.ts";
+import { AppServerRpcClient, type AppServerScope } from "./rpc-client.ts";
+import {
+  AppServerThreadClient,
+  StaleTurnCleanupError,
+  type EnsureThreadOptions,
+  type ForkThreadOptions,
+  type SetGoalOptions,
+  type SteerTurnOptions,
+  type ThreadOptions,
+  type ThreadScope,
+} from "./thread-client.ts";
 import { appServerLog as log } from "./log.ts";
 
 const MAX_SKIPPED_NOTIFICATIONS = 1000;
@@ -17,17 +27,17 @@ const UNKNOWN_LOG_INTERVAL = 100;
 const SKIP_WARNING_INTERVAL = 100;
 
 function yieldToEventLoop() {
-  return new Promise((resolve) => {
+  return new Promise<void>((resolve) => {
     setImmediate(resolve);
   });
 }
 
-function incrementMethodCount(counts, method) {
+function incrementMethodCount(counts: Map<string, number>, method: string | undefined) {
   const key = method ?? "unknown";
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-function summarizeMethodCounts(counts) {
+function summarizeMethodCounts(counts: ReadonlyMap<string, number>) {
   return [...counts.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
@@ -35,8 +45,24 @@ function summarizeMethodCounts(counts) {
     .join(", ");
 }
 
+export interface AppServerClientOptions {
+  /** How the app-server process is started; the local codex binary when absent. */
+  readonly spawnProcess?: SpawnAppServer;
+}
+
+/** A turn alasio starts in the app-server: the thread's options, and the prompt it runs. */
+export interface AppServerTurnOptions extends EnsureThreadOptions {
+  readonly prompt: string;
+  readonly model?: string | undefined;
+  readonly effort?: string | null | undefined;
+}
+
 export class AppServerClient {
-  constructor({ spawnProcess } = {}) {
+  readonly notifications: AppServerNotificationQueue;
+  readonly rpc: AppServerRpcClient;
+  readonly threads: AppServerThreadClient;
+
+  constructor({ spawnProcess }: AppServerClientOptions = {}) {
     this.notifications = new AppServerNotificationQueue({
       log,
     });
@@ -53,20 +79,20 @@ export class AppServerClient {
     });
   }
 
-  stop() {
+  stop(): void {
     this.rpc.stop();
     this.notifications.clear();
   }
 
-  async ensureThread({ threadId, threadKey, cwd, env, config }) {
+  async ensureThread({ threadId, threadKey, cwd, env, config }: EnsureThreadOptions): Promise<string> {
     return await this.threads.ensureThread({ threadId, threadKey, cwd, env, config });
   }
 
-  async startThread({ threadKey, cwd, env, config }) {
+  async startThread({ threadKey, cwd, env, config }: ThreadOptions): Promise<string> {
     return await this.threads.startThread({ threadKey, cwd, env, config });
   }
 
-  async startTurn({ threadId, threadKey, prompt, cwd, env, config, model, effort }) {
+  async startTurn({ threadId, threadKey, prompt, cwd, env, config, model, effort }: AppServerTurnOptions): Promise<string> {
     try {
       return await this.threads.startTurn({ threadId, prompt, cwd, model, effort });
     } catch (error) {
@@ -80,51 +106,51 @@ export class AppServerClient {
     }
   }
 
-  async forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config }) {
+  async forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config }: ForkThreadOptions): Promise<string> {
     return await this.threads.forkThread({ threadId, beforeTurnId, threadKey, cwd, env, config });
   }
 
-  async listThreads({ env, cwd }) {
+  async listThreads({ env, cwd }: AppServerScope): Promise<v2.Thread[]> {
     return await this.threads.listThreads({ env, cwd });
   }
 
-  async listTurns({ threadId, env, cwd }) {
+  async listTurns({ threadId, env, cwd }: ThreadScope): Promise<v2.Turn[]> {
     return await this.threads.listTurns({ threadId, env, cwd });
   }
 
-  async listModels({ env, cwd }) {
+  async listModels({ env, cwd }: AppServerScope): Promise<v2.Model[]> {
     return await this.threads.listModels({ env, cwd });
   }
 
-  claimTurn(threadId, turnId) {
+  claimTurn(threadId: string, turnId: string): void {
     this.threads.claimTurn(threadId, turnId);
   }
 
-  async waitForTurnId(threadId, timeoutMs) {
+  async waitForTurnId(threadId: string, timeoutMs?: number): Promise<string | null> {
     return await this.threads.waitForTurnId(threadId, timeoutMs);
   }
 
-  async steerTurn({ threadId, turnId, prompt }) {
+  async steerTurn({ threadId, turnId, prompt }: SteerTurnOptions): Promise<v2.TurnSteerResponse> {
     return await this.threads.steerTurn({ threadId, turnId, prompt });
   }
 
-  async interrupt(threadId, origin = "unspecified") {
+  async interrupt(threadId: string, origin = "unspecified"): Promise<boolean> {
     return await this.threads.interrupt(threadId, origin);
   }
 
-  async getGoal({ threadId, cwd, env }) {
+  async getGoal({ threadId, cwd, env }: ThreadScope): Promise<v2.ThreadGoalGetResponse> {
     return await this.threads.getGoal({ threadId, cwd, env });
   }
 
-  async setGoal({ threadId, cwd, env, objective, status, tokenBudget }) {
+  async setGoal({ threadId, cwd, env, objective, status, tokenBudget }: SetGoalOptions): Promise<v2.ThreadGoalSetResponse> {
     return await this.threads.setGoal({ threadId, cwd, env, objective, status, tokenBudget });
   }
 
-  async clearGoal({ threadId, cwd, env }) {
+  async clearGoal({ threadId, cwd, env }: ThreadScope): Promise<v2.ThreadGoalClearResponse> {
     return await this.threads.clearGoal({ threadId, cwd, env });
   }
 
-  async *eventsForTurn(threadId, turnId, signal) {
+  async *eventsForTurn(threadId: string, turnId: string | null | undefined, signal?: AbortSignal): AsyncGenerator<AppServerEvent, void, undefined> {
     let streamFinished = false;
     let cleanupOrigin = "consumer-exit";
     let skippedNotifications = 0;
@@ -134,9 +160,9 @@ export class AppServerClient {
     if (turnId) {
       acceptedTurnIds.add(turnId);
     }
-    const skippedMethods = new Map();
-    const ignoredMethods = new Map();
-    const unknownMethods = new Map();
+    const skippedMethods = new Map<string, number>();
+    const ignoredMethods = new Map<string, number>();
+    const unknownMethods = new Map<string, number>();
     try {
       while (true) {
         if (signal?.aborted) {
@@ -210,6 +236,6 @@ export class AppServerClient {
 
 export const codexAppServerClient = new AppServerClient();
 
-export function stopCodexAppServer() {
+export function stopCodexAppServer(): void {
   codexAppServerClient.stop();
 }

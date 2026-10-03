@@ -1,6 +1,7 @@
 import type { Database } from "better-sqlite3";
 import type { Message, Update } from "@grammyjs/types";
 import { newId } from "../shared/ids.ts";
+import type { IncomingFile } from "../telegram/message.ts";
 
 export type MessageDirection = "in" | "out";
 
@@ -34,18 +35,6 @@ export interface NewMessage {
   readonly turnId?: string | null | undefined;
 }
 
-/**
- * A file a Telegram message carried (a document, a photo's largest size, a video, …),
- * as far as it is kept.
- */
-export interface TelegramFile {
-  readonly file_id: string;
-  readonly file_unique_id?: string | undefined;
-  readonly file_name?: string | undefined;
-  readonly mime_type?: string | undefined;
-  readonly file_size?: number | undefined;
-}
-
 /** A row of `files`: a file a message carried, and where it was downloaded to. */
 export interface StoredFile {
   readonly id: string;
@@ -66,7 +55,8 @@ export interface StoredFile {
 export interface NewFile {
   readonly conversationId: string;
   readonly messageId: string;
-  readonly file: TelegramFile;
+  /** The file as the message carried it; it is kept whole, as raw_json. */
+  readonly file: IncomingFile;
   readonly localPath: string;
   readonly sha256?: string | null | undefined;
 }

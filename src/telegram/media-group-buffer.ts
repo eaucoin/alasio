@@ -1,30 +1,16 @@
+import type { SqliteStore } from "../persistence/store.ts";
+import type { Logger } from "../shared/log.ts";
+
 const DEFAULT_FLUSH_MS = 1_500;
 
-// The rows and calls the buffer uses from the store and the turn controller, narrowed
-// to what it reads (persistence/telegram-content-repository.ts, codex/turn-controller.ts).
-interface MediaGroupRow {
-  id: string;
-  conversation_id: string;
-}
+/** The store's media groups, and the messages and files they gather. */
+type MediaGroupStore = Pick<
+  SqliteStore,
+  "upsertMediaGroup" | "getPendingMediaGroupsDue" | "getMediaGroupMessages" | "getFilesForMessages" | "markMediaGroupFlushed"
+>;
 
-interface MediaGroupMessageRow {
-  id: string;
-  text: string | null;
-  transport_message_id: string | null;
-}
-
-interface MediaGroupFileRow {
-  local_path: string | null;
-}
-
-interface MediaGroupStore {
-  upsertMediaGroup(group: { mediaGroupId: string; conversationId: string; updateId: number; flushAfterMs: number }): void;
-  getPendingMediaGroupsDue(ageMs: number): MediaGroupRow[];
-  getMediaGroupMessages(mediaGroupId: string): MediaGroupMessageRow[];
-  getFilesForMessages(messageIds: string[]): MediaGroupFileRow[];
-  markMediaGroupFlushed(mediaGroupId: string): void;
-}
-
+// The call the buffer makes on the turn controller, narrowed to what it uses
+// (codex/turn-controller.ts).
 interface MediaGroupPrompt {
   conversationId: string;
   chatId: number | string;
@@ -37,14 +23,10 @@ interface MediaGroupTurns {
   processPrompt(prompt: MediaGroupPrompt): Promise<void>;
 }
 
-interface MediaGroupLog {
-  error(message: string): void;
-}
-
 export interface MediaGroupBufferOptions {
   store: MediaGroupStore;
   turns: MediaGroupTurns;
-  log: MediaGroupLog;
+  log: Logger;
   flushMs?: number;
 }
 
@@ -59,7 +41,7 @@ export interface MediaGroupMessage {
 export class MediaGroupBuffer {
   private readonly store: MediaGroupStore;
   private readonly turns: MediaGroupTurns;
-  private readonly log: MediaGroupLog;
+  private readonly log: Logger;
   private readonly flushMs: number;
   private readonly timers: Map<string, ReturnType<typeof setTimeout>>;
 

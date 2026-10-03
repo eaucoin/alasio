@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The login relay: how the session-filesystem Codex app-server (./sessionfs.ts) uses the
  * operator's Codex login without holding a copy of it.
@@ -18,11 +17,38 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
-import httpClient, { createServer } from "node:http";
+import httpClient, { createServer, type IncomingMessage, type OutgoingHttpHeaders, type RequestOptions } from "node:http";
 import httpsClient from "node:https";
+import type { AddressInfo } from "node:net";
 import { createLogger } from "../shared/log.ts";
 
 const log = createLogger("codex-login-relay");
+
+/** Codex's `auth.json`, as the relay reads it: any of its fields may be missing or of another type. */
+interface CodexAuthFile {
+  readonly tokens?: { readonly access_token?: unknown; readonly account_id?: unknown } | null;
+  readonly OPENAI_API_KEY?: unknown;
+}
+
+/** Where a request is sent on to, and the login headers it is sent with. */
+export interface LoginUpstream {
+  readonly origin: string;
+  readonly path: string;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export interface LoginRelayOptions {
+  readonly authFile: string;
+  readonly bearer?: string;
+  readonly upstreamFor?: (authFile: string, path: string) => LoginUpstream | null;
+}
+
+/** A running relay: the base URL a Codex model provider is given, the bearer it presents, and a close. */
+export interface LoginRelay {
+  readonly url: string;
+  readonly bearer: string;
+  close(): Promise<void>;
+}
 
 /** The paths a Codex model provider calls: the Responses API (with its subpaths) and the model list. */
 const ALLOWED_PATHS = [/^\/v1\/responses(?:[/?]|$)/, /^\/v1\/models(?:[/?]|$)/];
@@ -31,8 +57,9 @@ const ALLOWED_PATHS = [/^\/v1\/responses(?:[/?]|$)/, /^\/v1\/models(?:[/?]|$)/];
  * The upstream request for the login in `authFile`, read now: `{ origin, path, headers }`
  * for a request to `path`, or null when there is no usable login.
  */
-export function loginUpstream(authFile, path) {
-  let auth;
+export function loginUpstream(authFile: string, path: string): LoginUpstream | null {
+  // Codex writes auth.json; each field read from it is checked below.
+  let auth: CodexAuthFile | null;
   try {
     auth = JSON.parse(readFileSync(authFile, "utf8"));
   } catch {
@@ -55,7 +82,7 @@ export function loginUpstream(authFile, path) {
   return null;
 }
 
-function sameSecret(presented, expected) {
+function sameSecret(presented: string | undefined, expected: string) {
   const a = Buffer.from(presented ?? "");
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -66,16 +93,18 @@ function sameSecret(presented, expected) {
  * URL a Codex model provider is given (its `/v1` included), the bearer it must present,
  * and a close. `upstreamFor` resolves the upstream request, for tests.
  */
-export async function startLoginRelay({ authFile, bearer = randomBytes(32).toString("hex"), upstreamFor = loginUpstream }) {
-  const request = (options, onResponse) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
+export async function startLoginRelay({ authFile, bearer = randomBytes(32).toString("hex"), upstreamFor = loginUpstream }: LoginRelayOptions): Promise<LoginRelay> {
+  const request = (options: RequestOptions, onResponse: (response: IncomingMessage) => void) => (options.protocol === "http:" ? httpClient : httpsClient).request(options, onResponse);
   const expected = `Bearer ${bearer}`;
   const server = createServer((req, res) => {
     if (!sameSecret(req.headers.authorization, expected)) { res.writeHead(401).end("unknown bearer"); return; }
-    if (!ALLOWED_PATHS.some((re) => re.test(req.url))) { res.writeHead(403).end("path not allowed"); return; }
-    const upstream = upstreamFor(authFile, req.url);
+    // A request an http.Server receives always has a url.
+    const url = req.url!;
+    if (!ALLOWED_PATHS.some((re) => re.test(url))) { res.writeHead(403).end("path not allowed"); return; }
+    const upstream = upstreamFor(authFile, url);
     if (!upstream) { res.writeHead(503).end(`no Codex login in ${authFile}`); return; }
     const origin = new URL(upstream.origin);
-    const headers = { ...req.headers, host: origin.host };
+    const headers: OutgoingHttpHeaders = { ...req.headers, host: origin.host };
     delete headers.authorization;
     delete headers["x-api-key"];
     Object.assign(headers, upstream.headers);
@@ -89,15 +118,16 @@ export async function startLoginRelay({ authFile, bearer = randomBytes(32).toStr
     });
     req.pipe(upstreamReq);
   });
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
   });
-  const { port } = server.address();
+  // A server listening on a TCP port has an AddressInfo address.
+  const { port } = server.address() as AddressInfo;
   log.info(`relaying the Codex login in ${authFile} on 127.0.0.1:${port}`);
   return {
     url: `http://127.0.0.1:${port}/v1`,
     bearer,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }

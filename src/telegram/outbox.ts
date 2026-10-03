@@ -1,7 +1,10 @@
-// @ts-nocheck
 import { rmSync } from "node:fs";
 
+import type { NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
+import type { SqliteStore } from "../persistence/store.ts";
+import type { Logger } from "../shared/log.ts";
 import { currentTraceparent, inSpan, meter } from "../telemetry/index.ts";
+import type { Client } from "./client.ts";
 
 const DEFAULT_RETRY_MS = 10_000;
 const MAX_RETRY_MS = 5 * 60_000;
@@ -11,8 +14,32 @@ const deliveryLag = meter.createHistogram("alasio.delivery.lag", {
   unit: "s",
 });
 
+/** The wait a failed delivery was asked for before a retry (a TelegramApiError's), or 0. */
+function retryAfterMsOf(error: unknown): number {
+  const retryAfterMs = typeof error === "object" && error !== null && "retryAfterMs" in error ? error.retryAfterMs : undefined;
+  return Number(retryAfterMs) || 0;
+}
+
+/** The outbox's rows in the store. */
+export type OutboxStore = Pick<SqliteStore, "enqueueOutboxText" | "getDueOutbox" | "markOutboxSent" | "rescheduleOutbox" | "getPendingOutboxCount">;
+
+export interface TelegramOutboxOptions {
+  client: Pick<Client, "sendMessage">;
+  store: OutboxStore;
+  log: Logger;
+}
+
+/** A reply to queue: everything but the trace, which the outbox takes from where it is queued. */
+export type OutboxText = Omit<NewOutboxText, "traceparent">;
+
 export class TelegramOutbox {
-  constructor({ client, store, log }) {
+  private readonly client: Pick<Client, "sendMessage">;
+  private readonly store: OutboxStore;
+  private readonly log: Logger;
+  private timer: ReturnType<typeof setInterval> | null;
+  private flushPromise: Promise<void> | null;
+
+  constructor({ client, store, log }: TelegramOutboxOptions) {
     this.client = client;
     this.store = store;
     this.log = log;
@@ -24,7 +51,7 @@ export class TelegramOutbox {
     }).addCallback((result) => result.observe(this.store.getPendingOutboxCount()));
   }
 
-  start() {
+  start(): void {
     if (!this.timer) {
       this.timer = setInterval(() => void this.flushDue(), 5_000);
       this.timer.unref?.();
@@ -32,7 +59,7 @@ export class TelegramOutbox {
     void this.flushDue();
   }
 
-  stop() {
+  stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -40,13 +67,13 @@ export class TelegramOutbox {
   }
 
   /** Queues a reply; its delivery joins the trace it is queued in. */
-  enqueueText(args) {
+  enqueueText(args: OutboxText): string {
     const id = this.store.enqueueOutboxText({ ...args, traceparent: currentTraceparent() });
     void this.flushDue();
     return id;
   }
 
-  flushDue() {
+  flushDue(): Promise<void> {
     if (this.flushPromise) {
       return this.flushPromise;
     }
@@ -56,7 +83,7 @@ export class TelegramOutbox {
     return this.flushPromise;
   }
 
-  async flushInner() {
+  async flushInner(): Promise<void> {
     for (const item of this.store.getDueOutbox(20)) {
       try {
         await inSpan("alasio.delivery", {
@@ -71,11 +98,11 @@ export class TelegramOutbox {
   }
 
   /** Sends one reply, or defers it with backoff and throws what stopped it. */
-  async deliver(item) {
+  async deliver(item: OutboxEntry): Promise<void> {
     try {
       await this.client.sendMessage(item.chat_id, item.text, item.options);
     } catch (error) {
-      const retryAfterMs = Number(error?.retryAfterMs) || 0;
+      const retryAfterMs = retryAfterMsOf(error);
       const exponentialMs = Math.min(DEFAULT_RETRY_MS * (2 ** Math.min(item.attempts, 5)), MAX_RETRY_MS);
       const delayMs = Math.max(retryAfterMs, exponentialMs);
       this.store.rescheduleOutbox(item.id, error, delayMs);

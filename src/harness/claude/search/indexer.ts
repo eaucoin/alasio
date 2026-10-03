@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The indexer: reads the session store's entries into passages and their
  * occurrences, behind the SDK and never on its path. Each entry is read once
@@ -10,7 +9,10 @@
  * is indexed, and it moves only past entries older than SETTLE_MS, by which
  * time any append that took a lower seq has long committed.
  */
-import { passagesOf } from "./passages.ts";
+import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+import type { Pool, PoolClient } from "pg";
+
+import { passagesOf, type Passage } from "./passages.ts";
 
 /** Entries read into passages in one transaction. */
 export const ENTRIES_PER_BATCH = 200;
@@ -20,23 +22,34 @@ export const SETTLE_MS = 10 * 60 * 1000;
 
 const SETTLED = "settled_seq";
 
-async function settledSeq(client, schema) {
-  const { rows } = await client.query(`select value from ${schema}.search_state where name = $1`, [SETTLED]);
+/** Where a passage is written: an entry's part, with the entry's session and time. */
+interface Occurrence {
+  readonly seq: string;
+  readonly part: number;
+  readonly digest: string;
+  readonly kind: string;
+  readonly session: string;
+  readonly subpath: string;
+  readonly at: string | null;
+}
+
+async function settledSeq(client: PoolClient, schema: string): Promise<string> {
+  const { rows } = await client.query<{ value: string }>(`select value from ${schema}.search_state where name = $1`, [SETTLED]);
   return rows[0]?.value ?? "0";
 }
 
 /** An entry's time, where it has a valid one. */
-function timeOf(entry) {
+function timeOf(entry: SessionStoreEntry): string | null {
   return typeof entry.timestamp === "string" && !Number.isNaN(Date.parse(entry.timestamp)) ? entry.timestamp : null;
 }
 
 /** Indexes the next entries not yet indexed. Returns how many it read. */
-export async function indexBatch(pool, schema, { limit = ENTRIES_PER_BATCH } = {}) {
+export async function indexBatch(pool: Pool, schema: string, { limit = ENTRIES_PER_BATCH }: { readonly limit?: number } = {}): Promise<number> {
   const client = await pool.connect();
   try {
     await client.query("begin");
     // Shared locks keep the SDK from deleting these entries until they are indexed.
-    const { rows } = await client.query(
+    const { rows } = await client.query<{ seq: string; session_id: string; subpath: string; entry: SessionStoreEntry }>(
       `select e.seq, e.session_id, e.subpath, e.entry from ${schema}.entries e
        where e.seq > $1 and not exists (select 1 from ${schema}.indexed i where i.seq = e.seq)
        order by e.seq limit $2
@@ -48,8 +61,8 @@ export async function indexBatch(pool, schema, { limit = ENTRIES_PER_BATCH } = {
       return 0;
     }
 
-    const texts = new Map();
-    const occurrences = [];
+    const texts = new Map<string, Passage>();
+    const occurrences: Occurrence[] = [];
     for (const row of rows) {
       const at = timeOf(row.entry);
       for (const passage of passagesOf(row.entry)) {
@@ -65,7 +78,7 @@ export async function indexBatch(pool, schema, { limit = ENTRIES_PER_BATCH } = {
       [distinct.map((p) => p.digest), distinct.map((p) => p.prose), distinct.map((p) => p.text)],
     );
     const ids = new Map(
-      (await client.query(`select id, digest from ${schema}.passages where digest = any ($1::text[])`, [[...texts.keys()]])).rows.map((row) => [row.digest, row.id]),
+      (await client.query<{ id: string; digest: string }>(`select id, digest from ${schema}.passages where digest = any ($1::text[])`, [[...texts.keys()]])).rows.map((row) => [row.digest, row.id]),
     );
     await client.query(
       `insert into ${schema}.occurrences (entry_seq, part, passage_id, kind, session_id, subpath, at)
@@ -96,7 +109,7 @@ export async function indexBatch(pool, schema, { limit = ENTRIES_PER_BATCH } = {
  * Moves the settled mark as far as it may go: past entries that are indexed
  * and older than SETTLE_MS, up to the first entry that is not indexed.
  */
-export async function settle(pool, schema, { now = Date.now() } = {}) {
+export async function settle(pool: Pool, schema: string, { now = Date.now() }: { readonly now?: number } = {}): Promise<void> {
   await pool.query(
     `insert into ${schema}.search_state (name, value)
      select $1, coalesce(max(e.seq), s.settled)
@@ -115,9 +128,10 @@ export async function settle(pool, schema, { now = Date.now() } = {}) {
 }
 
 /** Drops passages no entry holds any more, as when the SDK deletes a session. Returns how many. */
-export async function collectOrphans(pool, schema) {
+export async function collectOrphans(pool: Pool, schema: string): Promise<number> {
   const { rowCount } = await pool.query(
     `delete from ${schema}.passages p where not exists (select 1 from ${schema}.occurrences o where o.passage_id = p.id)`,
   );
-  return rowCount;
+  // A delete always reports its count.
+  return rowCount ?? 0;
 }

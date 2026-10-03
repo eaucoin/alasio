@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * alasio's Neon: the connection alasio keeps to the database its deployment runs (the Helm
  * chart's Neon, or one of the operator's), and what alasio keeps in it.
@@ -10,7 +9,7 @@
 import { readFileSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import pg from "pg";
+import pg, { type Pool } from "pg";
 
 import { NeonRolloutStore } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
@@ -20,11 +19,38 @@ import { ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 
 const log = createLogger("neon");
 
+/** How to reach a deployment's Neon, and whether the lake runs. */
+interface NeonAccess {
+  readonly databaseUrl: string;
+  readonly lakePassword: string;
+  readonly lake: boolean;
+}
+
+/** alasio's stores in an open Neon, on the pool they share. */
+interface OpenNeon {
+  readonly pool: Pool;
+  readonly store: NeonSessionStore;
+  readonly rollouts: NeonRolloutStore;
+}
+
+/** alasio's connection to its deployment's Neon, as connectNeon makes it. */
+export interface Neon extends OpenNeon {
+  /** Whether the analytics lake runs. */
+  readonly lake: boolean;
+  close(): Promise<void>;
+}
+
+export interface ConnectNeonOptions {
+  readonly env?: Readonly<NodeJS.ProcessEnv>;
+  readonly lake?: boolean;
+  readonly timeoutMs?: number;
+}
+
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
  * and rollout stores' schemas, and the lake's role and reads.
  */
-async function openNeon({ databaseUrl, lakePassword, lake }) {
+async function openNeon({ databaseUrl, lakePassword, lake }: NeonAccess): Promise<OpenNeon> {
   const pool = new pg.Pool({
     connectionString: databaseUrl,
     max: 8,
@@ -51,7 +77,7 @@ async function openNeon({ databaseUrl, lakePassword, lake }) {
 /** How long alasio waits for a deployment's Neon to answer as it starts. */
 const CONNECT_TIMEOUT_MS = 600_000;
 
-function fileOrValue(env, key) {
+function fileOrValue(env: Readonly<NodeJS.ProcessEnv>, key: string): string {
   const file = env[`${key}_FILE`]?.trim();
   if (file) return readFileSync(file, "utf8").trim();
   const value = env[key]?.trim();
@@ -66,7 +92,7 @@ function fileOrValue(env, key) {
  * store, rollouts, lake, close }`: `store` keeps Claude Code's transcripts, `rollouts`
  * Codex's rollout files, and `lake` says whether the analytics lake runs.
  */
-export async function connectNeon({ env = process.env, lake = lakeEnabled(env), timeoutMs = CONNECT_TIMEOUT_MS } = {}) {
+export async function connectNeon({ env = process.env, lake = lakeEnabled(env), timeoutMs = CONNECT_TIMEOUT_MS }: ConnectNeonOptions = {}): Promise<Neon> {
   const databaseUrl = fileOrValue(env, "ALASIO_DATABASE_URL");
   const lakePassword = fileOrValue(env, "ALASIO_LAKE_PASSWORD");
   const deadline = Date.now() + timeoutMs;
@@ -76,7 +102,7 @@ export async function connectNeon({ env = process.env, lake = lakeEnabled(env), 
         return await openNeon({ databaseUrl, lakePassword, lake });
       } catch (error) {
         if (Date.now() + 5000 > deadline) throw error;
-        if (attempt === 1 || attempt % 12 === 0) log.info(`waiting for Neon: ${error.message}`);
+        if (attempt === 1 || attempt % 12 === 0) log.info(`waiting for Neon: ${error instanceof Error ? error.message : String(error)}`);
         await sleep(5000);
       }
     }

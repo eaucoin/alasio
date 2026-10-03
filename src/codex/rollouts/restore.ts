@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Writing rollouts back: every file the given threads need that is missing
  * here, their own and those their history starts in, byte for byte, where it
@@ -12,10 +11,18 @@ import { dirname, join } from "node:path";
 
 import { createLogger } from "../../shared/log.ts";
 import { listRolloutFiles } from "./files.ts";
+import type { NeonRolloutStore, RestorableRollout } from "./store.ts";
 
 const log = createLogger("rollout-restore");
 
-async function writeBack(store, home, rollout) {
+/** The threads to write back, the store they are kept in, and the Codex home they go to. */
+export interface RestoreRolloutsOptions {
+  readonly store: NeonRolloutStore;
+  readonly threadIds: readonly string[];
+  readonly home: string;
+}
+
+async function writeBack(store: NeonRolloutStore, home: string, rollout: RestorableRollout): Promise<void> {
   const bytes = await store.read(rollout.name);
   if (bytes.length !== rollout.size) {
     throw new Error(`the store holds ${bytes.length} of its ${rollout.size} bytes`);
@@ -33,10 +40,10 @@ async function writeBack(store, home, rollout) {
  * Writes back what `threadIds` need under `home` from `store`. Returns the
  * paths written; a file that cannot be is logged, and the rest still are.
  */
-export async function restoreRollouts({ store, threadIds, home }) {
+export async function restoreRollouts({ store, threadIds, home }: RestoreRolloutsOptions): Promise<string[]> {
   if (threadIds.length === 0) return [];
   const present = new Set(listRolloutFiles(home).map((file) => file.name));
-  const written = [];
+  const written: string[] = [];
   for (const rollout of await store.lineage(threadIds)) {
     if (present.has(rollout.name)) continue;
     try {

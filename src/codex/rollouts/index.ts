@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Codex's rollout files, kept in alasio's Neon: a mirror that copies each
  * change to them as it is written, and restore, which writes back what a
@@ -15,14 +14,15 @@
  * writes its files as ever, and if the mirror fails, the next check catches
  * up on everything.
  */
-import { watch } from "node:fs";
+import { watch, type FSWatcher, type WatchListener, type WatchOptionsWithStringEncoding } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { createLogger } from "../../shared/log.ts";
-import { listRolloutFiles, parseRolloutName, rolloutFile, ROLLOUT_DIRS } from "./files.ts";
-import { mirrorRollout } from "./mirror.ts";
+import { isNotFound, listRolloutFiles, parseRolloutName, rolloutFile, ROLLOUT_DIRS } from "./files.ts";
+import { mirrorRollout, type KnownRollouts } from "./mirror.ts";
 import { restoreRollouts } from "./restore.ts";
+import type { NeonRolloutStore } from "./store.ts";
 
 const log = createLogger("codex-rollouts");
 
@@ -37,29 +37,44 @@ const FLUSH_TIMEOUT_MS = 5_000;
 /** The key of the Codex home's own watcher, beside the rollout directories'. */
 const HOME = ".";
 
-const errorText = (error) => (error instanceof Error ? error.message : String(error));
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** The Codex home whose rollouts are kept, and the store they are kept in. */
+export interface CodexRolloutsOptions {
+  readonly store: NeonRolloutStore;
+  readonly home: string;
+}
+
+/** The rollouts of one Codex home, kept in the store, as startCodexRollouts starts them. */
+export interface CodexRollouts {
+  /** Writes back from the store what these threads need and this machine lacks. Returns the paths written. */
+  restore(threadIds: readonly string[]): Promise<string[]>;
+  /** Mirrors a thread's files now. Rejects if that fails or takes longer than FLUSH_TIMEOUT_MS. */
+  flush(threadId: string): Promise<void>;
+  close(): Promise<void>;
+}
 
 /**
  * Starts keeping the rollouts under `home` in `store`. Returns
  * `{ restore(threadIds), flush(threadId), close() }`.
  */
-export function startCodexRollouts({ store, home }) {
+export function startCodexRollouts({ store, home }: CodexRolloutsOptions): CodexRollouts {
   const controller = new AbortController();
   const { signal } = controller;
-  const watchers = new Map();
+  const watchers = new Map<string, FSWatcher>();
   // Paths the watchers reported that are not yet mirrored.
-  const reported = new Set();
-  let queue = Promise.resolve();
-  let known = null;
+  const reported = new Set<string>();
+  let queue: Promise<unknown> = Promise.resolve();
+  let known: KnownRollouts | null = null;
   let drainQueued = false;
   let failing = false;
 
   /** Runs `work` once everything queued before it is done. */
-  function serially(work) {
+  function serially<T>(work: (known: KnownRollouts) => Promise<T>): Promise<T> {
     const run = queue.then(async () => {
       try {
-        known ??= new Map((await store.list()).map(({ name, ...kept }) => [name, kept]));
-        const result = await work();
+        const current = (known ??= new Map((await store.list()).map(({ name, ...kept }) => [name, kept])));
+        const result = await work(current);
         if (failing) log.info("mirroring is running again");
         failing = false;
         return result;
@@ -73,12 +88,12 @@ export function startCodexRollouts({ store, home }) {
     return run;
   }
 
-  function failed(error) {
+  function failed(error: unknown): void {
     if (!failing) log.warn(`mirroring failed, and the next check retries it: ${errorText(error)}`);
     failing = true;
   }
 
-  async function drain() {
+  async function drain(known: KnownRollouts): Promise<void> {
     drainQueued = false;
     for (const path of reported) {
       reported.delete(path);
@@ -87,19 +102,19 @@ export function startCodexRollouts({ store, home }) {
     }
   }
 
-  function report(dir, filename) {
+  function report(dir: string, filename: string | null): void {
     if (filename) reported.add(join(dir, filename));
     if (drainQueued) return;
     drainQueued = true;
     // A report without a file name, which the kernel may give, is a check.
-    serially(filename ? drain : check).catch((error) => {
+    serially<unknown>(filename ? drain : check).catch((error: unknown) => {
       drainQueued = false;
       failed(error);
     });
   }
 
   /** Starts a watcher kept under `key`, which the next check starts again if it fails. Returns whether it started. */
-  function startWatcher(key, path, options, onChange) {
+  function startWatcher(key: string, path: string, options: WatchOptionsWithStringEncoding, onChange: WatchListener<string>): boolean {
     try {
       const watcher = watch(path, options, onChange);
       watcher.on("error", (error) => {
@@ -110,7 +125,7 @@ export function startCodexRollouts({ store, home }) {
       watchers.set(key, watcher);
       return true;
     } catch (error) {
-      if (error.code !== "ENOENT") log.warn(`could not watch ${path}: ${errorText(error)}`);
+      if (!isNotFound(error)) log.warn(`could not watch ${path}: ${errorText(error)}`);
       return false;
     }
   }
@@ -119,7 +134,7 @@ export function startCodexRollouts({ store, home }) {
    * Watches each rollout directory, and while one is missing, the Codex home
    * for it to be made, as Codex does with a new home's first thread.
    */
-  function watchDirs() {
+  function watchDirs(): void {
     const missing = ROLLOUT_DIRS.filter(
       (dir) => !watchers.has(dir) && !startWatcher(dir, join(home, dir), { recursive: true }, (_event, filename) => report(dir, filename)),
     );
@@ -128,7 +143,7 @@ export function startCodexRollouts({ store, home }) {
       watchers.delete(HOME);
     } else if (!watchers.has(HOME)) {
       startWatcher(HOME, home, {}, (_event, filename) => {
-        if (!missing.includes(filename)) return;
+        if (filename === null || !missing.includes(filename)) return;
         watchDirs();
         report(filename, null);
       });
@@ -136,7 +151,7 @@ export function startCodexRollouts({ store, home }) {
   }
 
   /** Mirrors every file that changed. Returns how many, and how many of those no report had covered. */
-  async function check() {
+  async function check(known: KnownRollouts): Promise<{ mirrored: number; missed: number }> {
     drainQueued = false;
     reported.clear();
     let mirrored = 0;
@@ -169,16 +184,14 @@ export function startCodexRollouts({ store, home }) {
   })();
 
   return {
-    /** Writes back from the store what these threads need and this machine lacks. Returns the paths written. */
     async restore(threadIds) {
       return await restoreRollouts({ store, threadIds, home });
     },
 
-    /** Mirrors a thread's files now. Rejects if that fails or takes longer than FLUSH_TIMEOUT_MS. */
     async flush(threadId) {
-      const flushed = serially(async () => {
+      const flushed = serially(async (known) => {
         for (const file of listRolloutFiles(home)) {
-          if (parseRolloutName(file.name).threadId === threadId) await mirrorRollout({ store, home, known, file });
+          if (parseRolloutName(file.name)?.threadId === threadId) await mirrorRollout({ store, home, known, file });
         }
       });
       const timeout = new AbortController();

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Claude Code's local transcripts, kept whole against the Neon store.
  *
@@ -13,36 +12,55 @@
  *   imported whole; one it has is reconciled, adding any entry the
  *   best-effort mirror dropped or never saw, matched so nothing is duplicated.
  */
-import { importSessionToStore } from "@anthropic-ai/claude-agent-sdk";
+import { importSessionToStore, type SessionKey, type SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { createLogger } from "../../shared/log.ts";
+import type { NeonSessionStore } from "./session-store.ts";
 
 const log = createLogger("claude-transcripts");
+
+/** A Claude session alasio points at, and the directory it runs in. */
+export interface AdoptedSession {
+  readonly sessionId: string;
+  readonly workingDirectory: string;
+}
+
+/** The sessions adoptTranscripts brings into the store. */
+export interface AdoptTranscriptsOptions {
+  readonly store: NeonSessionStore;
+  readonly sessions: readonly AdoptedSession[];
+}
+
+/** One of a session's local transcripts: the main one (no subpath) or a subagent's. */
+interface LocalTranscript {
+  readonly subpath: string | undefined;
+  readonly entries: readonly SessionStoreEntry[];
+}
 
 /**
  * Claude Code's home, as the SDK resolves it: from this process's
  * environment, which the SDK's own session helpers read too.
  */
-export function claudeHome() {
-  return process.env.CLAUDE_CONFIG_DIR?.trim() || join(process.env.HOME || homedir(), ".claude");
+export function claudeHome(): string {
+  return process.env["CLAUDE_CONFIG_DIR"]?.trim() || join(process.env["HOME"] || homedir(), ".claude");
 }
 
-function transcriptPath(home, projectKey, sessionId, subpath) {
+function transcriptPath(home: string, projectKey: string, sessionId: string, subpath?: string): string {
   return subpath
     ? join(home, "projects", projectKey, sessionId, `${subpath}.jsonl`)
     : join(home, "projects", projectKey, `${sessionId}.jsonl`);
 }
 
-function writeAtomically(path, content) {
+function writeAtomically(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(`${path}.alasio-tmp`, content, { mode: 0o600 });
   renameSync(`${path}.alasio-tmp`, path);
 }
 
-const jsonl = (entries) => entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+const jsonl = (entries: readonly SessionStoreEntry[]): string => entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 
 /**
  * Writes a session's transcript back from the store if its local copy is
@@ -50,7 +68,7 @@ const jsonl = (entries) => entries.map((entry) => JSON.stringify(entry)).join("\
  * JSONL, each subagent's JSONL, and a subagent's metadata beside it.
  * Returns whether the transcript is present locally afterwards.
  */
-export async function ensureLocalTranscript(store, sessionId) {
+export async function ensureLocalTranscript(store: NeonSessionStore, sessionId: string): Promise<boolean> {
   const projectKey = await store.projectKeyOf(sessionId);
   if (!projectKey) return false;
   const home = claudeHome();
@@ -64,8 +82,9 @@ export async function ensureLocalTranscript(store, sessionId) {
     const transcript = entries.filter((entry) => entry.type !== "agent_metadata");
     const path = transcriptPath(home, projectKey, sessionId, subpath);
     if (transcript.length > 0) writeAtomically(path, jsonl(transcript));
-    if (metadata.length > 0) {
-      const { type: _type, ...rest } = metadata.at(-1);
+    const latest = metadata.at(-1);
+    if (latest !== undefined) {
+      const { type: _type, ...rest } = latest;
       writeAtomically(path.replace(/\.jsonl$/u, ".meta.json"), JSON.stringify(rest));
     }
   }
@@ -75,9 +94,10 @@ export async function ensureLocalTranscript(store, sessionId) {
   return true;
 }
 
-function readJsonl(path) {
+/** A local transcript's entries, each line as Claude Code wrote it. */
+function readJsonl(path: string): SessionStoreEntry[] {
   if (!existsSync(path)) return [];
-  const entries = [];
+  const entries: SessionStoreEntry[] = [];
   for (const line of readFileSync(path, "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
@@ -90,7 +110,7 @@ function readJsonl(path) {
 }
 
 /** Where a session's local transcript lives: its project directory, if any. */
-function findProject(home, sessionId) {
+function findProject(home: string, sessionId: string): string | null {
   const projects = join(home, "projects");
   if (!existsSync(projects)) return null;
   for (const projectKey of readdirSync(projects)) {
@@ -100,8 +120,8 @@ function findProject(home, sessionId) {
 }
 
 /** The local transcripts of a session, main and subagents, by subpath. */
-function localTranscripts(home, projectKey, sessionId) {
-  const transcripts = [{ subpath: undefined, entries: readJsonl(transcriptPath(home, projectKey, sessionId)) }];
+function localTranscripts(home: string, projectKey: string, sessionId: string): LocalTranscript[] {
+  const transcripts: LocalTranscript[] = [{ subpath: undefined, entries: readJsonl(transcriptPath(home, projectKey, sessionId)) }];
   const subagents = join(home, "projects", projectKey, sessionId, "subagents");
   if (existsSync(subagents)) {
     for (const name of readdirSync(subagents, { recursive: true, encoding: "utf8" })) {
@@ -119,12 +139,12 @@ function localTranscripts(home, projectKey, sessionId) {
  * writes as it exits, outside the mirror, by their JSON, counted, so an entry
  * written twice is kept twice and one already stored is not added again.
  */
-async function reconcile(store, home, projectKey, sessionId) {
+async function reconcile(store: NeonSessionStore, home: string, projectKey: string, sessionId: string): Promise<number> {
   let added = 0;
   for (const { subpath, entries } of localTranscripts(home, projectKey, sessionId)) {
-    const key = { projectKey, sessionId, ...(subpath ? { subpath } : {}) };
+    const key: SessionKey = { projectKey, sessionId, ...(subpath ? { subpath } : {}) };
     const storedUuids = await store.uuidsOf(key);
-    const storedUuidless = new Map();
+    const storedUuidless = new Map<string, number>();
     for (const entry of await store.uuidlessEntriesOf(key)) {
       const text = JSON.stringify(entry);
       storedUuidless.set(text, (storedUuidless.get(text) ?? 0) + 1);
@@ -151,7 +171,7 @@ async function reconcile(store, home, projectKey, sessionId) {
  * Brings every session alasio points at into the store: `sessions` is
  * `[{ sessionId, workingDirectory }]`. Idempotent; run before serving.
  */
-export async function adoptTranscripts({ store, sessions }) {
+export async function adoptTranscripts({ store, sessions }: AdoptTranscriptsOptions): Promise<void> {
   const home = claudeHome();
   for (const { sessionId, workingDirectory } of sessions) {
     const projectKey = findProject(home, sessionId);

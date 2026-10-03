@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * A workspace is one of two kinds, and both are carried in the one `working_directory`
  * string alasio already threads through conversations, parked sessions, and the harness
@@ -16,8 +15,23 @@ import { assertValidVolumeId, isValidVolumeId } from "../sandbox/names.ts";
 
 const SESSION_FS_PREFIX = "sessionfs:";
 
+/** A folder workspace: a path on the machine the host profile mounts. */
+export interface FolderWorkspace {
+  readonly kind: "folder";
+  readonly path: string;
+}
+
+/** A session-filesystem workspace: the volume of its own Sandbox. */
+export interface SessionFsWorkspace {
+  readonly kind: "sessionfs";
+  readonly volumeId: string;
+}
+
+/** A workspace, parsed from its `working_directory`. */
+export type Workspace = FolderWorkspace | SessionFsWorkspace;
+
 /** The `working_directory` value for a session-filesystem workspace on `volumeId`. */
-export function sessionFsWorkspace(volumeId) {
+export function sessionFsWorkspace(volumeId: string): string {
   return `${SESSION_FS_PREFIX}${assertValidVolumeId(volumeId)}`;
 }
 
@@ -26,7 +40,7 @@ export function sessionFsWorkspace(volumeId) {
  * `{ kind: "sessionfs", volumeId }`. A malformed sentinel is rejected rather than
  * mistaken for a folder path.
  */
-export function parseWorkspace(workingDirectory) {
+export function parseWorkspace(workingDirectory: string | null | undefined): Workspace | null {
   if (typeof workingDirectory !== "string" || workingDirectory === "") {
     return null;
   }
@@ -41,6 +55,6 @@ export function parseWorkspace(workingDirectory) {
 }
 
 /** True when the workspace is a session filesystem (a sandboxed, isolated volume). */
-export function isSessionFs(workingDirectory) {
+export function isSessionFs(workingDirectory: string | null | undefined): boolean {
   return typeof workingDirectory === "string" && workingDirectory.startsWith(SESSION_FS_PREFIX);
 }

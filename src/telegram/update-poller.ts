@@ -1,10 +1,32 @@
-// @ts-nocheck
+import type { Update } from "@grammyjs/types";
+import type { SqliteStore } from "../persistence/store.ts";
 import { sleep } from "../shared/async.ts";
+import type { Logger } from "../shared/log.ts";
+import type { Client } from "./client.ts";
 
 const POLL_BACKOFF_MS = 3_000;
 
+/** Where the poller keeps the offset of the next update to fetch. */
+type OffsetStore = Pick<SqliteStore, "getTelegramOffset" | "setTelegramOffset">;
+
+export type ProcessUpdate = (update: Update) => Promise<void>;
+
+export interface UpdatePollerOptions {
+  client: Pick<Client, "getUpdates">;
+  store: OffsetStore;
+  processUpdate: ProcessUpdate;
+  log: Logger;
+}
+
 export class UpdatePoller {
-  constructor({ client, store, processUpdate, log }) {
+  private readonly client: Pick<Client, "getUpdates">;
+  private readonly store: OffsetStore;
+  private readonly processUpdate: ProcessUpdate;
+  private readonly log: Logger;
+  private abortController: AbortController;
+  private promise: Promise<void> | null;
+
+  constructor({ client, store, processUpdate, log }: UpdatePollerOptions) {
     this.client = client;
     this.store = store;
     this.processUpdate = processUpdate;
@@ -13,7 +35,7 @@ export class UpdatePoller {
     this.promise = null;
   }
 
-  start() {
+  start(): Promise<void> {
     if (this.abortController.signal.aborted) {
       this.abortController = new AbortController();
     }
@@ -21,7 +43,7 @@ export class UpdatePoller {
     return this.promise;
   }
 
-  async stop() {
+  async stop(): Promise<void> {
     this.abortController.abort();
     try {
       await this.promise;
@@ -30,7 +52,7 @@ export class UpdatePoller {
     }
   }
 
-  async loop() {
+  async loop(): Promise<void> {
     while (!this.abortController.signal.aborted) {
       try {
         const updates = await this.client.getUpdates({

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Claude Code for session-filesystem workspaces. The CLI runs in alasio like a folder
  * workspace's, on the operator's login and Claude home (so resume, the Neon mirror, and
@@ -14,13 +13,19 @@
  * - bayma, reached at the session's Sandbox with its token (sandbox/index.ts), is the one
  *   MCP server, and so the agent's only way into the workspace.
  */
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
+
+import type { BaymaEndpoint } from "../../kube/sandboxes.ts";
 import { SESSION_FS_AGENT_INSTRUCTIONS } from "../workspace-instructions.ts";
+
+/** The query options that confine Claude Code to a session filesystem. */
+export type SessionFsQueryOptions = Required<Pick<Options, "tools" | "settingSources" | "strictMcpConfig" | "mcpServers" | "systemPrompt">>;
 
 /** The built-in tools a session-filesystem Claude Code keeps. */
 export const SESSION_FS_CLAUDE_TOOLS = Object.freeze(["Agent", "WebSearch", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate"]);
 
 /** The query options that confine Claude Code to the workspace reached through `bayma` (`{ url, headers }`). */
-export function sessionFsQueryOptions(bayma) {
+export function sessionFsQueryOptions(bayma: BaymaEndpoint): SessionFsQueryOptions {
   return {
     tools: [...SESSION_FS_CLAUDE_TOOLS],
     settingSources: [],

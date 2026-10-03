@@ -1,16 +1,13 @@
 import type { Database } from "better-sqlite3";
 import { newId } from "../shared/ids.ts";
+import type { SendMessageOptions } from "../telegram/client.ts";
 import type { SqliteConversationRepository } from "./conversation-repository.ts";
 
 /**
  * The options a reply is sent with, as the Telegram client takes them. They are kept
  * as JSON, so they hold only what survives it.
  */
-export interface OutboxMessageOptions {
-  /** A directory of media copied for the reply, removed once it is delivered. */
-  readonly mediaDir?: string | undefined;
-  readonly [option: string]: unknown;
-}
+export type OutboxMessageOptions = SendMessageOptions;
 
 export type OutboxState = "pending" | "sent";
 

@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * What of a Claude Code transcript entry is searched: its passages.
  *
@@ -18,12 +17,30 @@
  * Prose is searched with English stemming; tool calls and their output,
  * code and paths more than words, as they are.
  */
+import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
 
 import { storable } from "../session-store.ts";
 
 /** The most characters one passage holds; longer text is split at a boundary. */
 export const PASSAGE_CHARS = 2000;
+
+/** A piece of an entry's text to search, as passagesOf gives it. */
+export interface Passage {
+  /** Where it is in the entry: its place among the entry's passages. */
+  readonly part: number;
+  readonly kind: string;
+  /** Whether it is searched as English. */
+  readonly prose: boolean;
+  readonly text: string;
+  readonly digest: string;
+}
+
+/**
+ * A content block of an entry's message, as found: Claude Code writes the
+ * Messages API's, and anything else is read by its strings.
+ */
+type ContentBlock = Readonly<Record<string, unknown>>;
 
 /** Kinds read as words; the rest are searched as written. */
 const PROSE_KINDS = new Set([
@@ -83,7 +100,7 @@ const ENCODED = /^[A-Za-z0-9+/=_-]{120,}$/u;
 const LABEL = /^\S{1,40}$/u;
 const URL_TEXT = /^[a-z][a-z0-9+.-]*:\/\//iu;
 
-function isMachineValue(text) {
+function isMachineValue(text: string): boolean {
   return UUID.test(text) || HEX.test(text) || TIMESTAMP.test(text) || ENCODED.test(text);
 }
 
@@ -91,14 +108,16 @@ function isMachineValue(text) {
  * The strings of `value` worth searching, in order. Outside a message's own
  * content (`labels: false`), short single words are labels and are skipped.
  */
-function stringsOf(value, { labels }, out = []) {
+function stringsOf(value: unknown, { labels }: { readonly labels: boolean }, out: string[] = []): string[] {
   if (typeof value === "string") {
     const text = value.trim();
     if (text && !isMachineValue(text) && (labels || !LABEL.test(text) || URL_TEXT.test(text))) out.push(text);
   } else if (Array.isArray(value)) {
-    for (const item of value) stringsOf(item, { labels }, out);
+    const items: readonly unknown[] = value;
+    for (const item of items) stringsOf(item, { labels }, out);
   } else if (value !== null && typeof value === "object") {
-    for (const [name, item] of Object.entries(value)) {
+    const fields: [string, unknown][] = Object.entries(value);
+    for (const [name, item] of fields) {
       if (!MACHINE_FIELDS.has(name) && !COPY_FIELDS.has(name)) stringsOf(item, { labels }, out);
     }
   }
@@ -106,16 +125,16 @@ function stringsOf(value, { labels }, out = []) {
 }
 
 /** The text of one block of a message's content, or null for none. */
-function blockText(block) {
-  switch (block.type) {
+function blockText(block: ContentBlock): unknown {
+  switch (block["type"]) {
     case "text":
-      return block.text;
+      return block["text"];
     case "thinking":
-      return block.thinking;
+      return block["thinking"];
     case "tool_use":
-      return [block.name, ...stringsOf(block.input, { labels: true })].join("\n");
+      return [block["name"], ...stringsOf(block["input"], { labels: true })].join("\n");
     case "tool_result":
-      return typeof block.content === "string" ? block.content : stringsOf(block.content, { labels: true }).join("\n");
+      return typeof block["content"] === "string" ? block["content"] : stringsOf(block["content"], { labels: true }).join("\n");
     case "image":
     case "redacted_thinking":
       return null;
@@ -125,22 +144,24 @@ function blockText(block) {
 }
 
 /** The texts of an entry, each with its kind, before splitting. */
-function textsOf(entry) {
+function textsOf(entry: SessionStoreEntry): Array<{ kind: string; text: unknown }> {
   const type = typeof entry.type === "string" ? entry.type : "unknown";
-  if ((type === "user" || type === "assistant") && entry.message) {
-    const { content } = entry.message;
+  const message = entry["message"];
+  if ((type === "user" || type === "assistant") && message) {
+    const content = typeof message === "object" && "content" in message ? message.content : undefined;
     if (typeof content === "string") return [{ kind: `${type}.text`, text: content }];
     if (!Array.isArray(content)) return [];
-    return content
-      .filter((block) => block && typeof block === "object")
-      .map((block) => ({ kind: `${type}.${block.type ?? "unknown"}`, text: blockText(block) }));
+    const blocks: readonly unknown[] = content;
+    return blocks
+      .filter((block): block is ContentBlock => block !== null && typeof block === "object")
+      .map((block) => ({ kind: `${type}.${block["type"] ?? "unknown"}`, text: blockText(block) }));
   }
   return [{ kind: type, text: stringsOf(entry, { labels: false }).join("\n") }];
 }
 
 /** Splits text into pieces of at most `max` characters, at the widest boundary it can. */
-export function split(text, max = PASSAGE_CHARS) {
-  const pieces = [];
+export function split(text: string, max = PASSAGE_CHARS): string[] {
+  const pieces: string[] = [];
   let rest = text;
   while (rest.length > max) {
     const window = rest.slice(0, max);
@@ -165,7 +186,7 @@ export function split(text, max = PASSAGE_CHARS) {
 }
 
 /** The digest that makes each distinct text one passage. */
-export function digest(text) {
+export function digest(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
@@ -173,8 +194,8 @@ export function digest(text) {
  * An entry's passages, `[{ part, kind, prose, text, digest }]`, in the order
  * its text appears. `prose` passages are searched as English.
  */
-export function passagesOf(entry) {
-  const passages = [];
+export function passagesOf(entry: SessionStoreEntry): Passage[] {
+  const passages: Passage[] = [];
   for (const { kind, text } of textsOf(entry)) {
     if (typeof text !== "string") continue;
     for (const piece of split(storable(text))) {

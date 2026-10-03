@@ -1,16 +1,5 @@
+import type { ListedSession, RewindMessage } from "../harness/claude/sessions.ts";
 import { formatCommandListRows, truncateText } from "./text.ts";
-
-/** A session as a harness lists it for !sessions: its date label and its one-line label. */
-interface ListedSession {
-  readonly timestamp: string;
-  readonly label: string;
-}
-
-/** A message of a session that !rewind can rewind to, by its index. */
-interface RewindMessage {
-  readonly index: number;
-  readonly text: string;
-}
 
 export function formatSessionsForTelegram(sessions: readonly ListedSession[], page: number, totalPages: number): string {
   const startNumber = (page - 1) * 5 + 1;
