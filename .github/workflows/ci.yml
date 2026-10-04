@@ -26,12 +26,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
       - uses: ./.github/actions/kube-tools
       - run: helm dependency build charts/alasio
       - run: helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
       - run: helm lint charts/alasio --strict --values charts/alasio/ci/host-values.yaml
       - run: helm lint charts/agent-sandbox --strict
       - run: helm unittest charts/alasio
+      # The CLI's manifests are the chart's objects, until the chart is removed.
+      - run: node --test cli/test/manifests-parity.test.ts
 
   e2e:
     runs-on: ubuntu-24.04
