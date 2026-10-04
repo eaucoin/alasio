@@ -19,7 +19,7 @@ import {
 // By module: the package's index also loads its browser SDK, which alasio has not.
 import * as OtelTracer from "@effect/opentelemetry/OtelTracer";
 import * as Resource from "@effect/opentelemetry/Resource";
-import { Cause, Context, Effect, Exit, Layer, Tracer } from "effect";
+import { Cause, Context, Effect, Exit, type Fiber, Layer, Tracer } from "effect";
 
 export { SpanKind } from "@opentelemetry/api";
 export {
@@ -36,13 +36,43 @@ export {
 export type { Signal, SignalExporter, Telemetry } from "./config.ts";
 
 /**
+ * OtelTracer's tracer, except for where an effect runs outside every span of its own:
+ * - under a span whose propagation is disabled (as outsideTraces makes), in the root
+ *   context, where OtelTracer would put the no-op span Effect gives it, which
+ *   instrumentation takes for a parent;
+ * - under none, in the context its fiber started in, where OtelTracer would leave
+ *   whatever it resumed in: a promise's callback resumes it in the context the promise
+ *   was awaited in, an ended span's.
+ */
+const alasioTracer = Effect.map(OtelTracer.make, (otel) => {
+  const evaluate = <X>(primitive: Tracer.EffectPrimitive<X>, fiber: Fiber.Fiber<unknown, unknown>): X => primitive["~effect/Effect/evaluate"](fiber);
+  const inSpan = otel.context ?? evaluate;
+  const startedIn = new WeakMap<Fiber.Fiber<unknown, unknown>, OtelContext>();
+  return Tracer.make({
+    span: (options) => otel.span(options),
+    context: (primitive, fiber) => {
+      let started = startedIn.get(fiber);
+      if (started === undefined) startedIn.set(fiber, started = context.active());
+      const span = fiber.cache.span;
+      if (span === undefined) return context.with(started, () => evaluate(primitive, fiber));
+      return Context.get(span.annotations, Tracer.DisablePropagation)
+        ? context.with(ROOT_CONTEXT, () => evaluate(primitive, fiber))
+        : inSpan(primitive, fiber);
+    },
+  });
+});
+
+/**
  * Effects' spans as OpenTelemetry spans of the SDK ./start.ts registers (none, when it
  * registers none): they nest under the active span and become it, so the
  * instrumented modules' spans nest under theirs. Their tracer is alasio's, named "alasio":
  * the resource given here names only the tracer (the SDK has its own), and a tracer
  * without a name is one OTLP cannot encode, which drops the batch its spans are in.
  */
-export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = OtelTracer.layerGlobal.pipe(Layer.provide(Resource.layer({ serviceName: "alasio" })));
+export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = Layer.effect(Tracer.Tracer, alasioTracer).pipe(
+  Layer.provideMerge(OtelTracer.layerGlobalTracer),
+  Layer.provide(Resource.layer({ serviceName: "alasio" })),
+);
 
 /** Where withAlasioSpan puts a span, and what it records on it at the start. */
 export interface AlasioSpanOptions {
@@ -173,9 +203,10 @@ export function currentTraceparent(): string | null {
 /**
  * `effect` outside every trace, for work that outlives the span it starts in. Its parent
  * span is one that records nothing and propagates nothing: the spans it makes start
- * traces of their own, and what it runs sees an OpenTelemetry context with no valid span,
- * so nothing it starts (a process given a TRACEPARENT, an instrumented call) continues
- * the trace it was started in.
+ * traces of their own, and what it runs sees an OpenTelemetry context with no span, so
+ * nothing it starts (a process given a TRACEPARENT, an instrumented call) continues the
+ * trace it was started in, and instrumentation that records only inside a trace (pg's)
+ * records nothing.
  */
 export const outsideTraces = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   Effect.withSpan(effect, "alasio.outside-traces", { root: true, annotations: Context.make(Tracer.DisablePropagation, true) });

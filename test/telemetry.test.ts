@@ -58,7 +58,7 @@ const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
 const { AlasioLoggerLayer, withLogScope } = await import("../src/shared/log.ts");
-const { resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
+const { outsideTraces, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
 const { makeClaudeLiveSessions } = await import("../src/harness/claude/live-sessions.ts");
 const { ActiveTurns } = await import("../src/harness/active-turns.ts");
 const { fakeQuery, initMessage, stamped, successResult } = await import("./support/claude-sdk.ts");
@@ -541,6 +541,30 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
   assert.notEqual(reply.spanContext().traceId, turn.spanContext().traceId, "a reply of Claude Code's own is a trace of its own");
   assert.equal(reply.parentSpanContext, undefined);
   assert.equal(spans.getFinishedSpans().some((span) => span.name === "alasio.outside-traces"), false, "nothing records the span outside traces");
+});
+
+test("an effect outside every trace runs with no span, so instrumentation that needs one records nothing, and its own spans start traces", async () => {
+  const seen = await Effect.runPromise(Effect.gen(function*() {
+    const outside = trace.getSpan(context.active());
+    const inner = yield* Effect.sync(() => trace.getSpan(context.active())).pipe(withAlasioSpan("alasio.effect.outside"));
+    return { outside, inner };
+  }).pipe(outsideTraces, withAlasioSpan("alasio.effect.traced"), Effect.provide(TracingLayer)));
+  // As the pg instrumentation's requireParentSpan asks: is there a span at all.
+  assert.equal(seen.outside, undefined);
+  const outside = finishedSpan("alasio.effect.outside");
+  assert.equal(seen.inner?.spanContext().spanId, outside.spanContext().spanId);
+  assert.equal(outside.parentSpanContext, undefined);
+  assert.notEqual(outside.spanContext().traceId, finishedSpan("alasio.effect.traced").spanContext().traceId);
+});
+
+test("an effect's span that has ended is the parent of nothing made after it, though its promise is what the effect resumes from", async () => {
+  await Effect.runPromise(Effect.gen(function*() {
+    yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 1))).pipe(withAlasioSpan("alasio.effect.earlier"));
+    yield* Effect.void.pipe(withAlasioSpan("alasio.effect.later"));
+  }).pipe(Effect.provide(TracingLayer)));
+  const later = finishedSpan("alasio.effect.later");
+  assert.equal(later.parentSpanContext, undefined);
+  assert.notEqual(later.spanContext().traceId, finishedSpan("alasio.effect.earlier").spanContext().traceId);
 });
 
 test("an effect's span is a span of alasio's tracer, which OTLP encodes", async () => {
