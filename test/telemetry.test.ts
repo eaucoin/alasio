@@ -7,6 +7,7 @@ import { type TestContext, test } from "node:test";
 
 import type { HookCallback, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { context, type Context, propagation, ROOT_CONTEXT, type Span, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
+import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { InMemoryLogRecordExporter, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { DataPointType, type MetricData, MetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
@@ -540,4 +541,13 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
   assert.notEqual(reply.spanContext().traceId, turn.spanContext().traceId, "a reply of Claude Code's own is a trace of its own");
   assert.equal(reply.parentSpanContext, undefined);
   assert.equal(spans.getFinishedSpans().some((span) => span.name === "alasio.outside-traces"), false, "nothing records the span outside traces");
+});
+
+test("an effect's span is a span of alasio's tracer, which OTLP encodes", async () => {
+  await Effect.runPromise(Effect.void.pipe(withAlasioSpan("alasio.effect.encoded"), Effect.provide(TracingLayer)));
+  const span = finishedSpan("alasio.effect.encoded");
+  assert.equal(span.instrumentationScope.name, "alasio");
+  // As the OTLP exporter encodes a batch: a tracer without a name throws here, and the
+  // batch, every span in it, is dropped.
+  assert.ok(ProtobufTraceSerializer.serializeRequest([span]));
 });

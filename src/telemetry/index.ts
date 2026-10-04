@@ -38,9 +38,11 @@ export type { Signal, SignalExporter, Telemetry } from "./config.ts";
 /**
  * Effects' spans as OpenTelemetry spans of the SDK ./start.ts registers (none, when it
  * registers none): they nest under the active span and become it, so the
- * instrumented modules' spans nest under theirs.
+ * instrumented modules' spans nest under theirs. Their tracer is alasio's, named "alasio":
+ * the resource given here names only the tracer (the SDK has its own), and a tracer
+ * without a name is one OTLP cannot encode, which drops the batch its spans are in.
  */
-export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = OtelTracer.layerGlobal.pipe(Layer.provide(Resource.layerFromEnv()));
+export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = OtelTracer.layerGlobal.pipe(Layer.provide(Resource.layer({ serviceName: "alasio" })));
 
 /** Where withAlasioSpan puts a span, and what it records on it at the start. */
 export interface AlasioSpanOptions {
