@@ -30,7 +30,7 @@ allowed to use it in a Secret, and install:
 kubectl create namespace alasio
 kubectl -n alasio create secret generic alasio-telegram \
   --from-literal=token=<bot token> --from-literal=allowedUserIds=<user ids>
-helm install alasio oci://ghcr.io/eaucoin/charts/alasio --version 2.0.0 \
+helm install alasio oci://ghcr.io/eaucoin/charts/alasio --version 3.0.0 \
   -n alasio --set alasio.telegram.existingSecret=alasio-telegram
 ```
 
