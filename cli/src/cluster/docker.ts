@@ -153,6 +153,8 @@ export class DockerEngine extends Context.Service<DockerEngine, {
   readonly exportImages: (references: readonly string[]) => Effect.Effect<Readable, DockerError, Scope.Scope>;
   /** The network, or null when there is none. */
   readonly inspectNetwork: (name: string) => Effect.Effect<NetworkInspect | null, DockerError>;
+  /** Every network there is. */
+  readonly listNetworks: Effect.Effect<readonly NetworkInspect[], DockerError>;
   /** Makes it; fails with status 409 when it exists. */
   readonly createNetwork: (network: NetworkCreate) => Effect.Effect<void, DockerError>;
   /** Removes it; one already gone is not an error. */
@@ -382,6 +384,7 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
     pullImage,
     exportImages: (references) => open({ method: "GET", path: "/images/get", query: { names: references } }),
     inspectNetwork: (network) => orNull(json({ method: "GET", path: `/networks/${name(network)}` })),
+    listNetworks: json({ method: "GET", path: "/networks" }),
     createNetwork: (network) => Effect.asVoid(body({ method: "POST", path: "/networks/create", body: network })),
     removeNetwork: (network) => orGone(body({ method: "DELETE", path: `/networks/${name(network)}` })),
     createVolume: (volume) => Effect.asVoid(body({ method: "POST", path: "/volumes/create", body: volume })),

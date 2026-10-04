@@ -8,7 +8,9 @@
  * keep (NAME-server-0-k3s and so on), so a node made anew, as when its image or settings
  * change, keeps its state. All of it is labelled as the cluster's, and nothing that is
  * not is changed. The nodes have fixed addresses in the network's subnet: the server the
- * second, after the gateway, and the agents those after it.
+ * second, after the gateway, and the agents those after it. Docker gives fixed addresses
+ * only in a subnet chosen for the network, so one is chosen when none is given: the first
+ * 172.30.N.0/24 no other network overlaps.
  *
  * The API server is published on the loopback only. What is done in the cluster itself,
  * waiting for it and configuring it, is done with the kubectl k3s carries in the server
@@ -46,7 +48,7 @@ export interface LocalClusterOptions {
   readonly storagePath: string;
   /** The node image; this release's unless given. */
   readonly image?: string;
-  /** The network's IPv4 subnet (a.b.c.d/n); Docker's choice unless given. */
+  /** The network's IPv4 subnet (a.b.c.d/n); the first free 172.30.N.0/24 unless given. */
   readonly subnet?: string;
   readonly hostAliases?: readonly HostAlias[];
   readonly mounts?: readonly HostMount[];
@@ -199,6 +201,33 @@ export function subnetAddress(cidr: string, index: number): string | null {
   return [24, 16, 8, 0].map((shift) => Math.floor(address / 2 ** shift) % 256).join(".");
 }
 
+/** The first and last addresses of the IPv4 subnet `cidr`, as numbers; null when it is none. */
+function subnetRange(cidr: string): readonly [number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(cidr);
+  if (!match) return null;
+  const octets = match.slice(1, 5).map(Number);
+  const prefix = Number(match[5]);
+  if (octets.some((octet) => octet > 255) || prefix > 32) return null;
+  const size = 2 ** (32 - prefix);
+  const first = octets.reduce((value, octet) => value * 256 + octet, 0);
+  return [first - (first % size), first - (first % size) + size - 1];
+}
+
+/** The first 172.30.N.0/24 that overlaps none of the `taken` subnets (others than IPv4 are not in the way), or null when all do. Pure, for tests. */
+export function freeSubnet(taken: readonly string[]): string | null {
+  const ranges = taken.flatMap((cidr) => {
+    const range = subnetRange(cidr);
+    return range ? [range] : [];
+  });
+  for (let third = 0; third < 256; third++) {
+    const candidate = `172.30.${third}.0/24`;
+    // A /24 written as such always has a range.
+    const [first, last] = subnetRange(candidate)!;
+    if (!ranges.some(([start, end]) => start <= last && first <= end)) return candidate;
+  }
+  return null;
+}
+
 /**
  * CoreDNS's NodeHosts, a hosts file, with `aliases`: k3s keeps a line for each node in
  * it, which stays, and every other line is the cluster's aliases, which are replaced.
@@ -289,8 +318,10 @@ const makeLocalCluster = Effect.fnUntraced(function*({
     if (existing && existing.Labels?.[CLUSTER_LABEL] !== cluster) return yield* unusable(`a network named ${cluster} is not its own`);
     let network: NetworkInspect | null = existing;
     if (!network) {
-      yield* Effect.logInfo(`making network ${cluster}`);
-      yield* docker.createNetwork({ Name: cluster, Driver: "bridge", ...(subnet ? { IPAM: { Config: [{ Subnet: subnet }] } } : {}), Labels: labels });
+      const chosen = subnet ?? freeSubnet((yield* docker.listNetworks).flatMap(({ IPAM }) => (IPAM.Config ?? []).flatMap(({ Subnet }) => Subnet ?? [])));
+      if (!chosen) return yield* unusable("every 172.30.N.0/24 is another network's: give the cluster a subnet");
+      yield* Effect.logInfo(`making network ${cluster} (${chosen})`);
+      yield* docker.createNetwork({ Name: cluster, Driver: "bridge", IPAM: { Config: [{ Subnet: chosen }] }, Labels: labels });
       network = yield* docker.inspectNetwork(cluster);
     }
     const actual = network?.IPAM.Config?.[0]?.Subnet;

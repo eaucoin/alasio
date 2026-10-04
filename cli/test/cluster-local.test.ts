@@ -9,7 +9,7 @@ import { KubeConfig } from "@kubernetes/client-node";
 import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker.ts";
-import { LocalCluster, type LocalClusterOptions, localKubeconfig, nodeHostsWith, subnetAddress } from "../src/cluster/local.ts";
+import { freeSubnet, LocalCluster, type LocalClusterOptions, localKubeconfig, nodeHostsWith, subnetAddress } from "../src/cluster/local.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
@@ -43,7 +43,8 @@ interface Rig {
   readonly run: <A, E>(body: (cluster: LocalCluster["Service"]) => Effect.Effect<A, E>, options?: Partial<LocalClusterOptions>) => Promise<A>;
 }
 
-async function rig(t: TestContext): Promise<Rig> {
+/** A cluster on a fake Docker; its network's subnet given in its settings, unless `subnet` is null. */
+async function rig(t: TestContext, subnet: string | null = "172.30.9.0/24"): Promise<Rig> {
   const { fake, k3s } = await serveK3sInDocker(K3S_YAML, { pullable: (reference) => !reference.endsWith(":absent") });
   const directory = mkdtempSync(join(tmpdir(), "alasio-cluster-"));
   t.after(async () => {
@@ -55,8 +56,7 @@ async function rig(t: TestContext): Promise<Rig> {
     apiPort: 7443,
     storagePath: join(directory, "storage"),
     image: "ghcr.io/eaucoin/alasio-node:test",
-    subnet: "172.30.9.0/24",
-    hostAliases: [{ ip: "172.30.9.250", hostnames: ["otelcol.observability"] }],
+    ...(subnet === null ? {} : { subnet, hostAliases: [{ ip: "172.30.9.250", hostnames: ["otelcol.observability"] }] }),
     readyTimeout: "300 millis",
     poll: "5 millis",
   };
@@ -250,6 +250,23 @@ test("up refuses a network of the cluster's with another subnet than its setting
   fake.networks.set("dev", { Name: "dev", Labels: { "alasio.cluster": "dev" }, Subnet: "172.30.8.0/24" });
   const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
   assert.equal(error.message, "cluster dev cannot be made: network dev has the subnet 172.30.8.0/24, not 172.30.9.0/24");
+});
+
+test("up gives a network made without a subnet the first 172.30.N.0/24 no other network has, so its nodes' addresses are fixed", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t, null);
+  fake.networks.set("bridge", { Name: "bridge", Labels: {}, Subnet: "172.17.0.0/16" });
+  fake.networks.set("other", { Name: "other", Labels: {}, Subnet: "172.30.0.0/24" });
+  await run((cluster) => cluster.up(kubeconfig));
+  assert.equal(fake.networks.get("dev")?.Subnet, "172.30.1.0/24");
+  const created = fake.requests.filter(({ path }) => path === "/containers/create").map(({ body }) => (body as { NetworkingConfig: { EndpointsConfig: Record<string, { IPAMConfig: { IPv4Address: string } }> } }).NetworkingConfig.EndpointsConfig["dev"]?.IPAMConfig.IPv4Address);
+  assert.deepEqual(created, ["172.30.1.2"]);
+});
+
+test("freeSubnet takes the first 172.30.N.0/24 that overlaps no network, and none when all do", () => {
+  assert.equal(freeSubnet([]), "172.30.0.0/24");
+  assert.equal(freeSubnet(["172.30.0.0/24", "172.30.1.0/25", "fd00::/64", "172.17.0.0/16"]), "172.30.2.0/24");
+  assert.equal(freeSubnet(["172.30.0.0/23"]), "172.30.2.0/24");
+  assert.equal(freeSubnet(["172.16.0.0/12"]), null);
 });
 
 test("up gives up on an API server that does not answer, saying why", async (t) => {

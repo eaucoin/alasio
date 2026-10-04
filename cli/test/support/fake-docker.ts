@@ -161,6 +161,9 @@ export async function serveFakeDocker({
       networks.set(network.Name, { Name: network.Name, Labels: network.Labels, Subnet: network.IPAM?.Config[0].Subnet ?? "172.18.0.0/16" });
       return json(response, 201, { Id: network.Name });
     }
+    if (route === "GET /networks") {
+      return json(response, 200, [...networks.values()].map((network) => ({ Name: network.Name, Labels: network.Labels, IPAM: { Config: [{ Subnet: network.Subnet }] } })));
+    }
     if ((match = /^(GET|DELETE) \/networks\/([^/]+)$/u.exec(route))) {
       const network = networks.get(match[2] ?? "");
       if (!network) return refuse(response, 404, `network ${match[2]} not found`);
