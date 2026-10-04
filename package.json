@@ -1,6 +1,6 @@
 {
   "name": "alasio",
-  "version": "3.0.3",
+  "version": "3.0.4",
   "private": true,
   "type": "module",
   "description": "Alasio Telegram bridge runtime",
