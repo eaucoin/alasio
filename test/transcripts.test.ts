@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { after, before, beforeEach, describe, test } from "node:test";
 
 import type { SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+import { Effect } from "effect";
 import pg from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
@@ -82,7 +83,7 @@ describe("claude transcripts against the store", { skip }, () => {
       { type: "agent_metadata", agentType: "Explore", description: "look around" },
     ]);
 
-    assert.equal(await ensureLocalTranscript(store, sessionId), true);
+    assert.equal(await Effect.runPromise(ensureLocalTranscript(store, sessionId)), true);
 
     const main = join(home, "projects", "-work", `${sessionId}.jsonl`);
     assert.deepEqual(readLines(main).map((e) => e.uuid), ["u1", "u2"]);
@@ -96,13 +97,13 @@ describe("claude transcripts against the store", { skip }, () => {
     const sessionId = randomUUID();
     const { projectKey, main } = writeLocal("/work", sessionId, [message("u1", "local")]);
     await store.append({ projectKey, sessionId }, [message("u1", "local"), message("u2", "only in the store")]);
-    assert.equal(await ensureLocalTranscript(store, sessionId), true);
+    assert.equal(await Effect.runPromise(ensureLocalTranscript(store, sessionId)), true);
     assert.deepEqual(readLines(main).map((e) => e.uuid), ["u1"]);
   });
 
   test("a session the store has never held is not found there", async () => {
     const store = await makeStore();
-    assert.equal(await ensureLocalTranscript(store, randomUUID()), false);
+    assert.equal(await Effect.runPromise(ensureLocalTranscript(store, randomUUID())), false);
   });
 
   test("adoption imports a session whole, then only adds what the mirror dropped", async () => {
@@ -114,7 +115,7 @@ describe("claude transcripts against the store", { skip }, () => {
       "agent-a": [message("22222222-2222-4222-8222-222222222222", "sub")],
     });
 
-    await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
     const key = { projectKey, sessionId };
     assert.equal((await store.load(key))?.length, 2);
     assert.equal((await store.load({ ...key, subpath: "subagents/agent-a" }))?.length, 1);
@@ -128,8 +129,8 @@ describe("claude transcripts against the store", { skip }, () => {
       { type: "cost-state", totalCostUSD: 1 },
     ];
     writeFileSync(main, later.map((e) => JSON.stringify(e)).join("\n") + "\n");
-    await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
-    await adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] });
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId, workingDirectory: dir }] }));
     assert.deepEqual(
       (await store.load(key))?.map((e) => e.uuid ?? e.type),
       ["11111111-1111-4111-8111-111111111111", "summary", "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "cost-state"],
@@ -138,7 +139,7 @@ describe("claude transcripts against the store", { skip }, () => {
 
   test("a session with no local transcript is left to the store", async () => {
     const store = await makeStore();
-    await adoptTranscripts({ store, sessions: [{ sessionId: randomUUID(), workingDirectory: "/nowhere" }] });
+    await Effect.runPromise(adoptTranscripts({ store, sessions: [{ sessionId: randomUUID(), workingDirectory: "/nowhere" }] }));
     assert.equal(existsSync(join(home, "projects")), false);
   });
 });

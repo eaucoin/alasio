@@ -1,7 +1,7 @@
 import type { CallbackQuery } from "@grammyjs/types";
 import { Effect, Option, Result } from "effect";
 
-import { type ConcurrentPromptPayload, Turns } from "../codex/turn-controller.ts";
+import { type ConcurrentPromptPayload, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { Harnesses, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName, resolveHarnessName } from "../harness/index.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";

@@ -8,7 +8,7 @@ import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
-import { Turns } from "./codex/turn-controller.ts";
+import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";

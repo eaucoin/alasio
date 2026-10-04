@@ -29,6 +29,7 @@ import { makeStatusReporter } from "./status-reporter.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
 
+/** The scope these lines have always been logged in, kept for whatever reads alasio's logs. */
 const LOG_SCOPE = "codex-turn-controller";
 
 const turnDuration = meter.createHistogram("alasio.turn.duration", {
@@ -82,7 +83,7 @@ interface SessionTurn extends TurnRequest {
 }
 
 /** How a turn ended: completed, without its answer, interrupted by the operator, or stopped by alasio stopping. */
-export type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
+type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
 
 /**
  * What a concurrent prompt's buttons (steer, queue, swerve, discard) carry: its prompt
@@ -317,48 +318,47 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: TurnsConfig) {
    * null for a trace of its own) and the active span otherwise; its outcome labels it
    * and its duration.
    */
-  const runSessionTurn = (turn: SessionTurn): Effect.Effect<boolean, TurnError> =>
-    Effect.gen(function*() {
-      const harness = yield* harnesses.requireForConversation(turn.conversationId);
-      const labels = { "alasio.harness": harness.name };
-      const startedAt = yield* Clock.currentTimeMillis;
-      let outcome: TurnOutcome | "failed" = "failed";
-      runningTurns.add(1, labels);
-      const { completed } = yield* runTurn(harness, turn).pipe(
-        Effect.tap((settled) => Effect.sync(() => {
-          outcome = settled.outcome;
-        })),
-        Effect.onInterrupt(() => Effect.sync(() => {
-          outcome = "stopped";
-        })),
-        Effect.onExit(() => Effect.suspend(() => Effect.annotateCurrentSpan("alasio.turn.outcome", outcome))),
-        withAlasioSpan("alasio.turn", {
-          parent: turn.traceparent,
-          attributes: {
-            ...labels,
-            "alasio.conversation.id": turn.conversationId,
-            "telegram.chat.id": String(turn.chatId),
-            ...(turn.jobId ? { "alasio.prompt_job.id": turn.jobId } : {}),
-            ...(turn.existingSession ? { "alasio.session.id": turn.existingSession } : {}),
-          },
-        }),
-        Effect.onExit(() => Effect.gen(function*() {
-          runningTurns.add(-1, labels);
-          turnDuration.record(((yield* Clock.currentTimeMillis) - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
-        })),
-      );
-      const queued = yield* Ref.modify(queuedMessages, (all) => [Option.getOrElse(HashMap.get(all, turn.conversationId), () => []), HashMap.remove(all, turn.conversationId)]);
-      if (queued.length > 0) {
-        yield* run({
-          conversationId: turn.conversationId,
-          chatId: turn.chatId,
-          messageId: turn.messageId,
-          prompt: queued.join("\n\n---\n\n"),
-          traceparent: null,
-        });
-      }
-      return completed;
-    }).pipe(withLogScope(LOG_SCOPE));
+  const runSessionTurn = Effect.fnUntraced(function*(turn: SessionTurn): Effect.fn.Return<boolean, TurnError> {
+    const harness = yield* harnesses.requireForConversation(turn.conversationId);
+    const labels = { "alasio.harness": harness.name };
+    const startedAt = yield* Clock.currentTimeMillis;
+    let outcome: TurnOutcome | "failed" = "failed";
+    runningTurns.add(1, labels);
+    const { completed } = yield* runTurn(harness, turn).pipe(
+      Effect.tap((settled) => Effect.sync(() => {
+        outcome = settled.outcome;
+      })),
+      Effect.onInterrupt(() => Effect.sync(() => {
+        outcome = "stopped";
+      })),
+      Effect.onExit(() => Effect.suspend(() => Effect.annotateCurrentSpan("alasio.turn.outcome", outcome))),
+      withAlasioSpan("alasio.turn", {
+        parent: turn.traceparent,
+        attributes: {
+          ...labels,
+          "alasio.conversation.id": turn.conversationId,
+          "telegram.chat.id": String(turn.chatId),
+          ...(turn.jobId ? { "alasio.prompt_job.id": turn.jobId } : {}),
+          ...(turn.existingSession ? { "alasio.session.id": turn.existingSession } : {}),
+        },
+      }),
+      Effect.onExit(() => Effect.gen(function*() {
+        runningTurns.add(-1, labels);
+        turnDuration.record(((yield* Clock.currentTimeMillis) - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
+      })),
+    );
+    const queued = yield* Ref.modify(queuedMessages, (all) => [Option.getOrElse(HashMap.get(all, turn.conversationId), () => []), HashMap.remove(all, turn.conversationId)]);
+    if (queued.length > 0) {
+      yield* run({
+        conversationId: turn.conversationId,
+        chatId: turn.chatId,
+        messageId: turn.messageId,
+        prompt: queued.join("\n\n---\n\n"),
+        traceparent: null,
+      });
+    }
+    return completed;
+  }, withLogScope(LOG_SCOPE));
 
   /** A turn on the conversation's mounted session, in the trace `traceparent` names (null: one of its own). */
   const run = (request: TurnRequest & { readonly traceparent: string | null }): Effect.Effect<boolean, TurnError> =>
@@ -375,39 +375,38 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: TurnsConfig) {
     Effect.flatMap(FiberSet.run(directTurns, turn), Fiber.join);
 
   /** The conversation's prompt jobs, one at a time, for as long as it is free and has any. */
-  const drain = (conversationId: string): Effect.Effect<void, NoServiceMounted | HarnessUnavailable> =>
-    Effect.gen(function*() {
-      /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
-      const failJob = (job: PromptJob, error: unknown) =>
-        Effect.suspend(() => {
-          store.failPromptJob(job.id, error);
-          return client.sendMessage(job.chat_id, `${harnessLabelOf(store, conversationId)} hit an error: ${errorText(error)}`).pipe(Effect.ignore);
-        });
-      while (!(yield* activeTurns.isBusy(conversationId))) {
-        const job = store.claimNextPromptJob(conversationId);
-        if (!job) {
-          return;
-        }
-        const activeHarness = (yield* harnesses.requireForConversation(conversationId)).name;
-        if (job.harness && job.harness !== activeHarness) {
-          yield* Effect.logWarning(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
-        }
-        // Claiming a job stamps its start, so a claimed job's started_at is set.
-        promptWait.record(job.started_at! - job.created_at, { "alasio.harness": activeHarness });
-        yield* run({
-          conversationId,
-          chatId: job.chat_id,
-          messageId: job.message_id,
-          prompt: job.prompt,
-          jobId: job.id,
-          traceparent: job.traceparent,
-        }).pipe(
-          Effect.flatMap((completed) => Effect.sync(() => store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled"))),
-          Effect.catch((error) => failJob(job, error)),
-          Effect.catchDefect((defect) => failJob(job, defect)),
-        );
+  const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, NoServiceMounted | HarnessUnavailable> {
+    /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
+    const failJob = (job: PromptJob, error: unknown) =>
+      Effect.suspend(() => {
+        store.failPromptJob(job.id, error);
+        return client.sendMessage(job.chat_id, `${harnessLabelOf(store, conversationId)} hit an error: ${errorText(error)}`).pipe(Effect.ignore);
+      });
+    while (!(yield* activeTurns.isBusy(conversationId))) {
+      const job = store.claimNextPromptJob(conversationId);
+      if (!job) {
+        return;
       }
-    });
+      const activeHarness = (yield* harnesses.requireForConversation(conversationId)).name;
+      if (job.harness && job.harness !== activeHarness) {
+        yield* Effect.logWarning(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
+      }
+      // Claiming a job stamps its start, so a claimed job's started_at is set.
+      promptWait.record(job.started_at! - job.created_at, { "alasio.harness": activeHarness });
+      yield* run({
+        conversationId,
+        chatId: job.chat_id,
+        messageId: job.message_id,
+        prompt: job.prompt,
+        jobId: job.id,
+        traceparent: job.traceparent,
+      }).pipe(
+        Effect.flatMap((completed) => Effect.sync(() => store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled"))),
+        Effect.catch((error) => failJob(job, error)),
+        Effect.catchDefect((defect) => failJob(job, defect)),
+      );
+    }
+  });
 
   // A worker scheduled once alasio is stopping is not run: the map is closed.
   const schedule = (conversationId: string): Effect.Effect<void> =>
@@ -461,50 +460,47 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: TurnsConfig) {
         return HashMap.set(all, conversationId, front ? [prompt, ...queue] : [...queue, prompt]);
       }),
     schedule,
-    setPromptDisposition: (jobId, state, priority = 0) =>
-      Effect.gen(function*() {
-        store.setPromptJobDisposition(jobId, state, priority);
-        const job = store.getPromptJob(jobId);
-        if (state === "pending" && job) {
-          yield* schedule(job.conversation_id);
-        }
-        return job;
-      }),
+    setPromptDisposition: Effect.fnUntraced(function*(jobId, state, priority = 0) {
+      store.setPromptJobDisposition(jobId, state, priority);
+      const job = store.getPromptJob(jobId);
+      if (state === "pending" && job) {
+        yield* schedule(job.conversation_id);
+      }
+      return job;
+    }),
     // The trace a turn asked for without one is the asker's, read before the turn is forked.
     run: (request) => Effect.suspend(() => runDirect(run({ ...request, traceparent: request.traceparent === undefined ? currentTraceparent() : request.traceparent }))),
-    runGoalTurn: ({ conversationId, chatId, messageId, sessionId, turnId, prompt }) =>
-      Effect.gen(function*() {
-        if (yield* activeTurns.isBusy(conversationId)) {
-          const job = store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
-          yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
-          return true;
-        }
-        store.setSessionId(conversationId, sessionId);
-        yield* runDirect(runSessionTurn({
-          conversationId,
-          chatId,
-          messageId,
-          prompt,
-          existingSession: sessionId,
-          attachedTurn: turnId ? { sessionId, turnId } : null,
-          traceparent: currentTraceparent(),
-        }));
+    runGoalTurn: Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, turnId, prompt }) {
+      if (yield* activeTurns.isBusy(conversationId)) {
+        const job = store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
+        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
         return true;
-      }),
-    startNewSession: (conversationId) =>
-      Effect.gen(function*() {
-        const harness = yield* harnesses.requireForConversation(conversationId);
-        if (yield* activeTurns.isBusy(conversationId)) {
-          return yield* new ConversationBusy({ message: `${harness.displayName} is currently working. Stop the active turn before starting a new session.` });
-        }
-        const workingDirectory = resolveWorkingDirectory(store, conversationId);
-        if (!workingDirectory) {
-          return yield* new NoWorkspaceMounted();
-        }
-        const sessionId = yield* harness.startFreshSession({ threadKey: conversationId, workingDirectory });
-        store.setSessionId(conversationId, sessionId);
-        return sessionId;
-      }),
+      }
+      store.setSessionId(conversationId, sessionId);
+      yield* runDirect(runSessionTurn({
+        conversationId,
+        chatId,
+        messageId,
+        prompt,
+        existingSession: sessionId,
+        attachedTurn: turnId ? { sessionId, turnId } : null,
+        traceparent: currentTraceparent(),
+      }));
+      return true;
+    }),
+    startNewSession: Effect.fnUntraced(function*(conversationId) {
+      const harness = yield* harnesses.requireForConversation(conversationId);
+      if (yield* activeTurns.isBusy(conversationId)) {
+        return yield* new ConversationBusy({ message: `${harness.displayName} is currently working. Stop the active turn before starting a new session.` });
+      }
+      const workingDirectory = resolveWorkingDirectory(store, conversationId);
+      if (!workingDirectory) {
+        return yield* new NoWorkspaceMounted();
+      }
+      const sessionId = yield* harness.startFreshSession({ threadKey: conversationId, workingDirectory });
+      store.setSessionId(conversationId, sessionId);
+      return sessionId;
+    }),
     reconcilePersistentState: Effect.sync(() => {
       const completedConversations = store.recoverPromptJobsAfterRestart();
       for (const conversationId of completedConversations) {

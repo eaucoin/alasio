@@ -15,7 +15,7 @@ import type { Pool, PoolClient } from "pg";
 import { passagesOf, type Passage } from "./passages.ts";
 
 /** Entries read into passages in one transaction. */
-export const ENTRIES_PER_BATCH = 200;
+const ENTRIES_PER_BATCH = 200;
 
 /** How old an entry must be before the settled mark moves past it. */
 export const SETTLE_MS = 10 * 60 * 1000;

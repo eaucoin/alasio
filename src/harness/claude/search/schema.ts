@@ -11,7 +11,7 @@
  */
 import type { Pool } from "pg";
 
-export const searchDdl = (SCHEMA: string): string => `
+const searchDdl = (SCHEMA: string): string => `
 create extension if not exists pg_trgm;
 
 create table if not exists ${SCHEMA}.passages (

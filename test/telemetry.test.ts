@@ -5,13 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
 
-import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import type { HookCallback, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { context, type Context, propagation, ROOT_CONTEXT, type Span, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import { InMemoryLogRecordExporter, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { DataPointType, type MetricData, MetricReader } from "@opentelemetry/sdk-metrics";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
-import type { Harness } from "../src/harness/index.ts";
+import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
+import type { Harness, TurnPersistence } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
 // Types only: effect itself is loaded once the SDK is registered, below.
@@ -54,9 +56,12 @@ const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
-const { createLogger } = await import("../src/shared/log.ts");
-const { inSpan, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
-const { Effect, Layer, ManagedRuntime, Schema } = await import("effect");
+const { AlasioLoggerLayer, withLogScope } = await import("../src/shared/log.ts");
+const { resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
+const { makeClaudeLiveSessions } = await import("../src/harness/claude/live-sessions.ts");
+const { ActiveTurns } = await import("../src/harness/active-turns.ts");
+const { fakeQuery, initMessage, stamped, successResult } = await import("./support/claude-sdk.ts");
+const { Deferred, Effect, Layer, ManagedRuntime, Schema } = await import("effect");
 const { FetchHttpClient } = await import("effect/http");
 const { Store } = await import("../src/persistence/store.ts");
 const { TelegramClient } = await import("../src/telegram/client.ts");
@@ -74,6 +79,26 @@ function outboxFor(t: TestContext, store: InstanceType<typeof SqliteStore>, answ
 }
 
 const ENDPOINT = { OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/" };
+
+const otelTracer = trace.getTracer("telemetry-test");
+
+/** `fn` in a span of OpenTelemetry's own, as an instrumented module (pg, http) makes one: the active span's child, or `parent`'s. */
+async function inOtelSpan<T>(name: string, fn: (span: Span) => T | Promise<T>, parent: Context = context.active()): Promise<T> {
+  return await otelTracer.startActiveSpan(name, {}, parent, async (span) => {
+    try {
+      return await fn(span);
+    } finally {
+      span.end();
+    }
+  });
+}
+
+/** The traceparent what runs now would hand on, as the Agent SDK hands one to Claude Code's process. */
+function traceparentHere(): string | undefined {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);
+  return carrier["traceparent"];
+}
 
 function finishedSpan(name: string): ReadableSpan {
   const span = spans.getFinishedSpans().findLast((candidate) => candidate.name === name);
@@ -197,11 +222,13 @@ test("Codex's app-server exports each signal alasio exports through its own conf
 });
 
 test("log lines become records of the trace they are written in", async () => {
-  const log = createLogger("telemetry-test");
-  const span = await inSpan("test.logging", {}, async (active) => {
-    log.warn("something to see", { "alasio.conversation.id": "telegram:1" });
-    return active;
-  });
+  await Effect.runPromise(Effect.logWarning("something to see").pipe(
+    Effect.annotateLogs("alasio.conversation.id", "telegram:1"),
+    withLogScope("telemetry-test"),
+    withAlasioSpan("test.logging"),
+    Effect.provide([AlasioLoggerLayer, TracingLayer]),
+  ));
+  const span = finishedSpan("test.logging");
   const record = logRecords.getFinishedLogRecords().findLast((candidate) => candidate.body === "something to see");
   assert.ok(record);
   assert.equal(record.severityText, "WARN");
@@ -360,11 +387,11 @@ test("a deferred delivery records what stopped it and keeps its trace", async (t
       throw new Error("Telegram is down");
     });
     spans.reset();
-    const turn = await inSpan("test.turn", { parent: null }, async (span) => {
+    const turn = await inOtelSpan("test.turn", async (span) => {
       await run(Effect.flatMap(Outbox, (outbox) => outbox.enqueueText({ chatId: "43", text: "reply" })));
       await run(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
       return span;
-    });
+    }, ROOT_CONTEXT);
     const delivery = finishedSpan("alasio.delivery");
     assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
     assert.equal(delivery.status.code, SpanStatusCode.ERROR);
@@ -380,7 +407,7 @@ test("a deferred delivery records what stopped it and keeps its trace", async (t
 
 class EffectProbeError extends Schema.TaggedError<EffectProbeError>()("EffectProbeError", { message: Schema.String }) {}
 
-test("an effect's span is a span of alasio's, as inSpan makes one: named, kinded, attributed, and labelled with its failure", async () => {
+test("an effect's span is a span of alasio's: named, kinded, attributed, and labelled with its failure", async () => {
   await Effect.runPromise(Effect.void.pipe(
     withAlasioSpan("alasio.effect.ok", { kind: SpanKind.CONSUMER, attributes: { "alasio.probe": "yes" } }),
     Effect.provide(TracingLayer),
@@ -408,9 +435,9 @@ test("an effect's span continues a traceparent, starts a trace of its own for nu
   assert.equal(continued.spanContext().traceId, "0af7651916cd43dd8448eb211c80319c");
   assert.equal(continued.parentSpanContext?.spanId, "b7ad6b7169203331");
 
-  await inSpan("alasio.outer", {}, async () => {
+  await inOtelSpan("alasio.outer", async () => {
     await Effect.runPromise(Effect.void.pipe(withAlasioSpan("alasio.effect.root", { parent: null }), Effect.provide(TracingLayer)));
-    await Effect.runPromise(Effect.promise(() => inSpan("alasio.effect.inner", {}, () => undefined)).pipe(
+    await Effect.runPromise(Effect.promise(() => inOtelSpan("alasio.effect.inner", () => undefined)).pipe(
       withAlasioSpan("alasio.effect.nested"),
       Effect.provide(TracingLayer),
     ));
@@ -422,7 +449,7 @@ test("an effect's span continues a traceparent, starts a trace of its own for nu
   assert.equal(finishedSpan("alasio.effect.inner").parentSpanContext?.spanId, nested.spanContext().spanId);
 });
 
-test("an effect's call is a call of alasio's, as rpcCall records one: a client span and a duration labelled with its failure", async () => {
+test("an effect's call is a call of alasio's: a client span and a duration labelled with its failure", async () => {
   await Effect.runPromise(Effect.fail(new EffectProbeError({ message: "refused" })).pipe(
     withRpcCall({ system: "telegram", service: "telegram", method: "effectProbe" }),
     Effect.ignore,
@@ -435,4 +462,82 @@ test("an effect's call is a call of alasio's, as rpcCall records one: a client s
   const points = (await histogramPoints("rpc.client.call.duration")).filter((point) => point.attributes["rpc.method"] === "effectProbe");
   assert.equal(points.length, 1);
   assert.equal(points[0]?.attributes["error.type"], "EffectProbeError");
+});
+
+/** A turn's persistence that keeps nothing: what the turn stores is not what this test looks at. */
+const forgetful: TurnPersistence = {
+  createPendingResponse: () => "pending-1",
+  updateActiveTurnPendingResponseId: () => undefined,
+  updatePendingSessionId: () => undefined,
+  updateActiveTurnSessionId: () => undefined,
+  appendBlockToPending: () => undefined,
+  markPendingResponseComplete: () => undefined,
+  markPendingAsPosted: () => undefined,
+  updateSessionUsage: () => undefined,
+  recordRestartEvent: () => undefined,
+};
+
+test("Claude Code's process does not join the turn's trace, and its hooks and replies still run on alasio's logger and tracer", async () => {
+  const handedOn: { atStart?: string | undefined; whileRead?: string | undefined } = {};
+  const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
+    handedOn.atStart = traceparentHere();
+    const hook: HookCallback | undefined = options.hooks?.PreToolUse?.[0]?.hooks[0];
+    return fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
+      yield initMessage("s-1");
+      for await (const message of prompt) {
+        handedOn.whileRead = traceparentHere();
+        // Claude Code runs bayma exec, which the hook sees first.
+        await hook?.({
+          hook_event_name: "PreToolUse",
+          session_id: "s-1",
+          transcript_path: "/home/op/.claude/projects/-work/s-1.jsonl",
+          cwd: "/work",
+          tool_name: "mcp__bayma__exec",
+          tool_input: { session_id: "b1", code: "await $`echo traced`" },
+          tool_use_id: "t1",
+        }, "t1", { signal: new AbortController().signal });
+        yield successResult({ result: "done", session_id: "s-1", user_message_uuids: [stamped(message).uuid] });
+        // Then reports, unasked, on work it left running: a reply of its own.
+        yield successResult({ result: "the background task finished", session_id: "s-1" });
+      }
+    })());
+  };
+  spans.reset();
+  logRecords.reset();
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const replied = yield* Deferred.make<void>();
+    // The live sessions are made in the turn, as the first turn of a folder makes its harness.
+    yield* Effect.gen(function*() {
+      const liveSessions = yield* makeClaudeLiveSessions({
+        workingDirectory: "/work",
+        sessions: { sessionExists: () => Effect.succeed(false) },
+        queryFactory,
+        folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
+      });
+      const result = yield* liveSessions.runTurn({
+        prompt: "hello",
+        resumeSession: null,
+        threadKey: "telegram:1",
+        chatId: "1",
+        messageId: "9",
+        workingDirectory: "/work",
+        persistence: forgetful,
+        onBackgroundResponse: Deferred.succeed(replied, undefined).pipe(Effect.asVoid, withAlasioSpan("test.background-reply")),
+      });
+      assert.equal(result.responseCompleted, true);
+    }).pipe(withAlasioSpan("alasio.turn"));
+    yield* Deferred.await(replied);
+  })).pipe(Effect.provide(ActiveTurns.layer), Effect.provide([AlasioLoggerLayer, TracingLayer])));
+
+  const turn = finishedSpan("alasio.turn");
+  assert.equal(handedOn.atStart, undefined, "the process is started with no trace to continue");
+  assert.equal(handedOn.whileRead, undefined, "the process is read with no trace to continue");
+  const hookLine = logRecords.getFinishedLogRecords().find((record) => String(record.body).startsWith("exec-hook seen thread=telegram:1"));
+  assert.ok(hookLine, "the hook's line is a log record of alasio's");
+  assert.equal(hookLine.instrumentationScope.name, "claude-live");
+  assert.notEqual(hookLine.spanContext?.traceId, turn.spanContext().traceId);
+  const reply = finishedSpan("test.background-reply");
+  assert.notEqual(reply.spanContext().traceId, turn.spanContext().traceId, "a reply of Claude Code's own is a trace of its own");
+  assert.equal(reply.parentSpanContext, undefined);
+  assert.equal(spans.getFinishedSpans().some((span) => span.name === "alasio.outside-traces"), false, "nothing records the span outside traces");
 });

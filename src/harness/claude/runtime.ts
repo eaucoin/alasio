@@ -1,8 +1,10 @@
 /**
- * Claude Code runtime adapter for alasio turns.
+ * How alasio starts Claude Code: the query it starts (the Agent SDK's, or a test's
+ * stand-in) and that query's options, what Claude Code fails with, and the id a new
+ * session is reserved under.
  *
  * Each mounted session is served by one long-lived Claude Code process fed
- * through streaming input (see live-sessions.ts), the way the Codex adapter
+ * through streaming input (see live-sessions.ts), the way the Codex harness
  * keeps app-server threads warm. A Telegram prompt is pushed into that
  * process and its turn ends on the result that names it; tool activity is
  * projected into the same persisted response blocks, and the SDK `result` is
@@ -81,7 +83,7 @@ export const startFreshClaudeSession = Effect.fnUntraced(function*({ threadKey }
  * search go through bayma, which alasio always mounts: its sessions persist,
  * and a Bun shell there does everything these did.
  */
-export const CLAUDE_DISALLOWED_TOOLS = Object.freeze(["Bash", "Monitor", "Grep", "Glob"]);
+const CLAUDE_DISALLOWED_TOOLS = Object.freeze(["Bash", "Monitor", "Grep", "Glob"]);
 
 /** The bayma tool that runs code (and so shell commands) in a session. */
 export const BAYMA_EXEC_TOOL = "mcp__bayma__exec";

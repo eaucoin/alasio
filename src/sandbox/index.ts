@@ -102,8 +102,8 @@ export interface SessionSandboxesOptions {
   readonly resolve?: (hostname: string) => Promise<LookupAddress>;
 }
 
-export const NET_MODE_LABEL = "alasio.dev/net-mode";
-export const WORKLOAD_LABEL = "alasio.dev/workload";
+const NET_MODE_LABEL = "alasio.dev/net-mode";
+const WORKLOAD_LABEL = "alasio.dev/workload";
 const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
 // The token's environment variable in bayma's container, which the OTLP headers expand.
 const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";

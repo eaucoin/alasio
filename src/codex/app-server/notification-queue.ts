@@ -17,7 +17,7 @@ interface RememberedTurn {
   readonly turnId: string | null;
 }
 
-export function getNotificationThreadId(message: AppServerNotification): string | null {
+function getNotificationThreadId(message: AppServerNotification): string | null {
   const params: NotificationIds = message?.params ?? {};
   const item = itemIds(params.item);
   return params.threadId

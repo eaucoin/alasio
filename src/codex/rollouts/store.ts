@@ -9,7 +9,7 @@
  */
 import type { Pool, PoolClient } from "pg";
 
-export const DEFAULT_SCHEMA = "codex_sessions";
+const DEFAULT_SCHEMA = "codex_sessions";
 /** Where the session-filesystem Codex home's rollouts are kept (codex/sessionfs.ts). */
 export const SESSION_FS_SCHEMA = "codex_sessionfs_sessions";
 

@@ -1,7 +1,7 @@
 import type { InlineKeyboardButton } from "@grammyjs/types";
 import { Effect } from "effect";
 
-import type { ConversationChat } from "../codex/turn-controller.ts";
+import type { ConversationChat } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import {
   CLAUDE_HARNESS,
@@ -129,7 +129,7 @@ function describeSwitch(result: HarnessSwitch, harness: HarnessName): string {
 }
 
 /** The service a /service argument or a button's payload names, or null when it names none. */
-export function resolveServiceTarget(target: unknown): HarnessName | null {
+function resolveServiceTarget(target: unknown): HarnessName | null {
   if (!target) {
     return null;
   }

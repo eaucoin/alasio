@@ -4,7 +4,7 @@
  */
 import { Effect } from "effect";
 
-import { type ConversationChat, Turns } from "../codex/turn-controller.ts";
+import { type ConversationChat, Turns } from "../codex/turns.ts";
 import { resolveHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import { buildFilePromptSuffix } from "../shared/file-prompt.ts";

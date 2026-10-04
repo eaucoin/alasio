@@ -15,7 +15,7 @@ import { Schema } from "effect";
 const VOLUME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
 
 /** A volume id, as what comes from outside alasio is decoded. */
-export const VolumeId = Schema.String.check(Schema.isPattern(VOLUME_ID_PATTERN));
+const VolumeId = Schema.String.check(Schema.isPattern(VOLUME_ID_PATTERN));
 
 /**
  * A session's token, `<volumeId>.<random>` (../kube/sandboxes.ts newToken), decoded into

@@ -12,7 +12,7 @@ import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
 import { finalResponseToMarkdown } from "../src/codex/response-markdown.ts";
 import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
-import { Turns } from "../src/codex/turn-controller.ts";
+import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { SqliteStore, Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";

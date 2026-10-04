@@ -2,7 +2,7 @@ import { harnessDisplayName, type HarnessName } from "../harness/names.ts";
 import type { RestartCause } from "../persistence/restart-repository.ts";
 
 /** How the post-restart prompts name what alasio runs as and how it is restarted. */
-export interface RestartPaths {
+interface RestartPaths {
   readonly unit: string;
   readonly restartFact: string;
   readonly restartPath: string;
@@ -14,7 +14,7 @@ export interface RestartPaths {
  * prompts use: its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE, which the chart
  * sets) and a rollout restart of it.
  */
-export function resolveRestartPaths(env: NodeJS.ProcessEnv = process.env): RestartPaths {
+function resolveRestartPaths(env: NodeJS.ProcessEnv = process.env): RestartPaths {
   const deployment = env["ALASIO_DEPLOYMENT"]?.trim() || "alasio";
   const namespace = env["ALASIO_NAMESPACE"]?.trim() || "alasio";
   return {

@@ -2,7 +2,7 @@ import type { InlineKeyboardButton } from "@grammyjs/types";
 import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
-import { type TurnError, Turns } from "../codex/turn-controller.ts";
+import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import type { HarnessError, HarnessGoals } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -23,7 +23,7 @@ export interface GoalTurnRequest {
 }
 
 /** How changing a goal fails, as its panel says. */
-export type GoalError = HarnessError | NewSessionError | TurnError | TelegramError;
+type GoalError = HarnessError | NewSessionError | TurnError | TelegramError;
 
 /** What the goal controls run on: the store, Telegram, and the turns, running and to run. */
 export type GoalServices = Store | TelegramClient | ActiveTurns | Turns;
@@ -279,7 +279,7 @@ export function buildReplaceGoalPanel({ store, conversationId, currentGoal, obje
   };
 }
 
-export function buildClearGoalConfirmationPanel({ store, conversationId, goal }: GoalPanelTarget & { readonly goal: v2.ThreadGoal }): ControlPanel {
+function buildClearGoalConfirmationPanel({ store, conversationId, goal }: GoalPanelTarget & { readonly goal: v2.ThreadGoal }): ControlPanel {
   return {
     text: [
       "Clear goal?",
@@ -383,7 +383,7 @@ function buildPanelForKnownGoal({ store, conversationId, sessionId, goal, turnSt
   return buildGoalPanel({ store, conversationId, goal, turnState });
 }
 
-export interface SendGoalPanelRequest {
+interface SendGoalPanelRequest {
   readonly conversationId: string;
   readonly chatId: ChatId;
   readonly isTurnActive?: boolean | undefined;
@@ -392,7 +392,7 @@ export interface SendGoalPanelRequest {
 }
 
 /** Sends the conversation's goal panel, or, when the goal cannot be read, why. */
-export const sendGoalPanel = Effect.fnUntraced(function*({ conversationId, chatId, isTurnActive = false, goals }: SendGoalPanelRequest): Effect.fn.Return<
+const sendGoalPanel = Effect.fnUntraced(function*({ conversationId, chatId, isTurnActive = false, goals }: SendGoalPanelRequest): Effect.fn.Return<
   void,
   TelegramError,
   Store | TelegramClient

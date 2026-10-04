@@ -24,7 +24,7 @@ export interface WorkflowWait {
 }
 
 /** Where the active turns are read from: alasio's store. */
-export interface ActiveTurnSource {
+interface ActiveTurnSource {
   getActiveTurns(): readonly Pick<Turn, "session_id" | "thread_key">[];
 }
 

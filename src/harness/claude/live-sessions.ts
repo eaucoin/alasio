@@ -43,7 +43,7 @@ import {
   type SDKResultMessage,
   type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
-import { Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, Scope, Stream } from "effect";
+import { Clock, Deferred, Effect, Exit, Fiber, FiberSet, Scope, Stream } from "effect";
 
 import {
   buildDbGuardrailFallbackText,
@@ -59,8 +59,7 @@ import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
 import { looksLikeSelfRestartCommand } from "../../policy/restart-command.ts";
 import { detectWorkflowWait } from "../../policy/workflow-wait.ts";
-import { effectRunnerHere } from "../../shared/effects.ts";
-import { createLogger, withLogScope } from "../../shared/log.ts";
+import { withLogScope } from "../../shared/log.ts";
 import type { SessionError } from "../../sandbox/index.ts";
 import { outsideTraces } from "../../telemetry/index.ts";
 import { ActiveTurns, type RunningTurn, type StopReason, stopReasonText } from "../active-turns.ts";
@@ -83,8 +82,6 @@ import type { ClaudeSessionApi } from "./sessions.ts";
 import { claudeTelemetryEnv } from "./telemetry.ts";
 
 const LOG_SCOPE = "claude-live";
-/** The scope's lines, for the helpers that log through a logger of their own (the turn timer, the command policy). */
-const log = createLogger(LOG_SCOPE);
 
 /** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
 const UNANSWERED_PROMPT_GRACE = "15 seconds";
@@ -194,7 +191,7 @@ function describeTasks(tasks: readonly BackgroundTask[]): string {
 /** A folder conversation's bayma where none is given: a deployment's without folder workspaces. */
 const defaultFolderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) => noFolderBayma({ harness: CLAUDE_HARNESS, threadKey });
 
-/** A promise of what starting Claude Code needs, failing as starting it fails. */
+/** A promise of the Agent SDK's, failing as Claude Code failed it. */
 const attempt = <A>(evaluate: () => Promise<A>): Effect.Effect<A, ClaudeCodeError> =>
   Effect.tryPromise({ try: evaluate, catch: (cause) => new ClaudeCodeError({ cause }) });
 
@@ -231,9 +228,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
   const activeTurns = yield* ActiveTurns;
-  // Runs Claude Code's hooks, which the Agent SDK calls as promises, and each process's
-  // consumer, which starts outside the trace of the turn that starts the process.
-  const run = yield* effectRunnerHere(Context.empty());
+  // Runs Claude Code's hooks, which the Agent SDK calls and awaits as promises, with what
+  // the live sessions run with (alasio's logger and tracer among it).
+  const runHook = Effect.runPromiseWith(yield* Effect.context<never>());
   const hosts = new Map<string, ClaudeHost>();
   const consumers = yield* FiberSet.make<void>();
   // At shutdown the processes, whose scopes are forked from this one, are closed first;
@@ -284,7 +281,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         content: buildDbGuardrailFallbackText(current.blockedGuardrailCommand),
       });
     }
-    current.turnTimer("query.finished", { guardrail_blocked: Boolean(current.blockedGuardrailCommand) });
+    yield* current.turnTimer("query.finished", { guardrail_blocked: Boolean(current.blockedGuardrailCommand) });
     yield* Effect.logInfo(`turn.done completed=${current.responseCompleted} interrupted=${current.interrupted}`);
     yield* Deferred.succeed(current.done, {
       blockSequence: current.blockSequence,
@@ -309,7 +306,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         const deliberate = host.closed && host.closeReason !== "process exited";
         if (!deliberate) {
           const message = error ? getErrorMessage(error) : "Claude Code exited before answering";
-          current.turnTimer("query.error", { error: message });
+          yield* current.turnTimer("query.error", { error: message });
           yield* Effect.logError(`Claude Code ended during a turn thread=${host.threadKey}: ${message}`);
           appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message));
         }
@@ -401,7 +398,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       const projected = projectResultMessage(message);
       host.sessionId = message.session_id ?? host.sessionId;
       if (projected?.ok) {
-        current.turnTimer("turn.completed");
+        yield* current.turnTimer("turn.completed");
         if (projected.text?.trim()) {
           appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
             type: "text",
@@ -413,7 +410,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         current.responseCompleted = true;
         current.onTransportCompleted?.({ sessionId: host.sessionId, turnId: null });
       } else {
-        current.turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
+        yield* current.turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
         appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(projected?.error ?? "Claude did not complete"));
       }
       const cacheRead = cacheReadTokensFromUsage(projected?.usage);
@@ -482,7 +479,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const current = host.current;
     if (current && !current.firstEventLogged) {
       current.firstEventLogged = true;
-      current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
+      yield* current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
     }
     current?.onStarted?.();
     if (message.type === "system" && message.subtype === "init") {
@@ -511,7 +508,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       for (const item of projectAssistantMessageToItems(message)) {
         if (current && !current.firstVisibleItemLogged && isVisibleCodexItem(item)) {
           current.firstVisibleItemLogged = true;
-          current.turnTimer("first_visible_item", { item_type: item.type });
+          yield* current.turnTimer("first_visible_item", { item_type: item.type });
         }
         mapItemToBlocks(item, {
           blockSequence: target.blockSequence,
@@ -526,7 +523,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       return;
     }
     if (message.type === "auth_status" && message.error && current) {
-      current.turnTimer("event.error", { error: message.error });
+      yield* current.turnTimer("event.error", { error: message.error });
       appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message.error));
     }
   });
@@ -583,14 +580,12 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       threadKey: host.threadKey,
       chatId: host.chatId,
       messageId: host.messageId,
-      controller: { abort: () => undefined },
-      log,
     });
     // One call records at most one restart event, so inspect the most telling command.
     const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
       ?? commands.find((candidate) => detectWorkflowWait(candidate))
       ?? firstCommand;
-    policy.inspectCommand({ command: primary, sessionId: host.sessionId });
+    yield* policy.inspectCommand({ command: primary, sessionId: host.sessionId });
     return {};
   });
 
@@ -602,11 +597,12 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const mcpServers = bayma
       ? undefined
       : claudeMcpServers(yield* needed(folderBayma({ threadKey })));
-    const resumeExists = resumeSession ? yield* attempt(() => sessions.sessionExists(resumeSession)) : false;
+    const resumeExists = resumeSession ? yield* sessions.sessionExists(resumeSession) : false;
     const controller = new AbortController();
     const channel = instrumentPromptChannel(yield* makePromptChannel, threadKey);
-    // Claude Code calls it only once the process runs, by when `host` is made.
-    const hook: HookCallback = (input) => run.runPromise(execHook(host, input));
+    // Claude Code calls it only once the process runs, by when `host` is made; it runs
+    // outside every trace, as the process does.
+    const hook: HookCallback = (input) => runHook(execHook(host, input).pipe(outsideTraces));
     const options = buildClaudeQueryOptions({
       workingDirectory,
       modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
@@ -624,9 +620,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     // The process outlives the turn that starts it, so it starts outside that turn's
     // trace: Claude Code's traces are its own, found from a turn by its session id.
     const sdkQuery = yield* Effect.try({
-      try: () => outsideTraces(() => queryFactory({ prompt: channel.prompts, options })),
+      try: () => queryFactory({ prompt: channel.prompts, options }),
       catch: (cause) => new ClaudeCodeError({ cause }),
-    });
+    }).pipe(outsideTraces);
     const host: ClaudeHost = {
       threadKey,
       key,
@@ -654,7 +650,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     };
     yield* Scope.addFinalizer(host.scope, closeProcess(host, "shutdown"));
     // Read outside the turn's trace too, for as long as the process runs.
-    yield* FiberSet.add(consumers, outsideTraces(() => run.runFork(consume(host))));
+    yield* FiberSet.run(consumers, consume(host).pipe(outsideTraces));
     yield* Effect.logInfo(`started thread=${threadKey} session=${String(host.sessionId).slice(0, 8)} mode=${host.mode}`);
     return host;
   });
@@ -684,9 +680,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
 
   const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult> {
     const { prompt, threadKey, chatId, messageId, persistence, onStarted } = params;
-    const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt, log });
+    const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt });
     yield* Effect.logInfo(`Querying Claude Code (resume=${params.resumeSession})`);
-    turnTimer("query.start");
+    yield* turnTimer("query.start");
     onStarted?.();
     const pendingResponseId = persistence.createPendingResponse(chatId, messageId, params.resumeSession);
     persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
@@ -705,7 +701,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       for (const uuid of current.promptUuids) {
         live.interruptedUuids.add(uuid);
       }
-      current.turnTimer("query.interrupted", { reason: text });
+      yield* current.turnTimer("query.interrupted", { reason: text });
       yield* Effect.logInfo(`Claude Code turn interrupted by operator control: ${text}`);
       yield* interrupt(live, text);
       if (live.current === current) {
@@ -746,8 +742,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         threadKey,
         chatId,
         messageId,
-        controller: { abort: () => undefined },
-        log,
       }),
       done,
       registration: yield* Scope.make(),
@@ -756,15 +750,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     // once; the registration ends with the turn, or with this fiber if it is interrupted.
     yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }).pipe(Scope.provide(current.registration));
     return yield* Effect.gen(function*() {
-      turnTimer("env.built");
+      yield* turnTimer("env.built");
       const started = yield* hostFor(params).pipe(
-        Effect.catchTag("ClaudeCodeError", (error) => {
-          turnTimer("query.error", { error: error.message });
-          return Effect.logError(`Error starting Claude Code: ${error.message}`).pipe(
-            Effect.andThen(Effect.sync(() => appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(error.message)))),
-            Effect.as(null),
-          );
-        }),
+        Effect.catchTag("ClaudeCodeError", Effect.fnUntraced(function*(error) {
+          yield* turnTimer("query.error", { error: error.message });
+          yield* Effect.logError(`Error starting Claude Code: ${error.message}`);
+          appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(error.message));
+          return null;
+        })),
       );
       if (started === null) {
         const failed: TurnResult = { blockSequence: current.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
@@ -772,7 +765,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         yield* Deferred.succeed(done, failed);
         return failed;
       }
-      turnTimer("query.created", { mode: started.mode });
+      yield* turnTimer("query.created", { mode: started.mode });
       host = started;
       started.persistence = persistence;
       started.chatId = chatId;

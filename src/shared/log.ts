@@ -1,3 +1,9 @@
+/**
+ * alasio's logging. Effects log with Effect's own `Effect.log*`, in the scope
+ * `withLogScope` puts them in, and AlasioLoggerLayer writes their lines; code that is not
+ * Effect (the synchronous store) logs through a logger `createLogger` makes. Either way a
+ * line is `[scope] message` on the console and a log record of that scope.
+ */
 import { type AnyValue, logs, SeverityNumber, type LogAttributes, type LogRecord } from "@opentelemetry/api-logs";
 import { Array as Arr, Cause, Effect, Logger as EffectLogger, type LogLevel as EffectLogLevel, References } from "effect";
 

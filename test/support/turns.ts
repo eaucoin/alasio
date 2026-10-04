@@ -7,7 +7,7 @@
 import { Effect, Layer, ManagedRuntime } from "effect";
 
 import { CodexAppServer } from "../../src/codex/app-server/client.ts";
-import { Turns } from "../../src/codex/turn-controller.ts";
+import { Turns } from "../../src/codex/turns.ts";
 import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
@@ -24,7 +24,7 @@ import { WorkflowHooks } from "../../src/workflow/hook-server.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
-export const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({ enqueueText: () => Effect.succeed("outbox-1"), deliverDue: Effect.void }));
+const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({ enqueueText: () => Effect.succeed("outbox-1"), deliverDue: Effect.void }));
 
 /** No workflow hook server: no workflow waits are reported. */
 export const noWorkflowHooks: Layer.Layer<WorkflowHooks> = Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map() }));
@@ -68,7 +68,7 @@ export interface TestServicesOptions {
 }
 
 /** alasio's services over `options`, as src/alasio.ts makes them but for what the test stands in. */
-export function testServices({
+function testServices({
   store,
   telegram = recordingTelegram().layer,
   harnesses = {},

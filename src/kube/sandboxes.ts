@@ -173,13 +173,13 @@ export interface SandboxesOptions {
 /** The container in every Sandbox's pod that runs bayma. */
 export const BAYMA_CONTAINER = "bayma";
 /** Where a Sandbox's token Secret is mounted in its bayma container. */
-export const TOKEN_DIR = "/run/alasio/bayma";
+const TOKEN_DIR = "/run/alasio/bayma";
 const TOKEN_KEY = "token";
 const TOKEN_VOLUME = "alasio-bayma-token";
 
 /** The label every object alasio makes carries, and the one that names its Sandbox. */
-export const MANAGED_BY = { "app.kubernetes.io/managed-by": "alasio" };
-export const SANDBOX_LABEL = "alasio.dev/sandbox";
+const MANAGED_BY = { "app.kubernetes.io/managed-by": "alasio" };
+const SANDBOX_LABEL = "alasio.dev/sandbox";
 
 // A first start pulls the image and provisions the volume, so it is given minutes.
 const READY_TIMEOUT: Duration.Input = "5 minutes";

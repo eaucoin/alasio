@@ -80,8 +80,9 @@ export theirs to the same place; with no endpoint set, nothing is exported.
 ## Development
 
 alasio is TypeScript that Node 24 runs as it is, checked by `npm run typecheck`
-against `tsconfig.json`. See `package.json` for the development scripts, `.env.example` for running
-alasio outside the cluster against one, `Dockerfile`, `sandbox/`, and
-`neon/lake/` for the images, `charts/alasio/` for the chart and its tests,
-`test/e2e/run.sh` for the end-to-end run, and `.github/workflows/` for the
-GitHub Actions workflows.
+against `tsconfig.json`. Its control plane is written in Effect: its services are
+layers, composed in `src/alasio.ts`. See `package.json` for the development
+scripts, `.env.example` for running alasio outside the cluster against one,
+`Dockerfile`, `sandbox/`, and `neon/lake/` for the images, `charts/alasio/` for
+the chart and its tests, `test/e2e/run.sh` for the end-to-end run, and
+`.github/workflows/` for the GitHub Actions workflows.

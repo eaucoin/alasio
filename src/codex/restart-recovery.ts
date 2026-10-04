@@ -36,18 +36,17 @@ export const recoverInterruptedTurns = (store: RestartRecoveryStore): Effect.Eff
  * Records that the conversation's running turn was cut short by a restart alasio cannot
  * attribute, unless what restarted it is already recorded (the agent's own command).
  */
-export const recordExternalRestartEvent = (store: RestartRecoveryStore, conversationId: string): Effect.Effect<void> =>
-  Effect.gen(function*() {
-    const turn = store.getActiveTurns().find((active) => active.thread_key === conversationId);
-    if (!turn || store.getRestartEvent(conversationId)) {
-      return;
-    }
-    store.recordRestartEvent({
-      cause: "external_or_unknown",
-      thread_key: conversationId,
-      channel: turn.channel,
-      thread_ts: turn.thread_ts,
-      session_id: turn.session_id ?? null,
-      timestamp: (yield* Clock.currentTimeMillis) / 1000,
-    });
+export const recordExternalRestartEvent = Effect.fnUntraced(function*(store: RestartRecoveryStore, conversationId: string): Effect.fn.Return<void> {
+  const turn = store.getActiveTurns().find((active) => active.thread_key === conversationId);
+  if (!turn || store.getRestartEvent(conversationId)) {
+    return;
+  }
+  store.recordRestartEvent({
+    cause: "external_or_unknown",
+    thread_key: conversationId,
+    channel: turn.channel,
+    thread_ts: turn.thread_ts,
+    session_id: turn.session_id ?? null,
+    timestamp: (yield* Clock.currentTimeMillis) / 1000,
   });
+});

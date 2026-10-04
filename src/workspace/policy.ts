@@ -32,7 +32,7 @@ function isInside(root: string, candidate: string): boolean {
 /**
  * Canonicalize a workspace root once so every later check compares realpaths.
  */
-export async function resolveWorkspaceRoot(root: string): Promise<string> {
+async function resolveWorkspaceRoot(root: string): Promise<string> {
   const canonical = await realpath(root);
   const info = await stat(canonical);
   if (!info.isDirectory()) {

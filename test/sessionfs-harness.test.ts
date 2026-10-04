@@ -213,10 +213,11 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
   };
   const sessionApi = {
     ...createClaudeSessionApi({ workingDirectory: DIRECTORY }),
-    sessionExists: async (id: string) => {
-      seen.resumeAsked = id;
-      return true;
-    },
+    sessionExists: (id: string) =>
+      Effect.sync(() => {
+        seen.resumeAsked = id;
+        return true;
+      }),
   };
   // The harness lasts as long as the scope it is made in, as alasio's last as long as alasio.
   const scope = Effect.runSync(Scope.make());

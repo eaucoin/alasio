@@ -21,10 +21,10 @@ export const lakeEnabled: Config.Config<boolean> = Config.String("ALASIO_LAKE_EN
 
 /** The role the lake connects as, and the database its catalog is kept in. */
 export const LAKE_ROLE = "lake";
-export const LAKE_DATABASE = "lake";
+const LAKE_DATABASE = "lake";
 
 /** What the lake reads: the schemas and tables it loads from, as alasio's stores make them. */
-export const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
+const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
   claude_sessions: ["entries"],
   codex_sessions: ["rollouts", "rollout_chunks"],
   codex_sessionfs_sessions: ["rollouts", "rollout_chunks"],

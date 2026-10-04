@@ -15,9 +15,9 @@
 import { MEDIA_LINE } from "./rich-media.ts";
 
 /** Rich messages hold 32768 characters; this leaves room for the escapes. */
-export const RICH_MESSAGE_MAX_CHARS = 30_000;
+const RICH_MESSAGE_MAX_CHARS = 30_000;
 /** Rich messages hold 500 blocks (rows, list items, paragraphs, ...); this bounds a part's lines. */
-export const RICH_MESSAGE_MAX_LINES = 450;
+const RICH_MESSAGE_MAX_LINES = 450;
 
 /** How large each part `splitRichMarkdown` makes may be. */
 export interface RichMarkdownLimits {

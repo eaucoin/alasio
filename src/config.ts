@@ -20,7 +20,7 @@ export interface AlasioConfig {
 /** How alasio talks to Codex: through `codex exec` or a Codex app-server. */
 export type CodexTransportMode = "exec" | "app-server";
 
-export function requireEnv(key: string): string {
+function requireEnv(key: string): string {
   const value = process.env[key];
   if (!value) {
     throw new Error(`Missing required environment variable: ${key}`);
@@ -33,7 +33,7 @@ export function requireEnv(key: string): string {
  * directory for existing deployments, otherwise under the operator's home so a
  * second bot never shares a database with the first.
  */
-export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
   if (env["ALASIO_STATE_DIR"]?.trim()) {
     return env["ALASIO_STATE_DIR"].trim();
   }
@@ -68,11 +68,3 @@ export function getCodexBinaryOverride(): string | null {
   return process.env["ALASIO_CODEX_BIN"] || null;
 }
 
-export function readPositiveIntEnv(key: string, fallback: number, env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[key];
-  if (!raw?.trim()) {
-    return fallback;
-  }
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}

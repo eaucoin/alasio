@@ -55,7 +55,7 @@ type ExecSocket = Awaited<ReturnType<Exec["exec"]>>;
 const DEFAULT_EXEC_MAX_BYTES = 16 * 1024 * 1024;
 
 /** The kubeconfig alasio runs with: its ServiceAccount in a pod, the default elsewhere. */
-export function loadKubeConfig(): KubeConfig {
+function loadKubeConfig(): KubeConfig {
   const kubeConfig = new KubeConfig();
   kubeConfig.loadFromDefault();
   return kubeConfig;
@@ -99,7 +99,7 @@ export class KubeClient extends Context.Service<KubeClient, {
 }
 
 /** The client over `kubeConfig`. */
-export function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
+function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
   const objects = KubernetesObjectApi.makeApiClient(kubeConfig);
   const executor = new Exec(kubeConfig);
 

@@ -41,7 +41,7 @@ export function workingStatusHtml({ harnessName, startedAtMs, workflowWait = nul
 }
 
 /** What a turn's status message says when alasio stops during the turn, which it continues after the restart. */
-export function restartingStatusText(harnessName: string): string {
+function restartingStatusText(harnessName: string): string {
   return `alasio is restarting; ${harnessName} continues this turn after the restart.`;
 }
 

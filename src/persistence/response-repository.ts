@@ -3,6 +3,9 @@ import { newId } from "../shared/ids.ts";
 import { createLogger } from "../shared/log.ts";
 import type { SqliteConversationRepository } from "./conversation-repository.ts";
 
+// The store is synchronous code (better-sqlite3), not Effect, which effects call as
+// plain functions; so it logs through a logger of its own, whose lines read as
+// effects' do.
 const log = createLogger("sqlite-response-repository");
 
 /**

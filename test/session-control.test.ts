@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import type { Turns } from "../src/codex/turn-controller.ts";
+import type { Turns } from "../src/codex/turns.ts";
 import type { HarnessSessions } from "../src/harness/index.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
 import { type SessionControlHarness, handleSessionControlCallback } from "../src/operator/session-control.ts";

@@ -3,34 +3,17 @@ import { Effect, type Scope } from "effect";
 import { SessionFilesystemsDisabled } from "../../sandbox/index.ts";
 import { parseWorkspace } from "../../workspace/kind.ts";
 import type { ActiveTurns } from "../active-turns.ts";
-import type { Harness, HarnessOptions, HarnessSessions } from "../index.ts";
+import type { Harness, HarnessOptions } from "../index.ts";
 import { CLAUDE_HARNESS, harnessDisplayName } from "../names.ts";
 import { makeClaudeLiveSessions } from "./live-sessions.ts";
 import { getClaudeEffort, getClaudeModel } from "./model.ts";
 import { listClaudeModels } from "./models.ts";
-import { ClaudeCodeError, startFreshClaudeSession } from "./runtime.ts";
+import { startFreshClaudeSession } from "./runtime.ts";
 import { createClaudeSessionApi, type ClaudeSessionApi } from "./sessions.ts";
 
 /** What makeClaudeHarness is given: a harness's options, and a stand-in session api for tests. */
 export interface ClaudeHarnessOptions extends HarnessOptions {
   readonly sessionApi?: ClaudeSessionApi | null;
-}
-
-/** A promise of the session api, failing as the api says. */
-const asked = <A>(ask: () => Promise<A>): Effect.Effect<A, ClaudeCodeError> =>
-  Effect.tryPromise({ try: ask, catch: (cause) => new ClaudeCodeError({ cause }) });
-
-/** Claude Code's session api, which the Agent SDK's helpers make promises, as a harness's sessions. */
-function claudeSessions(api: ClaudeSessionApi): HarnessSessions {
-  return {
-    listSessions: (page) => asked(() => api.listSessions(page)),
-    getTotalSessionPages: () => asked(() => api.getTotalSessionPages()),
-    getSessionByNumber: (num) => asked(() => api.getSessionByNumber(num)),
-    getSessionLastMessage: (sessionId) => asked(() => api.getSessionLastMessage(sessionId)),
-    listSessionMessages: (sessionId) => asked(() => api.listSessionMessages(sessionId)),
-    getTotalRewindPages: (sessionId) => asked(() => api.getTotalRewindPages(sessionId)),
-    createForkedSession: (sessionId, beforeUuid) => asked(() => api.createForkedSession(sessionId, beforeUuid)),
-  };
 }
 
 /**
@@ -73,7 +56,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     displayName: harnessDisplayName(CLAUDE_HARNESS),
     supportsGoals: false,
     supportsWarmup: false,
-    sessions: claudeSessions(sessions),
+    sessions,
     startFreshSession: ({ threadKey }) => startFreshClaudeSession({ threadKey }),
     warmSession: () => Effect.succeed(false),
     /**

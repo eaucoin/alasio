@@ -8,7 +8,7 @@ import type { v2 } from "../.types/codex/index.js";
 import { Effect } from "effect";
 
 import { NoActiveTurn } from "../src/codex/app-server/thread-client.ts";
-import { Turns } from "../src/codex/turn-controller.ts";
+import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { GoalUpdate, HarnessGoals } from "../src/harness/index.ts";
 import {

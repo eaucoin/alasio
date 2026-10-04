@@ -1,7 +1,7 @@
 import type { InlineKeyboardButton } from "@grammyjs/types";
 import { Effect } from "effect";
 
-import type { ConversationChat } from "../codex/turn-controller.ts";
+import type { ConversationChat } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
@@ -25,7 +25,7 @@ export type WorkspaceControlServices = Store | TelegramClient | ActiveTurns | Mo
 
 const WORKSPACE_KIND_PREFIX = "workspace:";
 
-export const CHOOSE_WORKSPACE_NOTICE = "No folder is mounted. Choose a folder to work in, or create one; your message was not queued.";
+const CHOOSE_WORKSPACE_NOTICE = "No folder is mounted. Choose a folder to work in, or create one; your message was not queued.";
 
 function workspaceKind(kind: string): string {
   return `${WORKSPACE_KIND_PREFIX}${kind}`;
@@ -173,12 +173,12 @@ const applyWorkspaceChange = <R>(change: Effect.Effect<WorkspaceChange, Workspac
   Effect.match(change, { onFailure: (error) => error.message, onSuccess: describeOutcome });
 
 /** What /workspace was asked to do: show the panel, mount a folder, or create one. */
-export type WorkspaceArgs =
+type WorkspaceArgs =
   | { readonly action: "panel" }
   | { readonly action: "create"; readonly name: string }
   | { readonly action: "use"; readonly target: string };
 
-export function parseWorkspaceArgs(args: string | null | undefined): WorkspaceArgs {
+function parseWorkspaceArgs(args: string | null | undefined): WorkspaceArgs {
   const trimmed = String(args ?? "").trim();
   if (!trimmed) {
     return { action: "panel" };

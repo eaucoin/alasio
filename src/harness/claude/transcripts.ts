@@ -16,11 +16,30 @@ import { importSessionToStore, type SessionKey, type SessionStoreEntry } from "@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { Effect, Schema } from "effect";
 
-import { createLogger } from "../../shared/log.ts";
+import { withLogScope } from "../../shared/log.ts";
 import type { NeonSessionStore } from "./session-store.ts";
 
-const log = createLogger("claude-transcripts");
+const LOG_SCOPE = "claude-transcripts";
+
+/** A transcript could not be written back from the store. */
+export class TranscriptRestoreError extends Schema.TaggedError<TranscriptRestoreError>()("TranscriptRestoreError", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
+}
+
+/** Claude Code's transcripts could not be brought into the store. */
+export class TranscriptAdoptionError extends Schema.TaggedError<TranscriptAdoptionError>()("TranscriptAdoptionError", {
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return this.cause instanceof Error ? this.cause.message : String(this.cause);
+  }
+}
 
 /** A Claude session alasio points at, and the directory it runs in. */
 export interface AdoptedSession {
@@ -44,7 +63,7 @@ interface LocalTranscript {
  * Claude Code's home, as the SDK resolves it: from this process's
  * environment, which the SDK's own session helpers read too.
  */
-export function claudeHome(): string {
+function claudeHome(): string {
   return process.env["CLAUDE_CONFIG_DIR"]?.trim() || join(process.env["HOME"] || homedir(), ".claude");
 }
 
@@ -62,22 +81,8 @@ function writeAtomically(path: string, content: string): void {
 
 const jsonl = (entries: readonly SessionStoreEntry[]): string => entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 
-/**
- * Writes a session's transcript back from the store if its local copy is
- * missing, as the SDK itself lays out a transcript it restores: the main
- * JSONL, each subagent's JSONL, and a subagent's metadata beside it.
- * Returns whether the transcript is present locally afterwards.
- */
-export async function ensureLocalTranscript(
-  store: Pick<NeonSessionStore, "projectKeyOf" | "listSubkeys" | "load">,
-  sessionId: string,
-): Promise<boolean> {
-  const projectKey = await store.projectKeyOf(sessionId);
-  if (!projectKey) return false;
-  const home = claudeHome();
-  const main = transcriptPath(home, projectKey, sessionId);
-  if (existsSync(main)) return true;
-
+/** A session's subagent transcripts and then its main one, as the store holds them, written here. */
+async function writeBack(store: Pick<NeonSessionStore, "listSubkeys" | "load">, home: string, projectKey: string, sessionId: string): Promise<void> {
   const key = { projectKey, sessionId };
   for (const subpath of await store.listSubkeys(key)) {
     const entries = (await store.load({ ...key, subpath })) ?? [];
@@ -92,10 +97,31 @@ export async function ensureLocalTranscript(
     }
   }
   // The main transcript last: its presence is what marks the copy complete.
-  writeAtomically(main, jsonl((await store.load(key)) ?? []));
-  log.info(`wrote transcript ${sessionId} back from the store`);
-  return true;
+  writeAtomically(transcriptPath(home, projectKey, sessionId), jsonl((await store.load(key)) ?? []));
 }
+
+/** What the store answers, or the work of writing a transcript back, failing as it failed. */
+const restoring = <A>(work: () => Promise<A>): Effect.Effect<A, TranscriptRestoreError> =>
+  Effect.tryPromise({ try: work, catch: (cause) => new TranscriptRestoreError({ cause }) });
+
+/**
+ * Writes a session's transcript back from the store if its local copy is
+ * missing, as the SDK itself lays out a transcript it restores: the main
+ * JSONL, each subagent's JSONL, and a subagent's metadata beside it.
+ * Succeeds with whether the transcript is present locally afterwards.
+ */
+export const ensureLocalTranscript = Effect.fnUntraced(function*(
+  store: Pick<NeonSessionStore, "projectKeyOf" | "listSubkeys" | "load">,
+  sessionId: string,
+): Effect.fn.Return<boolean, TranscriptRestoreError> {
+  const projectKey = yield* restoring(() => store.projectKeyOf(sessionId));
+  if (!projectKey) return false;
+  const home = claudeHome();
+  if (existsSync(transcriptPath(home, projectKey, sessionId))) return true;
+  yield* restoring(() => writeBack(store, home, projectKey, sessionId));
+  yield* Effect.logInfo(`wrote transcript ${sessionId} back from the store`);
+  return true;
+}, withLogScope(LOG_SCOPE));
 
 /** A local transcript's entries, each line as Claude Code wrote it. */
 function readJsonl(path: string): SessionStoreEntry[] {
@@ -170,25 +196,30 @@ async function reconcile(store: NeonSessionStore, home: string, projectKey: stri
   return added;
 }
 
+/** What adopting a transcript asks of the store, failing as it failed. */
+const adopting = <A>(work: () => Promise<A>): Effect.Effect<A, TranscriptAdoptionError> =>
+  Effect.tryPromise({ try: work, catch: (cause) => new TranscriptAdoptionError({ cause }) });
+
 /**
  * Brings every session alasio points at into the store: `sessions` is
- * `[{ sessionId, workingDirectory }]`. Idempotent; run before serving.
+ * `[{ sessionId, workingDirectory }]`. Idempotent; run before serving. A session
+ * that cannot be adopted is logged and left; failing to look for sessions here fails.
  */
-export async function adoptTranscripts({ store, sessions }: AdoptTranscriptsOptions): Promise<void> {
+export const adoptTranscripts = Effect.fnUntraced(function*({ store, sessions }: AdoptTranscriptsOptions): Effect.fn.Return<void, TranscriptAdoptionError> {
   const home = claudeHome();
   for (const { sessionId, workingDirectory } of sessions) {
-    const projectKey = findProject(home, sessionId);
+    const projectKey = yield* Effect.try({ try: () => findProject(home, sessionId), catch: (cause) => new TranscriptAdoptionError({ cause }) });
     if (!projectKey) continue;
-    try {
-      if (!(await store.projectKeyOf(sessionId))) {
-        await importSessionToStore(sessionId, store, { dir: workingDirectory, includeSubagents: true });
-        log.info(`adopted transcript ${sessionId} into the store`);
-        continue;
+    yield* Effect.gen(function*() {
+      if (!(yield* adopting(() => store.projectKeyOf(sessionId)))) {
+        yield* adopting(() => importSessionToStore(sessionId, store, { dir: workingDirectory, includeSubagents: true }));
+        yield* Effect.logInfo(`adopted transcript ${sessionId} into the store`);
+        return;
       }
-      const added = await reconcile(store, home, projectKey, sessionId);
-      if (added > 0) log.info(`reconciled transcript ${sessionId}: ${added} missing entries added`);
-    } catch (error) {
-      log.error(`could not adopt transcript ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
-    }
+      const added = yield* adopting(() => reconcile(store, home, projectKey, sessionId));
+      if (added > 0) yield* Effect.logInfo(`reconciled transcript ${sessionId}: ${added} missing entries added`);
+    }).pipe(
+      Effect.catch((error) => Effect.logError(`could not adopt transcript ${sessionId}: ${error.message}`)),
+    );
   }
-}
+}, withLogScope(LOG_SCOPE));

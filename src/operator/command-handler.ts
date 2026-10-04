@@ -4,7 +4,7 @@
  */
 import { Effect, Option } from "effect";
 
-import { type TurnError, Turns } from "../codex/turn-controller.ts";
+import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { type HarnessError, Harnesses, type HarnessUnavailable, resolveHarnessName } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
@@ -35,7 +35,7 @@ export interface CommandText {
 }
 
 /** A parsed command, and the conversation and message it came in. */
-export interface CommandRequest {
+interface CommandRequest {
   readonly cmd: OperatorCommand;
   readonly conversationId: string;
   readonly chatId: ChatId;
@@ -47,7 +47,7 @@ function shortSessionId(sessionId: string): string {
 }
 
 /** Handles a parsed command: whether it was one alasio knows. */
-export const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId, messageId }: CommandRequest): Effect.fn.Return<
+const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId, messageId }: CommandRequest): Effect.fn.Return<
   boolean,
   CommandError,
   OperatorServices

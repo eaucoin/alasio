@@ -1,4 +1,5 @@
-import type { Logger } from "../shared/log.ts";
+import { Effect } from "effect";
+
 import { resolveHookPort } from "../shared/runtime-constants.ts";
 
 /** How an agent waits on a GitHub Actions run: watching it, polling it, or checking its status. */
@@ -34,28 +35,15 @@ export function detectWorkflowWait(command: string): DetectedWorkflowWait | null
   return null;
 }
 
-export async function notifyWorkflowWait(
-  sessionId: string,
-  runId: string,
-  waitType: WorkflowWaitType,
-  command: string,
-  log: Pick<Logger, "warn"> = console,
-): Promise<void> {
-  try {
-    const response = await fetch(`http://localhost:${resolveHookPort()}/hook/workflow`, {
+/** Tells the workflow hook server (src/workflow/hook-server.ts) of a wait; a failure to is only logged. */
+export const notifyWorkflowWait = (notification: WorkflowHookNotification): Effect.Effect<void> =>
+  Effect.tryPromise(() =>
+    fetch(`http://localhost:${resolveHookPort()}/hook/workflow`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sessionId,
-        run_id: runId,
-        wait_type: waitType,
-        command,
-      } satisfies WorkflowHookNotification),
-    });
-    if (!response.ok) {
-      log.warn(`Workflow hook POST returned ${response.status}`);
-    }
-  } catch (error) {
-    log.warn(`Workflow hook POST failed: ${error}`);
-  }
-}
+      body: JSON.stringify(notification),
+    })
+  ).pipe(
+    Effect.flatMap((response) => (response.ok ? Effect.void : Effect.logWarning(`Workflow hook POST returned ${response.status}`))),
+    Effect.catch((error) => Effect.logWarning(`Workflow hook POST failed: ${error.cause}`)),
+  );

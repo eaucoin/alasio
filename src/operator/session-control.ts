@@ -1,7 +1,7 @@
 import type { InlineKeyboardButton } from "@grammyjs/types";
 import { Effect } from "effect";
 
-import { type ConversationBusy, Turns } from "../codex/turn-controller.ts";
+import { type ConversationBusy, Turns } from "../codex/turns.ts";
 import type { ListedSession } from "../harness/claude/sessions.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
@@ -98,7 +98,7 @@ export interface SessionsPanelRequest {
   readonly page?: unknown;
 }
 
-export const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1 }: SessionsPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store> {
+const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1 }: SessionsPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store> {
   const store = yield* Store;
   const mountedSessionId = store.getSessionId(conversationId);
   const totalPages = yield* harness.sessions.getTotalSessionPages();
@@ -156,7 +156,7 @@ export interface CurrentSessionPanelRequest {
   readonly conversationId: string;
 }
 
-export const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
+const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
   const store = yield* Store;
   const sessionId = store.getSessionId(conversationId);
   if (!sessionId) {

@@ -53,6 +53,7 @@ export class WorkspaceFolderError extends Schema.TaggedError<WorkspaceFolderErro
 /** How changing a conversation's folder fails. */
 export type WorkspaceChangeError = MountRefused | WorkspaceFolderError | SessionError;
 
+/** The scope these lines have always been logged in, kept for whatever reads alasio's logs. */
 const LOG_SCOPE = "codex-turn-controller";
 
 /** A folder operation of the workspace policy, its failure the operator's to read. */

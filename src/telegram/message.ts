@@ -3,8 +3,6 @@ import type { Audio, Document, Message, PhotoSize, Video, Voice } from "@grammyj
 /** A file an incoming message carries, as Telegram describes it, with a kind and a name to save it under. */
 export type IncomingFile = IncomingDocument | IncomingPhoto | IncomingVideo | IncomingAudio | IncomingVoice;
 
-export type IncomingFileKind = IncomingFile["kind"];
-
 export interface IncomingDocument extends Document {
   kind: "document";
   file_name: string;

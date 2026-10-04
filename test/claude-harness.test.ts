@@ -31,6 +31,7 @@ import { ALASIO_CLAUDE_EFFORT, ALASIO_CLAUDE_MODEL } from "../src/harness/claude
 import { type ClaudeSessionApi, type ClaudeTranscriptStore, createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnParams, TurnPersistence, TurnResult } from "../src/harness/index.ts";
+import { BaymaNotAnswering } from "../src/kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
@@ -94,9 +95,7 @@ function createPersistence(): RecordingPersistence {
 }
 
 const quietSessions: Pick<ClaudeSessionApi, "sessionExists"> = {
-  async sessionExists() {
-    return false;
-  },
+  sessionExists: () => Effect.succeed(false),
 };
 
 /** The text blocks of a response, in order. */
@@ -343,7 +342,7 @@ test("a result for another turn does not end the prompt channel", async () => {
     workingDirectory: "/work",
     persistence,
     activeTurns,
-    sessions: { sessionExists: async () => true },
+    sessions: { sessionExists: () => Effect.succeed(true) },
     queryFactory,
   });
   assert.equal(typeof promptUuid, "string", "the pushed prompt carries a client uuid");
@@ -393,7 +392,7 @@ test("a steered prompt keeps the channel open until its own result arrives", asy
     workingDirectory: "/work",
     persistence,
     activeTurns,
-    sessions: { sessionExists: async () => true },
+    sessions: { sessionExists: () => Effect.succeed(true) },
     queryFactory,
   });
   assert.equal(closedBeforeSteerAnswered, false, "the channel stays open for the steered prompt");
@@ -645,25 +644,25 @@ test("Claude session api maps SDK transcripts to alasio session and rewind shape
       },
     },
   });
-  assert.deepEqual(await api.listSessions(1), [
+  assert.deepEqual(await Effect.runPromise(api.listSessions(1)), [
     { uuid: "new", timestamp: "1970-01-01", label: "Newest work" },
     { uuid: "old", timestamp: "1970-01-01", label: "Old" },
   ]);
-  assert.equal(await api.getTotalSessionPages(), 1);
-  assert.equal(await api.getSessionByNumber(2), "old");
-  assert.equal(await api.getSessionByNumber(3), null);
-  assert.equal(await api.getSessionLastMessage("new"), "second answer");
-  assert.deepEqual((await api.listSessionMessages("new")).map((message) => [message.index, message.uuid, message.text]), [
+  assert.equal(await Effect.runPromise(api.getTotalSessionPages()), 1);
+  assert.equal(await Effect.runPromise(api.getSessionByNumber(2)), "old");
+  assert.equal(await Effect.runPromise(api.getSessionByNumber(3)), null);
+  assert.equal(await Effect.runPromise(api.getSessionLastMessage("new")), "second answer");
+  assert.deepEqual((await Effect.runPromise(api.listSessionMessages("new"))).map((message) => [message.index, message.uuid, message.text]), [
     [-1, "u3", "second ask"],
     [-2, "u1", "first ask"],
   ]);
-  assert.equal(await api.getTotalRewindPages("new"), 1);
-  assert.equal(await api.createForkedSession("new", "u3"), "forked");
+  assert.equal(await Effect.runPromise(api.getTotalRewindPages("new")), 1);
+  assert.equal(await Effect.runPromise(api.createForkedSession("new", "u3")), "forked");
   assert.deepEqual(forks, [["new", { dir: "/work", upToMessageId: "u2" }]]);
-  assert.match(await api.createForkedSession("new", "u1") ?? "", /^[0-9a-f-]{36}$/);
-  assert.equal(await api.createForkedSession("new", "missing"), null);
-  assert.equal(await api.sessionExists("new"), true);
-  assert.equal(await api.sessionExists("old"), false);
+  assert.match(await Effect.runPromise(api.createForkedSession("new", "u1")) ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(await Effect.runPromise(api.createForkedSession("new", "missing")), null);
+  assert.equal(await Effect.runPromise(api.sessionExists("new")), true);
+  assert.equal(await Effect.runPromise(api.sessionExists("old")), false);
 });
 
 test("Claude session api reads the session store, and falls back to local transcripts when it cannot", async () => {
@@ -700,13 +699,13 @@ test("Claude session api reads the session store, and falls back to local transc
     },
   });
   // Listing reads the store.
-  assert.equal(await api.getSessionByNumber(1), "kept");
+  assert.equal(await Effect.runPromise(api.getSessionByNumber(1)), "kept");
   assert.deepEqual(calls.splice(0), [["list", true]]);
   // With the store unreachable, listing and existence fall back to the local transcripts.
   storeUp = false;
-  assert.equal(await api.getSessionByNumber(1), "kept");
+  assert.equal(await Effect.runPromise(api.getSessionByNumber(1)), "kept");
   assert.deepEqual(calls.splice(0), [["list", true], ["list", false]]);
-  assert.equal(await api.sessionExists("local-only"), true);
+  assert.equal(await Effect.runPromise(api.sessionExists("local-only")), true);
   assert.deepEqual(calls.splice(0), [["info", false]]);
 });
 
@@ -810,7 +809,7 @@ test("background work keeps running after the answer and its report is delivered
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const events: string[] = [];
   const turn = runTurn(liveSessions, {
     ...turnParams(persistence),
@@ -851,7 +850,7 @@ test("later prompts on the same session reuse the live process; a new session or
   persistence.getModelChoice = () => model;
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const answer = async () => {
     const received = await cli.nextPrompt();
     cli.emit(successResult({ result: `re: ${received.message.content}`, session_id: "s-1", user_message_uuids: [received.uuid] }));
@@ -883,7 +882,7 @@ test("steering a Claude-started turn is answered in that turn's own reply", asyn
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   const first = await cli.nextPrompt();
   cli.emit(successResult({ result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] }));
@@ -906,7 +905,7 @@ test("/stop interrupts the turn without killing the process, and the interrupted
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   const first = await cli.nextPrompt();
   cli.emit(assistantMessage([text("Working...")]));
@@ -930,7 +929,7 @@ test("a Claude Code process that exits mid-turn fails that turn and the next pro
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
-  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: async () => true }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   await cli.nextPrompt();
   const [options] = cli.state.options;
@@ -953,13 +952,13 @@ test("a Claude Code process that exits mid-turn fails that turn and the next pro
 test("a stop asked while Claude Code is still starting is done once the turn ends, though the start fails", async () => {
   const persistence = createPersistence();
   const activeTurns = makeActiveTurns();
-  const { promise: lookedUp, reject: failLookup } = Promise.withResolvers<boolean>();
+  const { promise: bayma, reject: failBayma } = Promise.withResolvers<BaymaMcpServer>();
   const { liveSessions, closeAll } = openLiveSessions({
     workingDirectory: "/work",
-    // Starting the process waits on whether the session it resumes exists.
-    sessions: { sessionExists: () => lookedUp },
+    sessions: quietSessions,
     queryFactory: () => assert.fail("Claude Code never starts"),
-    folderBayma,
+    // Starting the process waits on the conversation's bayma.
+    folderBayma: () => Effect.tryPromise({ try: () => bayma, catch: () => new BaymaNotAnswering({ url: "http://bayma:7290/mcp", reason: "unreachable" }) }),
   }, activeTurns);
   const turn = runTurn(liveSessions, turnParams(persistence));
   while (!busy(activeTurns, "telegram:1")) {
@@ -967,11 +966,11 @@ test("a stop asked while Claude Code is still starting is done once the turn end
   }
   const stopping = runningTurnOf(activeTurns, "telegram:1").stop();
   assert.equal(await settlesSoon(stopping), false, "the stop waits for the turn to end");
-  failLookup(new Error("transcripts unreachable"));
+  failBayma(new Error("unreachable"));
   const result = await turn;
   assert.equal(await settlesSoon(stopping), true, "the stop is done once the turn ends");
   assert.equal(result.responseCompleted, false);
-  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: transcripts unreachable" }]);
+  assert.deepEqual(result.blockSequence, [{ type: "text", content: "Error: bayma in http://bayma:7290/mcp did not answer: unreachable" }]);
   assert.equal(busy(activeTurns, "telegram:1"), false);
   await closeAll();
 });

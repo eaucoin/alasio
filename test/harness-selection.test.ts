@@ -26,7 +26,7 @@ import {
   normalizeHarnessName,
 } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
-import { Turns } from "../src/codex/turn-controller.ts";
+import { Turns } from "../src/codex/turns.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { processPrompt } from "../src/operator/prompts.ts";
 import { buildRestartSyntheticText } from "../src/operator/restart-prompts.ts";

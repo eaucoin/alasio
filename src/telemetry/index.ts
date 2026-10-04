@@ -6,20 +6,20 @@
 import {
   type Attributes,
   context,
-  type Context,
+  type Context as OtelContext,
   INVALID_SPAN_CONTEXT,
+  isSpanContextValid,
   metrics,
   propagation,
   ROOT_CONTEXT,
   type Span,
   SpanKind,
-  SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
 // By module: the package's index also loads its browser SDK, which alasio has not.
 import * as OtelTracer from "@effect/opentelemetry/OtelTracer";
 import * as Resource from "@effect/opentelemetry/Resource";
-import { Cause, Effect, Exit, Layer, type Tracer } from "effect";
+import { Cause, Context, Effect, Exit, Layer, Tracer } from "effect";
 
 export { SpanKind } from "@opentelemetry/api";
 export {
@@ -42,15 +42,15 @@ export type { Signal, SignalExporter, Telemetry } from "./config.ts";
  */
 export const TracingLayer: Layer.Layer<OtelTracer.OtelTracer> = OtelTracer.layerGlobal.pipe(Layer.provide(Resource.layerFromEnv()));
 
-/** Where inSpan puts a span, and what it records on it at the start. */
-export interface InSpanOptions {
+/** Where withAlasioSpan puts a span, and what it records on it at the start. */
+export interface AlasioSpanOptions {
   readonly kind?: SpanKind;
   readonly attributes?: Attributes;
   /** A traceparent to continue, or null to start a trace of its own; the active span when absent. */
   readonly parent?: string | null | undefined;
 }
 
-/** A call rpcCall records. */
+/** A call withRpcCall records. */
 export interface RpcCallOptions {
   readonly system: string;
   readonly service: string;
@@ -64,8 +64,6 @@ export interface TraceCarrier {
   tracestate?: string;
 }
 
-const tracer = trace.getTracer("alasio");
-
 /** The meter alasio's own metrics are created on. */
 export const meter = metrics.getMeter("alasio");
 
@@ -75,71 +73,13 @@ const rpcDuration = meter.createHistogram("rpc.client.call.duration", {
 });
 
 /** The context a traceparent continues, or the root context for none. */
-function contextOf(traceparent: string | null): Context {
+function contextOf(traceparent: string | null): OtelContext {
   return traceparent ? propagation.extract(ROOT_CONTEXT, { traceparent }) : ROOT_CONTEXT;
 }
 
-/** The `error.type` of what was thrown. */
+/** The `error.type` of what an effect failed with. */
 function errorType(error: unknown): string {
   return error instanceof Error ? error.name : "Error";
-}
-
-/** What a span records of an error: the exception and its type, and an error status. */
-function recordError(span: Span, error: unknown): void {
-  span.recordException(error instanceof Error ? error : String(error));
-  span.setAttribute("error.type", errorType(error));
-  span.setStatus({ code: SpanStatusCode.ERROR, message: error instanceof Error ? error.message : String(error) });
-}
-
-/**
- * Runs `fn(span)` in a new span and ends the span when `fn` settles, recording what it
- * threw. The span's parent is the active span, unless `parent` is given: a traceparent
- * to continue, or null to start a trace of its own.
- */
-export async function inSpan<T>(
-  name: string,
-  { kind = SpanKind.INTERNAL, attributes = {}, parent }: InSpanOptions = {},
-  fn: (span: Span) => T | Promise<T>,
-): Promise<T> {
-  const parentContext = parent === undefined ? context.active() : contextOf(parent);
-  return await tracer.startActiveSpan(name, { kind, attributes }, parentContext, async (span) => {
-    try {
-      return await fn(span);
-    } catch (error) {
-      recordError(span, error);
-      throw error;
-    } finally {
-      span.end();
-    }
-  });
-}
-
-/**
- * A call alasio makes to `service` (`system` names its protocol): a client span named
- * `<service>/<method>` and its duration, labelled with the error it failed with.
- */
-export async function rpcCall<T>(
-  { system, service, method, attributes = {} }: RpcCallOptions,
-  fn: (span: Span) => T | Promise<T>,
-): Promise<T> {
-  const startedAt = performance.now();
-  let failure: string | null = null;
-  try {
-    return await inSpan(`${service}/${method}`, {
-      kind: SpanKind.CLIENT,
-      attributes: { "rpc.system.name": system, "rpc.service": service, "rpc.method": method, ...attributes },
-    }, fn);
-  } catch (error) {
-    failure = errorType(error);
-    throw error;
-  } finally {
-    rpcDuration.record((performance.now() - startedAt) / 1000, {
-      "rpc.system.name": system,
-      "rpc.service": service,
-      "rpc.method": method,
-      ...(failure ? { "error.type": failure } : {}),
-    });
-  }
 }
 
 /** Effect's name for an OpenTelemetry span kind. */
@@ -158,7 +98,7 @@ function effectSpanKind(kind: SpanKind): Tracer.SpanKind {
   }
 }
 
-/** Labels the active span with the type of what `cause` failed with, as inSpan does. */
+/** Labels the active span with the type of what `cause` failed with. */
 const labelFailure = <E>(cause: Cause.Cause<E>): Effect.Effect<void> =>
   OtelTracer.currentOtelSpan.pipe(
     Effect.flatMap((span) => Effect.sync(() => span.setAttribute("error.type", errorType(Cause.squash(cause))))),
@@ -166,11 +106,11 @@ const labelFailure = <E>(cause: Cause.Cause<E>): Effect.Effect<void> =>
   );
 
 /**
- * `effect` in a span, as inSpan runs a function in one: its parent the active span,
- * unless `parent` is given (a traceparent to continue, or null to start a trace of its
- * own), and what it fails with recorded on it.
+ * `effect` in a span of alasio's: its parent the active span, unless `parent` is given (a
+ * traceparent to continue, or null to start a trace of its own), and what it fails with
+ * recorded on it and labelling it (`error.type`).
  */
-export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attributes = {}, parent }: InSpanOptions = {}) =>
+export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attributes = {}, parent }: AlasioSpanOptions = {}) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => {
     const spanned = effect.pipe(
       Effect.tapCause(labelFailure),
@@ -178,15 +118,16 @@ export const withAlasioSpan = (name: string, { kind = SpanKind.INTERNAL, attribu
     );
     if (parent === null) return spanned;
     // Effect makes a span with no parent of its own a root, so the active span (the
-    // caller's, or the effect's own as the tracer keeps it active) is made its parent.
+    // caller's, or the effect's own as the tracer keeps it active) is made its parent;
+    // outside every trace (outsideTraces) there is none to continue.
     return Effect.suspend(() => {
       const continued = trace.getSpanContext(parent === undefined ? context.active() : contextOf(parent));
-      return continued ? spanned.pipe(OtelTracer.withSpanContext(continued)) : spanned;
+      return continued && isSpanContextValid(continued) ? spanned.pipe(OtelTracer.withSpanContext(continued)) : spanned;
     });
   };
 
 /**
- * A call alasio makes to `service`, as rpcCall records one: a client span named
+ * A call alasio makes to `service` (`system` names its protocol): a client span named
  * `<service>/<method>` and its duration, labelled with the error it failed with.
  */
 export const withRpcCall = ({ system, service, method, attributes = {} }: RpcCallOptions) =>
@@ -227,7 +168,12 @@ export function currentTraceparent(): string | null {
   return traceCarrier()?.traceparent ?? null;
 }
 
-/** Runs `fn` outside every trace, for work that outlives the span it starts in. */
-export function outsideTraces<T>(fn: () => T): T {
-  return context.with(ROOT_CONTEXT, fn);
-}
+/**
+ * `effect` outside every trace, for work that outlives the span it starts in. Its parent
+ * span is one that records nothing and propagates nothing: the spans it makes start
+ * traces of their own, and what it runs sees an OpenTelemetry context with no valid span,
+ * so nothing it starts (a process given a TRACEPARENT, an instrumented call) continues
+ * the trace it was started in.
+ */
+export const outsideTraces = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.withSpan(effect, "alasio.outside-traces", { root: true, annotations: Context.make(Tracer.DisablePropagation, true) });

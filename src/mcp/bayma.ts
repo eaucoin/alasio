@@ -51,7 +51,7 @@ const HARNESS_LABEL = "alasio.dev/harness";
 const CONVERSATION_ANNOTATION = "alasio.dev/conversation";
 
 /** A path segment from `value`. */
-export function sanitizePathToken(value: string): string {
+function sanitizePathToken(value: string): string {
   return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
 }
 

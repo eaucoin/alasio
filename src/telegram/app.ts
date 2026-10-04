@@ -6,13 +6,13 @@
  * sessions are warmed. All of it stops as its scope closes, polling first.
  */
 import type { Update } from "@grammyjs/types";
-import { Effect, FiberSet, Layer, Option, Schedule, Schema, type Scope } from "effect";
+import { Effect, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
 
-import { Turns } from "../codex/turn-controller.ts";
+import { Turns } from "../codex/turns.ts";
 import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
 import type { RolloutRestoreError } from "../codex/rollouts/restore.ts";
 import type { AlasioConfig } from "../config.ts";
-import { type AdoptedSession, adoptTranscripts } from "../harness/claude/transcripts.ts";
+import { type AdoptedSession, adoptTranscripts, type TranscriptAdoptionError } from "../harness/claude/transcripts.ts";
 import type { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { Harnesses } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
@@ -56,15 +56,6 @@ export interface TelegramAppConfig
 
 /** What the app runs on. */
 export type TelegramAppServices = Authorizer | MediaGroups | OperatorServices;
-
-/** Claude Code's transcripts could not be brought into the session store. */
-export class TranscriptAdoptionError extends Schema.TaggedError<TranscriptAdoptionError>()("TranscriptAdoptionError", {
-  cause: Schema.Defect(),
-}) {
-  override get message(): string {
-    return this.cause instanceof Error ? this.cause.message : String(this.cause);
-  }
-}
 
 /** How the app fails to start. */
 export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError;
@@ -112,10 +103,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
       .map(({ sessionId, workingDirectory }) => ({ sessionId, workingDirectory: harnessDirectoryOf(workingDirectory) }))
       .filter((session): session is AdoptedSession => Boolean(session.workingDirectory));
     yield* Effect.logInfo(`  Session store: adopting ${sessions.length} Claude session(s)`);
-    yield* Effect.tryPromise({
-      try: () => adoptTranscripts({ store: sessionStore, sessions }),
-      catch: (cause) => new TranscriptAdoptionError({ cause }),
-    });
+    yield* adoptTranscripts({ store: sessionStore, sessions });
   });
 
   /**
