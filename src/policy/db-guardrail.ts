@@ -76,11 +76,11 @@ export function isBlockedDbCommand(command: string): boolean {
 
 export function buildDbGuardrailSyntheticText(command: string): string {
   return "[SYSTEM GUARDRAIL EVENT]\n\n" +
-    "Your attempted tool command was blocked by the monorepo DB guardrail.\n\n" +
+    "Your attempted tool command was blocked by the DB guardrail.\n\n" +
     `Blocked command: \`${command}\`\n\n` +
     "Policy:\n" +
-    "- Local DB access is forbidden in monorepo.\n" +
-    "- Local schema pull and local schema rebaseline are forbidden in monorepo.\n" +
+    "- Local DB access is forbidden here.\n" +
+    "- Local schema pull and local schema rebaseline are forbidden here.\n" +
     "- Use the readonly query CLI for inspection.\n" +
     "- Use CI workflows for schema reconciliation.\n\n" +
     "Instruction:\n" +
@@ -90,7 +90,7 @@ export function buildDbGuardrailSyntheticText(command: string): string {
 }
 
 export function buildDbGuardrailFallbackText(command: string): string {
-  return "I hit the monorepo DB guardrail while trying to continue. " +
+  return "I hit the DB guardrail while trying to continue. " +
     `The blocked command was \`${command}\`. ` +
     "Local DB access and local schema pull are forbidden here, so I need to continue with the readonly query CLI for inspection and CI workflows for schema reconciliation.";
 }

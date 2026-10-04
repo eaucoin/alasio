@@ -48,7 +48,7 @@ export interface AlasioOptions {
   readonly folders?: readonly string[];
 }
 
-/** How a alasio process ended. */
+/** How an alasio process ended. */
 export interface AlasioExit {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
