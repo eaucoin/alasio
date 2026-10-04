@@ -138,7 +138,7 @@ test("the session-filesystem Codex writes its own home, carries none of the oper
     assert.deepEqual(scope.codexConfig, sessionFsThreadConfig(BAYMA));
     // A listing scope's type has no config; this pins that it carries none.
     assert.equal(Reflect.get(listing, "codexConfig"), undefined);
-    assert.deepEqual(Object.keys(scope.codexEnv).sort(), ["CODEX_HOME", "HOME", "PATH", "ALASIO_CODEX_LOGIN"]);
+    assert.deepEqual(Object.keys(scope.codexEnv).sort(), ["ALASIO_CODEX_LOGIN", "CODEX_HOME", "HOME", "PATH"]);
     assert.equal(scope.codexEnv["CODEX_HOME"], home);
     assert.equal(scope.codexEnv["HOME"], join(home, "home")); // not the operator's home
     assert.equal(scope.codexEnv["ALASIO_CODEX_LOGIN"], "relay-bearer");
