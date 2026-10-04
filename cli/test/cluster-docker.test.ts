@@ -53,7 +53,7 @@ test("an object that is not there is null, and one that is, Docker's answer", as
     })
   );
   assert.equal(seen.before, null);
-  assert.deepEqual(seen.after?.State, { Status: "created", Running: false });
+  assert.deepEqual(seen.after?.State, { Status: "created", Running: false, StartedAt: "0001-01-01T00:00:00Z" });
   assert.deepEqual(seen.after?.Config.Labels, { "alasio.cluster": "c" });
   assert.equal(seen.image?.Id, "sha256:node:1");
   assert.equal(seen.network, null);

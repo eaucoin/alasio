@@ -2,9 +2,10 @@
  * What the objects of an installation share: their names and labels, image references,
  * security contexts, and the pieces of pod specs several components have alike.
  *
- * Every name and label is the one the Helm chart gave the object it made, for its
- * release `alasio` in namespace `alasio`, so applying these objects takes over an
- * installation the chart made, object for object.
+ * Every name, and every label that selects pods, is the one the Helm chart gave the
+ * object it made, for its release `alasio` in namespace `alasio`, so applying these
+ * objects takes over an installation the chart made, object for object; they say they
+ * are managed by alasio, not Helm.
  */
 import { createHash } from "node:crypto";
 
@@ -49,11 +50,10 @@ export type Labels = Record<string, string>;
 /** The labels every object of a component carries. */
 export function labels(component: string): Labels {
   return {
-    "helm.sh/chart": `alasio-${VERSION.replaceAll("+", "_")}`,
     "app.kubernetes.io/name": "alasio",
     "app.kubernetes.io/instance": RELEASE,
     "app.kubernetes.io/version": VERSION,
-    "app.kubernetes.io/managed-by": "Helm",
+    "app.kubernetes.io/managed-by": "alasio",
     "app.kubernetes.io/part-of": "alasio",
     "app.kubernetes.io/component": component,
   };

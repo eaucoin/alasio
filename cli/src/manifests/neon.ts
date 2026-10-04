@@ -62,19 +62,15 @@ function secretVariable(secret: string, key: string): V1EnvVar {
   return { name: key, valueFrom: { secretKeyRef: { name: secret, key } } };
 }
 
-/** The annotations of the setup's objects: a hook that runs, in `weight`'s order, before alasio is installed or upgraded. */
-function setupHook(weight: string, deletePolicy: string): Record<string, string> {
-  return { "helm.sh/hook": "pre-install,pre-upgrade", "helm.sh/hook-weight": weight, "helm.sh/hook-delete-policy": deletePolicy };
-}
-
 /**
  * The stack's secrets, made once and kept, and each service's rendered from them, by
- * neon/control/kube-setup.ts before anything else of alasio starts.
+ * neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
+ * anything else of alasio starts (../kube/apply.ts).
  */
 function setup(config: InstallConfig): KubernetesObject[] {
   const name = neonName("setup");
   const { objectStore } = config;
-  const metadata = { name, namespace: NAMESPACE, labels: stackLabels("neon-setup"), annotations: setupHook("-10", "before-hook-creation") };
+  const metadata = { name, namespace: NAMESPACE, labels: stackLabels("neon-setup") };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
   const role: V1Role = {
     apiVersion: "rbac.authorization.k8s.io/v1",
@@ -92,7 +88,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
   const job: V1Job = {
     apiVersion: "batch/v1",
     kind: "Job",
-    metadata: { ...metadata, annotations: setupHook("0", "before-hook-creation,hook-succeeded") },
+    metadata,
     spec: {
       backoffLimit: 3,
       activeDeadlineSeconds: 300,
@@ -417,8 +413,7 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
 /**
  * neon-control: it bootstraps the tenant and timeline, serves the compute its spec,
  * answers the storage controller's hooks, and repairs a safekeeper that lost its disk.
- * Its record of what it bootstrapped is on a volume of its own, which outlives alasio's
- * removal.
+ * Its record of what it bootstrapped is on a volume of its own.
  */
 function control(config: InstallConfig): KubernetesObject[] {
   const name = neonName("control");
@@ -431,7 +426,7 @@ function control(config: InstallConfig): KubernetesObject[] {
   const claim: V1PersistentVolumeClaim = {
     apiVersion: "v1",
     kind: "PersistentVolumeClaim",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component), annotations: { "helm.sh/resource-policy": "keep" } },
+    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: claimSpec(config.neon.control.storage),
   };
   const deployment: V1Deployment = {

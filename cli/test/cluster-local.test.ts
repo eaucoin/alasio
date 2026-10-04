@@ -10,7 +10,8 @@ import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker.ts";
 import { LocalCluster, type LocalClusterOptions, localKubeconfig, nodeHostsWith, subnetAddress } from "../src/cluster/local.ts";
-import { type FakeContainer, type FakeDocker, type FakeExecResult, serveFakeDocker } from "./support/fake-docker.ts";
+import type { FakeDocker } from "./support/fake-docker.ts";
+import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
 /** The kubeconfig k3s writes in a server node. */
 const K3S_YAML = `apiVersion: v1
@@ -33,63 +34,6 @@ users:
     client-key-data: S0VZ
 `;
 
-const TOKEN = "K10abc::server:secret";
-
-/** What k3s writes in a server node that the cluster reads. */
-const SERVER_FILES: Readonly<Record<string, string>> = {
-  "/etc/rancher/k3s/k3s.yaml": K3S_YAML,
-  "/var/lib/rancher/k3s/server/token": `${TOKEN}\n`,
-};
-
-/** k3s as the fake's nodes run it: kubectl in the server, over an API server in memory, and ctr in every node. */
-class FakeK3s {
-  apiReady = true;
-  nodeHosts = "";
-  resourceVersion = 1;
-  readonly patches: unknown[] = [];
-  readonly applied: unknown[] = [];
-  readonly imported = new Map<string, string>();
-  containers: ReadonlyMap<string, FakeContainer> = new Map();
-
-  readonly exec = (container: string, command: readonly string[], stdin: Buffer): FakeExecResult => {
-    const [tool, ...args] = command;
-    if (tool === "ctr") {
-      this.imported.set(container, stdin.toString("utf8"));
-      return { exitCode: 0 };
-    }
-    if (!this.apiReady) return { exitCode: 1, stderr: "The connection to the server 127.0.0.1:6443 was refused" };
-    const verb = args.find((arg) => !arg.startsWith("--"));
-    if (args.includes("--raw=/readyz")) return { exitCode: 0, stdout: "ok" };
-    if (verb === "get" && args.includes("nodes")) {
-      // Every running node has registered and is ready.
-      const items = [...this.containers].filter(([, node]) => node.state === "running").map(([name]) => ({
-        metadata: { name },
-        status: { conditions: [{ type: "Ready", status: "True" }] },
-      }));
-      return { exitCode: 0, stdout: JSON.stringify({ items }) };
-    }
-    if (verb === "get" && args.includes("configmap")) {
-      return { exitCode: 0, stdout: JSON.stringify({ metadata: { resourceVersion: String(this.resourceVersion) }, data: { NodeHosts: this.nodeHosts } }) };
-    }
-    if (verb === "patch") {
-      const patch = JSON.parse(args.find((arg) => arg.startsWith("--patch="))?.slice("--patch=".length) ?? "") as {
-        metadata: { resourceVersion: string };
-        data: { NodeHosts: string };
-      };
-      this.patches.push(patch);
-      if (patch.metadata.resourceVersion !== String(this.resourceVersion)) return { exitCode: 1, stderr: "the object has been modified" };
-      this.nodeHosts = patch.data.NodeHosts;
-      this.resourceVersion += 1;
-      return { exitCode: 0 };
-    }
-    if (verb === "apply") {
-      this.applied.push(JSON.parse(stdin.toString("utf8")));
-      return { exitCode: 0 };
-    }
-    return { exitCode: 1, stderr: `unknown command ${command.join(" ")}` };
-  };
-}
-
 /** A fake Docker with k3s in its nodes, a directory for the cluster's files, and a way to run a LocalCluster on them. */
 interface Rig {
   readonly fake: FakeDocker;
@@ -100,16 +44,7 @@ interface Rig {
 }
 
 async function rig(t: TestContext): Promise<Rig> {
-  const k3s = new FakeK3s();
-  const fake = await serveFakeDocker({
-    onExec: k3s.exec,
-    files: (container, path) => {
-      const content = container.endsWith("-server-0") ? SERVER_FILES[path] : undefined;
-      return content === undefined ? null : Buffer.from(content);
-    },
-    pullable: (reference) => !reference.endsWith(":absent"),
-  });
-  k3s.containers = fake.containers;
+  const { fake, k3s } = await serveK3sInDocker(K3S_YAML, { pullable: (reference) => !reference.endsWith(":absent") });
   const directory = mkdtempSync(join(tmpdir(), "alasio-cluster-"));
   t.after(async () => {
     await fake.close();
@@ -281,7 +216,7 @@ test("agents join the server with the token it made, at the addresses after it, 
     NetworkingConfig: unknown;
   };
   assert.equal(agent.Cmd[0], "agent");
-  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${TOKEN}`]);
+  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`]);
   assert.equal(agent.Labels["alasio.role"], "agent");
   assert.equal(agent.ExposedPorts, undefined);
   assert.equal(agent.HostConfig.PortBindings, undefined);
@@ -328,6 +263,18 @@ test("up gives up on an API server that does not answer, saying why", async (t) 
   );
 });
 
+test("up waits for nodes reported ready since they started, not before", async (t) => {
+  const { k3s, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  await run((cluster) => cluster.down);
+  // The Ready status the server node had when it stopped, which it keeps until its kubelet reports again.
+  k3s.heartbeat = new Date(Date.now() - 60_000).toISOString();
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
+  assert.equal(error.message, "cluster dev was not ready within 0.3s, waiting for its nodes: not reported ready since started: dev-server-0");
+  k3s.heartbeat = null;
+  await run((cluster) => cluster.up(kubeconfig));
+});
+
 test("a pull that fails fails up before anything is made", async (t) => {
   const { fake, kubeconfig, run } = await rig(t);
   const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)), { image: "ghcr.io/eaucoin/alasio-node:absent" });
@@ -345,6 +292,16 @@ test("remove deletes the nodes and the network, and the volumes only when asked"
   assert.equal(fake.volumes.size, 5);
   await run((cluster) => cluster.remove({ volumes: true }));
   assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
+});
+
+test("remove with the storage empties it in the server node, as root, then removes it", async (t) => {
+  const { fake, kubeconfig, options, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig).pipe(Effect.andThen(cluster.down)));
+  await run((cluster) => cluster.remove({ volumes: true, storage: true }));
+  const commands = fake.requests.filter(({ path }) => path === "/containers/dev-server-0/exec").map(({ body }) => (body as { Cmd: string[] }).Cmd);
+  assert.deepEqual(commands.at(-1), ["find", options.storagePath, "-mindepth", "1", "-delete"]);
+  assert.equal(fake.containers.size, 0);
+  assert.throws(() => statSync(options.storagePath), /ENOENT/u);
 });
 
 test("status is Docker's version and the cluster's nodes, the server first", async (t) => {

@@ -42,9 +42,6 @@ import type { InstallConfig } from "./config.ts";
 /** The port every workspace's bayma serves MCP on. */
 const BAYMA_PORT = 7290;
 
-/** The resource policy of what outlives alasio's removal: its state, and the namespaces of its workspaces' volumes. */
-const KEEP = { "helm.sh/resource-policy": "keep" };
-
 /** The namespaces whose Sandboxes alasio drives: the sessions', and the host profile's. */
 function workspaceNamespaces(config: InstallConfig): string[] {
   return [...(config.sessions.enabled ? [config.sessions.namespace] : []), ...(config.host.enabled ? [config.host.namespace] : [])];
@@ -169,45 +166,16 @@ function hostProfile(config: InstallConfig): HostProfile {
   };
 }
 
-/** `text` quoted as Go's %q quotes it, which the chart's `quote` did. */
-function goQuote(text: string): string {
-  const escapes: Readonly<Record<string, string>> = { "\x07": "\\a", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t", "\v": "\\v", '"': '\\"', "\\": "\\\\" };
-  const hex = (code: number, digits: number) => code.toString(16).padStart(digits, "0");
-  let quoted = "";
-  for (const char of text) {
-    const code = char.codePointAt(0) ?? 0;
-    quoted += escapes[char]
-      ?? (/^[\p{L}\p{M}\p{N}\p{P}\p{S} ]$/u.test(char) ? char : code < 0x80 ? `\\x${hex(code, 2)}` : code < 0x10000 ? `\\u${hex(code, 4)}` : `\\U${hex(code, 8)}`);
-  }
-  return `"${quoted}"`;
-}
-
-/**
- * The ConfigMap of the templates, and its checksum, which alasio's pod carries so it
- * is replaced when they change: of the ConfigMap as the chart wrote it, so the pod an
- * installation the chart made runs is kept as long as they are the same.
- */
+/** The ConfigMap of the templates, and their checksum, which alasio's pod carries so it is replaced when they change. */
 function sandboxTemplates(config: InstallConfig): { readonly configMap: V1ConfigMap; readonly checksum: string } {
   const name = componentName("sandbox-templates");
-  const objectLabels = labels("alasio");
   const templates = goJson(
     { ...(config.sessions.enabled ? { sessions: sessionsProfile(config) } : {}), ...(config.host.enabled ? { host: hostProfile(config) } : {}) },
     "  ",
   );
-  const written = [
-    "apiVersion: v1",
-    "kind: ConfigMap",
-    "metadata:",
-    `  name: ${name}`,
-    "  labels:",
-    // The version, which the chart quoted, as it may read as a number.
-    ...Object.entries(objectLabels).map(([key, value]) => `    ${key}: ${key === "app.kubernetes.io/version" ? goQuote(value) : value}`),
-    "data:",
-    `  templates.json: ${goQuote(templates)}`,
-  ];
   return {
-    configMap: { apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace: NAMESPACE, labels: objectLabels }, data: { "templates.json": templates } },
-    checksum: sha256(`${written.join("\n")}\n`),
+    configMap: { apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace: NAMESPACE, labels: labels("alasio") }, data: { "templates.json": templates } },
+    checksum: sha256(templates),
   };
 }
 
@@ -312,14 +280,14 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
   };
 }
 
-/** alasio's volume, unless the configuration names an existing claim: its state outlives alasio's removal. */
+/** alasio's volume, unless the configuration names an existing claim. */
 function volume(config: InstallConfig): V1PersistentVolumeClaim[] {
   const { persistence } = config.alasio;
   if (persistence.existingClaim) return [];
   return [{
     apiVersion: "v1",
     kind: "PersistentVolumeClaim",
-    metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio"), annotations: KEEP },
+    metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") },
     spec: {
       accessModes: ["ReadWriteOnce"],
       ...(persistence.storageClassName ? { storageClassName: persistence.storageClassName } : {}),
@@ -342,7 +310,6 @@ function telemetryService(config: InstallConfig): V1Service {
  * The namespaces workspaces run in, which alasio makes unless told not to. Sessions'
  * enforces Pod Security "restricted": nothing privileged, no host paths, no added
  * capabilities. The host profile's is "privileged", as its pods mount the machine.
- * Both outlive alasio's removal, as the sessions' volumes are in them.
  */
 function namespaces(config: InstallConfig): V1Namespace[] {
   const { sessions, host } = config;
@@ -359,7 +326,6 @@ function namespaces(config: InstallConfig): V1Namespace[] {
             "pod-security.kubernetes.io/enforce-version": "latest",
             "pod-security.kubernetes.io/warn": "restricted",
           },
-          annotations: KEEP,
         },
       }]
       : []),
@@ -367,7 +333,7 @@ function namespaces(config: InstallConfig): V1Namespace[] {
       ? [{
         apiVersion: "v1",
         kind: "Namespace",
-        metadata: { name: host.namespace, labels: { ...labels("folder-bayma"), "pod-security.kubernetes.io/enforce": "privileged" }, annotations: KEEP },
+        metadata: { name: host.namespace, labels: { ...labels("folder-bayma"), "pod-security.kubernetes.io/enforce": "privileged" } },
       }]
       : []),
   ];

@@ -6,7 +6,10 @@
  * Helm renders a copy of the chart released at this package's version with this
  * package's images, as the builders install them. Its objects are compared as the API
  * server takes them: a key Helm rendered null is left out, and an object of alasio's
- * namespace that names none is in it.
+ * namespace that names none is in it. What is Helm's own is normalized away: its chart
+ * label, its hooks and resource policy, and its managed-by, which is alasio. So is the
+ * checksum of the sandbox templates alasio's pod carries, which the chart took of the
+ * ConfigMap it wrote, labels and all, and the builders of the templates alone.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -135,15 +138,52 @@ function withoutNulls(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== null).map(([key, entry]) => [key, withoutNulls(entry)]));
 }
 
+/** The annotations either side has that the other does not: Helm's, and the templates' checksum. */
+const UNCOMPARED_ANNOTATIONS = new Set([
+  "helm.sh/hook",
+  "helm.sh/hook-weight",
+  "helm.sh/hook-delete-policy",
+  "helm.sh/resource-policy",
+  "checksum/sandbox-templates",
+]);
+
+/** `metadata` as it is compared: managed by alasio, without Helm's chart label or the annotations not compared. */
+function comparedMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const { labels, annotations, ...rest } = metadata as { labels?: Record<string, string>; annotations?: Record<string, string> };
+  const keptLabels = labels && Object.fromEntries(
+    Object.entries(labels)
+      .filter(([key]) => key !== "helm.sh/chart")
+      .map(([key, value]) => [key, key === "app.kubernetes.io/managed-by" && value === "Helm" ? "alasio" : value]),
+  );
+  const keptAnnotations = annotations && Object.fromEntries(Object.entries(annotations).filter(([key]) => !UNCOMPARED_ANNOTATIONS.has(key)));
+  return {
+    ...rest,
+    ...(keptLabels ? { labels: keptLabels } : {}),
+    ...(keptAnnotations && Object.keys(keptAnnotations).length > 0 ? { annotations: keptAnnotations } : {}),
+  };
+}
+
+/** `value` as it is compared: every metadata in it, at every depth, by comparedMetadata. */
+function compared(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(compared);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      key === "metadata" && typeof entry === "object" && entry !== null ? compared(comparedMetadata(entry as Record<string, unknown>)) : compared(entry),
+    ]),
+  );
+}
+
 /** `object` in alasio's namespace, unless it is cluster-scoped or names its own. */
 function placed(object: KubernetesObject): KubernetesObject {
   if (CLUSTER_SCOPED.has(object.kind ?? "") || object.metadata?.namespace) return object;
   return { ...object, metadata: { ...object.metadata, namespace: NAMESPACE } };
 }
 
-/** The objects by kind, namespace and name, in that order, as JSON has them. */
+/** The objects by kind, namespace and name, in that order, as JSON has them and as they are compared. */
 function byIdentity(objects: readonly KubernetesObject[]): Map<string, unknown> {
-  const entries = objects.map((object) => [`${object.kind}/${object.metadata?.namespace ?? ""}/${object.metadata?.name}`, JSON.parse(JSON.stringify(object))] as const);
+  const entries = objects.map((object) => [`${object.kind}/${object.metadata?.namespace ?? ""}/${object.metadata?.name}`, compared(JSON.parse(JSON.stringify(object)))] as const);
   return new Map(entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 

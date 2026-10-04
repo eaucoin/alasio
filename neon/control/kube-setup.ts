@@ -1,5 +1,5 @@
 /**
- * Prepares alasio's Neon on Kubernetes, as a Helm hook Job before the stack starts: the
+ * Prepares alasio's Neon on Kubernetes, as a Job that runs before the stack starts: the
  * secrets it runs on, made once and kept in one Secret, and what each service is given
  * from them, as a Secret of its own, rendered from them on every install and upgrade.
  * Idempotent, and never rotating.

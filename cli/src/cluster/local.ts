@@ -111,6 +111,12 @@ export class NodeCommandFailed extends Schema.TaggedError<NodeCommandFailed>()("
   }
 }
 
+/** What `remove` removes beside the nodes and network. */
+export interface RemoveOptions {
+  readonly volumes?: boolean;
+  readonly storage?: boolean;
+}
+
 /** How bringing the cluster up fails. */
 export type LocalClusterError = DockerError | ClusterUnusable | ClusterNotReady | PlatformError.PlatformError;
 
@@ -125,8 +131,12 @@ export class LocalCluster extends Context.Service<LocalCluster, {
   readonly up: (kubeconfig: string) => Effect.Effect<void, LocalClusterError>;
   /** Stops its nodes, keeping everything. */
   readonly down: Effect.Effect<void, DockerError>;
-  /** Removes its nodes and network, and with `volumes` what they keep. */
-  readonly remove: (options?: { readonly volumes?: boolean }) => Effect.Effect<void, DockerError>;
+  /**
+   * Removes its nodes and network; with `volumes`, what they keep; with `storage`, its
+   * storage directory, its persistent volumes', whose files are its pods' users', removed
+   * in its server node, as root, first.
+   */
+  readonly remove: (options?: RemoveOptions) => Effect.Effect<void, DockerError | NodeCommandFailed | PlatformError.PlatformError>;
   readonly status: Effect.Effect<ClusterStatus, DockerError>;
   /** Loads images of this machine's Docker into every node's containerd, where pods find them without a pull. */
   readonly loadImages: (references: readonly string[]) => Effect.Effect<void, DockerError | NodeCommandFailed>;
@@ -337,16 +347,35 @@ const makeLocalCluster = Effect.fnUntraced(function*({
       ),
     );
 
-  const nodesReady = kubectl(["get", "nodes", "--output=json"]).pipe(
-    Effect.flatMap((stdout) => {
-      const { items } = JSON.parse(stdout.toString("utf8")) as V1NodeList;
-      const ready = new Set(
-        items.filter((node) => node.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True")).map((node) => node.metadata?.name),
-      );
-      const waiting = nodes.filter((node) => !ready.has(node));
-      return waiting.length === 0 ? Effect.void : Effect.fail(new NotYet({ message: `${waiting.join(", ")} not ready` }));
-    }),
-  );
+  /** When each node's container last started, in milliseconds since the epoch. */
+  const startTimes: Effect.Effect<ReadonlyMap<string, number>, DockerError> = Effect.forEach(nodes, (node) =>
+    Effect.map(docker.inspectContainer(node), (container) => [node, Date.parse(container?.State.StartedAt ?? "")] as const)).pipe(
+      Effect.map((entries) => new Map(entries)),
+    );
+
+  /**
+   * Every node ready, by a Ready condition its kubelet reported since its container
+   * started: one from before, which a node stopped while ready keeps until its kubelet
+   * reports again, is not yet the node's. The condition's heartbeat is to the second.
+   */
+  const nodesReady = (started: ReadonlyMap<string, number>) =>
+    kubectl(["get", "nodes", "--output=json"]).pipe(
+      Effect.flatMap((stdout) => {
+        const { items } = JSON.parse(stdout.toString("utf8")) as V1NodeList;
+        const ready = new Set(
+          items
+            .filter((node) =>
+              node.status?.conditions?.some(({ type, status, lastHeartbeatTime }) =>
+                type === "Ready" && status === "True" && lastHeartbeatTime !== undefined
+                && new Date(lastHeartbeatTime).getTime() >= Math.floor((started.get(node.metadata?.name ?? "") ?? Infinity) / 1000) * 1000
+              )
+            )
+            .map((node) => node.metadata?.name),
+        );
+        const waiting = nodes.filter((node) => !ready.has(node));
+        return waiting.length === 0 ? Effect.void : Effect.fail(new NotYet({ message: `not reported ready since started: ${waiting.join(", ")}` }));
+      }),
+    );
 
   /** CoreDNS's NodeHosts with the host aliases, patched only when they differ, and only over the version read. */
   const applyHostAliases = Effect.gen(function*() {
@@ -407,7 +436,7 @@ const makeLocalCluster = Effect.fnUntraced(function*({
         );
       }
     }
-    yield* awaitReady("its nodes", nodesReady);
+    yield* awaitReady("its nodes", Effect.flatMap(startTimes, nodesReady));
     yield* awaitReady("CoreDNS's NodeHosts", applyHostAliases);
     yield* awaitReady("the gvisor RuntimeClass", kubectl(["apply", "--filename=-"], { stdin: JSON.stringify(GVISOR_RUNTIME_CLASS) }));
     yield* writeKubeconfig(kubeconfig);
@@ -436,13 +465,19 @@ const makeLocalCluster = Effect.fnUntraced(function*({
       Effect.andThen(Effect.logInfo(`stopped cluster ${cluster}`)),
     ),
 
-    remove: ({ volumes = false } = {}) =>
+    remove: ({ volumes = false, storage = false } = {}) =>
       Effect.gen(function*() {
-        yield* Effect.forEach(yield* existingNodes, ({ name }) => docker.removeContainer(name), { discard: true });
+        const found = yield* existingNodes;
+        if (storage && found.some(({ name }) => name === server)) {
+          yield* docker.startContainer(server);
+          yield* inNode(server, ["find", storagePath, "-mindepth", "1", "-delete"]);
+        }
+        yield* Effect.forEach(found, ({ name }) => docker.removeContainer(name), { discard: true });
         const network = yield* docker.inspectNetwork(cluster);
         if (network?.Labels?.[CLUSTER_LABEL] === cluster) yield* docker.removeNetwork(cluster);
         if (volumes) yield* Effect.forEach(yield* docker.listVolumes(labels), ({ Name }) => docker.removeVolume(Name), { discard: true });
-        yield* Effect.logInfo(`removed cluster ${cluster}${volumes ? " and its volumes" : ""}`);
+        if (storage) yield* fs.remove(storagePath, { recursive: true, force: true });
+        yield* Effect.logInfo(`removed cluster ${cluster}${volumes ? " and its volumes" : ""}${storage ? `, and ${storagePath}` : ""}`);
       }),
 
     status: Effect.all({

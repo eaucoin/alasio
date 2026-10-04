@@ -30,11 +30,15 @@ export interface FakeExecResult {
 /** How the test answers a command run in `container`, given what it was sent on its stdin. */
 export type ExecAnswer = (container: string, command: readonly string[], stdin: Buffer) => FakeExecResult;
 
-/** A container the fake keeps: the body it was created with, and its state. */
+/** A container the fake keeps: the body it was created with, its state, and when it last started (zero time before it has). */
 export interface FakeContainer {
   readonly body: { readonly Labels?: Readonly<Record<string, string>> } & Record<string, unknown>;
   state: "created" | "running" | "exited";
+  startedAt?: string;
 }
+
+/** Docker's StartedAt of a container that never started. */
+const NEVER_STARTED = "0001-01-01T00:00:00Z";
 
 export interface FakeDockerOptions {
   readonly onExec?: ExecAnswer;
@@ -194,7 +198,11 @@ export async function serveFakeDocker({
       const container = containers.get(name);
       if (!container) return refuse(response, 404, `No such container: ${name}`);
       if (verb === "GET" && action === "json") {
-        return json(response, 200, { Name: `/${name}`, Config: { Labels: container.body.Labels ?? null }, State: { Status: container.state, Running: container.state === "running" } });
+        return json(response, 200, {
+          Name: `/${name}`,
+          Config: { Labels: container.body.Labels ?? null },
+          State: { Status: container.state, Running: container.state === "running", StartedAt: container.startedAt ?? NEVER_STARTED },
+        });
       }
       if (verb === "DELETE") {
         containers.delete(name);
@@ -204,6 +212,7 @@ export async function serveFakeDocker({
         const state = action === "start" ? "running" : "exited";
         if (container.state === state) return void response.writeHead(304).end();
         container.state = state;
+        if (state === "running") container.startedAt = new Date().toISOString();
         return void response.writeHead(204).end();
       }
       if (action === "exec") {

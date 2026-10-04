@@ -82,11 +82,11 @@ export interface Volume {
   readonly Labels: Readonly<Record<string, string>> | null;
 }
 
-/** What is read of a container. */
+/** What is read of a container: its state, and when it last started (RFC 3339, to the nanosecond). */
 export interface ContainerInspect {
   readonly Name: string;
   readonly Config: { readonly Labels: Readonly<Record<string, string>> | null };
-  readonly State: { readonly Status: string; readonly Running: boolean };
+  readonly State: { readonly Status: string; readonly Running: boolean; readonly StartedAt: string };
 }
 
 /** A container as `listContainers` lists it: its names begin with "/". */

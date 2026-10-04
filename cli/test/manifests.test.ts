@@ -130,8 +130,12 @@ describe("alasio", () => {
     assert.equal(deployment.spec?.template.spec?.securityContext?.runAsNonRoot, true);
   });
 
-  test("keeps its volume when alasio is removed", () => {
-    assert.equal(one(install(), "PersistentVolumeClaim", "alasio").metadata?.annotations?.["helm.sh/resource-policy"], "keep");
+  test("says every object is managed by alasio, and nothing of Helm's", () => {
+    const objects = install({ host: { enabled: true }, telemetry: { otlpEndpoint: "http://collector:4318" } });
+    assert.doesNotMatch(JSON.stringify(objects), /helm/iu);
+    for (const object of objects.filter(({ kind }) => kind !== "CustomResourceDefinition")) {
+      assert.equal(object.metadata?.labels?.["app.kubernetes.io/managed-by"], "alasio", `${object.kind} ${object.metadata?.name}`);
+    }
   });
 
   test("uses an existing claim instead of making one", () => {
@@ -191,9 +195,9 @@ describe("alasio", () => {
 });
 
 describe("neon", () => {
-  test("makes the stack's secrets in a hook before anything starts", () => {
+  test("makes the stack's secrets in a Job of its own", () => {
     const job = one<V1Job>(install(), "Job", "alasio-neon-setup");
-    assert.equal(job.metadata?.annotations?.["helm.sh/hook"], "pre-install,pre-upgrade");
+    assert.equal(job.spec?.template.spec?.serviceAccountName, "alasio-neon-setup");
     const setup = job.spec?.template.spec?.containers[0];
     assert.deepEqual(setup?.command, ["node", "/opt/alasio/neon/control/kube-setup.ts"]);
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);

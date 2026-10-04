@@ -22,9 +22,10 @@ export class InstallConfigError extends Schema.TaggedError<InstallConfigError>()
 }) {}
 
 /** `schema`, which is `value` (as the config file would hold it) when its key is left out. */
-const defaulted = <S extends Schema.Top>(schema: S, value: S["Encoded"]) => schema.pipe(Schema.withDecodingDefaultKey(Effect.succeed(value)));
+export const defaulted = <S extends Schema.Top>(schema: S, value: S["Encoded"]) => schema.pipe(Schema.withDecodingDefaultKey(Effect.succeed(value)));
 
-const matching = (pattern: RegExp, message: string) => Schema.String.check(Schema.isPattern(pattern, { message }));
+/** A string that matches `pattern`, which `message` says it must otherwise. */
+export const matching = (pattern: RegExp, message: string) => Schema.String.check(Schema.isPattern(pattern, { message }));
 
 const NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
 
@@ -32,10 +33,10 @@ const Namespace = matching(NAME, "must be a namespace name");
 const SecretName = matching(/^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/u, "must be a Secret's name");
 /** A Secret's name, or empty for none. */
 const OptionalSecretName = matching(/^(|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)$/u, "must be a Secret's name, or empty");
-const NonEmpty = Schema.String.check(Schema.isMinLength(1, { message: "must not be empty" }));
-const AbsolutePath = matching(/^\//u, "must be an absolute path");
+export const NonEmpty = Schema.String.check(Schema.isMinLength(1, { message: "must not be empty" }));
+export const AbsolutePath = matching(/^\//u, "must be an absolute path");
 /** An http(s) URL, or empty for none. */
-const OptionalUrl = matching(/^(|https?:\/\/.+)$/u, "must be an http(s) URL, or empty");
+export const OptionalUrl = matching(/^(|https?:\/\/.+)$/u, "must be an http(s) URL, or empty");
 const Id = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be a user or group id" }));
 const Bucket = matching(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u, "must be a bucket's name");
 const Size = matching(/^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$/u, "must be a storage size, such as 20Gi");
@@ -355,8 +356,8 @@ export type Image = InstallConfig["images"]["alasio"];
 
 const formatIssue = SchemaIssue.makeFormatterStandardSchemaV1();
 
-/** The first thing wrong with the configuration: the key's path, then what it must be. */
-function describe(issue: SchemaIssue.Issue): string {
+/** The first thing wrong with a configuration: the key's path, then what it must be. */
+export function describeIssue(issue: SchemaIssue.Issue): string {
   const [first] = formatIssue(issue).issues;
   const path = first?.path?.map((segment) => String(Predicate.hasProperty(segment, "key") ? segment.key : segment)).join(".") ?? "";
   return [path, first?.message ?? "is not what alasio installs from"].filter(Boolean).join(" ");
@@ -366,5 +367,5 @@ function describe(issue: SchemaIssue.Issue): string {
 export const decodeInstallConfig = (input: unknown): Result.Result<InstallConfig, InstallConfigError> =>
   Result.mapError(
     Schema.decodeUnknownResult(InstallConfig)(input, { onExcessProperty: "error" }),
-    (error) => new InstallConfigError({ message: describe(error.issue) }),
+    (error) => new InstallConfigError({ message: describeIssue(error.issue) }),
   );
