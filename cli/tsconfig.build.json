@@ -1,0 +1,15 @@
+{
+  // Compiles the CLI for its npm package: Node strips no types under node_modules, so
+  // the package carries JavaScript. Run from the repository it needs no build.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rewriteRelativeImportExtensions": true,
+    "allowImportingTsExtensions": false,
+    "rootDir": "..",
+    "outDir": "dist",
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src"]
+}

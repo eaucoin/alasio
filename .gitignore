@@ -4,3 +4,4 @@ node_modules/
 .types/
 sandbox/session-host/gvisor/
 sandbox/session-host/juicefs
+cli/dist/

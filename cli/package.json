@@ -1,0 +1,31 @@
+{
+  "name": "alasio",
+  "version": "3.0.4",
+  "description": "alasio: coding agents you talk to from Telegram, installed and run with npx alasio",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "alasio": "dist/cli/src/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node ./src/main.ts"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.0",
+    "@kubernetes/client-node": "2.0.0",
+    "effect": "4.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eaucoin/alasio.git",
+    "directory": "cli"
+  },
+  "homepage": "https://github.com/eaucoin/alasio"
+}

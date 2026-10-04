@@ -1,15 +1,19 @@
 {
-  "name": "alasio",
+  "name": "alasio-server",
   "version": "3.0.4",
   "private": true,
   "type": "module",
-  "description": "Alasio Telegram bridge runtime",
+  "description": "alasio's server: the Telegram bridge that runs Claude Code and Codex, in alasio's image",
+  "license": "MIT",
+  "workspaces": [
+    "cli"
+  ],
   "main": "src/index.ts",
   "scripts": {
     "start": "node ./src/index.ts",
     "doctor:telegram": "node ./src/telegram/doctor.ts",
     "typecheck": "node tooling/codex-protocol-types.ts && tsc -p .",
-    "test": "node --test test/*.test.ts",
+    "test": "node --test test/*.test.ts cli/test/*.test.ts",
     "test:neon": "node --test --test-concurrency=1 --test-timeout=1800000 neon/test/stack.test.ts",
     "lake": "node ./src/neon/lake-query.ts"
   },

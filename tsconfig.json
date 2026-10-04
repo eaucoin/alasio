@@ -1,5 +1,5 @@
 {
-  // Type-checks alasio; nothing is compiled. Node runs the .ts files as they are, by
+  // Type-checks alasio (the server and the CLI); nothing is compiled. Node runs the .ts files as they are, by
   // stripping their types, so they hold only syntax that strips away to JavaScript
   // and import each other by their .ts names.
   "compilerOptions": {
@@ -26,5 +26,5 @@
 
     "skipLibCheck": true
   },
-  "include": ["src", "test", "neon/control", "neon/lake/src", "neon/test", "tooling"]
+  "include": ["src", "test", "cli/src", "cli/test", "neon/control", "neon/lake/src", "neon/test", "tooling"]
 }
