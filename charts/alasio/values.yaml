@@ -143,8 +143,8 @@ host:
   # machine's tools.
   baymaImage:
     repository: ghcr.io/eaucoin/bayma
-    tag: 0.10.0
-    digest: sha256:d06080edb45b4929173fd58cf1f56dd1d9b94b0aa40e243097a6030623d26d2a
+    tag: 0.11.0
+    digest: sha256:91f78d334302fced5c5aecb5bdb1cb99757a8b05d0c9fda5d3b9855ebc6d1236
   # The operator's user and home, which alasio and each folder's bayma run as and in.
   uid: 1000
   gid: 1000
