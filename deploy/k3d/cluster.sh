@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Creates a k3d cluster that runs alasio's chart: k3s nodes with gVisor (node/), the
+# Creates a k3d cluster that runs alasio's chart: k3s nodes with gVisor (cluster/node), the
 # gvisor RuntimeClass, and kubelet thresholds for a machine whose disk the cluster
 # shares with everything else on it, so images in use are not evicted.
 #
@@ -19,7 +19,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 image=alasio-k3s-gvisor:v1.37.1-k3s1
 kubeconfig=${KUBECONFIG_OUT:-$PWD/kubeconfig-$name}
 
-docker image inspect "$image" >/dev/null 2>&1 || docker build -t "$image" "$here/node"
+docker image inspect "$image" >/dev/null 2>&1 || docker build -t "$image" "$here/../../cluster/node"
 
 args=(
   --image "$image"

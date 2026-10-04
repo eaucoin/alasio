@@ -41,7 +41,7 @@ jobs:
       - id: images
         name: Build and push the images, recording their digests
         run: |
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
             name=${image%%:*}
             docker build --tag "$REGISTRY/$name:$VERSION" \
               --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \

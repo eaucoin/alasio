@@ -10,3 +10,6 @@ export const IMAGES = {
   agent: { repository: "ghcr.io/eaucoin/alasio-agent", tag: VERSION, digest: "" },
   lake: { repository: "ghcr.io/eaucoin/alasio-lake", tag: VERSION, digest: "" },
 };
+
+/** The local cluster's node image: k3s with gVisor (cluster/node), pinned like the others. */
+export const NODE_IMAGE = { repository: "ghcr.io/eaucoin/alasio-node", tag: VERSION, digest: "" };
