@@ -17,7 +17,15 @@ import { Effect, Schedule } from "effect";
 
 import { KubeClient } from "../../src/kube/client.ts";
 import { loadKubeTemplates, type SessionsProfile } from "../../src/kube/config.ts";
-import { type BaymaEndpoint, makeSandboxes } from "../../src/kube/sandboxes.ts";
+import {
+  type BaymaEndpoint,
+  makeSandboxes,
+  POD_TEMPLATE_ANNOTATION,
+  podTemplateHash,
+  SANDBOX_API_VERSION,
+  SANDBOX_KIND,
+  type Sandbox,
+} from "../../src/kube/sandboxes.ts";
 import { SessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** What bayma's session.create answers, as far as the end-to-end scripts read it. */
@@ -41,7 +49,13 @@ export interface RoundtripSeen {
   resumeMs: number;
   afterResume?: string | undefined;
   execAfterResume?: string | undefined;
+  podReplaced: boolean;
+  movedPodLabel?: string | undefined;
+  execAfterMove?: string | undefined;
 }
+
+/** The pod label the round trip's other pod template adds. */
+const MOVED_LABEL = "alasio.dev/e2e-moved";
 
 const volumeId = process.argv[2];
 if (!volumeId) throw new Error("usage: session-roundtrip.ts <volumeId>");
@@ -74,14 +88,21 @@ const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
   const seen: Partial<RoundtripSeen> = {};
   const read = (path: string, maxBytes: number) => sessions.readFile(volumeId, path, maxBytes);
 
-  let { bayma } = yield* sessions.ensureSession(volumeId);
+  // Brought up as alasio made it, which this script, without alasio's telemetry settings,
+  // would not make it: from the Sandbox as it is, whose pod template is its own.
+  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
+  // A Sandbox, as the API server returns one.
+  const made = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId)) as Sandbox | null;
+  if (!made) return yield* Effect.die(new Error(`alasio made no Sandbox for ${volumeId}`));
+  const bringUp = sandboxes.ensure(volumeId, () => made);
+
+  let bayma = yield* bringUp;
   const wrote = yield* Effect.promise(() => exec(bayma, 'await Bun.write("/workspace/out/hello.txt", "hello from " + require("os").release()); "written"'));
   seen.exec = wrote.result_text || JSON.stringify(wrote).slice(0, 300);
   seen.read = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
   seen.missing = (yield* read("out/nope.txt", 1024)).note;
   seen.outside = (yield* read("/etc/passwd", 4096)).bytes ? "read /etc/passwd of the sandbox, not the host" : "refused";
 
-  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
   yield* sandboxes.suspend(volumeId);
   // The pod goes within a minute of the suspension.
   const pod = yield* kube.read("v1", "Pod", profile.namespace, volumeId).pipe(
@@ -90,11 +111,25 @@ const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
   seen.suspendedPod = pod ? "still there" : "gone";
   seen.whileSuspended = (yield* read("out/hello.txt", 1024)).note;
   const resumedAt = Date.now();
-  ({ bayma } = yield* sessions.ensureSession(volumeId));
+  bayma = yield* bringUp;
   seen.resumeMs = Date.now() - resumedAt;
   seen.afterResume = (yield* read("out/hello.txt", 1024)).bytes?.toString("utf8");
   const again = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
   seen.execAfterResume = again.result_text;
+
+  // Brought up with another pod template, as after an upgrade: its pod is one of that
+  // template, and its files are kept.
+  const currentPod = kube.read("v1", "Pod", profile.namespace, volumeId);
+  const podBefore = yield* currentPod;
+  const moved = structuredClone(made);
+  moved.spec.podTemplate.metadata = { ...moved.spec.podTemplate.metadata, labels: { ...moved.spec.podTemplate.metadata?.labels, [MOVED_LABEL]: "yes" } };
+  moved.metadata.annotations = { ...moved.metadata.annotations, [POD_TEMPLATE_ANNOTATION]: podTemplateHash(moved.spec.podTemplate) };
+  bayma = yield* sandboxes.ensure(volumeId, () => moved);
+  const podAfter = yield* currentPod;
+  seen.podReplaced = !!podBefore?.metadata?.uid && !!podAfter?.metadata?.uid && podBefore.metadata.uid !== podAfter.metadata.uid;
+  seen.movedPodLabel = podAfter?.metadata?.labels?.[MOVED_LABEL];
+  const afterMove = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
+  seen.execAfterMove = afterMove.result_text;
   return seen;
 });
 

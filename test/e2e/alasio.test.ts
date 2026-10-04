@@ -192,7 +192,7 @@ describe("alasio on Kubernetes", { skip }, () => {
     assert.equal(fromStub, "blocked");
   });
 
-  test("alasio reads a session's files as its agent, and a suspended session resumes with them", async () => {
+  test("alasio reads a session's files as its agent, a suspended session resumes with them, and one of another pod template moves onto it with them", async () => {
     const seen = await roundtrip(none);
     assert.equal(seen.exec, '"written"');
     assert.match(seen.read ?? "", /^hello from /u);
@@ -201,6 +201,9 @@ describe("alasio on Kubernetes", { skip }, () => {
     assert.equal(seen.whileSuspended, "the session is not running");
     assert.equal(seen.afterResume, seen.read);
     assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
+    assert.equal(seen.podReplaced, true);
+    assert.equal(seen.movedPodLabel, "yes");
+    assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
   });
 
   test("a session's telemetry reaches the deployment's backend, stamped with the session", { skip: !process.env["ALASIO_E2E_TELEMETRY"] && "the release exports no telemetry" }, async () => {
