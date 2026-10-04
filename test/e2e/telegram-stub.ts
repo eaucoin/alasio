@@ -3,7 +3,7 @@
  * talks to Telegram, and a test drives it as the operator would, by sending messages and
  * pressing buttons, and reads what alasio sent.
  *
- *   POST /bot<token>/<method>        the Bot API: getUpdates long-polls what the test
+ *   POST|GET /bot<token>/<method>    the Bot API: getUpdates long-polls what the test
  *                                    queued; every other method succeeds and is recorded,
  *                                    unless the test made it fail
  *   GET  /file/bot<token>/<path>     a file the test gave, as getFile names it
@@ -215,9 +215,10 @@ export function createTelegramStub(): TelegramStub {
     const reply = (status: number, body: unknown) => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
     try {
       const bot = /^\/bot[^/]+\/([A-Za-z]+)$/u.exec(url.pathname);
-      if (bot?.[1] !== undefined && request.method === "POST") {
+      // As Telegram's does, the Bot API answers a GET with its query as well as a POST with its body.
+      if (bot?.[1] !== undefined && (request.method === "POST" || request.method === "GET")) {
         const method = bot[1];
-        const payload = (await readJson(request)) as BotApiPayload; // alasio calls the Bot API
+        const payload = (request.method === "GET" ? Object.fromEntries(url.searchParams) : await readJson(request)) as BotApiPayload; // alasio calls the Bot API
         const failure = failures.get(method)?.shift();
         if (failure) {
           recorded.push({ method, payload, at: Date.now(), status: failure.status });
