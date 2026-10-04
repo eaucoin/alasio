@@ -86,6 +86,16 @@ function loadKubeConfig(): KubeConfig {
 
 const ref = (apiVersion: string, kind: string, namespace: string, name: string) => ({ apiVersion, kind, metadata: { namespace, name } });
 
+/**
+ * What a merge patch of the object sends: `patch`, addressed to the object, whose name
+ * and namespace sit in its metadata beside what `patch` changes there.
+ */
+export function patchBody(apiVersion: string, kind: string, namespace: string, name: string, patch: object): KubernetesObject {
+  const target = ref(apiVersion, kind, namespace, name);
+  const metadata = Predicate.hasProperty(patch, "metadata") && isJsonObject(patch.metadata) ? patch.metadata : {};
+  return { ...patch, ...target, metadata: { ...metadata, ...target.metadata } };
+}
+
 /** A call to the API, its rejection a KubeApiError. */
 const call = <A>(request: () => Promise<A>): Effect.Effect<A, KubeApiError> =>
   Effect.tryPromise({ try: request, catch: KubeApiError.of });
@@ -189,7 +199,7 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
     replace: (object) => call(() => objects.replace(object)),
     patch: (apiVersion, kind, namespace, name, patch) =>
       call(() =>
-        objects.patch({ ...ref(apiVersion, kind, namespace, name), ...patch }, undefined, undefined, "alasio", undefined, PatchStrategy.MergePatch)
+        objects.patch(patchBody(apiVersion, kind, namespace, name, patch), undefined, undefined, "alasio", undefined, PatchStrategy.MergePatch)
       ),
     remove: (apiVersion, kind, namespace, name) =>
       call(() => objects.delete(ref(apiVersion, kind, namespace, name), undefined, undefined, undefined, undefined, "Background")).pipe(

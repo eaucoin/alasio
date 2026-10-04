@@ -18,7 +18,7 @@ import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, typ
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
-import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, mergePatch } from "../src/kube/client.ts";
+import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, mergePatch, patchBody } from "../src/kube/client.ts";
 import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
 import {
   makeSandboxes,
@@ -397,6 +397,22 @@ test("a merge patch makes one object into another, removing what the other lacks
   assert.deepEqual(mergePatch(to, to), {});
   assert.deepEqual(mergePatch({ a: 1 }, { a: null }), { a: null });
   assert.equal(mergePatch(1, 2), 2);
+});
+
+test("a patch is sent addressed to its object, beside what it changes in its metadata", () => {
+  const sandbox = ["agents.x-k8s.io/v1beta1", "Sandbox", "alasio-sessions", "fs-abc123"] as const;
+  assert.deepEqual(patchBody(...sandbox, { spec: { operatingMode: "Running" } }), {
+    apiVersion: "agents.x-k8s.io/v1beta1",
+    kind: "Sandbox",
+    metadata: { namespace: "alasio-sessions", name: "fs-abc123" },
+    spec: { operatingMode: "Running" },
+  });
+  assert.deepEqual(patchBody(...sandbox, { metadata: { annotations: { a: "1" }, name: "other" }, spec: {} }), {
+    apiVersion: "agents.x-k8s.io/v1beta1",
+    kind: "Sandbox",
+    metadata: { annotations: { a: "1" }, namespace: "alasio-sessions", name: "fs-abc123" },
+    spec: {},
+  });
 });
 
 test("ensure moves a Sandbox made from another pod template onto alasio's, ending its pod and keeping its volumes", async () => {
