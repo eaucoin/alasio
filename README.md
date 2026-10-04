@@ -64,7 +64,8 @@ kubectl -n alasio rollout restart deployment/alasio
 
 which an agent in a folder workspace may run too: its turn continues once
 alasio is back. Workspaces are pods of their own, so their REPL sessions keep
-running through it.
+running through it. An upgrade that changes a workspace's pod, as a newer bayma
+does, replaces the pod at the workspace's next turn, its files kept.
 
 Every Claude Code transcript entry and Codex rollout line is also a row in an
 analytics lake, which you query read-only with

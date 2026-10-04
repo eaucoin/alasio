@@ -8,6 +8,7 @@
  */
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
+import { isDeepStrictEqual } from "node:util";
 
 import { Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, type V1Status } from "@kubernetes/client-node";
 import { Context, Effect, Layer, Predicate, Result, Schema } from "effect";
@@ -48,6 +49,28 @@ export class KubeExecError extends Schema.TaggedError<KubeExecError>()("KubeExec
 
 /** Whether `error` is the API's answer `status`. */
 export const hasStatus = (status: number) => (error: KubeApiError): boolean => error.status === status;
+
+/** Whether `value` is a JSON object, which a merge patch merges key by key. */
+const isJsonObject = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * The JSON merge patch (RFC 7386) that makes `from` into `to`: objects patched key by key,
+ * with null for each key `to` has no value for, and anything else, arrays included,
+ * given whole. A merge patch cannot set a null, so a null in `to` is a key it lacks.
+ */
+export function mergePatch(from: unknown, to: unknown): unknown {
+  if (!isJsonObject(from) || !isJsonObject(to)) return to;
+  const patch: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(from)) {
+    if (value !== undefined && to[key] === undefined) patch[key] = null;
+  }
+  for (const [key, value] of Object.entries(to)) {
+    if (value === undefined || isDeepStrictEqual(from[key], value)) continue;
+    patch[key] = mergePatch(from[key], value);
+  }
+  return patch;
+}
 
 /** The socket a `pods/exec` runs over. */
 type ExecSocket = Awaited<ReturnType<Exec["exec"]>>;

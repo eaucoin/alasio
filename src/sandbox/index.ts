@@ -293,6 +293,12 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       Effect.flatMap((made) => sandboxes.ensure(volumeId, () => made)),
     );
 
+  /** The internet a session was made with, as its Sandbox says; none for one not made, as a session is by default. */
+  const netModeOf = (volumeId: string): Effect.Effect<NetMode, KubeApiError> =>
+    kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId).pipe(
+      Effect.map((sandbox) => (sandbox?.metadata?.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none")),
+    );
+
   const readFile = Effect.fnUntraced(function*(volumeId: string, path: string, maxBytes: number): Effect.fn.Return<FileRead, KubeApiError | KubeExecError | SessionFileError> {
     // A Sandbox, as the API server returns one.
     const sandbox = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(volumeId))) as Sandbox | null;
@@ -328,8 +334,12 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       return directory;
     },
 
+    // Brought up as it was made: a pod of another template would be replaced by this one.
     ensureSession: (volumeId) =>
-      Effect.suspend(() => ensure(assertValidVolumeId(volumeId), "none")).pipe(Effect.map((bayma) => ({ bayma }))),
+      Effect.suspend(() => {
+        const id = assertValidVolumeId(volumeId);
+        return netModeOf(id).pipe(Effect.flatMap((netMode) => ensure(id, netMode)));
+      }).pipe(Effect.map((bayma) => ({ bayma }))),
 
     readFile,
   });

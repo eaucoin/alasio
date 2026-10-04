@@ -9,8 +9,12 @@
  * with it. bayma reads the token from a file (`--token-file`) and refuses any request
  * without it, so a Sandbox is closed to everything but alasio even before the
  * NetworkPolicy that admits only alasio applies to its new pod.
+ *
+ * agent-sandbox never changes a pod it has made, so a Sandbox records the pod template
+ * it runs, and one made from another than alasio's current template (as after an upgrade
+ * that brings a newer bayma) is moved onto it the next time alasio brings it up.
  */
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type {
   KubernetesObject,
@@ -27,7 +31,7 @@ import { FetchHttpClient } from "effect/http";
 
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
-import { hasStatus, type KubeApiError, KubeClient } from "./client.ts";
+import { hasStatus, type KubeApiError, KubeClient, mergePatch } from "./client.ts";
 
 export const SANDBOX_API_VERSION = "agents.x-k8s.io/v1beta1";
 export const SANDBOX_KIND = "Sandbox";
@@ -150,9 +154,10 @@ export type SandboxError = KubeApiError | SandboxNotReady | SandboxGone | Sandbo
 export interface Sandboxes {
   readonly namespace: string;
   /**
-   * Makes sure the Sandbox exists (made from `manifest()` when it does not), runs, and
-   * its bayma answers: the MCP endpoint and the bearer to reach it with. Callers asking
-   * at once share one bring-up.
+   * Makes sure the Sandbox exists (made from `manifest()` when it does not), runs a pod
+   * of `manifest()`'s template (replacing one of another, its volumes kept), and its
+   * bayma answers: the MCP endpoint and the bearer to reach it with. Callers asking at
+   * once share one bring-up.
    */
   readonly ensure: (name: string, manifest: () => Sandbox) => Effect.Effect<BaymaEndpoint, SandboxError>;
   /** The Sandbox's token, or null when it has none. */
@@ -180,6 +185,8 @@ const TOKEN_VOLUME = "alasio-bayma-token";
 /** The label every object alasio makes carries, and the one that names its Sandbox. */
 const MANAGED_BY = { "app.kubernetes.io/managed-by": "alasio" };
 const SANDBOX_LABEL = "alasio.dev/sandbox";
+/** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
+export const POD_TEMPLATE_ANNOTATION = "alasio.dev/pod-template";
 
 // A first start pulls the image and provisions the volume, so it is given minutes.
 const READY_TIMEOUT: Duration.Input = "5 minutes";
@@ -208,10 +215,23 @@ export function sameToken(presented: string, expected: string): boolean {
 }
 
 /**
+ * A digest of `podTemplate` that two templates share only when they are the same,
+ * whatever the order of their keys.
+ */
+export function podTemplateHash(podTemplate: V1PodTemplateSpec): string {
+  const sorted = (_key: string, value: unknown): unknown =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : value;
+  return createHash("sha256").update(JSON.stringify(podTemplate, sorted)).digest("hex");
+}
+
+/**
  * The Sandbox for `name` from a profile's `template` (`{ podTemplate,
  * volumeClaimTemplates }`, rendered by the chart), with what every Sandbox needs: its
- * labels, Running, its Service, and bayma given its token. `configure(podSpec, bayma)`
- * adds what is the caller's own and returns the spec. Pure, for tests.
+ * labels, Running, its Service, bayma given its token, and the hash of the pod template
+ * it runs. `configure(podSpec, bayma)` adds what is the caller's own and returns the
+ * spec. Pure, for tests.
  */
 export function sandboxManifest({
   name,
@@ -242,7 +262,7 @@ export function sandboxManifest({
   return {
     apiVersion: SANDBOX_API_VERSION,
     kind: SANDBOX_KIND,
-    metadata: { name, namespace, labels: allLabels, ...(Object.keys(annotations).length ? { annotations } : {}) },
+    metadata: { name, namespace, labels: allLabels, annotations: { ...annotations, [POD_TEMPLATE_ANNOTATION]: podTemplateHash(podTemplate) } },
     spec: {
       operatingMode: "Running",
       service: true,
@@ -287,10 +307,18 @@ function stored(object: KubernetesObject): StoredSandbox {
   return object as StoredSandbox;
 }
 
+/** The conditions of a Sandbox alasio waits for. */
+type SandboxConditionType = "Ready" | "Suspended";
+
+/** Whether the Sandbox's `type` condition holds, for its current spec. */
+function holds(sandbox: SandboxReadiness, type: SandboxConditionType): boolean {
+  const found = condition(sandbox, type);
+  return found?.status === "True" && (found.observedGeneration ?? 0) >= (sandbox.metadata.generation ?? 0);
+}
+
 /** Whether the Sandbox's pod is ready and its Service exists, for its current spec. */
 export function sandboxReady(sandbox: SandboxReadiness): boolean {
-  const ready = condition(sandbox, "Ready");
-  return ready?.status === "True" && (ready.observedGeneration ?? 0) >= (sandbox.metadata.generation ?? 0);
+  return holds(sandbox, "Ready");
 }
 
 /**
@@ -324,11 +352,11 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return value;
   });
 
-  /** The Sandbox, made from `manifest()` when it does not exist. */
-  const readOrCreate = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxGone> {
+  /** The Sandbox, made from `manifest` when it does not exist. */
+  const readOrCreate = Effect.fnUntraced(function*(name: string, manifest: Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxGone> {
     const existing = yield* read(name);
     if (existing) return existing;
-    const created = yield* kube.create(manifest()).pipe(
+    const created = yield* kube.create(manifest).pipe(
       Effect.map(stored),
       Effect.tap(() => Effect.logInfo(`created Sandbox ${namespace}/${name}`)),
       // Made meanwhile by another alasio: that one is it.
@@ -352,19 +380,19 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     );
   });
 
-  const notReady = (sandbox: StoredSandbox): SandboxNotReady =>
+  const notYet = (sandbox: StoredSandbox, type: SandboxConditionType): SandboxNotReady =>
     new SandboxNotReady({
       namespace,
       name: sandbox.metadata.name,
       within: Duration.toSeconds(readyTimeout),
-      reason: condition(sandbox, "Ready")?.message || undefined,
+      reason: condition(sandbox, type)?.message || undefined,
     });
 
-  /** The Sandbox once its controller says it is ready, looked at every `poll` for `readyTimeout`. */
-  const awaitReady = (initial: StoredSandbox): Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> => {
+  /** The Sandbox once its controller says its `type` condition holds, looked at every `poll` for `readyTimeout`. */
+  const awaitCondition = (initial: StoredSandbox, type: SandboxConditionType): Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> => {
     const name = initial.metadata.name;
     const check = (sandbox: StoredSandbox): Effect.Effect<StoredSandbox, SandboxNotReady> =>
-      sandboxReady(sandbox) ? Effect.succeed(sandbox) : Effect.fail(notReady(sandbox));
+      holds(sandbox, type) ? Effect.succeed(sandbox) : Effect.fail(notYet(sandbox, type));
     const again: Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> = Effect.sleep(poll).pipe(
       Effect.andThen(read(name)),
       Effect.flatMap((sandbox): Effect.Effect<StoredSandbox, SandboxNotReady | SandboxGone> =>
@@ -394,16 +422,35 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return answered.pipe(Effect.retry(Schedule.max([Schedule.spaced(poll), Schedule.during(remaining)])), Effect.asVoid);
   };
 
+  /**
+   * `sandbox`, made from another pod template than `desired`'s, given it and suspended:
+   * suspending ends its pod and keeps its volumes, so the pod it resumes with is made
+   * from that template.
+   */
+  const moveOnto = Effect.fnUntraced(function*(sandbox: StoredSandbox, desired: Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+    const name = sandbox.metadata.name;
+    yield* Effect.logInfo(`moving Sandbox ${namespace}/${name} onto its current pod template`);
+    const moved = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
+      metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] } },
+      spec: { operatingMode: "Suspended", podTemplate: mergePatch(sandbox.spec.podTemplate, desired.spec.podTemplate) },
+    }));
+    return yield* awaitCondition(moved, "Suspended");
+  });
+
   const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
-    let sandbox = yield* readOrCreate(name, manifest);
+    const desired = manifest();
+    let sandbox = yield* readOrCreate(name, desired);
     yield* ensureToken(sandbox);
+    if (sandbox.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] !== desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]) {
+      sandbox = yield* moveOnto(sandbox, desired);
+    }
     if (sandbox.spec?.operatingMode === "Suspended") {
       sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
       yield* Effect.logInfo(`resumed Sandbox ${namespace}/${name}`);
     }
     // Readiness and bayma's answer share one deadline.
     const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(readyTimeout);
-    sandbox = yield* awaitReady(sandbox);
+    sandbox = yield* awaitCondition(sandbox, "Ready");
     const value = yield* token(name);
     if (!value) return yield* new SandboxTokenMissing({ namespace, name });
     const host = sandbox.status?.serviceFQDN ?? `${name}.${namespace}.svc`;

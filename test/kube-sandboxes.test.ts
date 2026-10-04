@@ -18,11 +18,13 @@ import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, typ
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
-import { type ExecResult, exitCodeOf, KubeApiError, KubeClient } from "../src/kube/client.ts";
+import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, mergePatch } from "../src/kube/client.ts";
 import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
 import {
   makeSandboxes,
   newToken,
+  POD_TEMPLATE_ANNOTATION,
+  podTemplateHash,
   type SandboxSpec,
   type SandboxStatus,
   sameToken,
@@ -61,9 +63,21 @@ interface KeptObject extends KubernetesObject {
   stringData?: Record<string, string>;
 }
 
-/** A merge patch of a Sandbox's spec, the only kind alasio makes. */
+/** A merge patch of a Sandbox's annotations and spec, the only kind alasio makes. */
 interface SandboxPatch {
+  readonly metadata?: { readonly annotations?: Readonly<Record<string, string | undefined>> };
   readonly spec?: Partial<SandboxSpec>;
+}
+
+/** `target` with the JSON merge patch `patch` applied (RFC 7386), as the API server applies one. */
+function applyMergePatch(target: unknown, patch: unknown): unknown {
+  if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return patch;
+  const result: Record<string, unknown> = typeof target === "object" && target !== null && !Array.isArray(target) ? { ...target } : {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete result[key];
+    else result[key] = applyMergePatch(result[key], value);
+  }
+  return result;
 }
 
 type ExecArgs = Parameters<KubeClient["Service"]["exec"]>;
@@ -124,8 +138,11 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
       calls.push(["patch", kind, name, change]);
       const object = objects.get(key(kind, namespace, name));
       if (!object) return Effect.fail(refusal(404, "absent"));
-      object.spec = { ...object.spec, ...change.spec };
-      object.metadata.generation += 1;
+      const { metadata, spec } = applyMergePatch(object, structuredClone(change)) as KeptObject;
+      object.metadata = metadata;
+      object.spec = spec ?? {};
+      // As the API server does: a change of spec is a new generation.
+      if (change.spec) object.metadata.generation += 1;
       return Effect.succeed(structuredClone(object));
     });
   const service = KubeClient.of({
@@ -163,6 +180,26 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
         serviceFQDN: `${name}.${namespace}.svc.cluster.local`,
         conditions: [readyCondition(sandbox.metadata.generation)],
       };
+    },
+    /**
+     * Acts on the Sandbox every few milliseconds as agent-sandbox's controller does: ends
+     * the pod of a suspended one, saying so, and starts a running one's from its current
+     * pod template, recorded in `pods`. Stops when `stop()` is called.
+     */
+    control(namespace: string, name: string) {
+      const pods: string[] = [];
+      const timer = setInterval(() => {
+        const sandbox = objects.get(key("Sandbox", namespace, name));
+        if (!sandbox) return;
+        const generation = sandbox.metadata.generation;
+        if (sandbox.spec?.operatingMode === "Suspended") {
+          sandbox.status = { conditions: [{ ...readyCondition(generation), type: "Suspended", reason: "SandboxSuspendedPodTerminated" }] };
+        } else if (!sandboxReady(sandbox)) {
+          pods.push(String(sandbox.spec?.podTemplate?.spec?.containers[0]?.image));
+          this.ready(namespace, name);
+        }
+      }, 5);
+      return { pods, stop: () => clearInterval(timer) };
     },
   };
 }
@@ -315,16 +352,94 @@ test("ensure makes the Sandbox and its token, waits for bayma to answer, and is 
 
 test("ensure resumes a suspended Sandbox and gives one left without a token its Secret", async () => {
   const kube = fakeKube();
-  const created = kube.create(sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() }));
+  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const created = kube.create(manifest());
   kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
   kube.ready("alasio-sessions", "fs-abc123");
+  kube.calls.length = 0;
   await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
     const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
     // The resume raises the generation, so the earlier readiness no longer counts.
     after(20, () => kube.ready("alasio-sessions", "fs-abc123"));
-    yield* sandboxes.ensure("fs-abc123", () => assert.fail("an existing Sandbox is not made again"));
+    yield* sandboxes.ensure("fs-abc123", manifest);
   }));
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
+  assert.equal(kube.peek("Secret", "alasio-sessions", "fs-abc123-bayma-token")?.metadata.ownerReferences?.[0]?.uid, created.metadata?.uid);
+  // Made from its current template, it is resumed and nothing else.
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch" || verb === "create").map(([verb, kind, , change]) => [verb, kind, change]), [
+    ["create", "Secret", undefined],
+    ["patch", "Sandbox", { spec: { operatingMode: "Running" } }],
+  ]);
+});
+
+test("a Sandbox records the pod template it runs, the same for the same template however it is written", () => {
+  const hashOf = (template: SessionsProfile) =>
+    sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template }).metadata.annotations?.[POD_TEMPLATE_ANNOTATION];
+  const recorded = hashOf(profile());
+  assert.match(recorded ?? "", /^[0-9a-f]{64}$/u);
+  assert.equal(recorded, podTemplateHash(sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() }).spec.podTemplate));
+  // The same template with its keys in another order.
+  const podTemplate = profile().podTemplate;
+  assert.equal(hashOf(profile({ podTemplate: Object.fromEntries(Object.entries(podTemplate).reverse()) })), recorded);
+  assert.notEqual(hashOf(profile({ podTemplate: { ...profile().podTemplate, spec: { containers: [{ name: "bayma", image: "agent@sha256:2" }] } } })), recorded);
+  // What the caller adds to the Sandbox's own metadata is beside it.
+  assert.deepEqual(
+    sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile(), annotations: { "alasio.dev/conversation": "telegram:1" } }).metadata.annotations,
+    { "alasio.dev/conversation": "telegram:1", [POD_TEMPLATE_ANNOTATION]: recorded },
+  );
+});
+
+test("a merge patch makes one object into another, removing what the other lacks and giving arrays whole", () => {
+  const from = { a: 1, b: { c: 2, d: 3 }, e: [1, 2], f: "same", g: { h: 1 } };
+  const to = { a: 1, b: { c: 2, x: 4 }, e: [1], f: "same", g: { h: 1 }, i: { j: true }, k: undefined };
+  const patch = mergePatch(from, to);
+  assert.deepEqual(patch, { b: { d: null, x: 4 }, e: [1], i: { j: true } });
+  assert.deepEqual(mergePatch(to, to), {});
+  assert.deepEqual(mergePatch({ a: 1 }, { a: null }), { a: null });
+  assert.equal(mergePatch(1, 2), 2);
+});
+
+test("ensure moves a Sandbox made from another pod template onto alasio's, ending its pod and keeping its volumes", async () => {
+  const kube = fakeKube();
+  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const created = kube.create(older);
+  // Its pod of the older template runs.
+  kube.ready("alasio-sessions", "fs-abc123");
+  // A newer bayma, and a label the chart no longer renders.
+  const template = profile({
+    podTemplate: {
+      metadata: {},
+      spec: { ...profile().podTemplate.spec, containers: [{ name: "bayma", image: "agent@sha256:2", args: ["mcp-http", "--port", "7290"] }] },
+    },
+  });
+  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template, annotations: { "alasio.dev/conversation": "telegram:1" } });
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  const patches = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
+    yield* sandboxes.ensure("fs-abc123", () => current);
+    const patches = kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change);
+    // Brought up again, it is on alasio's template, and left as it is.
+    kube.calls.length = 0;
+    yield* sandboxes.ensure("fs-abc123", () => current);
+    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
+    return patches;
+  })).finally(controller.stop);
+  // Suspended with the current template, which ends the older pod, then resumed: one pod, of the current template.
+  assert.deepEqual(patches, [
+    {
+      metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] } },
+      spec: { operatingMode: "Suspended", podTemplate: mergePatch(older.spec.podTemplate, current.spec.podTemplate) },
+    },
+    { spec: { operatingMode: "Running" } },
+  ]);
+  assert.deepEqual(controller.pods, ["agent@sha256:2"]);
+  const moved = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
+  assert.ok(moved);
+  assert.deepEqual(moved.spec?.podTemplate, current.spec.podTemplate);
+  assert.equal(moved.metadata.annotations?.[POD_TEMPLATE_ANNOTATION], current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]);
+  assert.equal(moved.spec?.operatingMode, "Running");
+  assert.deepEqual(moved.spec?.volumeClaimTemplates, older.spec.volumeClaimTemplates);
+  assert.equal(moved.metadata.uid, created.metadata?.uid, "the Sandbox, and so its volumes, are the same");
   assert.equal(kube.peek("Secret", "alasio-sessions", "fs-abc123-bayma-token")?.metadata.ownerReferences?.[0]?.uid, created.metadata?.uid);
 });
 
@@ -430,6 +545,9 @@ test("a session on Kubernetes is made when created, and its files are read as it
     assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.labels?.["alasio.dev/net-mode"], "full");
     const { bayma } = yield* sessions.ensureSession("fs-abc123");
     assert.equal(bayma.url, "http://fs-abc123.alasio-sessions.svc.cluster.local:7290/mcp");
+    // Brought up with the internet it was made with, so its pod stays as it was made.
+    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
+    assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.labels?.["alasio.dev/net-mode"], "full");
 
     assert.deepEqual(yield* sessions.readFile("fs-abc123", "out/a.txt", 100), { bytes: Buffer.from("hello") });
     const exec = kube.calls.find((call): call is Extract<KubeCall, readonly ["exec", ...ExecArgs]> => call[0] === "exec");
