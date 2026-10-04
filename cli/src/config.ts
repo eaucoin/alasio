@@ -47,6 +47,8 @@ const LocalTarget = Schema.Struct({
   hostAliases: defaulted(Schema.Array(Schema.Struct({ ip: Ipv4, hostnames: Schema.Array(NonEmpty).check(Schema.isMinLength(1, { message: "must name a host" })) })), []),
   mounts: defaulted(Schema.Array(Schema.Struct({ source: AbsolutePath, target: AbsolutePath, readOnly: Schema.optionalKey(Schema.Boolean) })), []),
   storagePath: Schema.optionalKey(AbsolutePath),
+  /** The node image, such as one built from cluster/node on this machine; this version's unless given. */
+  image: Schema.optionalKey(NonEmpty),
   agents: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 }, { message: "must be from 0 to 16" })), 0),
 });
 

@@ -2,7 +2,7 @@
  * Recognises an agent restarting alasio, so the restart is recorded as its own doing and
  * its turn continues afterwards as one it caused. alasio is a Kubernetes Deployment,
  * restarted by rolling it out again: `kubectl rollout restart` of `ALASIO_DEPLOYMENT`
- * (alasio unless set), which the chart's host profile lets folder workspaces' agents do.
+ * (alasio unless set), which the host profile lets folder workspaces' agents do.
  */
 import type { RestartEvent } from "../persistence/restart-repository.ts";
 import { resolveCommandTokens, tokenizeShellCommand, unwrapShellCommandOnce } from "./shell-command.ts";

@@ -338,7 +338,7 @@ test("subnetAddress counts from the subnet's network address, within its host ad
 });
 
 test("nodeHostsWith keeps k3s's lines for the nodes and replaces every other with the aliases", () => {
-  const nodeHosts = "172.31.252.250 otelcol.observability\n172.31.252.1 host.k3d.internal\n172.31.252.3 dev-server-0";
+  const nodeHosts = "172.31.252.250 otelcol.observability\n172.31.252.1 host.docker.internal\n172.31.252.3 dev-server-0";
   assert.equal(
     nodeHostsWith(nodeHosts, ["dev-server-0"], [{ ip: "172.31.252.251", hostnames: ["otelcol.observability", "otelcol"] }]),
     "172.31.252.3 dev-server-0\n172.31.252.251 otelcol.observability otelcol",

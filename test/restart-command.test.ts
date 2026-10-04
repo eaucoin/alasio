@@ -19,7 +19,7 @@ test("a rollout restart of alasio's own Deployment is a self-restart, however it
   }
 });
 
-test("a release's own Deployment name is the one that counts", () => {
+test("an installation's own Deployment name is the one that counts", () => {
   const named = { ALASIO_DEPLOYMENT: "bot-alasio" };
   assert.equal(looksLikeSelfRestartCommand("kubectl rollout restart deployment/bot-alasio", { env: named }), true);
   assert.equal(looksLikeSelfRestartCommand("kubectl rollout restart deployment/alasio", { env: named }), false);

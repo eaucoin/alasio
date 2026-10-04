@@ -1,6 +1,6 @@
 /**
- * alasio's Neon: the connection alasio keeps to the database its deployment runs (the Helm
- * chart's Neon, or one of the operator's), and what alasio keeps in it.
+ * alasio's Neon: the connection alasio keeps to the database its installation runs (the
+ * Neon alasio installs, or one of the operator's), and what alasio keeps in it.
  *
  * It makes the analytics lake's role and catalog database either way (./lake.ts), and
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it

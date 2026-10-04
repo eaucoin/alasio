@@ -45,7 +45,7 @@ export interface SandboxMetadata extends V1ObjectMeta {
   namespace: string;
 }
 
-/** What alasio sets of a Sandbox's spec (charts/agent-sandbox/crds). */
+/** What alasio sets of a Sandbox's spec (cli/src/manifests/sandboxes.agents.x-k8s.io.json). */
 export interface SandboxSpec {
   operatingMode?: SandboxOperatingMode;
   /** Whether agent-sandbox gives the Sandbox a Service of its own. */
@@ -228,10 +228,10 @@ export function podTemplateHash(podTemplate: V1PodTemplateSpec): string {
 
 /**
  * The Sandbox for `name` from a profile's `template` (`{ podTemplate,
- * volumeClaimTemplates }`, rendered by the chart), with what every Sandbox needs: its
- * labels, Running, its Service, bayma given its token, and the hash of the pod template
- * it runs. `configure(podSpec, bayma)` adds what is the caller's own and returns the
- * spec. Pure, for tests.
+ * volumeClaimTemplates }`, as the installation gives it), with what every Sandbox
+ * needs: its labels, Running, its Service, bayma given its token, and the hash of the
+ * pod template it runs. `configure(podSpec, bayma)` adds what is the caller's own and
+ * returns the spec. Pure, for tests.
  */
 export function sandboxManifest({
   name,

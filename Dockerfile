@@ -1,7 +1,7 @@
 # alasio's image: the bot, neon-control, and the Neon setup job, on Node.
 #
-# The base is a full Ubuntu userland rather than a slim one because, with the chart's
-# host profile, the harnesses work on the operator's own machine from inside this
+# The base is a full Ubuntu userland rather than a slim one because, with the host
+# profile, the harnesses work on the operator's own machine from inside this
 # container: Codex runs its shell commands here, so the commands an agent runs should
 # behave as they do on an ordinary Ubuntu host. Published as ghcr.io/eaucoin/alasio by
 # .github/workflows/release.yml.

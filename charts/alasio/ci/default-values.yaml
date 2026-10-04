@@ -1,5 +1,0 @@
-# What chart-testing and CI lint the chart with: the defaults, given the one value
-# every install must set.
-alasio:
-  telegram:
-    existingSecret: alasio-telegram

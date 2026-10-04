@@ -11,7 +11,8 @@
  * second, after the gateway, and the agents those after it.
  *
  * The API server is published on the loopback only. What is done in the cluster itself,
- * waiting for it and configuring it, is done with the kubectl the server node carries.
+ * waiting for it and configuring it, is done with the kubectl k3s carries in the server
+ * node, so this machine needs none of Kubernetes' tools.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
@@ -200,8 +201,8 @@ export function subnetAddress(cidr: string, index: number): string | null {
 
 /**
  * CoreDNS's NodeHosts, a hosts file, with `aliases`: k3s keeps a line for each node in
- * it, which stays, and every other line is the cluster's aliases, which are replaced, as
- * k3d replaced its host aliases. Pure, for tests.
+ * it, which stays, and every other line is the cluster's aliases, which are replaced.
+ * Pure, for tests.
  */
 export function nodeHostsWith(nodeHosts: string, nodes: readonly string[], aliases: readonly HostAlias[]): string {
   const kept = nodeHosts.split("\n").filter((line) => line.trim().split(/\s+/u).slice(1).some((host) => nodes.includes(host)));

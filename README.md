@@ -9,81 +9,100 @@ bayma's REPL sessions.
 
 ## Get Started
 
-alasio runs on Kubernetes, from its Helm chart. The cluster needs a
-`gvisor` RuntimeClass and to enforce NetworkPolicy; on a single machine with
-Docker and k3d, `deploy/k3d/cluster.sh` makes one:
+alasio installs and runs itself with its command line, the npm package
+`alasio`. On a Linux x86-64 machine with Docker and Node 24, make a bot with
+BotFather, then:
 
 ```sh
-deploy/k3d/cluster.sh alasio
-export KUBECONFIG=$PWD/kubeconfig-alasio
+npx alasio init
+npx alasio up
 ```
 
-The chart and its images are private, in GitHub's container registry: log
-Helm in with `helm registry login ghcr.io`, and give the cluster credentials to
-pull with, through the chart's `imagePullSecrets` or, for that k3d cluster,
-`REGISTRY_CONFIG`.
-
-Make a bot with BotFather, then put its token and the Telegram user IDs
-allowed to use it in a Secret, and install:
-
-```sh
-kubectl create namespace alasio
-kubectl -n alasio create secret generic alasio-telegram \
-  --from-literal=token=<bot token> --from-literal=allowedUserIds=<user ids>
-helm install alasio oci://ghcr.io/eaucoin/charts/alasio --version 3.0.4 \
-  -n alasio --set alasio.telegram.existingSecret=alasio-telegram
-```
-
-Claude Code logs in with a token from `claude setup-token`, in a Secret the
-chart's `alasio.claude.existingSecret` names. Codex logs in once, in alasio's
-pod, and keeps the login on alasio's volume:
-
-```sh
-kubectl -n alasio exec -it deployment/alasio -c alasio -- \
-  /opt/alasio/node_modules/.bin/codex login --device-auth
-```
+`init` asks for the bot's token, which it checks with Telegram, the Telegram
+user IDs allowed to use it, Claude Code's token from `claude setup-token`,
+whether agents may work in this machine's folders, and where telemetry goes. It
+writes what you answer to `~/.config/alasio/config.json`, which holds no
+secret: the tokens are kept in the cluster alone, as Secrets. That cluster is
+one alasio makes on this machine, k3s with gVisor in Docker, its volumes under
+`~/.local/share/alasio/storage`. `up` starts it, and alasio in it, and waits
+until alasio runs. Run `init` again to change an answer; every question has a
+flag that answers it instead, for scripts (`npx alasio init --help`). Each
+command below runs as `npx alasio <command>`, or as `alasio <command>` once
+`npm install --global alasio` has installed it.
 
 Then message the bot. `/service` chooses the agent, Claude Code or Codex, and
 `/workspace` where it works. A new empty workspace is a filesystem of its own,
 in a sandbox that reaches the internet only if you chose so and never the
 cluster. Folder workspaces are your machine's own folders, worked on as you:
-they need the chart's host profile, `host.enabled`, which is privileged by
-nature and meant for a single-node cluster you own; its values say which of
-the machine's paths to mount and which user to run as.
+`init` asks which, and as whom; they are privileged by nature, and meant for a
+machine you own.
 
-`charts/alasio/values.yaml` documents every value. Among them, `neon.external`
-uses a Postgres of your own instead of the Neon the chart runs, and
-`objectStore.external` an S3-compatible store instead of the bundled
-SeaweedFS, where Neon keeps its storage and a daily backup goes.
-
-Restart alasio with
+Codex logs in once, in alasio, and keeps the login on alasio's volume:
 
 ```sh
-kubectl -n alasio rollout restart deployment/alasio
+npx alasio login codex
 ```
 
-which an agent in a folder workspace may run too: its turn continues once
-alasio is back. Workspaces are pods of their own, so their REPL sessions keep
-running through it. An upgrade that changes a workspace's pod, as a newer bayma
-does, replaces the pod at the workspace's next turn, its files kept.
+`alasio status` says what runs and whether it is healthy, `alasio logs` what
+alasio logs (`--follow` follows it, and `alasio logs lake` a component's), and
+`alasio restart` restarts it: a turn continues once alasio is back, and
+workspaces are pods of their own, so their REPL sessions keep running through
+it. `npx alasio@latest upgrade` upgrades alasio to the newest version. An
+upgrade that changes a workspace's pod, as a newer bayma does, replaces the pod
+at the workspace's next turn, its files kept. `alasio down` stops the cluster,
+keeping everything, and `alasio up` starts it again.
 
 Every Claude Code transcript entry and Codex rollout line is also a row in an
 analytics lake, which you query read-only with
 
 ```sh
-kubectl -n alasio exec deployment/alasio-lake -- node src/query.ts "SELECT count(*) FROM claude.entries"
+npx alasio lake "SELECT count(*) FROM claude.entries"
 ```
 
-alasio exports OpenTelemetry traces, metrics, and logs, over OTLP, to wherever
-the chart's `telemetry.otlpEndpoint` says, and Claude Code, Codex, and bayma
-export theirs to the same place; with no endpoint set, nothing is exported.
+alasio exports OpenTelemetry traces, metrics, and logs, over OTLP, to the
+endpoint `init` asks for, and Claude Code, Codex, and bayma export theirs to
+the same place; with none, nothing is exported.
+
+The config's `install` holds the rest of how alasio is installed, every key of
+it optional, and `cli/src/manifests/config.ts` documents each. Among them,
+`neon.external` uses a Postgres of your own instead of the Neon alasio runs,
+and `objectStore.external` an S3-compatible store instead of the bundled
+SeaweedFS, where Neon keeps its storage and a daily backup goes. `alasio up`
+applies what you change.
+
+`alasio uninstall` removes alasio and keeps its data, which `alasio up`
+installs it again with; `alasio uninstall --purge` removes the data too, and
+the cluster alasio made.
+
+alasio runs in a cluster of yours as well: `npx alasio init --kubeconfig
+<path>`, with `--context <name>` for another than the kubeconfig's current
+one, installs it in the cluster that kubeconfig reaches. The cluster must
+enforce NetworkPolicy, and have a `gvisor` RuntimeClass, unless the config's
+`sessions.runtimeClassName` names another.
 
 ## Development
 
 alasio is TypeScript that Node 24 runs as it is, checked by `npm run typecheck`
-against `tsconfig.json`. Its control plane is written in Effect: its services are
-layers, composed in `src/alasio.ts`. See `package.json` for the development
-scripts, `.env.example` for running alasio outside the cluster against one,
-`Dockerfile`, `sandbox/`, and `neon/lake/` for the images, `charts/alasio/` for
-the chart and its tests, `test/e2e/run.sh` for the end-to-end run, and
-`.github/workflows/` for the GitHub Actions workflows.
+against `tsconfig.json` and tested by `npm test`. `src/` is alasio's server,
+the Telegram bridge that runs the agents, in alasio's image (`Dockerfile`); its
+control plane is written in Effect, its services layers composed in
+`src/alasio.ts`, and `.env.example` is for running it outside the cluster
+against one. `cli/` is the command line, the npm package: it builds the
+Kubernetes objects it installs in `cli/src/manifests/`, applies them through
+the Kubernetes API, and makes the cluster on this machine through Docker's
+Engine API, in `cli/src/cluster/`, from the node image in `cluster/node/`.
+`sandbox/agent/` is the image sessions run, and `neon/` what alasio adds to
+Neon: neon-control, and the analytics lake, with its image.
+
+`npm run test:e2e` is the end-to-end run: it packs the command line's package
+and installs it, builds the images, makes a cluster from them with `alasio
+init`, starts alasio with `alasio up`, drives it through a Telegram stand-in,
+puts its Neon through crashes, and removes it all with `alasio uninstall
+--purge`. It needs Docker, and much of its disk; `ALASIO_E2E_AGENTS` gives the
+cluster agent nodes beside its server.
+
+The GitHub Actions workflows in `.github/workflows/` run on demand: `ci.yml`
+the tests, a check of the package npm packs, and the end-to-end run, on one
+node and on three; `release.yml`, from a version tag, the release, which
+publishes the images to GitHub's container registry and the command line,
+pinned to them by digest, to npm.

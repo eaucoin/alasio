@@ -1,63 +1,65 @@
 /**
- * alasio on Kubernetes, end to end: an installed release driven through the Telegram
- * stand-in as its operator drives it, its sessions' confinement checked from inside
- * them, its own code paths run in its pod with its ServiceAccount, and its telemetry
- * looked for where the deployment's goes.
+ * alasio, end to end, as its operator runs it: installed and started by its command line
+ * from its npm package (./harness.ts), driven through the Telegram stand-in as its
+ * operator drives it, its sessions' confinement checked from inside them, its own code
+ * paths run in its pod with its ServiceAccount, its telemetry looked for where the
+ * installation's goes, its Neon put through crashes and losses (neon/test/stack.ts), and
+ * removed, with all it keeps, by its command line at the end.
  *
- * Runs against a release that test/e2e/run.sh installed: KUBECONFIG names the cluster,
- * ALASIO_E2E_NAMESPACE and ALASIO_E2E_RELEASE the release (alasio and alasio unless set);
- * the stand-ins run in the namespace alasio-test. Needs kubectl.
+ *   ALASIO_E2E_AGENTS=2 npm run test:e2e
  */
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { type AddressInfo, createServer } from "node:net";
-import { after, before, describe, test } from "node:test";
-import { promisify } from "node:util";
-import type { InlineKeyboardButton } from "@grammyjs/types";
+import { existsSync, readFileSync } from "node:fs";
+import { after, afterEach, before, describe, test } from "node:test";
 
+import type { InlineKeyboardButton } from "@grammyjs/types";
+import type { V1Pod } from "@kubernetes/client-node";
+
+import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
+import { neonStack } from "../../neon/test/stack.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
+import { AGENTS, alasio, alasioOk, CLUSTER, dumpClusterState, type Forward, HOST_PROFILE, HOST_USER, KEEP, kube, paths, ref, setUp, tearDown } from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
+import { OTLP, STAND_INS, type StandIn, TELEGRAM } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
 
-const run = promisify(execFile);
-const NAMESPACE = process.env["ALASIO_E2E_NAMESPACE"] ?? "alasio";
-const RELEASE = process.env["ALASIO_E2E_RELEASE"] ?? "alasio";
-const FULL = RELEASE.includes("alasio") ? RELEASE : `${RELEASE}-alasio`;
-const SESSIONS = process.env["ALASIO_E2E_SESSIONS_NAMESPACE"] ?? "alasio-sessions";
-const STUBS = "alasio-test";
-const skip = !process.env["KUBECONFIG"] && "needs a cluster with a release installed: set KUBECONFIG";
+const SESSIONS = "alasio-sessions";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-const kubectl = async (namespace: string, ...args: string[]) => (await run("kubectl", ["--namespace", namespace, ...args], { maxBuffer: 64 * 1024 * 1024 })).stdout;
 
-async function freePort() {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  // A server listening on a TCP port has an address of its own.
-  const { port } = server.address() as AddressInfo;
-  await new Promise((resolve) => server.close(resolve));
-  return port;
-}
+/** Whether something of the run failed, for which what the cluster was doing is said. */
+let failed = false;
 
-/** A local port forwarded to a stand-in's Service. */
-interface PortForward {
-  readonly base: string;
-  stop(): void;
-}
+before(async () => {
+  try {
+    await setUp();
+  } catch (error) {
+    failed = true;
+    throw error;
+  }
+}, { timeout: 120 * 60_000 });
 
-/** A local port forwarded to a stand-in's Service, once it answers. */
-async function forward(service: string, remote: number): Promise<PortForward> {
-  const port = await freePort();
-  const child = spawn("kubectl", ["--namespace", STUBS, "port-forward", `service/${service}`, `${port}:${remote}`], { stdio: "ignore" });
-  const base = `http://127.0.0.1:${port}`;
+afterEach((t) => {
+  // Node says on a test's context whether it passed, once it has run.
+  if ("passed" in t && t.passed === false) failed = true;
+});
+
+after(async () => {
+  if (failed) await dumpClusterState();
+  await tearDown();
+}, { timeout: 30 * 60_000 });
+
+/** A local port forwarded to the stand-in's Service, once the stand-in answers there. */
+async function forward(standIn: StandIn): Promise<Forward> {
+  const forwarded = await kube.forward(STAND_INS, standIn.service, standIn.port);
   for (let attempt = 0; attempt < 60; attempt++) {
-    if (await fetch(`${base}/control/${service === "telegram" ? "calls" : "exports"}`).then(() => true, () => false)) return { base, stop: () => child.kill() };
+    if (await fetch(`${forwarded.base}${standIn.ready}`).then(() => true, () => false)) return forwarded;
     await sleep(500);
   }
-  throw new Error(`the ${service} stand-in did not answer`);
+  forwarded.close();
+  throw new Error(`the ${standIn.name} stand-in did not answer`);
 }
 
 /** The operator, through the Telegram stand-in: says things, presses buttons, reads replies. */
@@ -100,8 +102,51 @@ function operator(base: string) {
   };
 }
 
-let telegram: PortForward | undefined;
-let sink: PortForward | null | undefined;
+/** Runs `command` in alasio's container, in the pod it runs in now, which must succeed: what it printed. */
+const inAlasioContainer = async (command: readonly string[], stdin?: string) =>
+  kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), command, { container: "alasio", ...(stdin === undefined ? {} : { stdin }) });
+
+/**
+ * Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its
+ * last line, parsed, which the script prints in the shape `Seen` names.
+ */
+async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
+  // The scripts import alasio's modules by their paths in the repository, for the type
+  // checker; in alasio's image those are under /opt/alasio, and a script read from stdin
+  // resolves its imports from its working directory, not from where it was read. So they
+  // are rewritten to the image's paths as the script is piped in.
+  const source = readFileSync(new URL(script, import.meta.url), "utf8").replaceAll('from "../../src/', 'from "/opt/alasio/src/');
+  const stdout = await inAlasioContainer(["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args], source);
+  // split always returns at least one part.
+  return JSON.parse(stdout.trim().split("\n").at(-1)!);
+}
+
+describe("alasio's command line, on the alasio it installed", () => {
+  test("status says the cluster's nodes run, and each of alasio's workloads is ready", async () => {
+    const said = await alasioOk("status");
+    const nodes = [`${CLUSTER}-server-0`, ...Array.from({ length: AGENTS }, (_, index) => `${CLUSTER}-agent-${index}`)];
+    assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));
+    for (const node of nodes) assert.ok(said.includes(`\n  ${node}: running\n`), said);
+    assert.ok(said.includes(`  Deployment ${NAMESPACE}/${RELEASE}: ready\n`), said);
+    assert.ok(said.includes(`  StatefulSet ${NAMESPACE}/${RELEASE}-neon-pageserver: ready\n`), said);
+  });
+
+  test("logs shows what alasio and its components log, and names those it has when asked for another", async () => {
+    assert.notEqual((await alasioOk("logs")).trim(), "");
+    await alasioOk("logs", "lake", "--since", "1h");
+    const unknown = await alasio("logs", "nothing");
+    assert.equal(unknown.code, 1);
+    assert.match(unknown.stderr, /^alasio: alasio has no component nothing; it has .*\blake\b/mu);
+  });
+
+  test("lake answers a query of the analytics lake, in the format asked for", async () => {
+    assert.match(await alasioOk("lake", "SELECT 42 AS answer"), /^answer\n-+\n42\n\(1 rows\)$/mu);
+    assert.equal((await alasioOk("lake", "--format", "json", "SELECT 42 AS answer")).trim(), '{"answer":42}');
+  });
+});
+
+let telegram: Forward | undefined;
+let sink: Forward | undefined;
 let tg: ReturnType<typeof operator>;
 
 /** Creates a session filesystem through /workspace, as the operator does: its volume id. */
@@ -117,78 +162,59 @@ async function newSession(net: NetMode) {
 }
 
 /** Node run in a session's bayma container: its stdout. */
-const inSession = (volumeId: string, code: string) => kubectl(SESSIONS, "exec", volumeId, "-c", "bayma", "--", "node", "-e", code);
+const inSession = (volumeId: string, code: string) => kube.execOk(SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
 const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:AbortSignal.timeout(5000)}).then(r=>console.log("open"),e=>console.log("blocked"))`;
 const tcp = (host: string, port: number) => `const s=require("net").connect({host:${host},port:${port},timeout:3000});s.on("connect",()=>{console.log("open");process.exit()});s.on("timeout",()=>{console.log("blocked");process.exit()});s.on("error",()=>{console.log("blocked");process.exit()})`;
 
-/**
- * Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its
- * last line, parsed, which the script prints in the shape `Seen` names.
- */
-async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
-  const child = spawn("kubectl", ["--namespace", NAMESPACE, "exec", "-i", `deployment/${FULL}`, "-c", "alasio", "--", "sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args]);
-  // The scripts import alasio's modules by their paths in the repository, for the type
-  // checker; in alasio's image those are under /opt/alasio, and a script read from stdin
-  // resolves its imports from its working directory, not from where it was read. So they
-  // are rewritten to the image's paths as the script is piped in.
-  child.stdin.end(readFileSync(new URL(script, import.meta.url), "utf8").replaceAll('from "../../src/', 'from "/opt/alasio/src/'));
-  let stdout = "";
-  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk; });
-  const code = await new Promise((resolve) => child.on("exit", resolve));
-  assert.equal(code, 0, stdout);
-  // split always returns at least one part.
-  return JSON.parse(stdout.trim().split("\n").at(-1)!);
-}
-
 const roundtrip = (volumeId: string) => inAlasio<RoundtripSeen>("./session-roundtrip.ts", volumeId);
 
-before(async () => {
-  if (skip) return;
-  await kubectl(NAMESPACE, "rollout", "status", `deployment/${FULL}`, "--timeout=600s");
-  telegram = await forward("telegram", 8081);
-  sink = await forward("otlp", 4318).catch(() => null);
-  tg = operator(telegram.base);
-  await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
-});
-
-after(() => {
-  telegram?.stop();
-  sink?.stop();
-});
-
-describe("alasio on Kubernetes", { skip }, () => {
+describe("alasio on Kubernetes", () => {
   let none: string;
   let full: string;
 
+  before(async () => {
+    telegram = await forward(TELEGRAM);
+    sink = await forward(OTLP);
+    tg = operator(telegram.base);
+    await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+  });
+
+  after(() => {
+    telegram?.close();
+    sink?.close();
+  });
+
   test("a new empty workspace without internet is a session of its own, confined", async () => {
     none = await newSession("none");
-    const runtime = (await kubectl(SESSIONS, "get", "pod", none, "-o", "jsonpath={.spec.runtimeClassName}")).trim();
-    if (runtime === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
+    const pod = await kube.get<V1Pod>(ref("Pod", none, SESSIONS));
+    if (pod?.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
     assert.equal((await inSession(none, probe("http://1.1.1.1"))).trim(), "blocked");
     assert.equal((await inSession(none, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
     assert.match(await inSession(none, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
     assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
-    const gate = await kubectl(SESSIONS, "get", "pod", none, "-o", "jsonpath={.status.initContainerStatuses[?(@.name==\"egress-gate\")].state.terminated.exitCode}");
-    assert.equal(gate.trim(), "0");
+    const gate = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.initContainerStatuses?.find(({ name }) => name === "egress-gate");
+    assert.equal(gate?.state?.terminated?.exitCode, 0);
   });
 
   test("a new workspace with internet reaches the internet and nothing private", async () => {
     full = await newSession("full");
     assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
     assert.equal((await inSession(full, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
-    const other = (await kubectl(SESSIONS, "get", "pod", none, "-o", "jsonpath={.status.podIP}")).trim();
+    const other = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.podIP;
+    assert.ok(other, `the session ${none} has no address`);
     assert.equal((await inSession(full, probe(`http://${other}:7290/mcp`))).trim(), "blocked");
     assert.match(await inSession(full, `require("dns").promises.lookup("${none}.${SESSIONS}.svc.cluster.local").then(()=>console.log("resolved"),()=>console.log("unresolved"))`), /unresolved/u);
   });
 
   test("a session's bayma answers alasio alone, and only with the session's token", async () => {
     const url = `http://${none}.${SESSIONS}.svc.cluster.local:7290/mcp`;
-    const token = Buffer.from(await kubectl(SESSIONS, "get", "secret", `${none}-bayma-token`, "-o", "jsonpath={.data.token}"), "base64").toString();
-    const fromAlasio = async (headers: string[]) => (await kubectl(NAMESPACE, "exec", `deployment/${FULL}`, "-c", "alasio", "--", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url)).trim();
+    const token = await kube.secret(SESSIONS, `${none}-bayma-token`, "token");
+    const fromAlasio = async (headers: string[]) => (await inAlasioContainer(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url])).trim();
     assert.equal(await fromAlasio([]), "401");
     assert.equal(await fromAlasio(["-H", "Authorization: Bearer wrong"]), "401");
     assert.equal(await fromAlasio(["-H", `Authorization: Bearer ${token}`]), "400");
-    const fromStub = (await kubectl(STUBS, "exec", "deployment/telegram-stub", "--", "node", "-e", probe(url))).trim();
+    const stub = await kube.runningPod(STAND_INS, TELEGRAM.name);
+    const fromStub = (await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim();
     assert.equal(fromStub, "blocked");
   });
 
@@ -206,7 +232,7 @@ describe("alasio on Kubernetes", { skip }, () => {
     assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
   });
 
-  test("a session's telemetry reaches the deployment's backend, stamped with the session", { skip: !process.env["ALASIO_E2E_TELEMETRY"] && "the release exports no telemetry" }, async () => {
+  test("a session's telemetry reaches the installation's backend, stamped with the session", async () => {
     assert.ok(sink, "the OTLP stand-in did not answer");
     const deadline = Date.now() + 120_000;
     let stamped: ListedExport[] = [];
@@ -220,21 +246,37 @@ describe("alasio on Kubernetes", { skip }, () => {
     assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
   });
 
-  test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !process.env["ALASIO_E2E_HOST"] && "the release has no host profile" }, async () => {
+  test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+    const { home } = paths();
     const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
     assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
-    assert.deepEqual(seen, { uid: 1000, home: "/work" });
-    // The node's /tmp is shared between alasio and the folder's bayma, as a machine's is.
-    const proof = await kubectl(NAMESPACE, "exec", `deployment/${FULL}`, "-c", "alasio", "--", "cat", "/work/e2e-folder-proof");
-    assert.equal(proof, "written by 1000");
+    assert.deepEqual(seen, { uid: HOST_USER, home });
+    // The operator's home is the machine's, shared between alasio and the folder's bayma.
+    assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
+    assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
   });
 
-  test("alasio comes back from a rollout restart with its conversation's workspace", async () => {
-    await kubectl(NAMESPACE, "rollout", "restart", `deployment/${FULL}`);
-    await kubectl(NAMESPACE, "rollout", "status", `deployment/${FULL}`, "--timeout=600s");
+  test("alasio comes back from alasio restart with its conversation's workspace", async () => {
+    assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
     await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
     await tg.say("/workspace");
     const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
     assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+  });
+});
+
+neonStack();
+
+describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster" }, () => {
+  test("removes alasio and the cluster on this machine, with all they keep, and keeps the config", async () => {
+    const { configFile, kubeconfig, storage } = paths();
+    assert.equal(await alasioOk("uninstall", "--purge", "--yes"), `alasio and the cluster ${CLUSTER} are removed, with all their data; the config at ${configFile} is kept.\n`);
+    assert.ok(!existsSync(storage), `${storage} is left`);
+    assert.ok(!existsSync(kubeconfig), `${kubeconfig} is left`);
+    assert.ok(existsSync(configFile));
+    const status = await alasio("status");
+    assert.equal(status.code, 1);
+    assert.match(status.stdout, new RegExp(`^cluster ${CLUSTER}, in Docker .*:\n {2}not made\n$`, "u"));
+    assert.equal(status.stderr, `alasio: there is no cluster ${CLUSTER} yet: alasio up makes it\n`);
   });
 });

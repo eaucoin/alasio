@@ -4,7 +4,7 @@
  * from them, as a Secret of its own, rendered from them on every install and upgrade.
  * Idempotent, and never rotating.
  *
- * Environment: NAMESPACE, SECRET_PREFIX (the release's full name, which every Secret's
+ * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
  * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY

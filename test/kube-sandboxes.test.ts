@@ -255,7 +255,7 @@ test("the deployment's templates are checked as alasio starts", async () => {
     Effect.runPromiseExit(loadKubeTemplates.pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })))));
   const unset = await loading({});
   assert.ok(Exit.isFailure(unset));
-  assert.equal(Option.getOrThrow(Exit.findErrorOption(unset)).message, "ALASIO_KUBE_TEMPLATES is not set: alasio runs where its Helm chart deploys it");
+  assert.equal(Option.getOrThrow(Exit.findErrorOption(unset)).message, "ALASIO_KUBE_TEMPLATES is not set: alasio runs where alasio up installs it");
   const directory = mkdtempSync(join(tmpdir(), "alasio-templates-"));
   try {
     const path = join(directory, "templates.json");
@@ -421,7 +421,7 @@ test("ensure moves a Sandbox made from another pod template onto alasio's, endin
   const created = kube.create(older);
   // Its pod of the older template runs.
   kube.ready("alasio-sessions", "fs-abc123");
-  // A newer bayma, and a label the chart no longer renders.
+  // A newer bayma, and a label alasio no longer sets.
   const template = profile({
     podTemplate: {
       metadata: {},

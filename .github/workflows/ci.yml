@@ -21,7 +21,7 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
-  chart:
+  package:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -31,18 +31,14 @@ jobs:
           node-version: 24.14.0
           cache: npm
       - run: npm ci
-      - uses: ./.github/actions/kube-tools
-      - run: helm dependency build charts/alasio
-      - run: helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
-      - run: helm lint charts/alasio --strict --values charts/alasio/ci/host-values.yaml
-      - run: helm lint charts/agent-sandbox --strict
-      - run: helm unittest charts/alasio
-      # The CLI's manifests are the chart's objects, until the chart is removed.
-      - run: node --test cli/test/manifests-parity.test.ts
+      # Builds the command line and packs its npm package; checks that the package holds
+      # the built command line alone, with the CRD it applies; and runs alasio --version
+      # and --help from an install of it.
+      - run: node tooling/cli-package.ts
 
   e2e:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +60,8 @@ jobs:
           node-version: 24.14.0
           cache: npm
       - run: npm ci
-      - uses: ./.github/actions/kube-tools
-      - run: test/e2e/run.sh
+      # alasio's package installed, alasio init and up on a cluster of this runner, the
+      # end-to-end tests, and alasio uninstall --purge (test/e2e/harness.ts).
+      - run: npm run test:e2e
         env:
-          AGENTS: ${{ matrix.agents }}
+          ALASIO_E2E_AGENTS: ${{ matrix.agents }}

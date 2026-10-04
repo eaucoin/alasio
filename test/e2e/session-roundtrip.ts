@@ -1,9 +1,9 @@
 /**
- * Run inside alasio's pod (kubectl exec deploy/alasio -- node <this> <volumeId>): drives one
- * session through alasio's own Kubernetes driver and its ServiceAccount's permissions.
- * bayma answers over MCP with the session's token, writes a file in the workspace, which
- * alasio reads back through exec; the session is suspended, resumed, and the file is
- * still there. Prints one JSON line of what it saw.
+ * Run inside alasio's pod, by node there, with a session's volume id (inAlasio in
+ * alasio.test.ts): drives one session through alasio's own Kubernetes driver and its
+ * ServiceAccount's permissions. bayma answers over MCP with the session's token, writes
+ * a file in the workspace, which alasio reads back through exec; the session is
+ * suspended, resumed, and the file is still there. Prints one JSON line of what it saw.
  *
  * alasio's modules are imported by their paths in the repository, which inAlasio in
  * alasio.test.ts rewrites to the image's as it pipes this in.
@@ -135,7 +135,7 @@ const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
 
 const seen = await Effect.runPromise(Effect.gen(function*() {
   const { sessions } = yield* loadKubeTemplates;
-  if (!sessions) return yield* Effect.die(new Error("the release renders no sessions template"));
+  if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
   return yield* roundtrip(sessions).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/roundtrip", env: {} })));
 }).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));
 console.log(JSON.stringify(seen));

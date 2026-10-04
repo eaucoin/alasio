@@ -35,6 +35,7 @@ export interface ObjectRef extends Kind {
 const KINDS = {
   CustomResourceDefinition: { apiVersion: "apiextensions.k8s.io/v1", plural: "customresourcedefinitions", namespaced: false },
   Namespace: { apiVersion: "v1", plural: "namespaces", namespaced: false },
+  Node: { apiVersion: "v1", plural: "nodes", namespaced: false },
   ClusterRole: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterroles", namespaced: false },
   ClusterRoleBinding: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterrolebindings", namespaced: false },
   Role: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "roles", namespaced: true },

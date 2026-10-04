@@ -2,10 +2,9 @@
  * What the objects of an installation share: their names and labels, image references,
  * security contexts, and the pieces of pod specs several components have alike.
  *
- * Every name, and every label that selects pods, is the one the Helm chart gave the
- * object it made, for its release `alasio` in namespace `alasio`, so applying these
- * objects takes over an installation the chart made, object for object; they say they
- * are managed by alasio, not Helm.
+ * Every object is named after the installation, `alasio`, and labelled as Kubernetes
+ * recommends, managed by alasio. Names, and the labels that select pods, stay as they
+ * are from one version to the next, as a workload's selector cannot change.
  */
 import { createHash } from "node:crypto";
 
@@ -29,9 +28,9 @@ import type { InstallConfig } from "./config.ts";
 export const NAMESPACE = "alasio";
 
 /**
- * The installation's name, the chart's release's: alasio's own objects' name (its
- * Deployment, ServiceAccount and volume), the start of every other's, and the
- * instance every object is labelled with.
+ * The installation's name: alasio's own objects' name (its Deployment, ServiceAccount
+ * and volume), the start of every other's, and the instance every object is labelled
+ * with.
  */
 export const RELEASE = "alasio";
 
@@ -84,12 +83,12 @@ export function helperResources(): Pick<V1Container, "resources"> {
   return { resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "64Mi" } } };
 }
 
-/** `{ [key]: value }` when `value` holds anything, as the chart rendered a value it was given only then. */
+/** `{ [key]: value }` when `value` holds anything, so an object says nothing of what was given empty. */
 export function given<K extends string, V extends object>(key: K, value: V): { [P in K]?: V } {
   return Object.keys(value).length > 0 ? ({ [key]: value } as { [P in K]: V }) : {};
 }
 
-/** The variables of a record, in the order of their names, as the chart listed them. */
+/** The variables of a record, in the order of their names, so an object lists them alike however they were given. */
 export function envOf(variables: Readonly<Record<string, string>>): V1EnvVar[] {
   return Object.keys(variables).sort().map((name) => ({ name, value: variables[name] ?? "" }));
 }
@@ -184,9 +183,9 @@ function sortedKeys(_key: string, value: unknown): unknown {
 }
 
 /**
- * `value` as JSON as Go's encoding/json writes it, which the chart's toJson and
- * toPrettyJson did: keys sorted, `<`, `>`, `&` and the line separators escaped, and,
- * with `indent`, indented by it.
+ * `value` as JSON as Go's encoding/json writes it: keys sorted, so a value is always
+ * written alike, and its checksum with it; `<`, `>`, `&` and the line separators
+ * escaped; and, with `indent`, indented by it.
  */
 export function goJson(value: unknown, indent?: string): string {
   return JSON.stringify(value, sortedKeys, indent).replace(/[<>&\u2028\u2029]/gu, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);

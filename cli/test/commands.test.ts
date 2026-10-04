@@ -323,13 +323,15 @@ test("login codex runs Codex's device login in alasio's pod, and fails as it doe
   assert.equal(failure(await alasio(["login", "codex"])), "codex login exited with 1");
 });
 
-test("lake runs the query in the lake's pod and prints its answer", async (t) => {
+test("lake runs the query in the lake's pod and prints its answer, in the format asked for", async (t) => {
   const { alasio, kube } = await installed(t);
   kube.onExec = () => ({ exitCode: 0, stdout: "count\n42\n" });
   const run = await alasio(["lake", "SELECT count(*) FROM claude.entries"]);
   succeeded(run);
   assert.equal(run.stdout, "count\n42\n");
-  assert.deepEqual(kube.execs.at(-1)?.command, ["node", "/opt/lake/src/query.ts", "SELECT count(*) FROM claude.entries"]);
+  assert.deepEqual(kube.execs.at(-1)?.command, ["node", "/opt/lake/src/query.ts", "--format", "table", "SELECT count(*) FROM claude.entries"]);
+  succeeded(await alasio(["lake", "--format", "json", "SELECT 1"]));
+  assert.deepEqual(kube.execs.at(-1)?.command, ["node", "/opt/lake/src/query.ts", "--format", "json", "SELECT 1"]);
   kube.onExec = () => ({ exitCode: 2, stderr: "Parser Error: syntax error\n" });
   const refused = await alasio(["lake", "SELEC"]);
   assert.equal(failure(refused), "the lake's query exited with 2");

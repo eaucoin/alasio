@@ -1,7 +1,7 @@
 /**
  * Every Kubernetes object an installation of alasio is, from its configuration
- * (./config.ts): what the Helm chart rendered for release `alasio` in namespace
- * `alasio`. Pure; applying them is the caller's.
+ * (./config.ts): what alasio installs, as the installation `alasio` in the namespace
+ * `alasio`. Pure; applying them is the caller's (../install.ts).
  */
 import type { KubernetesObject } from "@kubernetes/client-node";
 

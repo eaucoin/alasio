@@ -27,7 +27,7 @@ export const SANDBOX_CRD: KubernetesObject = sandboxes;
 
 const NAME = `${RELEASE}-agent-sandbox-controller`;
 
-/** The labels of the controller's objects: those the chart it came in gave them, managed by alasio. */
+/** The labels of the controller's objects: the controller's name and version, the installation, and alasio as their manager. */
 const LABELS = {
   "app.kubernetes.io/name": "agent-sandbox-controller",
   "app.kubernetes.io/instance": RELEASE,

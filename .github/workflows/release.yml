@@ -1,35 +1,55 @@
 name: release
 
-# On demand only, from the version tag being released: publishes alasio's images and its
-# chart, which pins them by digest, to GitHub's container registry.
+# On demand only, from the version tag being released: publishes alasio's images to
+# GitHub's container registry, each attested, and its command line, pinned to them by
+# digest, to npm as the package `alasio`, with provenance.
+#
+# The images must be public, as `npx alasio up` pulls them without a login. GitHub makes a
+# new package private, and its API cannot change a package's visibility, so the owner
+# makes each of the four public once, in its package settings, after the first release
+# made it; the step after the push warns of any not public yet.
+#
+# npm: with a trusted publisher configured for the package on npmjs.com (this repository,
+# this workflow), npm publishes with this run's OIDC token, and the NPM_TOKEN secret is
+# not needed; without one, npm publishes with the token the NPM_TOKEN secret holds.
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
+  id-token: write
+  attestations: write
 
 env:
+  # Where cli/src/release.ts says alasio's images are.
   REGISTRY: ghcr.io/eaucoin
 
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
-      # The images and chart take the tag's version, so a run from a branch stops first.
+      # The images and the package take the tag's version, so a run from a branch stops first.
       - run: |
           [[ "$GITHUB_REF" == refs/tags/v* ]] ||
             { echo "::error::Run the release from a v* tag, not $GITHUB_REF"; exit 1; }
       - uses: actions/checkout@v4
-      - name: The tag, package.json and the chart agree on the version
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+          # Writes an .npmrc that authenticates to npm with NODE_AUTH_TOKEN.
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install --global npm@11.6.2
+      - name: The tag, the repository's package and the command line's agree on the version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          test "$(jq -r .version package.json)" = "$version"
-          test "$(yq .version charts/alasio/Chart.yaml)" = "$version"
-          test "$(yq .appVersion charts/alasio/Chart.yaml)" = "$version"
+          test "$(node -p 'require("./package.json").version')" = "$version"
+          test "$(node -p 'require("./cli/package.json").version')" = "$version"
           echo "VERSION=$version" >>"$GITHUB_ENV"
-      - uses: ./.github/actions/kube-tools
+      - run: npm ci
       # bayma's image, which the agent image is built on, takes more disk than a
       # runner starts with free.
       - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -40,41 +60,76 @@ jobs:
           password: ${{ github.token }}
       - id: images
         name: Build and push the images, recording their digests
+        env:
+          SOURCE: https://github.com/${{ github.repository }}
         run: |
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
             name=${image%%:*}
             docker build --tag "$REGISTRY/$name:$VERSION" \
-              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.source=$SOURCE" \
               --label "org.opencontainers.image.version=$VERSION" "${image#*:}"
             docker push "$REGISTRY/$name:$VERSION"
             digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
             echo "${name//-/_}=${digest#*@}" >>"$GITHUB_OUTPUT"
             # The next image's build needs the room this one took.
             docker image rm "$REGISTRY/$name:$VERSION" >/dev/null
+            docker builder prune --all --force >/dev/null
           done
-      - name: Pin the chart to the images just published, by digest
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio
+          subject-digest: ${{ steps.images.outputs.alasio }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio-agent
+          subject-digest: ${{ steps.images.outputs.alasio_agent }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio-lake
+          subject-digest: ${{ steps.images.outputs.alasio_lake }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/alasio-node
+          subject-digest: ${{ steps.images.outputs.alasio_node }}
+          push-to-registry: true
+      - name: The images are public
+        run: |
+          for name in alasio alasio-agent alasio-lake alasio-node; do
+            repository="${REGISTRY#ghcr.io/}/$name"
+            token=$(curl -fsS "https://ghcr.io/token?scope=repository:$repository:pull" | jq -r .token)
+            curl -fsS -o /dev/null -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/$repository/manifests/$VERSION" ||
+              echo "::warning::$REGISTRY/$name is not public yet: make it public in its package settings, as alasio pulls it without a login"
+          done
+      - name: Pin the command line to the images just published
         env:
           ALASIO: ${{ steps.images.outputs.alasio }}
           AGENT: ${{ steps.images.outputs.alasio_agent }}
           LAKE: ${{ steps.images.outputs.alasio_lake }}
+          NODE: ${{ steps.images.outputs.alasio_node }}
         run: |
-          yq -i '
-            .images.alasio.tag = strenv(VERSION) | .images.alasio.digest = strenv(ALASIO) |
-            .images.agent.tag = strenv(VERSION) | .images.agent.digest = strenv(AGENT) |
-            .images.lake.tag = strenv(VERSION) | .images.lake.digest = strenv(LAKE)
-          ' charts/alasio/values.yaml
-          git diff charts/alasio/values.yaml
-      - name: Package and push the chart
+          node tooling/pin-release.ts "$VERSION" "alasio=$ALASIO" "alasio-agent=$AGENT" "alasio-lake=$LAKE" "alasio-node=$NODE"
+          git diff cli/src/release.ts
+      # Builds the command line, packs and checks its package, and runs it from an install of it.
+      - run: node tooling/cli-package.ts
+      # Tolerates a re-run over a version npm has already.
+      - name: Publish the command line to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "${{ github.token }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
-          helm dependency build charts/alasio
-          helm lint charts/alasio --strict --values charts/alasio/ci/default-values.yaml
-          helm package charts/alasio --destination dist
-          helm push "dist/alasio-$VERSION.tgz" "oci://$REGISTRY/charts"
+          if npm view "alasio@$VERSION" version >/dev/null 2>&1; then
+            echo "alasio $VERSION is on npm already"
+          else
+            npm publish --workspace cli --provenance --access public
+          fi
       # Tolerates a re-run over an existing release.
       - run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
-            gh release create "$GITHUB_REF_NAME" "dist/alasio-$VERSION.tgz" --title "alasio $VERSION" --generate-notes \
-              --notes "Install: helm install alasio oci://$REGISTRY/charts/alasio --version $VERSION"
+            gh release create "$GITHUB_REF_NAME" --title "alasio $VERSION" --generate-notes \
+              --notes "Install and start it, on a Linux machine with Docker and Node 24: \`npx alasio@$VERSION init\`"
         env:
           GH_TOKEN: ${{ github.token }}

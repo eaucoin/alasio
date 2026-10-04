@@ -1,7 +1,7 @@
 /**
- * The manifests (cli/src/manifests) say what the Helm chart's tests said of its objects
- * (charts/alasio/tests): alasio's, Neon's, and those that confine what runs; and the
- * install configuration is checked and defaulted as the chart's values were.
+ * The manifests (cli/src/manifests): what they say of alasio's objects, Neon's, and
+ * those that confine what runs; and how the install configuration is checked and
+ * defaulted.
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -55,7 +55,7 @@ function templates(objects: readonly KubernetesObject[]): string {
 }
 
 describe("configuration", () => {
-  test("defaults every key the chart's values default", () => {
+  test("defaults what is left out", () => {
     const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } } });
     assert.ok(Result.isSuccess(decoded));
     const config = decoded.success;
@@ -67,13 +67,13 @@ describe("configuration", () => {
     assert.deepEqual(config.alasio.resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "8Gi" } });
   });
 
-  test("adds the quantities given to the defaults, as Helm merged values", () => {
+  test("adds the quantities given to the defaults", () => {
     const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, resources: { limits: { cpu: 2, memory: "4Gi" } } } });
     assert.ok(Result.isSuccess(decoded));
     assert.deepEqual(decoded.success.alasio.resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "4Gi", cpu: "2" } });
   });
 
-  test("refuses what the chart's schema refused, saying which key", () => {
+  test("refuses what alasio does not install from, saying which key", () => {
     const refused = (file: Record<string, unknown>) => {
       const decoded = decodeInstallConfig({ ...file, alasio: { telegram: { existingSecret: "telegram" }, ...(file["alasio"] as object | undefined) } });
       assert.ok(Result.isFailure(decoded));
@@ -92,7 +92,7 @@ describe("configuration", () => {
     assert.match(refused({ host: { mounts: [{ name: "home", hostPath: "home", mountPath: "/home" }] } }), /^host\.mounts\.0\.hostPath /u);
   });
 
-  test("requires what the chart required, given what is turned off", () => {
+  test("requires what stands in for what is turned off", () => {
     const message = (file: Record<string, unknown>) => {
       const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, ...file });
       return Result.isFailure(decoded) ? decoded.failure.message : "";
@@ -130,9 +130,8 @@ describe("alasio", () => {
     assert.equal(deployment.spec?.template.spec?.securityContext?.runAsNonRoot, true);
   });
 
-  test("says every object is managed by alasio, and nothing of Helm's", () => {
+  test("says every object is managed by alasio", () => {
     const objects = install({ host: { enabled: true }, telemetry: { otlpEndpoint: "http://collector:4318" } });
-    assert.doesNotMatch(JSON.stringify(objects), /helm/iu);
     for (const object of objects.filter(({ kind }) => kind !== "CustomResourceDefinition")) {
       assert.equal(object.metadata?.labels?.["app.kubernetes.io/managed-by"], "alasio", `${object.kind} ${object.metadata?.name}`);
     }

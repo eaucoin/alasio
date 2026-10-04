@@ -34,6 +34,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
       apiPort: local.apiPort,
       storagePath: local.storagePath ?? (yield* defaultStoragePath),
       ...(local.subnet ? { subnet: local.subnet } : {}),
+      ...(local.image ? { image: local.image } : {}),
       hostAliases: local.hostAliases,
       mounts: [...local.mounts, ...hostPaths.filter(({ source }) => !local.mounts.some((mount) => mount.source === source))],
       agents: local.agents,

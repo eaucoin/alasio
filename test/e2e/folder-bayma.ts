@@ -1,5 +1,5 @@
 /**
- * Run inside alasio's pod (kubectl exec deploy/alasio -- node <this>): a folder
+ * Run inside alasio's pod, by node there (inAlasio in alasio.test.ts): a folder
  * conversation's bayma through alasio's own code, as the host profile makes it, with a
  * file written through it to the operator's home. Prints one JSON line of what it saw.
  *
@@ -32,7 +32,7 @@ function text(part: ContentBlock | undefined): string {
 
 const bayma = await Effect.runPromise(Effect.gen(function*() {
   const { host } = yield* loadKubeTemplates;
-  if (!host) return yield* Effect.die(new Error("the release renders no host template"));
+  if (!host) return yield* Effect.die(new Error("the installation gives no host template"));
   return yield* HostBayma.pipe(
     Effect.flatMap((hostBayma) => hostBayma.ensure({ harness: "claude", threadKey: "e2e:folder" })),
     Effect.provide(HostBayma.layer(host)),

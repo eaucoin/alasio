@@ -14,11 +14,12 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "start": "node ./src/main.ts"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0",
+    "@effect/platform-node-shared": "4.0.0",
     "@kubernetes/client-node": "2.0.0",
     "effect": "4.0.0"
   },

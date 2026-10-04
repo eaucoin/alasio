@@ -11,8 +11,8 @@ interface RestartPaths {
 
 /**
  * What this process runs as and how it is restarted, in the words the post-restart
- * prompts use: its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE, which the chart
- * sets) and a rollout restart of it.
+ * prompts use: its Deployment (ALASIO_DEPLOYMENT and ALASIO_NAMESPACE, which alasio's
+ * Deployment sets) and a rollout restart of it.
  */
 function resolveRestartPaths(env: NodeJS.ProcessEnv = process.env): RestartPaths {
   const deployment = env["ALASIO_DEPLOYMENT"]?.trim() || "alasio";

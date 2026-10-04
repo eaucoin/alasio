@@ -8,10 +8,10 @@
  * is ever inside a session.
  *
  * What a session may reach is NetworkPolicy's to enforce, by the labels set here: the
- * chart's policies admit alasio alone in, and let a session out to alasio's telemetry
- * receiver only ("none") or to the internet's public addresses too ("full"). DNS is
- * set to match: public resolvers in "full", and none at all in "none", so a name cannot
- * carry anything out through the cluster's resolver.
+ * installation's policies admit alasio alone in, and let a session out to alasio's
+ * telemetry receiver only ("none") or to the internet's public addresses too ("full").
+ * DNS is set to match: public resolvers in "full", and none at all in "none", so a name
+ * cannot carry anything out through the cluster's resolver.
  *
  * Policies reach a new pod asynchronously, so a session's pod first waits, in an init
  * container, until its egress is confined: until the cluster's API server, a private

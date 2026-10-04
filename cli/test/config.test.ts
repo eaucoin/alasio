@@ -122,4 +122,13 @@ test("the local cluster mounts the host profile's paths, and keeps its storage u
   assert.equal(target.cluster.storagePath, "/data/alasio/storage");
   assert.deepEqual(target.cluster.mounts, [{ source: "/srv", target: "/srv" }, { source: "/home/op", target: "/home/op", readOnly: false }]);
   assert.equal(target.kubeconfig.path, "/home/op/.config/alasio/kubeconfig");
+  assert.equal(target.cluster.image, undefined);
+});
+
+test("the local cluster runs the node image the config names, such as one built here", async () => {
+  const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, storagePath: "/srv/storage", image: "alasio-node:dev" } } });
+  assert.ok(Result.isSuccess(decoded));
+  const target = await run(resolveTarget(decoded.success));
+  assert.ok(target._tag === "Local");
+  assert.equal(target.cluster.image, "alasio-node:dev");
 });

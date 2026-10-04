@@ -1,6 +1,7 @@
 /**
- * The templates the deployment renders for alasio's workspaces: `ALASIO_KUBE_TEMPLATES` is
- * the path of a JSON file, which the Helm chart mounts from a ConfigMap, of the form
+ * The templates alasio's installation gives it for its workspaces: `ALASIO_KUBE_TEMPLATES`
+ * is the path of a JSON file, which its Deployment mounts from a ConfigMap
+ * (cli/src/manifests/alasio.ts), of the form
  *
  *     {
  *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
@@ -50,8 +51,8 @@ const Path = said(Schema.String, "must be a path");
 
 /**
  * What alasio relies on of a pod template is checked with its profile (a container named
- * `bayma`); the rest of it, and the claim templates, are Kubernetes objects the chart
- * renders, which the API server checks as each Sandbox is made.
+ * `bayma`); the rest of it, and the claim templates, are Kubernetes objects the
+ * installation gives, which the API server checks as each Sandbox is made.
  */
 const PodTemplate = said(Schema.declare((value): value is V1PodTemplateSpec => Predicate.isObject(value)), "must be an object").pipe(
   Schema.withDecodingDefaultKey(Effect.succeed({})),
@@ -62,7 +63,7 @@ const VolumeClaimTemplates = said(
   "must be a list of volume claim templates",
 );
 
-/** Whether `podTemplate`, as the chart rendered it, runs a container named `bayma`. */
+/** Whether `podTemplate`, as the installation gives it, runs a container named `bayma`. */
 function runsBayma(podTemplate: unknown): boolean {
   const containers = Predicate.hasProperty(podTemplate, "spec") && Predicate.hasProperty(podTemplate.spec, "containers")
     ? podTemplate.spec.containers
@@ -76,7 +77,7 @@ const sandboxProfile = { namespace: Namespace, port: Port, podTemplate: PodTempl
 /** The issue of a profile whose pod template runs no bayma. */
 const baymaIssue = { path: ["podTemplate", "spec", "containers"], issue: 'must include one named "bayma"' };
 
-/** The template of session filesystems' Sandboxes (charts/alasio/templates/alasio/sandbox-templates.yaml). */
+/** The template of session filesystems' Sandboxes (sessionsProfile in cli/src/manifests/alasio.ts). */
 const SessionsProfile = said(
   Schema.Struct({
     ...sandboxProfile,
@@ -91,7 +92,7 @@ const SessionsProfile = said(
   "must be an object",
 ).check(Schema.makeFilter((profile) => (runsBayma(profile.podTemplate) ? undefined : baymaIssue)));
 
-/** The template of folder workspaces' bayma (charts/alasio/templates/alasio/sandbox-templates.yaml). */
+/** The template of folder workspaces' bayma (hostProfile in cli/src/manifests/alasio.ts). */
 const HostProfile = said(
   Schema.Struct({
     ...sandboxProfile,
@@ -138,7 +139,7 @@ export const decodeKubeTemplates = (path: string, text: string): Result.Result<K
  */
 export const loadKubeTemplates: Effect.Effect<KubeTemplates, KubeTemplatesError | Config.ConfigError> = Effect.gen(function*() {
   const path = (yield* Config.String("ALASIO_KUBE_TEMPLATES").pipe(Config.withDefault(""))).trim();
-  if (!path) return yield* new KubeTemplatesError({ message: "ALASIO_KUBE_TEMPLATES is not set: alasio runs where its Helm chart deploys it" });
+  if (!path) return yield* new KubeTemplatesError({ message: "ALASIO_KUBE_TEMPLATES is not set: alasio runs where alasio up installs it" });
   const text = yield* Effect.try({
     try: () => readFileSync(path, "utf8"),
     catch: (error) => new KubeTemplatesError({ message: `ALASIO_KUBE_TEMPLATES ${path} is not readable JSON: ${error instanceof Error ? error.message : String(error)}` }),

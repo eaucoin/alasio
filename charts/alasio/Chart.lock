@@ -1,6 +1,0 @@
-dependencies:
-- name: agent-sandbox
-  repository: file://../agent-sandbox
-  version: 1.0.5
-digest: sha256:35004df73c8e3942cddfd5dbfc97dbfe294058b067c68860cd19f4b0f9d03d41
-generated: "2026-10-02T17:55:08.929900322Z"

@@ -1,9 +1,0 @@
-apiVersion: v2
-name: agent-sandbox
-description: >-
-  agent-sandbox's Sandbox API and controller (kubernetes-sigs/agent-sandbox), pinned,
-  as alasio's chart depends on it. Install it once per cluster.
-type: application
-version: 1.0.5
-appVersion: v1.0.5
-home: https://github.com/kubernetes-sigs/agent-sandbox

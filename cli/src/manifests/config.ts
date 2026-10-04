@@ -1,13 +1,11 @@
 /**
  * How alasio is installed: the settings an operator chooses, which alasio's command line
- * keeps in its config file, as plain JSON. They are what the Helm chart's values were,
- * checked as its values.schema.json checked them; every key may be left out for its
- * default, the chart's, and alasio's own images default to this package's
- * (../release.ts).
+ * keeps in its config file as plain JSON, checked here: what is refused is said by its
+ * key, and why. Every key may be left out for its default, and alasio's own images
+ * default to this package's (../release.ts).
  *
  * A map of quantities given for resources adds to its defaults rather than replacing
- * them, as Helm merged values, so `{ "limits": { "cpu": "2" } }` keeps the default
- * memory limit.
+ * them, so `{ "limits": { "cpu": "2" } }` keeps the default memory limit.
  */
 import { isIPv4 } from "node:net";
 
@@ -326,7 +324,7 @@ const InstallStruct = Schema.Struct({
     Schema.Struct({ alasio: Image(IMAGES.alasio), agent: Image(IMAGES.agent), lake: Image(IMAGES.lake), pullPolicy: defaulted(PullPolicy, "IfNotPresent") }),
     {},
   ),
-  /** Pull Secrets for private registries, in the release's namespace and the sessions and host ones. */
+  /** Pull Secrets for private registries, in alasio's namespace and the sessions and host ones. */
   imagePullSecrets: defaulted(Schema.Array(SecretName), []),
   /** alasio itself; its telegram.existingSecret has no default, so every configuration says it. */
   alasio: Alasio.annotateKey({ messageMissingKey: "is required, with telegram.existingSecret" }),
