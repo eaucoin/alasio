@@ -5,9 +5,10 @@
  * container is replaceable at any moment, and the loader opens its connections again
  * whenever they fail, as when the compute restarts.
  *
- * It serves /healthz (its pod's probes) and /metrics (Prometheus, for the
- * stack's telemetry collector) on LAKE_HTTP_PORT from the moment it starts, and logs a
- * JSON line per event.
+ * It serves /healthz (its pod's liveness: loads are not failing for long), /readyz
+ * (its readiness: a load has succeeded, so the lake exists to be queried) and /metrics
+ * (Prometheus, for the stack's telemetry collector) on LAKE_HTTP_PORT from the moment
+ * it starts, and logs a JSON line per event.
  */
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -99,9 +100,10 @@ const loader = startLoader({
 });
 
 const server = createServer((request, response) => {
-  if (request.method === "GET" && request.url === "/healthz") {
-    const { ok, detail } = loader.health();
-    response.writeHead(ok ? 200 : 503, { "content-type": "text/plain" }).end(`${detail}\n`);
+  if (request.method === "GET" && (request.url === "/healthz" || request.url === "/readyz")) {
+    const { ok, ready, detail } = loader.health();
+    const well = request.url === "/healthz" ? ok : ok && ready;
+    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`${detail}\n`);
     return;
   }
   if (request.method === "GET" && request.url === "/metrics") {

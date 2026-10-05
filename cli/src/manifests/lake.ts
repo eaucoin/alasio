@@ -19,7 +19,8 @@ export function lakeObjects(config: InstallConfig): KubernetesObject[] {
     metadata: { name, namespace: NAMESPACE, labels: stackLabels("lake") },
     spec: { selector: selectorLabels("lake"), ports: [{ name: "metrics", port: 9464 }] },
   };
-  const health = { httpGet: { path: "/healthz", port: "metrics" } };
+  // Live while its loads are not failing for long; ready once one has made the lake.
+  const probe = (path: string) => ({ httpGet: { path, port: "metrics" } });
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -47,8 +48,8 @@ export function lakeObjects(config: InstallConfig): KubernetesObject[] {
             ],
             envFrom: [{ secretRef: { name } }],
             ports: [{ name: "metrics", containerPort: 9464 }],
-            readinessProbe: { ...health, periodSeconds: 10 },
-            livenessProbe: { ...health, initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
+            readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },
+            livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources: config.lake.resources,
             volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],

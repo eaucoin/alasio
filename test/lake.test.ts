@@ -438,7 +438,7 @@ describe("the lake", { skip }, () => {
       }
       await loader.stop();
       assert.deepEqual(logs, ["loaded", "maintained"]);
-      assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
+      assert.deepEqual(loader.health(), { ok: true, ready: true, detail: "loaded" });
       assert.ok(await lastMaintained(db));
       const text = metrics.render();
       assert.match(text, /^lake_cycles_total\{outcome="success"\} 1$/m);
@@ -478,7 +478,7 @@ describe("the lake", { skip }, () => {
       }
       await loader.stop();
       assert.deepEqual(events, ["open", "load failed", "close", "open", "loaded", "maintained", "close"]);
-      assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
+      assert.deepEqual(loader.health(), { ok: true, ready: true, detail: "loaded" });
     });
   });
 
@@ -538,7 +538,7 @@ test("a failing load is tried again soon, and the loader turns unhealthy only on
   try {
     await new Promise((resolve) => setTimeout(resolve, 60));
     assert.ok(attempts >= 3, `retried sooner than the interval (${attempts} attempts)`);
-    assert.deepEqual(loader.health(), { ok: true, detail: "load failed: permission denied for table entries" });
+    assert.deepEqual(loader.health(), { ok: true, ready: false, detail: "load failed: permission denied for table entries" });
     await new Promise((resolve) => setTimeout(resolve, 300)); // past three intervals of failing
     assert.equal(loader.health().ok, false);
   } finally {
