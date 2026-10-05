@@ -82,7 +82,7 @@ function neonPolicies(): NetworkPolicy[] {
  * controller, its node service and the mount pods it runs, in the driver's namespace) and
  * alasio's JuiceFS admin pods: Valkey takes no other connection but the stack's
  * collector's, which reads its metrics, and the bundled object store takes theirs on its
- * S3 port beside the stack's own.
+ * S3 port beside the stack's own, and Valkey's, whose pod formats the file system.
  */
 function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
   const driverNamespace = { matchLabels: { "kubernetes.io/metadata.name": config.workspaceStorage.csi.namespace } };
@@ -105,7 +105,7 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
       ? [policy(componentName("seaweedfs-workspaces"), NAMESPACE, "seaweedfs", {
         podSelector: { matchLabels: selectorLabels("seaweedfs") },
         policyTypes: ["Ingress"],
-        ingress: [{ from: juicefs, ports: [{ protocol: "TCP", port: 8333 }] }],
+        ingress: [{ from: [...juicefs, { podSelector: { matchLabels: selectorLabels("valkey") } }], ports: [{ protocol: "TCP", port: 8333 }] }],
       })]
       : []),
   ];

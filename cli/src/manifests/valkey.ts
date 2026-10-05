@@ -14,7 +14,7 @@
  * stack, whose pods reach each other: its NetworkPolicy (./network-policies.ts) admits
  * JuiceFS's pods alone.
  */
-import type { KubernetesObject, V1ConfigMap, V1EnvVarSource, V1Service, V1StatefulSet } from "@kubernetes/client-node";
+import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVarSource, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
 import { claimSpec, componentName, imagePullSecrets, labels, NAMESPACE, restrictedContainer, restrictedPod, selectorLabels, sha256 } from "./common.ts";
@@ -46,11 +46,16 @@ export function valkeyConf({ workspaceStorage }: InstallConfig): string {
   ].join("\n");
 }
 
-/** Valkey: its configuration, its Service, and its StatefulSet, with a volume of its own. */
-export function valkeyObjects(config: InstallConfig): KubernetesObject[] {
+/** The Valkey password's Secret, as a variable's source. */
+export const VALKEY_PASSWORD: V1EnvVarSource = { secretKeyRef: { name: VALKEY, key: "password" } };
+
+/**
+ * Valkey: its configuration, its Service, and its StatefulSet, with a volume of its own,
+ * and `sidecars` beside the server in its pod, which is ready once each of them is.
+ */
+export function valkeyObjects(config: InstallConfig, sidecars: readonly V1Container[]): KubernetesObject[] {
   const { valkey } = config.workspaceStorage;
   const conf = valkeyConf(config);
-  const password: V1EnvVarSource = { secretKeyRef: { name: VALKEY, key: "password" } };
   // JuiceFS's driver needs it to delete its volumes' data, so it is kept while they remain.
   const metadata = { name: VALKEY, namespace: NAMESPACE, labels: { ...labels("valkey"), ...VOLUME_DRIVER } };
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata, data: { "valkey.conf": conf } };
@@ -81,9 +86,9 @@ export function valkeyObjects(config: InstallConfig): KubernetesObject[] {
             imagePullPolicy: "IfNotPresent",
             command: ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"],
             env: [
-              { name: "VALKEY_PASSWORD", valueFrom: password },
+              { name: "VALKEY_PASSWORD", valueFrom: VALKEY_PASSWORD },
               // valkey-cli's, for the readiness probe.
-              { name: "VALKEYCLI_AUTH", valueFrom: password },
+              { name: "VALKEYCLI_AUTH", valueFrom: VALKEY_PASSWORD },
             ],
             ports: [{ name: "valkey", containerPort: VALKEY_PORT }],
             // Ready once its append-only file is loaded, which it reads as off until then.
@@ -102,7 +107,7 @@ export function valkeyObjects(config: InstallConfig): KubernetesObject[] {
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources: valkey.resources,
             volumeMounts: [{ name: "data", mountPath: "/data" }, { name: "config", mountPath: "/etc/valkey", readOnly: true }],
-          }],
+          }, ...sidecars],
           volumes: [{ name: "config", configMap: { name: VALKEY } }],
         },
       },

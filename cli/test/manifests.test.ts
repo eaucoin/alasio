@@ -476,6 +476,48 @@ describe("workspace storage", () => {
     assert.match(valkey.spec?.template.metadata?.annotations?.["checksum/config"] ?? "", /^[0-9a-f]{64}$/u);
   });
 
+  test("formats the file system beside Valkey, unless it is formatted already, before Valkey's pod is ready", () => {
+    const valkey = one<V1StatefulSet>(install({ workspaceStorage: { trashDays: 3 } }), "StatefulSet", "alasio-valkey");
+    const format = valkey.spec?.template.spec?.containers.find(({ name }) => name === "juicefs-format");
+    assert.ok(format);
+    assert.equal(format.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
+    assert.deepEqual(format.readinessProbe?.exec?.command, ["test", "-f", "/tmp/ready"]);
+    assert.deepEqual(format.env?.map(({ name, valueFrom }) => [name, valueFrom?.secretKeyRef?.name, valueFrom?.secretKeyRef?.key]), [
+      ["VALKEY_PASSWORD", "alasio-valkey", "password"],
+      ["NAME", "alasio-workspaces-juicefs", "name"],
+      ["STORAGE", "alasio-workspaces-juicefs", "storage"],
+      ["BUCKET", "alasio-workspaces-juicefs", "bucket"],
+      ["ACCESS_KEY", "alasio-workspaces-juicefs", "access-key"],
+      ["SECRET_KEY", "alasio-workspaces-juicefs", "secret-key"],
+    ]);
+    // Not formatted, and its first format refused, as the object store is not up yet.
+    const juicefs = [
+      'echo "$@" >> "$ROOT/calls"',
+      "case $1 in",
+      '  status) [ -e "$ROOT/formatted" ] ;;',
+      '  format) if [ -e "$ROOT/refused" ]; then : > "$ROOT/formatted"; else : > "$ROOT/refused"; exit 1; fi ;;',
+      "esac",
+    ].join("\n");
+    const recorded = (name: string) => `echo "${name} $*" >> "$ROOT/calls"`;
+    const env = { VALKEY_PASSWORD: "secret", NAME: "workspaces", STORAGE: "s3", BUCKET: "http://store:8333/workspaces", ACCESS_KEY: "key", SECRET_KEY: "shh" };
+    const { root, run, remove } = runScript(format, env, { juicefs, sleep: recorded("sleep"), touch: recorded("touch") });
+    const calls = () => {
+      const made = readFileSync(join(root, "calls"), "utf8").trim().split("\n");
+      rmSync(join(root, "calls"));
+      return made;
+    };
+    try {
+      const metaUrl = "redis://:secret@127.0.0.1:6379/1";
+      const formats = `format --storage s3 --bucket http://store:8333/workspaces --access-key key --secret-key shh --trash-days 3 ${metaUrl} workspaces`;
+      run();
+      assert.deepEqual(calls(), [`status ${metaUrl}`, formats, "sleep 5", `status ${metaUrl}`, formats, "touch /tmp/ready", "sleep infinity"]);
+      run();
+      assert.deepEqual(calls(), [`status ${metaUrl}`, "touch /tmp/ready", "sleep infinity"]);
+    } finally {
+      remove();
+    }
+  });
+
   test("installs JuiceFS's CSI driver, its images pinned by digest, provisioning volumes itself", () => {
     const objects = install();
     assert.deepEqual(one<V1CSIDriver>(objects, "CSIDriver", "csi.juicefs.com").spec, { attachRequired: false, podInfoOnMount: true });
@@ -571,7 +613,7 @@ describe("workspace storage", () => {
     }
   });
 
-  test("admits JuiceFS's pods alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port", () => {
+  test("admits JuiceFS's pods alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
@@ -593,7 +635,8 @@ describe("workspace storage", () => {
         ports: [{ protocol: "TCP", port: 6379 }],
       },
     ]);
-    assert.deepEqual(policy("alasio-seaweedfs-workspaces").ingress, [{ from: peers, ports: [{ protocol: "TCP", port: 8333 }] }]);
+    const valkey = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } } };
+    assert.deepEqual(policy("alasio-seaweedfs-workspaces").ingress, [{ from: [...peers, valkey], ports: [{ protocol: "TCP", port: 8333 }] }]);
   });
 
   test("makes its bucket and its identity, and gives the setup what its Secrets are made from", () => {

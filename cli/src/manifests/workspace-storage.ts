@@ -13,16 +13,16 @@
  * driver reads, and alasio's JuiceFS admin pods (the daily quota check here), never a
  * workspace.
  */
-import type { KubernetesObject, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Container, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
 import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, script } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
-import { VALKEY, VALKEY_PORT, valkeyObjects } from "./valkey.ts";
+import { VALKEY, VALKEY_PASSWORD, VALKEY_PORT, valkeyObjects } from "./valkey.ts";
 
 /** The Secret of the file system's credentials. */
-const WORKSPACES_CREDENTIALS = componentName("workspaces-juicefs");
+export const WORKSPACES_CREDENTIALS = componentName("workspaces-juicefs");
 
 /**
  * The label of alasio's pods that run JuiceFS's command line against the file system, the
@@ -124,8 +124,48 @@ function quotaCheck(config: InstallConfig): V1CronJob {
   };
 }
 
+/**
+ * Formats the file system, unless it is formatted already, beside Valkey's server, whose
+ * pod is ready only once it is: JuiceFS's driver sets a new volume's quota before the
+ * volume's mount pod has formatted the file system, so the first volume made on one not
+ * yet formatted would have none. Formatted as mount pods format it, with the bucket and
+ * its keys; it reaches Valkey on its pod's loopback, in the database the file system's
+ * `metaurl` names (neon/control/kube-setup.ts), and the object store as JuiceFS's pods do.
+ */
+function formatter(config: InstallConfig): V1Container {
+  const credential = (name: string, key: string) => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
+  return {
+    name: "juicefs-format",
+    image: imageReference(config.workspaceStorage.csi.mountImage),
+    imagePullPolicy: "IfNotPresent",
+    command: [
+      "/bin/sh",
+      "-c",
+      script(
+        "set -eu",
+        `meta="redis://:$VALKEY_PASSWORD@127.0.0.1:${VALKEY_PORT}/1"`,
+        'until juicefs status "$meta" >/dev/null 2>&1 || juicefs format --storage "$STORAGE" --bucket "$BUCKET" --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" \\',
+        `  --trash-days ${config.workspaceStorage.trashDays} "$meta" "$NAME"; do sleep 5; done`,
+        "touch /tmp/ready",
+        "exec sleep infinity",
+      ),
+    ],
+    env: [
+      { name: "VALKEY_PASSWORD", valueFrom: VALKEY_PASSWORD },
+      credential("NAME", "name"),
+      credential("STORAGE", "storage"),
+      credential("BUCKET", "bucket"),
+      credential("ACCESS_KEY", "access-key"),
+      credential("SECRET_KEY", "secret-key"),
+    ],
+    readinessProbe: { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 },
+    securityContext: restrictedContainer(),
+    resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
+  };
+}
+
 /** Workspace storage's objects, when it is on: Valkey, the CSI driver, the StorageClass, and the quota check. */
 export function workspaceStorageObjects(config: InstallConfig): KubernetesObject[] {
   if (!config.workspaceStorage.enabled) return [];
-  return [...valkeyObjects(config), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config)];
+  return [...valkeyObjects(config, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config)];
 }
