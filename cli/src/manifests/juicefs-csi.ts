@@ -102,8 +102,10 @@ export function driverConfig({ workspaceStorage }: InstallConfig): object {
         "free-space-ratio=0.2",
         `backup-meta=${backupInterval}`,
       ],
-      // Ready once the volume's directory answers through the mount.
-      readinessProbe: { exec: { command: ["stat", "${MOUNT_POINT}/${SUB_PATH}"] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
+      // Ready once the mount answers as FUSE's. A mount pod mounts its volume's directory
+      // alone (as `subdir`), so that is the mount's root, and nothing is under it by the
+      // volume's path; unmounted, the root is the node's own directory.
+      readinessProbe: { exec: { command: ["sh", "-c", 'test "$(stat --file-system --format=%T ${MOUNT_POINT})" = fuseblk'] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
     }],
   };
 }

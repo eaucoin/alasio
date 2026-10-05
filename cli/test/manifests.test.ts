@@ -538,7 +538,7 @@ describe("workspace storage", () => {
     assert.deepEqual(shared.spec?.template.spec?.containers[0]?.env?.find(({ name }) => name === "FS_SHARE_MOUNT"), { name: "FS_SHARE_MOUNT", value: "true" });
   });
 
-  test("runs mount pods of its class on a pinned client, its cache bounded, its metadata backed up, ready once the volume answers", () => {
+  test("runs mount pods of its class on a pinned client, its cache bounded, its metadata backed up, ready once the mount answers", () => {
     const objects = install({ workspaceStorage: { cacheSizeMiB: 2048, backupInterval: "30m" } });
     const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "juicefs-csi-driver-config").data?.["config.yaml"] ?? "");
     assert.deepEqual(config.mountPodPatch, [{
@@ -546,7 +546,7 @@ describe("workspace storage", () => {
       ceMountImage: "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
       resources: { requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } },
       mountOptions: ["cache-size=2048", "free-space-ratio=0.2", "backup-meta=30m"],
-      readinessProbe: { exec: { command: ["stat", "${MOUNT_POINT}/${SUB_PATH}"] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
+      readinessProbe: { exec: { command: ["sh", "-c", 'test "$(stat --file-system --format=%T ${MOUNT_POINT})" = fuseblk'] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
     }]);
   });
 
