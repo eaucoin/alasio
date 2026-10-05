@@ -82,19 +82,36 @@ interface FolderAccess {
   readonly folders: readonly string[];
 }
 
+/** A mount of the host profile as the config holds it: a machine path at a path in the pods, and its other keys. */
+type HostMount = Readonly<Record<string, unknown>> & { readonly name: string; readonly hostPath: string; readonly mountPath: string };
+
+/** Whether `value` is a mount of the host profile. */
+const isHostMount = (value: unknown): value is HostMount =>
+  Predicate.hasProperty(value, "name") && Predicate.isString(value.name) &&
+  Predicate.hasProperty(value, "hostPath") && Predicate.isString(value.hostPath) &&
+  Predicate.hasProperty(value, "mountPath") && Predicate.isString(value.mountPath);
+
 /**
  * The host profile of the install configuration `host` is, with `access`, or without
- * folder workspaces when it is null; its other keys kept. The home is always mounted,
- * as alasio keeps its state there, and bayma's in it.
+ * folder workspaces when it is null; its other keys kept. A folder it mounts already
+ * keeps its mount as written (where in the pods, its type, read-only), and a new one is
+ * mounted at its own path. The home is always in the pods, as alasio keeps its state
+ * there, and bayma's in it: mounted, unless a mount already puts it there.
  */
 function hostSettings(host: Readonly<Record<string, unknown>>, access: FolderAccess | null): Record<string, unknown> {
   if (!access) return { ...host, enabled: false };
-  const taken = new Set<string>();
-  const mounts = [...new Set([access.home, ...access.folders])].map((path) => {
-    const name = mountName(path, taken);
-    taken.add(name);
-    return { name, hostPath: path, mountPath: path };
-  });
+  const existing = (Array.isArray(host["mounts"]) ? host["mounts"] : []).filter(isHostMount);
+  const chosen = [...new Set([access.home, ...access.folders])];
+  const kept = existing.filter(({ hostPath }) => chosen.includes(hostPath));
+  const placed = (path: string) => kept.some(({ mountPath }) => path === mountPath || path.startsWith(`${mountPath.replace(/\/$/u, "")}/`));
+  const taken = new Set(kept.map(({ name }) => name));
+  const added = chosen
+    .filter((path) => !kept.some(({ hostPath }) => hostPath === path) && !(path === access.home && placed(path)))
+    .map((path) => {
+      const name = mountName(path, taken);
+      taken.add(name);
+      return { name, hostPath: path, mountPath: path };
+    });
   const stateRoot = host["stateRoot"];
   return {
     ...host,
@@ -103,7 +120,7 @@ function hostSettings(host: Readonly<Record<string, unknown>>, access: FolderAcc
     gid: access.gid,
     home: access.home,
     stateRoot: Predicate.isString(stateRoot) && stateRoot.startsWith(`${access.home}/`) ? stateRoot : `${access.home}/.alasio/bayma`,
-    mounts,
+    mounts: [...kept, ...added],
   };
 }
 

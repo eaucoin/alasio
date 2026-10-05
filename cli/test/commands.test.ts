@@ -166,6 +166,28 @@ test("init asks, checks the bot's token with Telegram, writes the config and the
   assert.equal(secretValue(kube, "alasio-claude", "token"), "sk-ant-oat01-claude");
 });
 
+test("init keeps the host profile's mounts as written, mounting only folders new to it, and the home unless a mount puts it there", async (t) => {
+  const setup = await rig(t);
+  const mounts = [
+    { name: "home", hostPath: "/home", mountPath: "/home" },
+    { name: "docker-socket", hostPath: "/host/run/docker.sock", mountPath: "/var/run/docker.sock", type: "Socket" },
+    { name: "docker", hostPath: "/host/bin/docker", mountPath: "/usr/bin/docker", readOnly: true, type: "File" },
+  ];
+  const host = { enabled: true, uid: 1000, gid: 1000, supplementalGroups: [110], home: "/home/op", stateRoot: "/home/op/.local/share/alasio/bayma", mounts };
+  setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } }, install: { host } });
+  const tokenFile = join(setup.home, "bot-token");
+  writeFileSync(tokenFile, BOT_TOKEN);
+  const again = ["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--no-up"];
+  // The config as init wrote it.
+  const written = () => (setup.config() as { install: { host: typeof host } }).install.host;
+  succeeded(await setup.alasio(again));
+  assert.deepEqual(written(), host);
+  succeeded(await setup.alasio([...again, "--folders", ["/home", "/host/run/docker.sock", "/host/bin/docker", "/srv/code"].join(",")]));
+  assert.deepEqual(written().mounts, [...mounts, { name: "srv-code", hostPath: "/srv/code", mountPath: "/srv/code" }]);
+  succeeded(await setup.alasio([...again, "--folders", "/home"]));
+  assert.deepEqual(written().mounts, [mounts[0]]);
+});
+
 test("init asks where alasio runs on a first run, and runs it in the cluster a kubeconfig reaches when told", async (t) => {
   const { alasio, config, kube, kubeconfig } = await rig(t);
   const run = await alasio(["init"], [[DOWN, ENTER], typed(kubeconfig), typed("fake"), typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], pressed("n")]);
