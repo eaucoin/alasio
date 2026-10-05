@@ -64,6 +64,7 @@ test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Co
   const made: string[] = [];
   const kube = KubeClient.of({
     read: () => Effect.succeed(null),
+    list: () => Effect.die("nothing is listed"),
     create: (object) =>
       Effect.sync(() => {
         made.push(`${object.kind}/${object.metadata?.name}`);

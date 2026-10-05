@@ -162,7 +162,7 @@ test("a session's harness directory is its own, under the state directory, outsi
   const profile: SessionsProfile = { namespace: "alasio-sessions", port: 7290, workspaceDir: "/workspace", podTemplate: { spec: { containers: [{ name: "bayma" }] } } };
   // A session's harness directory is alasio's own; Kubernetes is never reached for it.
   const unreachable = () => Effect.die("the harness directory reached Kubernetes");
-  const kube = Layer.succeed(KubeClient, KubeClient.of({ read: unreachable, create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable }));
+  const kube = Layer.succeed(KubeClient, KubeClient.of({ read: unreachable, list: unreachable, create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable }));
   const layer = SessionSandboxes.layer({ profile, stateDir, env: {} }).pipe(
     Layer.provide(kube),
     Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),

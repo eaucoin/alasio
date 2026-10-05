@@ -107,6 +107,8 @@ const call = <A>(request: () => Promise<A>): Effect.Effect<A, KubeApiError> =>
 export class KubeClient extends Context.Service<KubeClient, {
   /** The object, or null when there is none. */
   readonly read: (apiVersion: string, kind: string, namespace: string, name: string) => Effect.Effect<KubernetesObject | null, KubeApiError>;
+  /** The objects of `kind` in the namespace whose labels `labelSelector` selects. */
+  readonly list: (apiVersion: string, kind: string, namespace: string, labelSelector: string) => Effect.Effect<readonly KubernetesObject[], KubeApiError>;
   /** The created object; fails with status 409 when it exists. */
   readonly create: <T extends KubernetesObject>(object: T) => Effect.Effect<T, KubeApiError>;
   /** Replaces it whole, at its `metadata.resourceVersion`. */
@@ -195,6 +197,8 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
       call(() => objects.read(ref(apiVersion, kind, namespace, name))).pipe(
         Effect.catchIf(hasStatus(404), () => Effect.succeed(null)),
       ),
+    list: (apiVersion, kind, namespace, labelSelector) =>
+      call(() => objects.list(apiVersion, kind, namespace, undefined, undefined, undefined, undefined, labelSelector)).pipe(Effect.map(({ items }) => items)),
     create: (object) => call(() => objects.create(object)),
     replace: (object) => call(() => objects.replace(object)),
     patch: (apiVersion, kind, namespace, name, patch) =>

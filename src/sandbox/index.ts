@@ -18,12 +18,14 @@
  * address both modes refuse, no longer answers. Where NetworkPolicy is not enforced at
  * all a session therefore never starts, rather than starting open.
  */
+import { createHash } from "node:crypto";
 import type { LookupAddress } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schema } from "effect";
+import type { V1Pod } from "@kubernetes/client-node";
+import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema } from "effect";
 
 import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
@@ -35,6 +37,7 @@ import {
   SANDBOX_KIND,
   type Sandbox,
   type SandboxError,
+  type SandboxFault,
   sameToken,
   sandboxManifest,
   tokenSecretName,
@@ -77,6 +80,11 @@ export class SessionTelemetryUnavailable extends Schema.TaggedError<SessionTelem
   }
 }
 
+/** A session's lost mount could not be made anew: why. */
+class SessionMountError extends Schema.TaggedError<SessionMountError>()("SessionMountError", {
+  message: Schema.String,
+}) {}
+
 /** Reading a file in a session came to neither its bytes nor a reason it has none. */
 export class SessionFileError extends Schema.TaggedError<SessionFileError>()("SessionFileError", {
   message: Schema.String,
@@ -109,6 +117,32 @@ export interface SessionSandboxesOptions {
 const BROKEN_MOUNT = /Transport endpoint is not connected|Software caused connection abort|Input\/output error/u;
 /** How long a look at a session's workspace mount may take; a mount that hangs is not one a new pod mends. */
 const MOUNT_CHECK_TIMEOUT: Duration.Input = "10 seconds";
+
+/**
+ * JuiceFS's mount pods, by the labels its CSI driver (v0.33.0, pkg/common/common.go)
+ * gives them, and the label naming the volume one mounts, by its id (its volume handle).
+ */
+const MOUNT_POD_SELECTOR = "app.kubernetes.io/name=juicefs-mount";
+const MOUNT_POD_VOLUME_LABEL = "volume-id";
+/** How long a restarted session's pod is waited for to go, and how often it is looked at. */
+const POD_GONE_TIMEOUT: Duration.Input = "2 minutes";
+const POLL: Duration.Input = "1 second";
+
+/**
+ * Whether the annotation `key: value` of a mount pod is the driver's reference to a target
+ * path it serves, `value`: "juicefs-" and the path's SHA-256, cut to 63 characters
+ * (GetReferenceKey in pkg/util/util.go).
+ */
+function isTargetReference(key: string, value: string): boolean {
+  return key === `juicefs-${createHash("sha256").update(value).digest("hex")}`.slice(0, 63);
+}
+
+/** The target paths a mount pod serves, as its annotations reference them. */
+const targetsOf = (mountPod: V1Pod): string[] =>
+  Object.entries(mountPod.metadata?.annotations ?? {}).filter(([key, value]) => isTargetReference(key, value)).map(([, value]) => value);
+
+/** Whether a target path is one of `pod`'s volumes, under kubelet's directory of the pod. */
+const ofPod = (pod: V1Pod) => (target: string): boolean => target.includes(`/pods/${pod.metadata?.uid}/volumes/`);
 
 const NET_MODE_LABEL = "alasio.dev/net-mode";
 const WORKLOAD_LABEL = "alasio.dev/workload";
@@ -235,23 +269,83 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   const kube = yield* KubeClient;
 
   /**
-   * Why a running session's workspace is out of its reach, or null: gVisor does not
-   * follow mount propagation, so a JuiceFS mount lost and made anew under a session is
-   * never seen in it again, and only a new pod mends it. One exec, reading the workspace's
-   * file system statistics in bayma's container; a look that cannot be taken is logged,
-   * and finds nothing.
+   * The ids of the volumes JuiceFS's mount pods in `mountPodNamespace` serve `pod`, as
+   * their references to its target paths say. Looked up while the pod runs: the driver
+   * drops a pod's references as the pod goes.
    */
-  const brokenMount = (volumeId: string): Effect.Effect<string | null> =>
+  const servedVolumes = (mountPodNamespace: string, pod: V1Pod): Effect.Effect<readonly string[], KubeApiError> =>
+    kube.list("v1", "Pod", mountPodNamespace, MOUNT_POD_SELECTOR).pipe(
+      // Pods, as the API server lists them.
+      Effect.map((mountPods) =>
+        [...new Set((mountPods as readonly V1Pod[]).filter((mountPod) => targetsOf(mountPod).some(ofPod(pod))).flatMap(({ metadata }) => metadata?.labels?.[MOUNT_POD_VOLUME_LABEL] ?? []))]
+      ),
+    );
+
+  /**
+   * Removes the mount pods of `volumes` that served the session's pod `pod` on its node,
+   * once that pod is gone, and serve no other pod: the driver then makes the volume's
+   * mount anew, in a mount pod of its own, as the session's next pod is started on it,
+   * rather than reusing the broken one or one made in its place on its mount point. What
+   * is removed, or that nothing is, is logged; a removal that fails is logged and leaves
+   * the session to resume as it is.
+   */
+  const removeMountPods = (mountPodNamespace: string, volumeId: string, pod: V1Pod, volumes: readonly string[]): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      yield* kube.read("v1", "Pod", profile.namespace, volumeId).pipe(
+        Effect.repeat({ schedule: Schedule.spaced(POLL), while: (current) => current?.metadata?.uid === pod.metadata?.uid }),
+        Effect.timeoutOrElse({ duration: POD_GONE_TIMEOUT, orElse: () => Effect.fail(new SessionMountError({ message: `the pod of session ${volumeId} is not gone` })) }),
+      );
+      const listed = yield* Effect.forEach(volumes, (volume) => kube.list("v1", "Pod", mountPodNamespace, `${MOUNT_POD_SELECTOR},${MOUNT_POD_VOLUME_LABEL}=${volume}`));
+      // Pods, as the API server lists them.
+      const broken = (listed.flat() as V1Pod[]).filter((mountPod) =>
+        mountPod.spec?.nodeName === pod.spec?.nodeName && !mountPod.metadata?.deletionTimestamp && targetsOf(mountPod).every(ofPod(pod))
+      );
+      if (broken.length === 0) {
+        yield* Effect.logInfo(`found no JuiceFS mount pod of session ${volumeId}'s volume to remove; resuming it`);
+        return;
+      }
+      for (const { metadata } of broken) {
+        yield* kube.remove("v1", "Pod", mountPodNamespace, metadata?.name ?? "");
+        yield* Effect.logInfo(`removed JuiceFS mount pod ${mountPodNamespace}/${metadata?.name} of volume ${metadata?.labels?.[MOUNT_POD_VOLUME_LABEL]}, whose mount session ${volumeId} lost`);
+      }
+    }).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not remove the JuiceFS mount pods of session ${volumeId}'s volume: ${error.message}; resuming it`)),
+    );
+
+  /**
+   * What is wrong with a running session's workspace, or null: gVisor does not follow
+   * mount propagation, so a JuiceFS mount lost and made anew under a session is never seen
+   * in it again, and only a new pod mends it, on a mount made anew (removeMountPods). One
+   * exec, reading the workspace's file system statistics in bayma's container; a look that
+   * cannot be taken is logged, and finds nothing.
+   */
+  const brokenMount = (volumeId: string): Effect.Effect<SandboxFault | null> =>
     kube.exec(profile.namespace, volumeId, BAYMA_CONTAINER, ["env", "LC_ALL=C", "stat", "--file-system", "--format=%T", profile.workspaceDir]).pipe(
       Effect.timeout(MOUNT_CHECK_TIMEOUT),
-      Effect.flatMap(({ exitCode, stderr }): Effect.Effect<string | null> => {
+      Effect.flatMap(({ exitCode, stderr }): Effect.Effect<SandboxFault | null> => {
         if (exitCode === 0) return Effect.succeed(null);
         const broken = BROKEN_MOUNT.exec(stderr)?.[0];
-        if (broken) return Effect.succeed(`workspace mount is broken (${broken})`);
+        if (broken) return lostMount(volumeId, `workspace mount is broken (${broken})`);
         return Effect.logWarning(`could not look at the workspace mount of session ${volumeId} (exit ${exitCode}): ${stderr.trim()}`).pipe(Effect.as(null));
       }),
       Effect.catch((error) => Effect.logWarning(`could not look at the workspace mount of session ${volumeId}: ${error.message}`).pipe(Effect.as(null))),
     );
+
+  /** The fault of a session whose mount is lost: `why`, and, where alasio's JuiceFS driver runs, its mount pods removed before it resumes. */
+  const lostMount = (volumeId: string, why: string): Effect.Effect<SandboxFault> => {
+    const mountPodNamespace = profile.mountPodNamespace;
+    if (!mountPodNamespace) return Effect.succeed({ why, beforeResume: Effect.void });
+    return Effect.gen(function*() {
+      // A core Pod, as the API server returns one.
+      const pod = (yield* kube.read("v1", "Pod", profile.namespace, volumeId)) as V1Pod | null;
+      const volumes = pod ? yield* servedVolumes(mountPodNamespace, pod) : [];
+      return { why, beforeResume: pod ? removeMountPods(mountPodNamespace, volumeId, pod, volumes) : Effect.void };
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning(`could not find the JuiceFS mount pods of session ${volumeId}'s volume: ${error.message}`).pipe(Effect.as({ why, beforeResume: Effect.void }))
+      ),
+    );
+  };
 
   const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port, fault: brokenMount });
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);

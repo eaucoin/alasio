@@ -742,7 +742,7 @@ describe("security", () => {
   });
 
   test("lets alasio manage only Sandboxes, their token Secrets and exec in its namespaces", () => {
-    const roles = all<V1Role>(install(), "Role").filter((role) => role.metadata?.name === "alasio");
+    const roles = all<V1Role>(install({ workspaceStorage: { enabled: false } }), "Role").filter((role) => role.metadata?.name === "alasio");
     assert.equal(roles.length, 1);
     assert.equal(roles[0]?.metadata?.namespace, "alasio-sessions");
     assert.deepEqual(roles[0]?.rules, [
@@ -751,6 +751,22 @@ describe("security", () => {
       { apiGroups: [""], resources: ["pods"], verbs: ["get"] },
       { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
     ]);
+  });
+
+  test("lets alasio list and delete pods in JuiceFS's driver's namespace, its mount pods, only where it installs the driver, and tells it where", () => {
+    const mountPodRoles = (objects: readonly KubernetesObject[]) => all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio" && role.metadata.namespace === "kube-system");
+    const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
+    const objects = install();
+    assert.deepEqual(mountPodRoles(objects).map(({ rules }) => rules), [[{ apiGroups: [""], resources: ["pods"], verbs: ["list", "delete"] }]]);
+    const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "kube-system"), "RoleBinding", "alasio");
+    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
+    assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
+    assert.equal(sessions(objects).mountPodNamespace, "kube-system");
+    for (const off of [{ enabled: false }, { csi: { enabled: false } }]) {
+      const without = install({ workspaceStorage: off });
+      assert.deepEqual(mountPodRoles(without), []);
+      assert.equal(sessions(without).mountPodNamespace, undefined);
+    }
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {

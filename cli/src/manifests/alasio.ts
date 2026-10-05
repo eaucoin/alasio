@@ -9,6 +9,7 @@ import type {
   V1Deployment,
   V1EnvVar,
   V1Namespace,
+  V1ObjectMeta,
   V1PersistentVolumeClaim,
   V1Role,
   V1RoleBinding,
@@ -69,6 +70,7 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
     workspaceDir: "/workspace",
     egressGate: sessions.egressGate,
     fullModeNameservers: [...sessions.fullModeNameservers],
+    ...(mountPodsRemoved(config) ? { mountPodNamespace: workspaceStorage.csi.namespace } : {}),
     podTemplate: {
       metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" } },
       spec: {
@@ -348,10 +350,35 @@ function namespaces(config: InstallConfig): V1Namespace[] {
 }
 
 /**
+ * Whether alasio removes the JuiceFS mount pods of a session whose mount is lost as it
+ * restarts it (src/sandbox/index.ts): where it installs JuiceFS's driver, whose mount pods
+ * it then knows to be in the driver's namespace.
+ */
+function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
+  return workspaceStorage.enabled && workspaceStorage.csi.enabled;
+}
+
+/**
  * alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and reads
- * files from sessions through exec, in the namespaces it owns, and nothing else.
+ * files from sessions through exec, in the namespaces it owns, and, where it installs
+ * JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount pods; and
+ * nothing else.
  */
 function identity(config: InstallConfig): KubernetesObject[] {
+  const binding = (metadata: V1ObjectMeta): V1RoleBinding => ({
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "RoleBinding",
+    metadata,
+    subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RELEASE },
+  });
+  const inDriverNamespace = { name: RELEASE, namespace: config.workspaceStorage.csi.namespace, labels: labels("alasio") };
+  const mountPods: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata: inDriverNamespace,
+    rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "delete"] }],
+  };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") } };
   return [
     serviceAccount,
@@ -368,15 +395,9 @@ function identity(config: InstallConfig): KubernetesObject[] {
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
         ],
       };
-      const binding: V1RoleBinding = {
-        apiVersion: "rbac.authorization.k8s.io/v1",
-        kind: "RoleBinding",
-        metadata,
-        subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: NAMESPACE }],
-        roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RELEASE },
-      };
-      return [role, binding];
+      return [role, binding(metadata)];
     }),
+    ...(mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
     ...(config.host.enabled ? hostAgentIdentity(config) : []),
   ];
 }

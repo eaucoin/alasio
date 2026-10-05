@@ -149,6 +149,15 @@ export class BaymaNotAnswering extends Schema.TaggedError<BaymaNotAnswering>()("
   }
 }
 
+/**
+ * What is wrong with a running Sandbox's pod that only a new pod mends: `why`, said after
+ * "whose", and what to do once the pod is suspended and before the Sandbox resumes.
+ */
+export interface SandboxFault {
+  readonly why: string;
+  readonly beforeResume: Effect.Effect<void>;
+}
+
 /** How bringing a Sandbox's bayma up fails. */
 export type SandboxError = KubeApiError | SandboxNotReady | SandboxGone | SandboxTokenMissing | BaymaNotAnswering;
 
@@ -180,9 +189,9 @@ export interface SandboxesOptions {
   readonly poll?: Duration.Input;
   /**
    * What is wrong with the pod of the running Sandbox `name` that only a new pod mends,
-   * looked at as it is brought up: why, or null when nothing is.
+   * looked at as it is brought up, or null when nothing is.
    */
-  readonly fault?: (name: string) => Effect.Effect<string | null>;
+  readonly fault?: (name: string) => Effect.Effect<SandboxFault | null>;
 }
 
 /** The container in every Sandbox's pod that runs bayma. */
@@ -460,13 +469,16 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   /**
    * `sandbox`, whose pod has ended or has a fault only a new pod mends, suspended:
    * agent-sandbox replaces no pod that has ended, so the Sandbox would never be ready
-   * again, and the pod it resumes with is new. `why` says which, after "whose".
+   * again, and the pod it resumes with is new. `why` says which, after "whose", and
+   * `beforeResume` is done once it is suspended.
    */
-  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string, beforeResume: Effect.Effect<void> = Effect.void): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}`);
     const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
-    return yield* awaitCondition(suspended, "Suspended");
+    const restarted = yield* awaitCondition(suspended, "Suspended");
+    yield* beforeResume;
+    return restarted;
   });
 
   const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
@@ -479,8 +491,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`);
     } else if (fault && sandbox.spec?.operatingMode !== "Suspended" && sandboxReady(sandbox)) {
       // Only a pod that ran before: one just made, or about to be resumed, is new.
-      const why = yield* fault(name);
-      if (why !== null) sandbox = yield* restart(sandbox, why);
+      const found = yield* fault(name);
+      if (found !== null) sandbox = yield* restart(sandbox, found.why, found.beforeResume);
     }
     if (sandbox.spec?.operatingMode === "Suspended") {
       sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));

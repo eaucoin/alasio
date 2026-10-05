@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -9,12 +10,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
 
-import type { KubernetesObject, V1Condition, V1ObjectMeta } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Condition, V1ObjectMeta, V1Pod } from "@kubernetes/client-node";
 import type { Attributes } from "@opentelemetry/api";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, type Scope } from "effect";
+import { Array as Arr, ConfigProvider, Effect, Exit, Fiber, Layer, Logger, Option, Result, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -26,6 +27,7 @@ import {
   podEnded,
   POD_TEMPLATE_ANNOTATION,
   podTemplateHash,
+  type SandboxFault,
   type SandboxSpec,
   type SandboxStatus,
   sameToken,
@@ -55,10 +57,10 @@ const profile = (extra: Partial<SessionsProfile> = {}): SessionsProfile => ({
   ...extra,
 });
 
-/** A Sandbox or Secret as the fake API server keeps it, with the uid and generation it gave it. */
+/** A Sandbox, Secret or Pod as the fake API server keeps it, with the uid and generation it gave it. */
 interface KeptObject extends KubernetesObject {
   metadata: V1ObjectMeta & { uid: string; generation: number };
-  spec?: Partial<SandboxSpec>;
+  spec?: Partial<SandboxSpec> & { nodeName?: string };
   status?: SandboxStatus;
   data?: Record<string, string>;
   stringData?: Record<string, string>;
@@ -86,12 +88,15 @@ type ExecArgs = Parameters<KubeClient["Service"]["exec"]>;
 /** A call the fake API server was made, with what identifies it. */
 type KubeCall =
   | readonly [verb: "read" | "create" | "remove", kind: string | undefined, name: string | undefined]
+  | readonly [verb: "list", kind: string, labelSelector: string]
   | readonly [verb: "patch", kind: string, name: string, patch: SandboxPatch]
   | readonly [verb: "exec", ...ExecArgs];
 
 interface FakeKubeOptions {
   /** What a command run in a container comes to: its result, or how the exec failed. */
   readonly onExec?: (...args: ExecArgs) => ExecResult | KubeExecError;
+  /** How deleting the object of `kind` and `name` fails, if it does. */
+  readonly onRemove?: (kind: string, name: string) => KubeApiError | undefined;
 }
 
 /** The Ready condition agent-sandbox's controller sets once it has seen `generation`. */
@@ -108,10 +113,11 @@ const readyCondition = (observedGeneration: number): V1Condition => ({
 const refusal = (status: number, message: string) => new KubeApiError({ status, cause: new Error(message) });
 
 /**
- * An API server of Sandboxes and Secrets in memory, as a KubeClient. `ready(name)` marks
- * a Sandbox's pod ready, as agent-sandbox's controller would; `exec` answers with `onExec`.
+ * An API server of Sandboxes, Secrets and Pods in memory, as a KubeClient. `ready(name)`
+ * marks a Sandbox's pod ready, as agent-sandbox's controller would; `exec` answers with
+ * `onExec`, and `remove` fails as `onRemove` says.
  */
-function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stderr: "" }) }: FakeKubeOptions = {}) {
+function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stderr: "" }), onRemove = () => undefined }: FakeKubeOptions = {}) {
   const objects = new Map<string, KeptObject>();
   const key = (kind: string | undefined, namespace: string | undefined, name: string | undefined) => `${kind}/${namespace}/${name}`;
   let uid = 0;
@@ -153,14 +159,24 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
       return read(kind, namespace, name);
     }),
     create,
+    list: (_apiVersion, kind, namespace, labelSelector) => Effect.sync(() => {
+      calls.push(["list", kind, labelSelector]);
+      const wanted = labelSelector.split(",").map((term) => term.split("="));
+      return [...objects.values()]
+        .filter(({ kind: kept, metadata }) => kept === kind && metadata.namespace === namespace && wanted.every(([label, value]) => metadata.labels?.[label ?? ""] === value))
+        .map((object) => structuredClone(object));
+    }),
     replace: () => Effect.die("alasio replaces no object"),
     patch: (_apiVersion, kind, namespace, name, change) => patch(kind, namespace, name, change),
-    remove: (_apiVersion, kind, namespace, name) => Effect.sync(() => {
+    remove: (_apiVersion, kind, namespace, name) => Effect.suspend(() => {
       calls.push(["remove", kind, name]);
+      const refused = onRemove(kind, name);
+      if (refused) return Effect.fail(refused);
       objects.delete(key(kind, namespace, name));
       for (const [k, object] of objects) {
         if (object.metadata.ownerReferences?.some((owner) => owner.name === name && owner.kind === kind)) objects.delete(k);
       }
+      return Effect.void;
     }),
     exec: (...args) => Effect.suspend(() => {
       calls.push(["exec", ...args]);
@@ -187,7 +203,7 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
     /**
      * Acts on the Sandbox every few milliseconds as agent-sandbox's controller does: ends
      * the pod of a suspended one, saying so, and starts a running one's from its current
-     * pod template, recorded in `pods`. Stops when `stop()` is called.
+     * pod template, on the node `node-a`, recorded in `pods`. Stops when `stop()` is called.
      */
     control(namespace: string, name: string) {
       const pods: string[] = [];
@@ -196,10 +212,12 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
         if (!sandbox) return;
         const generation = sandbox.metadata.generation;
         if (sandbox.spec?.operatingMode === "Suspended") {
+          objects.delete(key("Pod", namespace, name));
           sandbox.status = { conditions: [{ ...readyCondition(generation), type: "Suspended", reason: "SandboxSuspendedPodTerminated" }] };
         } else if (!sandboxReady(sandbox) && !podEnded(sandbox)) {
           // As agent-sandbox, which replaces no pod that has ended.
           pods.push(String(sandbox.spec?.podTemplate?.spec?.containers[0]?.image));
+          objects.set(key("Pod", namespace, name), { apiVersion: "v1", kind: "Pod", metadata: { name, namespace, uid: `uid-${++uid}`, generation: 1 }, spec: { nodeName: "node-a" } });
           this.ready(namespace, name);
         }
       }, 5);
@@ -486,11 +504,14 @@ test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never r
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
 });
 
-test("ensure restarts a running Sandbox whose pod has a fault only a new pod mends, looking only at a pod that ran before", async () => {
+test("ensure restarts a running Sandbox whose pod has a fault only a new pod mends, looking only at a pod that ran before, and does what the fault asks before it resumes", async () => {
   const kube = fakeKube();
   const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
   const looked: string[] = [];
-  const faults: (string | null)[] = ["workspace mount is broken (Transport endpoint is not connected)", null];
+  // The mode the Sandbox was in as the fault's work was done.
+  const doneWhile: (string | undefined)[] = [];
+  const beforeResume = Effect.sync(() => doneWhile.push(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode));
+  const faults: (SandboxFault | null)[] = [{ why: "workspace mount is broken (Transport endpoint is not connected)", beforeResume }, null];
   const fault = (name: string) => Effect.sync(() => {
     looked.push(name);
     return faults.shift() ?? null;
@@ -514,6 +535,7 @@ test("ensure restarts a running Sandbox whose pod has a fault only a new pod men
     return restarted;
   })).finally(controller.stop);
   assert.deepEqual(patches, [{ spec: { operatingMode: "Suspended" } }, { spec: { operatingMode: "Running" } }]);
+  assert.deepEqual(doneWhile, ["Suspended"]);
   assert.deepEqual(looked, ["fs-abc123", "fs-abc123"]);
   assert.equal(controller.pods.length, 3);
 });
@@ -674,6 +696,99 @@ test("a session whose workspace mount is lost is restarted as it is brought up, 
     assert.equal(yield* restarts(new KubeExecError({ message: "exec in alasio-sessions/fs-abc123 ended without a status" })), false);
   }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))))).finally(controller.stop);
   assert.equal(controller.pods.length, 4);
+});
+
+/** A target path of the pod `podUid`'s volume `volume` under kubelet, as the CSI driver is given it. */
+const targetOf = (podUid: string, volume: string) => `/var/lib/kubelet/pods/${podUid}/volumes/kubernetes.io~csi/${volume}/mount`;
+
+/** A JuiceFS mount pod of `volume` on `node`, referencing `targets` as the CSI driver does (GetReferenceKey). */
+const mountPod = (name: string, volume: string, node: string, targets: readonly string[]): V1Pod => ({
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name,
+    namespace: "kube-system",
+    labels: { "app.kubernetes.io/name": "juicefs-mount", "volume-id": volume },
+    annotations: {
+      "juicefs-uniqueid": "",
+      ...Object.fromEntries(targets.map((target) => [`juicefs-${createHash("sha256").update(target).digest("hex")}`.slice(0, 63), target])),
+    },
+  },
+  spec: { nodeName: node, containers: [] },
+});
+
+/**
+ * A session made on `kube`, with alasio's JuiceFS mount pods in kube-system, brought up
+ * once its mount answers `lost`: what alasio logged as it did, the mount pods made by
+ * `mountPods(pod)` from its pod, and whether it was restarted.
+ */
+async function restartedOnLostMount(kube: FakeKube, mountPods: (pod: KeptObject) => readonly KubernetesObject[]) {
+  const lines: string[] = [];
+  const logger = Logger.make(({ message }) => {
+    lines.push(Arr.ensure(message).join(" "));
+  });
+  const layer = SessionSandboxes.layer({ profile: profile({ mountPodNamespace: "kube-system" }), stateDir: "/tmp/alasio-kube-test", env: {} });
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.volumes.create("fs-abc123");
+    const pod = kube.peek("Pod", "alasio-sessions", "fs-abc123");
+    assert.ok(pod);
+    for (const object of mountPods(pod)) kube.create(object);
+    kube.calls.length = 0;
+    yield* sessions.ensureSession("fs-abc123");
+  }).pipe(Effect.provide(layer), Effect.provide(Layer.mergeAll(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })), Logger.layer([logger]))))).finally(controller.stop);
+  const restarted = kube.calls.filter(([verb]) => verb === "patch").length === 2;
+  return { lines, restarted };
+}
+
+/** What a mount whose connection was aborted answers. */
+const aborted: ExecResult = { exitCode: 1, stdout: Buffer.alloc(0), stderr: "stat: cannot read file system information for '/workspace': Software caused connection abort\n" };
+
+test("a session whose mount is lost is restarted on a mount made anew: the mount pods of its volume that served it alone on its node removed once its pod is gone", async () => {
+  // The session's pod as the mount pods were removed: none of it is left by then.
+  const removedWhile: (string | undefined)[] = [];
+  const kube: FakeKube = fakeKube({
+    onExec: () => aborted,
+    onRemove: () => {
+      removedWhile.push(kube.peek("Pod", "alasio-sessions", "fs-abc123")?.metadata.uid);
+      return undefined;
+    },
+  });
+  const { lines, restarted } = await restartedOnLostMount(kube, (pod) => [
+    // Its own, referencing its target; and one the driver made in its place, which references none.
+    mountPod("juicefs-node-a-pvc-1-abcdef", "pvc-1", "node-a", [targetOf(pod.metadata.uid, "pvc-1")]),
+    mountPod("juicefs-node-a-pvc-1-ghijkl", "pvc-1", "node-a", []),
+    // Its volume's on another node, one serving another pod too, and another volume's.
+    mountPod("juicefs-node-b-pvc-1-mnopqr", "pvc-1", "node-b", []),
+    mountPod("juicefs-node-a-pvc-1-stuvwx", "pvc-1", "node-a", [targetOf(pod.metadata.uid, "pvc-1"), targetOf("other", "pvc-1")]),
+    mountPod("juicefs-node-a-pvc-2-yzabcd", "pvc-2", "node-a", [targetOf("other", "pvc-2")]),
+  ]);
+  assert.equal(restarted, true);
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "remove"), [["remove", "Pod", "juicefs-node-a-pvc-1-abcdef"], ["remove", "Pod", "juicefs-node-a-pvc-1-ghijkl"]]);
+  assert.deepEqual(removedWhile, [undefined, undefined]);
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "list"), [
+    ["list", "Pod", "app.kubernetes.io/name=juicefs-mount"],
+    ["list", "Pod", "app.kubernetes.io/name=juicefs-mount,volume-id=pvc-1"],
+  ]);
+  assert.ok(lines.includes("removed JuiceFS mount pod kube-system/juicefs-node-a-pvc-1-abcdef of volume pvc-1, whose mount session fs-abc123 lost"), lines.join("\n"));
+  assert.ok(lines.includes("removed JuiceFS mount pod kube-system/juicefs-node-a-pvc-1-ghijkl of volume pvc-1, whose mount session fs-abc123 lost"), lines.join("\n"));
+});
+
+test("a session whose mount is lost and whose mount pod is not found is restarted all the same, saying so", async () => {
+  const kube = fakeKube({ onExec: () => aborted });
+  const { lines, restarted } = await restartedOnLostMount(kube, () => [mountPod("juicefs-node-a-pvc-2-yzabcd", "pvc-2", "node-a", [targetOf("other", "pvc-2")])]);
+  assert.equal(restarted, true);
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "remove"), []);
+  assert.ok(lines.includes("found no JuiceFS mount pod of session fs-abc123's volume to remove; resuming it"), lines.join("\n"));
+});
+
+test("a session whose lost mount's pod cannot be removed is restarted all the same, saying why", async () => {
+  const kube = fakeKube({ onExec: () => aborted, onRemove: () => refusal(403, "pods is forbidden") });
+  const { lines, restarted } = await restartedOnLostMount(kube, (pod) => [mountPod("juicefs-node-a-pvc-1-abcdef", "pvc-1", "node-a", [targetOf(pod.metadata.uid, "pvc-1")])]);
+  assert.equal(restarted, true);
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "remove"), [["remove", "Pod", "juicefs-node-a-pvc-1-abcdef"]]);
+  assert.ok(lines.includes("could not remove the JuiceFS mount pods of session fs-abc123's volume: pods is forbidden; resuming it"), lines.join("\n"));
 });
 
 test("alasio finds session filesystems only where it has them, made without a call to Kubernetes", async () => {

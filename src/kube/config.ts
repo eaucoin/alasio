@@ -5,7 +5,7 @@
  *
  *     {
  *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
- *                     "podTemplate", "volumeClaimTemplates" },
+ *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates" },
  *       "host":     { "namespace", "port", "stateRoot", "podTemplate" }
  *     }
  *
@@ -87,6 +87,11 @@ const SessionsProfile = said(
     egressGate: Schema.optional(said(Schema.NullOr(Schema.Boolean), "must be true or false")),
     /** The resolvers sessions with internet access use, or none for alasio's defaults. */
     fullModeNameservers: Schema.optional(said(Schema.NullOr(Schema.Array(Schema.String)), "must be a list of addresses")),
+    /**
+     * Where JuiceFS's CSI driver, which alasio installs, runs the mount pods of sessions'
+     * volumes, whose broken ones a session's restart removes; none where it installs none.
+     */
+    mountPodNamespace: Schema.optional(Schema.NullOr(Namespace)),
     volumeClaimTemplates: Schema.optional(VolumeClaimTemplates),
   }),
   "must be an object",
