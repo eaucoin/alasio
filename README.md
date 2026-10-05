@@ -44,7 +44,27 @@ as `sessions.storage.size` says, its files kept in the object store beside
 Neon's and its metadata in a Valkey alasio runs; JuiceFS's CSI driver, which
 alasio installs, makes each one's volume and mounts it. A deleted workspace's
 files stay in the file system's trash for a day, and JuiceFS copies the file
-system's metadata to the object store every hour.
+system's metadata to the object store every hour, into the workspaces bucket's
+`workspaces/meta/`; the daily backup copies the newest of these beside Neon's
+dump, and a daily check repairs what a crashed client left uncounted of each
+workspace's size.
+
+Should Valkey lose the metadata, or hold metadata gone wrong, restore a copy
+from a pod in alasio's namespace labelled `alasio.dev/workload: juicefs-admin`,
+the one kind of pod besides JuiceFS's own that reaches Valkey and the bucket,
+on the JuiceFS mount image the config pins. The Secret
+`alasio-workspaces-juicefs` holds what it needs: the file system's `metaurl`,
+Valkey's database 1, and the bucket and its keys. Fetch the copy with `juicefs
+sync`, `juicefs load` it into an empty Valkey database, give that the bucket's
+keys, which copies leave out, with `juicefs config --access-key --secret-key`,
+and check it with `juicefs fsck`. Load into database 1 once it is empty, or
+point the Secret's `metaurl` at the database you loaded, until `alasio up`
+renders it again. Then delete the sessions' pods, in `alasio-sessions`: each
+comes back mounted on what you restored. Never mount a restored copy read-write
+while the file system it was copied from runs on the same bucket: both would
+write and delete the same objects. A copy restores whole only within
+`workspaceStorage.trashDays` of when it was made, as the data of files deleted
+since leaves the bucket with the trash.
 
 Codex logs in once, in alasio, and keeps the login on alasio's volume:
 

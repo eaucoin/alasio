@@ -231,7 +231,11 @@ const Neon = Schema.Struct({
   controllerDb: NeonStored("2Gi", { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
   control: NeonStored("100Mi", { requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "256Mi" } }),
   compute: NeonService({ requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "4Gi" } }),
-  /** A daily logical dump of alasio's database to the object store, the last `keep` kept. */
+  /**
+   * A daily logical dump of alasio's database to the object store, and a copy of
+   * JuiceFS's newest dump of workspace storage's metadata beside it; of each, the last
+   * `keep` kept.
+   */
   backup: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),

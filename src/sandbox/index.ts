@@ -102,6 +102,14 @@ export interface SessionSandboxesOptions {
   readonly resolve?: (hostname: string) => Promise<LookupAddress>;
 }
 
+/**
+ * What a lost FUSE mount answers, in the C locale: its client gone (ENOTCONN), its
+ * connection aborted (ECONNABORTED), or its I/O failing (EIO).
+ */
+const BROKEN_MOUNT = /Transport endpoint is not connected|Software caused connection abort|Input\/output error/u;
+/** How long a look at a session's workspace mount may take; a mount that hangs is not one a new pod mends. */
+const MOUNT_CHECK_TIMEOUT: Duration.Input = "10 seconds";
+
 const NET_MODE_LABEL = "alasio.dev/net-mode";
 const WORKLOAD_LABEL = "alasio.dev/workload";
 const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
@@ -225,7 +233,27 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   resolve = lookup,
 }: SessionSandboxesOptions) {
   const kube = yield* KubeClient;
-  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port });
+
+  /**
+   * Why a running session's workspace is out of its reach, or null: gVisor does not
+   * follow mount propagation, so a JuiceFS mount lost and made anew under a session is
+   * never seen in it again, and only a new pod mends it. One exec, reading the workspace's
+   * file system statistics in bayma's container; a look that cannot be taken is logged,
+   * and finds nothing.
+   */
+  const brokenMount = (volumeId: string): Effect.Effect<string | null> =>
+    kube.exec(profile.namespace, volumeId, BAYMA_CONTAINER, ["env", "LC_ALL=C", "stat", "--file-system", "--format=%T", profile.workspaceDir]).pipe(
+      Effect.timeout(MOUNT_CHECK_TIMEOUT),
+      Effect.flatMap(({ exitCode, stderr }): Effect.Effect<string | null> => {
+        if (exitCode === 0) return Effect.succeed(null);
+        const broken = BROKEN_MOUNT.exec(stderr)?.[0];
+        if (broken) return Effect.succeed(`workspace mount is broken (${broken})`);
+        return Effect.logWarning(`could not look at the workspace mount of session ${volumeId} (exit ${exitCode}): ${stderr.trim()}`).pipe(Effect.as(null));
+      }),
+      Effect.catch((error) => Effect.logWarning(`could not look at the workspace mount of session ${volumeId}: ${error.message}`).pipe(Effect.as(null))),
+    );
+
+  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port, fault: brokenMount });
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);
   const receiverPort = yield* ReceiverPort;
   const receiverService = yield* ReceiverService;

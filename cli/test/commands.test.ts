@@ -276,6 +276,10 @@ test("status says each workload's state, and fails when one is not ready", async
   succeeded(healthy);
   assert.equal(healthy.printed[0], `alasio 0.0.0-development, in the cluster of the current context of ${kubeconfig} (${kube.server}):`);
   assert.ok(healthy.printed.includes("  Deployment alasio/alasio: ready"));
+  // Workspace storage's: JuiceFS's driver, in its own namespace, and Valkey.
+  for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
+    assert.ok(healthy.printed.includes(line), line);
+  }
   const deployment = kube.get(DEPLOYMENT);
   assert.ok(deployment?.status);
   deployment.status["availableReplicas"] = 0;

@@ -18,7 +18,7 @@ import { ConfigProvider, Effect, Exit, Fiber, Layer, Option, Result, Schema, typ
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
-import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, mergePatch, patchBody } from "../src/kube/client.ts";
+import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, KubeExecError, mergePatch, patchBody } from "../src/kube/client.ts";
 import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
 import {
   makeSandboxes,
@@ -90,7 +90,8 @@ type KubeCall =
   | readonly [verb: "exec", ...ExecArgs];
 
 interface FakeKubeOptions {
-  readonly onExec?: (...args: ExecArgs) => ExecResult;
+  /** What a command run in a container comes to: its result, or how the exec failed. */
+  readonly onExec?: (...args: ExecArgs) => ExecResult | KubeExecError;
 }
 
 /** The Ready condition agent-sandbox's controller sets once it has seen `generation`. */
@@ -161,9 +162,10 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
         if (object.metadata.ownerReferences?.some((owner) => owner.name === name && owner.kind === kind)) objects.delete(k);
       }
     }),
-    exec: (...args) => Effect.sync(() => {
+    exec: (...args) => Effect.suspend(() => {
       calls.push(["exec", ...args]);
-      return onExec(...args);
+      const result = onExec(...args);
+      return result instanceof KubeExecError ? Effect.fail(result) : Effect.succeed(result);
     }),
   });
   return {
@@ -484,6 +486,38 @@ test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never r
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
 });
 
+test("ensure restarts a running Sandbox whose pod has a fault only a new pod mends, looking only at a pod that ran before", async () => {
+  const kube = fakeKube();
+  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const looked: string[] = [];
+  const faults: (string | null)[] = ["workspace mount is broken (Transport endpoint is not connected)", null];
+  const fault = (name: string) => Effect.sync(() => {
+    looked.push(name);
+    return faults.shift() ?? null;
+  });
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  const patches = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", fault });
+    // Just made, its pod is new.
+    yield* sandboxes.ensure("fs-abc123", manifest);
+    assert.deepEqual(looked, []);
+    // Its pod has a fault: suspended and resumed, its volumes kept.
+    yield* sandboxes.ensure("fs-abc123", manifest);
+    const restarted = kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change);
+    kube.calls.length = 0;
+    // Its new pod has none: left as it is.
+    yield* sandboxes.ensure("fs-abc123", manifest);
+    assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
+    // Suspended, it is resumed, and its new pod not looked at.
+    kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
+    yield* sandboxes.ensure("fs-abc123", manifest);
+    return restarted;
+  })).finally(controller.stop);
+  assert.deepEqual(patches, [{ spec: { operatingMode: "Suspended" } }, { spec: { operatingMode: "Running" } }]);
+  assert.deepEqual(looked, ["fs-abc123", "fs-abc123"]);
+  assert.equal(controller.pods.length, 3);
+});
+
 test("ensure gives up on a Sandbox that does not become ready in five minutes, saying why", async () => {
   const kube = fakeKube();
   const error = await onKube(kube, fetch, Effect.gen(function*() {
@@ -591,7 +625,7 @@ test("a session on Kubernetes is made when created, and its files are read as it
     assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.labels?.["alasio.dev/net-mode"], "full");
 
     assert.deepEqual(yield* sessions.readFile("fs-abc123", "out/a.txt", 100), { bytes: Buffer.from("hello") });
-    const exec = kube.calls.find((call): call is Extract<KubeCall, readonly ["exec", ...ExecArgs]> => call[0] === "exec");
+    const exec = kube.calls.find((call): call is Extract<KubeCall, readonly ["exec", ...ExecArgs]> => call[0] === "exec" && call[4][0] === "sh");
     assert.ok(exec);
     const [, namespace, pod, container, command, options] = exec;
     assert.deepEqual([namespace, pod, container], ["alasio-sessions", "fs-abc123", "bayma"]);
@@ -605,6 +639,41 @@ test("a session on Kubernetes is made when created, and its files are read as it
     yield* sessions.volumes.destroy("fs-abc123");
     assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123"), null);
   }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))));
+});
+
+test("a session whose workspace mount is lost is restarted as it is brought up, and one whose mount cannot be looked at is not", async () => {
+  const lost = (error: string): ExecResult => ({ exitCode: 1, stdout: Buffer.alloc(0), stderr: `stat: cannot read file system information for '/workspace': ${error}\n` });
+  const answers: (ExecResult | KubeExecError)[] = [];
+  const kube = fakeKube({ onExec: () => answers.shift() ?? assert.fail("one look at the mount for each bring-up") });
+  const layer = SessionSandboxes.layer({ profile: profile(), stateDir: "/tmp/alasio-kube-test", env: {} });
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  /** Whether bringing the session up, its mount answering `answer`, restarted it. */
+  const restarts = (answer: ExecResult | KubeExecError) =>
+    Effect.gen(function*() {
+      answers.push(answer);
+      kube.calls.length = 0;
+      yield* (yield* SessionSandboxes).ensureSession("fs-abc123");
+      assert.deepEqual(answers, []);
+      const patches = kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change);
+      assert.ok(patches.length === 0 || patches.length === 2, "suspended and resumed, or left as it is");
+      return patches.length === 2;
+    });
+  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    // Made now, its mount is new and not looked at.
+    yield* (yield* SessionSandboxes).volumes.create("fs-abc123");
+    assert.deepEqual(kube.calls.filter(([verb]) => verb === "exec"), []);
+
+    assert.equal(yield* restarts({ exitCode: 0, stdout: Buffer.from("fuse\n"), stderr: "" }), false);
+    const [look] = kube.calls.filter((call): call is Extract<KubeCall, readonly ["exec", ...ExecArgs]> => call[0] === "exec");
+    assert.deepEqual(look?.slice(1), ["alasio-sessions", "fs-abc123", "bayma", ["env", "LC_ALL=C", "stat", "--file-system", "--format=%T", "/workspace"]]);
+    assert.equal(yield* restarts(lost("Transport endpoint is not connected")), true);
+    assert.equal(yield* restarts(lost("Software caused connection abort")), true);
+    assert.equal(yield* restarts(lost("Input/output error")), true);
+    // A look that fails says nothing of the mount.
+    assert.equal(yield* restarts({ exitCode: 127, stdout: Buffer.alloc(0), stderr: "env: 'stat': No such file or directory\n" }), false);
+    assert.equal(yield* restarts(new KubeExecError({ message: "exec in alasio-sessions/fs-abc123 ended without a status" })), false);
+  }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))))).finally(controller.stop);
+  assert.equal(controller.pods.length, 4);
 });
 
 test("alasio finds session filesystems only where it has them, made without a call to Kubernetes", async () => {

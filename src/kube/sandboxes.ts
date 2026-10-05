@@ -12,7 +12,9 @@
  *
  * agent-sandbox never changes a pod it has made, so a Sandbox records the pod template
  * it runs, and one made from another than alasio's current template (as after an upgrade
- * that brings a newer bayma) is moved onto it the next time alasio brings it up.
+ * that brings a newer bayma) is moved onto it the next time alasio brings it up. Nor does
+ * it replace a pod that has ended, or one whose fault only a new pod mends, so alasio
+ * restarts the Sandbox of either as it brings it up.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
@@ -155,9 +157,9 @@ export interface Sandboxes {
   readonly namespace: string;
   /**
    * Makes sure the Sandbox exists (made from `manifest()` when it does not), runs a pod
-   * of `manifest()`'s template (replacing one of another, or one that has ended, its
-   * volumes kept), and its bayma answers: the MCP endpoint and the bearer to reach it
-   * with. Callers asking at once share one bring-up.
+   * of `manifest()`'s template, replacing one of another, one that has ended, or one
+   * with a fault (SandboxesOptions), its volumes kept, and its bayma answers: the MCP
+   * endpoint and the bearer to reach it with. Callers asking at once share one bring-up.
    */
   readonly ensure: (name: string, manifest: () => Sandbox) => Effect.Effect<BaymaEndpoint, SandboxError>;
   /** The Sandbox's token, or null when it has none. */
@@ -167,12 +169,20 @@ export interface Sandboxes {
   readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
 }
 
-/** What makeSandboxes is given: where, bayma's port in every one, and how long and how often to wait for one. */
+/**
+ * What makeSandboxes is given: where, bayma's port in every one, how long and how often
+ * to wait for one, and what may be wrong with a running one's pod.
+ */
 export interface SandboxesOptions {
   readonly namespace: string;
   readonly port: number;
   readonly readyTimeout?: Duration.Input;
   readonly poll?: Duration.Input;
+  /**
+   * What is wrong with the pod of the running Sandbox `name` that only a new pod mends,
+   * looked at as it is brought up: why, or null when nothing is.
+   */
+  readonly fault?: (name: string) => Effect.Effect<string | null>;
 }
 
 /** The container in every Sandbox's pod that runs bayma. */
@@ -340,6 +350,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   port,
   readyTimeout = READY_TIMEOUT,
   poll = POLL,
+  fault,
 }: SandboxesOptions): Effect.fn.Return<Sandboxes, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const fetch = yield* FetchHttpClient.Fetch;
@@ -447,12 +458,13 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   });
 
   /**
-   * `sandbox`, whose pod has ended, suspended: agent-sandbox replaces no pod that has
-   * ended, so the Sandbox would never be ready again, and the pod it resumes with is new.
+   * `sandbox`, whose pod has ended or has a fault only a new pod mends, suspended:
+   * agent-sandbox replaces no pod that has ended, so the Sandbox would never be ready
+   * again, and the pod it resumes with is new. `why` says which, after "whose".
    */
-  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
     const name = sandbox.metadata.name;
-    yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose pod ended (${condition(sandbox, "Ready")?.reason})`);
+    yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}`);
     const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
     return yield* awaitCondition(suspended, "Suspended");
   });
@@ -464,7 +476,11 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     if (sandbox.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] !== desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]) {
       sandbox = yield* moveOnto(sandbox, desired);
     } else if (podEnded(sandbox)) {
-      sandbox = yield* restart(sandbox);
+      sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`);
+    } else if (fault && sandbox.spec?.operatingMode !== "Suspended" && sandboxReady(sandbox)) {
+      // Only a pod that ran before: one just made, or about to be resumed, is new.
+      const why = yield* fault(name);
+      if (why !== null) sandbox = yield* restart(sandbox, why);
     }
     if (sandbox.spec?.operatingMode === "Suspended") {
       sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));

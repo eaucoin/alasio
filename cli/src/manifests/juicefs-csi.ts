@@ -60,6 +60,11 @@ export const MOUNT_POD_LABELS: Labels = { "app.kubernetes.io/name": "juicefs-mou
 export const CONTROLLER_POD_LABELS: Labels = { app: CONTROLLER, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
 export const NODE_POD_LABELS: Labels = { app: NODE, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
 
+/** The selector of the controller's, the node service's and the mount pods' pods, by their name labels. */
+export const JUICEFS_PODS_SELECTOR = `app.kubernetes.io/name in (${MOUNT_POD_LABELS["app.kubernetes.io/name"]}, ${CONTROLLER_POD_LABELS["app.kubernetes.io/name"]})`;
+/** Where each of those pods serves its Prometheus metrics (administration/monitoring.md). */
+export const JUICEFS_METRICS_PORT = 9567;
+
 /** The label of what the driver needs to delete its volumes' data, which alasio keeps while they remain. */
 export const VOLUME_DRIVER: Labels = { [VOLUME_DRIVER_LABEL]: CSI_DRIVER };
 

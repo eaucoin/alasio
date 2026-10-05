@@ -46,7 +46,8 @@ import {
   waitForObjectStore,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { JUICEFS_METRICS_PORT, JUICEFS_PODS_SELECTOR, VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { VALKEY, VALKEY_PORT } from "./valkey.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`. */
@@ -558,10 +559,13 @@ function compute(config: InstallConfig): KubernetesObject[] {
 
 /**
  * A logical dump of alasio's database, restorable into any Postgres whatever becomes of
- * the stack, to the object store's backups bucket, of which the last `keep` are kept.
+ * the stack, to the object store's backups bucket, and beside it, with workspace storage,
+ * the newest dump JuiceFS has made of its file system's metadata, which it makes in the
+ * workspaces bucket's `<name>/meta/`; of each, the last `keep` are kept.
  */
 function backup(config: InstallConfig): V1CronJob {
   const component = "neon-backup";
+  const { objectStore, workspaceStorage } = config;
   const dump: V1Container = {
     name: "dump",
     image: imageReference(config.neon.computeImage),
@@ -589,17 +593,31 @@ function backup(config: InstallConfig): V1CronJob {
       script(
         "set -eu",
         's3() { aws s3 --endpoint-url "$S3_ENDPOINT" "$@"; }',
+        // Deletes all but the newest KEEP of the backups whose names match $1, which sort by when they were made.
+        "prune() { s3 ls \"s3://$BUCKET/\" | awk '{print $4}' | grep \"$1\" | sort -r | tail -n +$((KEEP + 1)) \\",
+        '  | while read -r old; do s3 rm "s3://$BUCKET/$old"; done; }',
         "stamp=$(date -u +%Y%m%dT%H%M%SZ)",
         's3 cp /backup/alasio.dump "s3://$BUCKET/alasio-$stamp.dump"',
-        "s3 ls \"s3://$BUCKET/\" | awk '{print $4}' | grep '^alasio-.*\\.dump$' | sort -r | tail -n +$((KEEP + 1)) \\",
-        '  | while read -r old; do s3 rm "s3://$BUCKET/$old"; done',
+        "prune '^alasio-.*\\.dump$'",
+        ...(workspaceStorage.enabled
+          ? [
+            'meta="s3://$WORKSPACES_BUCKET/$WORKSPACES_NAME/meta/"',
+            "dump=$(s3 ls \"$meta\" | awk '{print $4}' | grep '^dump-.*\\.json\\.gz$' | sort -r | head -n 1)",
+            // None until a workspace's volume has been mounted for a while.
+            'if [ -n "$dump" ]; then s3 cp "$meta$dump" "s3://$BUCKET/$WORKSPACES_NAME-$dump"; else echo "JuiceFS has dumped no metadata of $WORKSPACES_NAME yet"; fi',
+            'prune "^$WORKSPACES_NAME-dump-.*\\.json\\.gz$"',
+          ]
+          : []),
       ),
     ],
     env: [
       { name: "S3_ENDPOINT", value: s3Endpoint(config) },
-      { name: "BUCKET", value: config.objectStore.buckets.backups },
+      { name: "BUCKET", value: objectStore.buckets.backups },
       { name: "KEEP", value: String(config.neon.backup.keep) },
-      { name: "AWS_DEFAULT_REGION", value: config.objectStore.external.region },
+      ...(workspaceStorage.enabled
+        ? [{ name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces }, { name: "WORKSPACES_NAME", value: workspaceStorage.name }]
+        : []),
+      { name: "AWS_DEFAULT_REGION", value: objectStore.external.region },
       { name: "HOME", value: "/tmp" },
     ],
     envFrom: [{ secretRef: { name: neonName("s3-admin") } }],
@@ -638,14 +656,16 @@ function backup(config: InstallConfig): V1CronJob {
 
 /**
  * The stack's telemetry: every Neon service's, SeaweedFS's and the lake's Prometheus
- * metrics, scraped and sent on as OTLP where alasio's telemetry goes, when it goes
- * anywhere. Its pod carries its configuration's checksum, so it is replaced when that
- * changes.
+ * metrics, and with workspace storage JuiceFS's and Valkey's, scraped and sent on as OTLP
+ * where alasio's telemetry goes, when it goes anywhere. JuiceFS's are its driver's and
+ * mount pods', found among the pods of the driver's namespace, which the collector may
+ * list; Valkey's are read with its password. Its pod carries its configuration's
+ * checksum, so it is replaced when that changes.
  */
 function collector(config: InstallConfig, endpoint: string): KubernetesObject[] {
   const name = neonName("collector");
   const component = "neon-collector";
-  const { telemetry } = config;
+  const { telemetry, workspaceStorage } = config;
   const safekeeper = neonName("safekeeper");
   const targets: Record<string, string[]> = {
     pageserver: [`${neonName("pageserver")}:9898`],
@@ -656,19 +676,51 @@ function collector(config: InstallConfig, endpoint: string): KubernetesObject[] 
     ...(config.objectStore.bundled.enabled ? { seaweedfs: [`${componentName("seaweedfs")}:9327`] } : {}),
     ...(config.lake.enabled ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
+  // Each running pod at its address, on the metrics port, named by its pod. The
+  // collector reads `$` as the start of a variable, and `$$` as a `$`.
+  const juicefs = {
+    job_name: "juicefs",
+    scrape_interval: "30s",
+    kubernetes_sd_configs: [{
+      role: "pod",
+      namespaces: { names: [workspaceStorage.csi.namespace] },
+      selectors: [{ role: "pod", label: JUICEFS_PODS_SELECTOR }],
+    }],
+    relabel_configs: [
+      { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${JUICEFS_METRICS_PORT}` },
+      { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+    ],
+  };
   const collectorConfig = {
     receivers: {
       prometheus: {
         config: {
-          scrape_configs: Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: "30s", static_configs: [{ targets: targets[job] }] })),
+          scrape_configs: [
+            ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: "30s", static_configs: [{ targets: targets[job] }] })),
+            ...(workspaceStorage.enabled ? [juicefs] : []),
+          ],
         },
       },
+      ...(workspaceStorage.enabled
+        ? {
+          redis: {
+            endpoint: `${VALKEY}:${VALKEY_PORT}`,
+            password: "${env:VALKEY_PASSWORD}",
+            collection_interval: "30s",
+            // How near it is to refusing writes: used memory against this.
+            metrics: { "redis.maxmemory": { enabled: true } },
+          },
+        }
+        : {}),
     },
     processors: { resource: { attributes: [{ key: "service.namespace", value: "alasio-neon", action: "upsert" }] }, batch: {} },
     exporters: { otlphttp: { endpoint, ...(telemetry.headersSecret ? { headers: "${file:/etc/otelcol/headers/headers.yaml}" } : {}) } },
     service: {
       telemetry: { metrics: { level: "none" } },
-      pipelines: { metrics: { receivers: ["prometheus"], processors: ["resource", "batch"], exporters: ["otlphttp"] } },
+      pipelines: {
+        metrics: { receivers: ["prometheus", ...(workspaceStorage.enabled ? ["redis"] : [])], processors: ["resource", "batch"], exporters: ["otlphttp"] },
+      },
     },
   };
   const configMap: V1ConfigMap = {
@@ -687,12 +739,14 @@ function collector(config: InstallConfig, endpoint: string): KubernetesObject[] 
       template: {
         metadata: { labels: stackLabels(component), annotations: { "checksum/config": sha256(goJson(collectorConfig)) } },
         spec: {
+          ...(workspaceStorage.enabled ? { serviceAccountName: name } : {}),
           ...stackPodSpec(config),
           containers: [{
             name: "collector",
             image: imageReference(config.neon.collector.image),
             imagePullPolicy: "IfNotPresent",
             args: ["--config=/etc/otelcol/config.yaml"],
+            ...(workspaceStorage.enabled ? { env: [{ name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: VALKEY, key: "password" } } }] } : {}),
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources: config.neon.collector.resources,
             volumeMounts: [
@@ -712,7 +766,24 @@ function collector(config: InstallConfig, endpoint: string): KubernetesObject[] 
       },
     },
   };
-  return [configMap, deployment];
+  if (!workspaceStorage.enabled) return [configMap, deployment];
+  // Who the collector is, and that it may find JuiceFS's pods in the driver's namespace.
+  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) } };
+  const metadata = { name, namespace: workspaceStorage.csi.namespace, labels: stackLabels(component) };
+  const role: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata,
+    rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }],
+  };
+  const binding: V1RoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "RoleBinding",
+    metadata,
+    subjects: [{ kind: "ServiceAccount", name, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name },
+  };
+  return [serviceAccount, role, binding, configMap, deployment];
 }
 
 /** Neon's objects, when it runs. */

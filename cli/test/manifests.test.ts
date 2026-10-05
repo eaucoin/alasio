@@ -4,6 +4,10 @@
  * configuration is checked and defaulted.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 
 import type {
@@ -18,6 +22,7 @@ import type {
   V1Namespace,
   V1PriorityClass,
   V1Role,
+  V1RoleBinding,
   V1Service,
   V1StatefulSet,
   V1StorageClass,
@@ -52,6 +57,23 @@ function container(workload: V1Deployment | V1StatefulSet): V1Container {
   const first = workload.spec?.template.spec?.containers[0];
   assert.ok(first);
   return first;
+}
+
+/**
+ * A container's shell script, run here with `env` and with `commands` (name to a shell
+ * script) in place of the programs of the image it runs in; in a directory of its own,
+ * `root`, which they may keep their state in. What it printed, or why it failed.
+ */
+function runScript(workload: { readonly command?: string[] | undefined }, env: Readonly<Record<string, string>>, commands: Readonly<Record<string, string>>) {
+  const [shell, flag, text] = workload.command ?? [];
+  assert.deepEqual([shell, flag], ["/bin/sh", "-c"]);
+  const root = mkdtempSync(join(tmpdir(), "alasio-script-"));
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  for (const [name, body] of Object.entries(commands)) writeFileSync(join(bin, name), `#!/bin/sh\n${body}`, { mode: 0o755 });
+  const run = (): string =>
+    execFileSync("/bin/sh", ["-c", text ?? ""], { env: { ...env, ROOT: root, PATH: `${bin}:${process.env["PATH"]}` }, encoding: "utf8" });
+  return { root, run, remove: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 /** The templates alasio makes its workspaces' Sandboxes from, as its ConfigMap holds them. */
@@ -306,9 +328,102 @@ describe("neon", () => {
     assert.match(config, /alasio-lake:9464/u);
   });
 
+  test("scrapes JuiceFS's pods, found in the driver's namespace, and Valkey, with its password, when workspace storage is on", () => {
+    const telemetry = { otlpEndpoint: "http://collector:4318" };
+    const collectorConfig = (objects: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-neon-collector").data?.["config.yaml"] ?? "");
+    const objects = install({ telemetry });
+    const config = collectorConfig(objects);
+    assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), {
+      job_name: "juicefs",
+      scrape_interval: "30s",
+      kubernetes_sd_configs: [{
+        role: "pod",
+        namespaces: { names: ["kube-system"] },
+        selectors: [{ role: "pod", label: "app.kubernetes.io/name in (juicefs-mount, juicefs-csi-driver)" }],
+      }],
+      relabel_configs: [
+        { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+        { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: "$$1:9567" },
+        { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+      ],
+    });
+    assert.deepEqual(config.receivers.redis, {
+      endpoint: "alasio-valkey:6379",
+      password: "${env:VALKEY_PASSWORD}",
+      collection_interval: "30s",
+      metrics: { "redis.maxmemory": { enabled: true } },
+    });
+    assert.deepEqual(config.service.pipelines.metrics.receivers, ["prometheus", "redis"]);
+    const collector = one<V1Deployment>(objects, "Deployment", "alasio-neon-collector");
+    assert.equal(collector.spec?.template.spec?.serviceAccountName, "alasio-neon-collector");
+    assert.deepEqual(container(collector).env, [{ name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-valkey", key: "password" } } }]);
+    const role = one<V1Role>(objects, "Role", "alasio-neon-collector");
+    assert.equal(role.metadata?.namespace, "kube-system");
+    assert.deepEqual(role.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
+    const binding = one<V1RoleBinding>(objects, "RoleBinding", "alasio-neon-collector");
+    assert.equal(binding.metadata?.namespace, "kube-system");
+    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio-neon-collector", namespace: "alasio" }]);
+    assert.ok(one(objects, "ServiceAccount", "alasio-neon-collector"));
+
+    const off = install({ telemetry, workspaceStorage: { enabled: false } });
+    const offConfig = collectorConfig(off);
+    assert.equal(offConfig.receivers.redis, undefined);
+    assert.deepEqual(offConfig.service.pipelines.metrics.receivers, ["prometheus"]);
+    assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), undefined);
+    assert.equal(one<V1Deployment>(off, "Deployment", "alasio-neon-collector").spec?.template.spec?.serviceAccountName, undefined);
+    assert.deepEqual(off.filter(({ kind, metadata }) => kind !== "ConfigMap" && kind !== "Deployment" && metadata?.name === "alasio-neon-collector"), []);
+  });
+
   test("backs the database up daily unless told not to", () => {
     assert.equal(one<V1CronJob>(install(), "CronJob", "alasio-neon-backup").spec?.schedule, "17 3 * * *");
     assert.deepEqual(install({ neon: { backup: { enabled: false } } }).filter((object) => object.metadata?.name === "alasio-neon-backup"), []);
+  });
+
+  test("backs JuiceFS's newest metadata dump up beside the database's, keeping as many of each", () => {
+    const upload = one<V1CronJob>(install({ neon: { backup: { keep: 2 } } }), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.containers[0];
+    assert.ok(upload);
+    const env = Object.fromEntries((upload.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
+    assert.equal(env["WORKSPACES_BUCKET"], "workspaces");
+    assert.equal(env["WORKSPACES_NAME"], "workspaces");
+    // The object store, a directory of buckets, as aws s3 lists, copies to and deletes from it; the dump's volume under ROOT.
+    const aws = [
+      "shift 3; verb=$1; shift",
+      'at() { printf "%s/%s" "$ROOT/store" "${1#s3://}"; }',
+      "case $verb in",
+      '  ls) [ -d "$(at "$1")" ] || exit 1; for f in "$(at "$1")"*; do [ -e "$f" ] && echo "2026-10-05 03:17:00 1 ${f##*/}"; done; true ;;',
+      '  cp) from=$1; case $from in s3://*) from=$(at "$from") ;; *) from=$ROOT$from ;; esac; mkdir -p "$(dirname "$(at "$2")")"; cp "$from" "$(at "$2")" ;;',
+      '  rm) rm "$(at "$1")" ;;',
+      "esac",
+    ].join("\n");
+    const { root, run, remove } = runScript(upload, env, { aws });
+    try {
+      const store = join(root, "store");
+      const backups = () => readdirSync(join(store, "backups")).sort();
+      mkdirSync(join(root, "backup"));
+      writeFileSync(join(root, "backup", "alasio.dump"), "database");
+      mkdirSync(join(store, "backups"), { recursive: true });
+      const older = ["alasio-20261003T031700Z.dump", "alasio-20261004T031700Z.dump", "workspaces-dump-2026-10-03-021000.json.gz", "workspaces-dump-2026-10-04-021000.json.gz"];
+      for (const name of older) writeFileSync(join(store, "backups", name), "older");
+      // Before JuiceFS has made any, there is none to copy.
+      assert.match(run(), /^JuiceFS has dumped no metadata of workspaces yet$/mu);
+      assert.equal(backups().filter((name) => name.startsWith("alasio-")).length, 2);
+      assert.ok(!backups().includes("alasio-20261003T031700Z.dump"));
+
+      const meta = join(store, "workspaces", "workspaces", "meta");
+      mkdirSync(meta, { recursive: true });
+      writeFileSync(join(meta, "dump-2026-10-04-021000.json.gz"), "older");
+      writeFileSync(join(meta, "dump-2026-10-05-021000.json.gz"), "newest");
+      run();
+      assert.deepEqual(backups().filter((name) => name.startsWith("workspaces-")), ["workspaces-dump-2026-10-04-021000.json.gz", "workspaces-dump-2026-10-05-021000.json.gz"]);
+      assert.equal(readFileSync(join(store, "backups", "workspaces-dump-2026-10-05-021000.json.gz"), "utf8"), "newest");
+      assert.equal(backups().filter((name) => name.startsWith("alasio-")).length, 2);
+    } finally {
+      remove();
+    }
+
+    const without = one<V1CronJob>(install({ workspaceStorage: { enabled: false } }), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.containers[0];
+    assert.doesNotMatch(without?.command?.[2] ?? "", /WORKSPACES/u);
+    assert.equal(without?.env?.find(({ name }) => name.startsWith("WORKSPACES_")), undefined);
   });
 });
 
@@ -412,7 +527,51 @@ describe("workspace storage", () => {
     }
   });
 
-  test("admits JuiceFS's pods alone to Valkey and to the object store's S3 port", () => {
+  test("checks each volume's quota daily and repairs it, as a JuiceFS admin on the pinned client, kept as the driver is", () => {
+    const quotaCheck = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-quota-check");
+    assert.equal(quotaCheck.metadata?.namespace, "alasio");
+    assert.equal(quotaCheck.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com");
+    assert.equal(quotaCheck.spec?.schedule, "47 3 * * *");
+    assert.equal(quotaCheck.spec?.concurrencyPolicy, "Forbid");
+    const pod = quotaCheck.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const check = pod?.spec?.containers[0];
+    assert.ok(check);
+    assert.equal(check.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
+    assert.deepEqual(check.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
+    // `juicefs quota list` as JuiceFS 1.4.1 tables quotas: directories' by path (a deleted
+    // one's in the trash, or by inode once it has none), users' and groups' by id.
+    const juicefs = [
+      'echo "$@" >> "$ROOT/calls"',
+      '[ "$2" = list ] || exit 0',
+      "cat <<'TABLE'",
+      "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
+      "|                     Path/ID                     |   Size  |   Used  | Use% |   Inodes  | IUsed | IUse% |",
+      "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
+      "| /.trash/2026-10-05-03/1-77-alasio-sessions-data | 1.0 GiB | 8.0 KiB |   0% | unchanged |     2 |       |",
+      "| /alasio-sessions-data-fs-abc123                 | 1.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
+      "| /alasio-sessions-data-fs-def456                 | 2.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| inode:42                                        | 1.0 GiB |     0 B |   0% | unchanged |     0 |       |",
+      "| uid:1000                                        | 4.0 GiB | 1.6 MiB |   0% | unchanged |   314 |       |",
+      "+-------------------------------------------------+---------+---------+------+-----------+-------+-------+",
+      "TABLE",
+    ].join("\n");
+    const metaUrl = "redis://:secret@alasio-valkey.alasio.svc.cluster.local:6379/1";
+    const { root, run, remove } = runScript(check, { META_URL: metaUrl }, { juicefs });
+    try {
+      run();
+      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [
+        `quota list ${metaUrl}`,
+        `quota check ${metaUrl} --path /alasio-sessions-data-fs-abc123 --repair`,
+        `quota check ${metaUrl} --path /alasio-sessions-data-fs-def456 --repair`,
+      ]);
+    } finally {
+      remove();
+    }
+  });
+
+  test("admits JuiceFS's pods alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port", () => {
     const objects = install();
     const policy = (name: string) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
@@ -427,7 +586,13 @@ describe("workspace storage", () => {
       { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio" } }, podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } },
     ];
     assert.deepEqual(policy("alasio-valkey").podSelector, { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } });
-    assert.deepEqual(policy("alasio-valkey").ingress, [{ from: peers, ports: [{ protocol: "TCP", port: 6379 }] }]);
+    assert.deepEqual(policy("alasio-valkey").ingress, [
+      { from: peers, ports: [{ protocol: "TCP", port: 6379 }] },
+      {
+        from: [{ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "neon-collector" } } }],
+        ports: [{ protocol: "TCP", port: 6379 }],
+      },
+    ]);
     assert.deepEqual(policy("alasio-seaweedfs-workspaces").ingress, [{ from: peers, ports: [{ protocol: "TCP", port: 8333 }] }]);
   });
 

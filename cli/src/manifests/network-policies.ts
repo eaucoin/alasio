@@ -9,6 +9,7 @@ import { componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./com
 import type { InstallConfig } from "./config.ts";
 import { CONTROLLER_POD_LABELS, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
+import { JUICEFS_ADMIN } from "./workspace-storage.ts";
 
 /**
  * A NetworkPolicy as the API server takes it: client-node's model calls an ingress
@@ -76,14 +77,12 @@ function neonPolicies(): NetworkPolicy[] {
   ];
 }
 
-/** The label of alasio's pods that run JuiceFS's command line against the workspaces' file system, a restore's, say. */
-const JUICEFS_ADMIN = { "alasio.dev/workload": "juicefs-admin" };
-
 /**
  * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
  * controller, its node service and the mount pods it runs, in the driver's namespace) and
- * alasio's JuiceFS admin pods: Valkey takes no other connection, and the bundled object
- * store takes theirs on its S3 port beside the stack's own.
+ * alasio's JuiceFS admin pods: Valkey takes no other connection but the stack's
+ * collector's, which reads its metrics, and the bundled object store takes theirs on its
+ * S3 port beside the stack's own.
  */
 function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
   const driverNamespace = { matchLabels: { "kubernetes.io/metadata.name": config.workspaceStorage.csi.namespace } };
@@ -97,7 +96,10 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
     policy(componentName("valkey"), NAMESPACE, "valkey", {
       podSelector: { matchLabels: selectorLabels("valkey") },
       policyTypes: ["Ingress"],
-      ingress: [{ from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] }],
+      ingress: [
+        { from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+        { from: [{ podSelector: { matchLabels: selectorLabels("neon-collector") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+      ],
     }),
     ...(config.objectStore.bundled.enabled
       ? [policy(componentName("seaweedfs-workspaces"), NAMESPACE, "seaweedfs", {
