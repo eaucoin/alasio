@@ -10,8 +10,10 @@ bayma's REPL sessions.
 ## Get Started
 
 alasio installs and runs itself with its command line, the npm package
-`alasio`. On a Linux x86-64 machine with Docker and Node 24, make a bot with
-BotFather, then:
+`alasio`. It needs a Linux x86-64 machine with Docker and Node 24, whose
+inotify limits hold the cluster's containers: `fs.inotify.max_user_instances`
+at least 1024 and `fs.inotify.max_user_watches` at least 524288, which `init`
+says how to raise. On such a machine, make a bot with BotFather, then:
 
 ```sh
 npx alasio init
@@ -36,6 +38,13 @@ in a sandbox that reaches the internet only if you chose so and never the
 cluster. Folder workspaces are your machine's own folders, worked on as you:
 `init` asks which, and as whom; they are privileged by nature, and meant for a
 machine you own.
+
+A new sandbox's filesystem is a directory of one JuiceFS file system, as large
+as `sessions.storage.size` says, its files kept in the object store beside
+Neon's and its metadata in a Valkey alasio runs; JuiceFS's CSI driver, which
+alasio installs, makes each one's volume and mounts it. A deleted workspace's
+files stay in the file system's trash for a day, and JuiceFS copies the file
+system's metadata to the object store every hour.
 
 Codex logs in once, in alasio, and keeps the login on alasio's volume:
 
@@ -67,8 +76,11 @@ The config's `install` holds the rest of how alasio is installed, every key of
 it optional, and `cli/src/manifests/config.ts` documents each. Among them,
 `neon.external` uses a Postgres of your own instead of the Neon alasio runs,
 and `objectStore.external` an S3-compatible store instead of the bundled
-SeaweedFS, where Neon keeps its storage and a daily backup goes. `alasio up`
-applies what you change.
+SeaweedFS, where Neon keeps its storage, a daily backup goes, and workspaces
+keep their files, each in a bucket the store must already have.
+`workspaceStorage.enabled: false` makes new workspaces volumes of the
+cluster's default StorageClass instead of JuiceFS's; a workspace keeps the
+volume it was made with either way. `alasio up` applies what you change.
 
 The config's `target.local` is the cluster alasio makes, and `registries` in it
 says where its nodes pull images from, as k3s's `registries.yaml` does, its
@@ -86,7 +98,9 @@ alasio runs in a cluster of yours as well: `npx alasio init --kubeconfig
 <path>`, with `--context <name>` for another than the kubeconfig's current
 one, installs it in the cluster that kubeconfig reaches. The cluster must
 enforce NetworkPolicy, and have a `gvisor` RuntimeClass, unless the config's
-`sessions.runtimeClassName` names another.
+`sessions.runtimeClassName` names another. JuiceFS's CSI driver goes in
+`kube-system`, as its own manifests put it; where the cluster has the driver
+already, `workspaceStorage.csi.enabled: false` uses that one.
 
 ## Development
 
@@ -96,7 +110,8 @@ the Telegram bridge that runs the agents, in alasio's image (`Dockerfile`); its
 control plane is written in Effect, its services layers composed in
 `src/alasio.ts`, and `.env.example` is for running it outside the cluster
 against one. `cli/` is the command line, the npm package: it builds the
-Kubernetes objects it installs in `cli/src/manifests/`, applies them through
+Kubernetes objects it installs in `cli/src/manifests/`, JuiceFS's CSI driver
+among them as JuiceFS's own manifests have it, applies them through
 the Kubernetes API, and makes the cluster on this machine through Docker's
 Engine API, in `cli/src/cluster/`, from the node image in `cluster/node/`.
 `sandbox/agent/` is the image sessions run, and `neon/` what alasio adds to

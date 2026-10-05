@@ -46,6 +46,8 @@ import {
   waitForObjectStore,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`. */
 function service(name: string, component: string, ports: V1ServicePort[]): V1Service {
@@ -63,13 +65,13 @@ function secretVariable(secret: string, key: string): V1EnvVar {
 }
 
 /**
- * The stack's secrets, made once and kept, and each service's rendered from them, by
- * neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
+ * The stack's secrets, made once and kept, and each service's rendered from them, workspace
+ * storage's among them when it is on, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
  * anything else of alasio starts (../kube/apply.ts).
  */
 function setup(config: InstallConfig): KubernetesObject[] {
   const name = neonName("setup");
-  const { objectStore } = config;
+  const { objectStore, workspaceStorage } = config;
   const metadata = { name, namespace: NAMESPACE, labels: stackLabels("neon-setup") };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
   const role: V1Role = {
@@ -115,6 +117,16 @@ function setup(config: InstallConfig): KubernetesObject[] {
               { name: "S3_REGION", value: objectStore.external.region },
               { name: "S3_BUCKET_NEON", value: objectStore.buckets.neon },
               { name: "S3_BUCKET_LAKE", value: objectStore.buckets.lake },
+              ...(workspaceStorage.enabled
+                ? [
+                  { name: "WORKSPACES_NAME", value: workspaceStorage.name },
+                  { name: "WORKSPACES_BUCKET", value: objectStore.buckets.workspaces },
+                  { name: "WORKSPACES_BUCKET_URL", value: workspacesBucketUrl(config) },
+                  { name: "WORKSPACES_TRASH_DAYS", value: String(workspaceStorage.trashDays) },
+                  { name: "VALKEY_ADDRESS", value: VALKEY_ADDRESS },
+                  { name: "WORKSPACES_SECRET_LABELS", value: JSON.stringify(VOLUME_DRIVER) },
+                ]
+                : []),
               ...(objectStore.bundled.enabled ? [] : [
                 { name: "S3_EXTERNAL", value: "1" },
                 { name: "S3_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "accessKey" } } },

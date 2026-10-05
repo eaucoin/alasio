@@ -1,7 +1,8 @@
 /**
  * alasio's commands (cli/src/commands/), run as an operator runs them, at a terminal
  * that answers their questions, against a fake Docker whose nodes run k3s, a fake
- * Kubernetes API, and a fake Telegram.
+ * Kubernetes API, and a fake Telegram, on a machine whose kernel settings the cluster
+ * here needs unless a test gives others.
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -281,6 +282,33 @@ test("status says each workload's state, and fails when one is not ready", async
   const unhealthy = await alasio(["status"]);
   assert.match(failure(unhealthy), /^1 of alasio's \d+ workloads are not ready$/u);
   assert.ok(unhealthy.printed.includes("  Deployment alasio/alasio: 0 of 1 available"));
+});
+
+test("init, up and status here refuse inotify limits too low for the cluster, saying how to raise them", async (t) => {
+  const { configure, docker, env, home, kube } = await rig(t);
+  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  const sysctl = { "fs.inotify.max_user_instances": "128\n", "fs.inotify.max_user_watches": "524288\n" };
+  const shortfall = "fs.inotify.max_user_instances is 128, and the cluster needs at least 1024";
+  const refusal = [
+    "this machine's inotify limits are too low for the cluster alasio makes on it:",
+    `  ${shortfall}`,
+    "Raise them as root, now:",
+    "  sysctl -w fs.inotify.max_user_instances=1024",
+    "and for every boot, in /etc/sysctl.d/60-inotify.conf:",
+    "  fs.inotify.max_user_instances = 1024",
+  ].join("\n");
+  // init refuses before it asks anything.
+  assert.equal(failure(await runAlasio(["init"], { env, sysctl })), refusal);
+  assert.equal(failure(await runAlasio(["up"], { env, sysctl })), refusal);
+  assert.equal(docker.containers.size, 0);
+
+  const tokenFile = join(home, "bot-token");
+  writeFileSync(tokenFile, BOT_TOKEN);
+  succeeded(await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"], { env }));
+  const status = await runAlasio(["status"], { env, sysctl });
+  assert.equal(failure(status), refusal);
+  assert.deepEqual(status.printed.slice(0, 3), ["cluster dev, in Docker 29.0.0:", "  dev-server-0: running", `  this machine's ${shortfall}`]);
+  assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
 
 test("status of a stopped cluster here says that up starts it", async (t) => {

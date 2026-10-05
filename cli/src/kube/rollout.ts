@@ -1,11 +1,11 @@
 /**
  * Waiting for what was applied to run: a CRD until it is established, a Job until it
- * completes, a Deployment or StatefulSet until its rollout is done; and waiting for what
- * was deleted to be gone. A wait says what it still waits for as that changes, and when
- * it gives up, why each thing is not ready, from its pods' state and the cluster's
- * warnings about them.
+ * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done; waiting
+ * for what was deleted to be gone; and for volumes let go of to be deleted. A wait says
+ * what it still waits for as that changes, and when it gives up, why each thing is not
+ * ready, from its pods' state and the cluster's warnings about them.
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod } from "@kubernetes/client-node";
 import { Duration, Effect, Schedule, Schema } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
@@ -29,11 +29,14 @@ interface Observed {
     readonly updatedReplicas?: number;
     readonly availableReplicas?: number;
     readonly readyReplicas?: number;
+    readonly desiredNumberScheduled?: number;
+    readonly updatedNumberScheduled?: number;
+    readonly numberReady?: number;
     readonly conditions?: readonly { readonly type: string; readonly status: string; readonly reason?: string; readonly message?: string }[];
   };
 }
 
-/** Where `object` is: a CRD, Job, Deployment or StatefulSet by its status, anything else ready once it exists. */
+/** Where `object` is: a CRD, Job, Deployment, StatefulSet or DaemonSet by its status, anything else ready once it exists. */
 export function readiness(object: KubernetesObject): Readiness {
   const { metadata, spec, status } = object as KubernetesObject & Observed;
   const condition = (type: string) => status?.conditions?.find((each) => each.type === type && each.status === "True");
@@ -62,9 +65,31 @@ export function readiness(object: KubernetesObject): Readiness {
       if (updated < replicas) return waiting(`${updated} of ${replicas} updated`);
       return ready < replicas ? waiting(`${ready} of ${replicas} ready`) : READY;
     }
+    case "DaemonSet": {
+      // A pod on every node it schedules to, rather than replicas.
+      const desired = status?.desiredNumberScheduled ?? 0;
+      const updated = status?.updatedNumberScheduled ?? 0;
+      const ready = status?.numberReady ?? 0;
+      if (unseen) return waiting("not yet rolled out");
+      if (updated < desired) return waiting(`${updated} of ${desired} nodes updated`);
+      return ready < desired ? waiting(`${ready} of ${desired} nodes ready`) : READY;
+    }
     default:
       return READY;
   }
+}
+
+/**
+ * Where a volume whose claim was deleted is: let go of once it is deleted, or released
+ * and kept as its reclaim policy says; failed when it could not be reclaimed; else still
+ * bound, or released while its data is deleted.
+ */
+export function reclamation(volume: V1PersistentVolume): Readiness {
+  const phase = volume.status?.phase ?? "Pending";
+  if (phase === "Failed") return { _tag: "Failed", reason: volume.status?.message ?? "it could not be reclaimed" };
+  if (phase === "Released") return volume.spec?.persistentVolumeReclaimPolicy === "Retain" ? READY : waiting("released, its data being deleted");
+  const claim = volume.spec?.claimRef;
+  return waiting(phase === "Bound" && claim ? `bound to ${claim.namespace}/${claim.name}` : phase.toLowerCase());
 }
 
 /** Something waited for that is not ready, as people read it: the object, and what it is at. */
@@ -148,14 +173,15 @@ const lastSeen = (event: CoreV1Event): number =>
 
 /**
  * Why `ref` is not ready: its pods' problems, and the latest of the cluster's warnings
- * about them, it, or what it made (a Deployment's ReplicaSets, named after it).
+ * about them, it, or what it made (a Deployment's ReplicaSets, named after it). The
+ * cluster keeps its warnings about what is in no namespace, as a volume, in `default`.
  */
 export const diagnose = Effect.fnUntraced(function*(ref: ObjectRef): Effect.fn.Return<string[], KubeApiError, KubeApi> {
   const kube = yield* KubeApi;
   const object = yield* kube.get<KubernetesObject & { spec?: { selector?: { matchLabels?: Record<string, string> } } }>(ref);
   const matchLabels = object?.spec?.selector?.matchLabels;
   const pods = matchLabels ? yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: selectorOf(matchLabels) }) : [];
-  const warnings = ref.namespace ? yield* kube.list<CoreV1Event>(EVENT, { namespace: ref.namespace, fieldSelector: "type=Warning" }) : [];
+  const warnings = yield* kube.list<CoreV1Event>(EVENT, { namespace: ref.namespace ?? "default", fieldSelector: "type=Warning" });
   const about = (names: readonly string[]) =>
     warnings
       .filter(({ involvedObject }) => names.some((name) => involvedObject.name === name || involvedObject.name?.startsWith(`${name}-`)))
@@ -221,5 +247,14 @@ export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Eff
     refs,
     (ref) => Effect.map(current(ref), (object) => (object ? waiting("being deleted") : READY)),
     (ref) => Effect.map(current(ref), (object) => (object?.metadata?.finalizers?.length ? [`waits on its finalizers: ${object.metadata.finalizers.join(", ")}`] : [])),
+    options,
+  );
+
+/** Waits until every volume ref, its claim deleted, is let go of (reclamation). */
+export const awaitReclaimed = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
+  awaitAll(
+    refs,
+    (ref) => Effect.flatMap(KubeApi, (kube) => Effect.map(kube.get<V1PersistentVolume>(ref), (volume) => (volume ? reclamation(volume) : READY))),
+    diagnose,
     options,
   );

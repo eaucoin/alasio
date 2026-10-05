@@ -16,6 +16,12 @@ const ENV = {
   NEON_COMPUTE_HOST: "q-neon-compute",
   NEON_CONTROLLER_DB_HOST: "q-neon-controller-db",
   S3_ENDPOINT: "http://q-seaweedfs:8333",
+  WORKSPACES_NAME: "workspaces",
+  WORKSPACES_BUCKET: "workspaces",
+  WORKSPACES_BUCKET_URL: "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces",
+  WORKSPACES_TRASH_DAYS: "1",
+  VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
+  WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
 };
 
 /** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
@@ -74,6 +80,9 @@ test("the setup's configuration comes from the environment, checked", () => {
   const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" });
   assert.ok(external.external);
   assert.equal(external.accessKey, "a");
+  assert.equal(config.workspaces?.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
+  assert.equal(setupConfig({ ...ENV, WORKSPACES_NAME: "" }).workspaces, null);
+  assert.throws(() => setupConfig({ ...ENV, WORKSPACES_BUCKET_URL: "" }), /WORKSPACES_BUCKET_URL must be set/);
 });
 
 test("the stack's secrets are made once, and every service's rendered from them on each run", async () => {
@@ -96,7 +105,27 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "workspaces"]);
+
+  // Workspace storage's JuiceFS reaches Valkey with its password, and its own bucket alone.
+  assert.equal(value(kube, names.valkey, "password"), root.valkeyPassword);
+  assert.equal(value(kube, names.workspaces, "metaurl"), `redis://:${encodeURIComponent(root.valkeyPassword)}@q-valkey.alasio.svc.cluster.local:6379/1`);
+  assert.equal(value(kube, names.workspaces, "name"), "workspaces");
+  assert.equal(value(kube, names.workspaces, "storage"), "s3");
+  assert.equal(value(kube, names.workspaces, "bucket"), "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces");
+  assert.equal(value(kube, names.workspaces, "access-key"), root.s3.workspaces.accessKey);
+  assert.equal(value(kube, names.workspaces, "secret-key"), root.s3.workspaces.secretKey);
+  assert.equal(value(kube, names.workspaces, "format-options"), "trash-days=1");
+  const driverOf = (name: string) => kube.secrets.get(name)?.metadata.labels?.["alasio.dev/volume-driver"];
+  assert.equal(driverOf(names.valkey), "csi.juicefs.com");
+  assert.equal(driverOf(names.workspaces), "csi.juicefs.com");
+  assert.equal(driverOf(names.database), undefined);
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "workspaces")?.actions, [
+    "Read:workspaces",
+    "List:workspaces",
+    "Tagging:workspaces",
+    "Write:workspaces",
+  ]);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -121,20 +150,33 @@ test("a root predating a secret gains it without losing the rest", async () => {
   assert.match(completed.computeControlToken, /^[\w-]{32}$/u);
 });
 
+/** Secrets as the root holds them, every S3 identity's credentials `s3`. */
+function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecrets {
+  return {
+    tenantId: "tenant",
+    timelineId: "timeline",
+    s3: { neon: s3, admin: s3, lake: s3, workspaces: s3 },
+    controllerDbPassword: "c",
+    alasioPassword: "q",
+    lakePassword: "l",
+    computeControlToken: "t",
+    valkeyPassword: "v",
+  };
+}
+
 test("with an external object store, every service uses its credentials and no SeaweedFS identities are made", () => {
-  const config = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "AK", S3_SECRET_KEY: "SK", S3_REGION: "eu-west-1", S3_BUCKET_NEON: "my-neon" });
+  const config = setupConfig({
+    ...ENV,
+    S3_EXTERNAL: "1",
+    S3_ACCESS_KEY: "AK",
+    S3_SECRET_KEY: "SK",
+    S3_REGION: "eu-west-1",
+    S3_BUCKET_NEON: "my-neon",
+    WORKSPACES_BUCKET_URL: "https://s3.example.com/my-workspaces",
+  });
   // The bundled store's credentials, which the external store's are used instead of.
-  const bundled = { accessKey: "bundled-key", secretKey: "bundled-secret" };
   const rendered = renderSecrets({
-    secrets: {
-      tenantId: "tenant",
-      timelineId: "timeline",
-      s3: { neon: bundled, admin: bundled, lake: bundled },
-      controllerDbPassword: "c",
-      alasioPassword: "q",
-      lakePassword: "l",
-      computeControlToken: "t",
-    },
+    secrets: stackSecrets({ accessKey: "bundled-key", secretKey: "bundled-secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
     config,
@@ -144,4 +186,21 @@ test("with an external object store, every service uses its credentials and no S
   assert.equal(rendered[names.safekeeper]?.["AWS_ACCESS_KEY_ID"], "AK");
   assert.equal(rendered[names.lake]?.["LAKE_S3_SECRET"], "SK");
   assert.match(rendered[names.safekeeper]?.["REMOTE_STORAGE"] ?? "",/bucket_name="my-neon", bucket_region="eu-west-1"/u);
+  assert.equal(rendered[names.workspaces]?.["bucket"], "https://s3.example.com/my-workspaces");
+  assert.equal(rendered[names.workspaces]?.["access-key"], "AK");
+  assert.equal(rendered[names.workspaces]?.["secret-key"], "SK");
+});
+
+test("without workspace storage, neither its Secrets nor its identity are made", () => {
+  const rendered = renderSecrets({
+    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
+    privateKeyPem: generateKeyPair().privateKeyPem,
+    publicKeyPem: "pk",
+    config: setupConfig({ ...ENV, WORKSPACES_NAME: "" }),
+  });
+  const names = secretNames("q");
+  assert.equal(rendered[names.valkey], undefined);
+  assert.equal(rendered[names.workspaces], undefined);
+  const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
 });

@@ -1,14 +1,15 @@
 /**
  * alasio's command line, run in a test as the operator runs it: its arguments parsed by
  * the `alasio` command, in an environment the test gives (its home, its XDG directories,
- * the Docker and Telegram it reaches), at a terminal that types the test's answers. What
- * it prints, logs and exits with is kept.
+ * the Docker and Telegram it reaches, the machine's kernel settings), at a terminal that
+ * types the test's answers. What it prints, logs and exits with is kept.
  */
 import { NodeServices } from "@effect/platform-node";
 import { ConfigProvider, Effect, type Exit, Layer, Logger, Sink, Stdio, type Terminal } from "effect";
 import { Command } from "effect/cli";
 import { TestConsole } from "effect/testing";
 
+import { INOTIFY_MINIMUMS, Sysctl } from "../../src/cluster/host.ts";
 import { alasio } from "../../src/commands.ts";
 import { TelegramBotApi } from "../../src/telegram.ts";
 import { fakeTerminal } from "./fake-terminal.ts";
@@ -29,10 +30,17 @@ export interface CliRun {
   readonly unread: number;
 }
 
-/** Runs `alasio ...args` with the environment `env` and a terminal that answers `answers`. */
+/** The kernel's settings of a machine that meets what the local cluster needs, as /proc/sys has them. */
+const FIT_HOST: Readonly<Record<string, string>> = Object.fromEntries(Object.entries(INOTIFY_MINIMUMS).map(([name, minimum]) => [name, `${minimum}\n`]));
+
+/** Runs `alasio ...args` with the environment `env`, on a machine of the kernel settings `sysctl`, and a terminal that answers `answers`. */
 export async function runAlasio(
   args: readonly string[],
-  { env, answers = [] }: { readonly env: Readonly<Record<string, string>>; readonly answers?: ReadonlyArray<readonly Terminal.UserInput[]> },
+  { env, sysctl = FIT_HOST, answers = [] }: {
+    readonly env: Readonly<Record<string, string>>;
+    readonly sysctl?: Readonly<Record<string, string>>;
+    readonly answers?: ReadonlyArray<readonly Terminal.UserInput[]>;
+  },
 ): Promise<CliRun> {
   const terminal = fakeTerminal(answers);
   const progress: string[] = [];
@@ -53,6 +61,7 @@ export async function runAlasio(
           Stdio.layerTest({ stdout: writer((text) => (stdout += text)), stderr: writer((text) => (stderr += text)) }),
           Logger.layer([Logger.make(({ message }) => void progress.push((Array.isArray(message) ? message : [message]).map(String).join(" ")))]),
           Layer.provideMerge(TelegramBotApi.layer, config),
+          Layer.succeed(Sysctl, { read: (name) => Effect.succeed(sysctl[name] ?? "") }),
         ),
       ),
       Effect.provide(NodeServices.layer),

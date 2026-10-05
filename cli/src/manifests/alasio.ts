@@ -49,12 +49,20 @@ function workspaceNamespaces(config: InstallConfig): string[] {
 
 /**
  * The template of session filesystems' Sandboxes: an empty, isolated workspace under
- * the sessions' runtime, restricted. alasio adds what is per Sandbox: its name and
- * labels, bayma's token, and its network mode.
+ * the sessions' runtime, restricted, on a volume of workspace storage's class when it is
+ * on. alasio adds what is per Sandbox: its name and labels, bayma's token, and its
+ * network mode.
  */
 function sessionsProfile(config: InstallConfig): SessionsProfile {
-  const { sessions } = config;
+  const { sessions, workspaceStorage } = config;
   const agent = imageReference(config.images.agent);
+  const storageClassName = sessions.storage.storageClassName || (workspaceStorage.enabled ? workspaceStorage.storageClassName : "");
+  // On workspace storage, the volume's mounts follow its mount pod's, as upstream's
+  // template has them (gVisor does not, and alasio restarts a session whose mount is
+  // gone), and its files are given the pod's group only when its root is not the group's,
+  // as walking a JuiceFS volume is slow.
+  const propagation = workspaceStorage.enabled ? { mountPropagation: "HostToContainer" } : {};
+  const ownership = workspaceStorage.enabled ? { fsGroupChangePolicy: "OnRootMismatch" } : {};
   return {
     namespace: sessions.namespace,
     port: BAYMA_PORT,
@@ -65,7 +73,7 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
       metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" } },
       spec: {
         ...(sessions.runtimeClassName ? { runtimeClassName: sessions.runtimeClassName } : {}),
-        securityContext: restrictedPod(1000, 1000),
+        securityContext: { ...restrictedPod(1000, 1000), ...ownership },
         ...imagePullSecrets(config),
         ...given("nodeSelector", { ...sessions.nodeSelector }),
         ...given("tolerations", [...sessions.tolerations]),
@@ -102,8 +110,8 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
           securityContext: restrictedContainer(),
           resources: sessions.resources,
           volumeMounts: [
-            { name: "data", mountPath: "/workspace", subPath: "workspace" },
-            { name: "data", mountPath: "/home/agent", subPath: "home" },
+            { name: "data", mountPath: "/workspace", subPath: "workspace", ...propagation },
+            { name: "data", mountPath: "/home/agent", subPath: "home", ...propagation },
             { name: "tmp", mountPath: "/tmp" },
           ],
         }],
@@ -114,7 +122,7 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
       metadata: { name: "data" },
       spec: {
         accessModes: ["ReadWriteOnce"],
-        ...(sessions.storage.storageClassName ? { storageClassName: sessions.storage.storageClassName } : {}),
+        ...(storageClassName ? { storageClassName } : {}),
         resources: { requests: { storage: sessions.storage.size } },
       },
     }],

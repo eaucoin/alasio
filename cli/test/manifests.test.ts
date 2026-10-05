@@ -1,7 +1,7 @@
 /**
- * The manifests (cli/src/manifests): what they say of alasio's objects, Neon's, and
- * those that confine what runs; and how the install configuration is checked and
- * defaulted.
+ * The manifests (cli/src/manifests): what they say of alasio's objects, Neon's,
+ * workspace storage's, and those that confine what runs; and how the install
+ * configuration is checked and defaulted.
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
@@ -11,15 +11,20 @@ import type {
   V1ConfigMap,
   V1Container,
   V1CronJob,
+  V1CSIDriver,
+  V1DaemonSet,
   V1Deployment,
   V1Job,
   V1Namespace,
+  V1PriorityClass,
   V1Role,
   V1Service,
   V1StatefulSet,
+  V1StorageClass,
 } from "@kubernetes/client-node";
 import { Result } from "effect";
 
+import type { SessionsProfile } from "../../src/kube/config.ts";
 import { decodeInstallConfig, manifests } from "../src/manifests/index.ts";
 
 /** The objects of the configuration `file` and the Telegram Secret every configuration names. */
@@ -103,7 +108,38 @@ describe("configuration", () => {
       message({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com" } } }),
       "objectStore.external.existingSecret is required with an external object store",
     );
-    assert.equal(message({ neon: { enabled: false, external: { existingSecret: "db" } }, objectStore: { bundled: { enabled: false } } }), "");
+    assert.equal(message({ sessions: { enabled: false } }), "workspaceStorage.enabled must be false when sessions.enabled is false, as its volumes are sessions' workspaces");
+    assert.equal(
+      message({ neon: { enabled: false, external: { existingSecret: "db" } } }),
+      "workspaceStorage.enabled must be false when neon.enabled is false, as its data is in the object store that runs with Neon",
+    );
+    assert.equal(
+      message({ neon: { enabled: false, external: { existingSecret: "db" } }, objectStore: { bundled: { enabled: false } }, workspaceStorage: { enabled: false } }),
+      "",
+    );
+  });
+
+  test("defaults workspace storage to JuiceFS, and refuses what JuiceFS does not take", () => {
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } } });
+    assert.ok(Result.isSuccess(decoded));
+    const { workspaceStorage, objectStore } = decoded.success;
+    assert.equal(workspaceStorage.enabled, true);
+    assert.equal(workspaceStorage.storageClassName, "alasio-workspaces");
+    assert.equal(workspaceStorage.backupInterval, "1h");
+    assert.equal(workspaceStorage.valkey.maxmemory, "384mb");
+    assert.equal(workspaceStorage.csi.shareMountPod, false);
+    assert.equal(objectStore.buckets.workspaces, "workspaces");
+    const refused = (given: Record<string, unknown>) => {
+      const result = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, workspaceStorage: given });
+      return Result.isFailure(result) ? result.failure.message : "";
+    };
+    assert.equal(refused({ backupInterval: "4m59s" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
+    assert.equal(refused({ backupInterval: "0" }), "workspaceStorage.backupInterval must be a duration of 5m or more, such as 1h");
+    assert.equal(refused({ backupInterval: "1h30m" }), "");
+    assert.equal(refused({ trashDays: -1 }), "workspaceStorage.trashDays must be 0 or more");
+    assert.equal(refused({ name: "Workspaces" }), "workspaceStorage.name must be a JuiceFS file system name");
+    assert.equal(refused({ valkey: { maxmemory: "384MB" } }), "workspaceStorage.valkey.maxmemory must be an amount of memory such as 384mb");
+    assert.equal(refused({ csi: { mountImage: { digest: "latest" } } }), "workspaceStorage.csi.mountImage.digest must be a sha256 digest, or empty");
   });
 });
 
@@ -232,7 +268,7 @@ describe("neon", () => {
   });
 
   test("pins every third-party image by digest", () => {
-    const statefulSets = all<V1StatefulSet>(install(), "StatefulSet");
+    const statefulSets = all<V1StatefulSet>(install({ workspaceStorage: { enabled: false } }), "StatefulSet");
     assert.equal(statefulSets.length, 4);
     for (const statefulSet of statefulSets) assert.match(container(statefulSet).image ?? "", /@sha256:[0-9a-f]{64}$/u, statefulSet.metadata?.name);
   });
@@ -250,7 +286,7 @@ describe("neon", () => {
   });
 
   test("runs no Neon when the database is the operator's", () => {
-    const objects = install({ neon: { enabled: false, external: { existingSecret: "db" } } });
+    const objects = install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false } });
     assert.deepEqual(objects.filter((object) => object.metadata?.labels?.["alasio.dev/stack"] === "neon"), []);
     assert.deepEqual(objects.filter((object) => object.metadata?.name === "alasio-lake"), []);
   });
@@ -273,6 +309,190 @@ describe("neon", () => {
   test("backs the database up daily unless told not to", () => {
     assert.equal(one<V1CronJob>(install(), "CronJob", "alasio-neon-backup").spec?.schedule, "17 3 * * *");
     assert.deepEqual(install({ neon: { backup: { enabled: false } } }).filter((object) => object.metadata?.name === "alasio-neon-backup"), []);
+  });
+});
+
+describe("workspace storage", () => {
+  /** The sessions template, as alasio reads it. */
+  const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
+
+  /** The setup Job's variable of `name`, if it has one. */
+  const setupVariable = (objects: readonly KubernetesObject[], name: string) =>
+    one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env?.find((variable) => variable.name === name)?.value;
+
+  /** Every container's image of `objects`' workloads. */
+  const images = (objects: readonly KubernetesObject[]) =>
+    objects
+      .flatMap((object) => (object as V1StatefulSet | V1DaemonSet).spec?.template?.spec?.containers ?? [])
+      .map(({ image }) => image ?? "");
+
+  test("makes new sessions' volumes of its class, mounted as JuiceFS's are", () => {
+    const profile = sessions(install());
+    assert.equal(profile.volumeClaimTemplates?.[0]?.spec?.storageClassName, "alasio-workspaces");
+    assert.equal(profile.podTemplate.spec?.securityContext?.fsGroupChangePolicy, "OnRootMismatch");
+    assert.equal(profile.podTemplate.spec?.securityContext?.fsGroup, 1000);
+    const mounts = profile.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.volumeMounts;
+    assert.deepEqual(mounts?.filter(({ name }) => name === "data").map(({ mountPropagation }) => mountPropagation), ["HostToContainer", "HostToContainer"]);
+  });
+
+  test("keeps the class sessions name, and without it, the cluster's default", () => {
+    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "fast" } } })).volumeClaimTemplates?.[0]?.spec?.storageClassName, "fast");
+    const off = templates(install({ workspaceStorage: { enabled: false } }));
+    assert.doesNotMatch(off, /storageClassName|fsGroupChangePolicy|mountPropagation/u);
+  });
+
+  test("keeps its metadata in a Valkey configured as JuiceFS's Redis best practices say", () => {
+    const objects = install({ workspaceStorage: { valkey: { maxmemory: "256mb" } } });
+    const conf = one<V1ConfigMap>(objects, "ConfigMap", "alasio-valkey").data?.["valkey.conf"]?.split("\n") ?? [];
+    for (const line of ["appendonly yes", "appendfsync everysec", "aof-use-rdb-preamble yes", "save 3600 1 300 100 60 10000", "stop-writes-on-bgsave-error yes"]) {
+      assert.ok(conf.includes(line), line);
+    }
+    assert.ok(conf.includes("maxmemory 256mb"));
+    assert.ok(conf.includes("maxmemory-policy noeviction"));
+    const valkey = one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey");
+    const server = container(valkey);
+    assert.equal(server.image, "valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11");
+    assert.deepEqual(server.env?.find(({ name }) => name === "VALKEY_PASSWORD")?.valueFrom, { secretKeyRef: { name: "alasio-valkey", key: "password" } });
+    assert.match(server.readinessProbe?.exec?.command?.[2] ?? "", /\^loading:0.*\^aof_enabled:1/u);
+    assert.equal(server.securityContext?.readOnlyRootFilesystem, true);
+    assert.equal(valkey.spec?.template.spec?.securityContext?.runAsNonRoot, true);
+    assert.equal(valkey.spec?.volumeClaimTemplates?.[0]?.spec?.resources?.requests?.["storage"], "2Gi");
+    assert.equal(valkey.spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined);
+    assert.match(valkey.spec?.template.metadata?.annotations?.["checksum/config"] ?? "", /^[0-9a-f]{64}$/u);
+  });
+
+  test("installs JuiceFS's CSI driver, its images pinned by digest, provisioning volumes itself", () => {
+    const objects = install();
+    assert.deepEqual(one<V1CSIDriver>(objects, "CSIDriver", "csi.juicefs.com").spec, { attachRequired: false, podInfoOnMount: true });
+    const controller = one<V1StatefulSet>(objects, "StatefulSet", "juicefs-csi-controller");
+    const node = one<V1DaemonSet>(objects, "DaemonSet", "juicefs-csi-node");
+    assert.equal(controller.metadata?.namespace, "kube-system");
+    assert.equal(controller.spec?.replicas, 1);
+    assert.deepEqual(controller.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "csi-resizer", "liveness-probe"]);
+    assert.ok(container(controller).args?.includes("--provisioner=true"));
+    assert.deepEqual(node.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "node-driver-registrar", "liveness-probe"]);
+    for (const image of images([controller, node])) assert.match(image, /:v[0-9.]+@sha256:[0-9a-f]{64}$/u, image);
+    for (const plugin of [container(controller), node.spec?.template.spec?.containers[0]]) {
+      assert.deepEqual(plugin?.env?.find(({ name }) => name === "JUICEFS_MOUNT_PRIORITY_NAME"), { name: "JUICEFS_MOUNT_PRIORITY_NAME", value: "alasio-juicefs-mount" });
+      assert.deepEqual(plugin?.env?.find(({ name }) => name === "JUICEFS_MOUNT_PREEMPTION_POLICY"), { name: "JUICEFS_MOUNT_PREEMPTION_POLICY", value: "Never" });
+      assert.equal(plugin?.env?.find(({ name }) => name === "FS_SHARE_MOUNT"), undefined);
+    }
+    const shared = one<V1DaemonSet>(install({ workspaceStorage: { csi: { shareMountPod: true } } }), "DaemonSet", "juicefs-csi-node");
+    assert.deepEqual(shared.spec?.template.spec?.containers[0]?.env?.find(({ name }) => name === "FS_SHARE_MOUNT"), { name: "FS_SHARE_MOUNT", value: "true" });
+  });
+
+  test("runs mount pods of its class on a pinned client, its cache bounded, its metadata backed up, ready once the volume answers", () => {
+    const objects = install({ workspaceStorage: { cacheSizeMiB: 2048, backupInterval: "30m" } });
+    const config = JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "juicefs-csi-driver-config").data?.["config.yaml"] ?? "");
+    assert.deepEqual(config.mountPodPatch, [{
+      pvcSelector: { matchStorageClassName: "alasio-workspaces" },
+      ceMountImage: "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
+      resources: { requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } },
+      mountOptions: ["cache-size=2048", "free-space-ratio=0.2", "backup-meta=30m"],
+      readinessProbe: { exec: { command: ["stat", "${MOUNT_POINT}/${SUB_PATH}"] }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3 },
+    }]);
+  });
+
+  test("runs mount pods under a PriorityClass that never preempts", () => {
+    const priority = one<V1PriorityClass>(install(), "PriorityClass", "alasio-juicefs-mount");
+    assert.equal(priority.preemptionPolicy, "Never");
+    assert.equal(priority.globalDefault, false);
+    assert.equal(priority.value, 1_000_000_000);
+  });
+
+  test("makes each volume of its class a directory of the file system, named after its claim, deleted with it and grown with it", () => {
+    const storageClass = one<V1StorageClass>(install(), "StorageClass", "alasio-workspaces");
+    assert.equal(storageClass.provisioner, "csi.juicefs.com");
+    assert.equal(storageClass.reclaimPolicy, "Delete");
+    assert.equal(storageClass.allowVolumeExpansion, true);
+    assert.equal(storageClass.parameters?.["pathPattern"], "${.pvc.namespace}-${.pvc.name}");
+    for (const use of ["provisioner", "node-publish", "controller-expand"]) {
+      assert.equal(storageClass.parameters?.[`csi.storage.k8s.io/${use}-secret-name`], "alasio-workspaces-juicefs", use);
+      assert.equal(storageClass.parameters?.[`csi.storage.k8s.io/${use}-secret-namespace`], "alasio", use);
+    }
+  });
+
+  test("admits JuiceFS's pods alone to Valkey and to the object store's S3 port", () => {
+    const objects = install();
+    const policy = (name: string) =>
+      one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
+    const driver = { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } };
+    const peers = [
+      { namespaceSelector: driver, podSelector: { matchLabels: { "app.kubernetes.io/name": "juicefs-mount" } } },
+      {
+        namespaceSelector: driver,
+        podSelector: { matchLabels: { app: "juicefs-csi-controller", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } },
+      },
+      { namespaceSelector: driver, podSelector: { matchLabels: { app: "juicefs-csi-node", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } } },
+      { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio" } }, podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } },
+    ];
+    assert.deepEqual(policy("alasio-valkey").podSelector, { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } });
+    assert.deepEqual(policy("alasio-valkey").ingress, [{ from: peers, ports: [{ protocol: "TCP", port: 6379 }] }]);
+    assert.deepEqual(policy("alasio-seaweedfs-workspaces").ingress, [{ from: peers, ports: [{ protocol: "TCP", port: 8333 }] }]);
+  });
+
+  test("makes its bucket and its identity, and gives the setup what its Secrets are made from", () => {
+    const objects = install();
+    const buckets = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
+    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups workspaces; do$/mu);
+    assert.equal(setupVariable(objects, "WORKSPACES_NAME"), "workspaces");
+    assert.equal(setupVariable(objects, "WORKSPACES_BUCKET"), "workspaces");
+    assert.equal(setupVariable(objects, "WORKSPACES_BUCKET_URL"), "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces");
+    assert.equal(setupVariable(objects, "WORKSPACES_TRASH_DAYS"), "1");
+    assert.equal(setupVariable(objects, "VALKEY_ADDRESS"), "alasio-valkey.alasio.svc.cluster.local:6379");
+  });
+
+  test("marks everything the driver needs to delete its volumes' data, so it is kept while they remain", () => {
+    const objects = install();
+    const needed = objects.filter(
+      ({ metadata }) => metadata?.labels?.["app.kubernetes.io/name"] === "juicefs-csi-driver" || metadata?.labels?.["app.kubernetes.io/component"] === "valkey",
+    );
+    assert.deepEqual(needed.filter(({ kind }) => kind !== "NetworkPolicy").map(({ kind, metadata }) => `${kind} ${metadata?.name}`), [
+      "ConfigMap alasio-valkey",
+      "Service alasio-valkey",
+      "StatefulSet alasio-valkey",
+      "CSIDriver csi.juicefs.com",
+      "PriorityClass alasio-juicefs-mount",
+      "ServiceAccount juicefs-csi-controller-sa",
+      "ServiceAccount juicefs-csi-node-sa",
+      "ClusterRole juicefs-external-provisioner-role",
+      "ClusterRole juicefs-csi-external-node-service-role",
+      "ClusterRoleBinding juicefs-csi-provisioner-binding",
+      "ClusterRoleBinding juicefs-csi-node-service-binding",
+      "ConfigMap juicefs-csi-driver-config",
+      "StatefulSet juicefs-csi-controller",
+      "DaemonSet juicefs-csi-node",
+    ]);
+    for (const object of needed.filter(({ kind }) => kind !== "NetworkPolicy")) {
+      assert.equal(object.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com", `${object.kind} ${object.metadata?.name}`);
+    }
+    // The Secrets the setup makes: Valkey's password and the file system's credentials.
+    assert.deepEqual(JSON.parse(setupVariable(objects, "WORKSPACES_SECRET_LABELS") ?? ""), { "alasio.dev/volume-driver": "csi.juicefs.com" });
+  });
+
+  test("keeps its data in the operator's object store, with its keys, when it is theirs", () => {
+    const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com/", existingSecret: "s3" } } });
+    assert.equal(setupVariable(objects, "WORKSPACES_BUCKET_URL"), "https://s3.example.com/workspaces");
+    assert.equal(setupVariable(objects, "S3_EXTERNAL"), "1");
+    assert.deepEqual(all(objects, "NetworkPolicy").filter((policy) => policy.metadata?.name === "alasio-seaweedfs-workspaces"), []);
+    assert.ok(one(objects, "NetworkPolicy", "alasio-valkey"));
+  });
+
+  test("leaves the driver to the cluster when told", () => {
+    const objects = install({ workspaceStorage: { csi: { enabled: false } } });
+    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "PriorityClass"), ...all(objects, "DaemonSet")], []);
+    assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("juicefs-")), []);
+    assert.ok(one(objects, "StorageClass", "alasio-workspaces"));
+    assert.ok(one(objects, "StatefulSet", "alasio-valkey"));
+  });
+
+  test("installs nothing of it when it is off", () => {
+    const objects = install({ workspaceStorage: { enabled: false } });
+    for (const kind of ["CSIDriver", "PriorityClass", "DaemonSet", "StorageClass"]) assert.deepEqual(all(objects, kind), [], kind);
+    assert.deepEqual(objects.filter(({ metadata }) => /valkey|juicefs|workspaces/u.test(metadata?.name ?? "")), []);
+    assert.equal(setupVariable(objects, "WORKSPACES_NAME"), undefined);
+    const buckets = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
+    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups; do$/mu);
   });
 });
 

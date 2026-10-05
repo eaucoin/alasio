@@ -9,7 +9,11 @@
  * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
- * identities are made here otherwise.
+ * identities are made here otherwise. With workspace storage on, WORKSPACES_NAME (its
+ * JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
+ * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
+ * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
+ * alasio keeps them while its volumes remain).
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
@@ -43,6 +47,18 @@ export interface SecretNames {
   compute: string;
   database: string;
   lake: string;
+  valkey: string;
+  workspaces: string;
+}
+
+/** Workspace storage, as the setup makes its Secrets. */
+export interface WorkspacesConfig {
+  name: string;
+  bucket: string;
+  bucketUrl: string;
+  trashDays: string;
+  valkeyAddress: string;
+  secretLabels: Record<string, string>;
 }
 
 /** The deployment's configuration, from the environment the module comment lists. */
@@ -63,6 +79,8 @@ interface SetupConfigBase {
   s3Region: string;
   neonBucket: string;
   lakeBucket: string;
+  /** Null when workspace storage is off. */
+  workspaces: WorkspacesConfig | null;
 }
 
 /** What renderSecrets renders from. */
@@ -103,6 +121,8 @@ export function secretNames(prefix: string): SecretNames {
     compute: `${prefix}-neon-compute`,
     database: `${prefix}-database`,
     lake: `${prefix}-lake`,
+    valkey: `${prefix}-valkey`,
+    workspaces: `${prefix}-workspaces-juicefs`,
   };
 }
 
@@ -168,8 +188,25 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       LAKE_S3_SECRET: s3("lake").secretKey,
     },
   };
+  const { workspaces } = config;
+  if (workspaces) {
+    rendered[names.valkey] = { password: secrets.valkeyPassword };
+    // The file system's volume credentials, as JuiceFS's CSI driver reads them; the
+    // format options are applied as the file system is first made.
+    rendered[names.workspaces] = {
+      name: workspaces.name,
+      // Its database 1, leaving the others free for a restore to be loaded into.
+      metaurl: `redis://:${encodeURIComponent(secrets.valkeyPassword)}@${workspaces.valkeyAddress}/1`,
+      storage: "s3",
+      bucket: workspaces.bucketUrl,
+      "access-key": s3("workspaces").accessKey,
+      "secret-key": s3("workspaces").secretKey,
+      "format-options": `trash-days=${workspaces.trashDays}`,
+    };
+  }
   if (!config.external) {
-    rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, { neon: config.neonBucket, lake: config.lakeBucket }), null, 2) + "\n" };
+    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null };
+    rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
   }
   return rendered;
 }
@@ -194,6 +231,16 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",
     neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
     lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
+    workspaces: env["WORKSPACES_NAME"]?.trim()
+      ? {
+        name: required("WORKSPACES_NAME"),
+        bucket: required("WORKSPACES_BUCKET"),
+        bucketUrl: required("WORKSPACES_BUCKET_URL"),
+        trashDays: required("WORKSPACES_TRASH_DAYS"),
+        valkeyAddress: required("VALKEY_ADDRESS"),
+        secretLabels: JSON.parse(required("WORKSPACES_SECRET_LABELS")),
+      }
+      : null,
   };
   return external
     ? { ...base, external, accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") }
@@ -224,11 +271,12 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
   const { secrets, changed } = completeSecrets(existing);
   log(root ? (changed ? "completing the stack's secrets" : "the stack's secrets are complete") : "making the stack's secrets");
 
+  const workspaceSecrets = new Set([names.valkey, names.workspaces]);
   for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }))) {
     const object = {
       apiVersion: "v1",
       kind: "Secret",
-      metadata: { name, namespace: config.namespace, labels },
+      metadata: { name, namespace: config.namespace, labels: { ...labels, ...(workspaceSecrets.has(name) ? config.workspaces?.secretLabels : {}) } },
       type: "Opaque",
       stringData,
     } satisfies V1Secret;

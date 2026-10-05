@@ -1,6 +1,7 @@
 /**
  * The bundled object store: SeaweedFS, one server with its S3 gateway, its identities
- * from the stack's setup, and a bucket each for Neon, the lake and backups; and the
+ * from the stack's setup, and a bucket each for Neon, the lake, backups and, when it is
+ * on, workspace storage; and the
  * periodic pass that applies its lifecycle rules.
  */
 import type { KubernetesObject, V1CronJob, V1Service, V1StatefulSet } from "@kubernetes/client-node";
@@ -55,6 +56,7 @@ function server(config: InstallConfig): KubernetesObject[] {
   const name = componentName("seaweedfs");
   const peers = `${name}-peers`;
   const { bundled, buckets } = config.objectStore;
+  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : [])];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {
@@ -133,7 +135,7 @@ function server(config: InstallConfig): KubernetesObject[] {
                   "shell() { printf '%s\\n' \"$1\" | weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888; }",
                   "until wget -q -O /dev/null http://127.0.0.1:8333/healthz; do sleep 2; done",
                   "shell 'fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1 -fsync -apply'",
-                  `for bucket in ${buckets.neon} ${buckets.lake} ${buckets.backups}; do`,
+                  `for bucket in ${made.join(" ")}; do`,
                   "  shell 's3.bucket.list' | grep -qw \"$bucket\" || shell \"s3.bucket.create -name $bucket\"",
                   "done",
                   `shell 's3.bucket.versioning -name ${buckets.neon} -enable'`,

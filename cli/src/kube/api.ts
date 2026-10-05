@@ -36,6 +36,10 @@ const KINDS = {
   CustomResourceDefinition: { apiVersion: "apiextensions.k8s.io/v1", plural: "customresourcedefinitions", namespaced: false },
   Namespace: { apiVersion: "v1", plural: "namespaces", namespaced: false },
   Node: { apiVersion: "v1", plural: "nodes", namespaced: false },
+  PersistentVolume: { apiVersion: "v1", plural: "persistentvolumes", namespaced: false },
+  PriorityClass: { apiVersion: "scheduling.k8s.io/v1", plural: "priorityclasses", namespaced: false },
+  StorageClass: { apiVersion: "storage.k8s.io/v1", plural: "storageclasses", namespaced: false },
+  CSIDriver: { apiVersion: "storage.k8s.io/v1", plural: "csidrivers", namespaced: false },
   ClusterRole: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterroles", namespaced: false },
   ClusterRoleBinding: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterrolebindings", namespaced: false },
   Role: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "roles", namespaced: true },
@@ -50,8 +54,10 @@ const KINDS = {
   NetworkPolicy: { apiVersion: "networking.k8s.io/v1", plural: "networkpolicies", namespaced: true },
   Deployment: { apiVersion: "apps/v1", plural: "deployments", namespaced: true },
   StatefulSet: { apiVersion: "apps/v1", plural: "statefulsets", namespaced: true },
+  DaemonSet: { apiVersion: "apps/v1", plural: "daemonsets", namespaced: true },
   Job: { apiVersion: "batch/v1", plural: "jobs", namespaced: true },
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
+  Sandbox: { apiVersion: "agents.x-k8s.io/v1beta1", plural: "sandboxes", namespaced: true },
 } as const;
 
 export type KindName = keyof typeof KINDS;

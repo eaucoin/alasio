@@ -12,11 +12,15 @@ import { lakeObjects } from "./lake.ts";
 import { neonObjects } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
 import { objectStoreObjects } from "./object-store.ts";
+import { workspaceStorageObjects } from "./workspace-storage.ts";
 
 export { decodeInstallConfig, InstallConfig, InstallConfigError, type InstallConfigFile } from "./config.ts";
 export { NAMESPACE } from "./common.ts";
 
-/** The objects of the installation `config` describes: agent-sandbox's, alasio's, Neon's, the object store's, the lake's, and the NetworkPolicies. */
+/**
+ * The objects of the installation `config` describes: agent-sandbox's, alasio's, Neon's,
+ * the object store's, the lake's, workspace storage's, and the NetworkPolicies.
+ */
 export function manifests(config: InstallConfig): readonly KubernetesObject[] {
   return [
     ...agentSandboxObjects(config),
@@ -24,6 +28,7 @@ export function manifests(config: InstallConfig): readonly KubernetesObject[] {
     ...neonObjects(config),
     ...objectStoreObjects(config),
     ...lakeObjects(config),
+    ...workspaceStorageObjects(config),
     ...networkPolicyObjects(config),
   ];
 }

@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted, Result, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
+import { requireInotifyLimits } from "../cluster/host.ts";
 import { LocalCluster } from "../cluster/local.ts";
 import { configPath, decodeOperatorConfig, defaultStoragePath, type OperatorConfigFile, readConfig, writeConfig } from "../config.ts";
 import { applyNamespace } from "../install.ts";
@@ -23,7 +24,7 @@ import { readClaudeToken, readTelegramBot, type TelegramBot, writeClaudeToken, w
 import { kubeApi, localCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { TelegramBotApi } from "../telegram.ts";
 import { timeoutFlag } from "./common.ts";
-import { bringUp } from "./up.ts";
+import { bringUp, ensureCluster } from "./up.ts";
 
 /** Something init must be told, and was not, with no questions to ask. */
 export class SettingMissing extends Schema.TaggedError<SettingMissing>()("SettingMissing", {
@@ -367,7 +368,10 @@ export const init = Command.make("init", flags, (given) =>
     if (existing) yield* Console.log(`alasio's config is ${path}; what you leave as it is stays.`);
     const install = existing?.install ?? {};
     const target = yield* chooseTarget(given, ask, existing?.file ?? null);
-    const current = yield* currentSecrets(yield* resolveTarget(yield* Effect.fromResult(decodeOperatorConfig(path, { target, install }))));
+    const resolved = yield* resolveTarget(yield* Effect.fromResult(decodeOperatorConfig(path, { target, install })));
+    // Before any question, as the cluster here cannot run without them.
+    if (resolved._tag === "Local") yield* requireInotifyLimits;
+    const current = yield* currentSecrets(resolved);
 
     const bot = yield* chooseBot(given, ask, current.bot);
     const claude = yield* chooseClaudeToken(given, ask, current.claude);
@@ -388,9 +392,7 @@ export const init = Command.make("init", flags, (given) =>
     yield* Console.log(`wrote ${path}`);
 
     const cluster = yield* resolveTarget(config);
-    if (cluster._tag === "Local") {
-      yield* Effect.provide(Effect.flatMap(LocalCluster, (local) => local.up(cluster.kubeconfig.path)), localCluster(cluster.cluster));
-    }
+    yield* ensureCluster(cluster);
     yield* Effect.provide(
       Effect.gen(function*() {
         yield* applyNamespace;
@@ -410,7 +412,8 @@ export const init = Command.make("init", flags, (given) =>
     Command.withDescription(
       "Asks for the bot's token (checked with Telegram) and who may use it, Claude Code's token, whether agents may work in this " +
         "machine's folders and as whom, and where telemetry goes; writes the config, which holds no secret; makes the cluster on " +
-        "this machine, unless --kubeconfig names another; writes the tokens there, as Secrets; and offers to start alasio. Run it " +
+        "this machine, unless --kubeconfig names another, once this machine's inotify limits are high enough for it (it says how " +
+        "to raise them first); writes the tokens there, as Secrets; and offers to start alasio. Run it " +
         "again to change something: it shows what is set and keeps what you leave. Tokens are never flags, which other users of " +
         "the machine can see: give them in files (--bot-token-file, --claude-token-file), or as TELEGRAM_BOT_TOKEN and " +
         "CLAUDE_CODE_OAUTH_TOKEN.",

@@ -1,11 +1,14 @@
 /**
- * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio and Neon,
+ * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon and
+ * workspace storage,
  * which need a cluster that enforces NetworkPolicy, as session filesystems do.
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
 import { componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { CONTROLLER_POD_LABELS, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
+import { VALKEY_PORT } from "./valkey.ts";
 
 /**
  * A NetworkPolicy as the API server takes it: client-node's model calls an ingress
@@ -73,6 +76,39 @@ function neonPolicies(): NetworkPolicy[] {
   ];
 }
 
+/** The label of alasio's pods that run JuiceFS's command line against the workspaces' file system, a restore's, say. */
+const JUICEFS_ADMIN = { "alasio.dev/workload": "juicefs-admin" };
+
+/**
+ * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
+ * controller, its node service and the mount pods it runs, in the driver's namespace) and
+ * alasio's JuiceFS admin pods: Valkey takes no other connection, and the bundled object
+ * store takes theirs on its S3 port beside the stack's own.
+ */
+function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
+  const driverNamespace = { matchLabels: { "kubernetes.io/metadata.name": config.workspaceStorage.csi.namespace } };
+  const juicefs: V1NetworkPolicyPeer[] = [
+    { namespaceSelector: driverNamespace, podSelector: { matchLabels: MOUNT_POD_LABELS } },
+    { namespaceSelector: driverNamespace, podSelector: { matchLabels: CONTROLLER_POD_LABELS } },
+    { namespaceSelector: driverNamespace, podSelector: { matchLabels: NODE_POD_LABELS } },
+    { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } }, podSelector: { matchLabels: JUICEFS_ADMIN } },
+  ];
+  return [
+    policy(componentName("valkey"), NAMESPACE, "valkey", {
+      podSelector: { matchLabels: selectorLabels("valkey") },
+      policyTypes: ["Ingress"],
+      ingress: [{ from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] }],
+    }),
+    ...(config.objectStore.bundled.enabled
+      ? [policy(componentName("seaweedfs-workspaces"), NAMESPACE, "seaweedfs", {
+        podSelector: { matchLabels: selectorLabels("seaweedfs") },
+        policyTypes: ["Ingress"],
+        ingress: [{ from: juicefs, ports: [{ protocol: "TCP", port: 8333 }] }],
+      })]
+      : []),
+  ];
+}
+
 /** The NetworkPolicies, unless they are turned off. */
 export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
   if (!config.networkPolicies.enabled) return [];
@@ -101,5 +137,6 @@ export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
         : {}),
     }),
     ...(config.neon.enabled ? neonPolicies() : []),
+    ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
   ];
 }

@@ -139,6 +139,7 @@ const Sessions = Schema.Struct({
   createNamespace: defaulted(Schema.Boolean, true),
   /** The RuntimeClass sessions run under; empty runs them under the cluster's default runtime. */
   runtimeClassName: defaulted(Schema.String, "gvisor"),
+  /** A new session's volume; its class, when empty, is workspace storage's, or the cluster's default without it. */
   storage: Storage("10Gi"),
   resources: Resources({ requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "2", memory: "2Gi" } }),
   /** Whether a session's pod waits until NetworkPolicy confines it. */
@@ -286,7 +287,109 @@ const ObjectStore = Schema.Struct({
     }),
     {},
   ),
-  buckets: defaulted(Schema.Struct({ neon: defaulted(Bucket, "neon"), lake: defaulted(Bucket, "lake"), backups: defaulted(Bucket, "backups") }), {}),
+  buckets: defaulted(
+    Schema.Struct({
+      neon: defaulted(Bucket, "neon"),
+      lake: defaulted(Bucket, "lake"),
+      backups: defaulted(Bucket, "backups"),
+      /** Workspace storage's data; an external store must have it already, as it must the others. */
+      workspaces: defaulted(Bucket, "workspaces"),
+    }),
+    {},
+  ),
+});
+
+/** The seconds of a duration as JuiceFS takes one (1h, 1h30m, 90s), or null when it is none. */
+function durationSeconds(duration: string): number | null {
+  const match = /^(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?$/u.exec(duration);
+  if (!match || duration === "") return null;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+}
+
+/** A component of JuiceFS's CSI driver: its resources. */
+const CsiComponent = (resources: Parameters<typeof Resources>[0]) => defaulted(Schema.Struct({ resources: Resources(resources) }), {});
+
+/**
+ * JuiceFS's CSI driver (juicedata/juicefs-csi-driver v0.33.0), which makes each session's
+ * claim a directory of the file system, its size the directory's quota; off where the
+ * cluster already has the driver. Its images are those that release names.
+ */
+const Csi = Schema.Struct({
+  enabled: defaulted(Schema.Boolean, true),
+  /** Where the driver and its mount pods run, as upstream installs them. */
+  namespace: defaulted(Namespace, "kube-system"),
+  image: Image({
+    repository: "juicedata/juicefs-csi-driver",
+    tag: "v0.33.0",
+    digest: "sha256:f918e7331c055ec7efb5a13ff4f81def57620defb003f7379c28fa97822ff44d",
+  }),
+  /** The JuiceFS client mount pods run, Community Edition. */
+  mountImage: Image({
+    repository: "juicedata/mount",
+    tag: "ce-v1.4.1",
+    digest: "sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673",
+  }),
+  registrarImage: Image({
+    repository: "registry.k8s.io/sig-storage/csi-node-driver-registrar",
+    tag: "v2.9.0",
+    digest: "sha256:cd21e19cd8bbd5bc56f1b4f1398a436e7897da2995d6d036c9729be3f4e456e6",
+  }),
+  resizerImage: Image({
+    repository: "registry.k8s.io/sig-storage/csi-resizer",
+    tag: "v1.9.0",
+    digest: "sha256:f1f352df97874442624fcef23eab04aa038f66cb0e361212f6ec09e92998184d",
+  }),
+  livenessProbeImage: Image({
+    repository: "registry.k8s.io/sig-storage/livenessprobe",
+    tag: "v2.11.0",
+    digest: "sha256:82adbebdf5d5a1f40f246aef8ddbee7f89dea190652aefe83336008e69f9a89f",
+  }),
+  controller: CsiComponent({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
+  node: CsiComponent({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
+  /** Each mount pod's: no CPU limit, which JuiceFS advises against below 4, and memory for its buffer and cache index. */
+  mountPod: CsiComponent({ requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } }),
+  /** One mount pod per node for every workspace rather than one per workspace: less memory, and a crash reaches each workspace on the node. */
+  shareMountPod: defaulted(Schema.Boolean, false),
+});
+
+/** Valkey, the file system's metadata engine. */
+const Valkey = Schema.Struct({
+  image: Image({
+    repository: "valkey/valkey",
+    tag: "9.1.2-alpine",
+    digest: "sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
+  }),
+  /** Its snapshots and append-only file. */
+  storage: Storage("2Gi"),
+  /** What it may hold, half its memory limit, leaving room for the fork that writes its snapshots; about a million files at 384mb. */
+  maxmemory: defaulted(matching(/^[0-9]+(kb|mb|gb)$/u, "must be an amount of memory such as 384mb"), "384mb"),
+  resources: Resources({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "768Mi" } }),
+});
+
+/**
+ * Workspace storage: each new session's workspace a volume of one JuiceFS file system,
+ * its metadata in a Valkey of alasio's own and its data in the object store's
+ * `workspaces` bucket. Without it, new workspaces are volumes of sessions.storage's
+ * class, the cluster's default unless it names one; a workspace keeps the volume it was
+ * made with either way.
+ */
+const WorkspaceStorage = Schema.Struct({
+  enabled: defaulted(Schema.Boolean, true),
+  /** The file system's name, which its data is kept under in the bucket. */
+  name: defaulted(matching(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u, "must be a JuiceFS file system name"), "workspaces"),
+  /** The StorageClass of its volumes, which sessions' claims are of unless sessions.storage names another. */
+  storageClassName: defaulted(matching(NAME, "must be a StorageClass name"), "alasio-workspaces"),
+  /** How many days a deleted file is kept in the file system's trash, 0 for none; set as the file system is first made. */
+  trashDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1),
+  /** How often JuiceFS dumps the file system's metadata to its bucket's meta/: a duration of 5m or more, the least it takes. */
+  backupInterval: defaulted(
+    Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) >= 300 || "must be a duration of 5m or more, such as 1h")),
+    "1h",
+  ),
+  /** Each mount's read cache on its node's disk, in MiB. */
+  cacheSizeMiB: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be 0 or more" })), 1024),
+  csi: defaulted(Csi, {}),
+  valkey: defaulted(Valkey, {}),
 });
 
 /** agent-sandbox's controller, installed once per cluster; off where the cluster already has it. */
@@ -316,6 +419,12 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
     if (!config.objectStore.external.endpoint) return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false" };
     if (!config.objectStore.external.existingSecret) return { path: ["objectStore", "external", "existingSecret"], issue: "is required with an external object store" };
   }
+  if (config.workspaceStorage.enabled && !config.sessions.enabled) {
+    return { path: ["workspaceStorage", "enabled"], issue: "must be false when sessions.enabled is false, as its volumes are sessions' workspaces" };
+  }
+  if (config.workspaceStorage.enabled && !config.neon.enabled) {
+    return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
+  }
   return undefined;
 }
 
@@ -333,6 +442,7 @@ const InstallStruct = Schema.Struct({
   host: defaulted(Host, {}),
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
+  workspaceStorage: defaulted(WorkspaceStorage, {}),
   /** The analytics lake, loaded from Neon into DuckLake. */
   lake: defaulted(
     Schema.Struct({ enabled: defaulted(Schema.Boolean, true), resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }) }),

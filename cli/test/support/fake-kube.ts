@@ -8,8 +8,9 @@
  *
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
- * pod), unless the test says an object is stuck (its pods wait on an image pull the
- * cluster warns about) or, for a Job, fails.
+ * pod, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
+ * pods wait on an image pull the cluster warns about, or its data is never deleted) or,
+ * for a Job, fails.
  */
 import { createHash } from "node:crypto";
 import { once } from "node:events";
@@ -86,7 +87,7 @@ export interface FakeKube {
   /** Its objects, by path. */
   readonly objects: Map<string, KubeObject>;
   readonly changes: KubeChange[];
-  /** Names of workloads whose pods never run, and of Jobs that fail. */
+  /** Names of workloads whose pods never run, and of volumes whose data cannot be deleted; and of Jobs that fail. */
   readonly stuck: Set<string>;
   readonly failing: Set<string>;
   /** What a pod logs, by its name. */
@@ -200,16 +201,19 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const condition = (type: string, reason = type) => ({ type, status: "True", reason, message: "" });
     if (object.kind === "CustomResourceDefinition") object.status = { conditions: [condition("Established")] };
     if (object.kind === "Job") object.status = { conditions: [failing.has(name) ? { ...condition("Failed", "BackoffLimitExceeded"), message: "Job has reached the specified backoff limit" } : condition("Complete")] };
-    if (object.kind !== "Deployment" && object.kind !== "StatefulSet") return;
+    if (object.kind !== "Deployment" && object.kind !== "StatefulSet" && object.kind !== "DaemonSet") return;
     const replicas = (object.spec?.["replicas"] as number | undefined) ?? 1;
     const blocked = stuck.has(name);
-    object.status = {
-      observedGeneration: generation,
-      replicas,
-      updatedReplicas: replicas,
-      availableReplicas: blocked ? 0 : replicas,
-      readyReplicas: blocked ? 0 : replicas,
-    };
+    // A DaemonSet's pod is on the cluster's one node.
+    object.status = object.kind === "DaemonSet"
+      ? { observedGeneration: generation, desiredNumberScheduled: 1, updatedNumberScheduled: 1, numberReady: blocked ? 0 : 1 }
+      : {
+        observedGeneration: generation,
+        replicas,
+        updatedReplicas: replicas,
+        availableReplicas: blocked ? 0 : replicas,
+        readyReplicas: blocked ? 0 : replicas,
+      };
     const template = object.spec?.["template"] as { metadata?: { labels?: Record<string, string> }; spec?: { containers?: { name: string; image: string }[] } } | undefined;
     const container = template?.spec?.containers?.[0];
     const pod = `${name}-0`;
@@ -243,15 +247,52 @@ export async function serveFakeKube(): Promise<FakeKube> {
     }
   };
 
-  /** Deletes the object at `path`, and what is in it or of it: a namespace's objects, a workload's pods. */
+  /**
+   * Reclaims the volumes bound to `claim`, which is deleted: a retained one is released,
+   * and another deleted, as its CSI driver does while the driver and the volume's class
+   * are there; it stays released without them, or when it is stuck, which the cluster
+   * warns about.
+   */
+  const reclaim = (claim: KubeObject): void => {
+    for (const [path, volume] of [...objects]) {
+      const spec: { claimRef?: { namespace?: string; name?: string }; persistentVolumeReclaimPolicy?: string; storageClassName?: string; csi?: { driver?: string } } = volume.spec ?? {};
+      if (volume.kind !== "PersistentVolume" || spec.claimRef?.namespace !== claim.metadata.namespace || spec.claimRef?.name !== claim.metadata.name) continue;
+      const { name } = volume.metadata;
+      const deletable = objects.has(`/apis/storage.k8s.io/v1/csidrivers/${spec.csi?.driver}`) && objects.has(`/apis/storage.k8s.io/v1/storageclasses/${spec.storageClassName}`);
+      if (spec.persistentVolumeReclaimPolicy !== "Retain" && deletable && !stuck.has(name)) {
+        objects.delete(path);
+        continue;
+      }
+      volume.status = { phase: "Released" };
+      if (stuck.has(name)) {
+        put("events", {
+          apiVersion: "v1",
+          kind: "Event",
+          metadata: { name: `${name}.warning`, namespace: "default" },
+          type: "Warning",
+          reason: "VolumeFailedDelete",
+          message: `rpc error: code = Unknown desc = could not delete the data of ${name}`,
+          involvedObject: { kind: "PersistentVolume", name },
+          lastTimestamp: new Date().toISOString(),
+        });
+      }
+    }
+  };
+
+  /** Deletes the object at `path`, and what is in it or of it: a namespace's objects, a workload's pods; the volumes of a claim deleted are reclaimed. */
   const remove = (path: string, object: KubeObject): void => {
     objects.delete(path);
     const { name, namespace } = object.metadata;
+    const gone = [object];
     for (const [other, each] of [...objects]) {
       const inside = object.kind === "Namespace" && each.metadata.namespace === name;
       const owned = each.kind === "Pod" && each.metadata.namespace === namespace && each.metadata.name.startsWith(`${name}-`);
-      if (inside || owned) objects.delete(other);
+      if (inside || owned) {
+        objects.delete(other);
+        gone.push(each);
+      }
     }
+    for (const each of gone) if (each.kind === "PersistentVolumeClaim") reclaim(each);
   };
 
   const handle = (request: IncomingMessage, body: Buffer, response: ServerResponse): void => {
