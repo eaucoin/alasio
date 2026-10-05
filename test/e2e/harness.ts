@@ -17,7 +17,7 @@
  * kubelet collected.
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,7 @@ import { type Duration, Effect, Stream } from "effect";
 
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
+import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { OTLP, standInObjects, TELEGRAM, urlOf } from "./stand-ins.ts";
 import { createTelegramStub } from "./telegram-stub.ts";
@@ -273,6 +274,40 @@ export const kube = {
   },
 };
 
+/** The namespace of session filesystems' Sandboxes. */
+export const SESSIONS = "alasio-sessions";
+
+/** Node run in a session's bayma container: its stdout. */
+export const inSession = (volumeId: string, code: string): Promise<string> => kube.execOk(SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
+
+/** Node code that prints whether a TCP connection to `host` (an expression) on `port` opens. */
+export const tcp = (host: string, port: number): string =>
+  `const s=require("net").connect({host:${host},port:${port},timeout:3000});s.on("connect",()=>{console.log("open");process.exit()});s.on("timeout",()=>{console.log("blocked");process.exit()});s.on("error",()=>{console.log("blocked");process.exit()})`;
+
+/** Runs `command` in alasio's container, in the pod it runs in now, which must succeed: what it printed. */
+export const inAlasioContainer = async (command: readonly string[], stdin?: string): Promise<string> =>
+  kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), command, { container: "alasio", ...(stdin === undefined ? {} : { stdin }) });
+
+/**
+ * Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its
+ * last line, parsed, which the script prints in the shape `Seen` names.
+ */
+export async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
+  // The scripts import alasio's modules by their paths in the repository, for the type
+  // checker; in alasio's image those are under /opt/alasio, and a script read from stdin
+  // resolves its imports from its working directory, not from where it was read. So they
+  // are rewritten to the image's paths as the script is piped in.
+  const source = readFileSync(new URL(script, import.meta.url), "utf8").replaceAll('from "../../src/', 'from "/opt/alasio/src/');
+  const stdout = await inAlasioContainer(["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args], source);
+  // split always returns at least one part.
+  return JSON.parse(stdout.trim().split("\n").at(-1)!);
+}
+
+/** Runs `script` with sh as root in the cluster's node `node`, a container of this machine's Docker, which must succeed: what it printed. */
+export async function onNode(node: string, script: string): Promise<string> {
+  return (await docker("exec", node, "sh", "-c", script)).stdout;
+}
+
 /** Builds the image `name`, tagged `tag`. */
 async function build(name: keyof typeof IMAGES, tag: string): Promise<void> {
   console.error(`# building ${tag} from ${IMAGES[name]}`);
@@ -342,6 +377,8 @@ function installation(): Record<string, unknown> {
       },
     },
     lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } } },
+    // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
+    workspaceStorage: { backupInterval: "5m" },
     agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },
   };
 }

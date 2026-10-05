@@ -3,7 +3,8 @@
  * from its npm package (./harness.ts), driven through the Telegram stand-in as its
  * operator drives it, its sessions' confinement checked from inside them, its own code
  * paths run in its pod with its ServiceAccount, its telemetry looked for where the
- * installation's goes, its Neon put through crashes and losses (neon/test/stack.ts), and
+ * installation's goes, its workspaces' JuiceFS put through file operations, crashes and a
+ * restore (./workspace-storage.ts), its Neon through crashes and losses (neon/test/stack.ts), and
  * removed, with all it keeps, by its command line at the end.
  *
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
@@ -19,35 +20,52 @@ import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
-import { AGENTS, alasio, alasioOk, CLUSTER, dumpClusterState, type Forward, HOST_PROFILE, HOST_USER, KEEP, kube, paths, ref, setUp, tearDown } from "./harness.ts";
+import {
+  AGENTS,
+  alasio,
+  alasioOk,
+  CLUSTER,
+  dumpClusterState,
+  type Forward,
+  HOST_PROFILE,
+  HOST_USER,
+  inAlasio,
+  inAlasioContainer,
+  inSession,
+  KEEP,
+  kube,
+  paths,
+  ref,
+  SESSIONS,
+  setUp,
+  tcp,
+  tearDown,
+} from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
 import { OTLP, STAND_INS, type StandIn, TELEGRAM } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
-
-const SESSIONS = "alasio-sessions";
+import { workspaceStorage } from "./workspace-storage.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Whether something of the run failed, for which what the cluster was doing is said. */
-let failed = false;
-
+// What the cluster was doing is said as something of the run fails, while the cluster is
+// as it failed it: before the tests that follow change it, or remove it.
 before(async () => {
   try {
     await setUp();
   } catch (error) {
-    failed = true;
+    await dumpClusterState();
     throw error;
   }
 }, { timeout: 120 * 60_000 });
 
-afterEach((t) => {
+afterEach(async (t) => {
   // Node says on a test's context whether it passed, once it has run.
-  if ("passed" in t && t.passed === false) failed = true;
+  if ("passed" in t && t.passed === false) await dumpClusterState();
 });
 
 after(async () => {
-  if (failed) await dumpClusterState();
   await tearDown();
 }, { timeout: 30 * 60_000 });
 
@@ -102,25 +120,6 @@ function operator(base: string) {
   };
 }
 
-/** Runs `command` in alasio's container, in the pod it runs in now, which must succeed: what it printed. */
-const inAlasioContainer = async (command: readonly string[], stdin?: string) =>
-  kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), command, { container: "alasio", ...(stdin === undefined ? {} : { stdin }) });
-
-/**
- * Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its
- * last line, parsed, which the script prints in the shape `Seen` names.
- */
-async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
-  // The scripts import alasio's modules by their paths in the repository, for the type
-  // checker; in alasio's image those are under /opt/alasio, and a script read from stdin
-  // resolves its imports from its working directory, not from where it was read. So they
-  // are rewritten to the image's paths as the script is piped in.
-  const source = readFileSync(new URL(script, import.meta.url), "utf8").replaceAll('from "../../src/', 'from "/opt/alasio/src/');
-  const stdout = await inAlasioContainer(["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args], source);
-  // split always returns at least one part.
-  return JSON.parse(stdout.trim().split("\n").at(-1)!);
-}
-
 describe("alasio's command line, on the alasio it installed", () => {
   test("status says the cluster's nodes run, and each of alasio's workloads is ready", async () => {
     const said = await alasioOk("status");
@@ -161,10 +160,7 @@ async function newSession(net: NetMode) {
   return volumeId;
 }
 
-/** Node run in a session's bayma container: its stdout. */
-const inSession = (volumeId: string, code: string) => kube.execOk(SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
 const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:AbortSignal.timeout(5000)}).then(r=>console.log("open"),e=>console.log("blocked"))`;
-const tcp = (host: string, port: number) => `const s=require("net").connect({host:${host},port:${port},timeout:3000});s.on("connect",()=>{console.log("open");process.exit()});s.on("timeout",()=>{console.log("blocked");process.exit()});s.on("error",()=>{console.log("blocked");process.exit()})`;
 
 const roundtrip = (volumeId: string) => inAlasio<RoundtripSeen>("./session-roundtrip.ts", volumeId);
 
@@ -246,6 +242,25 @@ describe("alasio on Kubernetes", () => {
     assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
   });
 
+  test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend", async () => {
+    assert.ok(sink, "the OTLP stand-in did not answer");
+    // JuiceFS's are its own Prometheus metrics, scraped; Valkey's, the collector's redis receiver's.
+    const names = ["juicefs_", "redis.memory.used"];
+    const deadline = Date.now() + 180_000;
+    let missing = names;
+    while (Date.now() < deadline) {
+      const arrived = await Promise.all(missing.map(async (name) => {
+        // The sink answers what it received.
+        const listed = (await (await fetch(`${sink?.base}/control/exports?contains=${encodeURIComponent(name)}`)).json()) as ListedExport[];
+        return listed.some((entry) => entry.signal === "metrics" && entry.contains);
+      }));
+      missing = missing.filter((_, index) => !arrived[index]);
+      if (missing.length === 0) break;
+      await sleep(10_000);
+    }
+    assert.deepEqual(missing, [], "no metric of these names arrived");
+  });
+
   test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
     const { home } = paths();
     const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
@@ -264,6 +279,8 @@ describe("alasio on Kubernetes", () => {
     assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
   });
 });
+
+workspaceStorage();
 
 neonStack();
 

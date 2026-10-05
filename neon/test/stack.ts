@@ -378,7 +378,12 @@ export function neonStack(): void {
           initContainers: [{
             name: "fetch",
             image: image(await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE))),
-            command: ["/bin/sh", "-c", `latest=$(aws s3 --endpoint-url ${s3} ls s3://${bucket}/ | awk '{print $4}' | sort | tail -1) && aws s3 --endpoint-url ${s3} cp "s3://${bucket}/$latest" /backup/alasio.dump`],
+            // The newest of the database's dumps, which share the bucket with JuiceFS's.
+            command: [
+              "/bin/sh",
+              "-c",
+              `latest=$(aws s3 --endpoint-url ${s3} ls s3://${bucket}/ | awk '{print $4}' | grep '^alasio-.*\\.dump$' | sort | tail -1) && aws s3 --endpoint-url ${s3} cp "s3://${bucket}/$latest" /backup/alasio.dump`,
+            ],
             env: [{ name: "HOME", value: "/tmp" }, { name: "AWS_DEFAULT_REGION", value: "us-east-1" }],
             envFrom: [{ secretRef: { name: neonName("s3-admin") } }],
             securityContext: restricted,

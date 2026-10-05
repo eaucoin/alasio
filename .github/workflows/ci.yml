@@ -54,6 +54,15 @@ jobs:
             /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az
           docker system prune --all --force
           df -h /
+      # Every root process in every container shares the runner's inotify limits, which the
+      # cluster's nodes, their pods and JuiceFS's mount pods use up, so alasio's local
+      # cluster needs them at least this high (cli/src/cluster/host.ts): raised where lower.
+      - run: |
+          for limit in max_user_instances=1024 max_user_watches=524288; do
+            name="fs.inotify.${limit%=*}"
+            [ "$(sysctl -n "$name")" -ge "${limit#*=}" ] || sudo sysctl -w "$name=${limit#*=}"
+          done
+          sysctl fs.inotify
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
