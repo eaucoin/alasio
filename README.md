@@ -70,6 +70,14 @@ and `objectStore.external` an S3-compatible store instead of the bundled
 SeaweedFS, where Neon keeps its storage and a daily backup goes. `alasio up`
 applies what you change.
 
+The config's `target.local` is the cluster alasio makes, and `registries` in it
+says where its nodes pull images from, as k3s's `registries.yaml` does, its
+keys in camel case: `mirrors`, the endpoints that stand for a registry, and
+`configs`, a registry's TLS, its files the nodes' own, as `mounts` mounts them.
+A registry that asks for a login is not one of them, as the config holds no
+secret. `alasio up` makes the nodes anew with what you change, keeping their
+data.
+
 `alasio uninstall` removes alasio and keeps its data, which `alasio up`
 installs it again with; `alasio uninstall --purge` removes the data too, and
 the cluster alasio made.
@@ -95,8 +103,8 @@ Engine API, in `cli/src/cluster/`, from the node image in `cluster/node/`.
 Neon: neon-control, and the analytics lake, with its image.
 
 `npm run test:e2e` is the end-to-end run: it packs the command line's package
-and installs it, builds the images, makes a cluster from them with `alasio
-init`, starts alasio with `alasio up`, drives it through a Telegram stand-in,
+and installs it, builds the images, makes a cluster with `alasio init` whose
+nodes pull them from a registry of the run's own, starts alasio with `alasio up`, drives it through a Telegram stand-in,
 puts its Neon through crashes, and removes it all with `alasio uninstall
 --purge`. It needs Docker, and much of its disk; `ALASIO_E2E_AGENTS` gives the
 cluster agent nodes beside its server.

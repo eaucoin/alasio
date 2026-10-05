@@ -132,7 +132,7 @@ export interface ContainerCreate {
 /** What `exec` is given beyond the command. */
 export interface ExecOptions {
   /** What the command reads on its standard input, which is closed after it. */
-  readonly stdin?: string | Readable;
+  readonly stdin?: string;
 }
 
 /** What a command run by `exec` came to. */
@@ -149,8 +149,6 @@ export class DockerEngine extends Context.Service<DockerEngine, {
   readonly inspectImage: (reference: string) => Effect.Effect<ImageInspect | null, DockerError>;
   /** Pulls the image `reference` names by tag or digest, from a registry that asks for no login. */
   readonly pullImage: (reference: string) => Effect.Effect<void, DockerError>;
-  /** The images, as one tar archive (`docker save`'s), streamed while the scope is open. */
-  readonly exportImages: (references: readonly string[]) => Effect.Effect<Readable, DockerError, Scope.Scope>;
   /** The network, or null when there is none. */
   readonly inspectNetwork: (name: string) => Effect.Effect<NetworkInspect | null, DockerError>;
   /** Every network there is. */
@@ -321,15 +319,7 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
         socket.on("data", (chunk: Buffer) => chunks.push(chunk));
         socket.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
         socket.on("close", () => resume(Effect.succeed(Buffer.concat(chunks))));
-        if (typeof stdin === "string") {
-          socket.end(stdin);
-        } else if (stdin) {
-          stdin.on("error", (cause) => {
-            resume(Effect.fail(unreachable(call, cause)));
-            socket.destroy();
-          });
-          stdin.pipe(socket);
-        }
+        if (stdin !== undefined) socket.end(stdin);
       });
       // A daemon that answers without upgrading refused.
       request.on("response", (response) => resume(refusal(call, response)));
@@ -382,7 +372,6 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
     // A reference as it is: the route takes its slashes and colons.
     inspectImage: (reference) => orNull(json({ method: "GET", path: `/images/${reference}/json` })),
     pullImage,
-    exportImages: (references) => open({ method: "GET", path: "/images/get", query: { names: references } }),
     inspectNetwork: (network) => orNull(json({ method: "GET", path: `/networks/${name(network)}` })),
     listNetworks: json({ method: "GET", path: "/networks" }),
     createNetwork: (network) => Effect.asVoid(body({ method: "POST", path: "/networks/create", body: network })),

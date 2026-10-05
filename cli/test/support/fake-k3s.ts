@@ -1,14 +1,14 @@
 /**
  * k3s in the nodes of a fake Docker (./fake-docker.ts): kubectl in the server node, over
- * an API server in memory (nodes, CoreDNS's ConfigMap, and what is applied), ctr and find
- * in every node, and the files k3s writes in the server node, its kubeconfig and token.
+ * an API server in memory (nodes, CoreDNS's ConfigMap, and what is applied), find in
+ * every node, and the files k3s writes in the server node, its kubeconfig and token.
  */
 import { type FakeContainer, type FakeDocker, type FakeDockerOptions, type FakeExecResult, serveFakeDocker } from "./fake-docker.ts";
 
 /** The token the server makes, which agents join with. */
 export const K3S_TOKEN = "K10abc::server:secret";
 
-/** k3s as the fake's nodes run it: kubectl in the server, over an API server in memory, and ctr in every node. */
+/** k3s as the fake's nodes run it: kubectl in the server, over an API server in memory, and find in every node. */
 export class FakeK3s {
   apiReady = true;
   /** When the nodes' kubelets last reported them ready; now, unless a test says. */
@@ -17,15 +17,10 @@ export class FakeK3s {
   resourceVersion = 1;
   readonly patches: unknown[] = [];
   readonly applied: unknown[] = [];
-  readonly imported = new Map<string, string>();
   containers: ReadonlyMap<string, FakeContainer> = new Map();
 
-  readonly exec = (container: string, command: readonly string[], stdin: Buffer): FakeExecResult => {
+  readonly exec = (_container: string, command: readonly string[], stdin: Buffer): FakeExecResult => {
     const [tool, ...args] = command;
-    if (tool === "ctr") {
-      this.imported.set(container, stdin.toString("utf8"));
-      return { exitCode: 0 };
-    }
     if (tool === "find") return { exitCode: 0 };
     if (!this.apiReady) return { exitCode: 1, stderr: "The connection to the server 127.0.0.1:6443 was refused" };
     const verb = args.find((arg) => !arg.startsWith("--"));

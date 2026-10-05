@@ -9,7 +9,7 @@ import { KubeConfig } from "@kubernetes/client-node";
 import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker.ts";
-import { freeSubnet, LocalCluster, type LocalClusterOptions, localKubeconfig, nodeHostsWith, subnetAddress } from "../src/cluster/local.ts";
+import { freeSubnet, LocalCluster, type LocalClusterOptions, localKubeconfig, nodeHostsWith, registriesYaml, subnetAddress } from "../src/cluster/local.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
@@ -332,15 +332,44 @@ test("status is Docker's version and the cluster's nodes, the server first", asy
   });
 });
 
-test("loadImages streams Docker's export of the images into every node's containerd", async (t) => {
-  const { fake, k3s, kubeconfig, run } = await rig(t);
-  await run((cluster) => cluster.up(kubeconfig).pipe(Effect.andThen(cluster.loadImages(["alasio:e2e", "alasio-agent:e2e"]))), { agents: 1 });
-  assert.deepEqual(Object.fromEntries(k3s.imported), {
-    "dev-server-0": "archive of alasio:e2e alasio-agent:e2e",
-    "dev-agent-0": "archive of alasio:e2e alasio-agent:e2e",
-  });
-  const imports = fake.requests.filter(({ path }) => /^\/containers\/[^/]+\/exec$/u.test(path)).map(({ body }) => (body as { Cmd: string[] }).Cmd);
-  assert.deepEqual(imports.at(-1), ["ctr", "--namespace=k8s.io", "images", "import", "-"]);
+test("every node is made with the registries, as k3s's registries.yaml, and made anew when they change", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  const registries = { mirrors: { "registry.example:5000": { endpoint: ["http://registry.example:5000"] } } };
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries });
+  const environments = () =>
+    fake.requests.filter(({ path }) => path === "/containers/create").map(({ query, body }) => [query.get("name"), (body as { Env: string[] }).Env.filter((variable) => variable.startsWith("ALASIO_REGISTRIES="))]);
+  assert.deepEqual(environments(), [
+    ["dev-server-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
+    ["dev-agent-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
+  ]);
+
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries: { ...registries, configs: { "registry.example:5000": { tls: { insecureSkipVerify: true } } } } });
+  assert.deepEqual(fake.changes().slice(changes).filter((change) => !change.startsWith("POST /volumes")), [
+    "POST /containers/dev-server-0/stop",
+    "DELETE /containers/dev-server-0",
+    "POST /containers/create",
+    "POST /containers/dev-server-0/start",
+    "POST /containers/dev-agent-0/stop",
+    "DELETE /containers/dev-agent-0",
+    "POST /containers/create",
+    "POST /containers/dev-agent-0/start",
+  ]);
+  assert.match(environments().at(-1)?.[1]?.[0] ?? "", /"configs":\{"registry\.example:5000":\{"tls":\{"insecure_skip_verify":true\}\}\}/u);
+});
+
+test("registriesYaml says the registries in k3s's keys, leaving out what is not given", () => {
+  assert.deepEqual(JSON.parse(registriesYaml({})), { mirrors: {}, configs: {} });
+  assert.deepEqual(
+    JSON.parse(registriesYaml({
+      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
+      configs: { "mirror.example": { tls: { caFile: "/etc/ssl/mirror-ca.pem", certFile: "/etc/ssl/node.pem", keyFile: "/etc/ssl/node-key.pem" } } },
+    })),
+    {
+      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
+      configs: { "mirror.example": { tls: { ca_file: "/etc/ssl/mirror-ca.pem", cert_file: "/etc/ssl/node.pem", key_file: "/etc/ssl/node-key.pem" } } },
+    },
+  );
 });
 
 test("subnetAddress counts from the subnet's network address, within its host addresses", () => {

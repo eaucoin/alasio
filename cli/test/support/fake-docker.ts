@@ -151,10 +151,6 @@ export async function serveFakeDocker({
       images.add(reference);
       return void response.end(`${JSON.stringify({ status: `Downloaded newer image for ${reference}` })}\n`);
     }
-    if (route === "GET /images/get") {
-      response.writeHead(200, { "Content-Type": "application/x-tar" });
-      return void response.end(`archive of ${query.getAll("names").join(" ")}`);
-    }
     if (route === "POST /networks/create") {
       const network = body as { Name: string; Labels: Record<string, string>; IPAM?: { Config: [{ Subnet: string }] } };
       if (networks.has(network.Name)) return refuse(response, 409, `network with name ${network.Name} already exists`);

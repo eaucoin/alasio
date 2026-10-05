@@ -12,6 +12,10 @@
  * only in a subnet chosen for the network, so one is chosen when none is given: the first
  * 172.30.N.0/24 no other network overlaps.
  *
+ * The registries the nodes pull from are k3s's registries.yaml, which the node image's
+ * entrypoint writes from the variable each node is made with, so a node is made anew when
+ * they change, as when its other settings do.
+ *
  * The API server is published on the loopback only. What is done in the cluster itself,
  * waiting for it and configuring it, is done with the kubectl k3s carries in the server
  * node, so this machine needs none of Kubernetes' tools.
@@ -39,6 +43,24 @@ export interface HostMount {
   readonly readOnly?: boolean;
 }
 
+/** A registry's TLS: files in the nodes, and whether its certificate goes unchecked. */
+export interface RegistryTls {
+  readonly caFile?: string;
+  readonly certFile?: string;
+  readonly keyFile?: string;
+  readonly insecureSkipVerify?: boolean;
+}
+
+/**
+ * The registries the nodes' containerd pulls from, as k3s's registries.yaml says them:
+ * the endpoints that stand for a registry, by its host, in the order they are tried, with
+ * how image names are rewritten there; and a registry's TLS, by its host.
+ */
+export interface Registries {
+  readonly mirrors?: Readonly<Record<string, { readonly endpoint: readonly string[]; readonly rewrite?: Readonly<Record<string, string>> }>>;
+  readonly configs?: Readonly<Record<string, { readonly tls: RegistryTls }>>;
+}
+
 /** What the local cluster is made with. */
 export interface LocalClusterOptions {
   readonly name: string;
@@ -54,6 +76,8 @@ export interface LocalClusterOptions {
   readonly mounts?: readonly HostMount[];
   /** Agent nodes beside the server. */
   readonly agents?: number;
+  /** The registries the nodes pull from; containerd's defaults unless given. */
+  readonly registries?: Registries;
   /** How long each wait for the cluster may take, and how often it looks. */
   readonly readyTimeout?: Duration.Input;
   readonly poll?: Duration.Input;
@@ -141,8 +165,6 @@ export class LocalCluster extends Context.Service<LocalCluster, {
    */
   readonly remove: (options?: RemoveOptions) => Effect.Effect<void, DockerError | NodeCommandFailed | PlatformError.PlatformError>;
   readonly status: Effect.Effect<ClusterStatus, DockerError>;
-  /** Loads images of this machine's Docker into every node's containerd, where pods find them without a pull. */
-  readonly loadImages: (references: readonly string[]) => Effect.Effect<void, DockerError | NodeCommandFailed>;
 }>()("alasio/cluster/LocalCluster") {
   static readonly layer = (options: LocalClusterOptions): Layer.Layer<LocalCluster, never, DockerEngine | FileSystem.FileSystem> =>
     Layer.effect(LocalCluster, makeLocalCluster(options));
@@ -167,6 +189,8 @@ const API_PORT = `${K3S_PORT}/tcp`;
 const K3S_KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
 /** The token the server made on its first start, which agents join with. */
 const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
+/** The variable the node image's entrypoint writes k3s's registries.yaml from, before k3s starts. */
+const REGISTRIES_ENV = "ALASIO_REGISTRIES";
 
 /**
  * kubelet's thresholds for a machine whose disk the cluster shares with everything else
@@ -263,6 +287,19 @@ export function localKubeconfig(k3sYaml: string, cluster: string, apiPort: numbe
   return local.exportConfig();
 }
 
+/** k3s's registries.yaml of `registries`, written as JSON, which YAML reads as it is. Pure, for tests. */
+export function registriesYaml({ mirrors = {}, configs = {} }: Registries): string {
+  return JSON.stringify({
+    mirrors,
+    configs: Object.fromEntries(
+      Object.entries(configs).map(([host, { tls }]) => [
+        host,
+        { tls: { ca_file: tls.caFile, cert_file: tls.certFile, key_file: tls.keyFile, insecure_skip_verify: tls.insecureSkipVerify } },
+      ]),
+    ),
+  });
+}
+
 /** A digest of `spec` that two specs share only when they are the same. */
 const specHash = (spec: ContainerCreate): string => createHash("sha256").update(JSON.stringify(spec)).digest("hex");
 
@@ -275,6 +312,7 @@ const makeLocalCluster = Effect.fnUntraced(function*({
   hostAliases = [],
   mounts = [],
   agents = 0,
+  registries,
   readyTimeout = READY_TIMEOUT,
   poll = POLL,
 }: LocalClusterOptions): Effect.fn.Return<LocalCluster["Service"], never, DockerEngine | FileSystem.FileSystem> {
@@ -286,12 +324,15 @@ const makeLocalCluster = Effect.fnUntraced(function*({
 
   const unusable = (reason: string) => new ClusterUnusable({ cluster, reason });
 
-  /** The container of `node`, with what every node has: privileged, as k3s in Docker needs, and its volumes, the storage directory and the host mounts. */
+  /**
+   * The container of `node`, with what every node has: privileged, as k3s in Docker needs,
+   * its volumes, the storage directory and the host mounts, and the registries.
+   */
   const nodeContainer = (node: string, role: NodeRole, address: string, command: readonly string[], env: readonly string[]): ContainerCreate => ({
     Image: image,
     Hostname: node,
     Cmd: command,
-    Env: env,
+    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : [])],
     Labels: { ...labels, [ROLE_LABEL]: role },
     ...(role === "server" ? { ExposedPorts: { [API_PORT]: {} } } : {}),
     HostConfig: {
@@ -516,15 +557,5 @@ const makeLocalCluster = Effect.fnUntraced(function*({
       docker: Effect.map(docker.version, ({ Version }) => Version),
       nodes: existingNodes,
     }),
-
-    loadImages: (references) =>
-      Effect.forEach(
-        nodes,
-        (node) =>
-          Effect.scoped(
-            Effect.flatMap(docker.exportImages(references), (archive) => inNode(node, ["ctr", "--namespace=k8s.io", "images", "import", "-"], { stdin: archive })),
-          ).pipe(Effect.andThen(Effect.logInfo(`loaded ${references.join(", ")} into ${node}`))),
-        { discard: true },
-      ),
   });
 });

@@ -2,17 +2,19 @@
  * alasio's end-to-end run, set up as an operator sets alasio up: its npm package packed
  * and installed (tooling/cli-package.ts), its images built here, a cluster on this
  * machine made by `alasio init` from the node image built here, alasio's own images
- * loaded into the cluster's nodes through the local cluster's driver, the stand-ins it
- * talks to instead of Telegram and a telemetry backend applied (./stand-ins.ts), and
- * alasio started by `alasio up`. The tests then drive it through its command line
- * (`alasio`), the stand-ins, and the cluster's API (`kube`); the run is torn down by
- * `alasio uninstall --purge`, after what the cluster was doing is said, when something
- * of the run failed.
+ * pushed to a registry of the run's own beside the cluster, which the cluster's
+ * `registries` have its nodes pull from, the stand-ins it talks to instead of Telegram
+ * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`.
+ * The tests then drive it through its command line (`alasio`), the stand-ins, and the
+ * cluster's API (`kube`); the run is torn down by `alasio uninstall --purge`, after what
+ * the cluster was doing is said, when something of the run failed.
  *
  * ALASIO_E2E_AGENTS is the number of agent nodes beside the server (0 unless set), and
- * ALASIO_E2E_KEEP=1 keeps the cluster and the run's directory afterwards. Needs Docker
- * and npm. Once loaded, the images built are removed, and Docker's build cache with
- * them, as a CI runner's disk holds the cluster's copies and little more.
+ * ALASIO_E2E_KEEP=1 keeps the cluster, its registry and the run's directory afterwards.
+ * Needs Docker and npm. Once pushed, the images built are removed, and Docker's build
+ * cache with them, as a CI runner's disk holds the registry's copies, and each node's of
+ * the images its pods run, and little more: a node pulls only those, and again any its
+ * kubelet collected.
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -23,15 +25,11 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { NodeServices } from "@effect/platform-node";
 import { CoreV1Api, type CoreV1Event, KubeConfig, type KubernetesObject, PortForward, type V1Deployment, type V1Node, type V1Pod, type V1Secret } from "@kubernetes/client-node";
 import { type Duration, Effect, Stream } from "effect";
 
-import { LocalCluster } from "../../cli/src/cluster/local.ts";
-import { readConfig } from "../../cli/src/config.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
-import { localCluster, resolveTarget } from "../../cli/src/target.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { OTLP, standInObjects, TELEGRAM, urlOf } from "./stand-ins.ts";
 import { createTelegramStub } from "./telegram-stub.ts";
@@ -60,6 +58,13 @@ export const HOST_USER = 1000;
 /** The images built here: their names, and what they are built from. */
 const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-node": "cluster/node" } as const;
 const imageOf = (name: keyof typeof IMAGES): string => `alasio-e2e/${name}:e2e`;
+
+/** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
+const REGISTRY = `${CLUSTER}-registry`;
+/** Distribution's registry. */
+const REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
+/** The registry as the nodes reach it, by its name on the cluster's network, over plain HTTP; the pods' images name it. */
+const REGISTRY_HOST = `${REGISTRY}:5000`;
 
 /** What a command, run here or in a container, came to. */
 export interface Ran {
@@ -268,33 +273,42 @@ export const kube = {
   },
 };
 
-/** Builds the image `name`, tagged imageOf(name). */
-async function build(name: keyof typeof IMAGES): Promise<void> {
-  console.error(`# building ${imageOf(name)} from ${IMAGES[name]}`);
-  await docker("build", "--quiet", "--tag", imageOf(name), IMAGES[name]);
+/** Builds the image `name`, tagged `tag`. */
+async function build(name: keyof typeof IMAGES, tag: string): Promise<void> {
+  console.error(`# building ${tag} from ${IMAGES[name]}`);
+  await docker("build", "--quiet", "--tag", tag, IMAGES[name]);
 }
 
-/** Loads the image `name` into every node of the cluster, through the local cluster's driver, then removes it here, with Docker's build cache. */
-async function load(configFile: string, name: keyof typeof IMAGES): Promise<void> {
-  await Effect.runPromise(
-    Effect.gen(function*() {
-      const config = yield* readConfig(configFile);
-      if (!config) return yield* Effect.die(new Error(`there is no config at ${configFile}`));
-      const target = yield* resolveTarget(config);
-      if (target._tag !== "Local") return yield* Effect.die(new Error("the run's cluster is not one on this machine"));
-      yield* Effect.flatMap(LocalCluster, (cluster) => cluster.loadImages([imageOf(name)])).pipe(Effect.provide(localCluster(target.cluster)));
-    }).pipe(Effect.provide(NodeServices.layer)),
-  );
-  await docker("image", "rm", imageOf(name));
+/**
+ * Starts the run's registry on the cluster's network, published on a port of the loopback,
+ * which Docker pushes to over plain HTTP as it does to any registry there: the registry's
+ * host as this machine reaches it.
+ */
+async function startRegistry(): Promise<string> {
+  console.error(`# starting the registry ${REGISTRY}`);
+  // One a kept run left goes first; what its volume holds is pushed over.
+  await docker("rm", "--force", REGISTRY).catch(() => undefined);
+  await docker("run", "--detach", "--name", REGISTRY, "--network", CLUSTER, "--publish", "127.0.0.1::5000", "--volume", `${REGISTRY}:/var/lib/registry`, REGISTRY_IMAGE);
+  // The published address, as `127.0.0.1:PORT`.
+  return (await docker("port", REGISTRY, "5000/tcp")).stdout.trim();
+}
+
+/** Builds the image `name` and pushes it to the registry at `pushHost`, then removes it here, with Docker's build cache. */
+async function push(pushHost: string, name: keyof typeof IMAGES): Promise<void> {
+  const tag = `${pushHost}/${imageOf(name)}`;
+  await build(name, tag);
+  console.error(`# pushing ${tag}`);
+  await docker("push", "--quiet", tag);
+  await docker("image", "rm", tag);
   await docker("builder", "prune", "--all", "--force");
 }
 
-/** The install configuration the run starts alasio with: its images built here, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
+/** The install configuration the run starts alasio with: its images built here, pulled from the run's registry, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
 function installation(): Record<string, unknown> {
-  const local = (name: keyof typeof IMAGES) => ({ repository: `alasio-e2e/${name}`, tag: "e2e", digest: "" });
+  const pushed = (name: keyof typeof IMAGES) => ({ repository: `${REGISTRY_HOST}/alasio-e2e/${name}`, tag: "e2e", digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
-    images: { alasio: local("alasio"), agent: local("alasio-agent"), lake: local("alasio-lake"), pullPolicy: "Never" },
+    images: { alasio: pushed("alasio"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM) },
       persistence: { size: "2Gi" },
@@ -355,11 +369,23 @@ export async function setUp(): Promise<void> {
   console.error(`# packing alasio's package and installing it in ${prefix}`);
   await installCli((await packCli(work)).tarball, prefix);
 
-  await build("alasio-node");
+  await build("alasio-node", imageOf("alasio-node"));
   mkdirSync(join(configHome, "alasio"), { recursive: true, mode: 0o700 });
   writeFileSync(
     configFile,
-    JSON.stringify({ target: { local: { name: CLUSTER, apiPort: await freePort(), storagePath: storage, agents: AGENTS, image: imageOf("alasio-node") } }, install: installation() }),
+    JSON.stringify({
+      target: {
+        local: {
+          name: CLUSTER,
+          apiPort: await freePort(),
+          storagePath: storage,
+          agents: AGENTS,
+          image: imageOf("alasio-node"),
+          registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } },
+        },
+      },
+      install: installation(),
+    }),
     { mode: 0o600 },
   );
   const botToken = join(work, "bot-token");
@@ -385,10 +411,8 @@ export async function setUp(): Promise<void> {
   kubeConfig.loadFromFile(current().kubeconfig);
   api = await Effect.runPromise(Effect.provide(Effect.gen(function*() { return yield* KubeApi; }), KubeApi.layer({ path: current().kubeconfig })));
 
-  for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) {
-    await build(name);
-    await load(configFile, name);
-  }
+  const pushHost = await startRegistry();
+  for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) await push(pushHost, name);
 
   console.error("# applying the stand-ins");
   const standIns = standInObjects();
@@ -438,14 +462,19 @@ export async function dumpClusterState(): Promise<void> {
   process.stderr.write(`${said.join("\n")}\n`);
 }
 
-/** Removes what the run made, unless it is kept: the cluster, with all it holds, the node image, and the run's directory. */
+/** Removes what the run made, unless it is kept: the registry, the cluster, with all it holds, the node image, and the run's directory. */
 export async function tearDown(): Promise<void> {
   if (!setup) return;
   const { work, configFile } = setup;
   if (KEEP) {
-    console.error(`# kept the cluster ${CLUSTER} and ${work}: ${setup.bin} --config ${configFile} uninstall --purge --yes removes the cluster`);
+    console.error(
+      `# kept the cluster ${CLUSTER}, the registry ${REGISTRY} and ${work}: docker rm --force ${REGISTRY} && docker volume rm ${REGISTRY} removes the registry, and then ${setup.bin} --config ${configFile} uninstall --purge --yes the cluster`,
+    );
     return;
   }
+  // First, as Docker removes no network a container is still on.
+  await docker("rm", "--force", REGISTRY).catch(() => undefined);
+  await docker("volume", "rm", REGISTRY).catch(() => undefined);
   const removed = await alasio("uninstall", "--purge", "--yes").catch((error: unknown) => ({ code: 1, stderr: error instanceof Error ? error.message : String(error) }));
   if (removed.code !== 0) console.error(`# the cluster ${CLUSTER} may be left: alasio uninstall --purge failed: ${removed.stderr.trim()}`);
   await docker("image", "rm", "--force", imageOf("alasio-node")).catch(() => undefined);

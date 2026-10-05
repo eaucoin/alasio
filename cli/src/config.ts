@@ -12,7 +12,8 @@
  *
  * The target is the cluster alasio makes on this machine (./cluster/local.ts), with its
  * API server on `apiPort` of the loopback and its volumes in `storagePath`
- * ($XDG_DATA_HOME/alasio/storage unless given), or one a kubeconfig reaches:
+ * ($XDG_DATA_HOME/alasio/storage unless given), its nodes pulling through the
+ * `registries` it is given, or one a kubeconfig reaches:
  * `{ "kubeconfig": { "path": "/home/me/.kube/config", "context": "prod" } }`, both keys
  * optional. The installation is the install configuration (./manifests/config.ts), every
  * key optional, but for the Secrets of the bot and of Claude Code, which alasio names.
@@ -38,6 +39,41 @@ export const ConfigFlag = GlobalFlag.Setting("config")({
 
 const Port = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 }, { message: "must be a port from 1 to 65535" }));
 const Ipv4 = matching(/^(\d{1,3}\.){3}\d{1,3}$/u, "must be an IPv4 address");
+const Url = matching(/^https?:\/\/.+$/u, "must be an http(s) URL");
+
+/**
+ * The registries the local cluster's nodes pull images from, as k3s's registries.yaml
+ * says them, its keys in camel case: a registry's mirrors, by its host (`*` for every
+ * one), and its TLS, whose files are the nodes', as `mounts` mounts them. A registry's
+ * login is a secret, which the config does not hold, so there is none: the registries are
+ * ones that ask for none.
+ */
+const Registries = Schema.Struct({
+  mirrors: defaulted(
+    Schema.Record(
+      NonEmpty,
+      Schema.Struct({
+        endpoint: Schema.Array(Url).check(Schema.isMinLength(1, { message: "must name an endpoint" })),
+        rewrite: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+      }),
+    ),
+    {},
+  ),
+  configs: defaulted(
+    Schema.Record(
+      NonEmpty,
+      Schema.Struct({
+        tls: Schema.Struct({
+          caFile: Schema.optionalKey(AbsolutePath),
+          certFile: Schema.optionalKey(AbsolutePath),
+          keyFile: Schema.optionalKey(AbsolutePath),
+          insecureSkipVerify: Schema.optionalKey(Schema.Boolean),
+        }),
+      }),
+    ),
+    {},
+  ),
+});
 
 /** The cluster alasio makes on this machine, its LocalClusterOptions. */
 const LocalTarget = Schema.Struct({
@@ -50,6 +86,7 @@ const LocalTarget = Schema.Struct({
   /** The node image, such as one built from cluster/node on this machine; this version's unless given. */
   image: Schema.optionalKey(NonEmpty),
   agents: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 }, { message: "must be from 0 to 16" })), 0),
+  registries: Schema.optionalKey(Registries),
 });
 
 /** A cluster a kubeconfig reaches: the default kubeconfig and its current context unless they are given. */

@@ -38,6 +38,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
       hostAliases: local.hostAliases,
       mounts: [...local.mounts, ...hostPaths.filter(({ source }) => !local.mounts.some((mount) => mount.source === source))],
       agents: local.agents,
+      ...(local.registries ? { registries: local.registries } : {}),
     },
     kubeconfig: { path: localKubeconfigPath(config) },
   };

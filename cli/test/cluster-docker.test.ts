@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { Readable } from "node:stream";
 import { test } from "node:test";
 
 import { Effect, Result } from "effect";
@@ -158,39 +157,6 @@ test("exec runs the command, sends its stdin, and parts its output from its erro
   assert.equal(results.plain.stdout.toString("utf8"), "node Ready\n");
   assert.equal(results.plain.stderr, "warning\n");
   assert.deepEqual({ ...results.fed, stdout: results.fed.stdout.toString("utf8") }, { exitCode: 1, stdout: "", stderr: "refused" });
-});
-
-test("an image export streams into an exec's stdin", async () => {
-  let imported = "";
-  await withDocker(
-    (docker) =>
-      Effect.gen(function*() {
-        yield* docker.createContainer("n", containerCreate);
-        yield* docker.startContainer("n");
-        yield* Effect.scoped(
-          Effect.flatMap(docker.exportImages(["alasio:e2e", "alasio-agent:e2e"]), (archive) => docker.exec("n", ["ctr", "images", "import", "-"], { stdin: archive })),
-        );
-      }),
-    {
-      onExec: (_container, _command, stdin) => {
-        imported = stdin.toString("utf8");
-        return { exitCode: 0 };
-      },
-    },
-  );
-  assert.equal(imported, "archive of alasio:e2e alasio-agent:e2e");
-});
-
-test("a stream fed to an exec that fails fails the exec", async () => {
-  const failing = new Readable({ read() { this.destroy(new Error("export broke")); } });
-  const error = await withDocker((docker) =>
-    Effect.gen(function*() {
-      yield* docker.createContainer("n", containerCreate);
-      yield* docker.startContainer("n");
-      return yield* Effect.flip(docker.exec("n", ["ctr", "images", "import", "-"], { stdin: failing }));
-    })
-  );
-  assert.match(error.message, /export broke/u);
 });
 
 test("exec in a container that is not running is Docker's refusal", async () => {

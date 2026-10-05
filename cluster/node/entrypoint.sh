@@ -31,6 +31,13 @@ if grep -q '127\.0\.0\.11' /etc/resolv.conf; then
   printf '%s\n' "$resolv" >/etc/resolv.conf
 fi
 
+# The registries containerd pulls from, k3s's registries.yaml, which k3s reads as it
+# starts: what the node was made with (ALASIO_REGISTRIES), written the same at every start.
+if [ -n "${ALASIO_REGISTRIES:-}" ]; then
+  mkdir -p /etc/rancher/k3s
+  printf '%s\n' "$ALASIO_REGISTRIES" >/etc/rancher/k3s/registries.yaml
+fi
+
 # The root's mounts shared, so mounts kubelet makes for pods propagate as they ask.
 mount --make-rshared /
 

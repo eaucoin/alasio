@@ -132,3 +132,28 @@ test("the local cluster runs the node image the config names, such as one built 
   assert.ok(target._tag === "Local");
   assert.equal(target.cluster.image, "alasio-node:dev");
 });
+
+test("the local cluster's registries are k3s's registries.yaml, without a login, which is a secret", async () => {
+  const registries = {
+    mirrors: { "registry.example:5000": { endpoint: ["http://registry.example:5000"] } },
+    configs: { "mirror.example": { tls: { caFile: "/etc/ssl/mirror-ca.pem" } } },
+  };
+  const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, registries } } });
+  assert.ok(Result.isSuccess(decoded));
+  const target = await run(resolveTarget(decoded.success));
+  assert.ok(target._tag === "Local");
+  assert.deepEqual(target.cluster.registries, registries);
+
+  const only = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, registries: { mirrors: { "*": { endpoint: ["https://mirror.example"] } } } } } });
+  assert.ok(Result.isSuccess(only) && "local" in only.success.target);
+  assert.deepEqual(only.success.target.local.registries, { mirrors: { "*": { endpoint: ["https://mirror.example"] } }, configs: {} });
+
+  const local = (given: unknown) => ({ target: { local: { apiPort: 41873, registries: given } } });
+  assert.equal(refusal(local({ mirrors: { "registry.example": { endpoint: [] } } })), `${PATH}: target.local.registries.mirrors.registry.example.endpoint must name an endpoint`);
+  assert.equal(
+    refusal(local({ mirrors: { "registry.example": { endpoint: ["registry.example:5000"] } } })),
+    `${PATH}: target.local.registries.mirrors.registry.example.endpoint.0 must be an http(s) URL`,
+  );
+  assert.equal(refusal(local({ configs: { "registry.example": { tls: { caFile: "ca.pem" } } } })), `${PATH}: target.local.registries.configs.registry.example.tls.caFile must be an absolute path`);
+  assert.match(refusal(local({ configs: { "registry.example": { tls: {}, auth: { username: "me", password: "secret" } } } })), /target\.local\.registries\.configs\.registry\.example\.auth /u);
+});
