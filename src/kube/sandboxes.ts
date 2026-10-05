@@ -155,9 +155,9 @@ export interface Sandboxes {
   readonly namespace: string;
   /**
    * Makes sure the Sandbox exists (made from `manifest()` when it does not), runs a pod
-   * of `manifest()`'s template (replacing one of another, its volumes kept), and its
-   * bayma answers: the MCP endpoint and the bearer to reach it with. Callers asking at
-   * once share one bring-up.
+   * of `manifest()`'s template (replacing one of another, or one that has ended, its
+   * volumes kept), and its bayma answers: the MCP endpoint and the bearer to reach it
+   * with. Callers asking at once share one bring-up.
    */
   readonly ensure: (name: string, manifest: () => Sandbox) => Effect.Effect<BaymaEndpoint, SandboxError>;
   /** The Sandbox's token, or null when it has none. */
@@ -321,6 +321,15 @@ export function sandboxReady(sandbox: SandboxReadiness): boolean {
   return holds(sandbox, "Ready");
 }
 
+/** The reasons agent-sandbox gives a Sandbox that is not ready because its pod has ended: failed (evicted, say) or exited. */
+const POD_ENDED = new Set(["PodFailed", "PodSucceeded"]);
+
+/** Whether the Sandbox's pod has ended, for its current spec; agent-sandbox makes no other in its place. */
+export function podEnded(sandbox: SandboxReadiness): boolean {
+  const ready = condition(sandbox, "Ready");
+  return ready !== null && POD_ENDED.has(ready.reason) && (ready.observedGeneration ?? 0) >= (sandbox.metadata.generation ?? 0);
+}
+
 /**
  * The Sandboxes of `namespace`, on the KubeClient, whose bayma serves on `port`; bayma
  * is reached with FetchHttpClient.Fetch to see that it answers. Bring-ups run in the
@@ -437,12 +446,25 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return yield* awaitCondition(moved, "Suspended");
   });
 
+  /**
+   * `sandbox`, whose pod has ended, suspended: agent-sandbox replaces no pod that has
+   * ended, so the Sandbox would never be ready again, and the pod it resumes with is new.
+   */
+  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+    const name = sandbox.metadata.name;
+    yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose pod ended (${condition(sandbox, "Ready")?.reason})`);
+    const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
+    return yield* awaitCondition(suspended, "Suspended");
+  });
+
   const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
     const desired = manifest();
     let sandbox = yield* readOrCreate(name, desired);
     yield* ensureToken(sandbox);
     if (sandbox.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] !== desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]) {
       sandbox = yield* moveOnto(sandbox, desired);
+    } else if (podEnded(sandbox)) {
+      sandbox = yield* restart(sandbox);
     }
     if (sandbox.spec?.operatingMode === "Suspended") {
       sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));

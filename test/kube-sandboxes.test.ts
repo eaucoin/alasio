@@ -23,6 +23,7 @@ import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type Sessio
 import {
   makeSandboxes,
   newToken,
+  podEnded,
   POD_TEMPLATE_ANNOTATION,
   podTemplateHash,
   type SandboxSpec,
@@ -194,7 +195,8 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
         const generation = sandbox.metadata.generation;
         if (sandbox.spec?.operatingMode === "Suspended") {
           sandbox.status = { conditions: [{ ...readyCondition(generation), type: "Suspended", reason: "SandboxSuspendedPodTerminated" }] };
-        } else if (!sandboxReady(sandbox)) {
+        } else if (!sandboxReady(sandbox) && !podEnded(sandbox)) {
+          // As agent-sandbox, which replaces no pod that has ended.
           pods.push(String(sandbox.spec?.podTemplate?.spec?.containers[0]?.image));
           this.ready(namespace, name);
         }
@@ -457,6 +459,29 @@ test("ensure moves a Sandbox made from another pod template onto alasio's, endin
   assert.deepEqual(moved.spec?.volumeClaimTemplates, older.spec.volumeClaimTemplates);
   assert.equal(moved.metadata.uid, created.metadata?.uid, "the Sandbox, and so its volumes, are the same");
   assert.equal(kube.peek("Secret", "alasio-sessions", "fs-abc123-bayma-token")?.metadata.ownerReferences?.[0]?.uid, created.metadata?.uid);
+});
+
+test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never replaces, keeping its volumes", async () => {
+  const kube = fakeKube();
+  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const created = kube.create(manifest());
+  // Evicted: the controller says so, for the Sandbox's current spec, and leaves it.
+  const sandbox = kube.objects.get("Sandbox/alasio-sessions/fs-abc123");
+  assert.ok(sandbox);
+  sandbox.status = { conditions: [{ ...readyCondition(sandbox.metadata.generation), status: "False", reason: "PodFailed", message: "Pod failed" }] };
+  assert.equal(podEnded(sandbox), true);
+  kube.calls.length = 0;
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
+    yield* sandboxes.ensure("fs-abc123", manifest);
+  })).finally(controller.stop);
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change), [
+    { spec: { operatingMode: "Suspended" } },
+    { spec: { operatingMode: "Running" } },
+  ]);
+  assert.equal(controller.pods.length, 1);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
 });
 
 test("ensure gives up on a Sandbox that does not become ready in five minutes, saying why", async () => {
