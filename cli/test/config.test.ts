@@ -125,6 +125,17 @@ test("the local cluster mounts the host profile's paths, and keeps its storage u
   assert.equal(target.cluster.image, undefined);
 });
 
+test("a host profile path the target's own mounts already put in the node is not mounted again", async () => {
+  const decoded = decodeOperatorConfig(PATH, {
+    target: { local: { apiPort: 41873, mounts: [{ source: "/tmp", target: "/host/tmp" }] } },
+    install: { host: { enabled: true, mounts: [{ name: "tmp", hostPath: "/host/tmp", mountPath: "/tmp" }, { name: "home", hostPath: "/home", mountPath: "/home" }] } },
+  });
+  assert.ok(Result.isSuccess(decoded));
+  const target = await run(resolveTarget(decoded.success));
+  assert.ok(target._tag === "Local");
+  assert.deepEqual(target.cluster.mounts, [{ source: "/tmp", target: "/host/tmp" }, { source: "/home", target: "/home", readOnly: false }]);
+});
+
 test("the local cluster runs the node image the config names, such as one built here", async () => {
   const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, storagePath: "/srv/storage", image: "alasio-node:dev" } } });
   assert.ok(Result.isSuccess(decoded));

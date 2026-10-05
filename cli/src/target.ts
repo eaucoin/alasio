@@ -4,7 +4,8 @@
  * reaches; and the services that reach it.
  *
  * The local cluster's nodes mount the host profile's paths at their own, as folder
- * workspaces mount them from the node.
+ * workspaces mount them from the node, but for those the target's own mounts already
+ * put there (as a node path of /host/tmp mounts the machine's /tmp).
  */
 import { Config, Effect, FileSystem, Layer, Option, Result } from "effect";
 
@@ -36,7 +37,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
       ...(local.subnet ? { subnet: local.subnet } : {}),
       ...(local.image ? { image: local.image } : {}),
       hostAliases: local.hostAliases,
-      mounts: [...local.mounts, ...hostPaths.filter(({ source }) => !local.mounts.some((mount) => mount.source === source))],
+      mounts: [...local.mounts, ...hostPaths.filter(({ target }) => !local.mounts.some((mount) => mount.target === target))],
       agents: local.agents,
       ...(local.registries ? { registries: local.registries } : {}),
     },
