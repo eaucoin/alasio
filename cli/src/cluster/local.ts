@@ -547,7 +547,13 @@ const makeLocalCluster = Effect.fnUntraced(function*({
         }
         yield* Effect.forEach(found, ({ name }) => docker.removeContainer(name), { discard: true });
         const network = yield* docker.inspectNetwork(cluster);
-        if (network?.Labels?.[CLUSTER_LABEL] === cluster) yield* docker.removeNetwork(cluster);
+        if (network?.Labels?.[CLUSTER_LABEL] === cluster) {
+          // Docker removes no network a container is on: others' (a collector given an
+          // address on it, say) are taken off it, and keep running.
+          yield* Effect.forEach(Object.values(network.Containers ?? {}), ({ Name }) =>
+            docker.disconnectNetwork(cluster, Name).pipe(Effect.andThen(Effect.logInfo(`took ${Name} off network ${cluster}`))), { discard: true });
+          yield* docker.removeNetwork(cluster);
+        }
         if (volumes) yield* Effect.forEach(yield* docker.listVolumes(labels), ({ Name }) => docker.removeVolume(Name), { discard: true });
         if (storage) yield* fs.remove(storagePath, { recursive: true, force: true });
         yield* Effect.logInfo(`removed cluster ${cluster}${volumes ? " and its volumes" : ""}${storage ? `, and ${storagePath}` : ""}`);

@@ -53,7 +53,8 @@ export interface FakeDocker {
   readonly host: string;
   readonly requests: DockerRequest[];
   readonly images: Set<string>;
-  readonly networks: Map<string, { readonly Name: string; readonly Labels: Readonly<Record<string, string>>; readonly Subnet: string }>;
+  /** The networks, with the containers on them other than nodes (`attached`, by name). */
+  readonly networks: Map<string, { readonly Name: string; readonly Labels: Readonly<Record<string, string>>; readonly Subnet: string; attached?: string[] }>;
   readonly volumes: Map<string, Readonly<Record<string, string>>>;
   readonly containers: Map<string, FakeContainer>;
   /** The requests that changed an image, network, volume or container, as `METHOD path`, in order. */
@@ -164,10 +165,23 @@ export async function serveFakeDocker({
       const network = networks.get(match[2] ?? "");
       if (!network) return refuse(response, 404, `network ${match[2]} not found`);
       if (match[1] === "DELETE") {
+        if (network.attached?.length) return refuse(response, 403, `error while removing network: network ${network.Name} has active endpoints`);
         networks.delete(network.Name);
         return void response.writeHead(204).end();
       }
-      return json(response, 200, { Name: network.Name, Labels: network.Labels, IPAM: { Config: [{ Subnet: network.Subnet }] } });
+      return json(response, 200, {
+        Name: network.Name,
+        Labels: network.Labels,
+        IPAM: { Config: [{ Subnet: network.Subnet }] },
+        Containers: Object.fromEntries((network.attached ?? []).map((name) => [`id-${name}`, { Name: name }])),
+      });
+    }
+    if ((match = /^POST \/networks\/([^/]+)\/disconnect$/u.exec(route))) {
+      const network = networks.get(match[1] ?? "");
+      if (!network) return refuse(response, 404, `network ${match[1]} not found`);
+      const { Container } = body as { Container: string };
+      network.attached = (network.attached ?? []).filter((name) => name !== Container);
+      return void response.writeHead(200).end();
     }
     if (route === "POST /volumes/create") {
       const volume = body as { Name: string; Labels: Record<string, string> };

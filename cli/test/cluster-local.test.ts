@@ -311,6 +311,20 @@ test("remove deletes the nodes and the network, and the volumes only when asked"
   assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
 });
 
+test("remove takes other containers off the network before removing it, and leaves them be", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  fake.containers.set("collector", { body: { Labels: {} }, state: "running" });
+  const network = fake.networks.get("dev");
+  assert.ok(network);
+  network.attached = ["collector"];
+  await run((cluster) => cluster.remove());
+  assert.equal(fake.networks.size, 0);
+  assert.deepEqual(fake.requests.filter(({ path }) => path === "/networks/dev/disconnect").map(({ body }) => body), [{ Container: "collector", Force: true }]);
+  assert.deepEqual([...fake.containers.keys()], ["collector"]);
+  assert.equal(fake.containers.get("collector")?.state, "running");
+});
+
 test("remove with the storage empties it in the server node, as root, then removes it", async (t) => {
   const { fake, kubeconfig, options, run } = await rig(t);
   await run((cluster) => cluster.up(kubeconfig).pipe(Effect.andThen(cluster.down)));

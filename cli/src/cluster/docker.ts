@@ -66,6 +66,8 @@ export interface NetworkInspect {
   readonly Name: string;
   readonly Labels: Readonly<Record<string, string>> | null;
   readonly IPAM: { readonly Config: readonly { readonly Subnet?: string }[] | null };
+  /** The containers on it, by id, when it is inspected by name. */
+  readonly Containers?: Readonly<Record<string, { readonly Name: string }>> | null;
 }
 
 /** A network as `createNetwork` makes it. */
@@ -157,6 +159,8 @@ export class DockerEngine extends Context.Service<DockerEngine, {
   readonly createNetwork: (network: NetworkCreate) => Effect.Effect<void, DockerError>;
   /** Removes it; one already gone is not an error. */
   readonly removeNetwork: (name: string) => Effect.Effect<void, DockerError>;
+  /** Takes the container off the network, running or not. */
+  readonly disconnectNetwork: (network: string, container: string) => Effect.Effect<void, DockerError>;
   /** Makes it, unless it exists. */
   readonly createVolume: (volume: Volume) => Effect.Effect<void, DockerError>;
   /** The volumes that carry every one of `labels`. */
@@ -376,6 +380,8 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
     listNetworks: json({ method: "GET", path: "/networks" }),
     createNetwork: (network) => Effect.asVoid(body({ method: "POST", path: "/networks/create", body: network })),
     removeNetwork: (network) => orGone(body({ method: "DELETE", path: `/networks/${name(network)}` })),
+    disconnectNetwork: (network, container) =>
+      Effect.asVoid(body({ method: "POST", path: `/networks/${name(network)}/disconnect`, body: { Container: container, Force: true } })),
     createVolume: (volume) => Effect.asVoid(body({ method: "POST", path: "/volumes/create", body: volume })),
     listVolumes: (labels) =>
       json<{ readonly Volumes: readonly Volume[] | null }>({ method: "GET", path: "/volumes", query: { filters: labelFilter(labels) } }).pipe(
