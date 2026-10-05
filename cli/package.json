@@ -1,6 +1,6 @@
 {
   "name": "alasio",
-  "version": "4.0.1",
+  "version": "4.1.0",
   "description": "alasio: coding agents you talk to from Telegram, installed and run with npx alasio",
   "type": "module",
   "license": "MIT",
