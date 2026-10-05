@@ -4,8 +4,9 @@
  * system within the claim's size; its files kept through the session suspended, Valkey
  * and the object store killed mid-write, its mount pod deleted and its mount lost, and,
  * on several nodes, its moving to another; neither Valkey nor the object store, nor their
- * credentials, within a session's reach; and the file system's metadata dumped, backed
- * up nightly, and restored from the backup with the same files.
+ * credentials, within a session's reach; a volume deleted with its claim, its directory
+ * with it; and the file system's metadata dumped, backed up nightly, and restored from
+ * the backup with the same files.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * workspaceStorage() once its sessions are made: it works on the session with no internet
@@ -522,6 +523,60 @@ export function workspaceStorage(): void {
         const directory = await directoryOf(await sessionOf(netMode));
         assert.match(said, new RegExp(`quota of /${directory} is consistent|/${directory}: quota\\(`, "u"), directory);
       }
+    });
+
+    test("a workspace's volume is deleted with its claim, and its directory with it", async () => {
+      const { claim: session } = await volumeOf(none);
+      const image = (await kube.get<V1CronJob>(ref("CronJob", componentName("juicefs-quota-check"), NAMESPACE)))?.spec?.jobTemplate.spec?.template.spec?.containers[0]?.image;
+      assert.ok(image);
+      const name = `juicefs-e2e-deleted-${Date.now()}`;
+      const claim: V1PersistentVolumeClaim = {
+        apiVersion: "v1",
+        kind: "PersistentVolumeClaim",
+        metadata: { name, namespace: NAMESPACE },
+        spec: { storageClassName: session.spec?.storageClassName ?? "", accessModes: session.spec?.accessModes ?? [], resources: { requests: { storage: "1Gi" } } },
+      };
+      const writer: V1Pod = {
+        apiVersion: "v1",
+        kind: "Pod",
+        metadata: { name, namespace: NAMESPACE },
+        spec: {
+          restartPolicy: "Never",
+          terminationGracePeriodSeconds: 0,
+          containers: [{ name: "writer", image, command: ["sh", "-c", "head -c 1048576 /dev/urandom > /data/written && sync"], volumeMounts: [{ name: "data", mountPath: "/data" }] }],
+          volumes: [{ name: "data", persistentVolumeClaim: { claimName: name } }],
+        },
+      };
+      await kube.apply(claim);
+      await kube.apply(writer);
+      try {
+        await until(`${name} written in its volume`, async () => {
+          const phase = (await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.status?.phase;
+          assert.notEqual(phase, "Failed", `${name} could not write in its volume`);
+          return phase === "Succeeded" ? true : undefined;
+        });
+      } finally {
+        await kube.remove(ref("Pod", name, NAMESPACE));
+      }
+      const volume = (await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", name, NAMESPACE)))?.spec?.volumeName;
+      assert.ok(volume, `the claim ${name} is bound to no volume`);
+      await kube.remove(ref("PersistentVolumeClaim", name, NAMESPACE));
+      await until(`the volume ${volume} deleted`, async () => ((await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume))) ? undefined : true), 300_000, async () => {
+        const left = await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume));
+        const logged = await kube.logs(DRIVER_NAMESPACE, "juicefs-csi-controller-0", "juicefs-plugin").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        return `: it is ${left?.status?.phase}; the controller last logged:\n${logged.trimEnd().split("\n").slice(-20).join("\n")}`;
+      });
+      const listing = await withAdminPod((inPod) =>
+        inPod("juicefs", [
+          "set -eu",
+          "mkdir -p /mounted",
+          'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$META_URL" /mounted',
+          "ls -a /mounted",
+          "umount /mounted",
+        ].join("\n"))
+      );
+      assert.ok(listing.split("\n").includes(await directoryOf(none)), `the file system holds no workspace's directory: ${listing}`);
+      assert.ok(!listing.split("\n").includes(`${NAMESPACE}-${name}`), `the deleted volume's directory remains: ${listing}`);
     });
 
     test("JuiceFS dumps its metadata to its bucket, the nightly backup copies the newest, and the copy restores the same files", async () => {

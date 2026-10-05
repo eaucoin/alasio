@@ -613,7 +613,7 @@ describe("workspace storage", () => {
     }
   });
 
-  test("admits JuiceFS's pods alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
+  test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
@@ -625,6 +625,7 @@ describe("workspace storage", () => {
         podSelector: { matchLabels: { app: "juicefs-csi-controller", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } },
       },
       { namespaceSelector: driver, podSelector: { matchLabels: { app: "juicefs-csi-node", "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" } } },
+      { namespaceSelector: driver, podSelector: { matchExpressions: [{ key: "batch.kubernetes.io/job-name", operator: "Exists" }] } },
       { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio" } }, podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } },
     ];
     assert.deepEqual(policy("alasio-valkey").podSelector, { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } });

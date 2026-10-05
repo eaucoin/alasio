@@ -31,6 +31,7 @@ import type {
   V1CSIDriver,
   V1DaemonSet,
   V1EnvVar,
+  V1LabelSelector,
   V1PolicyRule,
   V1PriorityClass,
   V1Probe,
@@ -59,6 +60,13 @@ export const MOUNT_POD_LABELS: Labels = { "app.kubernetes.io/name": "juicefs-mou
 /** The labels that select the controller's and the node service's pods, upstream's but for its version. */
 export const CONTROLLER_POD_LABELS: Labels = { app: CONTROLLER, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
 export const NODE_POD_LABELS: Labels = { app: NODE, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
+/**
+ * What selects the pods of the Jobs the controller runs to delete a volume's directory
+ * once its claim is gone: upstream labels such a Job but not its pod template
+ * (pkg/juicefs/mount/builder/job.go), so its pod carries only what Kubernetes gives a
+ * Job's pods, the name of its Job.
+ */
+export const JOB_POD_SELECTOR: V1LabelSelector = { matchExpressions: [{ key: "batch.kubernetes.io/job-name", operator: "Exists" }] };
 
 /** The selector of the controller's, the node service's and the mount pods' pods, by their name labels. */
 export const JUICEFS_PODS_SELECTOR = `app.kubernetes.io/name in (${MOUNT_POD_LABELS["app.kubernetes.io/name"]}, ${CONTROLLER_POD_LABELS["app.kubernetes.io/name"]})`;

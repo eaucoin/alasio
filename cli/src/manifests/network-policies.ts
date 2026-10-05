@@ -7,7 +7,7 @@ import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, 
 
 import { componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { CONTROLLER_POD_LABELS, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
+import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
 
@@ -79,10 +79,12 @@ function neonPolicies(): NetworkPolicy[] {
 
 /**
  * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
- * controller, its node service and the mount pods it runs, in the driver's namespace) and
- * alasio's JuiceFS admin pods: Valkey takes no other connection but the stack's
- * collector's, which reads its metrics, and the bundled object store takes theirs on its
- * S3 port beside the stack's own, and Valkey's, whose pod formats the file system.
+ * controller, its node service, the mount pods it runs and the Jobs that delete volumes'
+ * directories, in the driver's namespace) and alasio's JuiceFS admin pods: Valkey takes no
+ * other connection but the stack's collector's, which reads its metrics, and the bundled
+ * object store takes theirs on its S3 port beside the stack's own, and Valkey's, whose pod
+ * formats the file system. The driver's Jobs are told by no label of their own, so any
+ * Job's pod in its namespace is admitted, which the credentials of each still guard.
  */
 function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
   const driverNamespace = { matchLabels: { "kubernetes.io/metadata.name": config.workspaceStorage.csi.namespace } };
@@ -90,6 +92,7 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
     { namespaceSelector: driverNamespace, podSelector: { matchLabels: MOUNT_POD_LABELS } },
     { namespaceSelector: driverNamespace, podSelector: { matchLabels: CONTROLLER_POD_LABELS } },
     { namespaceSelector: driverNamespace, podSelector: { matchLabels: NODE_POD_LABELS } },
+    { namespaceSelector: driverNamespace, podSelector: JOB_POD_SELECTOR },
     { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } }, podSelector: { matchLabels: JUICEFS_ADMIN } },
   ];
   return [
