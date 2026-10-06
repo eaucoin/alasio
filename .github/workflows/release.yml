@@ -34,6 +34,23 @@ jobs:
       - run: |
           [[ "$GITHUB_REF" == refs/tags/v* ]] ||
             { echo "::error::Run the release from a v* tag, not $GITHUB_REF"; exit 1; }
+      # bayma's image, which the agent image is built on, takes more disk than a runner
+      # starts with free, and the images are built at once: each directory is removed at
+      # once, in the background, while the job readies the release; the step before the
+      # build waits for it.
+      - name: Free disk space, in the background
+        shell: bash
+        run: |
+          (
+            pids=()
+            for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL; do
+              sudo rm -rf "$dir" &
+              pids+=($!)
+            done
+            status=0
+            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+            echo "$status" >"$RUNNER_TEMP/disk-freed.part" && mv "$RUNNER_TEMP/disk-freed.part" "$RUNNER_TEMP/disk-freed"
+          ) >"$RUNNER_TEMP/disk-freed.log" 2>&1 &
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -50,30 +67,42 @@ jobs:
           test "$(node -p 'require("./cli/package.json").version')" = "$version"
           echo "VERSION=$version" >>"$GITHUB_ENV"
       - run: npm ci
-      # bayma's image, which the agent image is built on, takes more disk than a
-      # runner starts with free.
-      - run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Wait for the disk space
+        run: |
+          until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 1; done
+          cat "$RUNNER_TEMP/disk-freed.log"
+          exit "$(cat "$RUNNER_TEMP/disk-freed")"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # All four at once, each line said with its image's name; then each one's digest.
       - id: images
         name: Build and push the images, recording their digests
+        shell: bash
         env:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
+          declare -A pids
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
             name=${image%%:*}
-            docker build --tag "$REGISTRY/$name:$VERSION" \
-              --label "org.opencontainers.image.source=$SOURCE" \
-              --label "org.opencontainers.image.version=$VERSION" "${image#*:}"
-            docker push "$REGISTRY/$name:$VERSION"
+            {
+              docker build --tag "$REGISTRY/$name:$VERSION" \
+                --label "org.opencontainers.image.source=$SOURCE" \
+                --label "org.opencontainers.image.version=$VERSION" "${image#*:}" &&
+                docker push "$REGISTRY/$name:$VERSION"
+            } 2>&1 | sed -u "s/^/$name: /" &
+            pids[$name]=$!
+          done
+          failed=0
+          for name in "${!pids[@]}"; do
+            wait "${pids[$name]}" || { echo "::error::$name was not built and pushed"; failed=1; }
+          done
+          [ "$failed" = 0 ] || exit 1
+          for name in "${!pids[@]}"; do
             digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
             echo "${name//-/_}=${digest#*@}" >>"$GITHUB_OUTPUT"
-            # The next image's build needs the room this one took.
-            docker image rm "$REGISTRY/$name:$VERSION" >/dev/null
-            docker builder prune --all --force >/dev/null
           done
       - uses: actions/attest-build-provenance@v2
         with:
