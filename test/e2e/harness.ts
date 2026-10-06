@@ -11,10 +11,14 @@
  *
  * ALASIO_E2E_AGENTS is the number of agent nodes beside the server (0 unless set), and
  * ALASIO_E2E_KEEP=1 keeps the cluster, its registry and the run's directory afterwards.
- * Needs Docker and npm. Once pushed, the images built are removed, and Docker's build
- * cache with them, as a CI runner's disk holds the registry's copies, and each node's of
- * the images its pods run, and little more: a node pulls only those, and again any its
- * kubelet collected.
+ * ALASIO_E2E_REGISTRY names a registry the images were pushed to already, each as
+ * `<registry>/<name>:e2e`, as CI's images job pushes them once for all its end-to-end
+ * runs: `alasio init` pulls the node image, and the nodes alasio's, from there, without a
+ * login, and the run builds none and starts no registry. ALASIO_E2E_SHARD runs a shard of
+ * the suites (SHARD). Needs Docker and npm. Once pushed, the images built are removed,
+ * and Docker's build cache with them, as a CI runner's disk holds the registry's copies,
+ * and each node's of the images its pods run, and little more: a node pulls only those,
+ * and again any its kubelet collected.
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -56,9 +60,34 @@ const OPERATOR = "1001";
 /** The user folder workspaces run as. */
 export const HOST_USER = 1000;
 
+/** The shards of the suites, each run on a cluster of its own. */
+export const SHARDS = ["sessions", "neon"] as const;
+export type Shard = (typeof SHARDS)[number];
+
+/** The shard `value` names, or none, every suite, when it is unset or empty. */
+export function shardOf(value: string | undefined): Shard | undefined {
+  if (!value) return undefined;
+  const shard = SHARDS.find((name) => name === value);
+  if (!shard) throw new Error(`ALASIO_E2E_SHARD is ${value}, not one of ${SHARDS.join(", ")}`);
+  return shard;
+}
+
+/**
+ * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
+ * Kubernetes and workspaces on JuiceFS, which works on the sessions the other made, or
+ * `neon`, alasio's Neon, which needs neither; every suite unless set. Each shard runs the
+ * command line's suite, and uninstall's, as well.
+ */
+export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
+
+/** Whether the run runs the suites of `shard`. */
+export const inShard = (shard: Shard): boolean => SHARD === undefined || SHARD === shard;
+
 /** The images built here: their names, and what they are built from. */
 const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-node": "cluster/node" } as const;
-const imageOf = (name: keyof typeof IMAGES): string => `alasio-e2e/${name}:e2e`;
+
+/** The registry the images were pushed to already, when the run builds none. */
+const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
 
 /** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
 const REGISTRY = `${CLUSTER}-registry`;
@@ -66,6 +95,13 @@ const REGISTRY = `${CLUSTER}-registry`;
 const REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
 /** The registry as the nodes reach it, by its name on the cluster's network, over plain HTTP; the pods' images name it. */
 const REGISTRY_HOST = `${REGISTRY}:5000`;
+
+/** The image `name` as it is built here, and pushed to the run's registry. */
+const imageOf = (name: keyof typeof IMAGES): string => `alasio-e2e/${name}:e2e`;
+/** Where the image `name` is pulled from: where it was pushed already, or the run's registry. */
+const pulledOf = (name: keyof typeof IMAGES) => ({ repository: `${PUSHED ?? `${REGISTRY_HOST}/alasio-e2e`}/${name}`, tag: "e2e" });
+/** The node image, which alasio init makes the cluster from: pulled by it from where it was pushed already, or built here. */
+const NODE_IMAGE = PUSHED ? `${PUSHED}/alasio-node:e2e` : imageOf("alasio-node");
 
 /** What a command, run here or in a container, came to. */
 export interface Ran {
@@ -338,9 +374,9 @@ async function push(pushHost: string, name: keyof typeof IMAGES): Promise<void> 
   await docker("builder", "prune", "--all", "--force");
 }
 
-/** The install configuration the run starts alasio with: its images built here, pulled from the run's registry, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
+/** The install configuration the run starts alasio with: its images, pulled from where they were pushed, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
 function installation(): Record<string, unknown> {
-  const pushed = (name: keyof typeof IMAGES) => ({ repository: `${REGISTRY_HOST}/alasio-e2e/${name}`, tag: "e2e", digest: "" });
+  const pushed = (name: keyof typeof IMAGES) => ({ ...pulledOf(name), digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
     images: { alasio: pushed("alasio"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
@@ -406,7 +442,7 @@ export async function setUp(): Promise<void> {
   console.error(`# packing alasio's package and installing it in ${prefix}`);
   await installCli((await packCli(work)).tarball, prefix);
 
-  await build("alasio-node", imageOf("alasio-node"));
+  if (!PUSHED) await build("alasio-node", NODE_IMAGE);
   mkdirSync(join(configHome, "alasio"), { recursive: true, mode: 0o700 });
   writeFileSync(
     configFile,
@@ -417,8 +453,8 @@ export async function setUp(): Promise<void> {
           apiPort: await freePort(),
           storagePath: storage,
           agents: AGENTS,
-          image: imageOf("alasio-node"),
-          registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } },
+          image: NODE_IMAGE,
+          ...(PUSHED ? {} : { registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } } }),
         },
       },
       install: installation(),
@@ -448,8 +484,10 @@ export async function setUp(): Promise<void> {
   kubeConfig.loadFromFile(current().kubeconfig);
   api = await Effect.runPromise(Effect.provide(Effect.gen(function*() { return yield* KubeApi; }), KubeApi.layer({ path: current().kubeconfig })));
 
-  const pushHost = await startRegistry();
-  for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) await push(pushHost, name);
+  if (!PUSHED) {
+    const pushHost = await startRegistry();
+    for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) await push(pushHost, name);
+  }
 
   console.error("# applying the stand-ins");
   const standIns = standInObjects();
@@ -514,7 +552,7 @@ export async function tearDown(): Promise<void> {
   await docker("volume", "rm", REGISTRY).catch(() => undefined);
   const removed = await alasio("uninstall", "--purge", "--yes").catch((error: unknown) => ({ code: 1, stderr: error instanceof Error ? error.message : String(error) }));
   if (removed.code !== 0) console.error(`# the cluster ${CLUSTER} may be left: alasio uninstall --purge failed: ${removed.stderr.trim()}`);
-  await docker("image", "rm", "--force", imageOf("alasio-node")).catch(() => undefined);
+  await docker("image", "rm", "--force", NODE_IMAGE).catch(() => undefined);
   try {
     rmSync(work, { recursive: true, force: true });
   } catch (error) {

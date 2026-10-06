@@ -32,6 +32,7 @@ import {
   inAlasio,
   inAlasioContainer,
   inSession,
+  inShard,
   KEEP,
   kube,
   paths,
@@ -164,125 +165,127 @@ const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:Abort
 
 const roundtrip = (volumeId: string) => inAlasio<RoundtripSeen>("./session-roundtrip.ts", volumeId);
 
-describe("alasio on Kubernetes", () => {
-  let none: string;
-  let full: string;
+if (inShard("sessions")) {
+  describe("alasio on Kubernetes", () => {
+    let none: string;
+    let full: string;
 
-  before(async () => {
-    telegram = await forward(TELEGRAM);
-    sink = await forward(OTLP);
-    tg = operator(telegram.base);
-    await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
-  });
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      sink = await forward(OTLP);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
 
-  after(() => {
-    telegram?.close();
-    sink?.close();
-  });
+    after(() => {
+      telegram?.close();
+      sink?.close();
+    });
 
-  test("a new empty workspace without internet is a session of its own, confined", async () => {
-    none = await newSession("none");
-    const pod = await kube.get<V1Pod>(ref("Pod", none, SESSIONS));
-    if (pod?.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
-    assert.equal((await inSession(none, probe("http://1.1.1.1"))).trim(), "blocked");
-    assert.equal((await inSession(none, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
-    assert.match(await inSession(none, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
-    assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
-    const gate = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.initContainerStatuses?.find(({ name }) => name === "egress-gate");
-    assert.equal(gate?.state?.terminated?.exitCode, 0);
-  });
+    test("a new empty workspace without internet is a session of its own, confined", async () => {
+      none = await newSession("none");
+      const pod = await kube.get<V1Pod>(ref("Pod", none, SESSIONS));
+      if (pod?.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
+      assert.equal((await inSession(none, probe("http://1.1.1.1"))).trim(), "blocked");
+      assert.equal((await inSession(none, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
+      assert.match(await inSession(none, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
+      assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
+      const gate = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.initContainerStatuses?.find(({ name }) => name === "egress-gate");
+      assert.equal(gate?.state?.terminated?.exitCode, 0);
+    });
 
-  test("a new workspace with internet reaches the internet and nothing private", async () => {
-    full = await newSession("full");
-    assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
-    assert.equal((await inSession(full, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
-    const other = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.podIP;
-    assert.ok(other, `the session ${none} has no address`);
-    assert.equal((await inSession(full, probe(`http://${other}:7290/mcp`))).trim(), "blocked");
-    assert.match(await inSession(full, `require("dns").promises.lookup("${none}.${SESSIONS}.svc.cluster.local").then(()=>console.log("resolved"),()=>console.log("unresolved"))`), /unresolved/u);
-  });
+    test("a new workspace with internet reaches the internet and nothing private", async () => {
+      full = await newSession("full");
+      assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
+      assert.equal((await inSession(full, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
+      const other = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.podIP;
+      assert.ok(other, `the session ${none} has no address`);
+      assert.equal((await inSession(full, probe(`http://${other}:7290/mcp`))).trim(), "blocked");
+      assert.match(await inSession(full, `require("dns").promises.lookup("${none}.${SESSIONS}.svc.cluster.local").then(()=>console.log("resolved"),()=>console.log("unresolved"))`), /unresolved/u);
+    });
 
-  test("a session's bayma answers alasio alone, and only with the session's token", async () => {
-    const url = `http://${none}.${SESSIONS}.svc.cluster.local:7290/mcp`;
-    const token = await kube.secret(SESSIONS, `${none}-bayma-token`, "token");
-    const fromAlasio = async (headers: string[]) => (await inAlasioContainer(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url])).trim();
-    assert.equal(await fromAlasio([]), "401");
-    assert.equal(await fromAlasio(["-H", "Authorization: Bearer wrong"]), "401");
-    assert.equal(await fromAlasio(["-H", `Authorization: Bearer ${token}`]), "400");
-    const stub = await kube.runningPod(STAND_INS, TELEGRAM.name);
-    const fromStub = (await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim();
-    assert.equal(fromStub, "blocked");
-  });
+    test("a session's bayma answers alasio alone, and only with the session's token", async () => {
+      const url = `http://${none}.${SESSIONS}.svc.cluster.local:7290/mcp`;
+      const token = await kube.secret(SESSIONS, `${none}-bayma-token`, "token");
+      const fromAlasio = async (headers: string[]) => (await inAlasioContainer(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", ...headers, url])).trim();
+      assert.equal(await fromAlasio([]), "401");
+      assert.equal(await fromAlasio(["-H", "Authorization: Bearer wrong"]), "401");
+      assert.equal(await fromAlasio(["-H", `Authorization: Bearer ${token}`]), "400");
+      const stub = await kube.runningPod(STAND_INS, TELEGRAM.name);
+      const fromStub = (await kube.execOk(STAND_INS, stub, ["node", "-e", probe(url)], { container: TELEGRAM.container })).trim();
+      assert.equal(fromStub, "blocked");
+    });
 
-  test("alasio reads a session's files as its agent, a suspended session resumes with them, and one of another pod template moves onto it with them", async () => {
-    const seen = await roundtrip(none);
-    assert.equal(seen.exec, '"written"');
-    assert.match(seen.read ?? "", /^hello from /u);
-    assert.equal(seen.missing, "file not found");
-    assert.equal(seen.suspendedPod, "gone");
-    assert.equal(seen.whileSuspended, "the session is not running");
-    assert.equal(seen.afterResume, seen.read);
-    assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
-    assert.equal(seen.podReplaced, true);
-    assert.equal(seen.movedPodLabel, "yes");
-    assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
-  });
+    test("alasio reads a session's files as its agent, a suspended session resumes with them, and one of another pod template moves onto it with them", async () => {
+      const seen = await roundtrip(none);
+      assert.equal(seen.exec, '"written"');
+      assert.match(seen.read ?? "", /^hello from /u);
+      assert.equal(seen.missing, "file not found");
+      assert.equal(seen.suspendedPod, "gone");
+      assert.equal(seen.whileSuspended, "the session is not running");
+      assert.equal(seen.afterResume, seen.read);
+      assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
+      assert.equal(seen.podReplaced, true);
+      assert.equal(seen.movedPodLabel, "yes");
+      assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
+    });
 
-  test("a session's telemetry reaches the installation's backend, stamped with the session", async () => {
-    assert.ok(sink, "the OTLP stand-in did not answer");
-    const deadline = Date.now() + 120_000;
-    let stamped: ListedExport[] = [];
-    while (Date.now() < deadline) {
-      // The sink answers what it received.
-      const listed = (await (await fetch(`${sink.base}/control/exports?contains=${none}`)).json()) as ListedExport[];
-      stamped = listed.filter((entry) => entry.contains);
-      if (stamped.some((entry) => entry.signal === "traces")) break;
-      await sleep(3000);
-    }
-    assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
-  });
-
-  test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend", async () => {
-    assert.ok(sink, "the OTLP stand-in did not answer");
-    // JuiceFS's are its own Prometheus metrics, scraped; Valkey's, the collector's redis receiver's.
-    const names = ["juicefs_", "redis.memory.used"];
-    const deadline = Date.now() + 180_000;
-    let missing = names;
-    while (Date.now() < deadline) {
-      const arrived = await Promise.all(missing.map(async (name) => {
+    test("a session's telemetry reaches the installation's backend, stamped with the session", async () => {
+      assert.ok(sink, "the OTLP stand-in did not answer");
+      const deadline = Date.now() + 120_000;
+      let stamped: ListedExport[] = [];
+      while (Date.now() < deadline) {
         // The sink answers what it received.
-        const listed = (await (await fetch(`${sink?.base}/control/exports?contains=${encodeURIComponent(name)}`)).json()) as ListedExport[];
-        return listed.some((entry) => entry.signal === "metrics" && entry.contains);
-      }));
-      missing = missing.filter((_, index) => !arrived[index]);
-      if (missing.length === 0) break;
-      await sleep(10_000);
-    }
-    assert.deepEqual(missing, [], "no metric of these names arrived");
+        const listed = (await (await fetch(`${sink.base}/control/exports?contains=${none}`)).json()) as ListedExport[];
+        stamped = listed.filter((entry) => entry.contains);
+        if (stamped.some((entry) => entry.signal === "traces")) break;
+        await sleep(3000);
+      }
+      assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
+    });
+
+    test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend", async () => {
+      assert.ok(sink, "the OTLP stand-in did not answer");
+      // JuiceFS's are its own Prometheus metrics, scraped; Valkey's, the collector's redis receiver's.
+      const names = ["juicefs_", "redis.memory.used"];
+      const deadline = Date.now() + 180_000;
+      let missing = names;
+      while (Date.now() < deadline) {
+        const arrived = await Promise.all(missing.map(async (name) => {
+          // The sink answers what it received.
+          const listed = (await (await fetch(`${sink?.base}/control/exports?contains=${encodeURIComponent(name)}`)).json()) as ListedExport[];
+          return listed.some((entry) => entry.signal === "metrics" && entry.contains);
+        }));
+        missing = missing.filter((_, index) => !arrived[index]);
+        if (missing.length === 0) break;
+        await sleep(10_000);
+      }
+      assert.deepEqual(missing, [], "no metric of these names arrived");
+    });
+
+    test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+      const { home } = paths();
+      const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
+      assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
+      assert.deepEqual(seen, { uid: HOST_USER, home });
+      // The operator's home is the machine's, shared between alasio and the folder's bayma.
+      assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
+      assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
+    });
+
+    test("alasio comes back from alasio restart with its conversation's workspace", async () => {
+      assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
+      await tg.say("/workspace");
+      const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
+      assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+    });
   });
 
-  test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
-    const { home } = paths();
-    const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
-    assert.match(url, /^http:\/\/bayma-[0-9a-f]{20}\.alasio-host\.svc/u);
-    assert.deepEqual(seen, { uid: HOST_USER, home });
-    // The operator's home is the machine's, shared between alasio and the folder's bayma.
-    assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
-    assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
-  });
+  workspaceStorage();
+}
 
-  test("alasio comes back from alasio restart with its conversation's workspace", async () => {
-    assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
-    await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
-    await tg.say("/workspace");
-    const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
-    assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
-  });
-});
-
-workspaceStorage();
-
-neonStack();
+if (inShard("neon")) neonStack();
 
 describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster" }, () => {
   test("removes alasio and the cluster on this machine, with all they keep, and keeps the config", async () => {
