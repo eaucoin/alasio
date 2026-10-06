@@ -55,11 +55,15 @@ const NODE_ACCOUNT = "juicefs-csi-node-sa";
 /** The PriorityClass of mount pods. */
 const MOUNT_PRIORITY_CLASS = "alasio-juicefs-mount";
 
+/** The name label of the node service's mount pods, the clients. */
+export const MOUNT_POD_NAME = "juicefs-mount";
+/** The name label of the controller's and the node service's pods, the driver. */
+export const DRIVER_POD_NAME = "juicefs-csi-driver";
 /** The labels of the node service's mount pods. */
-export const MOUNT_POD_LABELS: Labels = { "app.kubernetes.io/name": "juicefs-mount" };
+export const MOUNT_POD_LABELS: Labels = { "app.kubernetes.io/name": MOUNT_POD_NAME };
 /** The labels that select the controller's and the node service's pods, upstream's but for its version. */
-export const CONTROLLER_POD_LABELS: Labels = { app: CONTROLLER, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
-export const NODE_POD_LABELS: Labels = { app: NODE, "app.kubernetes.io/name": "juicefs-csi-driver", "app.kubernetes.io/instance": "juicefs-csi-driver" };
+export const CONTROLLER_POD_LABELS: Labels = { app: CONTROLLER, "app.kubernetes.io/name": DRIVER_POD_NAME, "app.kubernetes.io/instance": DRIVER_POD_NAME };
+export const NODE_POD_LABELS: Labels = { app: NODE, "app.kubernetes.io/name": DRIVER_POD_NAME, "app.kubernetes.io/instance": DRIVER_POD_NAME };
 /**
  * What selects the pods of the Jobs the controller runs to delete a volume's directory
  * once its claim is gone: upstream labels such a Job but not its pod template
@@ -69,9 +73,11 @@ export const NODE_POD_LABELS: Labels = { app: NODE, "app.kubernetes.io/name": "j
 export const JOB_POD_SELECTOR: V1LabelSelector = { matchExpressions: [{ key: "batch.kubernetes.io/job-name", operator: "Exists" }] };
 
 /** The selector of the controller's, the node service's and the mount pods' pods, by their name labels. */
-export const JUICEFS_PODS_SELECTOR = `app.kubernetes.io/name in (${MOUNT_POD_LABELS["app.kubernetes.io/name"]}, ${CONTROLLER_POD_LABELS["app.kubernetes.io/name"]})`;
-/** Where each of those pods serves its Prometheus metrics (administration/monitoring.md). */
+export const JUICEFS_PODS_SELECTOR = `app.kubernetes.io/name in (${MOUNT_POD_NAME}, ${DRIVER_POD_NAME})`;
+/** Where mount pods serve their Prometheus metrics, the client's (administration/monitoring.md). */
 export const JUICEFS_METRICS_PORT = 9567;
+/** Where the controller's and the node service's pods serve theirs, the driver's own: its provisioning and volume errors among them. */
+export const DRIVER_METRICS_PORT = 8080;
 
 /** The label of what the driver needs to delete its volumes' data, which alasio keeps while they remain. */
 export const VOLUME_DRIVER: Labels = { [VOLUME_DRIVER_LABEL]: CSI_DRIVER };

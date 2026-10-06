@@ -333,20 +333,23 @@ describe("neon", () => {
     const collectorConfig = (objects: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-neon-collector").data?.["config.yaml"] ?? "");
     const objects = install({ telemetry });
     const config = collectorConfig(objects);
-    assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), {
-      job_name: "juicefs",
-      scrape_interval: "30s",
-      kubernetes_sd_configs: [{
-        role: "pod",
-        namespaces: { names: ["kube-system"] },
-        selectors: [{ role: "pod", label: "app.kubernetes.io/name in (juicefs-mount, juicefs-csi-driver)" }],
-      }],
-      relabel_configs: [
-        { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-        { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: "$$1:9567" },
-        { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
-      ],
-    });
+    // Mount pods serve their metrics on 9567, the driver's pods theirs on 8080.
+    for (const [job, name, port] of [["juicefs", "juicefs-mount", 9567], ["juicefs-csi", "juicefs-csi-driver", 8080]] as const) {
+      assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), {
+        job_name: job,
+        scrape_interval: "30s",
+        kubernetes_sd_configs: [{
+          role: "pod",
+          namespaces: { names: ["kube-system"] },
+          selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
+        }],
+        relabel_configs: [
+          { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+          { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
+          { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+        ],
+      }, job);
+    }
     assert.deepEqual(config.receivers.redis, {
       endpoint: "alasio-valkey:6379",
       password: "${env:VALKEY_PASSWORD}",
@@ -369,7 +372,9 @@ describe("neon", () => {
     const offConfig = collectorConfig(off);
     assert.equal(offConfig.receivers.redis, undefined);
     assert.deepEqual(offConfig.service.pipelines.metrics.receivers, ["prometheus"]);
-    assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "juicefs"), undefined);
+    for (const job of ["juicefs", "juicefs-csi"]) {
+      assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), undefined, job);
+    }
     assert.equal(one<V1Deployment>(off, "Deployment", "alasio-neon-collector").spec?.template.spec?.serviceAccountName, undefined);
     assert.deepEqual(off.filter(({ kind, metadata }) => kind !== "ConfigMap" && kind !== "Deployment" && metadata?.name === "alasio-neon-collector"), []);
   });

@@ -46,7 +46,7 @@ import {
   waitForObjectStore,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { JUICEFS_METRICS_PORT, JUICEFS_PODS_SELECTOR, VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME, VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY, VALKEY_PORT } from "./valkey.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
@@ -676,29 +676,32 @@ function collector(config: InstallConfig, endpoint: string): KubernetesObject[] 
     ...(config.objectStore.bundled.enabled ? { seaweedfs: [`${componentName("seaweedfs")}:9327`] } : {}),
     ...(config.lake.enabled ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
-  // Each running pod at its address, on the metrics port, named by its pod. The
+  // JuiceFS's pods of the name `name` in the driver's namespace: each running one at its
+  // address, on the port `port` they serve their metrics on, named by its pod. The
   // collector reads `$` as the start of a variable, and `$$` as a `$`.
-  const juicefs = {
-    job_name: "juicefs",
+  const juicefsJob = (job: string, name: string, port: number) => ({
+    job_name: job,
     scrape_interval: "30s",
     kubernetes_sd_configs: [{
       role: "pod",
       namespaces: { names: [workspaceStorage.csi.namespace] },
-      selectors: [{ role: "pod", label: JUICEFS_PODS_SELECTOR }],
+      selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
     }],
     relabel_configs: [
       { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${JUICEFS_METRICS_PORT}` },
+      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
       { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
     ],
-  };
+  });
+  // The mount pods, the clients, and the controller's and node service's, the driver.
+  const juicefs = [juicefsJob("juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob("juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)];
   const collectorConfig = {
     receivers: {
       prometheus: {
         config: {
           scrape_configs: [
             ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: "30s", static_configs: [{ targets: targets[job] }] })),
-            ...(workspaceStorage.enabled ? [juicefs] : []),
+            ...(workspaceStorage.enabled ? juicefs : []),
           ],
         },
       },

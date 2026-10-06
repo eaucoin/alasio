@@ -252,8 +252,10 @@ if (inShard("sessions")) {
 
     test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend", async () => {
       assert.ok(sink, "the OTLP stand-in did not answer");
-      // JuiceFS's are its own Prometheus metrics, scraped; Valkey's, the collector's redis receiver's.
-      const names = ["juicefs_", "redis.memory.used"];
+      // JuiceFS's are its own Prometheus metrics, scraped from its clients and from its
+      // driver, whose provisioning errors only its controller counts; Valkey's, the
+      // collector's redis receiver's.
+      const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
       const deadline = Date.now() + 180_000;
       let missing = names;
       while (Date.now() < deadline) {
