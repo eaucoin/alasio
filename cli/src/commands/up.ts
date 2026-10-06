@@ -2,7 +2,7 @@
 import { Console, Effect } from "effect";
 import { Command } from "effect/cli";
 
-import { requireInotifyLimits } from "../cluster/host.ts";
+import { requireLocalHost } from "../cluster/host.ts";
 import { LocalCluster } from "../cluster/local.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
 import { install, type Installed } from "../install.ts";
@@ -10,11 +10,11 @@ import { VERSION } from "../release.ts";
 import { describeTarget, kubeApi, localCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 
-/** Makes or starts the local cluster when it is the target, once this machine's inotify limits hold it, writing its kubeconfig; nothing for another. */
+/** Makes or starts the local cluster when it is the target, once this machine is one it runs on, its inotify limits high enough, writing its kubeconfig; nothing for another. */
 export const ensureCluster = (target: ResolvedTarget) =>
   target._tag === "Local"
     ? Effect.andThen(
-      requireInotifyLimits,
+      requireLocalHost,
       Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.up(target.kubeconfig.path)), localCluster(target.cluster)),
     )
     : Effect.void;
@@ -43,8 +43,8 @@ export const bringUp = Effect.fnUntraced(function*(config: OperatorConfig, timeo
 export const up = Command.make("up", { timeout: timeoutFlag }, ({ timeout }) => Effect.flatMap(loadConfig, (config) => bringUp(config, timeout))).pipe(
   Command.withShortDescription("Start alasio, installing or updating it"),
   Command.withDescription(
-    "Makes the cluster on this machine, or starts it, when that is where alasio runs, once this machine's inotify limits " +
-      "are high enough for it (it says how to raise them); applies alasio as the config says, " +
+    "Makes the cluster on this machine, or starts it, when that is where alasio runs, once this machine is one it runs on, " +
+      "Linux on x86-64, its inotify limits high enough for it (it says how to raise them); applies alasio as the config says, " +
       "with this version's images; and waits until it runs, saying what it waits for. Run it again after changing the config. " +
       "Past --timeout it says what is still not running and why.",
   ),

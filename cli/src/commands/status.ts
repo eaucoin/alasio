@@ -2,7 +2,7 @@
 import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
-import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls } from "../cluster/host.ts";
+import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/host.ts";
 import { LocalCluster } from "../cluster/local.ts";
 import { loadConfig } from "../config.ts";
 import { describeRef, kind, KubeApi, refOf } from "../kube/api.ts";
@@ -28,6 +28,8 @@ export const status = Command.make("status", {}, () =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
+    // The cluster here runs only on a machine of its kind, whose limits are read from Linux's /proc.
+    if (target._tag === "Local") yield* requireLocalMachine;
     const shortfalls = target._tag === "Local" ? yield* inotifyShortfalls : [];
     if (target._tag === "Local") {
       const { docker, nodes } = yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.status), localCluster(target.cluster));
@@ -66,6 +68,6 @@ export const status = Command.make("status", {}, () =>
     Command.withDescription(
       "Says where alasio runs (and, for the cluster on this machine, its nodes, and this machine's inotify limits when they are " +
         "too low for it), its version, and each of its workloads: ready, or what it is at and why. Exits with 1 when something " +
-        "is not ready, or the limits are too low.",
+        "is not ready, or the limits are too low, or this machine is not Linux on x86-64, which the cluster here needs.",
     ),
   );

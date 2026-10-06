@@ -315,6 +315,21 @@ test("init, up and status here refuse inotify limits too low for the cluster, sa
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
 
+test("init, up and status refuse to make a cluster on a machine other than Linux on x86-64, but reach one elsewhere from it", async (t) => {
+  const { configure, docker, env, home, kube } = await rig(t);
+  const mac = { platform: "darwin", arch: "arm64" };
+  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  const refusal = "the cluster alasio makes on this machine runs on Linux on x86-64, and this is darwin on arm64: " +
+    "run alasio on such a machine, or give it a cluster elsewhere with alasio init --kubeconfig";
+  for (const command of ["init", "up", "status"]) assert.equal(failure(await runAlasio([command], { env, machine: mac })), refusal, command);
+  assert.equal(docker.containers.size, 0);
+
+  const remote = await installed(t);
+  const status = await runAlasio(["status"], { env: remote.env, machine: mac });
+  succeeded(status);
+  assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
+});
+
 test("status of a stopped cluster here says that up starts it", async (t) => {
   const { alasio, configure, docker, home, kube } = await rig(t);
   configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
