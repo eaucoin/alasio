@@ -10,7 +10,7 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Cause, Console, Effect, Layer, Logger, Result } from "effect";
 import { CliError, Command } from "effect/cli";
 
-import { Machine, Sysctl } from "./cluster/host.ts";
+import { Machine, Sysctl } from "./cluster/machine.ts";
 import { alasio } from "./commands.ts";
 import { VERSION } from "./release.ts";
 import { TelegramBotApi } from "./telegram.ts";

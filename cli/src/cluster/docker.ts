@@ -1,415 +1,568 @@
 /**
- * Docker's Engine API, over the Unix socket Docker listens on: as much of it as the local
- * cluster (./local.ts) needs, its images, network, volumes and containers and commands
- * run in them, called with node:http, so neither the Docker CLI nor a client library is
- * needed. Paths are those of API version 1.44 (Docker 25), the oldest it is written for.
+ * The cluster in Docker: k3s in Docker's containers, made through its Engine API
+ * (./docker-engine.ts) from alasio's node image (cluster/node), which is k3s with gVisor
+ * registered as containerd's `runsc` runtime and an entrypoint that readies its container
+ * for k3s.
  *
- * The socket is the one `DOCKER_HOST` names (`unix://PATH`), /var/run/docker.sock when
- * it names none.
+ * A cluster NAME is a bridge network NAME, a server container NAME-server-0 and agent
+ * containers NAME-agent-I, each with named volumes for what k3s, kubelet and the CNI
+ * keep (NAME-server-0-k3s and so on), so a node made anew, as when its image or settings
+ * change, keeps its state. All of it is labelled as the cluster's, and nothing that is
+ * not is changed. The nodes have fixed addresses in the network's subnet: the server the
+ * second, after the gateway, and the agents those after it. Docker gives fixed addresses
+ * only in a subnet chosen for the network, so one is chosen when none is given: the first
+ * 172.30.N.0/24 no other network overlaps.
+ *
+ * The registries the nodes pull from are k3s's registries.yaml, which the node image's
+ * entrypoint writes from the variable each node is made with, so a node is made anew when
+ * they change, as when its other settings do.
+ *
+ * The API server is published on the loopback only. What is done in the cluster itself,
+ * waiting for it and configuring it, is done with the kubectl k3s carries in the server
+ * node, so this machine needs none of Kubernetes' tools.
  */
-import { type ClientRequest, type IncomingMessage, request as httpRequest, STATUS_CODES } from "node:http";
-import type { Duplex, Readable } from "node:stream";
-import { buffer } from "node:stream/consumers";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 
-import { Context, Effect, Layer, Result, Schedule, Schema, type Scope } from "effect";
+import { type Cluster, KubeConfig, type User, type V1ConfigMap, type V1NodeList } from "@kubernetes/client-node";
+import { Context, Duration, Effect, FileSystem, Layer, type PlatformError, Schedule, Schema } from "effect";
 
-const API_VERSION = "v1.44";
-const DEFAULT_SOCKET = "/var/run/docker.sock";
+import { imageReference } from "../images.ts";
+import { NODE_IMAGE } from "../release.ts";
+import { type ContainerCreate, DockerEngine, type DockerError, type ExecOptions, type Mount, type NetworkInspect } from "./docker-engine.ts";
 
-/** Docker refused a call, or could not be reached: the status it answered with, when it answered. */
-export class DockerError extends Schema.TaggedError<DockerError>()("DockerError", {
-  /** The call, as its method and path. */
-  call: Schema.String,
-  /** Docker's HTTP status (404 for absent, 409 for a conflict), when it answered. */
-  status: Schema.optional(Schema.Number),
-  /** What Docker answered, or why it could not be reached. */
+/** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
+export interface HostAlias {
+  readonly ip: string;
+  readonly hostnames: readonly string[];
+}
+
+/** A path of this machine mounted in every node, at `target`. */
+export interface HostMount {
+  readonly source: string;
+  readonly target: string;
+  readonly readOnly?: boolean;
+}
+
+/** A registry's TLS: files in the nodes, and whether its certificate goes unchecked. */
+export interface RegistryTls {
+  readonly caFile?: string;
+  readonly certFile?: string;
+  readonly keyFile?: string;
+  readonly insecureSkipVerify?: boolean;
+}
+
+/**
+ * The registries the nodes' containerd pulls from, as k3s's registries.yaml says them:
+ * the endpoints that stand for a registry, by its host, in the order they are tried, with
+ * how image names are rewritten there; and a registry's TLS, by its host.
+ */
+export interface Registries {
+  readonly mirrors?: Readonly<Record<string, { readonly endpoint: readonly string[]; readonly rewrite?: Readonly<Record<string, string>> }>>;
+  readonly configs?: Readonly<Record<string, { readonly tls: RegistryTls }>>;
+}
+
+/** What the cluster in Docker is made with. */
+export interface DockerClusterOptions {
+  readonly name: string;
+  /** The port on the loopback the API server is reached at. */
+  readonly apiPort: number;
+  /** The directory persistent volumes are made in (k3s's local-path), mounted at the same path in every node. */
+  readonly storagePath: string;
+  /** The node image; this release's unless given. */
+  readonly image?: string;
+  /** The network's IPv4 subnet (a.b.c.d/n); the first free 172.30.N.0/24 unless given. */
+  readonly subnet?: string;
+  readonly hostAliases?: readonly HostAlias[];
+  readonly mounts?: readonly HostMount[];
+  /** Agent nodes beside the server. */
+  readonly agents?: number;
+  /** The registries the nodes pull from; containerd's defaults unless given. */
+  readonly registries?: Registries;
+  /** How long each wait for the cluster may take, and how often it looks. */
+  readonly readyTimeout?: Duration.Input;
+  readonly poll?: Duration.Input;
+}
+
+export type NodeRole = "server" | "agent";
+
+/** A node's container, and the state Docker gives it (running, exited, ...). */
+export interface NodeStatus {
+  readonly name: string;
+  readonly role: NodeRole;
+  readonly state: string;
+}
+
+/** The Docker the cluster runs on, by its version, and the cluster's nodes, the server first; none when there is no cluster. */
+export interface ClusterStatus {
+  readonly docker: string;
+  readonly nodes: readonly NodeStatus[];
+}
+
+/** The cluster cannot be made as asked: something of its name is not its own, or its settings cannot hold. */
+export class ClusterUnusable extends Schema.TaggedError<ClusterUnusable>()("ClusterUnusable", {
+  cluster: Schema.String,
   reason: Schema.String,
 }) {
   override get message(): string {
-    return `Docker ${this.status === undefined ? "failed" : `answered ${this.status} to`} ${this.call}: ${this.reason}`;
+    return `cluster ${this.cluster} cannot be made: ${this.reason}`;
   }
 }
 
-/** `DOCKER_HOST` names a Docker that is not reached over a Unix socket. */
-export class DockerHostUnsupported extends Schema.TaggedError<DockerHostUnsupported>()("DockerHostUnsupported", {
-  host: Schema.String,
+/** The cluster did not come up in time: what it was waited for, and why it last was not. */
+export class ClusterNotReady extends Schema.TaggedError<ClusterNotReady>()("ClusterNotReady", {
+  cluster: Schema.String,
+  waitingFor: Schema.String,
+  /** How long it was given, in seconds. */
+  within: Schema.Number,
+  reason: Schema.String,
 }) {
   override get message(): string {
-    return `DOCKER_HOST is ${this.host}, but alasio reaches Docker only over a Unix socket (unix://PATH)`;
+    return `cluster ${this.cluster} was not ready within ${this.within}s, waiting for ${this.waitingFor}: ${this.reason}`;
   }
 }
 
-/** Whether `error` is Docker's answer `status`. */
-export const hasStatus = (status: number) => (error: DockerError): boolean => error.status === status;
+/** What a wait for the cluster has not seen yet; the wait's ClusterNotReady says it when it gives up. */
+class NotYet extends Schema.TaggedError<NotYet>()("NotYet", {
+  message: Schema.String,
+}) {}
+
+/** A command run in a node exited with another code than 0. */
+export class NodeCommandFailed extends Schema.TaggedError<NodeCommandFailed>()("NodeCommandFailed", {
+  node: Schema.String,
+  command: Schema.String,
+  exitCode: Schema.Number,
+  stderr: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.command} in ${this.node} exited with ${this.exitCode}${this.stderr.trim() ? `: ${this.stderr.trim()}` : ""}`;
+  }
+}
+
+/** What `remove` removes beside the nodes and network. */
+export interface RemoveOptions {
+  readonly volumes?: boolean;
+  readonly storage?: boolean;
+}
+
+/** How bringing the cluster up fails. */
+export type DockerClusterError = DockerError | ClusterUnusable | ClusterNotReady | PlatformError.PlatformError;
+
+/** The cluster in Docker of the options its layer was given. */
+export class DockerCluster extends Context.Service<DockerCluster, {
+  /**
+   * Makes the cluster, or what of it is missing, starts what is stopped, makes nodes
+   * whose image or settings changed anew, and waits until its nodes are ready; then gives
+   * CoreDNS the host aliases, applies the `gvisor` RuntimeClass, and writes a kubeconfig
+   * that reaches it to `kubeconfig` (0600).
+   */
+  readonly up: (kubeconfig: string) => Effect.Effect<void, DockerClusterError>;
+  /** Stops its nodes, keeping everything. */
+  readonly down: Effect.Effect<void, DockerError>;
+  /**
+   * Removes its nodes and network; with `volumes`, what they keep; with `storage`, its
+   * storage directory, its persistent volumes', whose files are its pods' users', removed
+   * in its server node, as root, first.
+   */
+  readonly remove: (options?: RemoveOptions) => Effect.Effect<void, DockerError | NodeCommandFailed | PlatformError.PlatformError>;
+  readonly status: Effect.Effect<ClusterStatus, DockerError>;
+}>()("alasio/cluster/DockerCluster") {
+  static readonly layer = (options: DockerClusterOptions): Layer.Layer<DockerCluster, never, DockerEngine | FileSystem.FileSystem> =>
+    Layer.effect(DockerCluster, makeDockerCluster(options));
+}
+
+const CLUSTER_LABEL = "alasio.cluster";
+const ROLE_LABEL = "alasio.role";
+/** The label of a node's container that says what it was made from: specHash's. */
+const SPEC_LABEL = "alasio.spec";
+
+/** What a node keeps, each in a volume of its own: the volume's suffix, and where it is mounted. */
+const NODE_VOLUMES = [
+  ["k3s", "/var/lib/rancher/k3s"],
+  ["kubelet", "/var/lib/kubelet"],
+  ["cni", "/var/lib/cni"],
+  ["log", "/var/log"],
+] as const;
+
+/** The API server's port in the server node. */
+const K3S_PORT = 6443;
+const API_PORT = `${K3S_PORT}/tcp`;
+const K3S_KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
+/** The token the server made on its first start, which agents join with. */
+const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
+/** The variable the node image's entrypoint writes k3s's registries.yaml from, before k3s starts. */
+const REGISTRIES_ENV = "ALASIO_REGISTRIES";
 
 /**
- * Whether `error` is Docker's answer to removing a container it killed but did not see
- * exit within the time it waits: the kill stands, and the container exits once its
- * processes do, which those waiting on a FUSE mount whose client dies with them, as
- * JuiceFS's on a node are, can take longer to.
+ * kubelet's thresholds for a machine whose disk the cluster shares with everything else
+ * on it: it evicts only when the disk is nearly full, and collects unused images only then,
+ * so images in use are not evicted.
  */
-const killedNotYetExited = (error: DockerError): boolean => error.status === 500 && error.reason.includes("did not receive an exit event");
+const KUBELET_ARGS = [
+  "--kubelet-arg=eviction-hard=imagefs.available<5%,nodefs.available<5%",
+  "--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
+  "--kubelet-arg=image-gc-high-threshold=98",
+  "--kubelet-arg=image-gc-low-threshold=95",
+];
 
-/** The socket of the Docker `env` names, by `DOCKER_HOST`. */
-export function dockerSocket(env: Readonly<NodeJS.ProcessEnv>): Result.Result<string, DockerHostUnsupported> {
-  const host = env["DOCKER_HOST"];
-  if (!host) return Result.succeed(DEFAULT_SOCKET);
-  if (host.startsWith("unix://")) return Result.succeed(host.slice("unix://".length));
-  return Result.fail(new DockerHostUnsupported({ host }));
+/** gVisor, as the node image registers it with containerd. */
+const GVISOR_RUNTIME_CLASS = { apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" };
+
+// A first start pulls k3s's own images, so it is given minutes.
+const READY_TIMEOUT: Duration.Input = "5 minutes";
+const POLL: Duration.Input = "1 second";
+
+/** The `index`th address of the IPv4 subnet `cidr` (a.b.c.d/n), its network address the 0th; null when it has no such host address. */
+export function subnetAddress(cidr: string, index: number): string | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(cidr);
+  if (!match) return null;
+  const octets = match.slice(1, 5).map(Number);
+  const prefix = Number(match[5]);
+  if (octets.some((octet) => octet > 255) || prefix > 30) return null;
+  // The last address is the subnet's broadcast address.
+  if (index < 1 || index >= 2 ** (32 - prefix) - 1) return null;
+  const network = octets.reduce((value, octet) => value * 256 + octet, 0);
+  const address = network - (network % 2 ** (32 - prefix)) + index;
+  return [24, 16, 8, 0].map((shift) => Math.floor(address / 2 ** shift) % 256).join(".");
 }
 
-/** What `version` reads of Docker's version. */
-export interface DockerVersion {
-  readonly Version: string;
-  readonly ApiVersion: string;
+/** The first and last addresses of the IPv4 subnet `cidr`, as numbers; null when it is none. */
+function subnetRange(cidr: string): readonly [number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(cidr);
+  if (!match) return null;
+  const octets = match.slice(1, 5).map(Number);
+  const prefix = Number(match[5]);
+  if (octets.some((octet) => octet > 255) || prefix > 32) return null;
+  const size = 2 ** (32 - prefix);
+  const first = octets.reduce((value, octet) => value * 256 + octet, 0);
+  return [first - (first % size), first - (first % size) + size - 1];
 }
 
-/** What is read of an image: that it is there. */
-export interface ImageInspect {
-  readonly Id: string;
-}
-
-/** What is read of a network. */
-export interface NetworkInspect {
-  readonly Name: string;
-  readonly Labels: Readonly<Record<string, string>> | null;
-  readonly IPAM: { readonly Config: readonly { readonly Subnet?: string }[] | null };
-  /** The containers on it, by id, when it is inspected by name. */
-  readonly Containers?: Readonly<Record<string, { readonly Name: string }>> | null;
-}
-
-/** A network as `createNetwork` makes it. */
-export interface NetworkCreate {
-  readonly Name: string;
-  readonly Driver: "bridge";
-  readonly IPAM?: { readonly Config: readonly { readonly Subnet: string }[] };
-  readonly Labels: Readonly<Record<string, string>>;
-}
-
-/** A volume, as `createVolume` makes and `listVolumes` lists it. */
-export interface Volume {
-  readonly Name: string;
-  readonly Labels: Readonly<Record<string, string>> | null;
-}
-
-/** What is read of a container: its state, and when it last started (RFC 3339, to the nanosecond). */
-export interface ContainerInspect {
-  readonly Name: string;
-  readonly Config: { readonly Labels: Readonly<Record<string, string>> | null };
-  readonly State: { readonly Status: string; readonly Running: boolean; readonly StartedAt: string };
-}
-
-/** A container as `listContainers` lists it: its names begin with "/". */
-export interface ContainerSummary {
-  readonly Names: readonly string[];
-  readonly Labels: Readonly<Record<string, string>>;
-  /** created, running, paused, restarting, exited, removing or dead. */
-  readonly State: string;
-}
-
-/** A mount of a container: a host path or a named volume, at `Target`. */
-export interface Mount {
-  readonly Type: "bind" | "volume";
-  readonly Source: string;
-  readonly Target: string;
-  readonly ReadOnly?: boolean;
-}
-
-/** A container as `createContainer` makes it: as much of the Engine API's body as the local cluster sets. */
-export interface ContainerCreate {
-  readonly Image: string;
-  readonly Hostname: string;
-  readonly Cmd: readonly string[];
-  readonly Env: readonly string[];
-  readonly Labels: Readonly<Record<string, string>>;
-  readonly ExposedPorts?: Readonly<Record<string, Readonly<Record<string, never>>>>;
-  readonly HostConfig: {
-    readonly Privileged: boolean;
-    readonly Init: boolean;
-    readonly CgroupnsMode: "private" | "host";
-    readonly RestartPolicy: { readonly Name: "no" | "always" | "unless-stopped" | "on-failure" };
-    readonly SecurityOpt: readonly string[];
-    readonly Tmpfs: Readonly<Record<string, string>>;
-    readonly Mounts: readonly Mount[];
-    readonly ExtraHosts: readonly string[];
-    readonly PortBindings?: Readonly<Record<string, readonly { readonly HostIp: string; readonly HostPort: string }[]>>;
-  };
-  readonly NetworkingConfig: {
-    readonly EndpointsConfig: Readonly<Record<string, { readonly IPAMConfig: { readonly IPv4Address: string } }>>;
-  };
-}
-
-/** What `exec` is given beyond the command. */
-export interface ExecOptions {
-  /** What the command reads on its standard input, which is closed after it. */
-  readonly stdin?: string;
-}
-
-/** What a command run by `exec` came to. */
-export interface ExecResult {
-  readonly exitCode: number;
-  readonly stdout: Buffer;
-  readonly stderr: string;
-}
-
-/** Docker's Engine API, as the local cluster calls it. Objects are addressed by name. */
-export class DockerEngine extends Context.Service<DockerEngine, {
-  readonly version: Effect.Effect<DockerVersion, DockerError>;
-  /** The image, or null when Docker has none of `reference`. */
-  readonly inspectImage: (reference: string) => Effect.Effect<ImageInspect | null, DockerError>;
-  /** Pulls the image `reference` names by tag or digest, from a registry that asks for no login. */
-  readonly pullImage: (reference: string) => Effect.Effect<void, DockerError>;
-  /** The network, or null when there is none. */
-  readonly inspectNetwork: (name: string) => Effect.Effect<NetworkInspect | null, DockerError>;
-  /** Every network there is. */
-  readonly listNetworks: Effect.Effect<readonly NetworkInspect[], DockerError>;
-  /** Makes it; fails with status 409 when it exists. */
-  readonly createNetwork: (network: NetworkCreate) => Effect.Effect<void, DockerError>;
-  /** Removes it; one already gone is not an error. */
-  readonly removeNetwork: (name: string) => Effect.Effect<void, DockerError>;
-  /** Takes the container off the network, running or not. */
-  readonly disconnectNetwork: (network: string, container: string) => Effect.Effect<void, DockerError>;
-  /** Makes it, unless it exists. */
-  readonly createVolume: (volume: Volume) => Effect.Effect<void, DockerError>;
-  /** The volumes that carry every one of `labels`. */
-  readonly listVolumes: (labels: Readonly<Record<string, string>>) => Effect.Effect<readonly Volume[], DockerError>;
-  /** Removes it, with what it holds; one already gone is not an error. */
-  readonly removeVolume: (name: string) => Effect.Effect<void, DockerError>;
-  /** The containers, running or not, that carry every one of `labels`. */
-  readonly listContainers: (labels: Readonly<Record<string, string>>) => Effect.Effect<readonly ContainerSummary[], DockerError>;
-  /** The container, or null when there is none. */
-  readonly inspectContainer: (name: string) => Effect.Effect<ContainerInspect | null, DockerError>;
-  /** Makes it, stopped; fails with status 409 when it exists. */
-  readonly createContainer: (name: string, container: ContainerCreate) => Effect.Effect<void, DockerError>;
-  /** Starts it; one running is not an error. */
-  readonly startContainer: (name: string) => Effect.Effect<void, DockerError>;
-  /** Stops it, as Docker does (SIGTERM, then SIGKILL after its timeout); one stopped is not an error. */
-  readonly stopContainer: (name: string) => Effect.Effect<void, DockerError>;
-  /** Removes it, running or not, keeping its named volumes; one already gone is not an error. */
-  readonly removeContainer: (name: string) => Effect.Effect<void, DockerError>;
-  /**
-   * Runs `command` in the running container, with `stdin` on its standard input when
-   * given, and collects its output. Interrupting it closes the exec's connection.
-   */
-  readonly exec: (container: string, command: readonly string[], options?: ExecOptions) => Effect.Effect<ExecResult, DockerError>;
-  /** The content of the file at `path` in the container. */
-  readonly readFile: (container: string, path: string) => Effect.Effect<Buffer, DockerError>;
-}>()("alasio/cluster/DockerEngine") {
-  /** The Docker `env` names (dockerSocket). */
-  static readonly layer = (env: Readonly<NodeJS.ProcessEnv> = process.env): Layer.Layer<DockerEngine, DockerHostUnsupported> =>
-    Layer.effect(DockerEngine, Effect.map(Effect.fromResult(dockerSocket(env)), makeDockerEngine));
-}
-
-/** A call of the Engine API: its query's arrays are repeated parameters. */
-interface DockerCall {
-  readonly method: "GET" | "POST" | "DELETE";
-  readonly path: string;
-  readonly query?: Readonly<Record<string, string | readonly string[]>>;
-  readonly body?: unknown;
-}
-
-const describe = (call: DockerCall): string => `${call.method} ${call.path}`;
-
-const unreachable = (call: DockerCall, cause: unknown): DockerError =>
-  new DockerError({ call: describe(call), reason: cause instanceof Error ? cause.message : String(cause) });
-
-/** A label filter of a list call, in the JSON Docker's `filters` parameter takes. */
-const labelFilter = (labels: Readonly<Record<string, string>>): string =>
-  JSON.stringify({ label: Object.entries(labels).map(([key, value]) => `${key}=${value}`) });
-
-/** The content of the first regular file in `tar`, a tar archive as Docker's archive endpoint sends one; null when it holds none. */
-export function firstFile(tar: Buffer): Buffer | null {
-  const BLOCK = 512;
-  for (let offset = 0; offset + BLOCK <= tar.length;) {
-    const header = tar.subarray(offset, offset + BLOCK);
-    // Two zero blocks end an archive.
-    if (header.every((byte) => byte === 0)) return null;
-    const size = Number.parseInt(header.toString("latin1", 124, 136).replace(/\0.*$/su, "").trim() || "0", 8);
-    const type = header[156];
-    const start = offset + BLOCK;
-    // "0", or NUL in archives older than POSIX's.
-    if (type === 0x30 || type === 0) return tar.subarray(start, start + size);
-    offset = start + Math.ceil(size / BLOCK) * BLOCK;
+/** The first 172.30.N.0/24 that overlaps none of the `taken` subnets (others than IPv4 are not in the way), or null when all do. Pure, for tests. */
+export function freeSubnet(taken: readonly string[]): string | null {
+  const ranges = taken.flatMap((cidr) => {
+    const range = subnetRange(cidr);
+    return range ? [range] : [];
+  });
+  for (let third = 0; third < 256; third++) {
+    const candidate = `172.30.${third}.0/24`;
+    // A /24 written as such always has a range.
+    const [first, last] = subnetRange(candidate)!;
+    if (!ranges.some(([start, end]) => start <= last && first <= end)) return candidate;
   }
   return null;
 }
 
 /**
- * The output of a command whose exec ran without a terminal: Docker sends it in frames of
- * an 8-byte header (the stream, 1 for stdout or 2 for stderr, and the size, big-endian, at
- * byte 4) and what was written.
+ * CoreDNS's NodeHosts, a hosts file, with `aliases`: k3s keeps a line for each node in
+ * it, which stays, and every other line is the cluster's aliases, which are replaced.
+ * Pure, for tests.
  */
-export function demultiplex(raw: Buffer): { readonly stdout: Buffer; readonly stderr: Buffer } {
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  for (let offset = 0; offset + 8 <= raw.length;) {
-    const size = raw.readUInt32BE(offset + 4);
-    const payload = raw.subarray(offset + 8, offset + 8 + size);
-    (raw[offset] === 2 ? stderr : stdout).push(payload);
-    offset += 8 + size;
-  }
-  return { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+export function nodeHostsWith(nodeHosts: string, nodes: readonly string[], aliases: readonly HostAlias[]): string {
+  const kept = nodeHosts.split("\n").filter((line) => line.trim().split(/\s+/u).slice(1).some((host) => nodes.includes(host)));
+  return [...kept, ...aliases.map(({ ip, hostnames }) => `${ip} ${hostnames.join(" ")}`)].join("\n");
 }
 
-/** The Engine API on the Unix socket `socketPath`. */
-function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
-  const send = (call: DockerCall, headers: Readonly<Record<string, string>> = {}): ClientRequest => {
-    const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(call.query ?? {})) {
-      for (const each of typeof value === "string" ? [value] : value) query.append(key, each);
+/**
+ * The kubeconfig k3s wrote in the server node (`k3sYaml`), named after the cluster and
+ * pointed at the API server's port on the loopback; null when it is not a kubeconfig with
+ * a cluster and a user, as while k3s writes it.
+ */
+export function localKubeconfig(k3sYaml: string, cluster: string, apiPort: number): string | null {
+  const written = new KubeConfig();
+  try {
+    written.loadFromString(k3sYaml);
+  } catch {
+    return null;
+  }
+  const server: Cluster | null = written.getCurrentCluster();
+  const user: User | null = written.getCurrentUser();
+  if (!server || !user) return null;
+  const local = new KubeConfig();
+  local.loadFromOptions({
+    clusters: [{ ...server, name: cluster, server: `https://127.0.0.1:${apiPort}` }],
+    users: [{ ...user, name: cluster }],
+    contexts: [{ name: cluster, cluster, user: cluster }],
+    currentContext: cluster,
+  });
+  return local.exportConfig();
+}
+
+/** k3s's registries.yaml of `registries`, written as JSON, which YAML reads as it is. Pure, for tests. */
+export function registriesYaml({ mirrors = {}, configs = {} }: Registries): string {
+  return JSON.stringify({
+    mirrors,
+    configs: Object.fromEntries(
+      Object.entries(configs).map(([host, { tls }]) => [
+        host,
+        { tls: { ca_file: tls.caFile, cert_file: tls.certFile, key_file: tls.keyFile, insecure_skip_verify: tls.insecureSkipVerify } },
+      ]),
+    ),
+  });
+}
+
+/** A digest of `spec` that two specs share only when they are the same. */
+const specHash = (spec: ContainerCreate): string => createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+
+const makeDockerCluster = Effect.fnUntraced(function*({
+  name: cluster,
+  apiPort,
+  storagePath,
+  image = imageReference(NODE_IMAGE),
+  subnet,
+  hostAliases = [],
+  mounts = [],
+  agents = 0,
+  registries,
+  readyTimeout = READY_TIMEOUT,
+  poll = POLL,
+}: DockerClusterOptions): Effect.fn.Return<DockerCluster["Service"], never, DockerEngine | FileSystem.FileSystem> {
+  const docker = yield* DockerEngine;
+  const fs = yield* FileSystem.FileSystem;
+  const labels = { [CLUSTER_LABEL]: cluster };
+  const server = `${cluster}-server-0`;
+  const nodes = [server, ...Array.from({ length: agents }, (_, index) => `${cluster}-agent-${index}`)];
+
+  const unusable = (reason: string) => new ClusterUnusable({ cluster, reason });
+
+  /**
+   * The container of `node`, with what every node has: privileged, as k3s in Docker needs,
+   * its volumes, the storage directory and the host mounts, and the registries.
+   */
+  const nodeContainer = (node: string, role: NodeRole, address: string, command: readonly string[], env: readonly string[]): ContainerCreate => ({
+    Image: image,
+    Hostname: node,
+    Cmd: command,
+    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : [])],
+    Labels: { ...labels, [ROLE_LABEL]: role },
+    ...(role === "server" ? { ExposedPorts: { [API_PORT]: {} } } : {}),
+    HostConfig: {
+      Privileged: true,
+      Init: true,
+      CgroupnsMode: "private",
+      RestartPolicy: { Name: "unless-stopped" },
+      SecurityOpt: ["label=disable"],
+      Tmpfs: { "/run": "", "/var/run": "" },
+      Mounts: [
+        ...NODE_VOLUMES.map(([suffix, target]): Mount => ({ Type: "volume", Source: `${node}-${suffix}`, Target: target })),
+        { Type: "bind", Source: storagePath, Target: storagePath },
+        ...mounts.map(({ source, target, readOnly = false }): Mount => ({ Type: "bind", Source: source, Target: target, ReadOnly: readOnly })),
+      ],
+      ExtraHosts: hostAliases.flatMap(({ ip, hostnames }) => hostnames.map((hostname) => `${hostname}:${ip}`)),
+      ...(role === "server" ? { PortBindings: { [API_PORT]: [{ HostIp: "127.0.0.1", HostPort: String(apiPort) }] } } : {}),
+    },
+    NetworkingConfig: { EndpointsConfig: { [cluster]: { IPAMConfig: { IPv4Address: address } } } },
+  });
+
+  /** The cluster's network, made unless it exists; its subnet, which must be `subnet` when that is given. */
+  const ensureNetwork = Effect.fnUntraced(function*(): Effect.fn.Return<string, DockerError | ClusterUnusable> {
+    const existing = yield* docker.inspectNetwork(cluster);
+    if (existing && existing.Labels?.[CLUSTER_LABEL] !== cluster) return yield* unusable(`a network named ${cluster} is not its own`);
+    let network: NetworkInspect | null = existing;
+    if (!network) {
+      const chosen = subnet ?? freeSubnet((yield* docker.listNetworks).flatMap(({ IPAM }) => (IPAM.Config ?? []).flatMap(({ Subnet }) => Subnet ?? [])));
+      if (!chosen) return yield* unusable("every 172.30.N.0/24 is another network's: give the cluster a subnet");
+      yield* Effect.logInfo(`making network ${cluster} (${chosen})`);
+      yield* docker.createNetwork({ Name: cluster, Driver: "bridge", IPAM: { Config: [{ Subnet: chosen }] }, Labels: labels });
+      network = yield* docker.inspectNetwork(cluster);
     }
-    const body = call.body === undefined ? undefined : JSON.stringify(call.body);
-    const request = httpRequest({
-      socketPath,
-      method: call.method,
-      path: `/${API_VERSION}${call.path}${query.size ? `?${query}` : ""}`,
-      headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-    });
-    request.end(body);
-    return request;
+    const actual = network?.IPAM.Config?.[0]?.Subnet;
+    if (!actual) return yield* unusable(`network ${cluster} has no subnet`);
+    if (subnet && actual !== subnet) return yield* unusable(`network ${cluster} has the subnet ${actual}, not ${subnet}`);
+    return actual;
+  });
+
+  /** The `index`th node's address in `networkSubnet`. */
+  const nodeAddress = (networkSubnet: string, index: number): Effect.Effect<string, ClusterUnusable> => {
+    const address = subnetAddress(networkSubnet, 2 + index);
+    return address ? Effect.succeed(address) : Effect.fail(unusable(`its subnet ${networkSubnet} has no room for ${nodes.length} nodes`));
   };
 
-  const readAll = (call: DockerCall, stream: Readable): Effect.Effect<Buffer, DockerError> =>
-    Effect.tryPromise({ try: () => buffer(stream), catch: (cause) => unreachable(call, cause) });
+  /** `node`'s container made as `spec` says, anew when it was made otherwise, and running. */
+  const ensureNode = Effect.fnUntraced(function*(node: string, spec: ContainerCreate): Effect.fn.Return<void, DockerError | ClusterUnusable> {
+    const hash = specHash(spec);
+    const existing = yield* docker.inspectContainer(node);
+    if (existing && existing.Config.Labels?.[CLUSTER_LABEL] !== cluster) return yield* unusable(`a container named ${node} is not one of its nodes`);
+    const current = existing !== null && existing.Config.Labels?.[SPEC_LABEL] === hash;
+    if (existing && !current) {
+      yield* Effect.logInfo(`making node ${node} anew, from its current image and settings`);
+      yield* docker.stopContainer(node);
+      yield* docker.removeContainer(node);
+    }
+    if (!current) {
+      yield* Effect.logInfo(`making node ${node}`);
+      yield* Effect.forEach(NODE_VOLUMES, ([suffix]) => docker.createVolume({ Name: `${node}-${suffix}`, Labels: labels }), { discard: true });
+      yield* docker.createContainer(node, { ...spec, Labels: { ...spec.Labels, [SPEC_LABEL]: hash } });
+    }
+    if (!current || !existing.State.Running) {
+      yield* Effect.logInfo(`starting node ${node}`);
+      yield* docker.startContainer(node);
+    }
+  });
 
-  /** Docker's refusal of `call`: the status of `response`, and the message its body holds. */
-  const refusal = (call: DockerCall, response: IncomingMessage): Effect.Effect<never, DockerError> =>
-    readAll(call, response).pipe(
-      Effect.flatMap((body) => {
-        const status = response.statusCode ?? 0;
-        const text = body.toString("utf8").trim();
-        let reason = text || STATUS_CODES[status] || "no message";
-        try {
-          const parsed: unknown = JSON.parse(text);
-          if (typeof parsed === "object" && parsed !== null && "message" in parsed && typeof parsed.message === "string") reason = parsed.message;
-        } catch {
-          // Not JSON: the text is the message.
-        }
-        return Effect.fail(new DockerError({ call: describe(call), status, reason }));
+  /** The output of `command` in `node`, which fails unless it exits with 0. */
+  const inNode = (node: string, command: readonly string[], options?: ExecOptions): Effect.Effect<Buffer, DockerError | NodeCommandFailed> =>
+    docker.exec(node, command, options).pipe(
+      Effect.flatMap(({ exitCode, stdout, stderr }) =>
+        exitCode === 0 ? Effect.succeed(stdout) : Effect.fail(new NodeCommandFailed({ node, command: command.join(" "), exitCode, stderr }))
+      ),
+    );
+
+  const kubectl = (args: readonly string[], options?: ExecOptions) => inNode(server, ["kubectl", ...args], options);
+
+  /** `check` once it succeeds, tried every `poll` for `readyTimeout`; why it last failed, when it never does. */
+  const awaitReady = <A>(waitingFor: string, check: Effect.Effect<A, DockerError | NodeCommandFailed | NotYet>): Effect.Effect<A, ClusterNotReady> =>
+    Effect.logInfo(`waiting for ${waitingFor}`).pipe(
+      Effect.andThen(
+        check.pipe(
+          Effect.mapError((error) => new ClusterNotReady({ cluster, waitingFor, within: Duration.toSeconds(readyTimeout), reason: error.message })),
+          Effect.retry(Schedule.max([Schedule.spaced(poll), Schedule.during(readyTimeout)])),
+        ),
+      ),
+    );
+
+  /** When each node's container last started, in milliseconds since the epoch. */
+  const startTimes: Effect.Effect<ReadonlyMap<string, number>, DockerError> = Effect.forEach(nodes, (node) =>
+    Effect.map(docker.inspectContainer(node), (container) => [node, Date.parse(container?.State.StartedAt ?? "")] as const)).pipe(
+      Effect.map((entries) => new Map(entries)),
+    );
+
+  /**
+   * Every node ready, by a Ready condition its kubelet reported since its container
+   * started: one from before, which a node stopped while ready keeps until its kubelet
+   * reports again, is not yet the node's. The condition's heartbeat is to the second.
+   */
+  const nodesReady = (started: ReadonlyMap<string, number>) =>
+    kubectl(["get", "nodes", "--output=json"]).pipe(
+      Effect.flatMap((stdout) => {
+        const { items } = JSON.parse(stdout.toString("utf8")) as V1NodeList;
+        const ready = new Set(
+          items
+            .filter((node) =>
+              node.status?.conditions?.some(({ type, status, lastHeartbeatTime }) =>
+                type === "Ready" && status === "True" && lastHeartbeatTime !== undefined
+                && new Date(lastHeartbeatTime).getTime() >= Math.floor((started.get(node.metadata?.name ?? "") ?? Infinity) / 1000) * 1000
+              )
+            )
+            .map((node) => node.metadata?.name),
+        );
+        const waiting = nodes.filter((node) => !ready.has(node));
+        return waiting.length === 0 ? Effect.void : Effect.fail(new NotYet({ message: `not reported ready since started: ${waiting.join(", ")}` }));
       }),
     );
 
-  /** The response to `call`, open while the scope is; a status of 400 or over is its refusal (304, already so, is not). */
-  const open = (call: DockerCall): Effect.Effect<IncomingMessage, DockerError, Scope.Scope> =>
-    Effect.acquireRelease(
-      Effect.callback<IncomingMessage, DockerError>((resume) => {
-        const request = send(call);
-        request.on("response", (response) => resume(Effect.succeed(response)));
-        request.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
-        return Effect.sync(() => request.destroy());
-      }),
-      (response) => Effect.sync(() => response.destroy()),
-    ).pipe(Effect.tap((response) => ((response.statusCode ?? 0) >= 400 ? refusal(call, response) : Effect.void)));
-
-  const body = (call: DockerCall): Effect.Effect<Buffer, DockerError> =>
-    Effect.scoped(Effect.flatMap(open(call), (response) => readAll(call, response)));
-
-  /** The JSON Docker answers `call` with, as the Engine API documents it. */
-  const json = <A>(call: DockerCall): Effect.Effect<A, DockerError> =>
-    Effect.map(body(call), (content) => JSON.parse(content.toString("utf8")) as A);
-
-  const orNull = <A>(effect: Effect.Effect<A, DockerError>): Effect.Effect<A | null, DockerError> =>
-    effect.pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed(null)));
-
-  const orGone = (effect: Effect.Effect<unknown, DockerError>): Effect.Effect<void, DockerError> =>
-    effect.pipe(Effect.asVoid, Effect.catchIf(hasStatus(404), () => Effect.void));
-
-  const name = (value: string): string => encodeURIComponent(value);
-
-  /**
-   * Starts exec `id` attached, `stdin` written to it and then closed, and collects what it
-   * writes until it ends. Docker upgrades the connection to a raw stream for this.
-   */
-  const attach = (id: string, stdin: ExecOptions["stdin"]): Effect.Effect<Buffer, DockerError> => {
-    const call: DockerCall = { method: "POST", path: `/exec/${id}/start`, body: { Detach: false, Tty: false } };
-    return Effect.callback<Buffer, DockerError>((resume) => {
-      const request = send(call, { Connection: "Upgrade", Upgrade: "tcp" });
-      let stream: Duplex | null = null;
-      request.on("upgrade", (_response, socket, head) => {
-        stream = socket;
-        const chunks: Buffer[] = [head];
-        socket.on("data", (chunk: Buffer) => chunks.push(chunk));
-        socket.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
-        socket.on("close", () => resume(Effect.succeed(Buffer.concat(chunks))));
-        if (stdin !== undefined) socket.end(stdin);
-      });
-      // A daemon that answers without upgrading refused.
-      request.on("response", (response) => resume(refusal(call, response)));
-      request.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
-      return Effect.sync(() => {
-        request.destroy();
-        stream?.destroy();
-      });
-    });
-  };
-
-  const exec = Effect.fnUntraced(function*(
-    container: string,
-    command: readonly string[],
-    { stdin }: ExecOptions = {},
-  ): Effect.fn.Return<ExecResult, DockerError> {
-    const { Id: id } = yield* json<{ readonly Id: string }>({
-      method: "POST",
-      path: `/containers/${name(container)}/exec`,
-      body: { AttachStdin: stdin !== undefined, AttachStdout: true, AttachStderr: true, Tty: false, Cmd: command },
-    });
-    const { stdout, stderr } = demultiplex(yield* attach(id, stdin));
-    // Docker records the exit code before it closes the exec's streams.
-    const inspect: DockerCall = { method: "GET", path: `/exec/${id}/json` };
-    const { ExitCode: exitCode } = yield* json<{ readonly ExitCode: number | null }>(inspect);
-    if (exitCode === null) return yield* new DockerError({ call: describe(inspect), reason: `${JSON.stringify(command[0])} has no exit code` });
-    return { exitCode, stdout, stderr: stderr.toString("utf8") };
+  /** CoreDNS's NodeHosts with the host aliases, patched only when they differ, and only over the version read. */
+  const applyHostAliases = Effect.gen(function*() {
+    const coredns = JSON.parse((yield* kubectl(["--namespace=kube-system", "get", "configmap", "coredns", "--output=json"])).toString("utf8")) as V1ConfigMap;
+    const nodeHosts = coredns.data?.["NodeHosts"] ?? "";
+    const desired = nodeHostsWith(nodeHosts, nodes, hostAliases);
+    if (desired === nodeHosts) return;
+    const patch = { metadata: { resourceVersion: coredns.metadata?.resourceVersion }, data: { NodeHosts: desired } };
+    yield* kubectl(["--namespace=kube-system", "patch", "configmap", "coredns", "--type=merge", `--patch=${JSON.stringify(patch)}`]);
   });
 
-  const pullImage = Effect.fnUntraced(function*(reference: string): Effect.fn.Return<void, DockerError> {
-    const call: DockerCall = { method: "POST", path: "/images/create", query: { fromImage: reference } };
-    // A pull that fails once it has begun still answers 200: its progress, one JSON object
-    // a line, ends with the error.
-    const progress = (yield* body(call)).toString("utf8").split("\n").filter((line) => line.trim());
-    for (const line of progress) {
-      const { error } = JSON.parse(line) as { readonly error?: string };
-      if (error) return yield* new DockerError({ call: describe(call), reason: error });
+  const writeKubeconfig = Effect.fnUntraced(function*(path: string): Effect.fn.Return<void, ClusterNotReady | PlatformError.PlatformError> {
+    const content = yield* awaitReady(
+      "its kubeconfig",
+      docker.readFile(server, K3S_KUBECONFIG).pipe(
+        Effect.flatMap((written) => {
+          const local = localKubeconfig(written.toString("utf8"), cluster, apiPort);
+          return local ? Effect.succeed(local) : Effect.fail(new NotYet({ message: `${K3S_KUBECONFIG} is not yet a kubeconfig with a cluster and a user` }));
+        }),
+      ),
+    );
+    // Written whole beside it, readable only by its owner, and moved over it.
+    yield* fs.makeDirectory(dirname(path), { recursive: true, mode: 0o700 });
+    const written = `${path}.${randomUUID()}`;
+    yield* fs.writeFileString(written, content, { flag: "wx", mode: 0o600 });
+    yield* fs.rename(written, path);
+    yield* Effect.logInfo(`wrote the kubeconfig of cluster ${cluster} to ${path}`);
+  });
+
+  const up = Effect.fnUntraced(function*(kubeconfig: string): Effect.fn.Return<void, DockerClusterError> {
+    if (!(yield* docker.inspectImage(image))) {
+      yield* Effect.logInfo(`pulling ${image}`);
+      yield* docker.pullImage(image);
     }
+    const networkSubnet = yield* ensureNetwork();
+    yield* fs.makeDirectory(storagePath, { recursive: true });
+    yield* ensureNode(
+      server,
+      nodeContainer(server, "server", yield* nodeAddress(networkSubnet, 0), [
+        "server",
+        "--disable=traefik",
+        // Where the kubeconfig reaches it.
+        "--tls-san=127.0.0.1",
+        `--default-local-storage-path=${storagePath}`,
+        ...KUBELET_ARGS,
+      ], []),
+    );
+    yield* awaitReady("its API server", kubectl(["get", "--raw=/readyz"]));
+    if (agents > 0) {
+      const token = (yield* awaitReady("its token", docker.readFile(server, K3S_TOKEN))).toString("utf8").trim();
+      for (const [index, agent] of nodes.slice(1).entries()) {
+        yield* ensureNode(
+          agent,
+          nodeContainer(agent, "agent", yield* nodeAddress(networkSubnet, 1 + index), ["agent", ...KUBELET_ARGS], [
+            `K3S_URL=https://${server}:${K3S_PORT}`,
+            `K3S_TOKEN=${token}`,
+          ]),
+        );
+      }
+    }
+    yield* awaitReady("its nodes", Effect.flatMap(startTimes, nodesReady));
+    yield* awaitReady("CoreDNS's NodeHosts", applyHostAliases);
+    yield* awaitReady("the gvisor RuntimeClass", kubectl(["apply", "--filename=-"], { stdin: JSON.stringify(GVISOR_RUNTIME_CLASS) }));
+    yield* writeKubeconfig(kubeconfig);
+    yield* Effect.logInfo(`cluster ${cluster} is up`);
   });
 
-  const readFile = Effect.fnUntraced(function*(container: string, path: string): Effect.fn.Return<Buffer, DockerError> {
-    const call: DockerCall = { method: "GET", path: `/containers/${name(container)}/archive`, query: { path } };
-    const file = firstFile(yield* body(call));
-    if (!file) return yield* new DockerError({ call: describe(call), reason: `${path} in ${container} is not a file` });
-    return file;
-  });
+  /** The cluster's nodes, the server first. */
+  const existingNodes: Effect.Effect<NodeStatus[], DockerError> = docker.listContainers(labels).pipe(
+    Effect.map((found) =>
+      found
+        .map((container): NodeStatus => ({
+          name: container.Names[0]?.replace(/^\//u, "") ?? "",
+          role: container.Labels[ROLE_LABEL] === "server" ? "server" : "agent",
+          state: container.State,
+        }))
+        .sort((a, b) => (a.role === b.role ? a.name.localeCompare(b.name) : a.role === "server" ? -1 : 1))
+    ),
+  );
 
-  return DockerEngine.of({
-    version: json({ method: "GET", path: "/version" }),
-    // A reference as it is: the route takes its slashes and colons.
-    inspectImage: (reference) => orNull(json({ method: "GET", path: `/images/${reference}/json` })),
-    pullImage,
-    inspectNetwork: (network) => orNull(json({ method: "GET", path: `/networks/${name(network)}` })),
-    listNetworks: json({ method: "GET", path: "/networks" }),
-    createNetwork: (network) => Effect.asVoid(body({ method: "POST", path: "/networks/create", body: network })),
-    removeNetwork: (network) => orGone(body({ method: "DELETE", path: `/networks/${name(network)}` })),
-    disconnectNetwork: (network, container) =>
-      Effect.asVoid(body({ method: "POST", path: `/networks/${name(network)}/disconnect`, body: { Container: container, Force: true } })),
-    createVolume: (volume) => Effect.asVoid(body({ method: "POST", path: "/volumes/create", body: volume })),
-    listVolumes: (labels) =>
-      json<{ readonly Volumes: readonly Volume[] | null }>({ method: "GET", path: "/volumes", query: { filters: labelFilter(labels) } }).pipe(
-        Effect.map(({ Volumes }) => Volumes ?? []),
-      ),
-    removeVolume: (volume) => orGone(body({ method: "DELETE", path: `/volumes/${name(volume)}` })),
-    listContainers: (labels) => json({ method: "GET", path: "/containers/json", query: { all: "true", filters: labelFilter(labels) } }),
-    inspectContainer: (container) => orNull(json({ method: "GET", path: `/containers/${name(container)}/json` })),
-    createContainer: (container, spec) => Effect.asVoid(body({ method: "POST", path: "/containers/create", query: { name: container }, body: spec })),
-    startContainer: (container) => Effect.asVoid(body({ method: "POST", path: `/containers/${name(container)}/start` })),
-    stopContainer: (container) => Effect.asVoid(body({ method: "POST", path: `/containers/${name(container)}/stop` })),
-    // Asked again while Docker has killed it but not seen it exit, for as long as a
-    // node's dying processes may take.
-    removeContainer: (container) =>
-      orGone(
-        body({ method: "DELETE", path: `/containers/${name(container)}`, query: { force: "true" } }).pipe(
-          Effect.retry({ while: killedNotYetExited, schedule: Schedule.max([Schedule.spaced("1 second"), Schedule.during("2 minutes")]) }),
-        ),
-      ),
-    exec,
-    readFile,
+  return DockerCluster.of({
+    up,
+
+    // The agents first, so none is left without its server.
+    down: existingNodes.pipe(
+      Effect.flatMap((found) => Effect.forEach(found.toReversed(), ({ name }) => docker.stopContainer(name), { discard: true })),
+      Effect.andThen(Effect.logInfo(`stopped cluster ${cluster}`)),
+    ),
+
+    remove: ({ volumes = false, storage = false } = {}) =>
+      Effect.gen(function*() {
+        const found = yield* existingNodes;
+        if (storage && found.some(({ name }) => name === server)) {
+          yield* docker.startContainer(server);
+          yield* inNode(server, ["find", storagePath, "-mindepth", "1", "-delete"]);
+        }
+        yield* Effect.forEach(found, ({ name }) => docker.removeContainer(name), { discard: true });
+        const network = yield* docker.inspectNetwork(cluster);
+        if (network?.Labels?.[CLUSTER_LABEL] === cluster) {
+          // Docker removes no network a container is on: others' (a collector given an
+          // address on it, say) are taken off it, and keep running.
+          yield* Effect.forEach(Object.values(network.Containers ?? {}), ({ Name }) =>
+            docker.disconnectNetwork(cluster, Name).pipe(Effect.andThen(Effect.logInfo(`took ${Name} off network ${cluster}`))), { discard: true });
+          yield* docker.removeNetwork(cluster);
+        }
+        if (volumes) yield* Effect.forEach(yield* docker.listVolumes(labels), ({ Name }) => docker.removeVolume(Name), { discard: true });
+        if (storage) yield* fs.remove(storagePath, { recursive: true, force: true });
+        yield* Effect.logInfo(`removed cluster ${cluster}${volumes ? " and its volumes" : ""}${storage ? `, and ${storagePath}` : ""}`);
+      }),
+
+    status: Effect.all({
+      docker: Effect.map(docker.version, ({ Version }) => Version),
+      nodes: existingNodes,
+    }),
   });
-}
+});

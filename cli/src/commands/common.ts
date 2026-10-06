@@ -6,13 +6,13 @@ import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Duration, Effect, Schema } from "effect";
 import { Flag } from "effect/cli";
 
-import { LocalCluster } from "../cluster/local.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { loadConfig } from "../config.ts";
 import { kind, KubeApi, type KubeApiError } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { podProblems, selectorOf, type WaitOptions } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../manifests/common.ts";
-import { kubeApi, localCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
 
 /** How often a wait looks. */
 const POLL: Duration.Input = "2 seconds";
@@ -45,7 +45,7 @@ export const sinceFlag = durationFlag("since").pipe(
 /** The waits of a command given `timeout`. */
 export const waitOptions = (timeout: Duration.Duration): WaitOptions => ({ timeout, poll: POLL });
 
-/** The local cluster is not running, so its API cannot be reached. */
+/** The cluster in Docker is not running, so its API cannot be reached. */
 export class ClusterNotRunning extends Schema.TaggedError<ClusterNotRunning>()("ClusterNotRunning", {
   cluster: Schema.String,
   made: Schema.Boolean,
@@ -56,15 +56,15 @@ export class ClusterNotRunning extends Schema.TaggedError<ClusterNotRunning>()("
 }
 
 /**
- * The config, the cluster it targets, and its API to run `use` with; a local cluster
- * must be running, as only `up` starts it.
+ * The config, the cluster it targets, and its API to run `use` with; a cluster in
+ * Docker must be running, as only `up` starts it.
  */
 export const onCluster = <A, E, R>(use: (target: ResolvedTarget) => Effect.Effect<A, E, R>) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
-    if (target._tag === "Local") {
-      const { nodes } = yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.status), localCluster(target.cluster));
+    if (target._tag === "Docker") {
+      const { nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
       const server = nodes.find(({ role }) => role === "server");
       if (server?.state !== "running") return yield* new ClusterNotRunning({ cluster: target.cluster.name, made: server !== undefined });
     }

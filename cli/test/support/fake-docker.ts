@@ -1,6 +1,6 @@
 /**
  * A Docker Engine in memory, serving the Engine API over a Unix socket as Docker does,
- * for the tests of the client (../../src/cluster/docker.ts) and of what drives it. It
+ * for the tests of the client (../../src/cluster/docker-engine.ts) and of what drives it. It
  * keeps images, networks, volumes and containers, records every request, upgrades an
  * exec's start to a raw stream as Docker does, and answers commands run in containers
  * and files read from them as the test says.

@@ -449,7 +449,7 @@ export async function setUp(): Promise<void> {
     configFile,
     JSON.stringify({
       target: {
-        local: {
+        docker: {
           name: CLUSTER,
           apiPort: await freePort(),
           storagePath: storage,

@@ -2,10 +2,10 @@
 import { Console, Effect, FileSystem, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
-import { LocalCluster } from "../cluster/local.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { loadConfig } from "../config.ts";
 import { removeInstallation } from "../kube/apply.ts";
-import { describeTarget, localCluster, resolveTarget } from "../target.ts";
+import { describeTarget, dockerCluster, resolveTarget } from "../target.ts";
 import { onCluster, timeoutFlag, waitOptions } from "./common.ts";
 
 /** The operator did not confirm. */
@@ -32,14 +32,14 @@ export const uninstall = Command.make(
       const where = describeTarget(target);
       const confirmed = yes || (yield* Prompt.run(Prompt.Confirm({
         message: purge
-          ? `Remove alasio and all its data from ${where}${target._tag === "Local" ? ", and the cluster itself" : ""}? This cannot be undone`
+          ? `Remove alasio and all its data from ${where}${target._tag === "Docker" ? ", and the cluster itself" : ""}? This cannot be undone`
           : `Remove alasio from ${where}, keeping its data?`,
         initial: false,
       })));
       if (!confirmed) return yield* new NotConfirmed();
-      if (purge && target._tag === "Local") {
+      if (purge && target._tag === "Docker") {
         // The cluster is alasio's own: removing it, with its volumes and storage, removes everything.
-        yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.remove({ volumes: true, storage: true })), localCluster(target.cluster));
+        yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.remove({ volumes: true, storage: true })), dockerCluster(target.cluster));
         yield* Effect.flatMap(FileSystem.FileSystem, (fs) => fs.remove(target.kubeconfig.path, { force: true }));
         yield* Console.log(`alasio and the cluster ${target.cluster.name} are removed, with all their data; the config at ${config.path} is kept.`);
         return;

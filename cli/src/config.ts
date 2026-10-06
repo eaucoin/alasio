@@ -6,12 +6,12 @@
  * in the cluster alone (./secrets.ts).
  *
  *     {
- *       "target": { "local": { "name": "alasio", "apiPort": 41873 } },
+ *       "target": { "docker": { "name": "alasio", "apiPort": 41873 } },
  *       "install": { "telemetry": { "otlpEndpoint": "http://collector.example.com:4318" } }
  *     }
  *
- * The target is the cluster alasio makes on this machine (./cluster/local.ts), with its
- * API server on `apiPort` of the loopback and its volumes in `storagePath`
+ * The target is the cluster alasio makes on this machine in Docker (./cluster/docker.ts),
+ * with its API server on `apiPort` of the loopback and its volumes in `storagePath`
  * ($XDG_DATA_HOME/alasio/storage unless given), its nodes pulling through the
  * `registries` it is given, or one a kubeconfig reaches:
  * `{ "kubeconfig": { "path": "/home/me/.kube/config", "context": "prod" } }`, both keys
@@ -42,11 +42,11 @@ const Ipv4 = matching(/^(\d{1,3}\.){3}\d{1,3}$/u, "must be an IPv4 address");
 const Url = matching(/^https?:\/\/.+$/u, "must be an http(s) URL");
 
 /**
- * The registries the local cluster's nodes pull images from, as k3s's registries.yaml
- * says them, its keys in camel case: a registry's mirrors, by its host (`*` for every
- * one), and its TLS, whose files are the nodes', as `mounts` mounts them. A registry's
- * login is a secret, which the config does not hold, so there is none: the registries are
- * ones that ask for none.
+ * The registries the cluster's nodes pull images from, as k3s's registries.yaml says
+ * them, its keys in camel case: a registry's mirrors, by its host (`*` for every one), and
+ * its TLS, whose files are the nodes', as `mounts` mounts them. A registry's login is a
+ * secret, which the config does not hold, so there is none: the registries are ones that
+ * ask for none.
  */
 const Registries = Schema.Struct({
   mirrors: defaulted(
@@ -75,8 +75,8 @@ const Registries = Schema.Struct({
   ),
 });
 
-/** The cluster alasio makes on this machine, its LocalClusterOptions. */
-const LocalTarget = Schema.Struct({
+/** The cluster alasio makes on this machine in Docker, its DockerClusterOptions. */
+const DockerTarget = Schema.Struct({
   name: defaulted(matching(/^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?$/u, "must be a name of lowercase letters, digits and dashes"), "alasio"),
   apiPort: Port.annotateKey({ messageMissingKey: "is required: alasio init chooses one" }),
   subnet: Schema.optionalKey(matching(/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/u, "must be an IPv4 subnet, such as 172.30.0.0/24")),
@@ -92,7 +92,7 @@ const LocalTarget = Schema.Struct({
 /** A cluster a kubeconfig reaches: the default kubeconfig and its current context unless they are given. */
 const KubeconfigTarget = Schema.Struct({ path: Schema.optionalKey(AbsolutePath), context: Schema.optionalKey(NonEmpty) });
 
-const Target = Schema.Union([Schema.Struct({ local: LocalTarget }), Schema.Struct({ kubeconfig: KubeconfigTarget })]);
+const Target = Schema.Union([Schema.Struct({ docker: DockerTarget }), Schema.Struct({ kubeconfig: KubeconfigTarget })]);
 
 const OperatorConfigSchema = Schema.Struct({
   target: Target.annotateKey({ messageMissingKey: "is required: alasio init writes it" }),
@@ -172,11 +172,11 @@ export const configPath: Effect.Effect<string, Config.ConfigError, GlobalFlag.Se
   return join(yield* xdgHome("XDG_CONFIG_HOME", ".config"), "alasio", "config.json");
 });
 
-/** Where the local cluster's volumes are unless its target says: $XDG_DATA_HOME/alasio/storage. */
+/** Where the volumes of a cluster on this machine are unless its target says: $XDG_DATA_HOME/alasio/storage. */
 export const defaultStoragePath: Effect.Effect<string, Config.ConfigError> = Effect.map(xdgHome("XDG_DATA_HOME", ".local/share"), (data) => join(data, "alasio", "storage"));
 
-/** The kubeconfig of the local cluster, beside the config file. */
-export const localKubeconfigPath = (config: Pick<OperatorConfig, "path">): string => join(dirname(config.path), "kubeconfig");
+/** The kubeconfig of a cluster alasio makes on this machine, beside the config file. */
+export const clusterKubeconfigPath = (config: Pick<OperatorConfig, "path">): string => join(dirname(config.path), "kubeconfig");
 
 /** The config at `path`, or null when there is none. */
 export const readConfig = Effect.fnUntraced(function*(path: string): Effect.fn.Return<OperatorConfig | null, OperatorConfigError | PlatformError.PlatformError, FileSystem.FileSystem> {

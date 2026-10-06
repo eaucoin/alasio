@@ -32,10 +32,10 @@ function directory(t: TestContext): string {
   return made;
 }
 
-test("a local target is defaulted, and keeps the port and storage it was given", () => {
-  const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873 } } });
+test("a docker target is defaulted, and keeps the port and storage it was given", () => {
+  const decoded = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873 } } });
   assert.ok(Result.isSuccess(decoded));
-  assert.deepEqual(decoded.success.target, { local: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0 } });
+  assert.deepEqual(decoded.success.target, { docker: { name: "alasio", apiPort: 41873, hostAliases: [], mounts: [], agents: 0 } });
   assert.deepEqual(decoded.success.install, {});
 });
 
@@ -47,9 +47,9 @@ test("a kubeconfig target needs neither its path nor its context", () => {
 
 test("what is refused is said with the file, the key and why", () => {
   assert.equal(refusal({}), `${PATH}: target is required: alasio init writes it`);
-  assert.equal(refusal({ target: { local: {} } }), `${PATH}: target.local.apiPort is required: alasio init chooses one`);
-  assert.equal(refusal({ target: { local: { apiPort: 70000 } } }), `${PATH}: target.local.apiPort must be a port from 1 to 65535`);
-  assert.equal(refusal({ target: { local: { apiPort: 1, storagePath: "data" } } }), `${PATH}: target.local.storagePath must be an absolute path`);
+  assert.equal(refusal({ target: { docker: {} } }), `${PATH}: target.docker.apiPort is required: alasio init chooses one`);
+  assert.equal(refusal({ target: { docker: { apiPort: 70000 } } }), `${PATH}: target.docker.apiPort must be a port from 1 to 65535`);
+  assert.equal(refusal({ target: { docker: { apiPort: 1, storagePath: "data" } } }), `${PATH}: target.docker.storagePath must be an absolute path`);
   assert.match(refusal({ target: { kubeconfig: {} }, telemetry: {} }), /^\/home\/op\/\.config\/alasio\/config\.json: telemetry /u);
   assert.equal(
     refusal({ target: { kubeconfig: {} }, install: { host: { mounts: [{ name: "home", hostPath: "home", mountPath: "/home" }] } } }),
@@ -87,19 +87,19 @@ test("the config is where XDG_CONFIG_HOME says, else under HOME, unless --config
 
 test("the config is written readable by its owner alone, in a directory only its owner opens", async (t) => {
   const path = join(directory(t), "alasio", "config.json");
-  await run(writeConfig(path, { target: { local: { apiPort: 41873 } } }));
+  await run(writeConfig(path, { target: { docker: { apiPort: 41873 } } }));
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(statSync(join(path, "..")).mode & 0o777, 0o700);
-  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { target: { local: { apiPort: 41873 } } });
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { target: { docker: { apiPort: 41873 } } });
   const read = await run(readConfig(path));
   assert.equal(read?.path, path);
-  assert.deepEqual(read?.file, { target: { local: { apiPort: 41873 } } });
+  assert.deepEqual(read?.file, { target: { docker: { apiPort: 41873 } } });
 });
 
 test("a config that is refused is not written", async (t) => {
   const path = join(directory(t), "config.json");
-  const error = await run(Effect.flip(writeConfig(path, { target: { local: { apiPort: 0 } } })));
-  assert.equal(error.message, `${path}: target.local.apiPort must be a port from 1 to 65535`);
+  const error = await run(Effect.flip(writeConfig(path, { target: { docker: { apiPort: 0 } } })));
+  assert.equal(error.message, `${path}: target.docker.apiPort must be a port from 1 to 65535`);
   assert.throws(() => statSync(path), /ENOENT/u);
 });
 
@@ -111,14 +111,14 @@ test("no config reads as none, and one that is not JSON says so", async (t) => {
   assert.match(error.message, /broken\.json: is not JSON: /u);
 });
 
-test("the local cluster mounts the host profile's paths, and keeps its storage under XDG_DATA_HOME unless given", async () => {
+test("the cluster in Docker mounts the host profile's paths, and keeps its storage under XDG_DATA_HOME unless given", async () => {
   const decoded = decodeOperatorConfig(PATH, {
-    target: { local: { apiPort: 41873, mounts: [{ source: "/srv", target: "/srv" }] } },
+    target: { docker: { apiPort: 41873, mounts: [{ source: "/srv", target: "/srv" }] } },
     install: { host: { enabled: true, mounts: [{ name: "home", hostPath: "/home/op", mountPath: "/home/op" }, { name: "srv", hostPath: "/srv", mountPath: "/srv" }] } },
   });
   assert.ok(Result.isSuccess(decoded));
   const target = await run(resolveTarget(decoded.success), { XDG_DATA_HOME: "/data" });
-  assert.ok(target._tag === "Local");
+  assert.ok(target._tag === "Docker");
   assert.equal(target.cluster.storagePath, "/data/alasio/storage");
   assert.deepEqual(target.cluster.mounts, [{ source: "/srv", target: "/srv" }, { source: "/home/op", target: "/home/op", readOnly: false }]);
   assert.equal(target.kubeconfig.path, "/home/op/.config/alasio/kubeconfig");
@@ -127,44 +127,44 @@ test("the local cluster mounts the host profile's paths, and keeps its storage u
 
 test("a host profile path the target's own mounts already put in the node is not mounted again", async () => {
   const decoded = decodeOperatorConfig(PATH, {
-    target: { local: { apiPort: 41873, mounts: [{ source: "/tmp", target: "/host/tmp" }] } },
+    target: { docker: { apiPort: 41873, mounts: [{ source: "/tmp", target: "/host/tmp" }] } },
     install: { host: { enabled: true, mounts: [{ name: "tmp", hostPath: "/host/tmp", mountPath: "/tmp" }, { name: "home", hostPath: "/home", mountPath: "/home" }] } },
   });
   assert.ok(Result.isSuccess(decoded));
   const target = await run(resolveTarget(decoded.success));
-  assert.ok(target._tag === "Local");
+  assert.ok(target._tag === "Docker");
   assert.deepEqual(target.cluster.mounts, [{ source: "/tmp", target: "/host/tmp" }, { source: "/home", target: "/home", readOnly: false }]);
 });
 
-test("the local cluster runs the node image the config names, such as one built here", async () => {
-  const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, storagePath: "/srv/storage", image: "alasio-node:dev" } } });
+test("the cluster in Docker runs the node image the config names, such as one built here", async () => {
+  const decoded = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873, storagePath: "/srv/storage", image: "alasio-node:dev" } } });
   assert.ok(Result.isSuccess(decoded));
   const target = await run(resolveTarget(decoded.success));
-  assert.ok(target._tag === "Local");
+  assert.ok(target._tag === "Docker");
   assert.equal(target.cluster.image, "alasio-node:dev");
 });
 
-test("the local cluster's registries are k3s's registries.yaml, without a login, which is a secret", async () => {
+test("the cluster in Docker's registries are k3s's registries.yaml, without a login, which is a secret", async () => {
   const registries = {
     mirrors: { "registry.example:5000": { endpoint: ["http://registry.example:5000"] } },
     configs: { "mirror.example": { tls: { caFile: "/etc/ssl/mirror-ca.pem" } } },
   };
-  const decoded = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, registries } } });
+  const decoded = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873, registries } } });
   assert.ok(Result.isSuccess(decoded));
   const target = await run(resolveTarget(decoded.success));
-  assert.ok(target._tag === "Local");
+  assert.ok(target._tag === "Docker");
   assert.deepEqual(target.cluster.registries, registries);
 
-  const only = decodeOperatorConfig(PATH, { target: { local: { apiPort: 41873, registries: { mirrors: { "*": { endpoint: ["https://mirror.example"] } } } } } });
-  assert.ok(Result.isSuccess(only) && "local" in only.success.target);
-  assert.deepEqual(only.success.target.local.registries, { mirrors: { "*": { endpoint: ["https://mirror.example"] } }, configs: {} });
+  const only = decodeOperatorConfig(PATH, { target: { docker: { apiPort: 41873, registries: { mirrors: { "*": { endpoint: ["https://mirror.example"] } } } } } });
+  assert.ok(Result.isSuccess(only) && "docker" in only.success.target);
+  assert.deepEqual(only.success.target.docker.registries, { mirrors: { "*": { endpoint: ["https://mirror.example"] } }, configs: {} });
 
-  const local = (given: unknown) => ({ target: { local: { apiPort: 41873, registries: given } } });
-  assert.equal(refusal(local({ mirrors: { "registry.example": { endpoint: [] } } })), `${PATH}: target.local.registries.mirrors.registry.example.endpoint must name an endpoint`);
+  const docker = (given: unknown) => ({ target: { docker: { apiPort: 41873, registries: given } } });
+  assert.equal(refusal(docker({ mirrors: { "registry.example": { endpoint: [] } } })), `${PATH}: target.docker.registries.mirrors.registry.example.endpoint must name an endpoint`);
   assert.equal(
-    refusal(local({ mirrors: { "registry.example": { endpoint: ["registry.example:5000"] } } })),
-    `${PATH}: target.local.registries.mirrors.registry.example.endpoint.0 must be an http(s) URL`,
+    refusal(docker({ mirrors: { "registry.example": { endpoint: ["registry.example:5000"] } } })),
+    `${PATH}: target.docker.registries.mirrors.registry.example.endpoint.0 must be an http(s) URL`,
   );
-  assert.equal(refusal(local({ configs: { "registry.example": { tls: { caFile: "ca.pem" } } } })), `${PATH}: target.local.registries.configs.registry.example.tls.caFile must be an absolute path`);
-  assert.match(refusal(local({ configs: { "registry.example": { tls: {}, auth: { username: "me", password: "secret" } } } })), /target\.local\.registries\.configs\.registry\.example\.auth /u);
+  assert.equal(refusal(docker({ configs: { "registry.example": { tls: { caFile: "ca.pem" } } } })), `${PATH}: target.docker.registries.configs.registry.example.tls.caFile must be an absolute path`);
+  assert.match(refusal(docker({ configs: { "registry.example": { tls: {}, auth: { username: "me", password: "secret" } } } })), /target\.docker\.registries\.configs\.registry\.example\.auth /u);
 });

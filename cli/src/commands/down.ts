@@ -2,9 +2,9 @@
 import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
-import { LocalCluster } from "../cluster/local.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { loadConfig } from "../config.ts";
-import { describeTarget, localCluster, resolveTarget } from "../target.ts";
+import { describeTarget, dockerCluster, resolveTarget } from "../target.ts";
 
 /** The command is for the cluster alasio makes, and the config targets another. */
 export class NotLocal extends Schema.TaggedError<NotLocal>()("NotLocal", {
@@ -20,10 +20,10 @@ export class NotLocal extends Schema.TaggedError<NotLocal>()("NotLocal", {
 export const down = Command.make("down", {}, () =>
   Effect.gen(function*() {
     const target = yield* resolveTarget(yield* loadConfig);
-    if (target._tag !== "Local") {
+    if (target._tag !== "Docker") {
       return yield* new NotLocal({ command: "down", target: describeTarget(target), instead: "alasio uninstall removes alasio from it" });
     }
-    yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.down), localCluster(target.cluster));
+    yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.down), dockerCluster(target.cluster));
     yield* Console.log(`alasio is stopped, with everything kept; alasio up starts it again.`);
   })).pipe(
     Command.withShortDescription("Stop the cluster on this machine"),

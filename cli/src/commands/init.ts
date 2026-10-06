@@ -15,13 +15,13 @@ import { homedir } from "node:os";
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted, Result, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
-import { requireLocalHost } from "../cluster/host.ts";
-import { LocalCluster } from "../cluster/local.ts";
+import { requireLocalHost } from "../cluster/machine.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { configPath, decodeOperatorConfig, defaultStoragePath, type OperatorConfigFile, readConfig, writeConfig } from "../config.ts";
 import { applyNamespace } from "../install.ts";
 import { OptionalUrl } from "../manifests/config.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot, writeClaudeToken, writeTelegramBot } from "../secrets.ts";
-import { kubeApi, localCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { TelegramBotApi } from "../telegram.ts";
 import { timeoutFlag } from "./common.ts";
 import { bringUp, ensureCluster } from "./up.ts";
@@ -46,7 +46,7 @@ export class SettingInvalid extends Schema.TaggedError<SettingInvalid>()("Settin
   }
 }
 
-/** A port of the loopback no one listens on now, which the local cluster's API server keeps from then on. */
+/** A port of the loopback no one listens on now, which the API server of the cluster in Docker keeps from then on. */
 const freePort = Effect.callback<number>((resume) => {
   const server = createServer();
   server.listen(0, "127.0.0.1", () => {
@@ -208,11 +208,11 @@ const chooseTarget = Effect.fnUntraced(function*(given: Flags, ask: boolean, exi
     ? yield* Prompt.Select({
       message: "Where should alasio run?",
       choices: [
-        { title: "Here", value: "local", description: "in a cluster alasio makes on this machine, in Docker" },
+        { title: "Here", value: "docker", description: "in a cluster alasio makes on this machine, in Docker" },
         { title: "In a cluster of mine", value: "kubeconfig", description: "one a kubeconfig reaches" },
       ],
     })
-    : "local";
+    : "docker";
   if (where === "kubeconfig") {
     const path = yield* Prompt.String({
       message: "Its kubeconfig (empty for $KUBECONFIG, or ~/.kube/config)",
@@ -221,13 +221,13 @@ const chooseTarget = Effect.fnUntraced(function*(given: Flags, ask: boolean, exi
     const context = yield* Prompt.String({ message: "Its context (empty for the kubeconfig's current one)" });
     return { kubeconfig: { ...(path ? { path } : {}), ...(context ? { context } : {}) } };
   }
-  return { local: { name: "alasio", apiPort: yield* freePort, storagePath: yield* defaultStoragePath } };
+  return { docker: { name: "alasio", apiPort: yield* freePort, storagePath: yield* defaultStoragePath } };
 });
 
-/** The Secrets the cluster has now, when it can be reached without being started: none for a local cluster not running. */
+/** The Secrets the cluster has now, when it can be reached without being started: none for a cluster in Docker not running. */
 const currentSecrets = Effect.fnUntraced(function*(target: ResolvedTarget) {
-  if (target._tag === "Local") {
-    const { nodes } = yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.status), localCluster(target.cluster));
+  if (target._tag === "Docker") {
+    const { nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
     if (!nodes.some(({ role, state }) => role === "server" && state === "running")) return { bot: null, claude: null };
   }
   return yield* Effect.provide(Effect.all({ bot: readTelegramBot, claude: readClaudeToken }), kubeApi(target));
@@ -370,7 +370,7 @@ export const init = Command.make("init", flags, (given) =>
     const target = yield* chooseTarget(given, ask, existing?.file ?? null);
     const resolved = yield* resolveTarget(yield* Effect.fromResult(decodeOperatorConfig(path, { target, install })));
     // Before any question, as the cluster here cannot run without them.
-    if (resolved._tag === "Local") yield* requireLocalHost;
+    if (resolved._tag === "Docker") yield* requireLocalHost;
     const current = yield* currentSecrets(resolved);
 
     const bot = yield* chooseBot(given, ask, current.bot);

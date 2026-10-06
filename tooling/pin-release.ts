@@ -61,7 +61,7 @@ export const IMAGES = {
   lake: ${image("alasio-lake")},
 };
 
-/** The local cluster's node image: k3s with gVisor (cluster/node), pinned like the others. */
+/** The node image of the cluster in Docker: k3s with gVisor (cluster/node), pinned like the others. */
 export const NODE_IMAGE = ${image("alasio-node")};
 `;
 }

@@ -106,7 +106,7 @@ keep their files, each in a bucket the store must already have.
 cluster's default StorageClass instead of JuiceFS's; a workspace keeps the
 volume it was made with either way. `alasio up` applies what you change.
 
-The config's `target.local` is the cluster alasio makes, and `registries` in it
+The config's `target.docker` is the cluster alasio makes, and `registries` in it
 says where its nodes pull images from, as k3s's `registries.yaml` does, its
 keys in camel case: `mirrors`, the endpoints that stand for a registry, and
 `configs`, a registry's TLS, its files the nodes' own, as `mounts` mounts them.

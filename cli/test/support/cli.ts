@@ -9,7 +9,7 @@ import { ConfigProvider, Effect, type Exit, Layer, Logger, Sink, Stdio, type Ter
 import { Command } from "effect/cli";
 import { TestConsole } from "effect/testing";
 
-import { INOTIFY_MINIMUMS, Machine, Sysctl } from "../../src/cluster/host.ts";
+import { INOTIFY_MINIMUMS, Machine, Sysctl } from "../../src/cluster/machine.ts";
 import { alasio } from "../../src/commands.ts";
 import { TelegramBotApi } from "../../src/telegram.ts";
 import { fakeTerminal } from "./fake-terminal.ts";

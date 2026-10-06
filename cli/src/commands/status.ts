@@ -2,14 +2,14 @@
 import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
-import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/host.ts";
-import { LocalCluster } from "../cluster/local.ts";
+import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { loadConfig } from "../config.ts";
 import { describeRef, kind, KubeApi, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness } from "../kube/rollout.ts";
 import { RELEASE } from "../manifests/common.ts";
-import { describeTarget, kubeApi, localCluster, resolveTarget } from "../target.ts";
+import { describeTarget, kubeApi, dockerCluster, resolveTarget } from "../target.ts";
 import { ClusterNotRunning } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
@@ -29,10 +29,10 @@ export const status = Command.make("status", {}, () =>
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
     // The cluster here runs only on a machine of its kind, whose limits are read from Linux's /proc.
-    if (target._tag === "Local") yield* requireLocalMachine;
-    const shortfalls = target._tag === "Local" ? yield* inotifyShortfalls : [];
-    if (target._tag === "Local") {
-      const { docker, nodes } = yield* Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.status), localCluster(target.cluster));
+    if (target._tag === "Docker") yield* requireLocalMachine;
+    const shortfalls = target._tag === "Docker" ? yield* inotifyShortfalls : [];
+    if (target._tag === "Docker") {
+      const { docker, nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
       yield* Console.log(`cluster ${target.cluster.name}, in Docker ${docker}:`);
       yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state }) => `  ${name}: ${state}`).join("\n") : "  not made");
       for (const shortfall of shortfalls) yield* Console.log(`  this machine's ${describeShortfall(shortfall)}`);

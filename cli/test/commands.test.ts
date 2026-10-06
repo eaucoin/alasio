@@ -45,7 +45,7 @@ async function rig(t: TestContext): Promise<Rig> {
   const kube = await serveFakeKube();
   const telegram = await serveFakeTelegram();
   telegram.bots.set(BOT_TOKEN, BOT);
-  // The local cluster's server node writes a kubeconfig that reaches the fake API, at the port the config gives it.
+  // The server node of the cluster in Docker writes a kubeconfig that reaches the fake API, at the port the config gives it.
   const { fake: docker } = await serveK3sInDocker(kube.kubeconfig);
   const home = mkdtempSync(join(tmpdir(), "alasio-commands-"));
   t.after(async () => {
@@ -203,24 +203,24 @@ test("init makes the cluster here unless told otherwise, its API on a port it ke
   const run = await alasio(["init", "--no-up"], [[ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER]]);
   // The node's kubeconfig names the port the config chose, where the fake API is not, so the Secrets are not written.
   assert.match(failure(run), /^Kubernetes could not be reached for PATCH \/api\/v1\/namespaces\/alasio/u);
-  const { target } = config() as { target: { local: { name: string; apiPort: number; storagePath: string } } };
-  assert.equal(target.local.name, "alasio");
-  assert.ok(target.local.apiPort > 0);
-  assert.equal(target.local.storagePath, join(env.XDG_DATA_HOME, "alasio", "storage"));
+  const { target } = config() as { target: { docker: { name: string; apiPort: number; storagePath: string } } };
+  assert.equal(target.docker.name, "alasio");
+  assert.ok(target.docker.apiPort > 0);
+  assert.equal(target.docker.storagePath, join(env.XDG_DATA_HOME, "alasio", "storage"));
   assert.equal(docker.containers.get("alasio-server-0")?.state, "running");
 });
 
 test("init asks nothing with --non-interactive, takes tokens from files and the environment, and makes the configured cluster", async (t) => {
   const { config, configFile, configure, docker, env, home, kube } = await rig(t);
   const storagePath = join(home, "storage");
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath } } });
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, `${BOT_TOKEN}\n`);
   const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], {
     env: { ...env, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-env" },
   });
   succeeded(run);
-  assert.deepEqual(config(), { target: { local: { name: "dev", apiPort: kube.port, storagePath } }, install: {} });
+  assert.deepEqual(config(), { target: { docker: { name: "dev", apiPort: kube.port, storagePath } }, install: {} });
   assert.equal(docker.containers.get("dev-server-0")?.state, "running");
   assert.equal(statSync(join(configFile, "..", "kubeconfig")).mode & 0o777, 0o600);
   assert.equal(secretValue(kube, "alasio-telegram", "token"), BOT_TOKEN);
@@ -290,7 +290,7 @@ test("status says each workload's state, and fails when one is not ready", async
 
 test("init, up and status here refuse inotify limits too low for the cluster, saying how to raise them", async (t) => {
   const { configure, docker, env, home, kube } = await rig(t);
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
   const sysctl = { "fs.inotify.max_user_instances": "128\n", "fs.inotify.max_user_watches": "524288\n" };
   const shortfall = "fs.inotify.max_user_instances is 128, and the cluster needs at least 1024";
   const refusal = [
@@ -318,7 +318,7 @@ test("init, up and status here refuse inotify limits too low for the cluster, sa
 test("init, up and status refuse to make a cluster on a machine other than Linux on x86-64, but reach one elsewhere from it", async (t) => {
   const { configure, docker, env, home, kube } = await rig(t);
   const mac = { platform: "darwin", arch: "arm64" };
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
   const refusal = "the cluster alasio makes on this machine runs on Linux on x86-64, and this is darwin on arm64: " +
     "run alasio on such a machine, or give it a cluster elsewhere with alasio init --kubeconfig";
   for (const command of ["init", "up", "status"]) assert.equal(failure(await runAlasio([command], { env, machine: mac })), refusal, command);
@@ -332,7 +332,7 @@ test("init, up and status refuse to make a cluster on a machine other than Linux
 
 test("status of a stopped cluster here says that up starts it", async (t) => {
   const { alasio, configure, docker, home, kube } = await rig(t);
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
   assert.equal(failure(await alasio(["status"])), "there is no cluster dev yet: alasio up makes it");
   docker.containers.set("dev-server-0", { body: { Labels: { "alasio.cluster": "dev", "alasio.role": "server" } }, state: "exited" });
   const run = await alasio(["status"]);
@@ -409,7 +409,7 @@ test("lake runs the query in the lake's pod and prints its answer, in the format
 
 test("down stops the cluster here, keeping everything, and is not for a cluster a kubeconfig reaches", async (t) => {
   const { alasio, configure, docker, home, kube, kubeconfig } = await rig(t);
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
   docker.containers.set("dev-server-0", { body: { Labels: { "alasio.cluster": "dev", "alasio.role": "server" } }, state: "running" });
   succeeded(await alasio(["down"]));
   assert.equal(docker.containers.get("dev-server-0")?.state, "exited");
@@ -437,7 +437,7 @@ test("uninstall asks first, and keeps alasio's data unless --purge", async (t) =
 test("uninstall --purge removes the cluster here whole: its nodes, volumes, storage and kubeconfig, but not the config", async (t) => {
   const { alasio, configFile, configure, docker, env, home, kube } = await rig(t);
   const storagePath = join(home, "storage");
-  configure({ target: { local: { name: "dev", apiPort: kube.port, storagePath } } });
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath } } });
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
   succeeded(await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"], { env }));

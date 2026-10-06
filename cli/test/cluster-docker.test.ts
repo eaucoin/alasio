@@ -1,215 +1,413 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, type TestContext } from "node:test";
 
-import { Effect, Result } from "effect";
+import { NodeServices } from "@effect/platform-node";
+import { KubeConfig } from "@kubernetes/client-node";
+import { Effect, Layer, Logger } from "effect";
 
-import { demultiplex, DockerEngine, DockerError, dockerSocket, firstFile } from "../src/cluster/docker.ts";
-import { type FakeDocker, type FakeDockerOptions, frame, serveFakeDocker, tarOf } from "./support/fake-docker.ts";
+import { DockerEngine } from "../src/cluster/docker-engine.ts";
+import { freeSubnet, DockerCluster, type DockerClusterOptions, localKubeconfig, nodeHostsWith, registriesYaml, subnetAddress } from "../src/cluster/docker.ts";
+import type { FakeDocker } from "./support/fake-docker.ts";
+import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
-/** Runs `body` with the client on a fake Docker served for it. */
-async function withDocker<A>(
-  body: (docker: DockerEngine["Service"], fake: FakeDocker) => Effect.Effect<A, unknown>,
-  options: FakeDockerOptions = {},
-): Promise<A> {
-  const fake = await serveFakeDocker(options);
-  try {
-    return await Effect.runPromise(
-      DockerEngine.pipe(Effect.flatMap((docker) => body(docker, fake)), Effect.provide(DockerEngine.layer({ DOCKER_HOST: fake.host }))),
-    );
-  } finally {
-    await fake.close();
-  }
+/** The kubeconfig k3s writes in a server node. */
+const K3S_YAML = `apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: Q0E=
+    server: https://127.0.0.1:6443
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+kind: Config
+users:
+- name: default
+  user:
+    client-certificate-data: Q0VSVA==
+    client-key-data: S0VZ
+`;
+
+/** A fake Docker with k3s in its nodes, a directory for the cluster's files, and a way to run a DockerCluster on them. */
+interface Rig {
+  readonly fake: FakeDocker;
+  readonly k3s: FakeK3s;
+  readonly kubeconfig: string;
+  readonly options: DockerClusterOptions;
+  readonly run: <A, E>(body: (cluster: DockerCluster["Service"]) => Effect.Effect<A, E>, options?: Partial<DockerClusterOptions>) => Promise<A>;
 }
 
-const container = { Image: "node", Hostname: "n", Cmd: ["server"], Env: [], Labels: { "alasio.cluster": "c" } } as const;
-const hostConfig = {
-  Privileged: true,
-  Init: true,
-  CgroupnsMode: "private",
-  RestartPolicy: { Name: "unless-stopped" },
-  SecurityOpt: [],
-  Tmpfs: {},
-  Mounts: [],
-  ExtraHosts: [],
-} as const;
-const containerCreate = { ...container, HostConfig: hostConfig, NetworkingConfig: { EndpointsConfig: {} } };
-
-test("DOCKER_HOST names the socket, Docker's own unless set, and only a unix:// one", () => {
-  assert.deepEqual(dockerSocket({}), Result.succeed("/var/run/docker.sock"));
-  assert.deepEqual(dockerSocket({ DOCKER_HOST: "unix:///run/user/1000/docker.sock" }), Result.succeed("/run/user/1000/docker.sock"));
-  const refused = dockerSocket({ DOCKER_HOST: "tcp://10.0.0.1:2375" });
-  assert.ok(Result.isFailure(refused));
-  assert.match(refused.failure.message, /tcp:\/\/10\.0\.0\.1:2375.*Unix socket/u);
-});
-
-test("an object that is not there is null, and one that is, Docker's answer", async () => {
-  const seen = await withDocker((docker, fake) =>
-    Effect.gen(function*() {
-      const before = yield* docker.inspectContainer("n");
-      yield* docker.createContainer("n", containerCreate);
-      fake.images.add("node:1");
-      return { before, after: yield* docker.inspectContainer("n"), image: yield* docker.inspectImage("node:1"), network: yield* docker.inspectNetwork("c") };
-    })
-  );
-  assert.equal(seen.before, null);
-  assert.deepEqual(seen.after?.State, { Status: "created", Running: false, StartedAt: "0001-01-01T00:00:00Z" });
-  assert.deepEqual(seen.after?.Config.Labels, { "alasio.cluster": "c" });
-  assert.equal(seen.image?.Id, "sha256:node:1");
-  assert.equal(seen.network, null);
-});
-
-test("calls go to API version 1.44, with their names in the query and their bodies as JSON", async () => {
-  const requests = await withDocker((docker, fake) =>
-    Effect.gen(function*() {
-      yield* docker.createContainer("n", containerCreate);
-      yield* docker.listContainers({ "alasio.cluster": "c" });
-      return fake.requests;
-    })
-  );
-  const [create, list] = requests;
-  assert.equal(create?.method, "POST");
-  assert.equal(create?.path, "/containers/create");
-  assert.equal(create?.query.get("name"), "n");
-  assert.deepEqual(create?.body, containerCreate);
-  assert.equal(list?.query.get("all"), "true");
-  assert.deepEqual(JSON.parse(list?.query.get("filters") ?? ""), { label: ["alasio.cluster=c"] });
-});
-
-test("a refusal carries Docker's status and message", async () => {
-  const error = await withDocker((docker) =>
-    docker.createContainer("n", containerCreate).pipe(Effect.andThen(docker.createContainer("n", containerCreate)), Effect.flip)
-  );
-  assert.ok(error instanceof DockerError);
-  assert.equal(error.status, 409);
-  assert.equal(error.call, "POST /containers/create");
-  assert.match(error.message, /^Docker answered 409 to POST \/containers\/create: Conflict\. The container name "\/n" is already in use$/u);
-});
-
-test("starting a running container, stopping a stopped one and removing a removed one are not errors", async () => {
-  const changes = await withDocker((docker, fake) =>
-    Effect.gen(function*() {
-      yield* docker.createContainer("n", containerCreate);
-      yield* docker.startContainer("n");
-      yield* docker.startContainer("n");
-      yield* docker.stopContainer("n");
-      yield* docker.stopContainer("n");
-      yield* docker.removeContainer("n");
-      yield* docker.removeContainer("n");
-      yield* docker.removeNetwork("c");
-      yield* docker.removeVolume("v");
-      return fake.changes();
-    })
-  );
-  assert.equal(changes.length, 9);
-});
-
-test("a container Docker killed but has not seen exit is removed once it has", async () => {
-  const deletes = await withDocker(
-    (docker, fake) =>
-      Effect.gen(function*() {
-        yield* docker.createContainer("n", containerCreate);
-        yield* docker.removeContainer("n");
-        return { left: fake.containers.has("n"), tries: fake.requests.filter(({ method, path }) => method === "DELETE" && path === "/containers/n").length };
-      }),
-    { slowToDie: (container) => (container === "n" ? 2 : 0) },
-  );
-  assert.deepEqual(deletes, { left: false, tries: 3 });
-});
-
-test("a pull that fails after Docker answered 200 fails with the error its progress ends with", async () => {
-  const error = await withDocker(
-    (docker, fake) =>
-      docker.pullImage("ghcr.io/eaucoin/alasio-node:1").pipe(
-        Effect.andThen(Effect.sync(() => assert.ok(fake.images.has("ghcr.io/eaucoin/alasio-node:1")))),
-        Effect.andThen(docker.pullImage("ghcr.io/eaucoin/private:1")),
-        Effect.flip,
+/** A cluster on a fake Docker; its network's subnet given in its settings, unless `subnet` is null. */
+async function rig(t: TestContext, subnet: string | null = "172.30.9.0/24"): Promise<Rig> {
+  const { fake, k3s } = await serveK3sInDocker(K3S_YAML, { pullable: (reference) => !reference.endsWith(":absent") });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-cluster-"));
+  t.after(async () => {
+    await fake.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const options: DockerClusterOptions = {
+    name: "dev",
+    apiPort: 7443,
+    storagePath: join(directory, "storage"),
+    image: "ghcr.io/eaucoin/alasio-node:test",
+    ...(subnet === null ? {} : { subnet, hostAliases: [{ ip: "172.30.9.250", hostnames: ["otelcol.observability"] }] }),
+    readyTimeout: "300 millis",
+    poll: "5 millis",
+  };
+  return {
+    fake,
+    k3s,
+    kubeconfig: join(directory, "config", "kubeconfig"),
+    options,
+    run: (body, overrides = {}) =>
+      Effect.runPromise(
+        DockerCluster.pipe(
+          Effect.flatMap(body),
+          Effect.provide(
+            DockerCluster.layer({ ...options, ...overrides }).pipe(
+              Layer.provide(DockerEngine.layer({ DOCKER_HOST: fake.host })),
+              Layer.provide(NodeServices.layer),
+            ),
+          ),
+          Effect.provide(Logger.layer([])),
+        ),
       ),
-    { pullable: (reference) => !reference.includes("private") },
-  );
-  assert.equal(error.reason, "denied");
-  assert.equal(error.status, undefined);
+  };
+}
+
+/** The body of the request `METHOD path` the fake was sent last. */
+const sent = (fake: FakeDocker, method: string, path: string): unknown => fake.requests.findLast((request) => request.method === method && request.path === path)?.body;
+
+test("up makes the cluster: its image, network, volumes and server, waits for it, configures it, and writes its kubeconfig", async (t) => {
+  const { fake, k3s, kubeconfig, options, run } = await rig(t);
+  k3s.nodeHosts = "172.30.9.2 dev-server-0";
+  await run((cluster) => cluster.up(kubeconfig));
+
+  assert.deepEqual(fake.changes(), [
+    "POST /images/create",
+    "POST /networks/create",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /containers/create",
+    "POST /containers/dev-server-0/start",
+  ]);
+  assert.equal(fake.requests.find(({ path }) => path === "/images/create")?.query.get("fromImage"), "ghcr.io/eaucoin/alasio-node:test");
+  assert.deepEqual(sent(fake, "POST", "/networks/create"), {
+    Name: "dev",
+    Driver: "bridge",
+    IPAM: { Config: [{ Subnet: "172.30.9.0/24" }] },
+    Labels: { "alasio.cluster": "dev" },
+  });
+  assert.deepEqual([...fake.volumes.keys()], ["dev-server-0-k3s", "dev-server-0-kubelet", "dev-server-0-cni", "dev-server-0-log"]);
+
+  const { Labels, ...server } = sent(fake, "POST", "/containers/create") as { Labels: Record<string, string> };
+  assert.equal(Labels["alasio.cluster"], "dev");
+  assert.equal(Labels["alasio.role"], "server");
+  assert.match(Labels["alasio.spec"] ?? "", /^[0-9a-f]{64}$/u);
+  assert.deepEqual(server, {
+    Image: "ghcr.io/eaucoin/alasio-node:test",
+    Hostname: "dev-server-0",
+    Cmd: [
+      "server",
+      "--disable=traefik",
+      "--tls-san=127.0.0.1",
+      `--default-local-storage-path=${options.storagePath}`,
+      "--kubelet-arg=eviction-hard=imagefs.available<5%,nodefs.available<5%",
+      "--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
+      "--kubelet-arg=image-gc-high-threshold=98",
+      "--kubelet-arg=image-gc-low-threshold=95",
+    ],
+    Env: [],
+    ExposedPorts: { "6443/tcp": {} },
+    HostConfig: {
+      Privileged: true,
+      Init: true,
+      CgroupnsMode: "private",
+      RestartPolicy: { Name: "unless-stopped" },
+      SecurityOpt: ["label=disable"],
+      Tmpfs: { "/run": "", "/var/run": "" },
+      Mounts: [
+        { Type: "volume", Source: "dev-server-0-k3s", Target: "/var/lib/rancher/k3s" },
+        { Type: "volume", Source: "dev-server-0-kubelet", Target: "/var/lib/kubelet" },
+        { Type: "volume", Source: "dev-server-0-cni", Target: "/var/lib/cni" },
+        { Type: "volume", Source: "dev-server-0-log", Target: "/var/log" },
+        { Type: "bind", Source: options.storagePath, Target: options.storagePath },
+      ],
+      ExtraHosts: ["otelcol.observability:172.30.9.250"],
+      PortBindings: { "6443/tcp": [{ HostIp: "127.0.0.1", HostPort: "7443" }] },
+    },
+    NetworkingConfig: { EndpointsConfig: { dev: { IPAMConfig: { IPv4Address: "172.30.9.2" } } } },
+  });
+  assert.ok(statSync(options.storagePath).isDirectory());
+
+  assert.equal(k3s.nodeHosts, "172.30.9.2 dev-server-0\n172.30.9.250 otelcol.observability");
+  assert.deepEqual(k3s.patches, [{ metadata: { resourceVersion: "1" }, data: { NodeHosts: k3s.nodeHosts } }]);
+  assert.deepEqual(k3s.applied, [{ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" }]);
+
+  assert.equal(statSync(kubeconfig).mode & 0o777, 0o600);
+  const written = new KubeConfig();
+  written.loadFromString(readFileSync(kubeconfig, "utf8"));
+  assert.equal(written.getCurrentContext(), "dev");
+  assert.equal(written.getCurrentCluster()?.server, "https://127.0.0.1:7443");
+  assert.equal(written.getCurrentCluster()?.caData, "Q0E=");
+  assert.equal(written.getCurrentUser()?.keyData, "S0VZ");
 });
 
-test("volumes are made once and listed by label", async () => {
-  const volumes = await withDocker((docker) =>
-    Effect.gen(function*() {
-      yield* docker.createVolume({ Name: "a", Labels: { "alasio.cluster": "c" } });
-      yield* docker.createVolume({ Name: "a", Labels: { "alasio.cluster": "c" } });
-      yield* docker.createVolume({ Name: "b", Labels: { "alasio.cluster": "other" } });
-      return yield* docker.listVolumes({ "alasio.cluster": "c" });
-    })
-  );
-  assert.deepEqual(volumes, [{ Name: "a", Labels: { "alasio.cluster": "c" } }]);
+test("up again changes nothing in Docker or CoreDNS", async (t) => {
+  const { fake, k3s, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  const changes = fake.changes().length;
+  const patches = k3s.patches.length;
+  await run((cluster) => cluster.up(kubeconfig));
+  assert.deepEqual(fake.changes().slice(changes), []);
+  assert.equal(k3s.patches.length, patches);
+  assert.equal(k3s.applied.length, 2);
 });
 
-test("exec runs the command, sends its stdin, and parts its output from its errors", async () => {
-  const runs: { container: string; command: readonly string[]; stdin: string }[] = [];
-  const results = await withDocker(
-    (docker, fake) =>
-      Effect.gen(function*() {
-        yield* docker.createContainer("n", containerCreate);
-        yield* docker.startContainer("n");
-        const plain = yield* docker.exec("n", ["kubectl", "get", "nodes"]);
-        const fed = yield* docker.exec("n", ["kubectl", "apply", "--filename=-"], { stdin: "{\"kind\":\"RuntimeClass\"}" });
-        const start = fake.requests.find(({ path }) => path === "/exec/exec-0/start");
-        return { plain, fed, startBody: start?.body };
-      }),
+test("up starts a stopped cluster, and down stops it, keeping everything", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  await run((cluster) => cluster.down);
+  assert.equal(fake.containers.get("dev-server-0")?.state, "exited");
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.up(kubeconfig));
+  assert.deepEqual(fake.changes().slice(changes), ["POST /containers/dev-server-0/start"]);
+});
+
+test("up makes a node made from other settings anew, keeping its volumes", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.up(kubeconfig), { mounts: [{ source: "/home", target: "/home" }] });
+  assert.deepEqual(fake.changes().slice(changes), [
+    "POST /containers/dev-server-0/stop",
+    "DELETE /containers/dev-server-0",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /volumes/create",
+    "POST /containers/create",
+    "POST /containers/dev-server-0/start",
+  ]);
+  const { HostConfig } = sent(fake, "POST", "/containers/create") as { HostConfig: { Mounts: unknown[] } };
+  assert.deepEqual(HostConfig.Mounts.at(-1), { Type: "bind", Source: "/home", Target: "/home", ReadOnly: false });
+  assert.equal(fake.volumes.size, 4);
+});
+
+test("agents join the server with the token it made, at the addresses after it, and stop before it", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig), { agents: 2 });
+  const agents = fake.requests.filter(({ path, query }) => path === "/containers/create" && query.get("name")?.includes("agent"));
+  assert.deepEqual(agents.map(({ query }) => query.get("name")), ["dev-agent-0", "dev-agent-1"]);
+  const agent = agents[1]?.body as {
+    Cmd: string[];
+    Env: string[];
+    Labels: Record<string, string>;
+    ExposedPorts?: unknown;
+    HostConfig: { PortBindings?: unknown };
+    NetworkingConfig: unknown;
+  };
+  assert.equal(agent.Cmd[0], "agent");
+  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`]);
+  assert.equal(agent.Labels["alasio.role"], "agent");
+  assert.equal(agent.ExposedPorts, undefined);
+  assert.equal(agent.HostConfig.PortBindings, undefined);
+  assert.deepEqual(agent.NetworkingConfig, { EndpointsConfig: { dev: { IPAMConfig: { IPv4Address: "172.30.9.4" } } } });
+  // The server is ready before its token is read and the agents are made.
+  const firstAgent = fake.requests.findIndex(({ path, query }) => path === "/containers/create" && query.get("name") === "dev-agent-0");
+  const token = fake.requests.findIndex(({ path }) => path === "/containers/dev-server-0/archive");
+  assert.ok(token >= 0 && token < firstAgent);
+
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.down, { agents: 2 });
+  assert.deepEqual(fake.changes().slice(changes), [
+    "POST /containers/dev-agent-1/stop",
+    "POST /containers/dev-agent-0/stop",
+    "POST /containers/dev-server-0/stop",
+  ]);
+});
+
+test("up touches nothing of its name that is not the cluster's", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  fake.containers.set("dev-server-0", { body: { Labels: {} }, state: "running" });
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
+  assert.equal(error._tag, "ClusterUnusable");
+  assert.equal(error.message, "cluster dev cannot be made: a container named dev-server-0 is not one of its nodes");
+  assert.ok(!fake.changes().some((change) => change.includes("/containers/dev-server-0")));
+  assert.equal(fake.containers.get("dev-server-0")?.state, "running");
+});
+
+test("up refuses a network of the cluster's with another subnet than its settings'", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  fake.networks.set("dev", { Name: "dev", Labels: { "alasio.cluster": "dev" }, Subnet: "172.30.8.0/24" });
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
+  assert.equal(error.message, "cluster dev cannot be made: network dev has the subnet 172.30.8.0/24, not 172.30.9.0/24");
+});
+
+test("up gives a network made without a subnet the first 172.30.N.0/24 no other network has, so its nodes' addresses are fixed", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t, null);
+  fake.networks.set("bridge", { Name: "bridge", Labels: {}, Subnet: "172.17.0.0/16" });
+  fake.networks.set("other", { Name: "other", Labels: {}, Subnet: "172.30.0.0/24" });
+  await run((cluster) => cluster.up(kubeconfig));
+  assert.equal(fake.networks.get("dev")?.Subnet, "172.30.1.0/24");
+  const created = fake.requests.filter(({ path }) => path === "/containers/create").map(({ body }) => (body as { NetworkingConfig: { EndpointsConfig: Record<string, { IPAMConfig: { IPv4Address: string } }> } }).NetworkingConfig.EndpointsConfig["dev"]?.IPAMConfig.IPv4Address);
+  assert.deepEqual(created, ["172.30.1.2"]);
+});
+
+test("freeSubnet takes the first 172.30.N.0/24 that overlaps no network, and none when all do", () => {
+  assert.equal(freeSubnet([]), "172.30.0.0/24");
+  assert.equal(freeSubnet(["172.30.0.0/24", "172.30.1.0/25", "fd00::/64", "172.17.0.0/16"]), "172.30.2.0/24");
+  assert.equal(freeSubnet(["172.30.0.0/23"]), "172.30.2.0/24");
+  assert.equal(freeSubnet(["172.16.0.0/12"]), null);
+});
+
+test("up gives up on an API server that does not answer, saying why", async (t) => {
+  const { k3s, kubeconfig, run } = await rig(t);
+  k3s.apiReady = false;
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
+  assert.equal(error._tag, "ClusterNotReady");
+  assert.match(
+    error.message,
+    /^cluster dev was not ready within 0\.3s, waiting for its API server: kubectl get --raw=\/readyz in dev-server-0 exited with 1: The connection to the server 127\.0\.0\.1:6443 was refused$/u,
+  );
+});
+
+test("up waits for nodes reported ready since they started, not before", async (t) => {
+  const { k3s, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  await run((cluster) => cluster.down);
+  // The Ready status the server node had when it stopped, which it keeps until its kubelet reports again.
+  k3s.heartbeat = new Date(Date.now() - 60_000).toISOString();
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)));
+  assert.equal(error.message, "cluster dev was not ready within 0.3s, waiting for its nodes: not reported ready since started: dev-server-0");
+  k3s.heartbeat = null;
+  await run((cluster) => cluster.up(kubeconfig));
+});
+
+test("a pull that fails fails up before anything is made", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  const error = await run((cluster) => Effect.flip(cluster.up(kubeconfig)), { image: "ghcr.io/eaucoin/alasio-node:absent" });
+  assert.equal(error.message, "Docker failed POST /images/create: denied");
+  assert.deepEqual(fake.changes(), ["POST /images/create"]);
+});
+
+test("remove deletes the nodes and the network, and the volumes only when asked", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  fake.volumes.set("unrelated", {});
+  await run((cluster) => cluster.up(kubeconfig));
+  await run((cluster) => cluster.remove());
+  assert.equal(fake.containers.size, 0);
+  assert.equal(fake.networks.size, 0);
+  assert.equal(fake.volumes.size, 5);
+  await run((cluster) => cluster.remove({ volumes: true }));
+  assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
+});
+
+test("remove takes other containers off the network before removing it, and leaves them be", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig));
+  fake.containers.set("collector", { body: { Labels: {} }, state: "running" });
+  const network = fake.networks.get("dev");
+  assert.ok(network);
+  network.attached = ["collector"];
+  await run((cluster) => cluster.remove());
+  assert.equal(fake.networks.size, 0);
+  assert.deepEqual(fake.requests.filter(({ path }) => path === "/networks/dev/disconnect").map(({ body }) => body), [{ Container: "collector", Force: true }]);
+  assert.deepEqual([...fake.containers.keys()], ["collector"]);
+  assert.equal(fake.containers.get("collector")?.state, "running");
+});
+
+test("remove with the storage empties it in the server node, as root, then removes it", async (t) => {
+  const { fake, kubeconfig, options, run } = await rig(t);
+  await run((cluster) => cluster.up(kubeconfig).pipe(Effect.andThen(cluster.down)));
+  await run((cluster) => cluster.remove({ volumes: true, storage: true }));
+  const commands = fake.requests.filter(({ path }) => path === "/containers/dev-server-0/exec").map(({ body }) => (body as { Cmd: string[] }).Cmd);
+  assert.deepEqual(commands.at(-1), ["find", options.storagePath, "-mindepth", "1", "-delete"]);
+  assert.equal(fake.containers.size, 0);
+  assert.throws(() => statSync(options.storagePath), /ENOENT/u);
+});
+
+test("status is Docker's version and the cluster's nodes, the server first", async (t) => {
+  const { kubeconfig, run } = await rig(t);
+  assert.deepEqual(await run((cluster) => cluster.status), { docker: "29.0.0", nodes: [] });
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1 });
+  await run((cluster) => cluster.down, { agents: 1 });
+  assert.deepEqual(await run((cluster) => cluster.status), {
+    docker: "29.0.0",
+    nodes: [{ name: "dev-server-0", role: "server", state: "exited" }, { name: "dev-agent-0", role: "agent", state: "exited" }],
+  });
+});
+
+test("every node is made with the registries, as k3s's registries.yaml, and made anew when they change", async (t) => {
+  const { fake, kubeconfig, run } = await rig(t);
+  const registries = { mirrors: { "registry.example:5000": { endpoint: ["http://registry.example:5000"] } } };
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries });
+  const environments = () =>
+    fake.requests.filter(({ path }) => path === "/containers/create").map(({ query, body }) => [query.get("name"), (body as { Env: string[] }).Env.filter((variable) => variable.startsWith("ALASIO_REGISTRIES="))]);
+  assert.deepEqual(environments(), [
+    ["dev-server-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
+    ["dev-agent-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
+  ]);
+
+  const changes = fake.changes().length;
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries: { ...registries, configs: { "registry.example:5000": { tls: { insecureSkipVerify: true } } } } });
+  assert.deepEqual(fake.changes().slice(changes).filter((change) => !change.startsWith("POST /volumes")), [
+    "POST /containers/dev-server-0/stop",
+    "DELETE /containers/dev-server-0",
+    "POST /containers/create",
+    "POST /containers/dev-server-0/start",
+    "POST /containers/dev-agent-0/stop",
+    "DELETE /containers/dev-agent-0",
+    "POST /containers/create",
+    "POST /containers/dev-agent-0/start",
+  ]);
+  assert.match(environments().at(-1)?.[1]?.[0] ?? "", /"configs":\{"registry\.example:5000":\{"tls":\{"insecure_skip_verify":true\}\}\}/u);
+});
+
+test("registriesYaml says the registries in k3s's keys, leaving out what is not given", () => {
+  assert.deepEqual(JSON.parse(registriesYaml({})), { mirrors: {}, configs: {} });
+  assert.deepEqual(
+    JSON.parse(registriesYaml({
+      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
+      configs: { "mirror.example": { tls: { caFile: "/etc/ssl/mirror-ca.pem", certFile: "/etc/ssl/node.pem", keyFile: "/etc/ssl/node-key.pem" } } },
+    })),
     {
-      onExec: (container, command, stdin) => {
-        runs.push({ container, command, stdin: stdin.toString("utf8") });
-        return command.includes("apply") ? { exitCode: 1, stderr: "refused" } : { exitCode: 0, stdout: "node Ready\n", stderr: "warning\n" };
-      },
+      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
+      configs: { "mirror.example": { tls: { ca_file: "/etc/ssl/mirror-ca.pem", cert_file: "/etc/ssl/node.pem", key_file: "/etc/ssl/node-key.pem" } } },
     },
   );
-  assert.deepEqual(runs, [
-    { container: "n", command: ["kubectl", "get", "nodes"], stdin: "" },
-    { container: "n", command: ["kubectl", "apply", "--filename=-"], stdin: "{\"kind\":\"RuntimeClass\"}" },
-  ]);
-  assert.deepEqual(results.startBody, { Detach: false, Tty: false });
-  assert.equal(results.plain.exitCode, 0);
-  assert.equal(results.plain.stdout.toString("utf8"), "node Ready\n");
-  assert.equal(results.plain.stderr, "warning\n");
-  assert.deepEqual({ ...results.fed, stdout: results.fed.stdout.toString("utf8") }, { exitCode: 1, stdout: "", stderr: "refused" });
 });
 
-test("exec in a container that is not running is Docker's refusal", async () => {
-  const error = await withDocker((docker) =>
-    docker.createContainer("n", containerCreate).pipe(Effect.andThen(docker.exec("n", ["true"])), Effect.flip)
+test("subnetAddress counts from the subnet's network address, within its host addresses", () => {
+  assert.equal(subnetAddress("172.31.252.0/24", 2), "172.31.252.2");
+  assert.equal(subnetAddress("10.1.0.0/16", 258), "10.1.1.2");
+  assert.equal(subnetAddress("10.1.2.3/16", 2), "10.1.0.2");
+  assert.equal(subnetAddress("192.168.0.0/30", 2), "192.168.0.2");
+  assert.equal(subnetAddress("192.168.0.0/30", 3), null);
+  assert.equal(subnetAddress("192.168.0.0/24", 0), null);
+  assert.equal(subnetAddress("300.1.0.0/16", 2), null);
+  assert.equal(subnetAddress("fd00::/64", 2), null);
+});
+
+test("nodeHostsWith keeps k3s's lines for the nodes and replaces every other with the aliases", () => {
+  const nodeHosts = "172.31.252.250 otelcol.observability\n172.31.252.1 host.docker.internal\n172.31.252.3 dev-server-0";
+  assert.equal(
+    nodeHostsWith(nodeHosts, ["dev-server-0"], [{ ip: "172.31.252.251", hostnames: ["otelcol.observability", "otelcol"] }]),
+    "172.31.252.3 dev-server-0\n172.31.252.251 otelcol.observability otelcol",
   );
-  assert.equal(error.status, 409);
+  assert.equal(nodeHostsWith(nodeHosts, ["dev-server-0"], []), "172.31.252.3 dev-server-0");
 });
 
-test("readFile reads the file out of the archive Docker sends, and a missing one is a 404", async () => {
-  const results = await withDocker(
-    (docker) =>
-      Effect.gen(function*() {
-        yield* docker.createContainer("n", containerCreate);
-        return { token: yield* docker.readFile("n", "/var/lib/rancher/k3s/server/token"), missing: yield* Effect.flip(docker.readFile("n", "/nothing")) };
-      }),
-    { files: (_container, path) => (path.endsWith("/token") ? Buffer.from("K10abc::server:secret\n") : null) },
-  );
-  assert.equal(results.token.toString("utf8"), "K10abc::server:secret\n");
-  assert.equal(results.missing.status, 404);
-});
-
-test("a Docker that cannot be reached fails with why, and no status", async () => {
-  const error = await Effect.runPromise(
-    DockerEngine.pipe(Effect.flatMap((docker) => Effect.flip(docker.version)), Effect.provide(DockerEngine.layer({ DOCKER_HOST: "unix:///nonexistent/docker.sock" }))),
-  );
-  assert.equal(error.status, undefined);
-  assert.match(error.message, /^Docker failed GET \/version: .*ENOENT/u);
-});
-
-test("firstFile reads past entries that are not regular files", () => {
-  const pax = tarOf("PaxHeaders/k3s.yaml", Buffer.from("30 mtime=1700000000.000000000\n"));
-  pax[156] = "x".charCodeAt(0);
-  const file = tarOf("k3s.yaml", Buffer.from("apiVersion: v1\n"));
-  assert.equal(firstFile(Buffer.concat([pax.subarray(0, 1024), file]))?.toString("utf8"), "apiVersion: v1\n");
-  assert.equal(firstFile(Buffer.alloc(1024)), null);
-});
-
-test("demultiplex parts frames by stream, in order", () => {
-  const { stdout, stderr } = demultiplex(Buffer.concat([frame(1, "a"), frame(2, "b"), frame(1, "c")]));
-  assert.equal(stdout.toString("utf8"), "ac");
-  assert.equal(stderr.toString("utf8"), "b");
+test("localKubeconfig is null for what is not yet a kubeconfig with a cluster and a user", () => {
+  assert.equal(localKubeconfig("", "dev", 7443), null);
+  assert.equal(localKubeconfig("apiVersion: v1\nclusters: [", "dev", 7443), null);
+  assert.ok(localKubeconfig(K3S_YAML, "dev", 7443)?.includes("https://127.0.0.1:7443"));
 });

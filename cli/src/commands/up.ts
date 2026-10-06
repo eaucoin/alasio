@@ -1,21 +1,21 @@
-/** `alasio up`: makes or starts the local cluster, applies alasio, and waits until it runs. */
+/** `alasio up`: makes or starts the cluster in Docker, applies alasio, and waits until it runs. */
 import { Console, Effect } from "effect";
 import { Command } from "effect/cli";
 
-import { requireLocalHost } from "../cluster/host.ts";
-import { LocalCluster } from "../cluster/local.ts";
+import { requireLocalHost } from "../cluster/machine.ts";
+import { DockerCluster } from "../cluster/docker.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
 import { install, type Installed } from "../install.ts";
 import { VERSION } from "../release.ts";
-import { describeTarget, kubeApi, localCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { describeTarget, kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 
-/** Makes or starts the local cluster when it is the target, once this machine is one it runs on, its inotify limits high enough, writing its kubeconfig; nothing for another. */
+/** Makes or starts the cluster in Docker when it is the target, once this machine is one it runs on, its inotify limits high enough, writing its kubeconfig; nothing for another. */
 export const ensureCluster = (target: ResolvedTarget) =>
-  target._tag === "Local"
+  target._tag === "Docker"
     ? Effect.andThen(
       requireLocalHost,
-      Effect.provide(Effect.flatMap(LocalCluster, (cluster) => cluster.up(target.kubeconfig.path)), localCluster(target.cluster)),
+      Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path)), dockerCluster(target.cluster)),
     )
     : Effect.void;
 
