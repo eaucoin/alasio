@@ -1,11 +1,18 @@
 name: ci
 
-# On demand only, as an end-to-end run builds every image and brings a cluster up.
+# On demand only, as an end-to-end run builds every image and brings clusters up.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  # Where the images job pushes the images, once, for every end-to-end job to pull: under
+  # run-<id>-<attempt>, packages of the attempt's own, which the last job deletes whole.
+  # A package GitHub's token makes here is linked to this public repository, and public as
+  # it is, so alasio init and the clusters' nodes pull them without a login.
+  REGISTRY: ghcr.io/eaucoin/alasio-ci
 
 jobs:
   unit:
@@ -36,7 +43,47 @@ jobs:
       # and --help from an install of it.
       - run: node tooling/cli-package.ts
 
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      registry: ${{ steps.push.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # All four at once, each line said with its image's name; the step fails if any did.
+      - id: push
+        name: Build and push the images
+        shell: bash
+        env:
+          PUSH_TO: ${{ env.REGISTRY }}/run-${{ github.run_id }}-${{ github.run_attempt }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          declare -A pids
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
+            name=${image%%:*}
+            {
+              docker build --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
+                docker push "$PUSH_TO/$name:e2e"
+            } 2>&1 | sed -u "s/^/$name: /" &
+            pids[$name]=$!
+          done
+          failed=0
+          for name in "${!pids[@]}"; do
+            wait "${pids[$name]}" || { echo "::error::$name was not built and pushed"; failed=1; }
+          done
+          echo "registry=$PUSH_TO" >>"$GITHUB_OUTPUT"
+          exit "$failed"
+
   e2e:
+    needs: images
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
@@ -44,16 +91,37 @@ jobs:
       matrix:
         # One node, and a server with two agents, so the stack and sessions spread.
         agents: [0, 2]
+        # The suites, in two shards that need nothing of each other's, each on a cluster
+        # of its own: alasio on Kubernetes and workspaces on JuiceFS, and Neon (test/e2e/harness.ts).
+        shard: [sessions, neon]
     steps:
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
       # it serves, unpacked: far more disk than a runner starts with free, so the
-      # software it comes with that this job does not use goes first.
-      - run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
-            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az
-          docker system prune --all --force
-          df -h /
+      # software it comes with that this job does not use goes first. Each directory is
+      # moved aside, as setup-node installs Node in a tool cache made anew, then removed,
+      # and Docker's images pruned, all at once, in the background, while the job readies
+      # the run; the step before the run waits for it.
+      - name: Free disk space, in the background
+        shell: bash
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          for dir in "${dirs[@]}"; do
+            [ ! -e "$dir" ] || sudo mv "$dir" "$dir.deleted"
+          done
+          (
+            pids=()
+            for dir in "${dirs[@]}"; do
+              sudo rm -rf "$dir.deleted" &
+              pids+=($!)
+            done
+            docker system prune --all --force &
+            pids+=($!)
+            status=0
+            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+            echo "$status" >"$RUNNER_TEMP/disk-freed.part" && mv "$RUNNER_TEMP/disk-freed.part" "$RUNNER_TEMP/disk-freed"
+          ) >"$RUNNER_TEMP/disk-freed.log" 2>&1 &
       # Every root process in every container shares the runner's inotify limits, which the
       # cluster's nodes, their pods and JuiceFS's mount pods use up, so alasio's local
       # cluster needs them at least this high (cli/src/cluster/host.ts): raised where lower.
@@ -69,8 +137,50 @@ jobs:
           node-version: 24.14.0
           cache: npm
       - run: npm ci
-      # alasio's package installed, alasio init and up on a cluster of this runner, the
-      # end-to-end tests, and alasio uninstall --purge (test/e2e/harness.ts).
+      - name: Wait for the disk space
+        run: |
+          until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 1; done
+          cat "$RUNNER_TEMP/disk-freed.log"
+          df -h /
+          exit "$(cat "$RUNNER_TEMP/disk-freed")"
+      # alasio's package installed, alasio init and up on a cluster of this runner from the
+      # images job's images, the shard's end-to-end tests, and alasio uninstall --purge
+      # (test/e2e/harness.ts).
       - run: npm run test:e2e
         env:
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
+          ALASIO_E2E_SHARD: ${{ matrix.shard }}
+          ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+
+  # Whatever came of the rest, the run's images are deleted, those of each of its attempts,
+  # pushed whole or not; so a failed run is re-run whole, its images built anew, as a
+  # re-run of its failed jobs alone would find them gone.
+  delete-images:
+    needs: [images, e2e]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the run's images
+        shell: bash
+        run: |
+          failed=0
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
+            for name in alasio alasio-agent alasio-lake alasio-node; do
+              image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
+              package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
+              if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
+                echo "deleted $image"
+              elif [[ $said == *"HTTP 404"* ]]; then
+                echo "no $image to delete"
+              else
+                echo "::error::$image was not deleted: $said"
+                failed=1
+              fi
+            done
+          done
+          exit "$failed"
