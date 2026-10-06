@@ -1,8 +1,8 @@
 /**
  * The node image's build arguments (cluster/node/Dockerfile): the k3s image it is built
  * from, and the gVisor release it adds with its sha512, as cluster/node/pins.json pins
- * them. Every build of the image passes them; run, it says them one a line, as a shell's
- * array takes them:
+ * them for the image and the host target alike. Every build of the image passes them;
+ * run, it says them one a line, as a shell's array takes them:
  *
  *   mapfile -t args < <(node tooling/node-image.ts) && docker build "${args[@]}" cluster/node
  */

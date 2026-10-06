@@ -163,16 +163,16 @@ export const inotifyStep: Effect.Effect<RaiseInotify | null, PlatformError.Platf
 export const describeRaiseInotify = ({ limits }: RaiseInotify): string =>
   `raise ${limits.map(({ name, minimum }) => `${name} to ${minimum}`).join(" and ")}, now and for every boot, in ${SYSCTL_FILE}`;
 
-/** The limits SYSCTL_FILE says, `name = value` a line, by name. Pure, for tests. */
-export function sysctlLimits(file: string): ReadonlyMap<string, string> {
+/** The limits SYSCTL_FILE says, `name = value` a line, by name. */
+function sysctlLimits(file: string): ReadonlyMap<string, string> {
   return new Map(file.split("\n").flatMap((line) => {
     const match = /^\s*([\w.]+)\s*=\s*(\S+)\s*$/u.exec(line);
     return match ? [[match[1] ?? "", match[2] ?? ""] as const] : [];
   }));
 }
 
-/** SYSCTL_FILE with `limits`, beside those it says already. Pure, for tests. */
-export function sysctlFile(existing: string, limits: RaiseInotify["limits"]): string {
+/** SYSCTL_FILE with `limits`, beside those it says already. */
+function sysctlFile(existing: string, limits: RaiseInotify["limits"]): string {
   const said = new Map(sysctlLimits(existing));
   for (const { name, minimum } of limits) said.set(name, String(minimum));
   const header = "# The inotify limits the cluster alasio makes here needs, which alasio raised; alasio uninstall --purge removes this file.";

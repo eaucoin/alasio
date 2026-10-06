@@ -6,17 +6,20 @@
  * in the cluster alone (./secrets.ts).
  *
  *     {
- *       "target": { "docker": { "name": "alasio", "apiPort": 41873 } },
+ *       "target": { "host": {} },
  *       "install": { "telemetry": { "otlpEndpoint": "http://collector.example.com:4318" } }
  *     }
  *
- * The target is the cluster alasio makes on this machine in Docker (./cluster/docker.ts),
- * with its API server on `apiPort` of the loopback and its volumes in `storagePath`
- * ($XDG_DATA_HOME/alasio/storage unless given), its nodes pulling through the
- * `registries` it is given, or one a kubeconfig reaches:
- * `{ "kubeconfig": { "path": "/home/me/.kube/config", "context": "prod" } }`, both keys
- * optional. The installation is the install configuration (./manifests/config.ts), every
- * key optional, but for the Secrets of the bot and of Claude Code, which alasio names.
+ * The target is k3s alasio installs on this machine (./cluster/host.ts), as above, its
+ * volumes in `storagePath` ($XDG_DATA_HOME/alasio/storage unless given) and its node
+ * pulling through the `registries` it is given; or the cluster alasio makes on this
+ * machine in Docker (./cluster/docker.ts),
+ * `{ "docker": { "name": "alasio", "apiPort": 41873 } }`, with its API server on `apiPort`
+ * of the loopback, its volumes and registries as k3s's on the machine; or one a kubeconfig
+ * reaches: `{ "kubeconfig": { "path": "/home/me/.kube/config", "context": "prod" } }`,
+ * both keys optional. A cluster alasio makes resolves its `hostAliases`. The
+ * installation is the install configuration (./manifests/config.ts), every key optional,
+ * but for the Secrets of the bot and of Claude Code, which alasio names.
  */
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -48,7 +51,7 @@ const Url = matching(/^https?:\/\/.+$/u, "must be an http(s) URL");
  * secret, which the config does not hold, so there is none: the registries are ones that
  * ask for none.
  */
-const Registries = Schema.Struct({
+export const Registries = Schema.Struct({
   mirrors: defaulted(
     Schema.Record(
       NonEmpty,
@@ -75,12 +78,22 @@ const Registries = Schema.Struct({
   ),
 });
 
+/** Names the cluster's DNS resolves to addresses, as /etc/hosts lines say them. */
+const HostAliases = Schema.Array(Schema.Struct({ ip: Ipv4, hostnames: Schema.Array(NonEmpty).check(Schema.isMinLength(1, { message: "must name a host" })) }));
+
+/** k3s alasio installs on this machine, its HostClusterOptions. */
+const HostTarget = Schema.Struct({
+  hostAliases: defaulted(HostAliases, []),
+  storagePath: Schema.optionalKey(AbsolutePath),
+  registries: Schema.optionalKey(Registries),
+});
+
 /** The cluster alasio makes on this machine in Docker, its DockerClusterOptions. */
 const DockerTarget = Schema.Struct({
   name: defaulted(matching(/^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?$/u, "must be a name of lowercase letters, digits and dashes"), "alasio"),
   apiPort: Port.annotateKey({ messageMissingKey: "is required: alasio init chooses one" }),
   subnet: Schema.optionalKey(matching(/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/u, "must be an IPv4 subnet, such as 172.30.0.0/24")),
-  hostAliases: defaulted(Schema.Array(Schema.Struct({ ip: Ipv4, hostnames: Schema.Array(NonEmpty).check(Schema.isMinLength(1, { message: "must name a host" })) })), []),
+  hostAliases: defaulted(HostAliases, []),
   mounts: defaulted(Schema.Array(Schema.Struct({ source: AbsolutePath, target: AbsolutePath, readOnly: Schema.optionalKey(Schema.Boolean) })), []),
   storagePath: Schema.optionalKey(AbsolutePath),
   /** The node image, such as one built from cluster/node on this machine; this version's unless given. */
@@ -92,12 +105,23 @@ const DockerTarget = Schema.Struct({
 /** A cluster a kubeconfig reaches: the default kubeconfig and its current context unless they are given. */
 const KubeconfigTarget = Schema.Struct({ path: Schema.optionalKey(AbsolutePath), context: Schema.optionalKey(NonEmpty) });
 
-const Target = Schema.Union([Schema.Struct({ docker: DockerTarget }), Schema.Struct({ kubeconfig: KubeconfigTarget })]);
+/** The targets, each by the key that names it. */
+const TARGETS = {
+  host: Schema.Struct({ host: HostTarget }),
+  docker: Schema.Struct({ docker: DockerTarget }),
+  kubeconfig: Schema.Struct({ kubeconfig: KubeconfigTarget }),
+};
 
-const OperatorConfigSchema = Schema.Struct({
-  target: Target.annotateKey({ messageMissingKey: "is required: alasio init writes it" }),
-  install: defaulted(Schema.Record(Schema.String, Schema.Unknown), {}),
-});
+const Target = Schema.Union([TARGETS.host, TARGETS.docker, TARGETS.kubeconfig]);
+
+/** The config with `target` as its target. */
+const configOf = <S extends Schema.Top>(target: S) =>
+  Schema.Struct({
+    target: target.annotateKey({ messageMissingKey: "is required: alasio init writes it" }),
+    install: defaulted(Schema.Record(Schema.String, Schema.Unknown), {}),
+  });
+
+const OperatorConfigSchema = configOf(Target);
 
 /** What the config file holds. */
 export type OperatorConfigFile = typeof OperatorConfigSchema.Encoded;
@@ -146,10 +170,20 @@ export function installConfigOf(install: Readonly<Record<string, unknown>>, { cl
   );
 }
 
-/** The config `input` (parsed JSON) is, checked: a key alasio does not know is refused. */
+/**
+ * The config `input` (parsed JSON) is, checked: a key alasio does not know is refused. What
+ * is refused of a target is said of the one its key names, rather than of the first of
+ * them all.
+ */
 export function decodeOperatorConfig(path: string, input: unknown): Result.Result<OperatorConfig, OperatorConfigError> {
-  const decoded = Schema.decodeUnknownResult(OperatorConfigSchema)(input, { onExcessProperty: "error" });
-  if (Result.isFailure(decoded)) return Result.fail(new OperatorConfigError({ path, reason: describeIssue(decoded.failure.issue) }));
+  const options = { onExcessProperty: "error" } as const;
+  const decoded = Schema.decodeUnknownResult(OperatorConfigSchema)(input, options);
+  if (Result.isFailure(decoded)) {
+    const keys = Predicate.hasProperty(input, "target") && Predicate.isObject(input.target) ? Object.keys(input.target) : [];
+    const named = keys.length === 1 ? Object.entries(TARGETS).find(([key]) => key === keys[0])?.[1] : undefined;
+    const precise = named ? Schema.decodeUnknownResult(configOf(named))(input, options) : decoded;
+    return Result.fail(new OperatorConfigError({ path, reason: describeIssue((Result.isFailure(precise) ? precise : decoded).failure.issue) }));
+  }
   const { target, install } = decoded.success;
   const checked = installConfigOf(install, { claude: true });
   if (Result.isFailure(checked)) return Result.fail(new OperatorConfigError({ path, reason: checked.failure }));
@@ -172,7 +206,7 @@ export const configPath: Effect.Effect<string, Config.ConfigError, GlobalFlag.Se
   return join(yield* xdgHome("XDG_CONFIG_HOME", ".config"), "alasio", "config.json");
 });
 
-/** Where the volumes of a cluster on this machine are unless its target says: $XDG_DATA_HOME/alasio/storage. */
+/** Where the volumes of a cluster alasio makes on this machine are unless its target says: $XDG_DATA_HOME/alasio/storage. */
 export const defaultStoragePath: Effect.Effect<string, Config.ConfigError> = Effect.map(xdgHome("XDG_DATA_HOME", ".local/share"), (data) => join(data, "alasio", "storage"));
 
 /** The kubeconfig of a cluster alasio makes on this machine, beside the config file. */

@@ -14,6 +14,8 @@ import { buffer } from "node:stream/consumers";
 
 import { Context, Effect, Layer, Result, Schedule, Schema, type Scope } from "effect";
 
+import { tarEntries } from "./tar.ts";
+
 const API_VERSION = "v1.44";
 const DEFAULT_SOCKET = "/var/run/docker.sock";
 
@@ -220,19 +222,7 @@ const labelFilter = (labels: Readonly<Record<string, string>>): string =>
 
 /** The content of the first regular file in `tar`, a tar archive as Docker's archive endpoint sends one; null when it holds none. */
 export function firstFile(tar: Buffer): Buffer | null {
-  const BLOCK = 512;
-  for (let offset = 0; offset + BLOCK <= tar.length;) {
-    const header = tar.subarray(offset, offset + BLOCK);
-    // Two zero blocks end an archive.
-    if (header.every((byte) => byte === 0)) return null;
-    const size = Number.parseInt(header.toString("latin1", 124, 136).replace(/\0.*$/su, "").trim() || "0", 8);
-    const type = header[156];
-    const start = offset + BLOCK;
-    // "0", or NUL in archives older than POSIX's.
-    if (type === 0x30 || type === 0) return tar.subarray(start, start + size);
-    offset = start + Math.ceil(size / BLOCK) * BLOCK;
-  }
-  return null;
+  return tarEntries(tar).find(({ type }) => type === "file")?.content ?? null;
 }
 
 /**

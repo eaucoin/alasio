@@ -63,6 +63,7 @@ export const upgrade = Command.make("upgrade", { timeout: timeoutFlag }, ({ time
     Command.withShortDescription("Upgrade alasio to this version"),
     Command.withDescription(
       "Does what alasio up does, with the images this version of alasio's package pins, after saying which images change " +
-        "and from which version of alasio. Run as npx alasio@latest upgrade to upgrade to the latest release.",
+        "and from which version of alasio, and, for k3s on this machine, with the k3s and gVisor it pins, saying which it " +
+        "installs in place of which. Run as npx alasio@latest upgrade to upgrade to the latest release.",
     ),
   );

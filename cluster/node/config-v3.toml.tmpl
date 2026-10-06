@@ -2,3 +2,11 @@
 
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
   runtime_type = "io.containerd.runsc.v1"
+{{- if .SystemdCgroup }}
+
+# Where systemd runs the machine, kubelet's cgroups are systemd's, and runsc places its
+# sandboxes' through systemd too, as runsc.toml beside this file says.
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
+  TypeUrl = "io.containerd.runsc.v1.options"
+  ConfigPath = "/var/lib/rancher/k3s/agent/etc/containerd/runsc.toml"
+{{- end }}

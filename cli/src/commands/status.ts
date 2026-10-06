@@ -1,16 +1,20 @@
 /** `alasio status`: what runs, and whether it is healthy. */
+import type { V1Node } from "@kubernetes/client-node";
 import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
+import { HostCluster } from "../cluster/host.ts";
+import { readySince } from "../cluster/k3s.ts";
 import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
+import { SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
 import { describeRef, kind, KubeApi, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness } from "../kube/rollout.ts";
 import { RELEASE } from "../manifests/common.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
-import { ClusterNotRunning } from "./common.ts";
+import { notRunning } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
@@ -29,15 +33,27 @@ export const status = Command.make("status", {}, () =>
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
     // The cluster here runs only on a machine of its kind, whose limits are read from Linux's /proc.
-    if (target._tag === "Docker") yield* requireLocalMachine;
-    const shortfalls = target._tag === "Docker" ? yield* inotifyShortfalls : [];
+    if (target._tag !== "Kubeconfig") yield* requireLocalMachine;
+    const shortfalls = target._tag !== "Kubeconfig" ? yield* inotifyShortfalls : [];
+    const sayShortfalls = Effect.forEach(shortfalls, (shortfall) => Console.log(`  this machine's ${describeShortfall(shortfall)}`), { discard: true });
     if (target._tag === "Docker") {
       const { docker, nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
       yield* Console.log(`cluster ${target.cluster.name}, in Docker ${docker}:`);
       yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state }) => `  ${name}: ${state}`).join("\n") : "  not made");
-      for (const shortfall of shortfalls) yield* Console.log(`  this machine's ${describeShortfall(shortfall)}`);
+      yield* sayShortfalls;
       const server = nodes.find(({ role }) => role === "server");
-      if (server?.state !== "running") return yield* new ClusterNotRunning({ cluster: target.cluster.name, made: server !== undefined });
+      if (server?.state !== "running") return yield* notRunning(target, server !== undefined);
+    }
+    if (target._tag === "Host") {
+      const { unit, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
+      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${installed?.gvisor ? `, with gVisor ${installed.gvisor}` : ""}:`);
+      yield* Console.log(unit.loaded ? `  service ${SERVICE}: ${unit.active}, ${unit.enabled ? "enabled" : "disabled"}` : "  not installed");
+      if (unit.active === "active") {
+        const nodes = yield* Effect.provide(Effect.flatMap(KubeApi, (kube) => kube.list<V1Node>(kind("Node"))), kubeApi(target));
+        for (const node of nodes) yield* Console.log(`  node ${node.metadata?.name}: ${readySince(node, 0) ? "ready" : "not ready"}`);
+      }
+      yield* sayShortfalls;
+      if (unit.active !== "active") return yield* notRunning(target, unit.loaded);
     }
     yield* Effect.provide(
       Effect.gen(function*() {
@@ -66,8 +82,8 @@ export const status = Command.make("status", {}, () =>
   })).pipe(
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
-      "Says where alasio runs (and, for the cluster on this machine, its nodes, and this machine's inotify limits when they are " +
-        "too low for it), its version, and each of its workloads: ready, or what it is at and why. Exits with 1 when something " +
+      "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
+        "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready, or what it is at and why. Exits with 1 when something " +
         "is not ready, or the limits are too low, or this machine is not Linux on x86-64, which the cluster here needs.",
     ),
   );

@@ -7,6 +7,7 @@ import { Duration, Effect, Schema } from "effect";
 import { Flag } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
+import { HostCluster } from "../cluster/host.ts";
 import { loadConfig } from "../config.ts";
 import { kind, KubeApi, type KubeApiError } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
@@ -45,28 +46,45 @@ export const sinceFlag = durationFlag("since").pipe(
 /** The waits of a command given `timeout`. */
 export const waitOptions = (timeout: Duration.Duration): WaitOptions => ({ timeout, poll: POLL });
 
-/** The cluster in Docker is not running, so its API cannot be reached. */
+/** A cluster alasio makes on this machine is not running, so its API cannot be reached: the message says which, and whether it is made. */
 export class ClusterNotRunning extends Schema.TaggedError<ClusterNotRunning>()("ClusterNotRunning", {
-  cluster: Schema.String,
-  made: Schema.Boolean,
-}) {
-  override get message(): string {
-    return this.made ? `the cluster ${this.cluster} is stopped: alasio up starts it` : `there is no cluster ${this.cluster} yet: alasio up makes it`;
-  }
-}
+  message: Schema.String,
+}) {}
+
+/** `target`, a cluster alasio makes, is stopped, or not `made` at all. */
+export const notRunning = (target: Exclude<ResolvedTarget, { readonly _tag: "Kubeconfig" }>, made: boolean): ClusterNotRunning =>
+  new ClusterNotRunning({
+    message: target._tag === "Host"
+      ? made ? "k3s on this machine is stopped: alasio up starts it" : "there is no k3s on this machine yet: alasio up installs it"
+      : made
+      ? `the cluster ${target.cluster.name} is stopped: alasio up starts it`
+      : `there is no cluster ${target.cluster.name} yet: alasio up makes it`,
+  });
+
+/** Whether the cluster `target` is, alasio made, is running: when not, whether it is made. */
+export const running = (target: Exclude<ResolvedTarget, { readonly _tag: "Kubeconfig" }>) =>
+  target._tag === "Host"
+    ? Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster)).pipe(
+      Effect.map(({ unit }) => ({ running: unit.active === "active", made: unit.loaded })),
+    )
+    : Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster)).pipe(
+      Effect.map(({ nodes }) => {
+        const server = nodes.find(({ role }) => role === "server");
+        return { running: server?.state === "running", made: server !== undefined };
+      }),
+    );
 
 /**
- * The config, the cluster it targets, and its API to run `use` with; a cluster in
- * Docker must be running, as only `up` starts it.
+ * The config, the cluster it targets, and its API to run `use` with; a cluster alasio
+ * makes must be running, as only `up` starts it.
  */
 export const onCluster = <A, E, R>(use: (target: ResolvedTarget) => Effect.Effect<A, E, R>) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
-    if (target._tag === "Docker") {
-      const { nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
-      const server = nodes.find(({ role }) => role === "server");
-      if (server?.state !== "running") return yield* new ClusterNotRunning({ cluster: target.cluster.name, made: server !== undefined });
+    if (target._tag !== "Kubeconfig") {
+      const { running: up, made } = yield* running(target);
+      if (!up) return yield* notRunning(target, made);
     }
     return yield* Effect.provide(use(target), kubeApi(target));
   });

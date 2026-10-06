@@ -15,15 +15,14 @@ import { homedir } from "node:os";
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted, Result, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
-import { DockerCluster } from "../cluster/docker.ts";
 import { requireLocalMachine } from "../cluster/machine.ts";
 import { configPath, decodeOperatorConfig, defaultStoragePath, type OperatorConfigFile, readConfig, writeConfig } from "../config.ts";
 import { applyNamespace } from "../install.ts";
 import { OptionalUrl } from "../manifests/config.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot, writeClaudeToken, writeTelegramBot } from "../secrets.ts";
-import { dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { TelegramBotApi } from "../telegram.ts";
-import { timeoutFlag } from "./common.ts";
+import { running, timeoutFlag } from "./common.ts";
 import { bringUp, ensureCluster } from "./up.ts";
 
 /** Something init must be told, and was not, with no questions to ask. */
@@ -46,7 +45,7 @@ export class SettingInvalid extends Schema.TaggedError<SettingInvalid>()("Settin
   }
 }
 
-/** A port of the loopback no one listens on now, which the API server of the cluster in Docker keeps from then on. */
+/** A port of the loopback no one listens on now, which the API server of a cluster in Docker keeps from then on. */
 const freePort = Effect.callback<number>((resume) => {
   const server = createServer();
   server.listen(0, "127.0.0.1", () => {
@@ -143,6 +142,10 @@ const validating = (check: (value: string) => string | null) => (value: string):
 };
 
 const flags = {
+  target: Flag.Literals("target", ["host", "docker"]).pipe(
+    Flag.optional,
+    Flag.withDescription("Where on this machine alasio runs: host, k3s it installs on the machine itself (the default), or docker, a cluster it makes in Docker"),
+  ),
   kubeconfig: Flag.String("kubeconfig").pipe(
     Flag.optional,
     Flag.withMetavar("path"),
@@ -198,21 +201,28 @@ const answer = <A, E1, R1, E2, R2>(
   otherwise: () => Effect.Effect<A, E2, R2>,
 ): Effect.Effect<A, E1 | E2, R1 | R2> => (Option.isSome(flag) ? Effect.succeed(flag.value) : ask ? asked() : otherwise());
 
-/** Where alasio runs: as the flags say, else as the config does, else as the operator answers; here unless they say otherwise. */
+/**
+ * Where alasio runs: as the flags say, else as the config does, else as the operator
+ * answers; in k3s on this machine unless they say otherwise. A target the config has
+ * already keeps its settings.
+ */
 const chooseTarget = Effect.fnUntraced(function*(given: Flags, ask: boolean, existing: OperatorConfigFile | null) {
   if (Option.isSome(given.kubeconfig) || Option.isSome(given.context)) {
     return { kubeconfig: { ...Option.match(given.kubeconfig, { onNone: () => ({}), onSome: (path) => ({ path }) }), ...Option.match(given.context, { onNone: () => ({}), onSome: (context) => ({ context }) }) } };
   }
-  if (existing) return existing.target;
-  const where = ask
+  if (existing && Option.match(given.target, { onNone: () => true, onSome: (kind) => kind in existing.target })) return existing.target;
+  const where = Option.isSome(given.target)
+    ? given.target.value
+    : ask
     ? yield* Prompt.Select({
       message: "Where should alasio run?",
       choices: [
-        { title: "Here", value: "docker", description: "in a cluster alasio makes on this machine, in Docker" },
+        { title: "Here", value: "host", description: "in k3s alasio installs on this machine, with gVisor, as root" },
+        { title: "Here, in Docker", value: "docker", description: "in a cluster alasio makes on this machine, in Docker" },
         { title: "In a cluster of mine", value: "kubeconfig", description: "one a kubeconfig reaches" },
       ],
     })
-    : "docker";
+    : "host";
   if (where === "kubeconfig") {
     const path = yield* Prompt.String({
       message: "Its kubeconfig (empty for $KUBECONFIG, or ~/.kube/config)",
@@ -221,15 +231,13 @@ const chooseTarget = Effect.fnUntraced(function*(given: Flags, ask: boolean, exi
     const context = yield* Prompt.String({ message: "Its context (empty for the kubeconfig's current one)" });
     return { kubeconfig: { ...(path ? { path } : {}), ...(context ? { context } : {}) } };
   }
-  return { docker: { name: "alasio", apiPort: yield* freePort, storagePath: yield* defaultStoragePath } };
+  if (where === "docker") return { docker: { name: "alasio", apiPort: yield* freePort, storagePath: yield* defaultStoragePath } };
+  return { host: { storagePath: yield* defaultStoragePath } };
 });
 
-/** The Secrets the cluster has now, when it can be reached without being started: none for a cluster in Docker not running. */
+/** The Secrets the cluster has now, when it can be reached without being started: none for a cluster alasio makes that is not running. */
 const currentSecrets = Effect.fnUntraced(function*(target: ResolvedTarget) {
-  if (target._tag === "Docker") {
-    const { nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
-    if (!nodes.some(({ role, state }) => role === "server" && state === "running")) return { bot: null, claude: null };
-  }
+  if (target._tag !== "Kubeconfig" && !(yield* running(target)).running) return { bot: null, claude: null };
   return yield* Effect.provide(Effect.all({ bot: readTelegramBot, claude: readClaudeToken }), kubeApi(target));
 });
 
@@ -370,7 +378,7 @@ export const init = Command.make("init", flags, (given) =>
     const target = yield* chooseTarget(given, ask, existing?.file ?? null);
     const resolved = yield* resolveTarget(yield* Effect.fromResult(decodeOperatorConfig(path, { target, install })));
     // Before any question, as the cluster here cannot run on another machine.
-    if (resolved._tag === "Docker") yield* requireLocalMachine;
+    if (resolved._tag !== "Kubeconfig") yield* requireLocalMachine;
     const current = yield* currentSecrets(resolved);
 
     const bot = yield* chooseBot(given, ask, current.bot);
@@ -412,8 +420,9 @@ export const init = Command.make("init", flags, (given) =>
     Command.withDescription(
       "Asks for the bot's token (checked with Telegram) and who may use it, Claude Code's token, whether agents may work in this " +
         "machine's folders and as whom, and where telemetry goes; writes the config, which holds no secret; makes the cluster on " +
-        "this machine, unless --kubeconfig names another, once this machine is one it runs on, Linux on x86-64, raising its inotify " +
-        "limits, as root, where they are too low for it; writes the tokens there, as Secrets; and offers to start alasio. Run it " +
+        "this machine, k3s on the machine itself unless --target docker makes it in Docker, or --kubeconfig names another " +
+        "cluster, once this machine is one it runs on, Linux on x86-64, doing what it must as root through sudo, as alasio up " +
+        "does; writes the tokens there, as Secrets; and offers to start alasio. Run it " +
         "again to change something: it shows what is set and keeps what you leave. Tokens are never flags, which other users of " +
         "the machine can see: give them in files (--bot-token-file, --claude-token-file), or as TELEGRAM_BOT_TOKEN and " +
         "CLAUDE_CODE_OAUTH_TOKEN.",

@@ -21,45 +21,35 @@
  * waiting for it and configuring it, is done with the kubectl k3s carries in the server
  * node, so this machine needs none of Kubernetes' tools.
  */
-import { createHash, randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { createHash } from "node:crypto";
 
-import { type Cluster, KubeConfig, type User, type V1ConfigMap, type V1NodeList } from "@kubernetes/client-node";
-import { Context, Duration, Effect, FileSystem, Layer, type PlatformError, Schedule, Schema } from "effect";
+import type { V1ConfigMap, V1NodeList } from "@kubernetes/client-node";
+import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schema } from "effect";
 
 import { imageReference } from "../images.ts";
 import { NODE_IMAGE } from "../release.ts";
 import { type ContainerCreate, DockerEngine, type DockerError, type ExecOptions, type Mount, type NetworkInspect } from "./docker-engine.ts";
-
-/** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
-export interface HostAlias {
-  readonly ip: string;
-  readonly hostnames: readonly string[];
-}
+import {
+  awaitReady as waitFor,
+  clusterKubeconfig,
+  type ClusterNotReady,
+  GVISOR_RUNTIME_CLASS,
+  type HostAlias,
+  KUBELET_ARGS,
+  nodeHostsWith,
+  NotYet,
+  readySince,
+  type Registries,
+  registriesYaml,
+  WAITS,
+  writeKubeconfig,
+} from "./k3s.ts";
 
 /** A path of this machine mounted in every node, at `target`. */
 export interface HostMount {
   readonly source: string;
   readonly target: string;
   readonly readOnly?: boolean;
-}
-
-/** A registry's TLS: files in the nodes, and whether its certificate goes unchecked. */
-export interface RegistryTls {
-  readonly caFile?: string;
-  readonly certFile?: string;
-  readonly keyFile?: string;
-  readonly insecureSkipVerify?: boolean;
-}
-
-/**
- * The registries the nodes' containerd pulls from, as k3s's registries.yaml says them:
- * the endpoints that stand for a registry, by its host, in the order they are tried, with
- * how image names are rewritten there; and a registry's TLS, by its host.
- */
-export interface Registries {
-  readonly mirrors?: Readonly<Record<string, { readonly endpoint: readonly string[]; readonly rewrite?: Readonly<Record<string, string>> }>>;
-  readonly configs?: Readonly<Record<string, { readonly tls: RegistryTls }>>;
 }
 
 /** What the cluster in Docker is made with. */
@@ -108,24 +98,6 @@ export class ClusterUnusable extends Schema.TaggedError<ClusterUnusable>()("Clus
     return `cluster ${this.cluster} cannot be made: ${this.reason}`;
   }
 }
-
-/** The cluster did not come up in time: what it was waited for, and why it last was not. */
-export class ClusterNotReady extends Schema.TaggedError<ClusterNotReady>()("ClusterNotReady", {
-  cluster: Schema.String,
-  waitingFor: Schema.String,
-  /** How long it was given, in seconds. */
-  within: Schema.Number,
-  reason: Schema.String,
-}) {
-  override get message(): string {
-    return `cluster ${this.cluster} was not ready within ${this.within}s, waiting for ${this.waitingFor}: ${this.reason}`;
-  }
-}
-
-/** What a wait for the cluster has not seen yet; the wait's ClusterNotReady says it when it gives up. */
-class NotYet extends Schema.TaggedError<NotYet>()("NotYet", {
-  message: Schema.String,
-}) {}
 
 /** A command run in a node exited with another code than 0. */
 export class NodeCommandFailed extends Schema.TaggedError<NodeCommandFailed>()("NodeCommandFailed", {
@@ -193,25 +165,6 @@ const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
 /** The variable the node image's entrypoint writes k3s's registries.yaml from, before k3s starts. */
 const REGISTRIES_ENV = "ALASIO_REGISTRIES";
 
-/**
- * kubelet's thresholds for a machine whose disk the cluster shares with everything else
- * on it: it evicts only when the disk is nearly full, and collects unused images only then,
- * so images in use are not evicted.
- */
-const KUBELET_ARGS = [
-  "--kubelet-arg=eviction-hard=imagefs.available<5%,nodefs.available<5%",
-  "--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
-  "--kubelet-arg=image-gc-high-threshold=98",
-  "--kubelet-arg=image-gc-low-threshold=95",
-];
-
-/** gVisor, as the node image registers it with containerd. */
-const GVISOR_RUNTIME_CLASS = { apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" };
-
-// A first start pulls k3s's own images, so it is given minutes.
-const READY_TIMEOUT: Duration.Input = "5 minutes";
-const POLL: Duration.Input = "1 second";
-
 /** The `index`th address of the IPv4 subnet `cidr` (a.b.c.d/n), its network address the 0th; null when it has no such host address. */
 export function subnetAddress(cidr: string, index: number): string | null {
   const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/u.exec(cidr);
@@ -253,53 +206,8 @@ export function freeSubnet(taken: readonly string[]): string | null {
   return null;
 }
 
-/**
- * CoreDNS's NodeHosts, a hosts file, with `aliases`: k3s keeps a line for each node in
- * it, which stays, and every other line is the cluster's aliases, which are replaced.
- * Pure, for tests.
- */
-export function nodeHostsWith(nodeHosts: string, nodes: readonly string[], aliases: readonly HostAlias[]): string {
-  const kept = nodeHosts.split("\n").filter((line) => line.trim().split(/\s+/u).slice(1).some((host) => nodes.includes(host)));
-  return [...kept, ...aliases.map(({ ip, hostnames }) => `${ip} ${hostnames.join(" ")}`)].join("\n");
-}
-
-/**
- * The kubeconfig k3s wrote in the server node (`k3sYaml`), named after the cluster and
- * pointed at the API server's port on the loopback; null when it is not a kubeconfig with
- * a cluster and a user, as while k3s writes it.
- */
-export function localKubeconfig(k3sYaml: string, cluster: string, apiPort: number): string | null {
-  const written = new KubeConfig();
-  try {
-    written.loadFromString(k3sYaml);
-  } catch {
-    return null;
-  }
-  const server: Cluster | null = written.getCurrentCluster();
-  const user: User | null = written.getCurrentUser();
-  if (!server || !user) return null;
-  const local = new KubeConfig();
-  local.loadFromOptions({
-    clusters: [{ ...server, name: cluster, server: `https://127.0.0.1:${apiPort}` }],
-    users: [{ ...user, name: cluster }],
-    contexts: [{ name: cluster, cluster, user: cluster }],
-    currentContext: cluster,
-  });
-  return local.exportConfig();
-}
-
-/** k3s's registries.yaml of `registries`, written as JSON, which YAML reads as it is. Pure, for tests. */
-export function registriesYaml({ mirrors = {}, configs = {} }: Registries): string {
-  return JSON.stringify({
-    mirrors,
-    configs: Object.fromEntries(
-      Object.entries(configs).map(([host, { tls }]) => [
-        host,
-        { tls: { ca_file: tls.caFile, cert_file: tls.certFile, key_file: tls.keyFile, insecure_skip_verify: tls.insecureSkipVerify } },
-      ]),
-    ),
-  });
-}
+/** kubelet's settings, as k3s's flags give them. */
+const kubeletArgs = KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`);
 
 /** A digest of `spec` that two specs share only when they are the same. */
 const specHash = (spec: ContainerCreate): string => createHash("sha256").update(JSON.stringify(spec)).digest("hex");
@@ -314,8 +222,8 @@ const makeDockerCluster = Effect.fnUntraced(function*({
   mounts = [],
   agents = 0,
   registries,
-  readyTimeout = READY_TIMEOUT,
-  poll = POLL,
+  readyTimeout = WAITS.readyTimeout,
+  poll = WAITS.poll,
 }: DockerClusterOptions): Effect.fn.Return<DockerCluster["Service"], never, DockerEngine | FileSystem.FileSystem> {
   const docker = yield* DockerEngine;
   const fs = yield* FileSystem.FileSystem;
@@ -410,16 +318,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
 
   const kubectl = (args: readonly string[], options?: ExecOptions) => inNode(server, ["kubectl", ...args], options);
 
-  /** `check` once it succeeds, tried every `poll` for `readyTimeout`; why it last failed, when it never does. */
-  const awaitReady = <A>(waitingFor: string, check: Effect.Effect<A, DockerError | NodeCommandFailed | NotYet>): Effect.Effect<A, ClusterNotReady> =>
-    Effect.logInfo(`waiting for ${waitingFor}`).pipe(
-      Effect.andThen(
-        check.pipe(
-          Effect.mapError((error) => new ClusterNotReady({ cluster, waitingFor, within: Duration.toSeconds(readyTimeout), reason: error.message })),
-          Effect.retry(Schedule.max([Schedule.spaced(poll), Schedule.during(readyTimeout)])),
-        ),
-      ),
-    );
+  const awaitReady = waitFor(`cluster ${cluster}`, { readyTimeout, poll });
 
   /** When each node's container last started, in milliseconds since the epoch. */
   const startTimes: Effect.Effect<ReadonlyMap<string, number>, DockerError> = Effect.forEach(nodes, (node) =>
@@ -427,25 +326,12 @@ const makeDockerCluster = Effect.fnUntraced(function*({
       Effect.map((entries) => new Map(entries)),
     );
 
-  /**
-   * Every node ready, by a Ready condition its kubelet reported since its container
-   * started: one from before, which a node stopped while ready keeps until its kubelet
-   * reports again, is not yet the node's. The condition's heartbeat is to the second.
-   */
+  /** Every node ready since its container started. */
   const nodesReady = (started: ReadonlyMap<string, number>) =>
     kubectl(["get", "nodes", "--output=json"]).pipe(
       Effect.flatMap((stdout) => {
         const { items } = JSON.parse(stdout.toString("utf8")) as V1NodeList;
-        const ready = new Set(
-          items
-            .filter((node) =>
-              node.status?.conditions?.some(({ type, status, lastHeartbeatTime }) =>
-                type === "Ready" && status === "True" && lastHeartbeatTime !== undefined
-                && new Date(lastHeartbeatTime).getTime() >= Math.floor((started.get(node.metadata?.name ?? "") ?? Infinity) / 1000) * 1000
-              )
-            )
-            .map((node) => node.metadata?.name),
-        );
+        const ready = new Set(items.filter((node) => readySince(node, started.get(node.metadata?.name ?? "") ?? Infinity)).map((node) => node.metadata?.name));
         const waiting = nodes.filter((node) => !ready.has(node));
         return waiting.length === 0 ? Effect.void : Effect.fail(new NotYet({ message: `not reported ready since started: ${waiting.join(", ")}` }));
       }),
@@ -461,21 +347,18 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     yield* kubectl(["--namespace=kube-system", "patch", "configmap", "coredns", "--type=merge", `--patch=${JSON.stringify(patch)}`]);
   });
 
-  const writeKubeconfig = Effect.fnUntraced(function*(path: string): Effect.fn.Return<void, ClusterNotReady | PlatformError.PlatformError> {
+  /** The kubeconfig the server wrote, pointed at the API server's port on the loopback, written to `path`. */
+  const fetchKubeconfig = Effect.fnUntraced(function*(path: string): Effect.fn.Return<void, ClusterNotReady | PlatformError.PlatformError> {
     const content = yield* awaitReady(
       "its kubeconfig",
       docker.readFile(server, K3S_KUBECONFIG).pipe(
         Effect.flatMap((written) => {
-          const local = localKubeconfig(written.toString("utf8"), cluster, apiPort);
+          const local = clusterKubeconfig(written.toString("utf8"), cluster, `https://127.0.0.1:${apiPort}`);
           return local ? Effect.succeed(local) : Effect.fail(new NotYet({ message: `${K3S_KUBECONFIG} is not yet a kubeconfig with a cluster and a user` }));
         }),
       ),
     );
-    // Written whole beside it, readable only by its owner, and moved over it.
-    yield* fs.makeDirectory(dirname(path), { recursive: true, mode: 0o700 });
-    const written = `${path}.${randomUUID()}`;
-    yield* fs.writeFileString(written, content, { flag: "wx", mode: 0o600 });
-    yield* fs.rename(written, path);
+    yield* Effect.provideService(writeKubeconfig(path, content), FileSystem.FileSystem, fs);
     yield* Effect.logInfo(`wrote the kubeconfig of cluster ${cluster} to ${path}`);
   });
 
@@ -494,7 +377,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
         // Where the kubeconfig reaches it.
         "--tls-san=127.0.0.1",
         `--default-local-storage-path=${storagePath}`,
-        ...KUBELET_ARGS,
+        ...kubeletArgs,
       ], []),
     );
     yield* awaitReady("its API server", kubectl(["get", "--raw=/readyz"]));
@@ -503,7 +386,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
       for (const [index, agent] of nodes.slice(1).entries()) {
         yield* ensureNode(
           agent,
-          nodeContainer(agent, "agent", yield* nodeAddress(networkSubnet, 1 + index), ["agent", ...KUBELET_ARGS], [
+          nodeContainer(agent, "agent", yield* nodeAddress(networkSubnet, 1 + index), ["agent", ...kubeletArgs], [
             `K3S_URL=https://${server}:${K3S_PORT}`,
             `K3S_TOKEN=${token}`,
           ]),
@@ -513,7 +396,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     yield* awaitReady("its nodes", Effect.flatMap(startTimes, nodesReady));
     yield* awaitReady("CoreDNS's NodeHosts", applyHostAliases);
     yield* awaitReady("the gvisor RuntimeClass", kubectl(["apply", "--filename=-"], { stdin: JSON.stringify(GVISOR_RUNTIME_CLASS) }));
-    yield* writeKubeconfig(kubeconfig);
+    yield* fetchKubeconfig(kubeconfig);
     yield* Effect.logInfo(`cluster ${cluster} is up`);
   });
 

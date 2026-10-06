@@ -10,6 +10,7 @@ import { NodeRuntime, NodeServices } from "@effect/platform-node";
 import { Cause, Console, Effect, Layer, Logger, Result } from "effect";
 import { CliError, Command } from "effect/cli";
 
+import { NodeReleases, Systemd } from "./cluster/host.ts";
 import { Machine, RootSystem } from "./cluster/machine.ts";
 import { Root } from "./cluster/root.ts";
 import { alasio } from "./commands.ts";
@@ -33,7 +34,11 @@ const report = (cause: Cause.Cause<unknown>): Effect.Effect<void> => {
 
 Command.run(alasio, { version: VERSION }).pipe(
   Effect.tapCause(report),
-  Effect.provide(Layer.mergeAll(TelegramBotApi.layer, Root.layer, Logger.layer([progress])).pipe(Layer.provideMerge(Layer.mergeAll(Machine.layer, RootSystem.layer)))),
+  Effect.provide(
+    Layer.mergeAll(TelegramBotApi.layer, Root.layer, Systemd.layer, NodeReleases.layer, Logger.layer([progress])).pipe(
+      Layer.provideMerge(Layer.mergeAll(Machine.layer, RootSystem.layer)),
+    ),
+  ),
   Effect.provide(NodeServices.layer),
   NodeRuntime.runMain({ disableErrorReporting: true }),
 );

@@ -9,7 +9,7 @@ import { KubeConfig } from "@kubernetes/client-node";
 import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker-engine.ts";
-import { freeSubnet, DockerCluster, type DockerClusterOptions, localKubeconfig, nodeHostsWith, registriesYaml, subnetAddress } from "../src/cluster/docker.ts";
+import { DockerCluster, type DockerClusterOptions, freeSubnet, subnetAddress } from "../src/cluster/docker.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
@@ -372,20 +372,6 @@ test("every node is made with the registries, as k3s's registries.yaml, and made
   assert.match(environments().at(-1)?.[1]?.[0] ?? "", /"configs":\{"registry\.example:5000":\{"tls":\{"insecure_skip_verify":true\}\}\}/u);
 });
 
-test("registriesYaml says the registries in k3s's keys, leaving out what is not given", () => {
-  assert.deepEqual(JSON.parse(registriesYaml({})), { mirrors: {}, configs: {} });
-  assert.deepEqual(
-    JSON.parse(registriesYaml({
-      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
-      configs: { "mirror.example": { tls: { caFile: "/etc/ssl/mirror-ca.pem", certFile: "/etc/ssl/node.pem", keyFile: "/etc/ssl/node-key.pem" } } },
-    })),
-    {
-      mirrors: { "*": { endpoint: ["https://mirror.example"], rewrite: { "^library/(.*)": "mirrored/$1" } } },
-      configs: { "mirror.example": { tls: { ca_file: "/etc/ssl/mirror-ca.pem", cert_file: "/etc/ssl/node.pem", key_file: "/etc/ssl/node-key.pem" } } },
-    },
-  );
-});
-
 test("subnetAddress counts from the subnet's network address, within its host addresses", () => {
   assert.equal(subnetAddress("172.31.252.0/24", 2), "172.31.252.2");
   assert.equal(subnetAddress("10.1.0.0/16", 258), "10.1.1.2");
@@ -395,19 +381,4 @@ test("subnetAddress counts from the subnet's network address, within its host ad
   assert.equal(subnetAddress("192.168.0.0/24", 0), null);
   assert.equal(subnetAddress("300.1.0.0/16", 2), null);
   assert.equal(subnetAddress("fd00::/64", 2), null);
-});
-
-test("nodeHostsWith keeps k3s's lines for the nodes and replaces every other with the aliases", () => {
-  const nodeHosts = "172.31.252.250 otelcol.observability\n172.31.252.1 host.docker.internal\n172.31.252.3 dev-server-0";
-  assert.equal(
-    nodeHostsWith(nodeHosts, ["dev-server-0"], [{ ip: "172.31.252.251", hostnames: ["otelcol.observability", "otelcol"] }]),
-    "172.31.252.3 dev-server-0\n172.31.252.251 otelcol.observability otelcol",
-  );
-  assert.equal(nodeHostsWith(nodeHosts, ["dev-server-0"], []), "172.31.252.3 dev-server-0");
-});
-
-test("localKubeconfig is null for what is not yet a kubeconfig with a cluster and a user", () => {
-  assert.equal(localKubeconfig("", "dev", 7443), null);
-  assert.equal(localKubeconfig("apiVersion: v1\nclusters: [", "dev", 7443), null);
-  assert.ok(localKubeconfig(K3S_YAML, "dev", 7443)?.includes("https://127.0.0.1:7443"));
 });

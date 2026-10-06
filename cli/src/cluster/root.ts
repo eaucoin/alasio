@@ -20,13 +20,21 @@ import {
   RootCommandFailed,
   RootSystem,
 } from "./machine.ts";
+import { describeNodeStep, NodeStep, type NodeStepError, performNodeStep } from "./node.ts";
 
 /** A step alasio does as root. */
-export const RootStep = Schema.Union([RaiseInotify, ForgetInotify]);
+export const RootStep = Schema.Union([RaiseInotify, ForgetInotify, ...NodeStep.members]);
 export type RootStep = typeof RootStep.Type;
 
 /** Steps as `alasio as-root` reads them: JSON. */
 export const RootSteps = Schema.fromJsonString(Schema.Array(RootStep));
+
+/** What steps came to: the kubeconfig k3s wrote, when one of them read it. */
+export const RootOutcome = Schema.Struct({ kubeconfig: Schema.optionalKey(Schema.String) });
+export type RootOutcome = typeof RootOutcome.Type;
+
+/** An outcome as `alasio as-root` says it: JSON. */
+export const RootOutcomeJson = Schema.fromJsonString(RootOutcome);
 
 /** What `step` does, as alasio says it will. */
 export function describeStep(step: RootStep): string {
@@ -35,22 +43,26 @@ export function describeStep(step: RootStep): string {
       return describeRaiseInotify(step);
     case "ForgetInotify":
       return describeForgetInotify();
+    default:
+      return describeNodeStep(step);
   }
 }
 
 /** How a step fails. */
-export type StepError = PlatformError.PlatformError | RootCommandFailed;
+export type StepError = PlatformError.PlatformError | RootCommandFailed | NodeStepError;
 
-/** Does `steps`, in order, as root. */
-export const performSteps = (steps: readonly RootStep[]): Effect.Effect<void, StepError, FileSystem.FileSystem | Machine | RootSystem> =>
-  Effect.forEach(steps, (step) => {
+/** Does `steps`, in order, as root: what they came to. */
+export const performSteps = (steps: readonly RootStep[]): Effect.Effect<RootOutcome, StepError, FileSystem.FileSystem | Machine | RootSystem> =>
+  Effect.reduce(steps, (): RootOutcome => ({}), (outcome, step) => {
     switch (step._tag) {
       case "RaiseInotify":
-        return raiseInotify(step);
+        return Effect.as(raiseInotify(step), outcome);
       case "ForgetInotify":
-        return forgetInotify;
+        return Effect.as(forgetInotify, outcome);
+      default:
+        return Effect.map(performNodeStep(step), (kubeconfig) => (kubeconfig ? { ...outcome, kubeconfig } : outcome));
     }
-  }, { discard: true });
+  });
 
 /** alasio must do something as root, and sudo cannot ask for a password without a terminal. */
 export class RootUnavailable extends Schema.TaggedError<RootUnavailable>()("RootUnavailable", {
@@ -65,12 +77,12 @@ export class RootUnavailable extends Schema.TaggedError<RootUnavailable>()("Root
   }
 }
 
-/** What alasio did as root, through sudo, failed. */
+/** What alasio did as root, through sudo, failed, or said what it came to as something else than its outcome. */
 export class RootStepsFailed extends Schema.TaggedError<RootStepsFailed>()("RootStepsFailed", {
-  exitCode: Schema.Number,
+  reason: Schema.String,
 }) {
   override get message(): string {
-    return `what alasio did as root, through sudo, exited with ${this.exitCode}; it said why above`;
+    return `what alasio did as root, through sudo, ${this.reason}`;
   }
 }
 
@@ -104,15 +116,15 @@ const announce = (steps: readonly RootStep[], how: string): Effect.Effect<void> 
 
 /** Does steps as root, saying first what they are. */
 export class Root extends Context.Service<Root, {
-  /** Does `steps`, in order; nothing, and asks for nothing, when there are none. */
-  readonly run: (steps: readonly RootStep[]) => Effect.Effect<void, RootError>;
+  /** Does `steps`, in order: what they came to; nothing, asking for nothing, when there are none. */
+  readonly run: (steps: readonly RootStep[]) => Effect.Effect<RootOutcome, RootError>;
 }>()("alasio/cluster/Root") {
   /** In this process, which is root's, or stands for it in tests. */
   static readonly inProcess: Layer.Layer<Root, never, FileSystem.FileSystem | Machine | RootSystem> = Layer.effect(
     Root,
     Effect.map(Effect.context<FileSystem.FileSystem | Machine | RootSystem>(), (context) =>
       Root.of({
-        run: (steps) => (steps.length === 0 ? Effect.void : Effect.andThen(announce(steps, "as root"), Effect.provide(performSteps(steps), context))),
+        run: (steps) => (steps.length === 0 ? Effect.succeed({}) : Effect.andThen(announce(steps, "as root"), Effect.provide(performSteps(steps), context))),
       })),
   );
 
@@ -130,13 +142,16 @@ export class Root extends Context.Service<Root, {
         Root.of({
           run: (steps) =>
             Effect.gen(function*() {
-              if (steps.length === 0) return;
+              if (steps.length === 0) return {};
               const interactive = yield* stdio.stdinIsTerminal;
               if (!interactive && (yield* sudo(["-n", "true"])).exitCode !== 0) return yield* new RootUnavailable({ steps: steps.map(describeStep) });
               yield* announce(steps, "as root, through sudo");
               const self = [process.execPath, ...process.execArgv, process.argv[1] ?? "", "as-root"];
-              const { exitCode } = yield* sudo([...(interactive ? [] : ["-n"]), "--", ...self], Schema.encodeSync(RootSteps)(steps));
-              if (exitCode !== 0) return yield* new RootStepsFailed({ exitCode });
+              const { exitCode, stdout } = yield* sudo([...(interactive ? [] : ["-n"]), "--", ...self], Schema.encodeSync(RootSteps)(steps));
+              if (exitCode !== 0) return yield* new RootStepsFailed({ reason: `exited with ${exitCode}; it said why above` });
+              return yield* Schema.decodeUnknownEffect(RootOutcomeJson)(stdout.toString("utf8")).pipe(
+                Effect.mapError(() => new RootStepsFailed({ reason: `said what it came to as ${JSON.stringify(stdout.toString("utf8").slice(0, 200))}` })),
+              );
             }),
         }),
       );

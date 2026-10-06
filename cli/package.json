@@ -14,7 +14,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp ../cluster/node/config-v3.toml.tmpl dist/cluster/node/",
     "start": "node ./src/main.ts"
   },
   "dependencies": {

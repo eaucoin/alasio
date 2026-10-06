@@ -15,14 +15,17 @@ import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer, Logger, Schema, Stdio } from "effect";
 
 import { Machine, RaiseInotify, SYSCTL_FILE } from "../src/cluster/machine.ts";
-import { Root, RootSteps } from "../src/cluster/root.ts";
+import { Root, type RootOutcome, RootSteps } from "../src/cluster/root.ts";
 import { runAlasio } from "./support/cli.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 
 const STEPS = [RaiseInotify.make({ limits: [{ name: "fs.inotify.max_user_instances", minimum: 1024 }] })];
 
-/** A sudo of the test's on PATH, which exits with `answer` to `sudo -n true` and with `exitCode` otherwise; what it was asked, and given. */
-function fakeSudo(t: TestContext, { answer = 0, exitCode = 0 } = {}): { readonly asked: () => string[]; readonly given: () => string } {
+/**
+ * A sudo of the test's on PATH, which exits with `answer` to `sudo -n true`, and otherwise
+ * says `outcome` and exits with `exitCode`; what it was asked, and given.
+ */
+function fakeSudo(t: TestContext, { answer = 0, exitCode = 0, outcome = "{}" } = {}): { readonly asked: () => string[]; readonly given: () => string } {
   const directory = mkdtempSync(join(tmpdir(), "alasio-sudo-"));
   const log = join(directory, "asked");
   const stdin = join(directory, "given");
@@ -31,6 +34,7 @@ function fakeSudo(t: TestContext, { answer = 0, exitCode = 0 } = {}): { readonly
     `printf '%s\\n' "$*" >>'${log}'`,
     `if [ "$*" = "-n true" ]; then exit ${answer}; fi`,
     `cat >'${stdin}'`,
+    `printf '%s\\n' '${outcome}'`,
     `exit ${exitCode}`,
   ].join("\n"));
   chmodSync(join(directory, "sudo"), 0o755);
@@ -46,14 +50,18 @@ function fakeSudo(t: TestContext, { answer = 0, exitCode = 0 } = {}): { readonly
   };
 }
 
-/** Root's run of `steps`, through sudo, with stdin a terminal or not: its failure's message, if it failed, and what it said. */
-async function throughSudo(t: TestContext, steps: typeof STEPS, terminal: boolean): Promise<{ readonly failed: string | null; readonly said: readonly string[] }> {
+/** Root's run of `steps`, through sudo, with stdin a terminal or not: what it came to, or its failure's message, and what it said. */
+async function throughSudo(
+  t: TestContext,
+  steps: typeof STEPS,
+  terminal: boolean,
+): Promise<{ readonly failed: string | null; readonly outcome: RootOutcome | null; readonly said: readonly string[] }> {
   const machine = new FakeMachine(mkdtempSync(join(tmpdir(), "alasio-machine-")));
   t.after(() => rmSync(machine.root, { recursive: true, force: true }));
   const said: string[] = [];
-  const failed = await Effect.runPromise(
+  const [failed, outcome] = await Effect.runPromise(
     Effect.flatMap(Root, (root) => root.run(steps)).pipe(
-      Effect.match({ onFailure: (error) => error.message, onSuccess: () => null }),
+      Effect.match({ onFailure: (error) => [error.message, null] as const, onSuccess: (came) => [null, came] as const }),
       Effect.provide(
         Root.layer.pipe(
           Layer.provide(Layer.mergeAll(
@@ -67,7 +75,7 @@ async function throughSudo(t: TestContext, steps: typeof STEPS, terminal: boolea
       Effect.provide(Logger.layer([Logger.make(({ message }) => void said.push(String(message)))])),
     ),
   );
-  return { failed, said };
+  return { failed, outcome, said };
 }
 
 const asRoot = (sudoArgs: readonly string[]) => [...sudoArgs, "--", process.execPath, ...process.execArgv, process.argv[1], "as-root"].join(" ");
@@ -103,6 +111,16 @@ test("without a terminal, a sudo that would ask for a password is not run, and w
 test("steps that fail through sudo fail the command, which says they said why", { skip }, async (t) => {
   fakeSudo(t, { exitCode: 3 });
   assert.equal((await throughSudo(t, STEPS, false)).failed, "what alasio did as root, through sudo, exited with 3; it said why above");
+});
+
+test("what the steps came to comes back from sudo on its stdout", { skip }, async (t) => {
+  fakeSudo(t, { outcome: '{"kubeconfig":"apiVersion: v1"}' });
+  assert.deepEqual((await throughSudo(t, STEPS, false)).outcome, { kubeconfig: "apiVersion: v1" });
+});
+
+test("what is not an outcome on sudo's stdout fails the command", { skip }, async (t) => {
+  fakeSudo(t, { outcome: "Password:" });
+  assert.equal((await throughSudo(t, STEPS, false)).failed, 'what alasio did as root, through sudo, said what it came to as "Password:\\n"');
 });
 
 test("no steps ask nothing of sudo", { skip }, async (t) => {

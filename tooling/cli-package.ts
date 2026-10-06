@@ -21,8 +21,17 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 /** npm's answers can be long: a pack's lists every file. */
 const MAX_BUFFER = 16 * 1024 * 1024;
 
-/** What the package must hold: its command, and the CRD it applies, which is data, not code. */
-export const REQUIRED = ["dist/cli/src/main.js", "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json"] as const;
+/**
+ * What the package must hold: its command, and what is data, not code: the CRD it applies,
+ * and the node's pins and containerd template, cluster/node's, which the host target
+ * installs from.
+ */
+export const REQUIRED = [
+  "dist/cli/src/main.js",
+  "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json",
+  "dist/cluster/node/pins.json",
+  "dist/cluster/node/config-v3.toml.tmpl",
+] as const;
 
 /** A packed package: its tarball, and the paths it holds, relative to the package. */
 export interface PackedCli {
@@ -38,7 +47,7 @@ interface PackReport {
 
 /** What is wrong with a package of `files`: a file it must not hold (sources, tests, anything not built), or one it lacks. */
 export function packageProblems(files: readonly string[]): string[] {
-  const stray = files.filter((file) => file !== "package.json" && !(file.startsWith("dist/") && /\.(js|js\.map|json)$/u.test(file)));
+  const stray = files.filter((file) => file !== "package.json" && !REQUIRED.some((required) => required === file) && !(file.startsWith("dist/") && /\.(js|js\.map|json)$/u.test(file)));
   const tests = files.filter((file) => /(^|\/)test\//u.test(file));
   const missing = REQUIRED.filter((file) => !files.includes(file));
   return [

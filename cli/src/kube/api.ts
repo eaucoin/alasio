@@ -38,6 +38,7 @@ const KINDS = {
   Node: { apiVersion: "v1", plural: "nodes", namespaced: false },
   PersistentVolume: { apiVersion: "v1", plural: "persistentvolumes", namespaced: false },
   PriorityClass: { apiVersion: "scheduling.k8s.io/v1", plural: "priorityclasses", namespaced: false },
+  RuntimeClass: { apiVersion: "node.k8s.io/v1", plural: "runtimeclasses", namespaced: false },
   StorageClass: { apiVersion: "storage.k8s.io/v1", plural: "storageclasses", namespaced: false },
   CSIDriver: { apiVersion: "storage.k8s.io/v1", plural: "csidrivers", namespaced: false },
   ClusterRole: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterroles", namespaced: false },
