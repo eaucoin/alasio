@@ -18,7 +18,13 @@
  * the suites (SHARD). Needs Docker and npm. Once pushed, the images built are removed,
  * and Docker's build cache with them, as a CI runner's disk holds the registry's copies,
  * and each node's of the images its pods run, and little more: a node pulls only those,
- * and again any its kubelet collected.
+ * and again any its kubelet collected. alasio's command line raises the inotify limits
+ * through sudo, which must ask for no password where they are too low.
+ *
+ * ALASIO_E2E_TARGET=host makes the cluster k3s on this machine itself, the host target,
+ * rather than in Docker: of one node, from images pushed already, it needs npm and sudo
+ * that asks for no password, through which alasio's command line does what it does as
+ * root, and the tests what they do as root on the node, which is this machine.
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -43,12 +49,16 @@ import { createTelegramStub } from "./telegram-stub.ts";
 const run = promisify(execFile);
 const root = fileURLToPath(new URL("../..", import.meta.url));
 
+/** Where the run makes its cluster: k3s on this machine itself, or in Docker. */
+export const TARGET = targetOf(process.env["ALASIO_E2E_TARGET"]);
 /** Agent nodes beside the server. */
 export const AGENTS = Number(process.env["ALASIO_E2E_AGENTS"] ?? 0);
 /** Whether the cluster, and the run's directory, are kept afterwards. */
 export const KEEP = process.env["ALASIO_E2E_KEEP"] === "1";
-/** The cluster: one of its own for each number of agents, so runs of each can be kept side by side. */
+/** The cluster in Docker: one of its own for each number of agents, so runs of each can be kept side by side. */
 export const CLUSTER = `alasio-e2e-${AGENTS}`;
+/** The cluster, as alasio names it in what it says. */
+const THE_CLUSTER = TARGET === "host" ? "k3s on this machine" : `the cluster ${CLUSTER}`;
 /**
  * Whether folder workspaces are on. The host profile is for a single machine's single
  * node, so it is off on several, where alasio's images are placed once each: Neon and its
@@ -60,6 +70,13 @@ export const HOST_PROFILE = AGENTS < 2;
 const OPERATOR = "1001";
 /** The user folder workspaces run as. */
 export const HOST_USER = 1000;
+
+/** The target `value` names: the cluster in Docker unless it names the host. */
+export function targetOf(value: string | undefined): "host" | "docker" {
+  if (!value || value === "docker") return "docker";
+  if (value === "host") return "host";
+  throw new Error(`ALASIO_E2E_TARGET is ${value}, not host or docker`);
+}
 
 /** The shards of the suites, each run on a cluster of its own. */
 export const SHARDS = ["sessions", "neon"] as const;
@@ -168,6 +185,9 @@ function capture(child: ChildProcess): Promise<Ran> {
     child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
   });
 }
+
+/** `sudo -n ...args`, which must succeed. */
+const sudo = (...args: string[]) => run("sudo", ["-n", ...args], { maxBuffer: 64 * 1024 * 1024 });
 
 /** `docker ...args`, which must succeed. */
 const docker = (...args: string[]) => run("docker", args, { cwd: root, maxBuffer: 64 * 1024 * 1024 });
@@ -340,9 +360,13 @@ export async function inAlasio<Seen>(script: string, ...args: string[]): Promise
   return JSON.parse(stdout.trim().split("\n").at(-1)!);
 }
 
-/** Runs `script` with sh as root in the cluster's node `node`, a container of this machine's Docker, which must succeed: what it printed. */
+/**
+ * Runs `script` with sh as root on the cluster's node `node`, which must succeed: what it
+ * printed. A node in Docker is a container of this machine's Docker; on the host, this
+ * machine is the node.
+ */
 export async function onNode(node: string, script: string): Promise<string> {
-  return (await docker("exec", node, "sh", "-c", script)).stdout;
+  return (TARGET === "host" ? await sudo("sh", "-c", script) : await docker("exec", node, "sh", "-c", script)).stdout;
 }
 
 /** Builds the image `name`, tagged `tag`. */
@@ -437,6 +461,7 @@ export async function setUp(): Promise<void> {
   const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: configHome, XDG_DATA_HOME: join(work, "data") };
   for (const name of ["KUBECONFIG", "TELEGRAM_BOT_TOKEN", "TELEGRAM_API_ROOT", "CLAUDE_CODE_OAUTH_TOKEN"]) delete env[name];
 
+  if (TARGET === "host" && (!PUSHED || AGENTS > 0)) throw new Error("the host target's run is of one node, from images pushed already (ALASIO_E2E_REGISTRY)");
   const prefix = join(work, "prefix");
   setup = { work, bin: join(prefix, "bin", "alasio"), env, configFile, kubeconfig: join(configHome, "alasio", "kubeconfig"), storage, home };
 
@@ -445,23 +470,19 @@ export async function setUp(): Promise<void> {
 
   if (!PUSHED) await build("alasio-node", NODE_IMAGE);
   mkdirSync(join(configHome, "alasio"), { recursive: true, mode: 0o700 });
-  writeFileSync(
-    configFile,
-    JSON.stringify({
-      target: {
-        docker: {
-          name: CLUSTER,
-          apiPort: await freePort(),
-          storagePath: storage,
-          agents: AGENTS,
-          image: NODE_IMAGE,
-          ...(PUSHED ? {} : { registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } } }),
-        },
+  const target = TARGET === "host"
+    ? { host: { storagePath: storage } }
+    : {
+      docker: {
+        name: CLUSTER,
+        apiPort: await freePort(),
+        storagePath: storage,
+        agents: AGENTS,
+        image: NODE_IMAGE,
+        ...(PUSHED ? {} : { registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } } }),
       },
-      install: installation(),
-    }),
-    { mode: 0o600 },
-  );
+    };
+  writeFileSync(configFile, JSON.stringify({ target, install: installation() }), { mode: 0o600 });
   const botToken = join(work, "bot-token");
   writeFileSync(botToken, "123:e2e", { mode: 0o600 });
   const telegram = createTelegramStub();
@@ -543,17 +564,18 @@ export async function tearDown(): Promise<void> {
   if (!setup) return;
   const { work, configFile } = setup;
   if (KEEP) {
-    console.error(
-      `# kept the cluster ${CLUSTER}, the registry ${REGISTRY} and ${work}: docker rm --force ${REGISTRY} && docker volume rm ${REGISTRY} removes the registry, and then ${setup.bin} --config ${configFile} uninstall --purge --yes the cluster`,
-    );
+    const registry = PUSHED ? "" : `docker rm --force ${REGISTRY} && docker volume rm ${REGISTRY} removes the registry, and then `;
+    console.error(`# kept ${THE_CLUSTER}${PUSHED ? "" : `, the registry ${REGISTRY}`} and ${work}: ${registry}${setup.bin} --config ${configFile} uninstall --purge --yes the cluster`);
     return;
   }
   // First, as Docker removes no network a container is still on.
-  await docker("rm", "--force", REGISTRY).catch(() => undefined);
-  await docker("volume", "rm", REGISTRY).catch(() => undefined);
+  if (!PUSHED) {
+    await docker("rm", "--force", REGISTRY).catch(() => undefined);
+    await docker("volume", "rm", REGISTRY).catch(() => undefined);
+  }
   const removed = await alasio("uninstall", "--purge", "--yes").catch((error: unknown) => ({ code: 1, stderr: error instanceof Error ? error.message : String(error) }));
-  if (removed.code !== 0) console.error(`# the cluster ${CLUSTER} may be left: alasio uninstall --purge failed: ${removed.stderr.trim()}`);
-  await docker("image", "rm", "--force", NODE_IMAGE).catch(() => undefined);
+  if (removed.code !== 0) console.error(`# ${THE_CLUSTER} may be left: alasio uninstall --purge failed: ${removed.stderr.trim()}`);
+  if (TARGET === "docker") await docker("image", "rm", "--force", NODE_IMAGE).catch(() => undefined);
   try {
     rmSync(work, { recursive: true, force: true });
   } catch (error) {

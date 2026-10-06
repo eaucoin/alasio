@@ -96,11 +96,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One node, and a server with two agents, so the stack and sessions spread.
+        # The cluster in Docker on one node, and on a server with two agents, so the stack
+        # and sessions spread; and k3s on the runner itself, the host target, which the
+        # runner's sudo, asking for no password, lets alasio install, on one.
+        target: [docker]
         agents: [0, 2]
         # The suites, in two shards that need nothing of each other's, each on a cluster
         # of its own: alasio on Kubernetes and workspaces on JuiceFS, and Neon (test/e2e/harness.ts).
         shard: [sessions, neon]
+        include:
+          - { target: host, agents: 0, shard: sessions }
+          - { target: host, agents: 0, shard: neon }
     steps:
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
       # it serves, unpacked: far more disk than a runner starts with free, so the
@@ -142,10 +148,11 @@ jobs:
           df -h /
           exit "$(cat "$RUNNER_TEMP/disk-freed")"
       # alasio's package installed, alasio init and up on a cluster of this runner from the
-      # images job's images, the shard's end-to-end tests, and alasio uninstall --purge
-      # (test/e2e/harness.ts).
+      # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
+      # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
       - run: npm run test:e2e
         env:
+          ALASIO_E2E_TARGET: ${{ matrix.target }}
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
