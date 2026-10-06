@@ -168,8 +168,8 @@ const Host = Schema.Struct({
   createNamespace: defaulted(Schema.Boolean, true),
   baymaImage: Image({
     repository: "ghcr.io/eaucoin/bayma",
-    tag: "0.12.1",
-    digest: "sha256:186b9e9e24bdf7d031faa5906c7c49e9be7d0fa9a47ac8d33a949eae62b31eb2",
+    tag: "0.12.2",
+    digest: "sha256:654750dd6a1ddcc36aaf46bf5676c58a3438fab3545da454c05aeb296f42a4e6",
   }),
   /** The operator's user and home, which alasio and each folder's bayma run as and in. */
   uid: defaulted(Id, 1000),

@@ -2,7 +2,7 @@
 # the unprivileged user `agent`. No harness runs here: Claude Code and Codex run in alasio
 # and reach a session only through its bayma. /workspace and /home/agent are the
 # session's volume, mounted by its Sandbox (cli/src/manifests/alasio.ts, sessionsProfile).
-ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.12.1@sha256:186b9e9e24bdf7d031faa5906c7c49e9be7d0fa9a47ac8d33a949eae62b31eb2
+ARG BAYMA_IMAGE=ghcr.io/eaucoin/bayma:0.12.2@sha256:654750dd6a1ddcc36aaf46bf5676c58a3438fab3545da454c05aeb296f42a4e6
 FROM ${BAYMA_IMAGE}
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
       org.opencontainers.image.description="alasio's session sandboxes: bayma, run as the unprivileged agent"
