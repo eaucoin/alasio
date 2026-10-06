@@ -13,7 +13,11 @@ alasio installs and runs itself with its command line, the npm package
 `alasio`. It needs a Linux x86-64 machine with Docker and Node 24, whose
 inotify limits hold the cluster's containers: `fs.inotify.max_user_instances`
 at least 1024 and `fs.inotify.max_user_watches` at least 524288, which `init`
-says how to raise. On such a machine, make a bot with BotFather, then:
+says how to raise. alasio and what runs beside it use about 3.5 GB of memory
+at rest, and each conversation's agent and sandbox more, so 4 CPUs and 8 GB of
+memory are a comfortable start; their images take about 25 GB of disk, and
+their data grows from there with workspaces and transcripts. On such a
+machine, make a bot with BotFather, then:
 
 ```sh
 npx alasio init
