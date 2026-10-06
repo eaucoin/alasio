@@ -10,14 +10,11 @@ bayma's REPL sessions.
 ## Get Started
 
 alasio installs and runs itself with its command line, the npm package
-`alasio`. It needs a Linux x86-64 machine with Docker and Node 24, whose
-inotify limits hold the cluster's containers: `fs.inotify.max_user_instances`
-at least 1024 and `fs.inotify.max_user_watches` at least 524288, which `init`
-and `up` raise where they are lower, as root, through sudo. alasio and what runs beside it use about 3.5 GB of memory
-at rest, and each conversation's agent and sandbox more, so 4 CPUs and 8 GB of
-memory are a comfortable start; their images take about 25 GB of disk, and
-their data grows from there with workspaces and transcripts. On such a
-machine, make a bot with BotFather, then:
+`alasio`. It needs a Linux x86-64 machine with Node 24, and sudo. alasio and
+what runs beside it use about 3.5 GB of memory at rest, and each conversation's
+agent and sandbox more, so 4 CPUs and 8 GB of memory are a comfortable start;
+their images take about 25 GB of disk, and their data grows from there with
+workspaces and transcripts. On such a machine, make a bot with BotFather, then:
 
 ```sh
 npx alasio init
@@ -29,12 +26,23 @@ user IDs allowed to use it, Claude Code's token from `claude setup-token`,
 whether agents may work in this machine's folders, and where telemetry goes. It
 writes what you answer to `~/.config/alasio/config.json`, which holds no
 secret: the tokens are kept in the cluster alone, as Secrets. That cluster is
-one alasio makes on this machine, k3s with gVisor in Docker, its volumes under
-`~/.local/share/alasio/storage`. `up` starts it, and alasio in it, and waits
-until alasio runs. Run `init` again to change an answer; every question has a
-flag that answers it instead, for scripts (`npx alasio init --help`). Each
-command below runs as `npx alasio <command>`, or as `alasio <command>` once
-`npm install --global alasio` has installed it.
+k3s, which alasio installs on this machine itself, with gVisor, sandboxing
+workspaces, as its containerd's runtime, and its volumes under
+`~/.local/share/alasio/storage`. `up` installs it, or starts it, and alasio in
+it, and waits until alasio runs. What `init` and `up` change on the machine
+they change as root, through sudo, all at once, after saying what: k3s, with
+its own install script, as the service `k3s`, and its configuration in
+`/etc/rancher/k3s`; gVisor, in `/usr/local/bin`; and the inotify limits the
+cluster needs, `fs.inotify.max_user_instances` at least 1024 and
+`fs.inotify.max_user_watches` at least 524288, where they are lower, now and in
+`/etc/sysctl.d/60-alasio-inotify.conf`. Without a terminal, sudo must ask for
+no password. k3s and gVisor are the releases this version of alasio pins,
+checked against their digests, and its API server is on the machine's port
+6443, as k3s has it; `up` asks for root again only when something of it
+changes. Run `init` again to change an answer; every question has a flag that
+answers it instead, for scripts (`npx alasio init --help`). Each command below
+runs as `npx alasio <command>`, or as `alasio <command>` once `npm install
+--global alasio` has installed it.
 
 Then message the bot. `/service` chooses the agent, Claude Code or Codex, and
 `/workspace` where it works. A new empty workspace is a filesystem of its own,
@@ -82,8 +90,9 @@ alasio logs (`--follow` follows it, and `alasio logs lake` a component's), and
 workspaces are pods of their own, so their REPL sessions keep running through
 it. `npx alasio@latest upgrade` upgrades alasio to the newest version. An
 upgrade that changes a workspace's pod, as a newer bayma does, replaces the pod
-at the workspace's next turn, its files kept. `alasio down` stops the cluster,
-keeping everything, and `alasio up` starts it again.
+at the workspace's next turn, its files kept, and an upgrade to a version that
+pins another k3s or gVisor installs them in place of those. `alasio down` stops
+the cluster, keeping everything, and `alasio up` starts it again.
 
 Every Claude Code transcript entry and Codex rollout line is also a row in an
 analytics lake, which you query read-only with
@@ -106,17 +115,29 @@ keep their files, each in a bucket the store must already have.
 cluster's default StorageClass instead of JuiceFS's; a workspace keeps the
 volume it was made with either way. `alasio up` applies what you change.
 
-The config's `target.docker` is the cluster alasio makes, and `registries` in it
-says where its nodes pull images from, as k3s's `registries.yaml` does, its
-keys in camel case: `mirrors`, the endpoints that stand for a registry, and
-`configs`, a registry's TLS, its files the nodes' own, as `mounts` mounts them.
-A registry that asks for a login is not one of them, as the config holds no
-secret. `alasio up` makes the nodes anew with what you change, keeping their
-data.
+The config's `target.host` is the cluster alasio makes, and `registries` in it
+says where k3s pulls images from, as k3s's `registries.yaml` does, its keys in
+camel case: `mirrors`, the endpoints that stand for a registry, and `configs`,
+a registry's TLS, its files the machine's own. A registry that asks for a login
+is not one of them, as the config holds no secret. `hostAliases` are names the
+cluster's DNS resolves, `{ "ip": ..., "hostnames": [...] }` as an `/etc/hosts`
+line says them, for its pods; the machine resolves names as it always has.
+`alasio up` applies what you change, restarting k3s for new registries.
+
+alasio makes its cluster in Docker instead with `npx alasio init --target
+docker`, on a machine with Docker, for several nodes on one machine, or where
+alasio should not install anything itself: k3s with gVisor in containers, from
+a node image alasio publishes with the same k3s and gVisor, its API server on a
+port of the loopback. Its config, `target.docker`, is as `target.host` is, its
+registries' files the nodes' own, as `mounts` mounts the machine's paths in
+them, beside `agents`, the nodes it has beside its server. It asks for root
+only to raise the inotify limits, where they are lower, and `alasio up` makes
+its nodes anew with what you change, keeping their data.
 
 `alasio uninstall` removes alasio and keeps its data, which `alasio up`
 installs it again with; `alasio uninstall --purge` removes the data too, and
-the cluster alasio made.
+the cluster alasio made, as root where it must: k3s, with its own uninstall
+script, and gVisor, or the cluster in Docker, and the inotify limits' file.
 
 alasio runs in a cluster of yours as well: `npx alasio init --kubeconfig
 <path>`, with `--context <name>` for another than the kubeconfig's current
@@ -135,21 +156,27 @@ control plane is written in Effect, its services layers composed in
 `src/alasio.ts`, and `.env.example` is for running it outside the cluster
 against one. `cli/` is the command line, the npm package: it builds the
 Kubernetes objects it installs in `cli/src/manifests/`, JuiceFS's CSI driver
-among them as JuiceFS's own manifests have it, applies them through
-the Kubernetes API, and makes the cluster on this machine through Docker's
-Engine API, in `cli/src/cluster/`, from the node image in `cluster/node/`.
+among them as JuiceFS's own manifests have it, applies them through the
+Kubernetes API, and makes the cluster on this machine, in `cli/src/cluster/`:
+k3s on the machine itself, through sudo, running itself as `alasio as-root` for
+what it does as root, or in Docker, through Docker's Engine API, from the node
+image in `cluster/node/`. Both run the k3s and gVisor `cluster/node/pins.json`
+pins, and its containerd template.
 `sandbox/agent/` is the image sessions run, and `neon/` what alasio adds to
 Neon: neon-control, and the analytics lake, with its image.
 
 `npm run test:e2e` is the end-to-end run: it packs the command line's package
-and installs it, builds the images, makes a cluster with `alasio init` whose
-nodes pull them from a registry of the run's own, starts alasio with `alasio up`, drives it through a Telegram stand-in,
-puts its Neon through crashes, and removes it all with `alasio uninstall
---purge`. It needs Docker, and much of its disk; `ALASIO_E2E_AGENTS` gives the
-cluster agent nodes beside its server.
+and installs it, builds the images, makes a cluster in Docker with `alasio
+init` whose nodes pull them from a registry of the run's own, starts alasio
+with `alasio up`, drives it through a Telegram stand-in, puts its Neon through
+crashes, and removes it all with `alasio uninstall --purge`. It needs Docker,
+and much of its disk; `ALASIO_E2E_AGENTS` gives the cluster agent nodes beside
+its server. `ALASIO_E2E_TARGET=host` runs it on k3s installed on the machine
+itself, from images pushed already (`ALASIO_E2E_REGISTRY`), with sudo that asks
+for no password: on a machine of no other use, as CI's runners are.
 
 The GitHub Actions workflows in `.github/workflows/` run on demand: `ci.yml`
-the tests, a check of the package npm packs, and the end-to-end run, on one
-node and on three; `release.yml`, from a version tag, the release, which
-publishes the images to GitHub's container registry and the command line,
-pinned to them by digest, to npm.
+the tests, a check of the package npm packs, and the end-to-end run, in Docker
+on one node and on three, and on the runner itself; `release.yml`, from a
+version tag, the release, which publishes the images to GitHub's container
+registry and the command line, pinned to them by digest, to npm.

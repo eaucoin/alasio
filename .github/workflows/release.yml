@@ -162,6 +162,6 @@ jobs:
       - run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --title "alasio $VERSION" --generate-notes \
-              --notes "Install and start it, on a Linux machine with Docker and Node 24: \`npx alasio@$VERSION init\`"
+              --notes "Install and start it, on a Linux machine with Node 24 and sudo: \`npx alasio@$VERSION init\`"
         env:
           GH_TOKEN: ${{ github.token }}
