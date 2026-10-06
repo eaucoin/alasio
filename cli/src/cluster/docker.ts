@@ -24,7 +24,7 @@
 import { createHash } from "node:crypto";
 
 import type { V1ConfigMap, V1NodeList } from "@kubernetes/client-node";
-import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schema } from "effect";
+import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schedule, Schema } from "effect";
 
 import { imageReference } from "../images.ts";
 import { NODE_IMAGE } from "../release.ts";
@@ -205,6 +205,21 @@ export function freeSubnet(taken: readonly string[]): string | null {
   }
   return null;
 }
+
+/**
+ * Aborts the FUSE connections of what is mounted in a node, as JuiceFS's workspaces are: a
+ * process waiting on one whose client is gone, as a node's are once they are killed, can
+ * itself be killed, and its node removed, only once it is. The machine's connections are
+ * all in /sys/fs/fuse/connections, each named after the minor of its mount's device, and
+ * only the node's own are aborted.
+ */
+const ABORT_FUSE = [
+  "grep -q ' /sys/fs/fuse/connections ' /proc/self/mounts || mount -t fusectl fusectl /sys/fs/fuse/connections",
+  "for device in $(awk '/ - fuse/ { print $3 }' /proc/self/mountinfo | sort -u); do",
+  '  abort="/sys/fs/fuse/connections/${device#*:}/abort"',
+  '  if [ -e "$abort" ]; then echo 1 >"$abort"; fi',
+  "done",
+].join("\n");
 
 /** kubelet's settings, as k3s's flags give them. */
 const kubeletArgs = KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`);
@@ -427,8 +442,11 @@ const makeDockerCluster = Effect.fnUntraced(function*({
         const found = yield* existingNodes;
         if (storage && found.some(({ name }) => name === server)) {
           yield* docker.startContainer(server);
-          yield* inNode(server, ["find", storagePath, "-mindepth", "1", "-delete"]);
+          // The pods still running write as it empties the directory, and one of its
+          // directories they write in as it is removed is not empty: it is emptied again.
+          yield* inNode(server, ["find", storagePath, "-mindepth", "1", "-delete"]).pipe(Effect.retry({ times: 9, schedule: Schedule.spaced("1 second") }));
         }
+        for (const { name } of found.filter(({ state }) => state === "running")) yield* Effect.ignore(inNode(name, ["sh", "-c", ABORT_FUSE]));
         yield* Effect.forEach(found, ({ name }) => docker.removeContainer(name), { discard: true });
         const network = yield* docker.inspectNetwork(cluster);
         if (network?.Labels?.[CLUSTER_LABEL] === cluster) {

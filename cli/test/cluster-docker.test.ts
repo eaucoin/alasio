@@ -299,14 +299,18 @@ test("a pull that fails fails up before anything is made", async (t) => {
   assert.deepEqual(fake.changes(), ["POST /images/create"]);
 });
 
-test("remove deletes the nodes and the network, and the volumes only when asked", async (t) => {
-  const { fake, kubeconfig, run } = await rig(t);
+test("remove aborts the FUSE connections of each running node's mounts, deletes the nodes and the network, and the volumes only when asked", async (t) => {
+  const { fake, k3s, kubeconfig, run } = await rig(t);
   fake.volumes.set("unrelated", {});
-  await run((cluster) => cluster.up(kubeconfig));
-  await run((cluster) => cluster.remove());
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1 });
+  const agent = fake.containers.get("dev-agent-0");
+  assert.ok(agent);
+  agent.state = "exited";
+  await run((cluster) => cluster.remove(), { agents: 1 });
+  assert.deepEqual(k3s.aborted, ["dev-server-0"]);
   assert.equal(fake.containers.size, 0);
   assert.equal(fake.networks.size, 0);
-  assert.equal(fake.volumes.size, 5);
+  assert.equal(fake.volumes.size, 9);
   await run((cluster) => cluster.remove({ volumes: true }));
   assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
 });
@@ -325,12 +329,13 @@ test("remove takes other containers off the network before removing it, and leav
   assert.equal(fake.containers.get("collector")?.state, "running");
 });
 
-test("remove with the storage empties it in the server node, as root, then removes it", async (t) => {
-  const { fake, kubeconfig, options, run } = await rig(t);
+test("remove with the storage empties it in the server node, as root, again while pods write in it, then removes it", async (t) => {
+  const { fake, k3s, kubeconfig, options, run } = await rig(t);
   await run((cluster) => cluster.up(kubeconfig).pipe(Effect.andThen(cluster.down)));
+  k3s.findFailures = 2;
   await run((cluster) => cluster.remove({ volumes: true, storage: true }));
   const commands = fake.requests.filter(({ path }) => path === "/containers/dev-server-0/exec").map(({ body }) => (body as { Cmd: string[] }).Cmd);
-  assert.deepEqual(commands.at(-1), ["find", options.storagePath, "-mindepth", "1", "-delete"]);
+  assert.deepEqual(commands.filter(([tool]) => tool === "find"), Array.from({ length: 3 }, () => ["find", options.storagePath, "-mindepth", "1", "-delete"]));
   assert.equal(fake.containers.size, 0);
   assert.throws(() => statSync(options.storagePath), /ENOENT/u);
 });
