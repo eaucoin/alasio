@@ -1,7 +1,7 @@
 /**
  * alasio's commands (cli/src/commands/), run as an operator runs them, at a terminal
  * that answers their questions, against a fake Docker whose nodes run k3s, a fake
- * Kubernetes API, and a fake Telegram, on a machine whose kernel settings the cluster
+ * Kubernetes API, and a fake Telegram, on a machine of the test's, whose inotify limits the cluster
  * here needs unless a test gives others.
  */
 import assert from "node:assert/strict";
@@ -13,10 +13,12 @@ import { test, type TestContext } from "node:test";
 import { Cause, Exit } from "effect";
 
 import { CODEX_LOGIN } from "../src/commands/login.ts";
+import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { type CliRun, runAlasio } from "./support/cli.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { serveK3sInDocker } from "./support/fake-k3s.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
+import { FakeMachine } from "./support/fake-machine.ts";
 import { serveFakeTelegram } from "./support/fake-telegram.ts";
 import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.ts";
 
@@ -27,6 +29,7 @@ const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
 interface Rig {
   readonly kube: FakeKube;
   readonly docker: FakeDocker;
+  readonly machine: FakeMachine;
   readonly home: string;
   /** A kubeconfig that reaches the fake API. */
   readonly kubeconfig: string;
@@ -52,6 +55,7 @@ async function rig(t: TestContext): Promise<Rig> {
     await Promise.all([kube.close(), telegram.close(), docker.close()]);
     rmSync(home, { recursive: true, force: true });
   });
+  const machine = new FakeMachine(join(home, "machine"));
   const kubeconfig = join(home, "kubeconfig");
   writeFileSync(kubeconfig, kube.kubeconfig);
   const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), DOCKER_HOST: docker.host, TELEGRAM_API_ROOT: telegram.root };
@@ -59,11 +63,12 @@ async function rig(t: TestContext): Promise<Rig> {
   return {
     kube,
     docker,
+    machine,
     home,
     kubeconfig,
     configFile,
     env,
-    alasio: (args, answers = []) => runAlasio(args, { env, answers }),
+    alasio: (args, answers = []) => runAlasio(args, { env, machine, answers }),
     configure: (config) => {
       mkdirSync(join(configFile, ".."), { recursive: true });
       writeFileSync(configFile, JSON.stringify(config));
@@ -211,13 +216,14 @@ test("init makes the cluster here unless told otherwise, its API on a port it ke
 });
 
 test("init asks nothing with --non-interactive, takes tokens from files and the environment, and makes the configured cluster", async (t) => {
-  const { config, configFile, configure, docker, env, home, kube } = await rig(t);
+  const { config, configFile, configure, docker, env, home, kube, machine } = await rig(t);
   const storagePath = join(home, "storage");
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath } } });
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, `${BOT_TOKEN}\n`);
   const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], {
     env: { ...env, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-env" },
+    machine,
   });
   succeeded(run);
   assert.deepEqual(config(), { target: { docker: { name: "dev", apiPort: kube.port, storagePath } }, install: {} });
@@ -288,44 +294,47 @@ test("status says each workload's state, and fails when one is not ready", async
   assert.ok(unhealthy.printed.includes("  Deployment alasio/alasio: 0 of 1 available"));
 });
 
-test("init, up and status here refuse inotify limits too low for the cluster, saying how to raise them", async (t) => {
-  const { configure, docker, env, home, kube } = await rig(t);
+test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
+  const { alasio, configure, home, kube, machine } = await rig(t);
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
-  const sysctl = { "fs.inotify.max_user_instances": "128\n", "fs.inotify.max_user_watches": "524288\n" };
+  machine.sysctl("fs.inotify.max_user_instances", 128);
   const shortfall = "fs.inotify.max_user_instances is 128, and the cluster needs at least 1024";
-  const refusal = [
-    "this machine's inotify limits are too low for the cluster alasio makes on it:",
-    `  ${shortfall}`,
-    "Raise them as root, now:",
-    "  sysctl -w fs.inotify.max_user_instances=1024",
-    "and for every boot, in /etc/sysctl.d/60-inotify.conf:",
-    "  fs.inotify.max_user_instances = 1024",
-  ].join("\n");
-  // init refuses before it asks anything.
-  assert.equal(failure(await runAlasio(["init"], { env, sysctl })), refusal);
-  assert.equal(failure(await runAlasio(["up"], { env, sysctl })), refusal);
-  assert.equal(docker.containers.size, 0);
-
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  succeeded(await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"], { env }));
-  const status = await runAlasio(["status"], { env, sysctl });
-  assert.equal(failure(status), refusal);
+  const init = await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]);
+  succeeded(init);
+  assert.ok(init.progress.includes([
+    "alasio changes this machine as root:",
+    `  raise fs.inotify.max_user_instances to 1024, now and for every boot, in ${SYSCTL_FILE}`,
+  ].join("\n")));
+  assert.equal(machine.read("/proc/sys/fs/inotify/max_user_instances"), "1024\n");
+  assert.match(machine.read(SYSCTL_FILE) ?? "", /^# .*\nfs\.inotify\.max_user_instances = 1024\n$/u);
+
+  // Another raised later is written beside it.
+  machine.sysctl("fs.inotify.max_user_watches", 8192);
+  const up = await alasio(["up"]);
+  succeeded(up);
+  assert.match(machine.read(SYSCTL_FILE) ?? "", /\nfs\.inotify\.max_user_instances = 1024\nfs\.inotify\.max_user_watches = 524288\n$/u);
+  succeeded(await alasio(["up"]));
+
+  machine.sysctl("fs.inotify.max_user_instances", 128);
+  const status = await alasio(["status"]);
+  assert.equal(failure(status), ["this machine's inotify limits are too low for the cluster alasio makes on it:", `  ${shortfall}`, "alasio up raises them, as root."].join("\n"));
   assert.deepEqual(status.printed.slice(0, 3), ["cluster dev, in Docker 29.0.0:", "  dev-server-0: running", `  this machine's ${shortfall}`]);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
 
 test("init, up and status refuse to make a cluster on a machine other than Linux on x86-64, but reach one elsewhere from it", async (t) => {
-  const { configure, docker, env, home, kube } = await rig(t);
+  const { configure, docker, env, home, kube, machine } = await rig(t);
   const mac = { platform: "darwin", arch: "arm64" };
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
   const refusal = "the cluster alasio makes on this machine runs on Linux on x86-64, and this is darwin on arm64: " +
     "run alasio on such a machine, or give it a cluster elsewhere with alasio init --kubeconfig";
-  for (const command of ["init", "up", "status"]) assert.equal(failure(await runAlasio([command], { env, machine: mac })), refusal, command);
+  for (const command of ["init", "up", "status"]) assert.equal(failure(await runAlasio([command], { env, machine, kind: mac })), refusal, command);
   assert.equal(docker.containers.size, 0);
 
   const remote = await installed(t);
-  const status = await runAlasio(["status"], { env: remote.env, machine: mac });
+  const status = await runAlasio(["status"], { env: remote.env, machine: remote.machine, kind: mac });
   succeeded(status);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
@@ -434,14 +443,16 @@ test("uninstall asks first, and keeps alasio's data unless --purge", async (t) =
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-telegram"), undefined);
 });
 
-test("uninstall --purge removes the cluster here whole: its nodes, volumes, storage and kubeconfig, but not the config", async (t) => {
-  const { alasio, configFile, configure, docker, env, home, kube } = await rig(t);
+test("uninstall --purge removes the cluster here whole: its nodes, volumes, storage and kubeconfig, and the limits' file, but not the config", async (t) => {
+  const { alasio, configFile, configure, docker, home, kube, machine } = await rig(t);
   const storagePath = join(home, "storage");
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath } } });
+  machine.sysctl("fs.inotify.max_user_watches", 8192);
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  succeeded(await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"], { env }));
+  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]));
   assert.ok(existsSync(storagePath));
+  assert.ok(machine.read(SYSCTL_FILE));
   const run = await alasio(["uninstall", "--purge"], [pressed("y")]);
   succeeded(run);
   assert.equal(docker.containers.size, 0);
@@ -450,5 +461,6 @@ test("uninstall --purge removes the cluster here whole: its nodes, volumes, stor
   assert.ok(!existsSync(storagePath));
   assert.ok(!existsSync(join(configFile, "..", "kubeconfig")));
   assert.ok(existsSync(configFile));
+  assert.equal(machine.read(SYSCTL_FILE), null);
   assert.match(run.prompts, /Remove alasio and all its data from the cluster dev on this machine, and the cluster itself\? This cannot be undone/u);
 });

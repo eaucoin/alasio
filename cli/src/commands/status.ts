@@ -2,14 +2,14 @@
 import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
-import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
 import { DockerCluster } from "../cluster/docker.ts";
+import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
 import { loadConfig } from "../config.ts";
 import { describeRef, kind, KubeApi, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness } from "../kube/rollout.ts";
 import { RELEASE } from "../manifests/common.ts";
-import { describeTarget, kubeApi, dockerCluster, resolveTarget } from "../target.ts";
+import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { ClusterNotRunning } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */

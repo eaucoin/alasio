@@ -2,21 +2,28 @@
 import { Console, Effect } from "effect";
 import { Command } from "effect/cli";
 
-import { requireLocalHost } from "../cluster/machine.ts";
 import { DockerCluster } from "../cluster/docker.ts";
+import { inotifyStep, requireLocalMachine } from "../cluster/machine.ts";
+import { Root } from "../cluster/root.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
 import { install, type Installed } from "../install.ts";
 import { VERSION } from "../release.ts";
-import { describeTarget, kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { describeTarget, dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
 
-/** Makes or starts the cluster in Docker when it is the target, once this machine is one it runs on, its inotify limits high enough, writing its kubeconfig; nothing for another. */
+/**
+ * Makes or starts the cluster in Docker when it is the target, once this machine is one it
+ * runs on, its inotify limits raised, as root, where they are too low, writing its
+ * kubeconfig; nothing for another.
+ */
 export const ensureCluster = (target: ResolvedTarget) =>
   target._tag === "Docker"
-    ? Effect.andThen(
-      requireLocalHost,
-      Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path)), dockerCluster(target.cluster)),
-    )
+    ? Effect.gen(function*() {
+      yield* requireLocalMachine;
+      const raise = yield* inotifyStep;
+      yield* Effect.flatMap(Root, (root) => root.run(raise ? [raise] : []));
+      yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path)), dockerCluster(target.cluster));
+    })
     : Effect.void;
 
 /** Where alasio runs, and what the operator does next. */
@@ -44,7 +51,7 @@ export const up = Command.make("up", { timeout: timeoutFlag }, ({ timeout }) => 
   Command.withShortDescription("Start alasio, installing or updating it"),
   Command.withDescription(
     "Makes the cluster on this machine, or starts it, when that is where alasio runs, once this machine is one it runs on, " +
-      "Linux on x86-64, its inotify limits high enough for it (it says how to raise them); applies alasio as the config says, " +
+      "Linux on x86-64, raising its inotify limits, as root, where they are too low for it; applies alasio as the config says, " +
       "with this version's images; and waits until it runs, saying what it waits for. Run it again after changing the config. " +
       "Past --timeout it says what is still not running and why.",
   ),

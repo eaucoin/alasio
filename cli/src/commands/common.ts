@@ -12,7 +12,7 @@ import { kind, KubeApi, type KubeApiError } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { podProblems, selectorOf, type WaitOptions } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../manifests/common.ts";
-import { kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 
 /** How often a wait looks. */
 const POLL: Duration.Input = "2 seconds";

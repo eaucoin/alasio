@@ -15,13 +15,13 @@ import { homedir } from "node:os";
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted, Result, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
-import { requireLocalHost } from "../cluster/machine.ts";
 import { DockerCluster } from "../cluster/docker.ts";
+import { requireLocalMachine } from "../cluster/machine.ts";
 import { configPath, decodeOperatorConfig, defaultStoragePath, type OperatorConfigFile, readConfig, writeConfig } from "../config.ts";
 import { applyNamespace } from "../install.ts";
 import { OptionalUrl } from "../manifests/config.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot, writeClaudeToken, writeTelegramBot } from "../secrets.ts";
-import { kubeApi, dockerCluster, type ResolvedTarget, resolveTarget } from "../target.ts";
+import { dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { TelegramBotApi } from "../telegram.ts";
 import { timeoutFlag } from "./common.ts";
 import { bringUp, ensureCluster } from "./up.ts";
@@ -369,8 +369,8 @@ export const init = Command.make("init", flags, (given) =>
     const install = existing?.install ?? {};
     const target = yield* chooseTarget(given, ask, existing?.file ?? null);
     const resolved = yield* resolveTarget(yield* Effect.fromResult(decodeOperatorConfig(path, { target, install })));
-    // Before any question, as the cluster here cannot run without them.
-    if (resolved._tag === "Docker") yield* requireLocalHost;
+    // Before any question, as the cluster here cannot run on another machine.
+    if (resolved._tag === "Docker") yield* requireLocalMachine;
     const current = yield* currentSecrets(resolved);
 
     const bot = yield* chooseBot(given, ask, current.bot);
@@ -412,8 +412,8 @@ export const init = Command.make("init", flags, (given) =>
     Command.withDescription(
       "Asks for the bot's token (checked with Telegram) and who may use it, Claude Code's token, whether agents may work in this " +
         "machine's folders and as whom, and where telemetry goes; writes the config, which holds no secret; makes the cluster on " +
-        "this machine, unless --kubeconfig names another, once this machine is one it runs on, Linux on x86-64, its inotify limits " +
-        "high enough for it (it says how to raise them first); writes the tokens there, as Secrets; and offers to start alasio. Run it " +
+        "this machine, unless --kubeconfig names another, once this machine is one it runs on, Linux on x86-64, raising its inotify " +
+        "limits, as root, where they are too low for it; writes the tokens there, as Secrets; and offers to start alasio. Run it " +
         "again to change something: it shows what is set and keeps what you leave. Tokens are never flags, which other users of " +
         "the machine can see: give them in files (--bot-token-file, --claude-token-file), or as TELEGRAM_BOT_TOKEN and " +
         "CLAUDE_CODE_OAUTH_TOKEN.",
