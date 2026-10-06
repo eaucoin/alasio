@@ -11,7 +11,7 @@ import { type ClientRequest, type IncomingMessage, request as httpRequest, STATU
 import type { Duplex, Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
 
-import { Context, Effect, Layer, Result, Schema, type Scope } from "effect";
+import { Context, Effect, Layer, Result, Schedule, Schema, type Scope } from "effect";
 
 const API_VERSION = "v1.44";
 const DEFAULT_SOCKET = "/var/run/docker.sock";
@@ -41,6 +41,14 @@ export class DockerHostUnsupported extends Schema.TaggedError<DockerHostUnsuppor
 
 /** Whether `error` is Docker's answer `status`. */
 export const hasStatus = (status: number) => (error: DockerError): boolean => error.status === status;
+
+/**
+ * Whether `error` is Docker's answer to removing a container it killed but did not see
+ * exit within the time it waits: the kill stands, and the container exits once its
+ * processes do, which those waiting on a FUSE mount whose client dies with them, as
+ * JuiceFS's on a node are, can take longer to.
+ */
+const killedNotYetExited = (error: DockerError): boolean => error.status === 500 && error.reason.includes("did not receive an exit event");
 
 /** The socket of the Docker `env` names, by `DOCKER_HOST`. */
 export function dockerSocket(env: Readonly<NodeJS.ProcessEnv>): Result.Result<string, DockerHostUnsupported> {
@@ -393,7 +401,14 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
     createContainer: (container, spec) => Effect.asVoid(body({ method: "POST", path: "/containers/create", query: { name: container }, body: spec })),
     startContainer: (container) => Effect.asVoid(body({ method: "POST", path: `/containers/${name(container)}/start` })),
     stopContainer: (container) => Effect.asVoid(body({ method: "POST", path: `/containers/${name(container)}/stop` })),
-    removeContainer: (container) => orGone(body({ method: "DELETE", path: `/containers/${name(container)}`, query: { force: "true" } })),
+    // Asked again while Docker has killed it but not seen it exit, for as long as a
+    // node's dying processes may take.
+    removeContainer: (container) =>
+      orGone(
+        body({ method: "DELETE", path: `/containers/${name(container)}`, query: { force: "true" } }).pipe(
+          Effect.retry({ while: killedNotYetExited, schedule: Schedule.max([Schedule.spaced("1 second"), Schedule.during("2 minutes")]) }),
+        ),
+      ),
     exec,
     readFile,
   });

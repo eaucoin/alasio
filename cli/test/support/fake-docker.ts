@@ -46,6 +46,11 @@ export interface FakeDockerOptions {
   readonly files?: (container: string, path: string) => Buffer | null;
   /** Whether a pull of `reference` succeeds; one that does not fails as Docker's do, after its 200. */
   readonly pullable?: (reference: string) => boolean;
+  /**
+   * How many times removing `container` is answered as Docker answers it for one whose
+   * processes, killed, take longer to exit than it waits, before it is removed.
+   */
+  readonly slowToDie?: (container: string) => number;
 }
 
 export interface FakeDocker {
@@ -112,6 +117,7 @@ export async function serveFakeDocker({
   onExec = () => ({ exitCode: 0 }),
   files = () => null,
   pullable = () => true,
+  slowToDie = () => 0,
 }: FakeDockerOptions = {}): Promise<FakeDocker> {
   // Under /tmp, not TMPDIR, which may be too long a path for a socket's (108 bytes at most).
   const directory = mkdtempSync("/tmp/fake-docker-");
@@ -121,6 +127,7 @@ export async function serveFakeDocker({
   const networks: FakeDocker["networks"] = new Map();
   const volumes: FakeDocker["volumes"] = new Map();
   const containers = new Map<string, FakeContainer>();
+  const killsUnseen = new Map<string, number>();
   const execs = new Map<string, { readonly container: string; readonly command: readonly string[]; readonly stdin: boolean; exitCode: number | null }>();
 
   const record = (request: IncomingMessage, body: Buffer): DockerRequest => {
@@ -218,6 +225,11 @@ export async function serveFakeDocker({
         });
       }
       if (verb === "DELETE") {
+        const unseen = killsUnseen.get(name) ?? 0;
+        if (unseen < slowToDie(name)) {
+          killsUnseen.set(name, unseen + 1);
+          return refuse(response, 500, `cannot remove container "/${name}": could not kill: tried to kill container, but did not receive an exit event`);
+        }
         containers.delete(name);
         return void response.writeHead(204).end();
       }

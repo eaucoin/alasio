@@ -103,6 +103,19 @@ test("starting a running container, stopping a stopped one and removing a remove
   assert.equal(changes.length, 9);
 });
 
+test("a container Docker killed but has not seen exit is removed once it has", async () => {
+  const deletes = await withDocker(
+    (docker, fake) =>
+      Effect.gen(function*() {
+        yield* docker.createContainer("n", containerCreate);
+        yield* docker.removeContainer("n");
+        return { left: fake.containers.has("n"), tries: fake.requests.filter(({ method, path }) => method === "DELETE" && path === "/containers/n").length };
+      }),
+    { slowToDie: (container) => (container === "n" ? 2 : 0) },
+  );
+  assert.deepEqual(deletes, { left: false, tries: 3 });
+});
+
 test("a pull that fails after Docker answered 200 fails with the error its progress ends with", async () => {
   const error = await withDocker(
     (docker, fake) =>
