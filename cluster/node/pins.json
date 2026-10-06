@@ -1,0 +1,15 @@
+{
+  "k3s": {
+    "version": "v1.37.1+k3s1",
+    "image": "rancher/k3s:v1.37.1-k3s1@sha256:ca7f37d993d82ef0dcdcfecb2e0e2618ea541dbaffc620c8cedebe01a82acd0d",
+    "sha256": "92b94582eb7b34a8cf532e6006842b9ed215a6783cf56a3dd6271fd35243b2c0",
+    "installScript": {
+      "commit": "356c025475bbefaa09cf0d7e48e8e2adbbde57db",
+      "sha256": "ed01f89fd977bf20ac1516bbebf8370bf3ddbaa55dac8aba610956a4c78cc00b"
+    }
+  },
+  "gvisor": {
+    "release": "20260921.0",
+    "sha512": "66a5b17354690ec2e4037b54080eeabde55a1503779ceb823d73856283a6836953e105493d7e38fb2dcf85e5c86e0f48c66a9abb0244a78bd612df938702475c"
+  }
+}

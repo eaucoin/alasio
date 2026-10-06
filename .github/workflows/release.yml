@@ -77,7 +77,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # All four at once, each line said with its image's name; then each one's digest.
+      # All four at once, each line said with its image's name, the node image with its pins
+      # (tooling/node-image.ts); then each one's digest.
       - id: images
         name: Build and push the images, recording their digests
         shell: bash
@@ -87,8 +88,10 @@ jobs:
           declare -A pids
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
             name=${image%%:*}
+            args=()
+            [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
             {
-              docker build --tag "$REGISTRY/$name:$VERSION" \
+              docker build "${args[@]}" --tag "$REGISTRY/$name:$VERSION" \
                 --label "org.opencontainers.image.source=$SOURCE" \
                 --label "org.opencontainers.image.version=$VERSION" "${image#*:}" &&
                 docker push "$REGISTRY/$name:$VERSION"

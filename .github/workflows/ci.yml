@@ -53,12 +53,17 @@ jobs:
       registry: ${{ steps.push.outputs.registry }}
     steps:
       - uses: actions/checkout@v4
+      # For tooling/node-image.ts, which says the node image's pins.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # All four at once, each line said with its image's name; the step fails if any did.
+      # All four at once, each line said with its image's name, the node image with its pins
+      # (tooling/node-image.ts); the step fails if any did.
       - id: push
         name: Build and push the images
         shell: bash
@@ -69,8 +74,10 @@ jobs:
           declare -A pids
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
             name=${image%%:*}
+            args=()
+            [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
             {
-              docker build --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
+              docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
                 docker push "$PUSH_TO/$name:e2e"
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!

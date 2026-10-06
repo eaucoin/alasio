@@ -36,6 +36,7 @@ import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
+import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
 import { OTLP, standInObjects, TELEGRAM, urlOf } from "./stand-ins.ts";
 import { createTelegramStub } from "./telegram-stub.ts";
 
@@ -347,7 +348,7 @@ export async function onNode(node: string, script: string): Promise<string> {
 /** Builds the image `name`, tagged `tag`. */
 async function build(name: keyof typeof IMAGES, tag: string): Promise<void> {
   console.error(`# building ${tag} from ${IMAGES[name]}`);
-  await docker("build", "--quiet", "--tag", tag, IMAGES[name]);
+  await docker("build", "--quiet", ...(name === "alasio-node" ? NODE_BUILD_ARGS : []), "--tag", tag, IMAGES[name]);
 }
 
 /**
