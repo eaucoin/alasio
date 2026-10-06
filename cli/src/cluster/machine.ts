@@ -104,14 +104,22 @@ export class RootCommandFailed extends Schema.TaggedError<RootCommandFailed>()("
   }
 }
 
+/** What a command asked something came to: its exit code, and what it said on stdout. */
+export interface Answer {
+  readonly exitCode: number;
+  readonly stdout: string;
+}
+
 /**
  * What alasio does to this machine as root beyond its files: the commands it runs, whose
- * output goes to stderr, as what a command is doing does, and the processes it kills, by
- * their executables.
+ * output goes to stderr, as what a command is doing does, those it asks something, and the
+ * processes it kills, by their executables.
  */
 export class RootSystem extends Context.Service<RootSystem, {
   /** Runs `command` with `args`, its environment this process's with `env`. */
   readonly run: (command: string, args: readonly string[], env?: Readonly<Record<string, string>>) => Effect.Effect<void, RootCommandFailed>;
+  /** Runs `command` with `args` for what it answers, whatever its exit code; it fails only when it does not start. */
+  readonly ask: (command: string, args: readonly string[]) => Effect.Effect<Answer, RootCommandFailed>;
   /** Kills every process that runs one of `executables`, at once: how many it killed. */
   readonly kill: (executables: readonly string[]) => Effect.Effect<number, PlatformError.PlatformError>;
 }>()("alasio/cluster/RootSystem") {
@@ -126,6 +134,14 @@ export class RootSystem extends Context.Service<RootSystem, {
             const child = spawn(command, args, { env: { ...process.env, ...env }, stdio: ["ignore", process.stderr, process.stderr] });
             child.on("error", (cause) => failed(`did not start: ${cause.message}`));
             child.on("close", (code, signal) => (code === 0 ? resume(Effect.void) : failed(signal ? `was killed by ${signal}` : `exited with ${code}`)));
+          }),
+        ask: (command, args) =>
+          Effect.callback<Answer, RootCommandFailed>((resume) => {
+            const child = spawn(command, args, { stdio: ["ignore", "pipe", process.stderr] });
+            let stdout = "";
+            child.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+            child.on("error", (cause) => resume(Effect.fail(new RootCommandFailed({ command: [command, ...args].join(" "), reason: `did not start: ${cause.message}` }))));
+            child.on("close", (code) => resume(Effect.succeed({ exitCode: code ?? 1, stdout })));
           }),
         kill: (executables) =>
           Effect.gen(function*() {

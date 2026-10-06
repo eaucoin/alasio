@@ -503,12 +503,19 @@ test("uninstall --purge removes the cluster here whole: its nodes, volumes, stor
   assert.match(run.prompts, /Remove alasio and all its data from the cluster dev on this machine, and the cluster itself\? This cannot be undone/u);
 });
 
+/** alasio initialized and up in k3s on the rig's machine: what init said. */
+async function upOnHost({ alasio, home }: Rig): Promise<CliRun> {
+  const tokenFile = join(home, "bot-token");
+  writeFileSync(tokenFile, BOT_TOKEN);
+  const run = await alasio(["init", "--non-interactive", "--target", "host", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]);
+  succeeded(run);
+  return run;
+}
+
 /** alasio initialized and up in k3s on this machine, k3s and gVisor installed from `releases`. */
 async function onHost(t: TestContext): Promise<Rig> {
   const setup = await rig(t);
-  const tokenFile = join(setup.home, "bot-token");
-  writeFileSync(tokenFile, BOT_TOKEN);
-  succeeded(await setup.alasio(["init", "--non-interactive", "--target", "host", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]));
+  await upOnHost(setup);
   return setup;
 }
 
@@ -638,4 +645,50 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   const status = await alasio(["status"]);
   assert.equal(failure(status), "there is no k3s on this machine yet: alasio up installs it");
   assert.deepEqual(status.printed, ["k3s on this machine:", "  not installed"]);
+});
+
+test("an active ufw lets the cluster's pods and Services in, by rules alasio adds only where it has none, and uninstall removes those alone", async (t) => {
+  const setup = await rig(t);
+  const { alasio, machine } = setup;
+  machine.enableUfw(["192.168.1.0/24", "10.43.0.0/16"]);
+  const installed = await upOnHost(setup);
+  assert.equal(
+    rootSteps(installed)[0],
+    "let the cluster's pods and Services, 10.42.0.0/16 and 10.43.0.0/16, in to this machine through ufw, as k3s needs; nothing else is opened, k3s's API server's port 6443 staying closed to the rest",
+  );
+  assert.deepEqual(machine.commands().filter((command) => command.startsWith("ufw")), ["ufw show added", "ufw allow from 10.42.0.0/16 to any", "ufw show added"]);
+  assert.deepEqual([...machine.ufwRules].sort(), ["10.42.0.0/16", "10.43.0.0/16", "192.168.1.0/24"]);
+  assert.deepEqual(rootSteps(await alasio(["up"])), []);
+
+  const removed = await alasio(["uninstall", "--purge", "--yes"]);
+  succeeded(removed);
+  assert.match(rootSteps(removed)[0] ?? "", /^stop the cluster's gVisor pods, remove the rules alasio added to ufw for 10\.42\.0\.0\/16, uninstall k3s /u);
+  assert.deepEqual([...machine.ufwRules].sort(), ["10.43.0.0/16", "192.168.1.0/24"]);
+});
+
+test("an active firewalld trusts the cluster's pods and Services, permanently and now, and uninstall takes them out again", async (t) => {
+  const setup = await rig(t);
+  const { alasio, machine } = setup;
+  machine.enableFirewalld(["172.16.0.0/12"]);
+  const installed = await upOnHost(setup);
+  assert.match(rootSteps(installed)[0] ?? "", /^let the cluster's pods and Services, 10\.42\.0\.0\/16 and 10\.43\.0\.0\/16, in to this machine through firewalld, /u);
+  assert.deepEqual(machine.commands().filter((command) => command.includes("--add-source") || command.endsWith("--reload")), [
+    "firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16",
+    "firewall-cmd --permanent --zone=trusted --add-source=10.43.0.0/16",
+    "firewall-cmd --reload",
+  ]);
+  assert.deepEqual([...machine.trusted].sort(), ["10.42.0.0/16", "10.43.0.0/16", "172.16.0.0/12"]);
+  succeeded(await alasio(["uninstall", "--purge", "--yes"]));
+  assert.deepEqual([...machine.trusted], ["172.16.0.0/12"]);
+  assert.equal(machine.reloads, 2);
+});
+
+test("a firewall that is not active, as ufw installed but not enabled, is left as it is", async (t) => {
+  const setup = await rig(t);
+  setup.machine.write("/etc/ufw/ufw.conf", "ENABLED=no\n");
+  const installed = await upOnHost(setup);
+  assert.ok(!rootSteps(installed).some((step) => step.includes("ufw")));
+  assert.deepEqual(setup.machine.commands().filter((command) => command.startsWith("ufw") || command.startsWith("firewall-cmd")), []);
+  succeeded(await setup.alasio(["uninstall", "--purge", "--yes"]));
+  assert.deepEqual(setup.machine.commands().filter((command) => command.startsWith("ufw") || command.startsWith("firewall-cmd")), []);
 });

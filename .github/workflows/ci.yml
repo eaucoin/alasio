@@ -98,14 +98,15 @@ jobs:
       matrix:
         # The cluster in Docker on one node, and on a server with two agents, so the stack
         # and sessions spread; and k3s on the runner itself, the host target, which the
-        # runner's sudo, asking for no password, lets alasio install, on one.
+        # runner's sudo, asking for no password, lets alasio install, on one: behind ufw
+        # for one shard, as a server often is, and without a firewall for the other.
         target: [docker]
         agents: [0, 2]
         # The suites, in two shards that need nothing of each other's, each on a cluster
         # of its own: alasio on Kubernetes and workspaces on JuiceFS, and Neon (test/e2e/harness.ts).
         shard: [sessions, neon]
         include:
-          - { target: host, agents: 0, shard: sessions }
+          - { target: host, agents: 0, shard: sessions, firewall: ufw }
           - { target: host, agents: 0, shard: neon }
     steps:
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
@@ -147,6 +148,18 @@ jobs:
           cat "$RUNNER_TEMP/disk-freed.log"
           df -h /
           exit "$(cat "$RUNNER_TEMP/disk-freed")"
+      # ufw active, denying all that comes in, as alasio finds it on a server: alasio lets the
+      # cluster's networks in (cli/src/cluster/node.ts), and its rules, said now, are to be
+      # the same once alasio is removed.
+      - name: Enable ufw, denying what comes in
+        if: matrix.firewall == 'ufw'
+        run: |
+          command -v ufw >/dev/null || sudo apt-get install --yes ufw
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw --force enable
+          sudo ufw status verbose
+          sudo ufw show added | tee "$RUNNER_TEMP/ufw-rules"
       # alasio's package installed, alasio init and up on a cluster of this runner from the
       # images job's images, the shard's end-to-end tests, and alasio uninstall --purge,
       # which leaves nothing of the cluster on the runner (test/e2e/harness.ts).
@@ -156,6 +169,11 @@ jobs:
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+      - name: ufw's rules are as they were before alasio
+        if: matrix.firewall == 'ufw'
+        run: |
+          sudo ufw status verbose
+          sudo ufw show added | diff "$RUNNER_TEMP/ufw-rules" -
 
   # Whatever came of the rest, the run's images are deleted, those of each of its attempts,
   # pushed whole or not; so a failed run is re-run whole, its images built anew, as a

@@ -43,6 +43,8 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   assert.match(comment ?? "", /^# /u);
   assert.deepEqual(JSON.parse(k3s ?? ""), {
     "disable": ["traefik"],
+    "cluster-cidr": "10.42.0.0/16",
+    "service-cidr": "10.43.0.0/16",
     "default-local-storage-path": "/home/op/.local/share/alasio/storage",
     "kubelet-arg": [
       "eviction-hard=imagefs.available<5%,nodefs.available<5%",

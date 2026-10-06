@@ -36,16 +36,18 @@ import {
   WAITS,
   writeKubeconfig,
 } from "./k3s.ts";
-import { forgetInotifyStep, inotifyStep, Machine } from "./machine.ts";
+import { forgetInotifyStep, inotifyStep, Machine, under } from "./machine.ts";
 import {
   type Artifact,
   type ChecksumMismatch,
   checked,
+  CLUSTER_NETWORKS,
   ConfigureNode,
   containerdTemplate,
   type Download,
   downloads,
   filesDigest,
+  type Firewall,
   InstallGvisor,
   InstallK3s,
   NODE_PINS,
@@ -53,6 +55,7 @@ import {
   nodeFiles,
   type NodePins,
   type NodeStamp,
+  OpenFirewall,
   ReadKubeconfig,
   readStamp,
   RemoveNode,
@@ -188,8 +191,13 @@ export function kubeconfigState(text: string | null, now: Date): KubeconfigState
   return ends !== null && ends.getTime() - now.getTime() < RENEW_WITHIN_DAYS * 24 * 60 * 60 * 1000 ? "expiring" : "current";
 }
 
-/** What the node needs of root: its files written, gVisor installed, k3s installed, restarted or started, and its kubeconfig read, after renewing it. */
+/**
+ * What the node needs of root: the cluster's networks let in through the active firewall,
+ * its files written, gVisor installed, k3s installed, restarted or started, and its
+ * kubeconfig read, after renewing it.
+ */
 export interface NodePlan {
+  readonly firewall: Firewall | null;
   readonly configure: boolean;
   readonly gvisor: boolean;
   readonly k3s: "install" | "restart" | "start" | null;
@@ -199,15 +207,18 @@ export interface NodePlan {
 
 /**
  * What the node needs of root, by what alasio installed (`stamp`), the files that
- * configure it (by their digest), its service, and the operator's kubeconfig. Pure, for
- * tests.
+ * configure it (by their digest), its service, the operator's kubeconfig, and the
+ * firewall active on the machine, which lets the cluster's networks in once alasio has
+ * seen to it. Pure, for tests.
  */
-export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig }: {
+export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, firewall }: {
   readonly stamp: NodeStamp | null;
   readonly config: string;
   readonly unit: UnitState;
   readonly kubeconfig: KubeconfigState;
+  readonly firewall: Firewall | null;
 }): NodePlan {
+  const opened = stamp?.firewall?.tool === firewall && CLUSTER_NETWORKS.every((network) => stamp?.firewall?.networks.includes(network));
   const configure = stamp?.config !== config;
   const gvisor = stamp?.gvisor !== pins.gvisor.release;
   const k3s = stamp?.k3s !== pins.k3s.version || !unit.loaded
@@ -218,7 +229,7 @@ export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig }: {
     ? "start"
     : null;
   const startsAnew = k3s === "install" || k3s === "restart";
-  return { configure, gvisor, k3s, kubeconfig: k3s !== null || kubeconfig !== "current", renew: kubeconfig === "expiring" && !startsAnew };
+  return { firewall: firewall !== null && !opened ? firewall : null, configure, gvisor, k3s, kubeconfig: k3s !== null || kubeconfig !== "current", renew: kubeconfig === "expiring" && !startsAnew };
 }
 
 /** k3s's service, and what alasio installed, when anything. */
@@ -278,6 +289,13 @@ const makeHostCluster = Effect.fnUntraced(function*({
   const config: NodeConfig = { role: "server", storagePath, ...(registries ? { registries } : {}) };
   const waitFor = awaitReady(CLUSTER, { readyTimeout, poll });
 
+  /** The firewall active on this machine, which lets in only what it is told to: ufw, as its config says, or firewalld, as its service is; none. */
+  const activeFirewall = Effect.gen(function*() {
+    const ufw = under(machine.root, "/etc/ufw/ufw.conf");
+    if ((yield* fs.exists(ufw)) && /^ENABLED=yes$/mu.test(yield* fs.readFileString(ufw))) return "ufw" as const;
+    return (yield* systemd.unit("firewalld")).active === "active" ? ("firewalld" as const) : null;
+  });
+
   /** What alasio installed, refusing a k3s it did not. */
   const installed = Effect.gen(function*() {
     const unit = yield* systemd.unit(SERVICE);
@@ -327,7 +345,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
     yield* fs.makeDirectory(storagePath, { recursive: true });
     const files = nodeFiles(config, yield* onMachine(containerdTemplate));
     const copy = (yield* fs.exists(kubeconfig)) ? yield* fs.readFileString(kubeconfig) : null;
-    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()) });
+    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall: yield* activeFirewall });
     const raise = yield* onMachine(inotifyStep);
     const started = plan.k3s === null && !plan.renew ? 0 : Date.now();
     const outcome = yield* Effect.scoped(Effect.gen(function*() {
@@ -339,6 +357,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
       const script = plan.k3s === "install" ? yield* fetched(directory, "install.sh", from.installScript) : null;
       const steps: RootStep[] = [
         ...(raise ? [raise] : []),
+        ...(plan.firewall ? [OpenFirewall.make({ firewall: plan.firewall, networks: CLUSTER_NETWORKS })] : []),
         ...(plan.configure ? [ConfigureNode.make({ config })] : []),
         ...(archive ? [InstallGvisor.make({ release: pins.gvisor.release, ...(stamp?.gvisor ? { previous: stamp.gvisor } : {}), archive })] : []),
         ...(binary && script ? [InstallK3s.make({ version: pins.k3s.version, ...(stamp?.k3s ? { previous: stamp.k3s } : {}), role: config.role, binary, script })] : []),
@@ -374,7 +393,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
         const { unit, stamp } = yield* installed;
         const forget = yield* onMachine(forgetInotifyStep);
         yield* root.run([
-          ...(unit.loaded || stamp !== null ? [RemoveNode.make({})] : []),
+          ...(unit.loaded || stamp !== null ? [RemoveNode.make(stamp?.firewall ? { firewall: { tool: stamp.firewall.tool, added: stamp.firewall.added } } : {})] : []),
           ...(storage && (yield* fs.exists(storagePath)) ? [RemoveStorage.make({ path: storagePath })] : []),
           ...(forget ? [forget] : []),
         ]);

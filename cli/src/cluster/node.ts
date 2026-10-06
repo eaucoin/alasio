@@ -67,6 +67,11 @@ const SERVICE_FILE = `/etc/systemd/system/${SERVICE}.service`;
 const NODE_PASSWORD = "/etc/rancher/node";
 const KILLALL = `${BIN}/k3s-killall.sh`;
 const UNINSTALL = `${BIN}/k3s-uninstall.sh`;
+/** The networks of the cluster's pods and Services, as k3s is set with them: k3s's own. */
+const CLUSTER_CIDR = "10.42.0.0/16";
+const SERVICE_CIDR = "10.43.0.0/16";
+/** What a firewall must let in to the machine from the cluster: its pods and its Services, as k3s's requirements say. */
+export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
 /** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
 const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;
 /** What alasio installs of gVisor's release, in BIN: runsc and its shim, and the binaries runsc runs beside it. */
@@ -94,7 +99,13 @@ export const containerdTemplate: Effect.Effect<string, PlatformError.PlatformErr
  * it is, the registries, the template, and runsc's options. Pure, for tests.
  */
 export function nodeFiles(config: NodeConfig, template: string): ReadonlyMap<string, string> {
-  const k3s = { "disable": ["traefik"], "default-local-storage-path": config.storagePath, "kubelet-arg": KUBELET_ARGS };
+  const k3s = {
+    "disable": ["traefik"],
+    "cluster-cidr": CLUSTER_CIDR,
+    "service-cidr": SERVICE_CIDR,
+    "default-local-storage-path": config.storagePath,
+    "kubelet-arg": KUBELET_ARGS,
+  };
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],
     ...(config.registries ? [[REGISTRIES_YAML, `${registriesYaml(config.registries)}\n`] as const] : []),
@@ -106,11 +117,21 @@ export function nodeFiles(config: NodeConfig, template: string): ReadonlyMap<str
 /** A digest of `files` that two sets of files share only when they are the same. */
 export const filesDigest = (files: ReadonlyMap<string, string>): string => createHash("sha256").update(JSON.stringify([...files])).digest("hex");
 
-/** What alasio installed on this machine, as STAMP records it: k3s's version, gVisor's release, and the digest of the files that configure the node. */
+/** A firewall alasio opens the cluster's networks in, where it is active. */
+export const Firewall = Schema.Literals(["ufw", "firewalld"]);
+export type Firewall = typeof Firewall.Type;
+
+/**
+ * What alasio installed on this machine, as STAMP records it: k3s's version, gVisor's
+ * release, the digest of the files that configure the node, and the firewall it opened
+ * the cluster's networks in, with those it added a rule for itself, which are all it
+ * removes.
+ */
 export const NodeStamp = Schema.Struct({
   k3s: Schema.optionalKey(Schema.String),
   gvisor: Schema.optionalKey(Schema.String),
   config: Schema.optionalKey(Schema.String),
+  firewall: Schema.optionalKey(Schema.Struct({ tool: Firewall, networks: Schema.Array(Schema.String), added: Schema.Array(Schema.String) })),
 });
 export type NodeStamp = typeof NodeStamp.Type;
 
@@ -174,6 +195,8 @@ const writeFile = Effect.fnUntraced(function*(path: string, content: string | Ui
   yield* fs.rename(written, path);
 });
 
+/** The step that lets `networks`, the cluster's, in to the machine through `firewall`, which is active. */
+export const OpenFirewall = Schema.TaggedStruct("OpenFirewall", { firewall: Firewall, networks: Schema.Array(Schema.String) });
 /** The step that writes the files that configure k3s and its containerd as a node of `config`. */
 export const ConfigureNode = Schema.TaggedStruct("ConfigureNode", { config: NodeConfig });
 /** The step that installs gVisor's release, from its archive, in place of `previous`. */
@@ -190,20 +213,23 @@ export const InstallK3s = Schema.TaggedStruct("InstallK3s", {
 export const StartK3s = Schema.TaggedStruct("StartK3s", { restart: Schema.Boolean });
 /** The step that stops k3s's service, disabling it, and stops its pods. */
 export const StopK3s = Schema.TaggedStruct("StopK3s", {});
-/** The step that removes k3s, with its uninstall script, and gVisor. */
-export const RemoveNode = Schema.TaggedStruct("RemoveNode", {});
+/** The step that removes k3s, with its uninstall script, gVisor, and the firewall's rules for the cluster's networks alasio added, by STAMP's `firewall`. */
+export const RemoveNode = Schema.TaggedStruct("RemoveNode", { firewall: Schema.optionalKey(Schema.Struct({ tool: Firewall, added: Schema.Array(Schema.String) })) });
 /** The step that removes the directory of the node's volumes. */
 export const RemoveStorage = Schema.TaggedStruct("RemoveStorage", { path: Schema.String });
 /** The step that reads k3s's kubeconfig, after restarting k3s, which renews its certificates, when `renew`. */
 export const ReadKubeconfig = Schema.TaggedStruct("ReadKubeconfig", { renew: Schema.Boolean });
 
-export const NodeStep = Schema.Union([ConfigureNode, InstallGvisor, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
+export const NodeStep = Schema.Union([OpenFirewall, ConfigureNode, InstallGvisor, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
 export type NodeStep = typeof NodeStep.Type;
 
 /** What `step` does, as alasio says it will. */
 export function describeNodeStep(step: NodeStep): string {
   const replacing = (previous: string | undefined) => (previous ? `, in place of ${previous},` : "");
   switch (step._tag) {
+    case "OpenFirewall":
+      return `let the cluster's pods and Services, ${step.networks.join(" and ")}, in to this machine through ${step.firewall}, as k3s needs; ` +
+        "nothing else is opened, k3s's API server's port 6443 staying closed to the rest";
     case "ConfigureNode":
       return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime runsc, in ${CONTAINERD}`;
     case "InstallGvisor":
@@ -215,7 +241,9 @@ export function describeNodeStep(step: NodeStep): string {
     case "StopK3s":
       return `stop and disable the service ${SERVICE}, and stop the cluster's pods, gVisor's and those k3s-killall.sh stops`;
     case "RemoveNode":
-      return `stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
+      return `stop the cluster's gVisor pods, ` +
+        (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.join(" and ")}, ` : "") +
+        `uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
         `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor from ${BIN}, and JuiceFS's mounts and directories, ` +
         JUICEFS.join(" and ");
     case "RemoveStorage":
@@ -261,6 +289,46 @@ const removeJuicefs = Effect.gen(function*() {
   for (const directory of JUICEFS) yield* fs.remove(under(root, directory), { recursive: true, force: true });
 });
 
+/** What a firewall alasio opens the cluster's networks in is asked, and told, as root. */
+const FIREWALLS: Readonly<Record<Firewall, {
+  /** Whether `network` is let in already, by a rule of the firewall's own, alasio's or another's. */
+  readonly lets: (network: string) => Effect.Effect<boolean, RootCommandFailed, RootSystem>;
+  readonly allow: (network: string) => Effect.Effect<void, RootCommandFailed, RootSystem>;
+  readonly remove: (network: string) => Effect.Effect<void, RootCommandFailed, RootSystem>;
+  /** Makes what it was told hold now, after it was told it; nothing for one it holds at once. */
+  readonly apply: Effect.Effect<void, RootCommandFailed, RootSystem>;
+}>> = {
+  // ufw's rules hold as they are added, and `ufw show added` says each as `ufw allow from NETWORK`.
+  ufw: {
+    lets: (network) =>
+      Effect.flatMap(RootSystem, (system) => system.ask("ufw", ["show", "added"])).pipe(
+        Effect.map(({ stdout }) => stdout.split("\n").some((line) => line.trim() === `ufw allow from ${network}`)),
+      ),
+    allow: (network) => Effect.flatMap(RootSystem, (system) => system.run("ufw", ["allow", "from", network, "to", "any"])),
+    remove: (network) => Effect.flatMap(RootSystem, (system) => system.run("ufw", ["delete", "allow", "from", network, "to", "any"])),
+    apply: Effect.void,
+  },
+  // firewalld's trusted zone lets its sources in, its permanent rules holding once reloaded.
+  firewalld: {
+    lets: (network) =>
+      Effect.flatMap(RootSystem, (system) => system.ask("firewall-cmd", ["--permanent", "--zone=trusted", `--query-source=${network}`])).pipe(
+        Effect.map(({ exitCode }) => exitCode === 0),
+      ),
+    allow: (network) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--permanent", "--zone=trusted", `--add-source=${network}`])),
+    remove: (network) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--permanent", "--zone=trusted", `--remove-source=${network}`])),
+    apply: Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--reload"])),
+  },
+};
+
+/** Removes the rules for `added` from `tool`, those alasio added, and no other. */
+const closeFirewall = ({ tool, added }: { readonly tool: Firewall; readonly added: readonly string[] }) =>
+  Effect.gen(function*() {
+    if (added.length === 0) return;
+    for (const network of added) yield* FIREWALLS[tool].remove(network);
+    yield* FIREWALLS[tool].apply;
+    yield* Effect.logInfo(`removed ${tool}'s rules for ${added.join(" and ")}`);
+  });
+
 /** Whether k3s's service is installed. */
 const serviceInstalled = Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem;
@@ -287,6 +355,19 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
     const { root } = yield* Machine;
     const system = yield* RootSystem;
     switch (step._tag) {
+      case "OpenFirewall": {
+        const firewall = FIREWALLS[step.firewall];
+        const previous = (yield* readStamp)?.firewall;
+        const added = previous?.tool === step.firewall ? [...previous.added] : [];
+        for (const network of step.networks) {
+          if (yield* firewall.lets(network)) continue;
+          yield* firewall.allow(network);
+          added.push(network);
+        }
+        yield* firewall.apply;
+        yield* recordStamp({ firewall: { tool: step.firewall, networks: step.networks, added } });
+        return yield* Effect.logInfo(`${step.firewall} lets ${step.networks.join(" and ")} in`);
+      }
       case "ConfigureNode": {
         const files = nodeFiles(step.config, yield* containerdTemplate);
         for (const [path, content] of files) yield* writeFile(under(root, path), content, path.startsWith(K3S_ETC) ? 0o600 : 0o644);
@@ -334,6 +415,7 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         // k3s first, which would start the pods gVisor's end again.
         if (yield* serviceInstalled) yield* systemctl("stop", SERVICE);
         yield* killGvisor;
+        if (step.firewall) yield* closeFirewall(step.firewall);
         if (yield* fs.exists(under(root, UNINSTALL))) yield* system.run(UNINSTALL, []);
         yield* removeJuicefs;
         // alasio's own, and the node's password, which k3s keeps and its uninstall script leaves.

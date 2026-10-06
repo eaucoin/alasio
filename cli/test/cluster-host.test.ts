@@ -25,10 +25,11 @@ const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: NODE_PINS.gvisor.release
 const RUNNING = { loaded: true, active: "active", enabled: true };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
-  const plan = (changes: Partial<Parameters<typeof planNode>[1]>) => planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", ...changes });
-  const none = { configure: false, gvisor: false, k3s: null, kubeconfig: false, renew: false };
+  const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
+    planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, ...changes });
+  const none = { firewall: null, configure: false, gvisor: false, k3s: null, kubeconfig: false, renew: false };
   assert.deepEqual(plan({}), none);
-  assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), { configure: true, gvisor: true, k3s: "install", kubeconfig: true, renew: false });
+  assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), { firewall: null, configure: true, gvisor: true, k3s: "install", kubeconfig: true, renew: false });
   assert.deepEqual(plan({ config: "another" }), { ...none, configure: true, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: "20200101.0" } }), { ...none, gvisor: true, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, k3s: "v1.30.0+k3s1" } }), { ...none, k3s: "install", kubeconfig: true });
@@ -36,6 +37,13 @@ test("planNode asks for nothing once all is as alasio installed it, and for what
   assert.deepEqual(plan({ unit: { ...RUNNING, active: "failed" } }), { ...none, k3s: "start", kubeconfig: true });
   assert.deepEqual(plan({ kubeconfig: "missing" }), { ...none, kubeconfig: true });
   assert.deepEqual(plan({ kubeconfig: "expiring" }), { ...none, kubeconfig: true, renew: true });
+  // An active firewall lets the cluster's networks in once alasio has opened it, the same one, to them all.
+  assert.deepEqual(plan({ firewall: "ufw" }), { ...none, firewall: "ufw" });
+  const opened = { tool: "ufw" as const, networks: ["10.42.0.0/16", "10.43.0.0/16"], added: ["10.42.0.0/16"] };
+  assert.deepEqual(plan({ firewall: "ufw", stamp: { ...INSTALLED, firewall: opened } }), none);
+  assert.deepEqual(plan({ firewall: "firewalld", stamp: { ...INSTALLED, firewall: opened } }), { ...none, firewall: "firewalld" });
+  assert.deepEqual(plan({ firewall: "ufw", stamp: { ...INSTALLED, firewall: { ...opened, networks: ["10.42.0.0/16"] } } }), { ...none, firewall: "ufw" });
+  assert.deepEqual(plan({ stamp: { ...INSTALLED, firewall: opened } }), none);
   // A restart renews the certificates anyway.
   assert.deepEqual(plan({ kubeconfig: "expiring", config: "another" }), { ...none, configure: true, k3s: "restart", kubeconfig: true });
 });
@@ -126,10 +134,10 @@ test("up waits for the node reported ready since k3s started anew, not before", 
 
 test("what root's work did not do as it failed is done the next time, as alasio installed what it did", async (t) => {
   const { machine, up } = await rig(t, { since: true });
-  machine.onRun = (ran) => (ran.command === "sh" ? "exited with 1" : machine.k3s(ran));
+  machine.onRun = (ran) => (ran.command === "sh" ? "exited with 1" : machine.act(ran));
   assert.match(await up() ?? "", /^sh \/.*\/install\.sh exited with 1$/u);
   assert.deepEqual(Object.keys(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? "")).sort(), ["config", "gvisor"]);
-  machine.onRun = (ran) => machine.k3s(ran);
+  machine.onRun = (ran) => machine.act(ran);
   assert.equal(await up(), null);
   assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["sh install.sh", "sh install.sh"]);
 });

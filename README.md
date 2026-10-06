@@ -37,12 +37,15 @@ cluster needs, `fs.inotify.max_user_instances` at least 1024 and
 `fs.inotify.max_user_watches` at least 524288, where they are lower, now and in
 `/etc/sysctl.d/60-alasio-inotify.conf`. Without a terminal, sudo must ask for
 no password. k3s and gVisor are the releases this version of alasio pins,
-checked against their digests, and its API server is on the machine's port
-6443, as k3s has it; `up` asks for root again only when something of it
-changes. Run `init` again to change an answer; every question has a flag that
-answers it instead, for scripts (`npx alasio init --help`). Each command below
-runs as `npx alasio <command>`, or as `alasio <command>` once `npm install
---global alasio` has installed it.
+checked against their digests. k3s's API server listens on port 6443 of every
+interface of the machine; where ufw or firewalld is active, `up` lets the
+cluster's pod and Service networks, `10.42.0.0/16` and `10.43.0.0/16`, in to
+the machine, as k3s needs, and nothing else, so the port stays behind the
+firewall, and `uninstall --purge` removes the rules it added. `up` asks for
+root again only when something of all this changes. Run `init` again to change
+an answer; every question has a flag that answers it instead, for scripts (`npx
+alasio init --help`). Each command below runs as `npx alasio <command>`, or as
+`alasio <command>` once `npm install --global alasio` has installed it.
 
 Then message the bot. `/service` chooses the agent, Claude Code or Codex, and
 `/workspace` where it works. A new empty workspace is a filesystem of its own,
