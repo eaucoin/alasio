@@ -15,6 +15,7 @@
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { AlasioConfig } from "../config.ts";
+import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
@@ -94,8 +95,10 @@ export class Mounts extends Context.Service<Mounts, {
   /**
    * Forks the session filesystem mounted on the conversation (src/sandbox/index.ts) and
    * mounts the fork, with no session of its own yet. Refused for a folder, and while a
-   * turn runs in the conversation or prompts wait in it, as the source is suspended while
-   * it is cloned.
+   * turn runs in the conversation, or in another that mounts the source, or prompts wait
+   * in it, as the source is suspended while it is cloned: those conversations are held
+   * busy until it is (ActiveTurns' hold), so no turn starts under the clone, and what was
+   * asked of them meanwhile runs after.
    */
   readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | SessionForkError | StoreError>;
   /**
@@ -105,13 +108,14 @@ export class Mounts extends Context.Service<Mounts, {
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
   /** The mounts of an alasio of `workspaceRoot`, the branch environment `branch` unless it is none, main. */
-  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns> =>
+  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns | Turns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot, branch));
 }
 
-const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns> {
+const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns | Turns> {
   const store = yield* Store;
   const activeTurns = yield* ActiveTurns;
+  const turns = yield* Turns;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
 
   /** Refuses a folder where alasio is a branch environment. */
@@ -222,8 +226,17 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
         return yield* new MountRefused({ message: "Only a session workspace can be forked: a folder's files are the host's, which are not copied on write." });
       }
       yield* unblocked(conversationId, "forking its workspace");
+      const mounting = new Set([
+        conversationId,
+        ...(yield* store.listWorkspaceConversations(sessionFsWorkspace(source.volumeId))).filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId),
+      ]);
       const volumeId = newVolumeId();
-      yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
+      yield* Effect.scoped(Effect.gen(function*() {
+        if (!(yield* activeTurns.hold([...mounting]))) {
+          return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
+        }
+        yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
+      })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
       const change = yield* mountCreated(
         conversationId,
         sessionFsWorkspace(volumeId),

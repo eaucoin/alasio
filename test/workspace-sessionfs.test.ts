@@ -7,6 +7,7 @@ import { test } from "node:test";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect } from "effect";
 
+import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { Mounts } from "../src/operator/mounts.ts";
 import { buildWorkspacePanel, handleWorkspaceControlCallback, handleWorkspaceTextCommand } from "../src/operator/workspace-control.ts";
 import type { Store } from "../src/persistence/store.ts";
@@ -15,6 +16,7 @@ import { parseWorkspace } from "../src/workspace/kind.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, withServices } from "./support/turns.ts";
+import { eventually } from "./support/wait.ts";
 
 // Buttons in a panel/edit, flattened to their labels.
 const labels = (markup: InlineKeyboardMarkup) => markup.inline_keyboard.flat().map((b) => b.text);
@@ -80,9 +82,13 @@ interface VolumeCalls {
 
 /**
  * Session filesystems that make, fork and destroy the volumes asked for, recording each;
- * a fork fails when `forkFails`, and the forks' Sandboxes are `forks`.
+ * a fork fails when `forkFails`, and lasts until `forking` ends; the forks' Sandboxes are `forks`.
  */
-function fakeVolumes({ forkFails = false, forks = [] }: { readonly forkFails?: boolean; readonly forks?: readonly string[] } = {}): SessionSandboxes["Service"] & VolumeCalls {
+function fakeVolumes({ forkFails = false, forking = Effect.void, forks = [] }: {
+  readonly forkFails?: boolean;
+  readonly forking?: Effect.Effect<void>;
+  readonly forks?: readonly string[];
+} = {}): SessionSandboxes["Service"] & VolumeCalls {
   const calls: VolumeCalls = { created: [], forked: [], destroyed: [] };
   return {
     ...calls,
@@ -94,7 +100,7 @@ function fakeVolumes({ forkFails = false, forks = [] }: { readonly forkFails?: b
       fork: (sourceVolumeId, volumeId) =>
         Effect.suspend(() => {
           calls.forked.push([sourceVolumeId, volumeId]);
-          return forkFails ? Effect.fail(new SessionForkError({ message: "the clone failed" })) : Effect.succeed({ volumeId, netMode: "full" as const });
+          return Effect.andThen(forking, forkFails ? Effect.fail(new SessionForkError({ message: "the clone failed" })) : Effect.succeed({ volumeId, netMode: "full" as const }));
         }),
       destroy: (volumeId) => Effect.sync(() => void calls.destroyed.push(volumeId)),
       forks: Effect.succeed(forks),
@@ -230,5 +236,46 @@ test("as alasio starts, the session workspaces a crash left unmade go: those rec
     await alasio.runPromise(Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces));
     assert.deepEqual(sandbox.destroyed, ["fs-unmade", "fs-orphan"]);
     assert.deepEqual((await run(store.listSessionWorkspaces)).map(({ volumeId }) => volumeId), ["fs-made"]);
+  });
+});
+
+test("Fork holds every conversation on the workspace busy while it clones, and is refused while a turn runs in one", async () => {
+  const forking = Promise.withResolvers<void>();
+  const forkEnds = Promise.withResolvers<void>();
+  // Forks last until the test ends them once it holds them.
+  let held = false;
+  const sandbox = fakeVolumes({ forking: Effect.suspend(() => (held ? Effect.andThen(Effect.sync(() => forking.resolve()), Effect.promise(() => forkEnds.promise)) : Effect.void)) });
+  await withWorkspaceControls(sandbox, async (alasio, { calls }, store) => {
+    await alasio.runPromise(press("sessionfs_create", { net: "none" }));
+    const source = await mountedVolume(store);
+    const other = await run(store.upsertConversation({ chatId: "2", user: { id: 2 } }));
+    await run(store.setWorkingDirectory(other, `sessionfs:${source}`));
+    const busy = (conversationId: string) => alasio.runPromise(Effect.flatMap(ActiveTurns, (active) => active.isBusy(conversationId)));
+
+    // A turn in another conversation on the workspace, which the fork would suspend.
+    const turnEnds = Promise.withResolvers<void>();
+    const turn = alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      yield* (yield* ActiveTurns).register(other, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false });
+      yield* Effect.promise(() => turnEnds.promise);
+    })));
+    await eventually("the other conversation's turn to run", async () => (await busy(other)) || undefined);
+    await alasio.runPromise(press("fork"));
+    assert.equal(calls.sendMessage.at(-1)?.[1], "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends.");
+    assert.deepEqual(sandbox.forked, []);
+    turnEnds.resolve();
+    await turn;
+
+    // While it clones, no turn starts in either.
+    held = true;
+    const pressed = alasio.runPromise(press("fork"));
+    await forking.promise;
+    try {
+      assert.deepEqual([await busy(CONVERSATION), await busy(other)], [true, true]);
+    } finally {
+      forkEnds.resolve();
+    }
+    await pressed;
+    assert.deepEqual([await busy(CONVERSATION), await busy(other)], [false, false]);
+    assert.equal(sandbox.forked.length, 1);
   });
 });
