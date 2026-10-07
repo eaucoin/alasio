@@ -522,6 +522,10 @@ export function workspaceStorage(): void {
       }
     });
 
+    test("the daily collection collects the file system", async () => {
+      await runJob(componentName("juicefs-gc"));
+    });
+
     test("a workspace's volume is deleted with its claim, and its directory with it", async () => {
       const { claim: session } = await volumeOf(none);
       const image = (await kube.get<V1CronJob>(ref("CronJob", componentName("juicefs-quota-check"), NAMESPACE)))?.spec?.jobTemplate.spec?.template.spec?.containers[0]?.image;
