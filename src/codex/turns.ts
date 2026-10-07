@@ -1,4 +1,4 @@
-import { Clock, Context, Deferred, Effect, Fiber, FiberMap, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
+import { Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
 
 import {
   type AttachedTurn,
@@ -175,7 +175,14 @@ const makeTurns = Effect.fnUntraced(function*() {
   });
   // Each conversation's prompt worker, and the turns run outside one (a command's, a
   // goal's): interrupted, each turn left for after the restart, as alasio stops.
-  const workers = yield* FiberMap.make<string>();
+  const workers = yield* FiberSet.make<void>();
+  /**
+   * The conversations whose worker runs: `again` once it is scheduled while it runs, so it
+   * drains once more before it ends. Whether a worker ends, and whether a schedule starts
+   * one, are each decided in one change of it, so a prompt queued as its worker finds no
+   * other is never left to a worker that is ending.
+   */
+  const draining = yield* Ref.make(HashMap.empty<string, "draining" | "again">());
   const directTurns = yield* FiberSet.make<boolean, TurnError>();
   const queuedMessages = yield* Ref.make(HashMap.empty<string, readonly string[]>());
 
@@ -407,12 +414,35 @@ const makeTurns = Effect.fnUntraced(function*() {
     }
   });
 
-  // A worker scheduled once alasio is stopping is not run: the map is closed.
-  const schedule = (conversationId: string): Effect.Effect<void> =>
-    FiberMap.run(workers, conversationId, drain(conversationId).pipe(
-      Effect.catch((error) => Effect.logError(`Prompt worker for ${conversationId} stopped: ${error.message}`)),
+  /** Whether the conversation's worker drains again, having been scheduled while it ran; it is forgotten otherwise. */
+  const drainsAgain = (conversationId: string): Effect.Effect<boolean> =>
+    Ref.modify(draining, (all) =>
+      Option.contains(HashMap.get(all, conversationId), "again")
+        ? [true, HashMap.set(all, conversationId, "draining")] as const
+        : [false, HashMap.remove(all, conversationId)] as const);
+
+  /** The conversation's worker: it drains its prompt jobs until no schedule came while it did. */
+  const worker = (conversationId: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      do {
+        yield* drain(conversationId).pipe(
+          Effect.catch((error) => Effect.logError(`Prompt worker for ${conversationId} stopped: ${error.message}`)),
+        );
+      } while (yield* drainsAgain(conversationId));
+    }).pipe(
+      // A worker that died or was interrupted ended without forgetting itself.
+      Effect.onExit((exit) => Exit.isSuccess(exit) ? Effect.void : Ref.update(draining, HashMap.remove(conversationId))),
       withLogScope(LOG_SCOPE),
-    ), { onlyIfMissing: true }).pipe(Effect.exit, Effect.asVoid);
+    );
+
+  // A worker scheduled once alasio is stopping is not run: the set is closed.
+  const schedule = (conversationId: string): Effect.Effect<void> =>
+    Ref.modify(draining, (all) =>
+      HashMap.has(all, conversationId)
+        ? [false, HashMap.set(all, conversationId, "again")] as const
+        : [true, HashMap.set(all, conversationId, "draining")] as const).pipe(
+        Effect.flatMap((start) => start ? FiberSet.run(workers, worker(conversationId)).pipe(Effect.exit, Effect.asVoid) : Effect.void),
+      );
 
   const askHowToHandleConcurrentPrompt = Effect.fnUntraced(function*({ conversationId, chatId, job, visibleText }: ConversationChat & {
     readonly job: Pick<PromptJob, "id" | "prompt">;

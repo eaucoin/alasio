@@ -23,7 +23,8 @@ import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
 import { newSchema, run, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
-import { noWorkflowHooks } from "./support/turns.ts";
+import { noWorkflowHooks, withServices } from "./support/turns.ts";
+import { eventually } from "./support/wait.ts";
 
 /** A Telegram client for a reporter that only queues replies, never sending or editing itself. */
 const unusedClient = recordingTelegram({
@@ -221,6 +222,32 @@ test("a prompt job is claimed by one worker however many ask at once", async () 
   await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "2", prompt: "second", priority: 1 }));
   const claims = await Promise.all([1, 2, 3].map(() => run(store.claimNextPromptJob(CONVERSATION))));
   assert.deepEqual(claims.map((job) => job?.prompt ?? "none").sort(), ["first", "none", "second"]);
+});
+
+test("a prompt queued as its conversation's worker finds no other is still run", async () => {
+  const store = await codexConversation();
+  // The worker's first claim, which finds nothing, held as it returns until the test lets it go.
+  const foundNone = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let claims = 0;
+  const held: Store["Service"] = {
+    ...store,
+    claimNextPromptJob: (conversationId) =>
+      store.claimNextPromptJob(conversationId).pipe(Effect.tap((job) => {
+        claims += 1;
+        return claims === 1 && job === null ? Effect.andThen(Effect.sync(() => foundNone.resolve()), Effect.promise(() => release.promise)) : Effect.void;
+      })),
+  };
+  await withServices({ store: held }, async (alasio) => {
+    const schedule = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(CONVERSATION)));
+    await schedule();
+    await foundNone.promise;
+    // Queued and scheduled while the worker is ending, having found no job.
+    const job = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "1", prompt: "queued meanwhile" }));
+    await schedule();
+    release.resolve();
+    await eventually("the job to be claimed", async () => ((await run(store.getPromptJob(job.id)))?.state === "pending" ? undefined : true));
+  });
 });
 
 test("the store's schema is not one alasio's role finds first, so what the role makes unqualified goes where it always went", async () => {
