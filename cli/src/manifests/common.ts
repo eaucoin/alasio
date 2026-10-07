@@ -98,6 +98,11 @@ export function lakeRuns(config: InstallConfig): boolean {
   return config.lake.enabled && config.neon.enabled;
 }
 
+/** Whether Grafana runs (./grafana.ts): when it is on, beside the lake, which it reads. */
+export function grafanaRuns(config: InstallConfig): boolean {
+  return config.grafana.enabled && lakeRuns(config);
+}
+
 /** Whether the stack's telemetry collector runs (./collector.ts): with the lake, or an endpoint to send to. */
 export function collectorRuns(config: InstallConfig): boolean {
   return lakeRuns(config) || Boolean(config.telemetry.otlpEndpoint);
@@ -152,13 +157,14 @@ export function databaseSecret(config: InstallConfig): string {
 
 /**
  * The passwords of the roles alasio makes in its Neon for what reads it beside alasio,
- * given while that runs: the lake's query endpoint's. Each by its key in the database
- * Secret, which the stack's setup writes it in, and the variable that names its file to
- * alasio (src/neon/connect.ts).
+ * given while that runs: the lake's query endpoint's, and Grafana's. Each by its key in
+ * the database Secret, which the stack's setup writes it in, and the variable that names
+ * its file to alasio (src/neon/connect.ts).
  */
 export function rolePasswords(config: InstallConfig): { readonly key: string; readonly variable: string }[] {
   return [
     ...(lakeRuns(config) ? [{ key: "lake-reader-password", variable: "ALASIO_LAKE_READER_PASSWORD_FILE" }] : []),
+    ...(grafanaRuns(config) ? [{ key: "grafana-password", variable: "ALASIO_GRAFANA_PASSWORD_FILE" }] : []),
   ];
 }
 

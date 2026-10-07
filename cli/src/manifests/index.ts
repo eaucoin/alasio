@@ -9,6 +9,7 @@ import { agentSandboxObjects } from "./agent-sandbox.ts";
 import { alasioObjects } from "./alasio.ts";
 import { collectorObjects } from "./collector.ts";
 import type { InstallConfig } from "./config.ts";
+import { grafanaObjects } from "./grafana.ts";
 import { lakeObjects } from "./lake.ts";
 import { neonObjects } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
@@ -20,8 +21,8 @@ export { NAMESPACE } from "./common.ts";
 
 /**
  * The objects of the installation `config` describes: agent-sandbox's, alasio's, Neon's,
- * the object store's, the lake's, the telemetry collector's, workspace storage's, and the
- * NetworkPolicies.
+ * the object store's, the lake's, Grafana's, the telemetry collector's, workspace
+ * storage's, and the NetworkPolicies.
  */
 export function manifests(config: InstallConfig): readonly KubernetesObject[] {
   return [
@@ -30,6 +31,7 @@ export function manifests(config: InstallConfig): readonly KubernetesObject[] {
     ...neonObjects(config),
     ...objectStoreObjects(config),
     ...lakeObjects(config),
+    ...grafanaObjects(config),
     ...collectorObjects(config),
     ...workspaceStorageObjects(config),
     ...networkPolicyObjects(config),

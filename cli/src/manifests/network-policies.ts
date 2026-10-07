@@ -1,12 +1,13 @@
 /**
  * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
- * telemetry collector and workspace storage, which need a cluster that enforces
+ * telemetry collector, Grafana and workspace storage, which need a cluster that enforces
  * NetworkPolicy, as session filesystems do.
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
-import { COLLECTOR_PORT, collectorRuns, componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
+import { COLLECTOR_PORT, collectorRuns, componentName, grafanaRuns, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { LAKE_QUERY_PORT } from "./lake.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
@@ -133,6 +134,41 @@ function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
   });
 }
 
+/**
+ * Grafana takes no connection: `alasio grafana` reaches it through the API server's
+ * port-forward, which no NetworkPolicy sees. It reaches the cluster's DNS, its database
+ * on the compute and the lake's query endpoint, each of which admits it, and Telegram's
+ * Bot API, as alasio does, on the internet's HTTPS port; nothing else, and no other
+ * address of the cluster or its network.
+ */
+function grafanaPolicies({ sessions }: InstallConfig): NetworkPolicy[] {
+  const grafana = { podSelector: { matchLabels: selectorLabels("grafana") } };
+  const admitted = (component: string, port: number): NetworkPolicy =>
+    policy(componentName(`${component}-from-grafana`), NAMESPACE, component, {
+      podSelector: { matchLabels: selectorLabels(component) },
+      policyTypes: ["Ingress"],
+      ingress: [{ from: [grafana], ports: [{ protocol: "TCP", port }] }],
+    });
+  return [
+    policy(componentName("grafana"), NAMESPACE, "grafana", {
+      ...grafana,
+      policyTypes: ["Ingress", "Egress"],
+      egress: [
+        {
+          to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
+          ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
+        },
+        { to: [{ podSelector: { matchLabels: selectorLabels("neon-compute") } }], ports: [{ protocol: "TCP", port: 55433 }] },
+        { to: [{ podSelector: { matchLabels: selectorLabels("lake") } }], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] },
+        // The addresses sessions with internet may not reach, the cluster's and its network's, are Grafana's too.
+        { to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...sessions.blockedCidrs] } }], ports: [{ protocol: "TCP", port: 443 }] },
+      ],
+    }),
+    admitted("neon-compute", 55433),
+    admitted("lake", LAKE_QUERY_PORT),
+  ];
+}
+
 /** The NetworkPolicies, unless they are turned off. */
 export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
   if (!config.networkPolicies.enabled) return [];
@@ -162,6 +198,7 @@ export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
     }),
     ...(config.neon.enabled ? neonPolicies() : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
+    ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
   ];
 }

@@ -406,6 +406,58 @@ describe("the lake's query endpoint", () => {
   });
 });
 
+describe("Grafana", () => {
+  const GRAFANA = { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "grafana" };
+  type Policy = KubernetesObject & { spec: { podSelector: unknown; policyTypes: string[]; ingress?: unknown; egress?: unknown } };
+
+  test("runs beside the lake, unless it is off", () => {
+    assert.ok(one(install(), "Deployment", "alasio-grafana"));
+    for (const off of [{ grafana: { enabled: false } }, { lake: { enabled: false } }]) {
+      assert.deepEqual(install(off).filter(({ metadata }) => metadata?.name?.startsWith("alasio-grafana")), [], JSON.stringify(off));
+    }
+  });
+
+  test("runs one Grafana, from its image, on its database in the compute, alerting through the bot, keeping nothing", () => {
+    const grafana = one<V1Deployment>(install({ images: { grafana: { tag: "1.2.3" } } }), "Deployment", "alasio-grafana");
+    assert.deepEqual([grafana.spec?.replicas, grafana.spec?.strategy?.type], [1, "Recreate"]);
+    const pod = grafana.spec?.template.spec;
+    assert.deepEqual([pod?.automountServiceAccountToken, pod?.securityContext?.runAsUser], [false, 472]);
+    assert.equal(container(grafana).image, "ghcr.io/eaucoin/alasio-grafana:1.2.3");
+    assert.deepEqual(container(grafana).env, [
+      // Directly, not through a pooler: its migrations hold a session's advisory lock.
+      { name: "GF_DATABASE_HOST", value: "alasio-neon-compute:55433" },
+      { name: "LAKE_QUERY_URL", value: "http://alasio-lake:8090" },
+      { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: "telegram", key: "token" } } },
+      { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: "telegram", key: "allowedUserIds" } } },
+    ]);
+    assert.deepEqual(container(grafana).envFrom, [{ secretRef: { name: "alasio-grafana" } }]);
+    assert.equal(container(grafana).securityContext?.readOnlyRootFilesystem, true);
+    assert.ok(pod?.volumes?.every(({ emptyDir }) => emptyDir), "no volume but emptyDirs");
+  });
+
+  test("admits no pod to Grafana, and lets it reach DNS, its database, the lake's query endpoint and the internet's HTTPS alone", () => {
+    const objects = install();
+    const own = one<Policy>(objects, "NetworkPolicy", "alasio-grafana").spec;
+    assert.deepEqual([own.podSelector, own.policyTypes, own.ingress], [{ matchLabels: GRAFANA }, ["Ingress", "Egress"], undefined]);
+    const egress = own.egress as { to: Record<string, unknown>[]; ports: { protocol: string; port: number }[] }[];
+    assert.deepEqual(egress.map(({ ports }) => ports.map(({ protocol, port }) => `${protocol}/${port}`).join(",")), ["UDP/53,TCP/53", "TCP/55433", "TCP/8090", "TCP/443"]);
+    assert.deepEqual(egress[3]?.to, [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }]);
+    // Neither the compute nor the lake admits it as a pod of the stack: each does so on its port alone.
+    assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-grafana").spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined);
+    for (const [component, port] of [["neon-compute", 55433], ["lake", 8090]] as const) {
+      assert.deepEqual(one<Policy>(objects, "NetworkPolicy", `alasio-${component}-from-grafana`).spec.ingress, [{ from: [{ podSelector: { matchLabels: GRAFANA } }], ports: [{ protocol: "TCP", port }] }]);
+    }
+  });
+
+  test("has alasio make Grafana's role while Grafana runs", () => {
+    const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
+    assert.deepEqual(passwordFiles(alasio({}))?.at(-1), ["ALASIO_GRAFANA_PASSWORD_FILE", "/run/alasio/database/grafana-password"]);
+    const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-password", "lake-reader-password", "grafana-password"]);
+    assert.deepEqual(passwordFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_PASSWORD_FILE", "ALASIO_LAKE_READER_PASSWORD_FILE"]);
+  });
+});
+
 describe("telemetry", () => {
   /** The collector's configuration, as its ConfigMap holds it. */
   const collectorConfig = (objects: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-collector").data?.["config.yaml"] ?? "");

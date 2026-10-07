@@ -437,6 +437,7 @@ const InstallStruct = Schema.Struct({
       alasio: Image(IMAGES.alasio),
       agent: Image(IMAGES.agent),
       lake: Image(IMAGES.lake),
+      grafana: Image(IMAGES.grafana),
       pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
     }),
     {},
@@ -451,13 +452,18 @@ const InstallStruct = Schema.Struct({
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
-  /** The analytics lake, loaded from Neon into DuckLake, and its query endpoint, which alasio lake reads it through. */
+  /** The analytics lake, loaded from Neon into DuckLake, and its query endpoint, which Grafana and alasio lake read it through. */
   lake: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
       query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "192Mi" }, limits: { memory: "1Gi" } }) }), {}),
     }),
+    {},
+  ),
+  /** Grafana, with the lake: dashboards and alerts on it, alerting through the Telegram bot; alasio grafana reaches it. */
+  grafana: defaulted(
+    Schema.Struct({ enabled: defaulted(Schema.Boolean, true), resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "768Mi" } }) }),
     {},
   ),
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */
