@@ -163,7 +163,7 @@ async function newSession(net: NetMode) {
   await tg.say("/workspace");
   await tg.choose(/New empty workspace/u);
   await tg.choose(net === "full" ? /Full internet/u : /No internet/u);
-  const created = await tg.waitFor((call) => /Created and mounted empty workspace/u.test(call.payload.text ?? ""));
+  const created = await tg.waitFor((call) => /Created and mounted session workspace/u.test(call.payload.text ?? ""));
   const volumeId = /fs-[0-9a-f]+/u.exec(created.payload.text ?? "")?.[0];
   assert.ok(volumeId, `alasio named no workspace: ${created.payload.text}`);
   return volumeId;
@@ -259,15 +259,15 @@ if (inShard("sessions")) {
       assert.equal(await alasioOk("restart"), "alasio restarted; a turn it was running continues.\n");
       await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
       await tg.say("/workspace");
-      const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
-      assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+      const panel = await tg.waitFor((call) => /^Session workspace: /mu.test(call.payload.text ?? ""));
+      assert.match(panel.payload.text ?? "", new RegExp(`^Session workspace: ${full}, full internet$`, "mu"));
     });
 
     test("alasio's pod, deleted, is rescheduled on no volume, and its conversation goes on: its mount, the buttons it had sent, and its session", async () => {
       const volumes = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.volumes ?? [];
       assert.deepEqual(volumes.filter((volume) => volume.persistentVolumeClaim), []);
       await tg.say("/workspace");
-      const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
+      const panel = await tg.waitFor((call) => /^Session workspace: /mu.test(call.payload.text ?? ""));
       const refresh = tg.buttons(panel).find((button) => button.text === "Refresh");
       assert.ok(refresh && "callback_data" in refresh, "the panel has a Refresh button");
 
@@ -278,8 +278,8 @@ if (inShard("sessions")) {
 
       // A button sent by the pod that is gone acts in the one that replaced it.
       await tg.press(refresh.callback_data);
-      const refreshed = await tg.waitFor((call) => call.method === "editMessageText" && /Folder: sessionfs:/u.test(call.payload.text ?? ""));
-      assert.match(refreshed.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+      const refreshed = await tg.waitFor((call) => call.method === "editMessageText" && /^Session workspace: /mu.test(call.payload.text ?? ""));
+      assert.match(refreshed.payload.text ?? "", new RegExp(`^Session workspace: ${full}, full internet$`, "mu"));
 
       // The next message goes on in the session the conversation had, which the new pod's
       // Codex, not having run it, is asked to resume.
@@ -290,7 +290,55 @@ if (inShard("sessions")) {
   });
 }
 
-if (inShard("workspaces")) workspaceStorage();
+if (inShard("workspaces")) {
+  describe("a session workspace forked from Telegram", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    test("Fork in the workspace panel switches the conversation to a clone of its session workspace, where a turn runs in a session of its own, the source untouched", async () => {
+      const source = await newSession("none");
+      const inWorkspace = (volumeId: string, script: string) => kube.execOk(SESSIONS, volumeId, ["sh", "-c", script], { container: "bayma" });
+      await inWorkspace(source, "echo from the source > /workspace/kept");
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello from the source");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+
+      await tg.calls();
+      await tg.say("/workspace");
+      await tg.choose(/^Fork this workspace$/u);
+      // Said, and then on the panel, which shows the fork mounted.
+      const panel = await tg.waitFor((call) => call.method === "editMessageText" && /^Forked session workspace /mu.test(call.payload.text ?? ""));
+      const fork = new RegExp(`^Forked session workspace ${source} into session workspace (fs-[0-9a-f]+) and switched to it`, "mu").exec(panel.payload.text ?? "")?.[1];
+      assert.ok(fork, panel.payload.text);
+      assert.match(panel.payload.text ?? "", new RegExp(`^Session workspace: ${fork}, no internet, fork of ${source}$`, "mu"));
+      // The fork waits, suspended, for its first turn; the source runs again.
+      assert.equal(await kube.get<V1Pod>(ref("Pod", fork, SESSIONS)), null);
+      assert.ok(await kube.get<V1Pod>(ref("Pod", source, SESSIONS)));
+
+      await tg.say("hello from the fork");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      assert.equal(await inWorkspace(fork, "cat /workspace/kept"), "from the source\n");
+      await inWorkspace(fork, "echo from the fork > /workspace/kept");
+      assert.equal(await inWorkspace(source, "cat /workspace/kept"), "from the source\n");
+
+      // The source is still listed, and switching back to it restores its session.
+      await tg.calls();
+      await tg.say("/workspace");
+      await tg.choose(new RegExp(`^${source}$`, "u"));
+      await tg.waitFor((call) => new RegExp(`^Switched to session workspace ${source} `, "mu").test(call.payload.text ?? ""));
+    });
+  });
+
+  workspaceStorage();
+}
 
 /** How many rows of the lake's `otel` metric tables `condition` selects, as SQL. */
 const metricRows = (condition: string) =>
