@@ -725,6 +725,70 @@ describe("workspace storage", () => {
     }
   });
 
+  test("clones a session's volume into a new one's directory once its quota is set, counts its usage anew after and gives it its source's owner, privileged on a mount of the whole file system, as a JuiceFS admin", () => {
+    const { clone } = sessions(install());
+    assert.ok(clone);
+    assert.equal(clone.claimTemplate, "data");
+    const { job } = clone;
+    assert.deepEqual(job.metadata, {
+      generateName: "alasio-workspace-clone-",
+      namespace: "alasio",
+      labels: { ...job.metadata?.labels, "app.kubernetes.io/component": "workspace-clone" },
+    });
+    assert.equal(job.spec?.backoffLimit, 0);
+    const pod = job.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.restartPolicy, "Never");
+    assert.equal(pod?.spec?.securityContext, undefined);
+    const cloner = pod?.spec?.containers[0];
+    assert.ok(cloner);
+    assert.equal(cloner.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
+    assert.deepEqual(cloner.securityContext, { privileged: true });
+    assert.deepEqual(cloner.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
+    // The destination's directory has no quota at first, then the driver's.
+    const juicefs = [
+      'echo "$@" >> "$ROOT/calls"',
+      'if [ "$1 $2" = "quota get" ]; then [ -e "$ROOT/quota" ] && echo "| /alasio-sessions-data-fs-def456 | 1.0 GiB |"; : > "$ROOT/quota"; fi',
+      "true",
+    ].join("\n");
+    const recorded = (name: string) => `echo "${name} $*" >> "$ROOT/calls"`;
+    // A mount that answers at once, and a source directory the pod's group's, as kubelet made it.
+    const stat = 'case $1 in --file-system) echo fuseblk ;; --format=%a) echo 2775 ;; *) echo 1000:1000 ;; esac';
+    const env = {
+      META_URL: "redis://valkey/1",
+      SOURCE_NAMESPACE: "alasio-sessions",
+      SOURCE_CLAIM: "data-fs-abc123",
+      DESTINATION_NAMESPACE: "alasio-sessions",
+      DESTINATION_CLAIM: "data-fs-def456",
+    };
+    const commands = { juicefs, mkdir: recorded("mkdir"), stat: stat, sleep: recorded("sleep"), umount: recorded("umount"), chown: recorded("chown"), chmod: recorded("chmod") };
+    const { root, run, remove } = runScript(cloner, env, commands);
+    try {
+      run();
+      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [
+        "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
+        "sleep 2",
+        "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
+        "mkdir -p /jfs",
+        "mount --no-bgjob --cache-size 0 redis://valkey/1 /jfs",
+        "clone --preserve /jfs/alasio-sessions-data-fs-abc123/workspace /jfs/alasio-sessions-data-fs-def456/workspace",
+        "clone --preserve /jfs/alasio-sessions-data-fs-abc123/home /jfs/alasio-sessions-data-fs-def456/home",
+        "chown 1000:1000 /jfs/alasio-sessions-data-fs-def456",
+        "chmod 2775 /jfs/alasio-sessions-data-fs-def456",
+        "umount /jfs",
+        "quota check redis://valkey/1 --path /alasio-sessions-data-fs-def456 --repair",
+      ]);
+    } finally {
+      remove();
+    }
+  });
+
+  test("forks sessions only where their volumes are its class's", () => {
+    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "alasio-workspaces" } } })).clone?.claimTemplate, "data");
+    assert.equal(sessions(install({ sessions: { storage: { storageClassName: "fast" } } })).clone, undefined);
+    assert.equal(sessions(install({ workspaceStorage: { enabled: false } })).clone, undefined);
+  });
+
   test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
@@ -864,6 +928,22 @@ describe("security", () => {
       { apiGroups: [""], resources: ["pods"], verbs: ["get"] },
       { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
     ]);
+  });
+
+  test("lets alasio read sessions' claims and run the Jobs that clone them in its own namespace, only where it forks sessions", () => {
+    const rolesOf = (objects: readonly KubernetesObject[]) =>
+      Object.fromEntries(all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio").map(({ metadata, rules }) => [metadata?.namespace, rules]));
+    const objects = install({ host: { enabled: true } });
+    const roles = rolesOf(objects);
+    assert.deepEqual(roles["alasio"], [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }]);
+    assert.deepEqual(roles["alasio-sessions"]?.at(-1), { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] });
+    assert.ok(!JSON.stringify(roles["alasio-host"]).includes("persistentvolumeclaims"));
+    const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
+    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
+    assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
+    const unforked = rolesOf(install({ sessions: { storage: { storageClassName: "fast" } } }));
+    assert.equal(unforked["alasio"], undefined);
+    assert.ok(!JSON.stringify(unforked["alasio-sessions"]).includes("persistentvolumeclaims"));
   });
 
   test("lets alasio list and delete pods in JuiceFS's driver's namespace, its mount pods, only where it installs the driver, and tells it where", () => {

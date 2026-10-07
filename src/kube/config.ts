@@ -5,7 +5,7 @@
  *
  *     {
  *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
- *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates" },
+ *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates", "clone" },
  *       "host":     { "namespace", "port", "stateRoot", "podTemplate" }
  *     }
  *
@@ -15,7 +15,7 @@
  */
 import { readFileSync } from "node:fs";
 
-import type { V1PersistentVolumeClaim, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { V1Job, V1PersistentVolumeClaim, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Config, Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
 
 /** The deployment's templates could not be read, or are not what alasio needs; the message says which. */
@@ -63,6 +63,21 @@ const VolumeClaimTemplates = said(
   "must be a list of volume claim templates",
 );
 
+/**
+ * How a session's volume is cloned (cloneJob in cli/src/manifests/workspace-storage.ts):
+ * the name of the volume's claim template, and the Job that clones one claim of it into
+ * another, given the claims' namespaces and names as `SOURCE_NAMESPACE`, `SOURCE_CLAIM`,
+ * `DESTINATION_NAMESPACE` and `DESTINATION_CLAIM`. The Job is a Kubernetes object the
+ * installation gives, which the API server checks as each is made.
+ */
+const Clone = said(
+  Schema.Struct({
+    claimTemplate: said(Schema.NonEmptyString, "must be a claim template's name"),
+    job: said(Schema.declare((value): value is V1Job => Predicate.isObject(value)), "must be an object"),
+  }),
+  "must be an object",
+);
+
 /** Whether `podTemplate`, as the installation gives it, runs a container named `bayma`. */
 function runsBayma(podTemplate: unknown): boolean {
   const containers = Predicate.hasProperty(podTemplate, "spec") && Predicate.hasProperty(podTemplate.spec, "containers")
@@ -93,6 +108,8 @@ const SessionsProfile = said(
      */
     mountPodNamespace: Schema.optional(Schema.NullOr(Namespace)),
     volumeClaimTemplates: Schema.optional(VolumeClaimTemplates),
+    /** How a session's volume is cloned, where its storage can; none where it cannot, and sessions are not forked. */
+    clone: Schema.optional(Schema.NullOr(Clone)),
   }),
   "must be an object",
 ).check(Schema.makeFilter((profile) => (runsBayma(profile.podTemplate) ? undefined : baymaIssue)));

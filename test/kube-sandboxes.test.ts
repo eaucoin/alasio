@@ -272,6 +272,10 @@ test("the deployment's templates are checked as alasio starts", async () => {
   assert.equal(failure({ sessions: { ...profile(), workspaceDir: undefined } }), "ALASIO_KUBE_TEMPLATES sessions.workspaceDir must be a path");
   assert.equal(failure({ host: profile() }), "ALASIO_KUBE_TEMPLATES host.stateRoot must be a path");
   assert.equal(failure({ sessions: 5 }), "ALASIO_KUBE_TEMPLATES sessions must be an object");
+  const clone = { claimTemplate: "data", job: { kind: "Job" } };
+  assert.deepEqual(Result.getOrThrow(load({ sessions: { ...profile(), clone } })).sessions?.clone, clone);
+  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "" } } }), "ALASIO_KUBE_TEMPLATES sessions.clone.claimTemplate must be a claim template's name");
+  assert.equal(failure({ sessions: { ...profile(), clone: { claimTemplate: "data" } } }), "ALASIO_KUBE_TEMPLATES sessions.clone.job must be an object");
 
   const loading = (env: Record<string, string>) =>
     Effect.runPromiseExit(loadKubeTemplates.pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })))));

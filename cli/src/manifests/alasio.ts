@@ -39,6 +39,7 @@ import {
   sha256,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { cloneJob } from "./workspace-storage.ts";
 
 /** The port every workspace's bayma serves MCP on. */
 const BAYMA_PORT = 7290;
@@ -128,7 +129,13 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
         resources: { requests: { storage: sessions.storage.size } },
       },
     }],
+    ...(sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
   };
+}
+
+/** Whether alasio forks sessions: where their volumes are workspace storage's, which JuiceFS clones. */
+function sessionsForked({ sessions, workspaceStorage }: InstallConfig): boolean {
+  return workspaceStorage.enabled && [workspaceStorage.storageClassName, ""].includes(sessions.storage.storageClassName);
 }
 
 /** The template of folder workspaces' bayma: bayma itself, as the operator, with the machine's mounts. */
@@ -360,9 +367,10 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
 
 /**
  * alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and reads
- * files from sessions through exec, in the namespaces it owns, and, where it installs
- * JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount pods; and
- * nothing else.
+ * files from sessions through exec, in the namespaces it owns; where it forks sessions,
+ * reads sessions' volume claims and runs the Jobs that clone them in its own; and, where
+ * it installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its
+ * mount pods; and nothing else.
  */
 function identity(config: InstallConfig): KubernetesObject[] {
   const binding = (metadata: V1ObjectMeta): V1RoleBinding => ({
@@ -379,11 +387,19 @@ function identity(config: InstallConfig): KubernetesObject[] {
     metadata: inDriverNamespace,
     rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "delete"] }],
   };
+  const inOwnNamespace = { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") };
+  const clones: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata: inOwnNamespace,
+    rules: [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }],
+  };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") } };
   return [
     serviceAccount,
     ...workspaceNamespaces(config).flatMap((namespace): KubernetesObject[] => {
       const metadata = { name: RELEASE, namespace, labels: labels("alasio") };
+      const forked = sessionsForked(config) && namespace === config.sessions.namespace;
       const role: V1Role = {
         apiVersion: "rbac.authorization.k8s.io/v1",
         kind: "Role",
@@ -393,10 +409,12 @@ function identity(config: InstallConfig): KubernetesObject[] {
           { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
           { apiGroups: [""], resources: ["pods"], verbs: ["get"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
+          ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
         ],
       };
       return [role, binding(metadata)];
     }),
+    ...(sessionsForked(config) ? [clones, binding(inOwnNamespace)] : []),
     ...(mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
     ...(config.host.enabled ? hostAgentIdentity(config) : []),
   ];
