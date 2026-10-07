@@ -10,7 +10,8 @@
  * readiness: the intake has the lake open, so telemetry can be taken and the lake
  * queried) and /metrics (Prometheus, for the stack's telemetry collector) on
  * LAKE_HTTP_PORT, and the intake, OTLP over HTTP, on LAKE_INTAKE_PORT, from the moment
- * it starts, and logs a JSON line per event.
+ * it starts. It logs a JSON line per event, and exports each as telemetry too
+ * (telemetry.ts).
  */
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -24,6 +25,7 @@ import { type LoaderLake, startLoader } from "./loader.ts";
 import { createMetrics } from "./metrics.ts";
 import { ensureOtel } from "./otel.ts";
 import { prepareLake } from "./sync.ts";
+import { startTelemetry } from "./telemetry.ts";
 
 /** Names the one loader's advisory lock, in the catalog database. */
 const LOCK = "alasio.lake.loader";
@@ -37,8 +39,11 @@ interface LoaderLock {
   lost: () => boolean;
 }
 
+const telemetry = startTelemetry();
+
 function log(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
+  telemetry?.emit(message, fields);
 }
 
 /**
@@ -146,5 +151,6 @@ process.on("SIGTERM", async () => {
   server.close();
   intakeServer.close();
   await Promise.all([loader.stop(), intake.stop()]);
+  await telemetry?.shutdown();
   process.exit(0);
 });

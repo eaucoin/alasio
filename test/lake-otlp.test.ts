@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
 import { DuckDBListValue, DuckDBMapValue, DuckDBStructValue, DuckDBTimestampNanosecondsValue, type DuckDBValue } from "@duckdb/node-api";
@@ -19,6 +21,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 
 import { type TelemetryRows, telemetryRows } from "../neon/lake/src/otel.ts";
 import { decodeRequest, type Encoding, MalformedRequest, type Signal } from "../neon/lake/src/otlp.ts";
+import { startTelemetry } from "../neon/lake/src/telemetry.ts";
 
 // Requests as OpenTelemetry's own SDK and serializers make them, in both encodings, are
 // decoded into the `otel` schema's rows (neon/lake/src/otel.ts), which must be alike
@@ -228,4 +231,43 @@ test("a request that is not its signal's OTLP is malformed", () => {
   malformed("metrics", "json", JSON.stringify({ resourceMetrics: 5 }));
   malformed("traces", "json", JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{ startTimeUnixNano: "soon" }] }] }] }));
   malformed("metrics", "json", JSON.stringify({ resourceMetrics: [{ scopeMetrics: [{ metrics: [{ histogram: { dataPoints: [{ count: "-1" }] } }] }] }] }));
+});
+
+test("the lake's events are exported as log records where the standard variables say, and nowhere without them", async () => {
+  const received: Uint8Array[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    // With no encoding set, a request reads as Buffers.
+    for await (const chunk of request as AsyncIterable<Buffer>) chunks.push(chunk);
+    if (request.url === "/v1/logs") received.push(Buffer.concat(chunks));
+    response.writeHead(200, { "content-type": "application/x-protobuf" }).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const variables = ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_RESOURCE_ATTRIBUTES"] as const;
+  const saved = variables.map((name) => process.env[name]);
+  try {
+    for (const name of variables) delete process.env[name];
+    assert.equal(startTelemetry(), null);
+    // A server listening on a TCP port has an address of its own.
+    process.env["OTEL_EXPORTER_OTLP_ENDPOINT"] = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    process.env["OTEL_RESOURCE_ATTRIBUTES"] = "deployment.environment.name=test";
+    const telemetry = startTelemetry();
+    assert.ok(telemetry);
+    telemetry.emit("load failed", { error: "permission denied", claude: { inserted: 1 } });
+    await telemetry.shutdown();
+  } finally {
+    variables.forEach((name, index) => {
+      const value = saved[index];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    });
+    server.close();
+  }
+  const logs = received.flatMap((body) => rowsOf("logs", "protobuf", body)["logs"] ?? []);
+  assert.equal(logs.length, 1);
+  const [event] = logs;
+  assert.ok(event);
+  assert.deepEqual([event["ServiceName"], event["Body"], event["ScopeName"]], ["alasio-lake", "load failed", "alasio-lake"]);
+  assert.deepEqual(event["LogAttributes"], { error: "permission denied", claude: '{"inserted":1}' });
+  assert.equal((event["ResourceAttributes"] as Record<string, string>)["deployment.environment.name"], "test");
 });

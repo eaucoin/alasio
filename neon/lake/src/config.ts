@@ -19,6 +19,8 @@
  *                                           set, none is ever downloaded
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
  *   LAKE_INTAKE_PORT                        the telemetry intake, OTLP over HTTP (default 4318)
+ *
+ * Its own telemetry is configured by OpenTelemetry's standard variables (./telemetry.ts).
  */
 
 /** A Postgres database the lake connects to, as role `lake`. */
