@@ -920,13 +920,51 @@ describe("the lake's reader", () => {
     assert.ok(sql.length > 20, `${sql.length} queries`);
     // Grafana's variables, as it fills them in.
     const filled = (query: string) =>
-      [["${__from}", String(Date.now() - 3_600_000)], ["${__to}", String(Date.now())], ["${__interval_ms}", "60000"], ["${trace}", "0af7651916cd43dd8448eb211c80319c"], ["${conversation:sqlstring}", "'telegram:1'"]]
+      [["${__from}", String(Date.now() - 3_600_000)], ["${__to}", String(Date.now())], ["${__interval_ms}", "60000"], ["${trace}", "0af7651916cd43dd8448eb211c80319c"], ["${conversation:sqlstring}", "'telegram:1'"], ["${branch:sqlstring}", "'main'"]]
         .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), query);
     const reader = await openReader(readerConfig);
     try {
       const failed: string[] = [];
       for (const [where, query = ""] of sql) await answer(reader.db, filled(query)).catch((error: Error) => failed.push(`${where}: ${error.message}`));
       assert.deepEqual(failed, []);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("the Agents dashboard shows main's turns or a branch environment's, as its Branch chooses, and a branch's no transcript", async () => {
+    const turn = (traceId: string, resource: Record<string, string>) => ({
+      resource: { attributes: Object.entries({ "service.name": "alasio", ...resource }).map(([key, value]) => ({ key, value: { stringValue: value } })) },
+      scopeSpans: [{ spans: [{ traceId, spanId: "00f067aa0ba902b7", name: "alasio.turn", startTimeUnixNano: String(NOW), endTimeUnixNano: String(NOW + 1_000_000_000n) }] }],
+    });
+    const MAIN_TURN = "1af7651916cd43dd8448eb211c80319c";
+    const BRANCH_TURN = "2af7651916cd43dd8448eb211c80319c";
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("traces", { resourceSpans: [turn(MAIN_TURN, {}), turn(BRANCH_TURN, { "alasio.branch": "try" })] }));
+      await flushTelemetry(db);
+    });
+    const dashboard: { panels: { title: string; type: string; targets?: { url_options: { data: string } }[] }[]; templating: { list: { name: string; query: { infinityQuery: { url_options: { data: string } } } }[] } } =
+      JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/agents.json", import.meta.url), "utf8"));
+    // A table's query, or a variable's.
+    const query = (name: string) => {
+      const found = dashboard.panels.find(({ title, type }) => title === name && type === "table")?.targets?.[0]?.url_options.data ??
+        dashboard.templating.list.find((variable) => variable.name === name)?.query.infinityQuery.url_options.data;
+      assert.ok(found, name);
+      return found;
+    };
+    const on = (branch: string, sql: string) =>
+      [["${__from}", String(Number(NOW / 1_000_000n) - 3_600_000)], ["${__to}", String(Number(NOW / 1_000_000n) + 3_600_000)], ["${__interval_ms}", "60000"], ["${branch:sqlstring}", `'${branch}'`]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
+    const reader = await openReader(readerConfig);
+    try {
+      const branches = await answer(reader.db, on("main", query("branch")));
+      assert.deepEqual(branches, [{ __text: "main", __value: "main" }, { __text: "try", __value: "try" }]);
+      const traces = async (branch: string) => (await answer(reader.db, on(branch, query("Turns")))).map((row) => row["trace"]).filter((trace) => trace === MAIN_TURN || trace === BRANCH_TURN);
+      assert.deepEqual(await traces("main"), [MAIN_TURN]);
+      assert.deepEqual(await traces("try"), [BRANCH_TURN]);
+      // Its transcripts are in its own lake, which Grafana does not read.
+      assert.deepEqual(await answer(reader.db, on("try", query("Tool calls"))), []);
     } finally {
       reader.close();
     }

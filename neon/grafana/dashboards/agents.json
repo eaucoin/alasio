@@ -1,7 +1,7 @@
 {
   "uid": "alasio-agents",
   "title": "Agents",
-  "description": "Claude Code's and Codex's turns as alasio runs them, from its alasio.turn spans; the tokens they spend and the tools they call, from their transcripts; and a turn's trace, span by span.",
+  "description": "Claude Code's and Codex's turns as alasio runs them, from its alasio.turn spans; the tokens they spend and the tools they call, from their transcripts; and a turn's trace, span by span. Main's, or a branch environment's turns, as Branch chooses.",
   "tags": [
     "alasio"
   ],
@@ -16,6 +16,56 @@
   "schemaVersion": 41,
   "templating": {
     "list": [
+      {
+        "name": "branch",
+        "label": "Branch",
+        "type": "query",
+        "datasource": {
+          "type": "yesoreyeram-infinity-datasource",
+          "uid": "lake"
+        },
+        "query": {
+          "queryType": "infinity",
+          "refId": "variable",
+          "infinityQuery": {
+            "refId": "A",
+            "datasource": {
+              "type": "yesoreyeram-infinity-datasource",
+              "uid": "lake"
+            },
+            "type": "json",
+            "source": "url",
+            "parser": "backend",
+            "format": "table",
+            "url": "/query",
+            "url_options": {
+              "method": "POST",
+              "body_type": "raw",
+              "body_content_type": "text/plain",
+              "data": "select * from (\nselect 'main' as __text, 'main' as __value\nunion\nselect distinct ResourceAttributes['alasio.branch'], ResourceAttributes['alasio.branch']\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is not null and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})\n) order by __value <> 'main', __value"
+            },
+            "root_selector": "",
+            "columns": [
+              {
+                "selector": "__text",
+                "text": "__text",
+                "type": "string"
+              },
+              {
+                "selector": "__value",
+                "text": "__value",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "refresh": 2,
+        "description": "main, or a branch environment (alasio branch), whose telemetry is tagged alasio.branch. A branch's transcripts are in its own lake, which Grafana does not read: on a branch, tokens and tool calls show none.",
+        "current": {
+          "text": "main",
+          "value": "main"
+        }
+      },
       {
         "name": "trace",
         "label": "Turn",
@@ -42,7 +92,7 @@
               "method": "POST",
               "body_type": "raw",
               "body_content_type": "text/plain",
-              "data": "select strftime(Timestamp, '%Y-%m-%d %H:%M:%S') || ', ' || SpanAttributes['alasio.conversation.id'] || ', ' || coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as __text,\nTraceId as __value\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 200"
+              "data": "select strftime(Timestamp, '%Y-%m-%d %H:%M:%S') || ', ' || SpanAttributes['alasio.conversation.id'] || ', ' || coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as __text,\nTraceId as __value\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 200"
             },
             "root_selector": "",
             "columns": [
@@ -111,7 +161,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select count(*) as turns from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+            "data": "select count(*) as turns from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
           },
           "root_selector": "",
           "columns": [
@@ -185,7 +235,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select count(*) filter (where (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed')) as failed from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+            "data": "select count(*) filter (where (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed')) as failed from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
           },
           "root_selector": "",
           "columns": [
@@ -263,7 +313,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select quantile_cont(Duration, 0.5) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+            "data": "select quantile_cont(Duration, 0.5) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
           },
           "root_selector": "",
           "columns": [
@@ -336,7 +386,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select quantile_cont(Duration, 0.95) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+            "data": "select quantile_cont(Duration, 0.95) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
           },
           "root_selector": "",
           "columns": [
@@ -411,7 +461,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, count(*) as turns\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, count(*) as turns\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all order by 1"
           },
           "root_selector": "",
           "columns": [
@@ -507,7 +557,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, SpanAttributes['alasio.harness'] || ', median' as series, quantile_cont(Duration, 0.5) / 1e9 as seconds\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\nunion all\nselect time_bucket(to_milliseconds(${__interval_ms}), Timestamp), SpanAttributes['alasio.harness'] || ', 95th percentile', quantile_cont(Duration, 0.95) / 1e9\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\norder by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, SpanAttributes['alasio.harness'] || ', median' as series, quantile_cont(Duration, 0.5) / 1e9 as seconds\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\nunion all\nselect time_bucket(to_milliseconds(${__interval_ms}), Timestamp), SpanAttributes['alasio.harness'] || ', 95th percentile', quantile_cont(Duration, 0.95) / 1e9\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\norder by 1"
           },
           "root_selector": "",
           "columns": [
@@ -586,7 +636,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select Timestamp as time, SpanAttributes['alasio.conversation.id'] as conversation, SpanAttributes['alasio.harness'] as harness,\ncoalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, Duration / 1e9 as duration, SpanAttributes['alasio.session.id'] as session,\nSpanAttributes['alasio.volume.id'] as workspace, TraceId as trace\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 500"
+            "data": "select Timestamp as time, SpanAttributes['alasio.conversation.id'] as conversation, SpanAttributes['alasio.harness'] as harness,\ncoalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, Duration / 1e9 as duration, SpanAttributes['alasio.session.id'] as session,\nSpanAttributes['alasio.volume.id'] as workspace, TraceId as trace\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and coalesce(ResourceAttributes['alasio.branch'], 'main') = ${branch:sqlstring} and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 500"
           },
           "root_selector": "",
           "columns": [
@@ -734,7 +784,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), started_at) as time, input_tokens as input, output_tokens as output,\ncache_read_input_tokens as \"cache read\", cache_creation_input_tokens as \"cache written\"\nfrom claude.messages where started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}))\non input, output, \"cache read\", \"cache written\" into name kind value tokens)\ngroup by all order by 1"
+            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), started_at) as time, input_tokens as input, output_tokens as output,\ncache_read_input_tokens as \"cache read\", cache_creation_input_tokens as \"cache written\"\nfrom claude.messages where ${branch:sqlstring} = 'main' and started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}))\non input, output, \"cache read\", \"cache written\" into name kind value tokens)\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [
@@ -814,7 +864,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), occurred_at) as time, input_tokens - coalesce(cached_input_tokens, 0) as input, cached_input_tokens as \"cache read\",\noutput_tokens as output, reasoning_output_tokens as reasoning\nfrom codex.token_usage where occurred_at >= epoch_ms(${__from}) and occurred_at < epoch_ms(${__to}))\non input, \"cache read\", output, reasoning into name kind value tokens)\ngroup by all order by 1"
+            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), occurred_at) as time, input_tokens - coalesce(cached_input_tokens, 0) as input, cached_input_tokens as \"cache read\",\noutput_tokens as output, reasoning_output_tokens as reasoning\nfrom codex.token_usage where ${branch:sqlstring} = 'main' and occurred_at >= epoch_ms(${__from}) and occurred_at < epoch_ms(${__to}))\non input, \"cache read\", output, reasoning into name kind value tokens)\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [
@@ -892,7 +942,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select 'claude' as harness, model, count(*) as responses, sum(input_tokens) as input,\nsum(cache_read_input_tokens) as cache_read, sum(output_tokens) as output\nfrom claude.messages where started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}) group by all\nunion all\nselect 'codex', t.model, count(*), sum(u.input_tokens - coalesce(u.cached_input_tokens, 0)), sum(u.cached_input_tokens), sum(u.output_tokens)\nfrom codex.token_usage u left join codex.turns t using (home, thread_id, turn_id) where u.occurred_at >= epoch_ms(${__from}) and u.occurred_at < epoch_ms(${__to}) group by all\norder by output desc"
+            "data": "select 'claude' as harness, model, count(*) as responses, sum(input_tokens) as input,\nsum(cache_read_input_tokens) as cache_read, sum(output_tokens) as output\nfrom claude.messages where ${branch:sqlstring} = 'main' and started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}) group by all\nunion all\nselect 'codex', t.model, count(*), sum(u.input_tokens - coalesce(u.cached_input_tokens, 0)), sum(u.cached_input_tokens), sum(u.output_tokens)\nfrom codex.token_usage u left join codex.turns t using (home, thread_id, turn_id) where ${branch:sqlstring} = 'main' and u.occurred_at >= epoch_ms(${__from}) and u.occurred_at < epoch_ms(${__to}) group by all\norder by output desc"
           },
           "root_selector": "",
           "columns": [
@@ -997,7 +1047,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select harness, tool, count(*) as calls, count(*) filter (where failed) as failed,\nquantile_cont(seconds, 0.5) as median, quantile_cont(seconds, 0.95) as p95, max(seconds) as slowest\nfrom (\nselect 'claude' as harness, tool_name as tool, coalesce(is_error, false) as failed, epoch(answered_at - called_at) as seconds\nfrom claude.tool_calls where called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\nunion all\nselect 'codex', name, false, epoch(answered_at - called_at) from codex.tool_calls where called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\n) group by all order by calls desc"
+            "data": "select harness, tool, count(*) as calls, count(*) filter (where failed) as failed,\nquantile_cont(seconds, 0.5) as median, quantile_cont(seconds, 0.95) as p95, max(seconds) as slowest\nfrom (\nselect 'claude' as harness, tool_name as tool, coalesce(is_error, false) as failed, epoch(answered_at - called_at) as seconds\nfrom claude.tool_calls where ${branch:sqlstring} = 'main' and called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\nunion all\nselect 'codex', name, false, epoch(answered_at - called_at) from codex.tool_calls where ${branch:sqlstring} = 'main' and called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\n) group by all order by calls desc"
           },
           "root_selector": "",
           "columns": [
@@ -1133,7 +1183,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), called_at) as time, tool_name as tool, count(*) as failed\nfrom claude.tool_calls where is_error and called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to}) group by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), called_at) as time, tool_name as tool, count(*) as failed\nfrom claude.tool_calls where ${branch:sqlstring} = 'main' and is_error and called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to}) group by all order by 1"
           },
           "root_selector": "",
           "columns": [
