@@ -19,6 +19,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
+import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
@@ -243,6 +244,15 @@ if (inShard("sessions")) {
       // The operator's home is the machine's, shared between alasio and the folder's bayma.
       assert.equal(readFileSync(`${home}/e2e-folder-proof`, "utf8"), `written by ${HOST_USER}`);
       assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
+    });
+
+    test("a message runs a turn on Codex, the run's stand-in for it, whose answer reaches the operator, and its spans the lake", async () => {
+      await tg.calls();
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      await untilInLake("span of Codex's app-server", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'");
     });
 
     test("alasio comes back from alasio restart with its conversation's workspace", async () => {

@@ -63,7 +63,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       # All four at once, each line said with its image's name, the node image with its pins
-      # (tooling/node-image.ts); the step fails if any did.
+      # (tooling/node-image.ts), and on alasio's, alasio-codex-stand-in, which the end-to-end
+      # runs install (test/e2e/codex-stand-in.Dockerfile); the step fails if any did.
       - id: push
         name: Build and push the images
         shell: bash
@@ -78,7 +79,12 @@ jobs:
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
             {
               docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
-                docker push "$PUSH_TO/$name:e2e"
+                docker push "$PUSH_TO/$name:e2e" &&
+                if [ "$name" = alasio ]; then
+                  docker build --file test/e2e/codex-stand-in.Dockerfile --build-arg "ALASIO=$PUSH_TO/alasio:e2e" \
+                    --tag "$PUSH_TO/alasio-codex-stand-in:e2e" --label "org.opencontainers.image.source=$SOURCE" test &&
+                    docker push "$PUSH_TO/alasio-codex-stand-in:e2e"
+                fi
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!
           done
@@ -195,7 +201,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-node; do
+            for name in alasio alasio-agent alasio-lake alasio-node alasio-codex-stand-in; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then

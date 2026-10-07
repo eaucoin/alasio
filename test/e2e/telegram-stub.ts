@@ -30,6 +30,7 @@ export interface BotApiPayload
     Pick<BotParams<"getUpdates">, "offset" | "timeout">
       & Pick<BotParams<"sendMessage">, "chat_id" | "text" | "reply_markup">
       & Pick<BotParams<"editMessageText">, "message_id">
+      & Pick<BotParams<"sendRichMessage">, "rich_message">
       & Pick<BotParams<"getFile">, "file_id">
   > {
   readonly multipartBytes?: number;

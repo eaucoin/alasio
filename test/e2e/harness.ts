@@ -4,7 +4,9 @@
  * machine made by `alasio init` from the node image built here, alasio's own images
  * pushed to a registry of the run's own beside the cluster, which the cluster's
  * `registries` have its nodes pull from, the stand-ins it talks to instead of Telegram
- * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`.
+ * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`,
+ * running a stand-in for Codex in its place (./codex-stand-in.ts), as the run has no
+ * Codex login.
  * The tests then drive it through its command line (`alasio`), the stand-ins, and the
  * cluster's API (`kube`); the run is torn down by `alasio uninstall --purge`, after what
  * the cluster was doing is said, when something of the run failed.
@@ -102,8 +104,15 @@ export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 /** Whether the run runs the suites of `shard`. */
 export const inShard = (shard: Shard): boolean => SHARD === undefined || SHARD === shard;
 
-/** The images built here: their names, and what they are built from. */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-node": "cluster/node" } as const;
+/**
+ * The images built here: their names, and what they are built from. alasio's runs in
+ * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
+ * (./codex-stand-in.Dockerfile), built on it.
+ */
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+
+/** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
+const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
 
 /** The registry the images were pushed to already, when the run builds none. */
 const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
@@ -376,10 +385,10 @@ export async function onNode(node: string, script: string): Promise<string> {
   return (TARGET === "host" ? await sudo("sh", "-c", script) : await docker("exec", node, "sh", "-c", script)).stdout;
 }
 
-/** Builds the image `name`, tagged `tag`. */
-async function build(name: keyof typeof IMAGES, tag: string): Promise<void> {
+/** Builds the image `name`, tagged `tag`, with `args` for docker build besides. */
+async function build(name: keyof typeof IMAGES, tag: string, args: readonly string[] = []): Promise<void> {
   console.error(`# building ${tag} from ${IMAGES[name]}`);
-  await docker("build", "--quiet", ...(name === "alasio-node" ? NODE_BUILD_ARGS : []), "--tag", tag, IMAGES[name]);
+  await docker("build", "--quiet", ...(name === "alasio-node" ? NODE_BUILD_ARGS : []), ...args, "--tag", tag, IMAGES[name]);
 }
 
 /**
@@ -396,24 +405,24 @@ async function startRegistry(): Promise<string> {
   return (await docker("port", REGISTRY, "5000/tcp")).stdout.trim();
 }
 
-/** Builds the image `name` and pushes it to the registry at `pushHost`, then removes it here, with Docker's build cache. */
-async function push(pushHost: string, name: keyof typeof IMAGES): Promise<void> {
+/** Builds the image `name`, with `args` for docker build besides, and pushes it to the registry at `pushHost`, then removes it here, with Docker's build cache. */
+async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly string[] = []): Promise<void> {
   const tag = `${pushHost}/${imageOf(name)}`;
-  await build(name, tag);
+  await build(name, tag, args);
   console.error(`# pushing ${tag}`);
   await docker("push", "--quiet", tag);
   await docker("image", "rm", tag);
   await docker("builder", "prune", "--all", "--force");
 }
 
-/** The install configuration the run starts alasio with: its images, pulled from where they were pushed, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
+/** The install configuration the run starts alasio with: its images, pulled from where they were pushed, alasio's with the stand-in for Codex, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
 function installation(): Record<string, unknown> {
   const pushed = (name: keyof typeof IMAGES) => ({ ...pulledOf(name), digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
-    images: { alasio: pushed("alasio"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
+    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
     alasio: {
-      env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM) },
+      env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
       persistence: { size: "2Gi" },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
@@ -516,6 +525,8 @@ export async function setUp(): Promise<void> {
   if (!PUSHED) {
     const pushHost = await startRegistry();
     for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) await push(pushHost, name);
+    // On alasio's image, which its build pulls back from the registry.
+    await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }
 
   console.error("# applying the stand-ins");
