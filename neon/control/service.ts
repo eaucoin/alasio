@@ -22,7 +22,7 @@ import { readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-import { type JsonWebKeySet, publicJwks, signToken, verifyToken } from "./jwt.ts";
+import { bearsScope, type JsonWebKeySet, publicJwks, signToken } from "./jwt.ts";
 import { scramVerifier } from "./scram.ts";
 import type { StackSecrets } from "./secrets.ts";
 
@@ -376,10 +376,8 @@ async function bootstrap(): Promise<void> {
   }, REPAIR_INTERVAL_MS).unref();
 }
 
-function authorized(request: IncomingMessage): boolean {
-  const token = request.headers.authorization?.replace(/^Bearer /, "");
-  return Boolean(token && verifyToken(publicKeyPem, token));
-}
+/** Whether the request bears a token of the admin scope, as the storage controller's calls do. */
+const fromAdmin = (request: IncomingMessage): boolean => bearsScope(publicKeyPem, request.headers.authorization, "admin");
 
 /** Whether the request carries the compute's token, which only the compute is given. */
 function fromCompute(request: IncomingMessage): boolean {
@@ -408,7 +406,7 @@ const server = createServer((request, response) => {
     return;
   }
   if (request.method === "PUT" && (request.url === "/notify-attach" || request.url === "/notify-safekeepers")) {
-    if (!authorized(request)) {
+    if (!fromAdmin(request)) {
       response.writeHead(401).end();
       return;
     }

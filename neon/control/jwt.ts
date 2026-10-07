@@ -68,6 +68,12 @@ export function verifyToken(publicKeyPem: string, token: string): TokenClaims | 
   }
 }
 
+/** Whether `authorization`, an HTTP Authorization header, bears a token `publicKeyPem` signed for `scope`. */
+export function bearsScope(publicKeyPem: string, authorization: string | undefined, scope: string): boolean {
+  if (!authorization?.startsWith("Bearer ")) return false;
+  return verifyToken(publicKeyPem, authorization.slice("Bearer ".length))?.scope === scope;
+}
+
 /** The public key as a JWK set, which compute_ctl verifies its API's tokens with. */
 export function publicJwks(publicKeyPem: string): JsonWebKeySet {
   const jwk = createPublicKey(publicKeyPem).export({ format: "jwk" });
