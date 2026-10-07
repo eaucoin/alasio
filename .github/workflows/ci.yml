@@ -109,14 +109,15 @@ jobs:
         target: [docker]
         agents: [0, 2]
         # The suites, in shards that need nothing of each other's, each on a cluster of its
-        # own: alasio on Kubernetes, workspaces on JuiceFS, Neon, and alasio's telemetry
-        # (test/e2e/harness.ts).
-        shard: [sessions, workspaces, neon, telemetry]
+        # own: alasio on Kubernetes, workspaces on JuiceFS, Neon, alasio's telemetry, and
+        # branch environments (test/e2e/harness.ts).
+        shard: [sessions, workspaces, neon, telemetry, branches]
         include:
           - { target: host, agents: 0, shard: sessions, firewall: ufw }
           - { target: host, agents: 0, shard: workspaces }
           - { target: host, agents: 0, shard: neon }
           - { target: host, agents: 0, shard: telemetry }
+          - { target: host, agents: 0, shard: branches }
     steps:
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
       # it serves, unpacked: far more disk than a runner starts with free, so the

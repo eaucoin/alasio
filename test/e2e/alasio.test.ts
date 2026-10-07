@@ -10,11 +10,13 @@
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
  */
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, V1Deployment, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1Deployment, V1PersistentVolume, V1Pod } from "@kubernetes/client-node";
 
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
@@ -25,6 +27,7 @@ import {
   AGENTS,
   alasio,
   alasioOk,
+  alasioOkWith,
   alasioRunning,
   CLUSTER,
   dumpClusterState,
@@ -39,6 +42,7 @@ import {
   kube,
   lakeQuery,
   onNode,
+  OTHER_OPERATOR,
   paths,
   ref,
   SESSIONS,
@@ -49,7 +53,7 @@ import {
 } from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
-import { OTLP, STAND_INS, type StandIn, TELEGRAM } from "./stand-ins.ts";
+import { OTLP, STAND_INS, type StandIn, TELEGRAM, TELEGRAM_BRANCH, urlOf } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
 import { workspaceStorage } from "./workspace-storage.ts";
 
@@ -102,7 +106,8 @@ function operator(base: string) {
   };
   return {
     buttons,
-    say: (text: string) => post("/control/message", { text }),
+    /** Says `text` as the operator, or as `user`, another the bot is for, each in their own chat. */
+    say: (text: string, user?: number) => post("/control/message", { text, ...(user === undefined ? {} : { chatId: user, userId: user }) }),
     press: (data: string | undefined) => post("/control/callback", { data }),
     calls,
     /** What alasio sends until `predicate` holds for one, which is returned. */
@@ -484,9 +489,14 @@ if (inShard("telemetry")) {
           }],
         };
         await inAlasioContainer(["curl", "-fsS", "-X", "POST", "-H", "content-type: application/json", "--data-binary", "@-", "http://alasio-collector.alasio.svc:4318/v1/traces"], JSON.stringify(turn));
-        const alert = await tg.waitFor((call) => call.method === "sendMessage" && /Turns are failing/u.test(call.payload.text ?? ""), 420_000);
-        assert.equal(alert.payload.chat_id, "1001");
-        assert.match(alert.payload.text ?? "", /conversation = telegram:1001/u);
+        // Each user's alert, by the chat it went to, until both users have theirs.
+        const alerts = new Map<string, string>();
+        await tg.waitFor((call) => {
+          if (call.method === "sendMessage" && /Turns are failing/u.test(call.payload.text ?? "")) alerts.set(String(call.payload.chat_id), call.payload.text ?? "");
+          return alerts.size === 2;
+        }, 420_000);
+        assert.deepEqual([...alerts.keys()].sort(), ["1001", String(OTHER_OPERATOR)]);
+        for (const text of alerts.values()) assert.match(text, /conversation = telegram:1001/u);
         const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string }[] }[] } };
         assert.equal(rules.data.groups.flatMap((group) => group.rules).find(({ name }) => name === "Turns are failing")?.state, "firing");
       });
@@ -504,6 +514,162 @@ if (inShard("telemetry")) {
 }
 
 if (inShard("neon")) neonStack();
+
+/** The branch environment the run makes, and its namespaces. */
+const BRANCH = "e2e";
+const BRANCH_NAMESPACE = `alasio-branch-${BRANCH}`;
+const BRANCH_SESSIONS = `${BRANCH_NAMESPACE}-sessions`;
+/** The chat, another user's, that main mounts on a folder. */
+const FOLDER_CHAT = OTHER_OPERATOR;
+
+/** Runs `sql` on alasio's database in `namespace` (main's, or a branch's), as the compute's own superuser, in its pod: what psql printed. */
+async function onDatabase(namespace: string, sql: string): Promise<string> {
+  const pod = await kube.runningPod(namespace, "alasio-neon-compute");
+  return (await kube.execOk(namespace, pod, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "alasio", "-Atc", sql], { container: "compute" })).trim();
+}
+
+/** Calls neon-control's API in its pod with the stack's admin token: what it answered. */
+async function neonControl(path: string): Promise<string> {
+  const pod = await kube.runningPod(NAMESPACE, "alasio-neon-control");
+  const token = await kube.secret(NAMESPACE, "alasio-branches", "control-token");
+  return kube.execOk(NAMESPACE, pod, ["curl", "-sS", "-H", "@-", `http://127.0.0.1:8080${path}`], { container: "neon-control", stdin: `authorization: Bearer ${token}\n` });
+}
+
+/** Waits until main's lake logs a maintenance pass that `passes` holds for, after those it logged before. */
+async function untilMaintained(what: string, passes: (line: string) => boolean): Promise<void> {
+  const pod = await kube.runningPod(NAMESPACE, "alasio-lake");
+  const seen = (await kube.logs(NAMESPACE, pod, "lake")).split("\n").length;
+  const deadline = Date.now() + 240_000;
+  while (Date.now() < deadline) {
+    const lines = (await kube.logs(NAMESPACE, pod, "lake")).split("\n").slice(seen);
+    if (lines.some((line) => line.includes('"message":"maintained"') && passes(line))) return;
+    await sleep(5000);
+  }
+  assert.fail(`main's lake logged no maintenance that ${what}`);
+}
+
+if (inShard("branches")) {
+  describe("branch environments", () => {
+    let branchTelegram: Forward | undefined;
+    let branch: ReturnType<typeof operator>;
+    let volumeId: string;
+
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      branchTelegram = await forward(TELEGRAM_BRANCH);
+      tg = operator(telegram.base);
+      branch = operator(branchTelegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      // Main's lake loaded and maintained every few seconds, so the run sees its passes.
+      const lake = await kube.get<V1Deployment>(ref("Deployment", "alasio-lake", NAMESPACE));
+      const containers = lake?.spec?.template.spec?.containers ?? [];
+      assert.ok(containers.some(({ name }) => name === "lake"));
+      const often = [{ name: "LAKE_INTERVAL_SECONDS", value: "10" }, { name: "LAKE_MAINTENANCE_HOURS", value: "0.002" }];
+      // A merge patch replaces the list whole: the query endpoint's container is given back as it was.
+      const patched = containers.map((container) => (container.name === "lake" ? { ...container, env: [...(container.env ?? []), ...often] } : container));
+      await kube.patch(ref("Deployment", "alasio-lake", NAMESPACE), { spec: { template: { spec: { containers: patched } } } });
+      await kube.awaitReady([ref("Deployment", "alasio-lake", NAMESPACE)], "5 minutes");
+    });
+
+    after(() => {
+      telegram?.close();
+      branchTelegram?.close();
+    });
+
+    test("main works in a session workspace on Codex, and in a folder in another chat, which the branch inherits", async () => {
+      volumeId = await newSession("none");
+      await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      if (HOST_PROFILE) {
+        await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
+        await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
+        await tg.say("/service codex", FOLDER_CHAT);
+        await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      }
+    });
+
+    test("alasio branch create makes the branch, serving its own bot, and main's lake keeps its files while it is", async () => {
+      const work = mkdtempSync(join(tmpdir(), "alasio-e2e-branch-"));
+      writeFileSync(join(work, "bot-token"), "456:branch", { mode: 0o600 });
+      // The branch's alasio talks to its own bot's stand-in, as the command line checks its token with it.
+      writeFileSync(join(work, "overrides.json"), JSON.stringify({ alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } } }));
+      const started = Date.now();
+      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"));
+      console.error(`# the branch ran ${((Date.now() - started) / 1000).toFixed(1)}s after alasio branch create was run`);
+      await branch.waitFor((call) => call.method === "setMyCommands", 300_000);
+      assert.match(await alasioOk("branch", "list"), new RegExp(`^${BRANCH}: a branch of main, \\d+m old, its alasio ready, `, "mu"));
+      await untilMaintained("kept the files for the branch", (line) => line.includes(`"keptFilesFor":["${BRANCH}"]`));
+    });
+
+    test("a turn on the branch goes on in main's conversation in a fork of its workspace, which main made, and nothing of main's changes", async () => {
+      const messages = await onDatabase(NAMESPACE, "select count(*) from state.messages");
+      const mounted = await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'");
+      assert.equal(mounted, `sessionfs:${volumeId}`);
+      await tg.calls();
+      await branch.say("again");
+      await branch.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      // Forked into the branch's own sessions, under the same id, with main's files.
+      assert.ok(await kube.get(ref("Sandbox", volumeId, BRANCH_SESSIONS)));
+      const inBranch = (code: string) => kube.execOk(BRANCH_SESSIONS, volumeId, ["node", "-e", code], { container: "bayma" });
+      assert.equal(await inBranch('process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
+      await inBranch('require("fs").writeFileSync("/workspace/proof", "written by the branch")');
+      assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
+      // Main's database, and its bot, as they were.
+      assert.equal(await onDatabase(NAMESPACE, "select count(*) from state.messages"), messages);
+      assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), mounted);
+      assert.deepEqual((await tg.calls()).filter((call) => call.method !== "getUpdates" && call.method !== "answerCallbackQuery"), []);
+      // The branch's database has the turn main's does not.
+      assert.ok(Number(await onDatabase(BRANCH_NAMESPACE, "select count(*) from state.messages")) > Number(messages));
+    });
+
+    test("the branch's telemetry is in main's lake, tagged with the branch", async () => {
+      await untilInLake("trace of the branch's alasio", `select count(*) as n from otel.traces where ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] = '${BRANCH}'`);
+    });
+
+    test("a folder workspace main mounted is refused on the branch, saying why", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+      await branch.say("hi", FOLDER_CHAT);
+      await branch.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /hit an error: This is the branch environment e2e, .* A folder is this machine's own files/u.test(call.payload.text ?? ""));
+    });
+
+    test("the branch's alasio, compute and lake fit the run's cluster, as the metrics server measures them", async () => {
+      const deadline = Date.now() + 300_000;
+      let measured: readonly (KubernetesObject & { containers?: { usage?: { memory?: string } }[] })[] = [];
+      while (Date.now() < deadline && measured.length < 3) {
+        measured = await kube.list("PodMetrics", { namespace: BRANCH_NAMESPACE }).catch(() => []);
+        if (measured.length < 3) await sleep(10_000);
+      }
+      const pods = await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE });
+      for (const { metadata, containers } of measured) {
+        const node = pods.find((pod) => pod.metadata?.name === metadata?.name)?.spec?.nodeName;
+        console.error(`# measured: ${metadata?.name} on ${node} uses ${containers?.map(({ usage }) => usage?.memory).join(" + ")}`);
+      }
+      assert.equal(measured.length, 3, "the metrics server measured the branch's three pods");
+      if (AGENTS === 0) assert.equal(new Set(pods.map((pod) => pod.spec?.nodeName)).size, 1);
+    });
+
+    test("alasio branch delete leaves nothing of the branch, and main's lake maintenance deletes files again", async () => {
+      const { branches } = JSON.parse(await neonControl("/branches")) as { branches: { name: string; timelineId: string }[] };
+      const timeline = branches.find(({ name }) => name === BRANCH)?.timelineId;
+      assert.ok(timeline);
+      await alasioOk("branch", "delete", BRANCH);
+      assert.equal(await alasioOk("branch", "list"), "alasio has no branch environments.\n");
+      for (const namespace of [BRANCH_NAMESPACE, BRANCH_SESSIONS]) assert.equal(await kube.get(ref("Namespace", namespace)), null);
+      const volumes = await kube.list<V1PersistentVolume>("PersistentVolume");
+      assert.deepEqual(volumes.filter(({ spec }) => spec?.claimRef?.namespace === BRANCH_SESSIONS).map(({ metadata }) => metadata?.name), []);
+      const { tenantId } = JSON.parse(await kube.secret(NAMESPACE, "alasio-neon-root", "secrets.json")) as { tenantId: string };
+      const controller = await kube.runningPod(NAMESPACE, "alasio-neon-storage-controller");
+      const found = await kube.execOk(NAMESPACE, controller, ["sh", "-c", 'curl -sS -o /dev/null -w "%{http_code}" -H "authorization: Bearer $CONTROL_PLANE_JWT_TOKEN" "$0"', `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${timeline}`]);
+      assert.equal(found, "404");
+      await untilMaintained("deleted files again", (line) => !line.includes("keptFilesFor"));
+      // Main goes on as it was.
+      await tg.say("and main?");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+    });
+  });
+}
 
 /** What alasio installs on this machine as the host target, and what its cluster leaves there: none of it is left once it is removed. */
 const INSTALLED_HERE = [

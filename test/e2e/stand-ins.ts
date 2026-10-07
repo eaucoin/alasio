@@ -1,9 +1,10 @@
 /**
  * What alasio talks to in the end-to-end run instead of Telegram and a telemetry backend:
- * the stand-ins ./telegram-stub.ts and ./otlp-sink.ts, each run by Node in a Deployment
- * of its own, from a ConfigMap that holds its script, behind a Service, in a namespace of
- * their own. The run applies them to the cluster before it starts alasio. Telegram's
- * serves HTTPS too, as api.telegram.org, for Grafana (./telegram-tls.ts).
+ * the stand-ins ./telegram-stub.ts, twice (main's bot's, and a branch environment's), and
+ * ./otlp-sink.ts, each run by Node in a Deployment of its own, from a ConfigMap that holds
+ * its script, behind a Service, in a namespace of their own. The run applies them to the
+ * cluster before it starts alasio. Main's Telegram serves HTTPS too, as api.telegram.org,
+ * for Grafana (./telegram-tls.ts).
  */
 import { readFileSync } from "node:fs";
 
@@ -33,6 +34,8 @@ export interface StandIn {
 export const TELEGRAM_TLS_PORT = 8443;
 
 export const TELEGRAM: StandIn = { name: "telegram-stub", container: "stub", service: "telegram", port: 8081, script: "telegram-stub.ts", ready: "/control/calls", tlsPort: TELEGRAM_TLS_PORT };
+/** A second bot's Telegram, a branch environment's, which it polls as main polls main's; over HTTP alone, as a branch has no Grafana. */
+export const TELEGRAM_BRANCH: StandIn = { name: "telegram-branch-stub", container: "stub", service: "telegram-branch", port: 8081, script: "telegram-stub.ts", ready: "/control/calls" };
 export const OTLP: StandIn = { name: "otlp-sink", container: "sink", service: "otlp", port: 4318, script: "otlp-sink.ts", ready: "/control/exports" };
 
 /** Where a stand-in is reached from the cluster. */
@@ -87,5 +90,5 @@ function objectsOf({ name, container, service, port, script, ready, tlsPort }: S
 /** The stand-ins' objects, their namespace first. */
 export function standInObjects(): KubernetesObject[] {
   const namespace: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: STAND_INS } };
-  return [namespace, ...objectsOf(TELEGRAM), ...objectsOf(OTLP)];
+  return [namespace, ...objectsOf(TELEGRAM), ...objectsOf(TELEGRAM_BRANCH), ...objectsOf(OTLP)];
 }

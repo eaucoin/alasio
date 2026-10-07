@@ -84,6 +84,8 @@ const THE_CLUSTER = TARGET === "host" ? "k3s on this machine" : `the cluster ${C
 export const HOST_PROFILE = AGENTS < 2;
 /** The Telegram user the stand-in's operator is, whom the bot is for. */
 const OPERATOR = "1001";
+/** Another user the bot is for, whose own chat a suite may talk in beside the operator's. */
+export const OTHER_OPERATOR = 1002;
 /** The user folder workspaces run as. */
 export const HOST_USER = 1000;
 
@@ -95,7 +97,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, every suite, when it is unset or empty. */
@@ -109,8 +111,8 @@ export function shardOf(value: string | undefined): Shard | undefined {
 /**
  * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
  * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
- * alasio's Neon; or `telemetry`, where alasio's telemetry goes, on a session of its own;
- * every suite unless set. Each shard runs the command line's suite, and uninstall's, as
+ * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own; or
+ * `branches`, branch environments; every suite unless set. Each shard runs the command line's suite, and uninstall's, as
  * well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
@@ -188,7 +190,13 @@ export function alasio(...args: string[]): Promise<Ran> {
 
 /** Runs `alasio ...args`, which must succeed: what it printed. */
 export async function alasioOk(...args: string[]): Promise<string> {
-  const ran = await alasio(...args);
+  return alasioOkWith({}, ...args);
+}
+
+/** Runs `alasio ...args` with `env` over the run's environment, which must succeed: what it printed. */
+export async function alasioOkWith(env: NodeJS.ProcessEnv, ...args: string[]): Promise<string> {
+  const { bin } = current();
+  const ran = await capture(spawn(bin, args, { env: { ...current().env, ...env }, stdio: ["ignore", "pipe", "pipe"] }));
   if (ran.code !== 0) throw new Error(`alasio ${args.join(" ")} exited with ${ran.code}:\n${ran.stderr}`);
   return ran.stdout;
 }
@@ -538,7 +546,7 @@ export async function setUp(): Promise<void> {
     const { port } = telegram.server.address() as AddressInfo;
     const folders = HOST_PROFILE ? ["--folder-workspaces", "--user", `${HOST_USER}:${HOST_USER}`, "--home", home] : ["--no-folder-workspaces"];
     const ran = await capture(
-      spawn(current().bin, ["init", "--non-interactive", "--bot-token-file", botToken, "--allowed-user-ids", OPERATOR, ...folders, "--telemetry-endpoint", urlOf(OTLP), "--no-up"], {
+      spawn(current().bin, ["init", "--non-interactive", "--bot-token-file", botToken, "--allowed-user-ids", `${OPERATOR},${OTHER_OPERATOR}`, ...folders, "--telemetry-endpoint", urlOf(OTLP), "--no-up"], {
         env: { ...env, TELEGRAM_API_ROOT: `http://127.0.0.1:${port}` },
         stdio: ["ignore", "pipe", "pipe"],
       }),
