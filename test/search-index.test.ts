@@ -9,17 +9,14 @@ import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { indexTranscripts } from "../src/harness/claude/search/index.ts";
 import { SETTLE_MS, collectOrphans, indexBatch, settle } from "../src/harness/claude/search/indexer.ts";
 import { ensureSearchSchema } from "../src/harness/claude/search/schema.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
-const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
-
-// Set by the first hook unless every test that uses them is skipped.
+// Set by the first hook.
 let database: TestPostgres | undefined;
 let pool: pg.Pool;
 let schemas = 0;
 
 before(async () => {
-  if (skip) return;
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 6 });
 });
@@ -50,7 +47,7 @@ const answer = (uuid: string, text: string, at = "2026-09-27T01:00:01Z") => ({ t
 const output = (uuid: string, text: string, at = "2026-09-27T01:00:02Z") => ({ type: "user", uuid, timestamp: at, message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: text }] } });
 const key = (sessionId: string) =>({ projectKey: "-work", sessionId });
 
-describe("indexing the store's entries", { skip }, () => {
+describe("indexing the store's entries", () => {
   test("each distinct text is one passage, with an occurrence wherever it is written", async () => {
     const { schema, store, q, indexAll } = await makeSearch();
     await store.append(key("a"), [prompt("u1", "where are the transcripts kept?"), answer("a1", "In Neon.")]);
@@ -121,7 +118,7 @@ describe("indexing the store's entries", { skip }, () => {
   });
 });
 
-describe("searching", { skip }, () => {
+describe("searching", () => {
   test("finds passages by their words, stemmed for prose, and by trigrams for typos and substrings", async () => {
     const { store, q, indexAll } = await makeSearch();
     await store.append(key("a"), [
@@ -164,7 +161,7 @@ describe("searching", { skip }, () => {
   });
 });
 
-describe("the indexer", { skip }, () => {
+describe("the indexer", () => {
   test("indexes what is appended while it runs, and stops when its scope closes", async () => {
     const { schema, store, q } = await makeSearch();
     const scope = Effect.runSync(Scope.make());

@@ -11,11 +11,9 @@ import pg from "pg";
 
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { adoptTranscripts, ensureLocalTranscript } from "../src/harness/claude/transcripts.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
-const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
-
-// Set by the first hook unless every test that uses them is skipped.
+// Set by the first hook.
 let database: TestPostgres | undefined;
 let pool: pg.Pool;
 // Each case's Claude home, made before it.
@@ -24,7 +22,6 @@ let previousHome: string | undefined;
 let schemas = 0;
 
 before(async () => {
-  if (skip) return;
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 4 });
 });
@@ -72,7 +69,7 @@ function writeLocal(
   return { projectKey, main: join(projectDir, `${sessionId}.jsonl`) };
 }
 
-describe("claude transcripts against the store", { skip }, () => {
+describe("claude transcripts against the store", () => {
   test("a transcript missing locally is written back whole, subagents and their metadata beside it", async () => {
     const store = await makeStore();
     const sessionId = randomUUID();

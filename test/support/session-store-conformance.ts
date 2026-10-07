@@ -5,16 +5,12 @@
  * fresh, empty store for each case.
  */
 import assert from "node:assert/strict";
-import { describe, test, type TestOptions } from "node:test";
+import { describe, test } from "node:test";
 
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 
 /** The store as the suite exercises it: the SDK's optional methods it checks are all there. */
 export type ConformingSessionStore = Required<Pick<SessionStore, "append" | "load" | "listSessions" | "delete" | "listSubkeys">>;
-
-export interface SessionStoreConformanceOptions {
-  readonly skip?: TestOptions["skip"];
-}
 
 export const KEY: SessionKey = { projectKey: "proj", sessionId: "sess" };
 export const E = (type: string, extra: Record<string, unknown> = {}): SessionStoreEntry => ({ type, ...extra });
@@ -30,11 +26,8 @@ function canon(value: unknown): string {
 
 export const expectEntries = (actual: unknown, expected: unknown): void => assert.equal(canon(actual), canon(expected));
 
-export function sessionStoreConformance(
-  makeStore: () => Promise<ConformingSessionStore>,
-  { skip = false }: SessionStoreConformanceOptions = {},
-): void {
-  describe("SessionStore conformance", { skip }, () => {
+export function sessionStoreConformance(makeStore: () => Promise<ConformingSessionStore>): void {
+  describe("SessionStore conformance", () => {
     test("append then load returns same entries in same order", async () => {
       const store = await makeStore();
       const entries = [E("a", { n: 1, nested: { x: [1, 2] } }), E("b", { n: 2 })];

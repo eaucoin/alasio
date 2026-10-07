@@ -9,9 +9,7 @@ import { TestClock } from "effect/testing";
 import pg from "pg";
 
 import { Neon, type NeonError } from "../src/neon/connect.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
-
-const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 /** Neon as alasio connects to it, with `env` for its environment and its log lines kept in `lines`. */
 function connecting<A, E>(
@@ -57,8 +55,8 @@ test("a Neon that does not answer is waited for ten minutes, saying why once a m
   for (const line of lines) assert.match(line, /^waiting for Neon: connect ECONNREFUSED 127\.0\.0\.1:1$/);
 });
 
-describe("Neon, answering", { skip }, () => {
-  // Set by the first hook, which runs unless the suite is skipped.
+describe("Neon, answering", () => {
+  // Set by the first hook.
   let database: TestPostgres | undefined;
   let admin: pg.Pool;
   let secrets: string | undefined;

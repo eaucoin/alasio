@@ -9,12 +9,10 @@ import { forkSession, getSessionMessages, importSessionToStore, listSessions } f
 import pg from "pg";
 
 import { NeonSessionStore, docOf, mirrorOnly } from "../src/harness/claude/session-store.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 import { E, KEY, expectEntries, sessionStoreConformance } from "./support/session-store-conformance.ts";
 
-const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
-
-// Set by the first hook unless every test that uses them is skipped.
+// Set by the first hook.
 let database: TestPostgres | undefined;
 let pool: pg.Pool;
 let schemas = 0;
@@ -27,7 +25,6 @@ async function makeStore(): Promise<NeonSessionStore> {
 }
 
 before(async () => {
-  if (skip) return;
   database = await startPostgres();
   pool = new pg.Pool({ connectionString: database.url, max: 4 });
 });
@@ -37,7 +34,7 @@ after(async () => {
   await database?.stop();
 });
 
-sessionStoreConformance(makeStore, { skip });
+sessionStoreConformance(makeStore);
 
 test("an entry's doc replaces only what jsonb cannot hold, in keys and values alike", () => {
   const half = "😀".slice(0, 1);
@@ -47,7 +44,7 @@ test("an entry's doc replaces only what jsonb cannot hold, in keys and values al
   );
 });
 
-describe("alasio's session store", { skip }, () => {
+describe("alasio's session store", () => {
   test("an entry re-delivered after a retried append is kept once; entries without a uuid are kept as appended", async () => {
     const store = await makeStore();
     await store.append(KEY, [E("user", { uuid: "u1" }), E("summary")]);
@@ -160,7 +157,7 @@ describe("alasio's session store", { skip }, () => {
   });
 });
 
-describe("the SDK's session helpers on the store", { skip }, () => {
+describe("the SDK's session helpers on the store", () => {
   let home: string;
   let previousHome: string | undefined;
 

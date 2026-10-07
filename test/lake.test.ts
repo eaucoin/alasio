@@ -31,16 +31,15 @@ import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lak
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { ensureLakeRole, LAKE_ROLE, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // The lake loads alasio's Neon into DuckLake. Here its source is a throwaway Postgres
 // written through alasio's own stores, its catalog a database there owned by the lake's
 // role, and its files a local directory; DuckDB is the real one the lake runs.
 
-const skip = !dockerAvailable() && "needs Docker";
 const LAKE_PASSWORD = "lake-test-password";
 
-// Set by the first hook unless every test that uses them is skipped.
+// Set by the first hook.
 let postgres: TestPostgres | undefined;
 let admin: pg.Pool; // the source database, as its owner (alasio)
 let store: NeonSessionStore;
@@ -49,7 +48,6 @@ let dataDir: string | undefined;
 let config: LakeConfig;
 
 before(async () => {
-  if (skip) return;
   postgres = await startPostgres();
   const server = new pg.Client({ connectionString: postgres.url });
   await server.connect();
@@ -175,7 +173,7 @@ type ClaudeToolCallRow = Nullable<{
   answered_at: Date;
 }>;
 
-describe("Claude Code transcripts", { skip }, () => {
+describe("Claude Code transcripts", () => {
   test("every entry is loaded with its fields typed and its whole kept", async () => {
     await store.append(KEY, TRANSCRIPT);
     await store.append(SUBAGENT, [{ type: "user", uuid: "s1", timestamp: at(4), isSidechain: true, message: { role: "user", content: "subtask" } }]);
@@ -345,7 +343,7 @@ type CodexTokenUsageRow = Nullable<{ response_id: string; input_tokens: bigint; 
 /** A row of lake.codex.tool_calls, as far as these tests read it. */
 type CodexToolCallRow = Nullable<{ name: string; kind: string; input: string; output: string; turn_id: string }>;
 
-describe("Codex rollouts", { skip }, () => {
+describe("Codex rollouts", () => {
   const NAME = "rollout-2026-10-01T12-00-00-thread-1.jsonl";
   const whole = Buffer.from(ROLLOUT_LINES.join(""));
 
@@ -442,7 +440,7 @@ async function openForIntake() {
 const post = (base: string, path: string, body: Uint8Array | string, headers: Record<string, string>) =>
   fetch(`${base}${path}`, { method: "POST", headers, body });
 
-describe("telemetry", { skip }, () => {
+describe("telemetry", () => {
   test("the intake writes each request it takes, at once queryable from another DuckDB, and refuses what is not OTLP", async () => {
     const spans = new InMemorySpanExporter();
     const tracer = new BasicTracerProvider({ resource: resourceFromAttributes({ "service.name": "intake-test" }), spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("t");
@@ -573,7 +571,7 @@ test("the lake loads the extension builds its image pins", async () => {
 
 // --- The lake as a whole -------------------------------------------------------------
 
-describe("the lake", { skip }, () => {
+describe("the lake", () => {
   test("a lake of another model version is rebuilt empty, and one of this version kept", async () => {
     const lake = await openLake(config);
     try {

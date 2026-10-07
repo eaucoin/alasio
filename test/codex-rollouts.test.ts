@@ -13,9 +13,7 @@ import { type CodexRolloutsOptions, type KeptCodexRollouts, makeCodexRollouts } 
 import { type KnownRollouts, mirrorRollout } from "../src/codex/rollouts/mirror.ts";
 import { restoreRollouts, type RestoreRolloutsOptions } from "../src/codex/rollouts/restore.ts";
 import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
-import { dockerAvailable, startPostgres, type TestPostgres } from "./support/postgres.ts";
-
-const skip = !dockerAvailable() && "needs Docker for a throwaway Postgres";
+import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 const THREAD_A = "01a0cadd-b753-7d42-84a0-15a98e372686";
 const THREAD_B = "01a0e957-a6ff-7691-8d31-ed8d7315fa68";
@@ -61,8 +59,8 @@ test("rollout files are found under sessions and archived_sessions, compressed o
   }
 });
 
-describe("the rollout store", { skip }, () => {
-  // Set by the first hook, which runs unless the suite is skipped.
+describe("the rollout store", () => {
+  // Set by the first hook.
   let database: TestPostgres | undefined;
   let pool: pg.Pool;
   let schemas = 0;

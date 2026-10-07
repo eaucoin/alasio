@@ -26,12 +26,10 @@ import { NeonRolloutStore } from "../src/codex/rollouts/store.ts";
 import { type SessionListingScope, createCodexSessionApi } from "../src/codex/sessions.ts";
 import type { CodexThreadConfig } from "../src/codex/thread-config.ts";
 import { agentMessage, codexThread, codexTurn, userMessage } from "./support/codex-protocol.ts";
-import { type TestPostgres, dockerAvailable, startPostgres } from "./support/postgres.ts";
+import { type TestPostgres, startPostgres } from "./support/postgres.ts";
 
 const CODEX_BIN = new URL("../node_modules/.bin/codex", import.meta.url).pathname;
-const skip = !existsSync(CODEX_BIN)
-  ? "needs the Codex binary alasio installs"
-  : !dockerAvailable() && "needs Docker for a throwaway Postgres";
+const skip = !existsSync(CODEX_BIN) && "needs the Codex binary alasio installs";
 
 /** An event the Responses API streams: its type, and what it carries. */
 interface ResponsesEvent {
