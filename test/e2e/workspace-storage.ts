@@ -1,4 +1,5 @@
 /**
+/**
  * Workspaces on JuiceFS as alasio installs it: a session's workspace a directory of the
  * file system, made by JuiceFS's CSI driver, doing in gVisor what tools ask of a file
  * system within the claim's size; its files kept through the session suspended, Valkey
@@ -8,15 +9,14 @@
  * with it; and the file system's metadata dumped, backed up nightly, and restored from
  * the backup with the same files.
  *
- * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
- * workspaceStorage() once its sessions are made: it works on the session with no internet
- * and, on several nodes, the one with internet.
+ * The end-to-end run's workspaces shard (test/e2e/alasio.test.ts), registered with
+ * workspaceStorage(): it makes its sessions as alasio does, one with no internet, which
+ * it works on, and one with internet.
  */
 import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
 
 import type {
-  KubernetesObject,
   V1CronJob,
   V1Deployment,
   V1Job,
@@ -35,6 +35,7 @@ import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/w
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
 import type { BroughtUp } from "./session-bring-up.ts";
+import type { Made } from "./session-volumes.ts";
 
 /** Where the installation's JuiceFS driver runs, and makes its mount pods: its default namespace. */
 const DRIVER_NAMESPACE = "kube-system";
@@ -175,13 +176,8 @@ const bringUp = (volumeId: string, ...where: string[]) => inAlasio<BroughtUp>(".
 
 const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
 
-/** The newest session the run made with `netMode`. */
-async function sessionOf(netMode: NetMode): Promise<string> {
-  const sandboxes = await kube.list<KubernetesObject>("Sandbox", { namespace: SESSIONS, labelSelector: selectorOf({ "alasio.dev/workload": "session", "alasio.dev/net-mode": netMode }) });
-  const newest = [...sandboxes].sort((a, b) => new Date(b.metadata?.creationTimestamp ?? 0).getTime() - new Date(a.metadata?.creationTimestamp ?? 0).getTime())[0];
-  assert.ok(newest?.metadata?.name, `the run made no session with ${netMode} internet`);
-  return newest.metadata.name;
-}
+/** Makes the session `volumeId` with `netMode` as alasio does (./session-volumes.ts). */
+const create = (volumeId: string, netMode: NetMode) => inAlasio<Made>("./session-volumes.ts", "create", volumeId, netMode);
 
 /** The session's pod, which runs. */
 async function podOf(volumeId: string): Promise<V1Pod> {
@@ -329,12 +325,13 @@ function dumpedAt(dump: string): number {
 /** Registers the suite, which runs once the end-to-end run has made its sessions. */
 export function workspaceStorage(): void {
   describe("workspaces on JuiceFS", () => {
-    let none: string;
+    const sessions: Record<NetMode, string> = { none: "fs-e2e-none", full: "fs-e2e-full" };
+    const none = sessions.none;
     let fixture: string;
     let fixtureWrittenAt: number;
 
     before(async () => {
-      none = await sessionOf("none");
+      for (const netMode of ["none", "full"] as const) assert.deepEqual(await create(sessions[netMode], netMode), { volumeId: sessions[netMode], netMode });
       fixture = (await inWorkspaceOk(none, [
         "set -e",
         `mkdir -p ${FIXTURE} && cd ${FIXTURE}`,
@@ -388,7 +385,7 @@ export function workspaceStorage(): void {
         kube.secret(NAMESPACE, WORKSPACES_CREDENTIALS, "secret-key"),
       ]);
       for (const netMode of ["none", "full"] as const) {
-        const session = await sessionOf(netMode);
+        const session = sessions[netMode];
         for (const [address, port] of addresses) {
           assert.equal((await inSession(session, tcp(JSON.stringify(address), port))).trim(), "blocked", `${netMode}: ${address}:${port}`);
         }
@@ -504,7 +501,7 @@ export function workspaceStorage(): void {
     });
 
     test("a workspace moves to another node with its files, as a JuiceFS volume is no node's", { skip: AGENTS < 2 && "the run has one node" }, async () => {
-      const full = await sessionOf("full");
+      const full = sessions.full;
       const written = (await inWorkspaceOk(full, `mkdir -p ${WORKDIR} && head -c 1048576 /dev/urandom > ${WORKDIR}/moving && sha256sum < ${WORKDIR}/moving`)).trim();
       const node = (await podOf(full)).spec?.nodeName ?? "";
       await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
@@ -520,7 +517,7 @@ export function workspaceStorage(): void {
     test("the daily quota check checks each workspace's quota", async () => {
       const said = await runJob(componentName("juicefs-quota-check"));
       for (const netMode of ["none", "full"] as const) {
-        const directory = await directoryOf(await sessionOf(netMode));
+        const directory = await directoryOf(sessions[netMode]);
         assert.match(said, new RegExp(`quota of /${directory} is consistent|/${directory}: quota\\(`, "u"), directory);
       }
     });

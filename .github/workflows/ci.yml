@@ -108,12 +108,13 @@ jobs:
         # for one shard, as a server often is, and without a firewall for the others.
         target: [docker]
         agents: [0, 2]
-        # The suites, in three shards that need nothing of each other's, each on a cluster
-        # of its own: alasio on Kubernetes and workspaces on JuiceFS, Neon, and alasio's
-        # telemetry (test/e2e/harness.ts).
-        shard: [sessions, neon, telemetry]
+        # The suites, in shards that need nothing of each other's, each on a cluster of its
+        # own: alasio on Kubernetes, workspaces on JuiceFS, Neon, and alasio's telemetry
+        # (test/e2e/harness.ts).
+        shard: [sessions, workspaces, neon, telemetry]
         include:
           - { target: host, agents: 0, shard: sessions, firewall: ufw }
+          - { target: host, agents: 0, shard: workspaces }
           - { target: host, agents: 0, shard: neon }
           - { target: host, agents: 0, shard: telemetry }
     steps:

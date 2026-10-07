@@ -263,9 +263,9 @@ if (inShard("sessions")) {
       assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
     });
   });
-
-  workspaceStorage();
 }
+
+if (inShard("workspaces")) workspaceStorage();
 
 /** How many rows of the lake's `otel` metric tables `condition` selects, as SQL. */
 const metricRows = (condition: string) =>

@@ -81,7 +81,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "neon", "telemetry"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, every suite, when it is unset or empty. */
@@ -94,10 +94,10 @@ export function shardOf(value: string | undefined): Shard | undefined {
 
 /**
  * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
- * Kubernetes and workspaces on JuiceFS, which works on the sessions the other made,
- * `neon`, alasio's Neon, which needs neither, or `telemetry`, where alasio's telemetry
- * goes, on a session of its own; every suite unless set. Each shard runs the command
- * line's suite, and uninstall's, as well.
+ * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
+ * alasio's Neon; or `telemetry`, where alasio's telemetry goes, on a session of its own;
+ * every suite unless set. Each shard runs the command line's suite, and uninstall's, as
+ * well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
