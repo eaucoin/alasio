@@ -18,6 +18,7 @@ import type { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { Harnesses } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
+import { Mounts } from "../operator/mounts.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
@@ -212,6 +213,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
     Effect.catch((error) => Effect.logWarning(`Failed to configure Telegram native commands: ${error.message}`)),
   );
   yield* turns.reconcilePersistentState;
+  // Before anything can make another, the session filesystems a crash left unmade go.
+  yield* Effect.flatMap(Mounts, (mounts) => mounts.reconcileSessionWorkspaces);
   yield* turns.flushCompletedResponses;
   yield* mediaGroups.flushDue;
   if (config.sessionStore) {

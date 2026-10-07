@@ -769,13 +769,16 @@ test("the Job that clones a volume is the installation's, told which claim to cl
 test("a fork is made suspended, its claim bound, then cloned from its source, suspended meanwhile and resumed after, with its internet", async () => {
   const kube = fakeKube();
   const cluster = forkCluster(kube, [["alasio-sessions", "fs-abc123"], ["alasio-sessions", "fs-def456"]], "Complete");
-  const forked = await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
+  const { forked, forks } = await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
     const sessions = yield* SessionSandboxes;
     yield* sessions.volumes.create("fs-abc123", "full");
     kube.calls.length = 0;
-    return yield* sessions.volumes.fork("fs-abc123", "fs-def456");
+    const forked = yield* sessions.volumes.fork("fs-abc123", "fs-def456");
+    return { forked, forks: yield* sessions.volumes.forks };
   })).finally(cluster.stop);
   assert.deepEqual(forked, { volumeId: "fs-def456", netMode: "full" });
+  // The fork's Sandbox, and only it, says it is a fork, and of what.
+  assert.deepEqual(forks, ["fs-def456"]);
   // As the clone ran: the source suspended, its pod ended; the fork suspended, never
   // having had a pod, on its bound claim.
   assert.deepEqual(cluster.clones, [{
@@ -795,7 +798,10 @@ test("a fork is made suspended, its claim bound, then cloned from its source, su
   const fork = kube.peek("Sandbox", "alasio-sessions", "fs-def456");
   assert.equal(fork?.metadata.labels?.["alasio.dev/net-mode"], "full");
   assert.equal(fork?.spec?.operatingMode, "Suspended");
-  assert.deepEqual(fork?.metadata.annotations, sessionSandboxManifest({ volumeId: "fs-def456", netMode: "full", profile: profile(), telemetry: null }).metadata.annotations);
+  assert.deepEqual(fork?.metadata.annotations, {
+    ...sessionSandboxManifest({ volumeId: "fs-def456", netMode: "full", profile: profile(), telemetry: null }).metadata.annotations,
+    "alasio.dev/forked-from": "fs-abc123",
+  });
   // The fork made before the clone, the source suspended and resumed around it, and the Job deleted after it.
   const job = kube.calls.find(([verb, kind]) => verb === "create" && kind === "Job")?.[2];
   assert.match(String(job), /^alasio-workspace-clone-/u);

@@ -28,6 +28,7 @@ import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type Prompt
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
 import { ensureSchema } from "./schema.ts";
+import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
 import { poolDatabase, type Sql, type StoreError } from "./sql.ts";
 import { NeonStateRepository } from "./state-repository.ts";
 import {
@@ -78,6 +79,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   restarts: new NeonRestartRepository(sql, schema),
   usage: new NeonUsageRepository(sql, schema),
   codexLogin: new NeonCodexLoginRepository(sql, schema),
+  sessionWorkspaces: new NeonSessionWorkspaceRepository(sql, schema),
 });
 
 /** What alasio does with its store; each of it fails as Neon does. */
@@ -108,6 +110,14 @@ export class Store extends Context.Service<Store, {
   readonly clearModelChoice: (conversationId: string, harness: HarnessName) => Stored<void>;
   /** Sets the session of the conversation's mounted harness. */
   readonly setSessionId: (conversationId: string, sessionId: string | null) => Stored<void>;
+
+  /** Records a session filesystem before it is made, not yet made. */
+  readonly recordSessionWorkspace: (workspace: NewSessionWorkspace) => Stored<void>;
+  /** Marks a session filesystem made, with the internet it was made with. */
+  readonly markSessionWorkspaceMade: (volumeId: string, netMode: SessionWorkspaceNetMode) => Stored<void>;
+  readonly forgetSessionWorkspace: (volumeId: string) => Stored<void>;
+  /** Every session filesystem recorded, made or not, newest first. */
+  readonly listSessionWorkspaces: Stored<SessionWorkspace[]>;
 
   /** Buttons' actions in the conversation, kept until pressed, which remember what it has mounted now: their ids, in order. */
   readonly createCallbackActions: (conversationId: string, actions: readonly NewCallbackAction[]) => Stored<string[]>;
@@ -201,7 +211,7 @@ export class Store extends Context.Service<Store, {
 const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null }: StoreOptions) {
   const database = poolDatabase(pool);
   yield* ensureSchema(database, schema);
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin } = repositories(
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces } = repositories(
     database,
     schema,
     workingDirectory,
@@ -225,6 +235,11 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     setModelChoice: (conversationId, harness, choice) => conversations.setModelChoice(conversationId, harness, choice),
     clearModelChoice: (conversationId, harness) => conversations.clearModelChoice(conversationId, harness),
     setSessionId: (conversationId, sessionId) => conversations.setSessionId(conversationId, sessionId),
+
+    recordSessionWorkspace: (workspace) => sessionWorkspaces.record(workspace),
+    markSessionWorkspaceMade: (volumeId, netMode) => sessionWorkspaces.markMade(volumeId, netMode),
+    forgetSessionWorkspace: (volumeId) => sessionWorkspaces.forget(volumeId),
+    listSessionWorkspaces: sessionWorkspaces.list(),
 
     createCallbackActions: (conversationId, actions) => callbacks.createCallbackActions(conversationId, actions),
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),

@@ -53,6 +53,18 @@ create table if not exists ${SCHEMA}.workspace_sessions (
   primary key (conversation_id, harness, working_directory)
 );
 
+-- The session filesystems alasio made, and those it is making: a fork is recorded before
+-- its Sandbox is made, and made only once it is cloned, so one a crash cut short is known.
+create table if not exists ${SCHEMA}.session_workspaces (
+  volume_id text primary key,
+  -- the session filesystem it is a fork of; null for one made empty
+  forked_from text,
+  -- both null while it is made
+  net_mode text,
+  made_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists ${SCHEMA}.telegram_updates (
   update_id bigint primary key,
   payload json not null,

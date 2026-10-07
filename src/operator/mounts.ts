@@ -2,6 +2,11 @@
  * What is mounted on a conversation, as the operator changes it: the service its turns
  * run on, and the folder or session filesystem they work in. A change is refused while a
  * turn runs in the conversation, or while prompts wait for what it would leave.
+ *
+ * The session filesystems alasio makes, empty or forked from another, are recorded in
+ * its store before they are made and marked made once they are whole, which is what
+ * lists them for the operator to switch to. One a failure or a crash left unmade is
+ * deleted, at once or as alasio next starts.
  */
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
@@ -11,10 +16,10 @@ import { harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
-import { type NetMode, type SessionError, SessionSandboxes } from "../sandbox/index.ts";
-import { newVolumeId } from "../sandbox/names.ts";
+import { type NetMode, type SessionError, type SessionForkError, SessionSandboxes } from "../sandbox/index.ts";
+import { isValidVolumeId, newVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
-import { sessionFsWorkspace } from "../workspace/kind.ts";
+import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../workspace/kind.ts";
 import { createWorkspace, resolveWorkspacePath } from "../workspace/policy.ts";
 
 /** The outcome of mounting a service on a conversation. */
@@ -33,6 +38,8 @@ export interface WorkspaceChange {
   readonly switched: boolean;
   /** Set when the folder was newly created. */
   readonly created?: boolean | undefined;
+  /** The session filesystem the one mounted is a fork of, when it was forked just now. */
+  readonly forkedFrom?: string | undefined;
   readonly previous: string | null;
   readonly workingDirectory: string;
 }
@@ -52,7 +59,7 @@ export class WorkspaceFolderError extends Schema.TaggedError<WorkspaceFolderErro
 }
 
 /** How changing a conversation's folder fails. */
-export type WorkspaceChangeError = MountRefused | WorkspaceFolderError | SessionError;
+export type WorkspaceChangeError = MountRefused | WorkspaceFolderError | SessionError | SessionForkError;
 
 /** The scope these lines have always been logged in, kept for whatever reads alasio's logs. */
 const LOG_SCOPE = "codex-turn-controller";
@@ -78,6 +85,18 @@ export class Mounts extends Context.Service<Mounts, {
    * and restores like any other workspace; its sandbox comes up when a turn needs it.
    */
   readonly createSessionWorkspace: (conversationId: string, netMode: NetMode) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
+  /**
+   * Forks the session filesystem mounted on the conversation (src/sandbox/index.ts) and
+   * mounts the fork, with no session of its own yet. Refused for a folder, and while a
+   * turn runs in the conversation or prompts wait in it, as the source is suspended while
+   * it is cloned.
+   */
+  readonly forkSessionWorkspace: (conversationId: string) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | SessionForkError | StoreError>;
+  /**
+   * Deletes the session filesystems a failure or a crash left unmade: those recorded but
+   * not made, and forks' Sandboxes no record made. As alasio starts, before any is made.
+   */
+  readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
   static readonly layer = ({ workspaceRoot }: Pick<AlasioConfig, "workspaceRoot">): Layer.Layer<Mounts, never, Store | ActiveTurns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot));
@@ -88,15 +107,38 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
   const activeTurns = yield* ActiveTurns;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
 
-  /** Refuses a change while a turn runs in the conversation or prompts wait for its service. */
-  const unblocked = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, MountRefused | StoreError> {
+  /** Refuses a change while a turn runs in the conversation or prompts wait for its service; `doing` is the change, as the operator is told. */
+  const unblocked = Effect.fnUntraced(function*(conversationId: string, doing = "switching services"): Effect.fn.Return<void, MountRefused | StoreError> {
     if (yield* activeTurns.isBusy(conversationId)) {
       const mount = yield* store.getMount(conversationId);
-      return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before switching services.` });
+      return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before ${doing}.` });
     }
     if (yield* store.hasOpenPromptJobs(conversationId)) {
-      return yield* new MountRefused({ message: "Queued prompts are still waiting for the current service. Let them finish or discard them before switching." });
+      return yield* new MountRefused({ message: `Queued prompts are still waiting for the current service. Let them finish or discard them before ${doing}.` });
     }
+  });
+
+  /** Deletes the session filesystem `volumeId`, and its record once it is gone. */
+  const discard = (volumeId: string): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      if (sandbox) yield* sandbox.volumes.destroy(volumeId);
+      yield* store.forgetSessionWorkspace(volumeId);
+      yield* Effect.logInfo(`workspace.discarded.sessionfs volume=${volumeId}`);
+    }).pipe(Effect.catch((error) => Effect.logWarning(`could not delete the unmade session filesystem ${volumeId}, which alasio deletes as it next starts: ${error.message}`)));
+
+  /** `make`, a session filesystem's making, recorded before and marked made after; one that fails is discarded. */
+  const recorded = <E>(volumeId: string, forkedFrom: string | null, make: Effect.Effect<{ readonly netMode: NetMode }, E>): Effect.Effect<void, E | StoreError> =>
+    store.recordSessionWorkspace({ volumeId, forkedFrom }).pipe(
+      Effect.andThen(make.pipe(Effect.onError(() => discard(volumeId)))),
+      Effect.flatMap(({ netMode }) => store.markSessionWorkspaceMade(volumeId, netMode)),
+    );
+
+  /** The session filesystem `target` names, `sessionfs:<volumeId>`, which alasio made. */
+  const sessionWorkspace = Effect.fnUntraced(function*(target: string): Effect.fn.Return<string, MountRefused | StoreError> {
+    const volumeId = target.trim().slice("sessionfs:".length);
+    const made = (yield* store.listSessionWorkspaces).some((workspace) => workspace.volumeId === volumeId && workspace.madeAt !== null);
+    if (!sandbox || !isValidVolumeId(volumeId) || !made) return yield* new MountRefused({ message: `There is no session workspace ${volumeId}.` });
+    return sessionFsWorkspace(volumeId);
   });
 
   /** Mounts `workingDirectory`, created just now, on the conversation. */
@@ -126,7 +168,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
       return { switched: true, previous, next: harness, sessionId: after.sessionId, workingDirectory: after.workingDirectory };
     }, withLogScope(LOG_SCOPE)),
     switchWorkspace: Effect.fnUntraced(function*(conversationId, target) {
-      const workingDirectory = yield* folder(() => resolveWorkspacePath({ root: workspaceRoot, candidate: target }));
+      const workingDirectory = yield* (isSessionFs(target.trim()) ? sessionWorkspace(target) : folder(() => resolveWorkspacePath({ root: workspaceRoot, candidate: target })));
       const previous = (yield* store.getMount(conversationId)).workingDirectory;
       if (previous === workingDirectory) {
         return { switched: false, previous, workingDirectory };
@@ -147,12 +189,41 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
       }
       yield* unblocked(conversationId);
       const volumeId = newVolumeId();
-      yield* sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none");
+      yield* recorded(volumeId, null, sandbox.volumes.create(volumeId, netMode === "full" ? "full" : "none"));
       return yield* mountCreated(
         conversationId,
         sessionFsWorkspace(volumeId),
         `workspace.created.sessionfs conversation=${JSON.stringify(conversationId)} volume=${volumeId} net=${netMode}`,
       );
     }, withLogScope(LOG_SCOPE)),
+    forkSessionWorkspace: Effect.fnUntraced(function*(conversationId) {
+      if (!sandbox) {
+        return yield* new MountRefused({ message: "Session filesystems are not enabled on this deployment." });
+      }
+      const source = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
+      if (source?.kind !== "sessionfs") {
+        return yield* new MountRefused({ message: "Only a session workspace can be forked: a folder's files are the host's, which are not copied on write." });
+      }
+      yield* unblocked(conversationId, "forking its workspace");
+      const volumeId = newVolumeId();
+      yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
+      const change = yield* mountCreated(
+        conversationId,
+        sessionFsWorkspace(volumeId),
+        `workspace.forked.sessionfs conversation=${JSON.stringify(conversationId)} volume=${volumeId} from=${source.volumeId}`,
+      );
+      return { ...change, forkedFrom: source.volumeId };
+    }, withLogScope(LOG_SCOPE)),
+    reconcileSessionWorkspaces: Effect.gen(function*() {
+      if (!sandbox) return;
+      const workspaces = yield* store.listSessionWorkspaces;
+      const unmade = workspaces.filter(({ madeAt }) => madeAt === null).map(({ volumeId }) => volumeId);
+      const made = new Set(workspaces.filter(({ madeAt }) => madeAt !== null).map(({ volumeId }) => volumeId));
+      const forks = yield* sandbox.volumes.forks.pipe(
+        Effect.catch((error) => Effect.logWarning(`could not list the forks' Sandboxes: ${error.message}`).pipe(Effect.as([]))),
+      );
+      const orphans = forks.filter((volumeId) => !made.has(volumeId) && !unmade.includes(volumeId));
+      for (const volumeId of [...unmade, ...orphans]) yield* discard(volumeId);
+    }).pipe(withLogScope(LOG_SCOPE)),
   });
 });

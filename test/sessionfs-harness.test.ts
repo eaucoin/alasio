@@ -34,7 +34,7 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
   const unused = () => assert.fail("a harness only finds a session's directory and starts its host");
   return {
     ensured,
-    volumes: { create: unused, fork: unused, destroy: unused },
+    volumes: { create: unused, fork: unused, destroy: unused, forks: Effect.sync(unused) },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
     ensureSession: (volumeId) =>
       Effect.sync(() => {

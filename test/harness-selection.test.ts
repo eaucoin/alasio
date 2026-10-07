@@ -143,6 +143,7 @@ const unusedSandbox: SessionSandboxes["Service"] = {
     create: () => Effect.die(new Error("no volume is made")),
     fork: () => Effect.die(new Error("no volume is forked")),
     destroy: () => Effect.die(new Error("no volume is destroyed")),
+    forks: Effect.die(new Error("no fork is listed")),
   },
   harnessDirectory: () => assert.fail("harnessDirectory"),
   ensureSession: () => Effect.die(new Error("no session is ensured")),

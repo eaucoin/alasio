@@ -78,6 +78,8 @@ export interface SessionSandboxManifestOptions {
   readonly namespace?: string;
   /** Whether it is made running, as it is unless told, or suspended. */
   readonly operatingMode?: SandboxOperatingMode;
+  /** The session it is a fork of, which its Sandbox records, for a fork. */
+  readonly forkedFrom?: string | undefined;
 }
 
 /** A volume claim, by its namespace and name. */
@@ -173,6 +175,8 @@ const ofPod = (pod: V1Pod) => (target: string): boolean => target.includes(`/pod
 
 const NET_MODE_LABEL = "alasio.dev/net-mode";
 const WORKLOAD_LABEL = "alasio.dev/workload";
+/** The annotation of a fork's Sandbox that names the session it was forked from. */
+const FORKED_FROM_ANNOTATION = "alasio.dev/forked-from";
 const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
 // The token's environment variable in bayma's container, which the OTLP headers expand.
 const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";
@@ -212,6 +216,7 @@ export function sessionSandboxManifest({
   telemetry,
   namespace = profile.namespace,
   operatingMode,
+  forkedFrom,
 }: SessionSandboxManifestOptions): Sandbox {
   const full = netMode === "full";
   return sandboxManifest({
@@ -220,6 +225,7 @@ export function sessionSandboxManifest({
     template: profile,
     labels: { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: full ? "full" : "none" },
     ...(operatingMode === undefined ? {} : { operatingMode }),
+    ...(forkedFrom === undefined ? {} : { annotations: { [FORKED_FROM_ANNOTATION]: forkedFrom } }),
     configure(spec, bayma) {
       if (telemetry) {
         bayma.env = [
@@ -302,6 +308,8 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
       namespace?: string,
     ) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError>;
     readonly destroy: (volumeId: string) => Effect.Effect<void, KubeApiError>;
+    /** The sessions that are forks, made or not, as their Sandboxes say. */
+    readonly forks: Effect.Effect<readonly string[], KubeApiError>;
   };
   /**
    * The directory in alasio a session's harness runs in: empty, the session's own, and
@@ -565,7 +573,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     const source = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(sourceVolumeId))) as Sandbox | null;
     if (!source) return yield* new SessionForkError({ message: `there is no session ${sourceVolumeId} to fork` });
     const netMode: NetMode = source.metadata.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none";
-    const made = sessionSandboxManifest({ volumeId, netMode, profile, telemetry: yield* telemetry, namespace, operatingMode: "Suspended" });
+    const made = sessionSandboxManifest({ volumeId, netMode, profile, telemetry: yield* telemetry, namespace, operatingMode: "Suspended", forkedFrom: sourceVolumeId });
     yield* kube.create(made);
     const claimOf = (claimNamespace: string, sandbox: string): ClaimRef => ({ namespace: claimNamespace, name: claimName(clone.claimTemplate, sandbox) });
     const destination = claimOf(namespace, volumeId);
@@ -591,6 +599,9 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
         ),
       fork: (sourceVolumeId, volumeId, namespace = profile.namespace) => forking.withPermit(fork(sourceVolumeId, volumeId, namespace)).pipe(withLogScope("sandbox")),
       destroy: (volumeId) => Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))),
+      forks: kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, `${WORKLOAD_LABEL}=session`).pipe(
+        Effect.map((listed) => listed.filter(({ metadata }) => metadata?.annotations?.[FORKED_FROM_ANNOTATION] !== undefined).map(({ metadata }) => metadata?.name ?? "")),
+      ),
     },
 
     harnessDirectory: (volumeId) => {

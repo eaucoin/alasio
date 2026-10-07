@@ -136,7 +136,7 @@ export async function createWorkspace(
 
 export function workspaceLabel(path: string): string {
   if (typeof path === "string" && path.startsWith("sessionfs:")) {
-    return `empty workspace ${path.slice("sessionfs:".length)}`;
+    return `session workspace ${path.slice("sessionfs:".length)}`;
   }
   return basename(path) || path;
 }
