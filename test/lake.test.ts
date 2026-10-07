@@ -12,6 +12,7 @@ import pg from "pg";
 import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
 import { type LakeConfig, loadConfig } from "../neon/lake/src/config.ts";
+import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { LAKE, openLake, type Row, rows } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics } from "../neon/lake/src/metrics.ts";
@@ -406,6 +407,22 @@ describe("Codex rollouts", { skip }, () => {
       assert.deepEqual(await rows(db, `select home, count(*) as n from ${LAKE}.codex.lines group by home`), [{ home: "sessionfs", n: 7n }]);
     });
   });
+});
+
+test("the lake loads the extension builds its image pins", async () => {
+  const lake = await DuckDBInstance.create(":memory:");
+  const db = await lake.connect();
+  try {
+    for (const extension of Object.keys(EXTENSIONS)) {
+      await db.run(`install ${extension}`);
+      await db.run(`load ${extension}`);
+    }
+    const loaded = await rows<{ extension_name: string; extension_version: string }>(db, "select extension_name, extension_version from duckdb_extensions() where loaded and install_path <> '(BUILT-IN)' order by 1");
+    assert.deepEqual(Object.fromEntries(loaded.map(({ extension_name, extension_version }) => [extension_name, extension_version])), EXTENSIONS);
+  } finally {
+    db.closeSync();
+    lake.closeSync();
+  }
 });
 
 // --- The lake as a whole -------------------------------------------------------------

@@ -1,6 +1,7 @@
 /**
- * Installs the lake's DuckDB extensions into a directory, at image build time, and
- * loads each to prove it works, so the running lake never fetches one.
+ * Installs the lake's DuckDB extensions into a directory, at image build time, loads
+ * each to prove it works, and checks each is the build the lake pins, so the running
+ * lake never fetches one, nor runs one it was not tested with.
  *
  *   node install-extensions.ts <directory>
  */
@@ -15,7 +16,7 @@ if (!directory) {
 }
 const instance = await DuckDBInstance.create(":memory:", { extension_directory: directory });
 const db = await instance.connect();
-for (const extension of EXTENSIONS) {
+for (const extension of Object.keys(EXTENSIONS)) {
   await db.run(`install ${extension}`);
   await db.run(`load ${extension}`);
 }
@@ -23,3 +24,8 @@ const installed = (await db.runAndReadAll("select extension_name, extension_vers
 console.log(installed.map(({ extension_name, extension_version }) => `${extension_name} ${extension_version}`).join("\n"));
 db.closeSync();
 instance.closeSync();
+const unpinned = installed.filter(({ extension_name, extension_version }) => EXTENSIONS[String(extension_name)] !== extension_version);
+if (unpinned.length > 0) {
+  console.error(`not the builds pinned in extensions.ts: ${unpinned.map(({ extension_name, extension_version }) => `${extension_name} ${extension_version}`).join(", ")}`);
+  process.exit(1);
+}

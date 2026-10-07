@@ -73,7 +73,7 @@ export async function openLake(config: LakeConfig, { readOnly = false, source = 
     instance.closeSync();
   };
   try {
-    for (const extension of EXTENSIONS) {
+    for (const extension of Object.keys(EXTENSIONS)) {
       if (!config.extensionDirectory) await db.run(`install ${extension}`);
       await db.run(`load ${extension}`);
     }
