@@ -19,6 +19,7 @@ import type {
   V1DaemonSet,
   V1Deployment,
   V1Job,
+  V1LabelSelector,
   V1Namespace,
   V1PriorityClass,
   V1Role,
@@ -34,6 +35,63 @@ import { branchObjects } from "../src/manifests/branch.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
+/** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
+interface NetworkPolicyObject extends KubernetesObject {
+  readonly spec: {
+    readonly podSelector: V1LabelSelector;
+    readonly policyTypes?: readonly string[];
+    readonly ingress?: readonly { readonly from?: readonly Peer[]; readonly ports?: readonly { readonly port?: number | string }[] }[];
+  };
+}
+
+/** A peer of an ingress rule. */
+interface Peer {
+  readonly namespaceSelector?: V1LabelSelector;
+  readonly podSelector?: V1LabelSelector;
+  readonly ipBlock?: object;
+}
+
+/** A pod, as NetworkPolicies select it: by its labels, and its namespace's. */
+interface Pod {
+  readonly namespace: string;
+  readonly namespaceLabels: Readonly<Record<string, string>>;
+  readonly labels: Readonly<Record<string, string>>;
+}
+
+/** Whether `selector` selects what has `labels`. */
+function selects(selector: V1LabelSelector, labels: Readonly<Record<string, string>>): boolean {
+  return Object.entries(selector.matchLabels ?? {}).every(([key, value]) => labels[key] === value) &&
+    (selector.matchExpressions ?? []).every(({ key, operator, values = [] }) => {
+      const value = labels[key];
+      if (operator === "In") return value !== undefined && values.includes(value);
+      if (operator === "NotIn") return value === undefined || !values.includes(value);
+      if (operator === "Exists") return value !== undefined;
+      if (operator === "DoesNotExist") return value === undefined;
+      throw new Error(`no selector operator ${operator}`);
+    });
+}
+
+/**
+ * Whether `policies` let `from` connect to `to` on `port`, as Kubernetes reads them:
+ * anything, where none of them selects `to` for ingress; otherwise what a rule of one
+ * that does admits. An address block is taken to admit any pod, so none goes unseen.
+ */
+function admits(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean {
+  const selecting = policies.filter(({ metadata, spec }) =>
+    metadata?.namespace === to.namespace && (spec.policyTypes ?? ["Ingress"]).includes("Ingress") && selects(spec.podSelector, to.labels)
+  );
+  const peerAdmits = (peer: Peer, namespace: string) =>
+    peer.ipBlock !== undefined ||
+    ((peer.namespaceSelector ? selects(peer.namespaceSelector, from.namespaceLabels) : from.namespace === namespace) &&
+      (peer.podSelector ? selects(peer.podSelector, from.labels) : true));
+  return selecting.length === 0 || selecting.some(({ metadata, spec }) =>
+    (spec.ingress ?? []).some((rule) =>
+      (rule.ports === undefined || rule.ports.some((allowed) => allowed.port === undefined || allowed.port === port)) &&
+      (rule.from === undefined || rule.from.some((peer) => peerAdmits(peer, metadata?.namespace ?? "")))
+    )
+  );
+}
+
 function configOf(file: Record<string, unknown> = {}): InstallConfig {
   const { alasio, ...rest } = file;
   const decoded = decodeInstallConfig({ ...rest, alasio: { telegram: { existingSecret: "telegram" }, ...(alasio as object | undefined) } });
@@ -1179,6 +1237,33 @@ describe("branch environments", () => {
       ports: [{ protocol: "TCP", port: 4318 }],
     }]);
     assert.ok(policy("alasio-neon-compute", "alasio-branch-try"));
+  });
+
+  test("reach none of main's compute, alasio (but its fork of their sessions, from their alasio) or lake, as the policies of both admit them", () => {
+    const main = install();
+    const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
+    const namespaces = new Map(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name ?? "", metadata?.labels ?? {}]));
+    /** The pods of `objects`' Deployment `name`, as the cluster labels them and their namespace. */
+    const podOf = (objects: readonly KubernetesObject[], name: string, namespace: string): Pod => {
+      const deployment = all<V1Deployment>(objects, "Deployment").find(({ metadata }) => metadata?.name === name && metadata.namespace === namespace);
+      assert.ok(deployment, `${namespace}/${name}`);
+      return { namespace, namespaceLabels: { ...namespaces.get(namespace), "kubernetes.io/metadata.name": namespace }, labels: deployment.spec?.template.metadata?.labels ?? {} };
+    };
+    const branchPods = {
+      alasio: podOf(branch, "alasio", "alasio-branch-try"),
+      compute: podOf(branch, "alasio-neon-compute", "alasio-branch-try"),
+      lake: podOf(branch, "alasio-lake", "alasio-branch-try"),
+      session: { namespace: "alasio-branch-try-sessions", namespaceLabels: { ...namespaces.get("alasio-branch-try-sessions"), "kubernetes.io/metadata.name": "alasio-branch-try-sessions" }, labels: { "alasio.dev/workload": "session" } },
+    };
+    const targets: [string, Pod, number][] = [
+      ["main's compute", podOf(main, "alasio-neon-compute", "alasio"), 55433],
+      ...[4318, 4319].map((port): [string, Pod, number] => [`main's alasio on ${port}`, podOf(main, "alasio", "alasio"), port]),
+      ...[4318, 8090, 9464].map((port): [string, Pod, number] => [`main's lake on ${port}`, podOf(main, "alasio-lake", "alasio"), port]),
+    ];
+    const reached = Object.entries(branchPods).flatMap(([from, pod]) =>
+      targets.filter(([, target, port]) => admits(policies, pod, target, port)).map(([to]) => `${from} → ${to}`)
+    );
+    assert.deepEqual(reached, ["alasio → main's alasio on 4319"]);
   });
 
   test("are admitted by main to what they share of its storage alone, and to its fork of their sessions, which only main forks", () => {
