@@ -1,13 +1,15 @@
 /**
  * The lake service: the stack's container that keeps the analytics lake loaded from
- * alasio's Neon (model.ts). One loads at a time, which a Postgres advisory
- * lock on the catalog makes sure of; DuckDB keeps nothing of its own, so the
- * container is replaceable at any moment, and the loader opens its connections again
- * whenever they fail, as when the compute restarts.
+ * alasio's Neon (model.ts), and takes alasio's telemetry into it (intake.ts). One loads
+ * at a time, which a Postgres advisory lock on the catalog makes sure of; DuckDB keeps
+ * nothing of its own, so the container is replaceable at any moment, and the loader and
+ * the intake each open their connections again whenever they fail, as when the compute
+ * restarts.
  *
- * It serves /healthz (its pod's liveness: loads are not failing for long), /readyz
- * (its readiness: a load has succeeded, so the lake exists to be queried) and /metrics
- * (Prometheus, for the stack's telemetry collector) on LAKE_HTTP_PORT from the moment
+ * It serves /healthz (its pod's liveness: loads are not failing for long), /readyz (its
+ * readiness: the intake has the lake open, so telemetry can be taken and the lake
+ * queried) and /metrics (Prometheus, for the stack's telemetry collector) on
+ * LAKE_HTTP_PORT, and the intake, OTLP over HTTP, on LAKE_INTAKE_PORT, from the moment
  * it starts, and logs a JSON line per event.
  */
 import { createServer } from "node:http";
@@ -16,14 +18,18 @@ import { setTimeout as sleep } from "node:timers/promises";
 import pg from "pg";
 
 import { type DatabaseConfig, loadConfig } from "./config.ts";
+import { type IntakeLake, startIntake } from "./intake.ts";
 import { type Lake, openLake } from "./lake.ts";
 import { type LoaderLake, startLoader } from "./loader.ts";
 import { createMetrics } from "./metrics.ts";
+import { ensureOtel } from "./otel.ts";
 import { prepareLake } from "./sync.ts";
 
 /** Names the one loader's advisory lock, in the catalog database. */
 const LOCK = "alasio.lake.loader";
 const LOCK_RETRY_MS = 10_000;
+/** The intake's DuckDB's memory limit: a request's rows, staged, are all it holds. */
+const INTAKE_MEMORY_LIMIT = "256MB";
 
 /** The loader's lock: the connection holding it, and whether that has since been lost. */
 interface LoaderLock {
@@ -90,6 +96,18 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
   };
 }
 
+/** Opens the lake for the intake: no source, and the telemetry's schema made ready. */
+async function openForIntake(): Promise<IntakeLake> {
+  const lake = await openLake(config, { source: false, memoryLimit: INTAKE_MEMORY_LIMIT });
+  try {
+    await ensureOtel(lake.db);
+  } catch (error) {
+    lake.close();
+    throw error;
+  }
+  return lake;
+}
+
 const metrics = createMetrics();
 const loader = startLoader({
   open,
@@ -97,13 +115,16 @@ const loader = startLoader({
   log,
   intervalMs: config.intervalMs,
   maintenanceIntervalMs: config.maintenanceIntervalMs,
+  retentionDays: config.retentionDays,
 });
+const intake = startIntake({ open: openForIntake, metrics, log });
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && (request.url === "/healthz" || request.url === "/readyz")) {
-    const { ok, ready, detail } = loader.health();
-    const well = request.url === "/healthz" ? ok : ok && ready;
-    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`${detail}\n`);
+    const { ok, detail } = loader.health();
+    const well = request.url === "/healthz" ? ok : intake.ready();
+    const said = `loader: ${detail}; intake: ${intake.ready() ? "open" : "opening the lake"}`;
+    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`${said}\n`);
     return;
   }
   if (request.method === "GET" && request.url === "/metrics") {
@@ -113,13 +134,17 @@ const server = createServer((request, response) => {
   response.writeHead(404).end();
 });
 server.listen(config.httpPort, "0.0.0.0", () => log("listening", { port: config.httpPort }));
+const intakeServer = createServer(intake.handle);
+intakeServer.listen(config.intakePort, "0.0.0.0", () => log("taking telemetry", { port: config.intakePort }));
 
 // As PID 1 in its container, Node would otherwise ignore docker stop's SIGTERM. A
-// load under way finishes first; being transactional, one cut short by the kill
-// that follows the grace period loses nothing either.
+// load or a write under way finishes first; being transactional, one cut short by the
+// kill that follows the grace period loses nothing either, and the collector sends
+// again what it was not told was written.
 process.on("SIGTERM", async () => {
   log("stopping");
   server.close();
-  await loader.stop();
+  intakeServer.close();
+  await Promise.all([loader.stop(), intake.stop()]);
   process.exit(0);
 });

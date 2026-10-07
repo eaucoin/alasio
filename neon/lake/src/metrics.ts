@@ -1,7 +1,7 @@
 /**
  * The lake's own metrics, in Prometheus's text format, for the stack's telemetry
- * collector to scrape (neon/control/setup.js): how its loads and maintenance go,
- * and how much each changed.
+ * collector to scrape (cli/src/manifests/collector.ts): how its loads, its maintenance
+ * and its telemetry intake go, and how much each changed.
  */
 
 interface Metric {
@@ -15,6 +15,8 @@ const METRICS = {
   lake_cycle_duration_seconds: { type: "gauge", help: "How long the last load took" },
   lake_last_success_timestamp_seconds: { type: "gauge", help: "When a load last succeeded" },
   lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome" },
+  lake_telemetry_requests_total: { type: "counter", help: "OTLP requests the telemetry intake took, by signal and outcome" },
+  lake_telemetry_rows_total: { type: "counter", help: "Rows the telemetry intake wrote, by table" },
 } satisfies Record<string, Metric>;
 
 export type MetricName = keyof typeof METRICS;

@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "alasio's analytics lake: Claude Code's transcripts and Codex's rollouts, typed, in DuckLake on the Neon stack",
+  "description": "alasio's analytics lake: Claude Code's transcripts, Codex's rollouts and alasio's telemetry, typed, in DuckLake on the Neon stack",
   "dependencies": {
     "@duckdb/node-api": "1.5.6-r.1",
-    "pg": "8.23.0"
+    "pg": "8.23.0",
+    "protobufjs": "7.6.6"
   }
 }

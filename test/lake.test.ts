@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { gzipSync } from "node:zlib";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
+import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { ConfigProvider, Effect } from "effect";
 import pg from "pg";
 
@@ -13,10 +19,13 @@ import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
 import { type LakeConfig, loadConfig } from "../neon/lake/src/config.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
-import { LAKE, openLake, type Row, rows } from "../neon/lake/src/lake.ts";
+import { startIntake } from "../neon/lake/src/intake.ts";
+import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION } from "../neon/lake/src/model.ts";
+import { ensureOtel, flushTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
+import type { LogsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
@@ -409,6 +418,143 @@ describe("Codex rollouts", { skip }, () => {
   });
 });
 
+// --- Telemetry ---------------------------------------------------------------------
+
+const NOW = BigInt(Date.now()) * 1_000_000n;
+const DAY = 86_400_000_000_000n;
+
+/** A JSON export request of a log record from `service` at each of `times`, in nanoseconds. */
+const logRequest = (service: string, ...times: bigint[]): LogsRequest => ({
+  resourceLogs: [{
+    resource: { attributes: [{ key: "service.name", value: { stringValue: service } }] },
+    scopeLogs: [{ logRecords: times.map((time) => ({ timeUnixNano: String(time), body: { stringValue: "an event" } })) }],
+  }],
+});
+
+/** The lake as the intake opens it: no source, the telemetry's schema ready. */
+async function openForIntake() {
+  const lake = await openLake(config, { source: false });
+  await ensureOtel(lake.db);
+  return lake;
+}
+
+/** POSTs `body` to the intake at `base`, as the collector's exporter does. */
+const post = (base: string, path: string, body: Uint8Array | string, headers: Record<string, string>) =>
+  fetch(`${base}${path}`, { method: "POST", headers, body });
+
+describe("telemetry", { skip }, () => {
+  test("the intake writes each request it takes, at once queryable from another DuckDB, and refuses what is not OTLP", async () => {
+    const spans = new InMemorySpanExporter();
+    const tracer = new BasicTracerProvider({ resource: resourceFromAttributes({ "service.name": "intake-test" }), spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("t");
+    tracer.startSpan("alasio.turn", { attributes: { "alasio.conversation.id": "telegram:7" } }).end();
+    const traces = ProtobufTraceSerializer.serializeRequest(spans.getFinishedSpans());
+    assert.ok(traces);
+
+    const metrics = createMetrics();
+    const intake = startIntake({ open: openForIntake, metrics, log: () => {} });
+    const server = createServer(intake.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    // A server listening on a TCP port has an address of its own.
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      for (let waited = 0; !intake.ready() && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.ok(intake.ready());
+      const protobuf = await post(base, "/v1/traces", gzipSync(traces), { "content-type": "application/x-protobuf", "content-encoding": "gzip" });
+      assert.deepEqual([protobuf.status, protobuf.headers.get("content-type"), (await protobuf.arrayBuffer()).byteLength], [200, "application/x-protobuf", 0]);
+      const json = await post(base, "/v1/logs", JSON.stringify(logRequest("intake-test", NOW, NOW + 1n)), { "content-type": "application/json; charset=utf-8" });
+      assert.deepEqual([json.status, await json.text()], [200, "{}"]);
+
+      assert.equal((await post(base, "/v1/logs", "{", { "content-type": "application/json" })).status, 400);
+      assert.equal((await post(base, "/v1/logs", "{}", { "content-type": "text/plain" })).status, 415);
+      assert.equal((await post(base, "/v1/logs", "{}", { "content-type": "application/json", "content-encoding": "br" })).status, 415);
+      assert.equal((await post(base, "/v1/profiles", "{}", { "content-type": "application/json" })).status, 404);
+
+      const reader = await openLake(config, { readOnly: true });
+      try {
+        const [span] = await rows<{ SpanName: string; conversation: string }>(reader.db, `select SpanName, SpanAttributes['alasio.conversation.id'] as conversation from ${LAKE}.otel.traces where ServiceName = 'intake-test'`);
+        assert.deepEqual(span, { SpanName: "alasio.turn", conversation: "telegram:7" });
+        assert.equal((await one<Count>(reader.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = 'intake-test'`)).n, 2n);
+      } finally {
+        reader.close();
+      }
+      const text = metrics.render();
+      assert.match(text, /^lake_telemetry_rows_total\{table="otel.logs"\} 2$/m);
+      assert.match(text, /^lake_telemetry_requests_total\{signal="logs",outcome="malformed"\} 1$/m);
+    } finally {
+      server.close();
+      await intake.stop();
+    }
+  });
+
+  test("the intake answers 503 while it cannot open the lake, so the collector sends again", async () => {
+    const intake = startIntake({ open: () => Promise.reject(new Error("the compute is restarting")), metrics: createMetrics(), log: () => {}, retryMs: 10 });
+    const server = createServer(intake.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      assert.equal(intake.ready(), false);
+      assert.equal((await post(base, "/v1/logs", JSON.stringify(logRequest("unwritten", NOW)), { "content-type": "application/json" })).status, 503);
+    } finally {
+      server.close();
+      await intake.stop();
+    }
+  });
+
+  test("maintenance deletes the days of telemetry past its retention, and then their files", async () => {
+    await withLake(async (db) => {
+      const days = [40n, 31n, 30n, 0n];
+      await writeTelemetry(db, telemetryRows("logs", logRequest("retained", ...days.map((ago) => NOW - ago * DAY))));
+      await flushTelemetry(db); // to files, whose deletion follows
+      const day = (ago: bigint) => new Date(Number((NOW - ago * DAY) / 1_000_000n));
+      const partition = (date: Date) => join(dataDir ?? "", "otel", "logs", `year=${date.getUTCFullYear()}`, `month=${date.getUTCMonth() + 1}`, `day=${date.getUTCDate()}`);
+      const files = (ago: bigint) => readdirSync(partition(day(ago))).filter((name) => name.endsWith(".parquet"));
+      assert.ok(files(40n).length > 0);
+      // Nothing kept past its need, so maintenance deletes what it may at once.
+      await db.run(`call ${LAKE}.set_option('expire_older_than', '0 seconds')`);
+      await db.run(`call ${LAKE}.set_option('delete_older_than', '0 seconds')`);
+
+      await maintainLake(db, { retentionDays: 30 });
+      const kept = await rows<{ day: Date }>(db, `select Timestamp::DATE::TIMESTAMP as day from ${LAKE}.otel.logs where ServiceName = 'retained' order by Timestamp`);
+      assert.deepEqual(kept.map(({ day }) => day.toISOString().slice(0, 10)), [30n, 0n].map((ago) => day(ago).toISOString().slice(0, 10)));
+      // The pass after the one that deleted them deletes their files, once their snapshots expire.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await maintainLake(db, { retentionDays: 30 });
+      assert.deepEqual([files(40n), files(31n)], [[], []]);
+      assert.ok(files(30n).length > 0);
+    });
+  });
+});
+
+test("the lake's writes take turns, whichever DuckDB makes them", async () => {
+  const instances = await Promise.all([DuckDBInstance.create(":memory:"), DuckDBInstance.create(":memory:")]);
+  const [first, second] = await Promise.all(instances.map((instance) => instance.connect()));
+  assert.ok(first && second);
+  const events: string[] = [];
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const one = transaction(first, async () => {
+    events.push("first began");
+    await held;
+    events.push("first ends");
+  });
+  const other = transaction(second, async () => {
+    events.push("second began");
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(events, ["first began"]);
+  release();
+  await Promise.all([one, other]);
+  assert.deepEqual(events, ["first began", "first ends", "second began"]);
+  await assert.rejects(transaction(first, async () => {
+    throw new Error("a write that failed");
+  }));
+  assert.equal(await transaction(second, async () => "the next still runs"), "the next still runs");
+  for (const db of [first, second]) db.closeSync();
+  for (const instance of instances) instance.closeSync();
+});
+
 test("the lake loads the extension builds its image pins", async () => {
   const lake = await DuckDBInstance.create(":memory:");
   const db = await lake.connect();
@@ -433,12 +579,15 @@ describe("the lake", { skip }, () => {
     try {
       await prepareLake(lake.db, { rebuild: true });
       await syncLake(lake.db);
+      await writeTelemetry(lake.db, telemetryRows("logs", logRequest("rebuilt", NOW)));
       assert.equal(await prepareLake(lake.db), false);
       assert.ok((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.claude.entries`)).n > 0n);
       await lake.db.run(`update ${LAKE}.loader.meta set value = '0' where key = 'model_version'`);
       assert.equal(await prepareLake(lake.db), true);
       assert.equal(await lakeModelVersion(lake.db), MODEL_VERSION);
       assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.claude.entries`)).n, 0n);
+      // Telemetry is not derived, and is kept through any rebuild.
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = 'rebuilt'`)).n, 1n);
     } finally {
       lake.close();
     }
@@ -449,24 +598,24 @@ describe("the lake", { skip }, () => {
       const metrics = createMetrics();
       const logs: string[] = [];
       const open = async () => ({ db, close: async () => {}, lost: () => false });
-      const loader = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000 });
+      const loader = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000, retentionDays: 30 });
       for (let waited = 0; !logs.includes("maintained") && waited < 30_000; waited += 50) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       await loader.stop();
       assert.deepEqual(logs, ["loaded", "maintained"]);
-      assert.deepEqual(loader.health(), { ok: true, ready: true, detail: "loaded" });
+      assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
       assert.ok(await lastMaintained(db));
       const text = metrics.render();
       assert.match(text, /^lake_cycles_total\{outcome="success"\} 1$/m);
       assert.match(text, /^lake_maintenance_total\{outcome="success"\} 1$/m);
       assert.match(text, /^# TYPE lake_rows_total counter$/m);
       // Maintained within the interval: the next loader does not maintain again.
-      const again = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000 });
+      const again = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000, retentionDays: 30 });
       await new Promise((resolve) => setTimeout(resolve, 500));
       await again.stop();
       assert.equal(logs.filter((message) => message === "maintained").length, 1);
-      await maintainLake(db); // and on demand it runs at once
+      await maintainLake(db, { retentionDays: 30 }); // and on demand it runs at once
     });
   });
 
@@ -483,6 +632,7 @@ describe("the lake", { skip }, () => {
         log: (message) => events.push(message),
         intervalMs: 60_000,
         maintenanceIntervalMs: 3_600_000,
+        retentionDays: 30,
         retryMs: 10,
         sync: async (lake) => {
           attempts += 1;
@@ -495,7 +645,7 @@ describe("the lake", { skip }, () => {
       }
       await loader.stop();
       assert.deepEqual(events, ["open", "load failed", "close", "open", "loaded", "maintained", "close"]);
-      assert.deepEqual(loader.health(), { ok: true, ready: true, detail: "loaded" });
+      assert.deepEqual(loader.health(), { ok: true, detail: "loaded" });
     });
   });
 
@@ -546,6 +696,7 @@ test("a failing load is tried again soon, and the loader turns unhealthy only on
     log: (message) => logs.push(message),
     intervalMs: 100,
     maintenanceIntervalMs: 3_600_000,
+    retentionDays: 30,
     retryMs: 10,
     sync: async () => {
       attempts += 1;
@@ -555,7 +706,7 @@ test("a failing load is tried again soon, and the loader turns unhealthy only on
   try {
     await new Promise((resolve) => setTimeout(resolve, 60));
     assert.ok(attempts >= 3, `retried sooner than the interval (${attempts} attempts)`);
-    assert.deepEqual(loader.health(), { ok: true, ready: false, detail: "load failed: permission denied for table entries" });
+    assert.deepEqual(loader.health(), { ok: true, detail: "load failed: permission denied for table entries" });
     await new Promise((resolve) => setTimeout(resolve, 300)); // past three intervals of failing
     assert.equal(loader.health().ok, false);
   } finally {
@@ -600,11 +751,13 @@ interface PackageManifest {
   readonly devDependencies?: Readonly<Record<string, string>>;
 }
 
-test("the lake's image pins the DuckDB alasio tests it with", () => {
+test("the lake's image pins the DuckDB and the protobuf decoder alasio tests it with", () => {
   const lake: PackageManifest = JSON.parse(readFileSync(new URL("../neon/lake/package.json", import.meta.url), "utf8"));
   const alasio: PackageManifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  const pinned = lake.dependencies?.["@duckdb/node-api"];
-  assert.ok(pinned);
-  assert.equal(alasio.devDependencies?.["@duckdb/node-api"], pinned);
-  assert.match(pinned, /^\d+\.\d+\.\d+/); // exact, not a range
+  for (const dependency of ["@duckdb/node-api", "protobufjs"]) {
+    const pinned = lake.dependencies?.[dependency];
+    assert.ok(pinned, dependency);
+    assert.equal(alasio.devDependencies?.[dependency], pinned, dependency);
+    assert.match(pinned, /^\d+\.\d+\.\d+/, dependency); // exact, not a range
+  }
 });

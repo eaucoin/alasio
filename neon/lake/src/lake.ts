@@ -4,6 +4,12 @@
  * the source. DuckDB runs in this process and keeps nothing of its own: everything
  * durable is in the catalog and the object store, so any process can open the lake
  * and none has to stay up for it.
+ *
+ * The lake service opens it twice, for the loader and for the telemetry intake, each
+ * on a DuckDB of its own, so either can drop and reopen its connections without the
+ * other's. Their writes still take turns: DuckLake 1.0 on Postgres mishandles commits
+ * that race (duplicate snapshot ids, retries run out), so every write to the lake in
+ * this process is made through `serially`, one at a time, and none ever races another.
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +34,8 @@ export interface OpenLakeOptions {
   readOnly?: boolean;
   /** Attach alasio's database too, read-only, for loading. */
   source?: boolean;
+  /** DuckDB's memory limit, when not the configuration's. */
+  memoryLimit?: string;
 }
 
 /** A row as DuckDB returns it, its values as plain JavaScript. */
@@ -52,12 +60,12 @@ export function conninfo({ host, port, user, password, database }: DatabaseConfi
 
 /**
  * Opens the lake. `readOnly` attaches it read-only, for queries; `source` also
- * attaches alasio's database read-only, for loading. Returns `{ db, close }`, `db`
- * a DuckDB connection.
+ * attaches alasio's database read-only, for loading; `memoryLimit` replaces the
+ * configuration's. Returns `{ db, close }`, `db` a DuckDB connection.
  */
-export async function openLake(config: LakeConfig, { readOnly = false, source = !readOnly }: OpenLakeOptions = {}): Promise<Lake> {
+export async function openLake(config: LakeConfig, { readOnly = false, source = !readOnly, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
   const options: Record<string, string> = {
-    memory_limit: config.memoryLimit,
+    memory_limit: memoryLimit,
     threads: String(config.threads),
     // Where a large load spills past the memory limit: scratch, never the lake.
     temp_directory: join(tmpdir(), "duckdb-lake"),
@@ -87,9 +95,12 @@ export async function openLake(config: LakeConfig, { readOnly = false, source = 
     if (source) {
       await db.run(`attach ${literal(conninfo(config.source))} as ${SOURCE} (type postgres, read_only)`);
     }
-    await db.run(
-      `attach ${literal(`ducklake:postgres:${conninfo(config.catalog)}`)} as ${LAKE}
-        (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
+    // Serially, as the lake's first attach writes its catalog.
+    await serially(() =>
+      db.run(
+        `attach ${literal(`ducklake:postgres:${conninfo(config.catalog)}`)} as ${LAKE}
+          (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
+      )
     );
     return { db, close };
   } catch (error) {
@@ -106,15 +117,33 @@ export async function rows<Selected = Row>(db: DuckDBConnection, sql: string, va
   return (await db.runAndReadAll(sql, values)).getRowObjectsJS() as Selected[];
 }
 
-/** Runs `work` in one transaction on the lake: all of it is committed, or none. */
-export async function transaction<T>(db: DuckDBConnection, work: () => Promise<T>): Promise<T> {
-  await db.run("begin transaction");
-  try {
-    const result = await work();
-    await db.run("commit");
+/** Runs work it is given once all it was given before has ended, and resolves as that work does. */
+export type Queue = <T>(work: () => Promise<T>) => Promise<T>;
+
+/** A queue: work run one at a time, in the order it is given. */
+export function queue(): Queue {
+  let last: Promise<unknown> = Promise.resolve();
+  return (work) => {
+    const result = last.then(work);
+    last = result.catch(() => {});
     return result;
-  } catch (error) {
-    await db.run("rollback").catch(() => {});
-    throw error;
-  }
+  };
+}
+
+/** Runs `work`, which writes to the lake, after every write given before it: this process's writes, one at a time. */
+export const serially: Queue = queue();
+
+/** Runs `work` in one transaction on the lake, serially: all of it is committed, or none. */
+export function transaction<T>(db: DuckDBConnection, work: () => Promise<T>): Promise<T> {
+  return serially(async () => {
+    await db.run("begin transaction");
+    try {
+      const result = await work();
+      await db.run("commit");
+      return result;
+    } catch (error) {
+      await db.run("rollback").catch(() => {});
+      throw error;
+    }
+  });
 }

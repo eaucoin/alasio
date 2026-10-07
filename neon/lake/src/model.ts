@@ -13,12 +13,14 @@
  * so far), each tool call with its result, and Codex's turns, token usage, and tool
  * calls.
  *
- * The lake is derived: alasio's Neon is the source of truth. A model this version
- * does not match is dropped and loaded again from it (ensureModel).
+ * These schemas are derived: alasio's Neon is the source of truth. A model this
+ * version does not match is dropped and loaded again from it (ensureModel). The lake's
+ * telemetry is not derived but kept nowhere else, so its schema is apart from this
+ * model and never rebuilt (./otel.ts).
  */
 import type { DuckDBConnection } from "@duckdb/node-api";
 
-import { LAKE, rows } from "./lake.ts";
+import { LAKE, rows, transaction } from "./lake.ts";
 
 export interface RebuildOptions {
   /** Drop the lake whatever its model version, to be loaded again from its source. */
@@ -157,20 +159,12 @@ export async function lakeModelVersion(db: DuckDBConnection): Promise<number | n
  * version. Returns whether it was (re)built empty.
  */
 export async function ensureModel(db: DuckDBConnection, { rebuild = false }: RebuildOptions = {}): Promise<boolean> {
-  const version = await lakeModelVersion(db);
-  if (version === MODEL_VERSION && !rebuild) {
-    await create(db);
-    return false;
-  }
-  await db.run("begin transaction");
-  try {
+  const rebuilt = rebuild || (await lakeModelVersion(db)) !== MODEL_VERSION;
+  await transaction(db, async () => {
+    if (!rebuilt) return create(db);
     await drop(db);
     await create(db);
     await db.run(`insert into ${LAKE}.loader.meta values ('model_version', '${MODEL_VERSION}')`);
-    await db.run("commit");
-  } catch (error) {
-    await db.run("rollback").catch(() => {});
-    throw error;
-  }
-  return true;
+  });
+  return rebuilt;
 }

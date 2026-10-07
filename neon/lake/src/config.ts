@@ -1,6 +1,6 @@
 /**
- * The lake's configuration, from its environment, which the stack's compose.env
- * gives it (neon/control/setup.js). Every setting has a stated meaning and those
+ * The lake's configuration, from its environment, which its Deployment gives it
+ * (cli/src/manifests/lake.ts). Every setting has a stated meaning and those
  * without a sensible default are required, so a misconfigured lake fails at once
  * rather than mid-cycle.
  *
@@ -13,10 +13,12 @@
  *   LAKE_S3_ENDPOINT, LAKE_S3_KEY, LAKE_S3_SECRET  for an s3:// data path
  *   LAKE_INTERVAL_SECONDS                   between loads (default 300)
  *   LAKE_MAINTENANCE_HOURS                  between maintenance passes (default 24)
+ *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
  *   LAKE_MEMORY_LIMIT, LAKE_THREADS         DuckDB's (default 1GB, 2)
  *   LAKE_EXTENSION_DIRECTORY                the extensions the image installed; with it
  *                                           set, none is ever downloaded
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
+ *   LAKE_INTAKE_PORT                        the telemetry intake, OTLP over HTTP (default 4318)
  */
 
 /** A Postgres database the lake connects to, as role `lake`. */
@@ -44,10 +46,12 @@ export interface LakeConfig {
   s3: S3Config | null;
   intervalMs: number;
   maintenanceIntervalMs: number;
+  retentionDays: number;
   memoryLimit: string;
   threads: number;
   extensionDirectory: string | null;
   httpPort: number;
+  intakePort: number;
 }
 
 const ROLE = "lake";
@@ -92,9 +96,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
       : null,
     intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
     maintenanceIntervalMs: positive(env, "LAKE_MAINTENANCE_HOURS", 24) * 3_600_000,
+    retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
     memoryLimit: optional(env, "LAKE_MEMORY_LIMIT", "1GB"),
     threads: positive(env, "LAKE_THREADS", 2),
     extensionDirectory: env["LAKE_EXTENSION_DIRECTORY"]?.trim() || null,
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
+    intakePort: positive(env, "LAKE_INTAKE_PORT", 4318),
   };
 }

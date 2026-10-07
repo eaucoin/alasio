@@ -5,8 +5,8 @@
  *
  * `alasio lake [--format table|csv|json] "<SQL>"` runs it in the lake's container. The
  * lake is the default database, so its tables and views are named as `claude.entries`,
- * `codex.turns`, and so on (model.ts). The lake is attached read-only, so a
- * query can change nothing.
+ * `codex.turns`, `otel.traces`, and so on (model.ts, otel.ts). The lake is attached
+ * read-only, so a query can change nothing.
  */
 import { loadConfig } from "./config.ts";
 import { type Lake, LAKE, openLake, rows } from "./lake.ts";

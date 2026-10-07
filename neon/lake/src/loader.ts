@@ -1,7 +1,8 @@
 /**
  * The loader's loop: a load now and then every interval, and a maintenance pass
  * whenever the last is older than its interval (it is recorded in the lake, so a
- * restart neither repeats nor skips one).
+ * restart neither repeats nor skips one), which deletes the telemetry past its
+ * retention too.
  *
  * The loop opens the lake itself and keeps it open between loads. A load that fails
  * is logged and counted, its connections are dropped, and it is tried again sooner
@@ -31,17 +32,15 @@ export interface LoaderOptions {
   log: Log;
   intervalMs: number;
   maintenanceIntervalMs: number;
+  /** How many days of telemetry maintenance keeps. */
+  retentionDays: number;
   retryMs?: number;
   sync?: (db: DuckDBConnection) => Promise<LakeLoad>;
 }
 
-/**
- * Whether the loader is well (unhealthy once loads have failed long enough), whether it
- * is ready (a load has succeeded, so the lake is there to be queried), and why.
- */
+/** Whether the loader is well (unhealthy once loads have failed long enough), and why. */
 export interface LoaderHealth {
   ok: boolean;
-  ready: boolean;
   detail: string;
 }
 
@@ -61,17 +60,16 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * Starts the loop. `open(signal)` opens the lake for loading and resolves
  * `{ db, close, lost }` (`lost()` says whether it can no longer be used); it may wait,
  * until `signal` aborts. `sync` is the load, replaceable for tests. Returns
- * `{ health(), stop() }`: `health()` is `{ ok, ready, detail }`, unhealthy once loads
- * have failed for UNHEALTHY_AFTER_INTERVALS intervals, ready once a load has succeeded; `stop()` lets a load under way
- * finish, closes the lake, and resolves once the loop has ended.
+ * `{ health(), stop() }`: `health()` is `{ ok, detail }`, unhealthy once loads have
+ * failed for UNHEALTHY_AFTER_INTERVALS intervals; `stop()` lets a load under way finish,
+ * closes the lake, and resolves once the loop has ended.
  */
-export function startLoader({ open, metrics, log, intervalMs, maintenanceIntervalMs, retryMs = RETRY_MS, sync = syncLake }: LoaderOptions): Loader {
+export function startLoader({ open, metrics, log, intervalMs, maintenanceIntervalMs, retentionDays, retryMs = RETRY_MS, sync = syncLake }: LoaderOptions): Loader {
   const stopped = new AbortController();
   let lake: LoaderLake | null = null;
   let wake: (() => void) | null = null;
   let detail = "starting";
   let failingSince: number | null = null;
-  let loadedOnce = false;
 
   async function drop() {
     const closing = lake;
@@ -98,7 +96,6 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
       }
       detail = "loaded";
       failingSince = null;
-      loadedOnce = true;
       return true;
     } catch (error) {
       if (stopped.signal.aborted) return false;
@@ -117,7 +114,7 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
     const last = await lastMaintained(db).catch(() => null);
     if (last && Date.now() - last.getTime() < maintenanceIntervalMs) return;
     try {
-      await maintainLake(db);
+      await maintainLake(db, { retentionDays });
       metrics.add("lake_maintenance_total", { outcome: "success" });
       log("maintained");
     } catch (error) {
@@ -146,7 +143,6 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
   return {
     health: () => ({
       ok: failingSince === null || Date.now() - failingSince < UNHEALTHY_AFTER_INTERVALS * intervalMs,
-      ready: loadedOnce,
       detail,
     }),
     async stop() {
