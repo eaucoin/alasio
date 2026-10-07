@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, V1Deployment, V1Pod } from "@kubernetes/client-node";
 
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
@@ -443,6 +443,16 @@ if (inShard("telemetry")) {
           rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
         }
         assert.ok(rows > 0, "the panel answered with no service");
+        // A query the lake refuses says why, in Grafana.
+        const refused = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [{ ...services, url_options: { ...(services as { url_options: object }).url_options, data: "select nothing" } }] }) })).body as {
+          results: { A: { error?: string } };
+        };
+        assert.match(refused.results.A.error ?? "", /Binder Error: Referenced column "nothing" was not found/u);
+        // Started once its database was ready for it, on a fresh install: never restarted for want of it.
+        const pod = await kube.get<V1Pod>(ref("Pod", await kube.runningPod(NAMESPACE, "alasio-grafana"), NAMESPACE));
+        assert.deepEqual(pod?.status?.containerStatuses?.map(({ name, restartCount }) => [name, restartCount]), [["grafana", 0]]);
+        const backOffs = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE })).filter(({ involvedObject, reason }) => involvedObject.name?.startsWith("alasio-grafana-") && reason === "BackOff");
+        assert.deepEqual(backOffs.map(({ message }) => message), []);
         // What Grafana and the lake's query endpoint hold, as their cgroups count it.
         const memory = async (pod: string, container: string) =>
           (await kube.execOk(NAMESPACE, pod, ["cat", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.peak"], { container })).trim().split("\n").map((bytes) => `${Math.round(Number(bytes) / 1048576)} MiB`).join(", peak ");
