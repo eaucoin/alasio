@@ -6,14 +6,28 @@
  * (./network-policies.ts).
  *
  * One replica, replaced rather than rolled: its migrations take a session's advisory
- * lock, which is why it connects to the compute directly. Its settings and what it is
+ * lock, which is why it connects to the compute directly. It starts once it can log in
+ * to its database, which alasio lets it once the database is made, rather than failing
+ * and being restarted until then. Its settings and what it is
  * provisioned with are its image's; what is the installation's is given here, from the
  * Secret the stack's setup makes (`alasio-grafana`) and the bot's.
  */
 import type { KubernetesObject, V1Deployment, V1Service } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
-import { componentName, grafanaRuns, imagePullSecrets, labels, NAMESPACE, neonName, restrictedPod, restrictedContainer, selectorLabels } from "./common.ts";
+import {
+  componentName,
+  grafanaRuns,
+  helperResources,
+  imagePullSecrets,
+  labels,
+  NAMESPACE,
+  neonName,
+  restrictedContainer,
+  restrictedPod,
+  script,
+  selectorLabels,
+} from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
 
@@ -50,6 +64,22 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
           enableServiceLinks: false,
           securityContext: restrictedPod(GRAFANA_USER, GRAFANA_USER),
           ...imagePullSecrets(config),
+          initContainers: [{
+            name: "wait-for-database",
+            image: imageReference(config.neon.computeImage),
+            imagePullPolicy: "IfNotPresent",
+            command: ["/bin/sh", "-c", script('until psql --no-psqlrc --quiet --command="select 1" >/dev/null 2>&1; do sleep 2; done')],
+            env: [
+              { name: "PGHOST", value: neonName("compute") },
+              { name: "PGPORT", value: "55433" },
+              { name: "PGDATABASE", value: "grafana" },
+              { name: "PGUSER", value: "grafana" },
+              { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: GRAFANA, key: "GF_DATABASE_PASSWORD" } } },
+              { name: "PGCONNECT_TIMEOUT", value: "5" },
+            ],
+            securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+            ...helperResources(),
+          }],
           containers: [{
             name: "grafana",
             image: imageReference(config.images.grafana),

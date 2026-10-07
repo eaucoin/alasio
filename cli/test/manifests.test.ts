@@ -435,6 +435,23 @@ describe("Grafana", () => {
     assert.ok(pod?.volumes?.every(({ emptyDir }) => emptyDir), "no volume but emptyDirs");
   });
 
+  test("starts Grafana once it can log in to its database, which alasio lets it once the database is made", () => {
+    const wait = one<V1Deployment>(install(), "Deployment", "alasio-grafana").spec?.template.spec?.initContainers?.[0];
+    assert.ok(wait);
+    const env = Object.fromEntries((wait.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
+    assert.deepEqual([env["PGHOST"], env["PGPORT"], env["PGDATABASE"], env["PGUSER"]], ["alasio-neon-compute", "55433", "grafana", "grafana"]);
+    assert.deepEqual(wait.env?.find(({ name }) => name === "PGPASSWORD")?.valueFrom, { secretKeyRef: { name: "alasio-grafana", key: "GF_DATABASE_PASSWORD" } });
+    // A login refused twice, then let in.
+    const psql = 'n=$(cat "$ROOT/tries" 2>/dev/null || echo 0); echo $((n + 1)) >"$ROOT/tries"; [ "$n" -ge 2 ] && echo "$PGUSER@$PGDATABASE" >"$ROOT/in"';
+    const { root, run, remove } = runScript(wait, env, { psql, sleep: "true" });
+    try {
+      run();
+      assert.deepEqual([readFileSync(join(root, "tries"), "utf8"), readFileSync(join(root, "in"), "utf8")], ["3\n", "grafana@grafana\n"]);
+    } finally {
+      remove();
+    }
+  });
+
   test("admits no pod to Grafana, and lets it reach DNS, its database, the lake's query endpoint and the internet's HTTPS alone", () => {
     const objects = install();
     const own = one<Policy>(objects, "NetworkPolicy", "alasio-grafana").spec;

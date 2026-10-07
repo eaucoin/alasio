@@ -18,12 +18,13 @@ const GRAFANA_DATABASE = "grafana";
  * whose public schema it makes its tables. The database is alasio's: alasio may not
  * act as the roles it makes, so it cannot give the database away, and grants Grafana
  * its schema instead, on a connection to the database, at the server `databaseUrl`
- * reaches alasio's on. Idempotent.
+ * reaches alasio's on. Grafana may log in last, once all of that is made: so it can
+ * log in once its database is ready for it, which its pod waits for (cli/src/
+ * manifests/grafana.ts). Idempotent.
  */
 export async function ensureGrafanaRole(pool: Pool, databaseUrl: string, password: string): Promise<void> {
   const role = await pool.query("select 1 from pg_roles where rolname = $1", [GRAFANA_ROLE]);
-  if (role.rows.length === 0) await pool.query(`create role ${GRAFANA_ROLE} login`);
-  await pool.query(`alter role ${GRAFANA_ROLE} with login password '${scramVerifier(password)}'`);
+  if (role.rows.length === 0) await pool.query(`create role ${GRAFANA_ROLE} nologin`);
   const database = await pool.query("select 1 from pg_database where datname = $1", [GRAFANA_DATABASE]);
   if (database.rows.length === 0) await pool.query(`create database ${GRAFANA_DATABASE}`);
   await pool.query(`revoke all on database ${GRAFANA_DATABASE} from public`);
@@ -37,4 +38,5 @@ export async function ensureGrafanaRole(pool: Pool, databaseUrl: string, passwor
   } finally {
     await client.end().catch(() => {});
   }
+  await pool.query(`alter role ${GRAFANA_ROLE} with login password '${scramVerifier(password)}'`);
 }
