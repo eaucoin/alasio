@@ -1,8 +1,8 @@
 /**
  * alasio's Neon as alasio installs it: its components killed, the whole stack stopped at
  * once, a safekeeper's volume lost, with nothing committed lost; its garbage collected,
- * its dumps restorable, its past readable, and its lake loading; and an upgrade that
- * changes nothing restarting none of it.
+ * its dumps restorable, its past readable, its branches made, run and deleted, and its
+ * lake loading; and an upgrade that changes nothing restarting none of it.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
@@ -19,7 +19,7 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { alasioOk, type Forward, kube, ref } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
-import { type BranchesFile, MAIN, type ReadyBranch } from "../control/branches.ts";
+import { type Branch, type BranchesFile, computeId, MAIN, type ReadyBranch } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
 import type { StackSecrets } from "../control/secrets.ts";
 
@@ -248,6 +248,9 @@ interface ServedComputeConfig {
   [field: string]: unknown;
 }
 
+/** A branch as neon-control's API answers it. */
+type Listed = Branch & { computeId: string };
+
 /** Registers the suite, which runs once the end-to-end run has installed alasio. */
 export function neonStack(): void {
   describe("alasio's Neon, as alasio installs it", () => {
@@ -465,6 +468,128 @@ export function neonStack(): void {
           assert.equal(Number(count.trim().split("\n").at(-1)), 100);
         } finally {
           await kube.remove(ref("ConfigMap", name, NAMESPACE)).catch(() => {});
+        }
+      });
+    });
+
+    // After the database's tests: the whole stack stopping at once would stop the branch's compute too.
+    describe("branches", () => {
+      const BRANCH = "e2e";
+      /** The pod of the branch's compute, which runs as main's does, but on the branch. */
+      const COMPUTE = `${computeId(BRANCH)}-compute`;
+      let control: Forward | undefined;
+
+      /** neon-control's API, called with `bearer`, a token of the admin scope unless given: its status, and what it answered. */
+      async function api<Body = unknown>(method: string, path: string, { body, bearer = token("admin") }: { readonly body?: unknown; readonly bearer?: string } = {}) {
+        assert.ok(control);
+        const response = await fetch(`${control.base}${path}`, {
+          method,
+          headers: { authorization: `Bearer ${bearer}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        const text = await response.text();
+        const answered: Body = text ? JSON.parse(text) : null;
+        return { status: response.status, body: answered };
+      }
+
+      /** The branches neon-control answers, main first. */
+      const listed = async () => (await api<{ branches: Listed[] }>("GET", "/branches")).body.branches;
+
+      /** Runs `sql` on the branch's compute, from its pod: what psql printed. */
+      const onBranch = async (sql: string) => (await kube.execOk(NAMESPACE, COMPUTE, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "alasio", "-Atc", sql])).trim();
+
+      before(async () => {
+        control = await kube.forward(NAMESPACE, neonName("control"), 8080);
+      });
+
+      after(async () => {
+        control?.close();
+        await kube.remove(ref("Pod", COMPUTE, NAMESPACE)).catch(() => {});
+      });
+
+      test("are managed with a token of the admin scope alone, not with the tenant's every compute holds", async () => {
+        const tenant = signToken(privateKey, "tenant", tenantId);
+        for (const [method, path, body] of [["GET", "/branches"], ["POST", "/branches", { name: BRANCH }], ["DELETE", `/branches/${BRANCH}`], ["PUT", "/notify-attach", {}]] as const) {
+          assert.equal((await api(method, path, { body, bearer: tenant })).status, 401, `${method} ${path}`);
+        }
+        assert.deepEqual((await listed()).map(({ name, state, computeId }) => ({ name, state, computeId })), [{ name: MAIN, state: "ready", computeId: "alasio" }]);
+      });
+
+      test("a branch's compute reads its parent as of its branch point, and writes on it alone", async () => {
+        await query("create table branched (id int primary key)");
+        await query("insert into branched select g from generate_series(1, 100) g");
+        const [point] = await query<{ lsn: string }>("select pg_current_wal_lsn()::text as lsn");
+        assert.ok(point);
+        await query("insert into branched select g from generate_series(101, 200) g");
+
+        const created = await api<Listed>("POST", "/branches", { body: { name: BRANCH, lsn: point.lsn } });
+        assert.equal(created.status, 201, JSON.stringify(created.body));
+        assert.equal(created.body.parent, MAIN);
+        assert.equal(created.body.computeId, `branch-${BRANCH}`);
+        assert.ok(created.body.state === "ready");
+        assert.deepEqual([...created.body.safekeepers.ids].sort(), [1, 2, 3]);
+        const again = await api<Listed>("POST", "/branches", { body: { name: BRANCH } });
+        assert.equal(again.status, 200);
+        assert.equal(again.body.timelineId, created.body.timelineId);
+
+        // Main's compute's pod, under labels of its own, and with the branch's compute id.
+        const template = (await kube.get<V1Deployment>(ref("Deployment", neonName("compute"), NAMESPACE)))?.spec?.template.spec;
+        const [compute] = template?.containers ?? [];
+        assert.ok(template && compute?.args);
+        const pod: V1Pod = {
+          apiVersion: "v1",
+          kind: "Pod",
+          metadata: { name: COMPUTE, namespace: NAMESPACE, labels: { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon", "app.kubernetes.io/component": "neon-test" } },
+          spec: { ...template, containers: [{ ...compute, args: compute.args.map((arg, at, args) => (args[at - 1] === "--compute-id" ? computeId(BRANCH) : arg)) }] },
+        };
+        await kube.apply(pod);
+        await awaitPodReady(COMPUTE);
+        assert.equal(await onBranch("select count(*) from branched"), "100");
+        await onBranch("insert into branched select g from generate_series(1001, 1050) g");
+        assert.equal(await onBranch("select count(*) from branched"), "150");
+        assert.deepEqual(await query("select count(*)::int as n, max(id) as top from branched"), [{ n: 200, top: 200 }]);
+      });
+
+      test("branch from branches, at a point their parent still has, and are deleted before their parent", async () => {
+        const child = await api<Listed>("POST", "/branches", { body: { name: `${BRANCH}-child`, parent: BRANCH } });
+        assert.equal(child.status, 201, JSON.stringify(child.body));
+        assert.equal(child.body.parent, BRANCH);
+        assert.equal((await api("DELETE", `/branches/${BRANCH}`)).status, 412);
+        assert.equal((await api("DELETE", `/branches/${MAIN}`)).status, 400);
+        // Below the start of main's history, which no timeline has.
+        const early = await api("POST", "/branches", { body: { name: `${BRANCH}-early`, lsn: "0/8" } });
+        assert.equal(early.status, 406, JSON.stringify(early.body));
+        assert.equal((await api("POST", "/branches", { body: { name: "Early" } })).status, 400);
+        assert.equal((await api("DELETE", `/branches/${BRANCH}-child`)).status, 204);
+        assert.deepEqual((await listed()).map(({ name }) => name), [MAIN, BRANCH]);
+      });
+
+      test("a branch deleted once its compute has stopped is gone from the storage controller and the safekeepers", async () => {
+        const branch = (await listed()).find(({ name }) => name === BRANCH);
+        assert.ok(branch);
+        const compute = await kube.get<V1Pod>(ref("Pod", COMPUTE, NAMESPACE));
+        assert.ok(compute);
+        await kube.remove(ref("Pod", COMPUTE, NAMESPACE));
+        await awaitReplaced([compute]);
+        // A 409 says the storage controller is deleting it still, and it is asked again.
+        const deadline = Date.now() + 180_000;
+        let deleted = await api("DELETE", `/branches/${BRANCH}`);
+        while (deleted.status === 409 && Date.now() < deadline) deleted = await api("DELETE", `/branches/${BRANCH}`);
+        assert.equal(deleted.status, 204, JSON.stringify(deleted.body));
+        assert.deepEqual((await listed()).map(({ name }) => name), [MAIN]);
+
+        const controller = await podOf("neon-storage-controller");
+        const timeline = `http://127.0.0.1:1234/v1/tenant/${tenantId}/timeline/${branch.timelineId}`;
+        const found = await kube.execOk(NAMESPACE, controller, ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-H", `authorization: Bearer ${token("admin")}`, timeline]);
+        assert.equal(found, "404");
+        const replicas = (await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("safekeeper"), NAMESPACE)))?.spec?.replicas ?? 0;
+        for (let index = 0; index < replicas; index++) {
+          // Each keeps its timelines in /data/<tenant>/<timeline>.
+          const held = () => kube.execOk(NAMESPACE, `${neonName("safekeeper")}-${index}`, ["ls", `/data/${tenantId}`]);
+          while ((await held()).split("\n").includes(branch.timelineId)) {
+            assert.ok(Date.now() < deadline, `safekeeper ${index + 1} keeps the deleted branch's timeline`);
+            await sleep(3000);
+          }
         }
       });
     });
