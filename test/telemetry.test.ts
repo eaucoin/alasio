@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
@@ -57,6 +56,7 @@ const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
 const { SqliteStore } = await import("../src/persistence/store.ts");
+const { sessionFsWorkspace } = await import("../src/workspace/kind.ts");
 const { AlasioLoggerLayer, withLogScope } = await import("../src/shared/log.ts");
 const { outsideTraces, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
 const { makeClaudeLiveSessions } = await import("../src/harness/claude/live-sessions.ts");
@@ -288,16 +288,13 @@ test("Codex app-server requests carry their span's trace context", async () => {
   assert.equal(sent.trace?.traceparent, `00-${request.spanContext().traceId}-${request.spanContext().spanId}-01`);
 });
 
-test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits", async () => {
+test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits, the turn naming its session and workspace", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
-  const folder = join(root, "repo");
-  mkdirSync(folder);
-  execFileSync("git", ["init", "-q"], { cwd: folder });
   const store = new SqliteStore(root, join(root, "alasio.sqlite"));
   try {
     const conversationId = store.upsertConversation({ chatId: "42", user: { id: 42 } });
     store.setActiveHarness(conversationId, CODEX_HARNESS);
-    store.setWorkingDirectory(conversationId, folder);
+    store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123"));
     const telegram = recordingTelegram({
       sendMessage: () => Effect.sync(() => [sentMessage(42, telegram.calls.sendMessage.length)]),
     });
@@ -362,6 +359,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     assert.equal(turn.attributes["alasio.harness"], CODEX_HARNESS);
     assert.equal(turn.attributes["alasio.turn.outcome"], "completed");
     assert.equal(turn.attributes["alasio.session.id"], "thread-1");
+    assert.equal(turn.attributes["alasio.volume.id"], "fs-abc123");
     assert.equal(delivery.spanContext().traceId, traceId);
     assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
     assert.deepEqual(delivered, ["done"]);

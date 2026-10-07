@@ -22,6 +22,7 @@ import { SessionSandboxes } from "../sandbox/index.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { WorkflowHooks } from "../workflow/hook-server.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 import { truncateText } from "../operator/text.ts";
 import { makeReplyMedia } from "./reply-media.ts";
 import { recordExternalRestartEvent, recoverInterruptedTurns } from "./restart-recovery.ts";
@@ -205,6 +206,10 @@ const makeTurns = Effect.fnUntraced(function*({ stateDir }: TurnsConfig) {
     const workingDirectory = resolveWorkingDirectory(store, conversationId);
     if (!workingDirectory) {
       return yield* new NoWorkspaceMounted();
+    }
+    const workspace = parseWorkspace(workingDirectory);
+    if (workspace?.kind === "sessionfs") {
+      yield* Effect.annotateCurrentSpan("alasio.volume.id", workspace.volumeId);
     }
     store.upsertActiveTurn({
       conversationId,
