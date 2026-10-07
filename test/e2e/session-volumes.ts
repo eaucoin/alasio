@@ -1,7 +1,8 @@
 /**
  * Run inside alasio's pod, by node there (inAlasio in harness.ts): makes a session as
  * alasio does, through its own session filesystems and its ServiceAccount's permissions,
- * `create <volumeId> <none|full>`. Prints one JSON line of the session made.
+ * `create <volumeId> <none|full>`, or forks one, `fork <sourceVolumeId> <volumeId>`.
+ * Prints one JSON line of the session made.
  *
  * Its Sandbox is made from what this script, without alasio's telemetry settings, makes
  * of the template, as ./session-bring-up.ts brings sessions up, so either finds the
@@ -23,14 +24,16 @@ export interface Made {
 }
 
 const [verb, first, second] = process.argv.slice(2);
-if (verb !== "create" || !first || (second !== "none" && second !== "full")) throw new Error("usage: session-volumes.ts create <volumeId> <none|full>");
+if (!first || !second || !((verb === "create" && (second === "none" || second === "full")) || verb === "fork")) {
+  throw new Error("usage: session-volumes.ts create <volumeId> <none|full> | fork <sourceVolumeId> <volumeId>");
+}
 
 const made = await Effect.runPromise(Effect.gen(function*() {
   const { sessions } = yield* loadKubeTemplates;
   if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
   return yield* Effect.gen(function*() {
     const { volumes } = yield* SessionSandboxes;
-    const done: Made = yield* volumes.create(first, second);
+    const done: Made = verb === "create" ? yield* volumes.create(first, second === "full" ? "full" : "none") : yield* volumes.fork(first, second);
     return done;
   }).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/volumes", env: {} })));
 }).pipe(Effect.scoped, Effect.provide(KubeClient.layer)));

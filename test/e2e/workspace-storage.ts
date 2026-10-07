@@ -4,10 +4,12 @@
  * file system, made by JuiceFS's CSI driver, doing in gVisor what tools ask of a file
  * system within the claim's size; its files kept through the session suspended, Valkey
  * and the object store killed mid-write, its mount pod deleted and its mount lost, and,
- * on several nodes, its moving to another; neither Valkey nor the object store, nor their
- * credentials, within a session's reach; a volume deleted with its claim, its directory
- * with it; and the file system's metadata dumped, backed up nightly, and restored from
- * the backup with the same files.
+ * on several nodes, its moving to another; a session forked, its fork a clone of its
+ * files with their owners, its own quota, and neither touched by what is done in the
+ * other or by its deletion; neither Valkey nor the object store, nor their credentials,
+ * within a session's reach; a volume deleted with its claim, its directory with it; the
+ * file system checked and collected daily; and its metadata dumped, backed up nightly,
+ * and restored from the backup with the same files.
  *
  * The end-to-end run's workspaces shard (test/e2e/alasio.test.ts), registered with
  * workspaceStorage(): it makes its sessions as alasio does, one with no internet, which
@@ -32,6 +34,7 @@ import { componentName, NAMESPACE, neonName } from "../../cli/src/manifests/comm
 import { CSI_DRIVER, JUICEFS_PODS_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "../../cli/src/manifests/juicefs-csi.ts";
 import { VALKEY } from "../../cli/src/manifests/valkey.ts";
 import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
+import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
 import type { BroughtUp } from "./session-bring-up.ts";
@@ -44,6 +47,10 @@ const SEAWEEDFS = componentName("seaweedfs");
 /** Where the suite works in a session's workspace, and the files it writes first and expects everywhere after. */
 const WORKDIR = "/workspace/juicefs-e2e";
 const FIXTURE = `${WORKDIR}/fixture`;
+
+/** Where the suite writes the files a fork is to keep, beside one in the home. */
+const FORKED = `${WORKDIR}/forked`;
+const FORKED_HOME = "/home/agent/forked";
 
 /** The digest of the files under the current directory, which two copies of it share only when they hold the same. */
 const DIGEST = "find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-16";
@@ -178,6 +185,9 @@ const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some
 
 /** Makes the session `volumeId` with `netMode` as alasio does (./session-volumes.ts). */
 const create = (volumeId: string, netMode: NetMode) => inAlasio<Made>("./session-volumes.ts", "create", volumeId, netMode);
+
+/** Forks the session `source` into `volumeId` as alasio does (./session-volumes.ts). */
+const fork = (source: string, volumeId: string) => inAlasio<Made>("./session-volumes.ts", "fork", source, volumeId);
 
 /** The session's pod, which runs. */
 async function podOf(volumeId: string): Promise<V1Pod> {
@@ -327,6 +337,7 @@ export function workspaceStorage(): void {
   describe("workspaces on JuiceFS", () => {
     const sessions: Record<NetMode, string> = { none: "fs-e2e-none", full: "fs-e2e-full" };
     const none = sessions.none;
+    const forked = "fs-e2e-fork";
     let fixture: string;
     let fixtureWrittenAt: number;
 
@@ -402,6 +413,74 @@ export function workspaceStorage(): void {
       await until("the session's pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", none, SESSIONS))) ? undefined : true));
       await bringUp(none);
       assert.equal(await fixtureDigest(none), fixture);
+    });
+
+    test("a fork holds its source's files, with their owners, modes and symlinks, counted by its own quota, and its source runs again after", async () => {
+      await inWorkspaceOk(none, [
+        "set -e",
+        `mkdir -p ${FORKED}/private && cd ${FORKED}`,
+        "echo secret > private/key && chmod 600 private/key && chmod 700 private",
+        "printf '#!/bin/sh\\necho ran\\n' > run && chmod 755 run",
+        "ln -s private/key link && ln -s /nowhere dangling",
+        `echo home > ${FORKED_HOME}`,
+      ].join("\n"));
+      /** The files the fork is to keep, each with its owner, mode, type and target. */
+      const listing = (volumeId: string) => inWorkspaceOk(volumeId, `find ${FORKED} ${FORKED_HOME} -printf '%p %U:%G %m %y %l\\n' | LC_ALL=C sort`);
+      const listed = await listing(none);
+      assert.match(listed, /\/private\/key 1000:1000 600 f \n/u);
+      assert.match(listed, /\/link 1000:1000 777 l private\/key\n/u);
+      const running = (await podOf(none)).metadata?.uid;
+
+      assert.deepEqual(await fork(none, forked), { volumeId: forked, netMode: "none" });
+      // Its source, suspended for the clone, runs again, in a new pod, with its files.
+      const source = await podOf(none);
+      assert.ok(isReady(source) && source.metadata?.uid !== running, `the source runs in ${source.metadata?.uid}, as before the fork`);
+      assert.equal(await listing(none), listed);
+      // The fork waits to be brought up, its volume's quota the claim's, counting what it was cloned with.
+      assert.equal((await kube.get<Sandbox>(ref("Sandbox", forked, SESSIONS)))?.spec.operatingMode, "Suspended");
+      const claim = await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", `data-${forked}`, SESSIONS));
+      assert.equal(claim?.status?.phase, "Bound");
+      const directory = `${SESSIONS}-data-${forked}`;
+      const quota = await withAdminPod((inPod) => inPod("juicefs", `juicefs quota get "$META_URL" --path /${directory} && juicefs quota check "$META_URL" --path /${directory} 2>&1`));
+      assert.match(quota, new RegExp(`\\| /${directory} +\\| +1\\.0 GiB +\\| +[1-9][0-9.]* MiB `, "u"));
+      assert.match(quota, new RegExp(`quota of /${directory} is consistent`, "u"));
+      await bringUp(forked);
+      assert.equal(await listing(forked), listed);
+      assert.equal(await fixtureDigest(forked), fixture);
+      assert.equal((await inWorkspaceOk(forked, `${FORKED}/run`)).trim(), "ran");
+    });
+
+    test("a fork and its source see nothing of what is written in the other", async () => {
+      await inWorkspaceOk(forked, `cd ${FORKED} && echo fork > from-fork && echo changed > private/key && rm run`);
+      await inWorkspaceOk(none, `cd ${FORKED} && echo source > from-source && echo home again >> ${FORKED_HOME}`);
+      const seen = (volumeId: string) => inWorkspaceOk(volumeId, `cd ${FORKED} && ls && cat private/key ${FORKED_HOME}`);
+      assert.equal(await seen(none), "dangling\nfrom-source\nlink\nprivate\nrun\nsecret\nhome\nhome again\n");
+      assert.equal(await seen(forked), "dangling\nfrom-fork\nlink\nprivate\nchanged\nhome\n");
+    });
+
+    test("a fork takes no more than its own claim's size", async () => {
+      const said = await inWorkspaceOk(forked, [
+        `cd ${WORKDIR}`,
+        'fallocate -l 900M quota-a && echo "took 900M"',
+        'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
+        "rm -f quota-a quota-b",
+      ].join("; "));
+      assert.match(said, /^took 900M$/mu);
+      assert.match(said, /quota exceeded/iu);
+      assert.doesNotMatch(said, /took 300M more/u);
+    });
+
+    test("deleting a fork leaves whole both the session it was forked from and its own fork", async () => {
+      const again = `${forked}-again`;
+      assert.deepEqual(await fork(forked, again), { volumeId: again, netMode: "none" });
+      const volume = (await volumeOf(forked)).volume.metadata?.name ?? "";
+      await kube.remove(ref("Sandbox", forked, SESSIONS));
+      await until(`the fork's volume ${volume} deleted`, async () => ((await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume))) ? undefined : true));
+      assert.equal(await fixtureDigest(none), fixture);
+      await bringUp(again);
+      assert.equal(await fixtureDigest(again), fixture);
+      assert.equal(await inWorkspaceOk(again, `cat ${FORKED}/private/key`), "changed\n");
+      await kube.remove(ref("Sandbox", again, SESSIONS));
     });
 
     for (const component of [VALKEY, SEAWEEDFS]) {
