@@ -2,7 +2,8 @@
  * The loader's loop: a load now and then every interval, and a maintenance pass
  * whenever the last is older than its interval (it is recorded in the lake, so a
  * restart neither repeats nor skips one), which deletes the telemetry past its
- * retention too.
+ * retention too, and deletes no file while Neon has branches; a branch environment's
+ * lake is never maintained.
  *
  * The loop opens the lake itself and keeps it open between loads. A load that fails
  * is logged and counted, its connections are dropped, and it is tried again sooner
@@ -31,9 +32,15 @@ export interface LoaderOptions {
   metrics: Pick<Metrics, "add" | "set">;
   log: Log;
   intervalMs: number;
-  maintenanceIntervalMs: number;
+  /** Null for a lake that is never maintained. */
+  maintenanceIntervalMs: number | null;
   /** How many days of telemetry maintenance keeps. */
   retentionDays: number;
+  /**
+   * The branches of Neon's besides main, asked before each maintenance pass, which deletes
+   * no file while there are any, nor when they cannot be learned; none where not given.
+   */
+  branches?: () => Promise<readonly string[]>;
   retryMs?: number;
   sync?: (db: DuckDBConnection) => Promise<LakeLoad>;
 }
@@ -64,7 +71,17 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * failed for UNHEALTHY_AFTER_INTERVALS intervals; `stop()` lets a load under way finish,
  * closes the lake, and resolves once the loop has ended.
  */
-export function startLoader({ open, metrics, log, intervalMs, maintenanceIntervalMs, retentionDays, retryMs = RETRY_MS, sync = syncLake }: LoaderOptions): Loader {
+export function startLoader({
+  open,
+  metrics,
+  log,
+  intervalMs,
+  maintenanceIntervalMs,
+  retentionDays,
+  branches = async () => [],
+  retryMs = RETRY_MS,
+  sync = syncLake,
+}: LoaderOptions): Loader {
   const stopped = new AbortController();
   let lake: LoaderLake | null = null;
   let wake: (() => void) | null = null;
@@ -108,17 +125,30 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
     }
   }
 
-  async function maintainIfDue() {
+  /** The branches files are kept for, or null when they could not be learned, and every file is kept. */
+  async function keptFor(): Promise<readonly string[] | null> {
+    try {
+      return await branches();
+    } catch (error) {
+      log("could not learn Neon's branches; keeping every file", { error: errorText(error) });
+      return null;
+    }
+  }
+
+  async function maintainIfDue(every: number) {
     // Only ever after a load that succeeded, which leaves the lake open.
     const { db } = lake!;
     const last = await lastMaintained(db).catch(() => null);
-    if (last && Date.now() - last.getTime() < maintenanceIntervalMs) return;
+    if (last && Date.now() - last.getTime() < every) return;
+    const kept = await keptFor();
+    const keepFiles = kept === null || kept.length > 0;
+    const files = keepFiles ? "kept" : "deleted";
     try {
-      await maintainLake(db, { retentionDays });
-      metrics.add("lake_maintenance_total", { outcome: "success" });
-      log("maintained");
+      await maintainLake(db, { retentionDays, keepFiles });
+      metrics.add("lake_maintenance_total", { outcome: "success", files });
+      log("maintained", keepFiles ? { keptFilesFor: kept ?? "unknown branches" } : {});
     } catch (error) {
-      metrics.add("lake_maintenance_total", { outcome: "failure" });
+      metrics.add("lake_maintenance_total", { outcome: "failure", files });
       log("maintenance failed", { error: errorText(error) });
     }
   }
@@ -127,7 +157,7 @@ export function startLoader({ open, metrics, log, intervalMs, maintenanceInterva
     while (!stopped.signal.aborted) {
       const loaded = await cycle();
       if (stopped.signal.aborted) break;
-      if (loaded) await maintainIfDue();
+      if (loaded && maintenanceIntervalMs !== null) await maintainIfDue(maintenanceIntervalMs);
       if (stopped.signal.aborted) break;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, loaded ? intervalMs : Math.min(intervalMs, retryMs));

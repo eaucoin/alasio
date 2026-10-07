@@ -544,6 +544,12 @@ describe("telemetry", () => {
     assert.deepEqual(variable(lake, "LAKE_RETENTION_DAYS"), { name: "LAKE_RETENTION_DAYS", value: "7" });
   });
 
+  test("has the lake ask neon-control for Neon's branches, whose lakes read its files, with the token of its Secret", () => {
+    const lake = one<V1Deployment>(install(), "Deployment", "alasio-lake");
+    assert.deepEqual(variable(lake, "LAKE_BRANCHES_URL"), { name: "LAKE_BRANCHES_URL", value: "http://alasio-neon-control:8080/branches" });
+    assert.deepEqual(container(lake).envFrom, [{ secretRef: { name: "alasio-lake" } }]);
+  });
+
   test("admits alasio and folder workspaces' bayma to the collector, beside the stack", () => {
     const ingress = (objects: readonly KubernetesObject[]) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: unknown } }>(objects, "NetworkPolicy", "alasio-collector").spec;

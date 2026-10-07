@@ -19,6 +19,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import pg from "pg";
 
+import { branchesBesideMain } from "./branches.ts";
 import { type DatabaseConfig, loadConfig } from "./config.ts";
 import { type IntakeLake, startIntake } from "./intake.ts";
 import { type Lake, openLake } from "./lake.ts";
@@ -124,6 +125,7 @@ async function openForIntake(): Promise<IntakeLake> {
 }
 
 const metrics = createMetrics();
+const { branches } = config;
 const loader = startLoader({
   open,
   metrics,
@@ -131,6 +133,7 @@ const loader = startLoader({
   intervalMs: config.intervalMs,
   maintenanceIntervalMs: config.maintenanceIntervalMs,
   retentionDays: config.retentionDays,
+  ...(branches ? { branches: () => branchesBesideMain(branches) } : {}),
 });
 const intake = startIntake({ open: openForIntake, metrics, log });
 

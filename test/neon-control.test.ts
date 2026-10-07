@@ -4,9 +4,11 @@ import { describe, test } from "node:test";
 import {
   type Branch,
   BranchError,
+  BRANCHES_SCOPE,
   branchOfCompute,
   branchPoint,
   branchRequest,
+  callScopes,
   type ComputeStack,
   computeConfig,
   computeId,
@@ -211,4 +213,15 @@ test("neon-control takes a token of the admin scope only, not the tenant's every
   assert.ok(!bearsScope(publicKeyPem, bearer(signToken(generateKeyPair().privateKeyPem, "admin")), "admin"));
   assert.ok(!bearsScope(publicKeyPem, signToken(privateKeyPem, "admin"), "admin"));
   assert.ok(!bearsScope(publicKeyPem, undefined, "admin"));
+});
+
+test("the lake's token of the branches scope lists the branches, and calls nothing else", () => {
+  const { privateKeyPem, publicKeyPem } = generateKeyPair();
+  const lake = `Bearer ${signToken(privateKeyPem, BRANCHES_SCOPE)}`;
+  const takes = (method: string, url: string) => bearsScope(publicKeyPem, lake, ...callScopes(method, url));
+  assert.ok(takes("GET", "/branches"));
+  assert.ok(!takes("POST", "/branches"));
+  assert.ok(!takes("DELETE", "/branches/dev"));
+  assert.ok(!takes("PUT", "/notify-safekeepers"));
+  assert.ok(bearsScope(publicKeyPem, `Bearer ${signToken(privateKeyPem, "admin")}`, ...callScopes("POST", "/branches")));
 });

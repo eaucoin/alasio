@@ -14,7 +14,12 @@
  *   LAKE_DATA_PATH                          where the Parquet files go: s3://lake/ on the stack
  *   LAKE_S3_ENDPOINT, LAKE_S3_KEY, LAKE_S3_SECRET  for an s3:// data path
  *   LAKE_INTERVAL_SECONDS                   between loads (default 300)
- *   LAKE_MAINTENANCE_HOURS                  between maintenance passes (default 24)
+ *   LAKE_MAINTENANCE_HOURS                  between maintenance passes (default 24); 0 for
+ *                                           none, as a branch environment's lake, whose
+ *                                           files are main's too, has it
+ *   LAKE_BRANCHES_URL, LAKE_BRANCHES_TOKEN  neon-control's list of Neon's branches, and the
+ *                                           token it is read with: while it lists any but
+ *                                           main, maintenance deletes no file (sync.ts)
  *   LAKE_RETENTION_DAYS                     the days of telemetry kept (default 30)
  *   LAKE_MEMORY_LIMIT, LAKE_THREADS         DuckDB's (default 1GB, 2)
  *   LAKE_EXTENSION_DIRECTORY                the extensions the image installed; with it
@@ -51,6 +56,12 @@ export interface S3Config {
   secret: string;
 }
 
+/** neon-control's list of Neon's branches, and the bearer token it is read with. */
+export interface BranchesSource {
+  url: string;
+  token: string;
+}
+
 /** What the lake is opened with: its catalog and data path, whom it is opened as there, and its DuckDB's settings. */
 export interface LakeAccess {
   /** DuckLake's catalog. */
@@ -66,7 +77,10 @@ export interface LakeConfig extends LakeAccess {
   /** alasio's database, which the lake loads from. */
   source: DatabaseConfig;
   intervalMs: number;
-  maintenanceIntervalMs: number;
+  /** Null for a lake that is never maintained. */
+  maintenanceIntervalMs: number | null;
+  /** Where the lake learns of Neon's branches, which may read its files; null where it is not told. */
+  branches: BranchesSource | null;
   retentionDays: number;
   httpPort: number;
   intakePort: number;
@@ -99,6 +113,11 @@ function positive(env: NodeJS.ProcessEnv, name: string, fallback: number): numbe
   return value;
 }
 
+/** A positive number, or 0 for none: null. */
+function positiveOrNone(env: NodeJS.ProcessEnv, name: string, fallback: number): number | null {
+  return env[name]?.trim() === "0" ? null : positive(env, name, fallback);
+}
+
 /** The lake as `user` opens it, with the password and object store credentials of the variables `secrets` names. */
 function access(
   env: NodeJS.ProcessEnv,
@@ -128,11 +147,14 @@ function access(
 /** The lake service's configuration. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
   const lake = access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, "1GB");
+  const maintenanceHours = positiveOrNone(env, "LAKE_MAINTENANCE_HOURS", 24);
+  const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
   return {
     ...lake,
     source: { ...lake.catalog, database: optional(env, "LAKE_SOURCE_DATABASE", "alasio") },
     intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
-    maintenanceIntervalMs: positive(env, "LAKE_MAINTENANCE_HOURS", 24) * 3_600_000,
+    maintenanceIntervalMs: maintenanceHours === null ? null : maintenanceHours * 3_600_000,
+    branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,
     retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
     intakePort: positive(env, "LAKE_INTAKE_PORT", 4318),

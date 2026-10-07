@@ -60,6 +60,21 @@ export interface BranchRequest {
   lsn: string | null;
 }
 
+/**
+ * The scope of the lake's token, which lists the branches and does nothing else: Neon's
+ * own services do not know it.
+ */
+export const BRANCHES_SCOPE = "branches";
+
+/**
+ * The scopes of the tokens a call of neon-control's API (`method` on `url`) is taken
+ * with: the admin's, as the storage controller's hooks bear it, and for a list of the
+ * branches the lake's too, which keeps its files while any branch may read them.
+ */
+export function callScopes(method: string, url: string): readonly string[] {
+  return method === "GET" && url === "/branches" ? ["admin", BRANCHES_SCOPE] : ["admin"];
+}
+
 /** A refusal for the API's caller: its HTTP status, and what it says. */
 export class BranchError extends Error {
   readonly status: number;

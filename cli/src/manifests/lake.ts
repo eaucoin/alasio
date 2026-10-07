@@ -63,7 +63,13 @@ export function lakeObjects(config: InstallConfig): KubernetesObject[] {
               name: "lake",
               image,
               imagePullPolicy: config.images.pullPolicy,
-              env: [...lakeEnv, { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) }, ...otelEnv(config)],
+              env: [
+                ...lakeEnv,
+                { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) },
+                // Whose files it keeps: while Neon has branches, their lakes read its files.
+                { name: "LAKE_BRANCHES_URL", value: `http://${neonName("control")}:8080/branches` },
+                ...otelEnv(config),
+              ],
               envFrom: [{ secretRef: { name } }],
               ports: [{ name: "metrics", containerPort: 9464 }, { name: "otlp-http", containerPort: LAKE_INTAKE_PORT }],
               readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },

@@ -17,6 +17,7 @@
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
+import { BRANCHES_SCOPE } from "./branches.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
@@ -195,6 +196,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       LAKE_READER_S3_KEY: s3("lakeReader").accessKey,
       LAKE_READER_S3_SECRET: s3("lakeReader").secretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
+      // What it asks neon-control which branches there are with, which can do nothing else.
+      LAKE_BRANCHES_TOKEN: token(BRANCHES_SCOPE),
     },
     [names.grafana]: {
       GF_DATABASE_PASSWORD: secrets.grafanaPassword,

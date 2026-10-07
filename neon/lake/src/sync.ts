@@ -50,8 +50,8 @@ export async function syncLake(db: DuckDBConnection, options: LakeSyncOptions = 
  * catalog moved to files, snapshots past their retention expired, small files merged,
  * files mostly deleted rewritten, and then the files nothing refers to any longer
  * deleted: those expiry and the merges left (cleanup), and those no snapshot ever
- * recorded (orphans), which are the two steps that delete. Each is a call of its own,
- * so a lake whose files others still use (a branch's) can be kept without them.
+ * recorded (orphans), which are the two steps that delete (DELETING). Each is a call of
+ * its own, so a lake whose files others still use can be kept without them.
  */
 export const MAINTENANCE = [
   "ducklake_flush_inlined_data",
@@ -62,14 +62,33 @@ export const MAINTENANCE = [
   "ducklake_delete_orphaned_files",
 ] as const;
 
+/** The steps of MAINTENANCE that delete files. */
+export const DELETING: ReadonlySet<(typeof MAINTENANCE)[number]> = new Set(["ducklake_cleanup_old_files", "ducklake_delete_orphaned_files"]);
+
+/** What maintainLake is given. */
+export interface MaintenanceOptions {
+  /** How many days of telemetry it keeps. */
+  retentionDays: number;
+  /**
+   * Whether it keeps every file: while Neon has branches, each of whose lakes is a copy of
+   * this one's catalog at its branch point, which still names files this one's no longer
+   * does, and writes files of its own beside them, which this one's never named.
+   */
+  keepFiles: boolean;
+}
+
 /**
  * Keeps the lake in order: deletes the telemetry older than `retentionDays` days
- * (./otel.ts), then runs DuckLake's maintenance (MAINTENANCE), each step on its own.
- * Records when, so a restart does not repeat it.
+ * (./otel.ts), then runs DuckLake's maintenance (MAINTENANCE), each step on its own, but
+ * for those that delete files when it `keepFiles`; what they would have deleted waits
+ * for the first pass that does not. Records when, so a restart does not repeat it.
  */
-export async function maintainLake(db: DuckDBConnection, { retentionDays }: { retentionDays: number }): Promise<void> {
+export async function maintainLake(db: DuckDBConnection, { retentionDays, keepFiles }: MaintenanceOptions): Promise<void> {
   await deleteExpiredTelemetry(db, retentionDays);
-  for (const step of MAINTENANCE) await serially(() => db.run(`call ${step}('${LAKE}')`));
+  for (const step of MAINTENANCE) {
+    if (keepFiles && DELETING.has(step)) continue;
+    await serially(() => db.run(`call ${step}('${LAKE}')`));
+  }
   await transaction(db, async () => {
     await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);
     await db.run(`insert into ${LAKE}.loader.meta values ('maintained_at', ${literal(new Date().toISOString())})`);

@@ -15,6 +15,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import { ConfigProvider, Effect } from "effect";
 import pg from "pg";
 
+import { branchesBesideMain } from "../neon/lake/src/branches.ts";
 import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
 import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } from "../neon/lake/src/config.ts";
@@ -523,12 +524,12 @@ describe("telemetry", () => {
       await db.run(`call ${LAKE}.set_option('expire_older_than', '0 seconds')`);
       await db.run(`call ${LAKE}.set_option('delete_older_than', '0 seconds')`);
 
-      await maintainLake(db, { retentionDays: 30 });
+      await maintainLake(db, { retentionDays: 30, keepFiles: false });
       const kept = await rows<{ day: Date }>(db, `select Timestamp::DATE::TIMESTAMP as day from ${LAKE}.otel.logs where ServiceName = 'retained' order by Timestamp`);
       assert.deepEqual(kept.map(({ day }) => day.toISOString().slice(0, 10)), [30n, 0n].map((ago) => day(ago).toISOString().slice(0, 10)));
       // The pass after the one that deleted them deletes their files, once their snapshots expire.
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await maintainLake(db, { retentionDays: 30 });
+      await maintainLake(db, { retentionDays: 30, keepFiles: false });
       assert.deepEqual([files(40n), files(31n)], [[], []]);
       assert.ok(files(30n).length > 0);
     });
@@ -618,15 +619,120 @@ describe("the lake", () => {
       assert.ok(await lastMaintained(db));
       const text = metrics.render();
       assert.match(text, /^lake_cycles_total\{outcome="success"\} 1$/m);
-      assert.match(text, /^lake_maintenance_total\{outcome="success"\} 1$/m);
+      assert.match(text, /^lake_maintenance_total\{outcome="success",files="deleted"\} 1$/m);
       assert.match(text, /^# TYPE lake_rows_total counter$/m);
       // Maintained within the interval: the next loader does not maintain again.
       const again = startLoader({ open, metrics, log: (message) => logs.push(message), intervalMs: 60_000, maintenanceIntervalMs: 3_600_000, retentionDays: 30 });
       await new Promise((resolve) => setTimeout(resolve, 500));
       await again.stop();
       assert.equal(logs.filter((message) => message === "maintained").length, 1);
-      await maintainLake(db, { retentionDays: 30 }); // and on demand it runs at once
+      await maintainLake(db, { retentionDays: 30, keepFiles: false }); // and on demand it runs at once
     });
+  });
+
+  test("while Neon has branches the loader's maintenance deletes no file, nor when it cannot learn them; a branch's lake is never maintained", async () => {
+    await withLake(async (db) => {
+      const metrics = createMetrics();
+      const logs: string[] = [];
+      const open = async () => ({ db, close: async () => {}, lost: () => false });
+      const maintained = async (options: Pick<Parameters<typeof startLoader>[0], "maintenanceIntervalMs" | "branches">) => {
+        await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);
+        const loader = startLoader({ open, metrics, log: (message, fields) => logs.push(`${message}${fields ? ` ${JSON.stringify(fields)}` : ""}`), intervalMs: 60_000, retentionDays: 30, ...options });
+        for (let waited = 0; !logs.some((line) => line.startsWith("maintained")) && waited < 2000; waited += 50) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await loader.stop();
+        return logs.splice(0).filter((line) => !line.startsWith("loaded"));
+      };
+      assert.deepEqual(await maintained({ maintenanceIntervalMs: 3_600_000, branches: async () => ["try-codex"] }), ['maintained {"keptFilesFor":["try-codex"]}']);
+      assert.deepEqual(await maintained({
+        maintenanceIntervalMs: 3_600_000,
+        branches: async () => {
+          throw new Error("neon-control answered 503");
+        },
+      }), ['could not learn Neon\'s branches; keeping every file {"error":"neon-control answered 503"}', 'maintained {"keptFilesFor":"unknown branches"}']);
+      assert.deepEqual(await maintained({ maintenanceIntervalMs: 3_600_000, branches: async () => [] }), ["maintained {}"]);
+      assert.deepEqual(await maintained({ maintenanceIntervalMs: null }), []);
+      assert.equal(await lastMaintained(db), null);
+      const text = metrics.render();
+      assert.match(text, /^lake_maintenance_total\{outcome="success",files="kept"\} 2$/m);
+      assert.match(text, /^lake_maintenance_total\{outcome="success",files="deleted"\} 1$/m);
+    });
+  });
+
+  test("a branch's lake reads every file its catalog names through a week of main's maintenance, and once no branch is left main deletes what the branch wrote", async () => {
+    // A branch's catalog is a copy of main's at its branch point, as Neon's branch of the
+    // `lake` database is: here, one database made from the other as its template.
+    const superuser = new pg.Client({ connectionString: postgres?.url });
+    await superuser.connect();
+    const gateDir = mkdtempSync(join(tmpdir(), "alasio-lake-gate-"));
+    const lakeOf = (database: string): LakeConfig => ({ ...config, dataPath: gateDir, catalog: { ...config.catalog, database } });
+    const parquet = () => readdirSync(gateDir, { recursive: true, encoding: "utf8" }).filter((name) => name.endsWith(".parquet")).map((name) => join(gateDir, name));
+    const named = async (db: DuckDBConnection) => (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 't')`)).map(({ data_file }) => data_file);
+    const total = async (db: DuckDBConnection) => (await one<Count>(db, `select count(*) as n from ${LAKE}.t`)).n;
+    // Each open made ready as the lake service makes it, but keeping nothing past its need,
+    // so what a pass may delete it deletes at once.
+    const opened = async (database: string) => {
+      const lake = await openLake(lakeOf(database));
+      await prepareLake(lake.db);
+      await lake.db.run(`call ${LAKE}.set_option('expire_older_than', '0 seconds')`);
+      await lake.db.run(`call ${LAKE}.set_option('delete_older_than', '0 seconds')`);
+      return lake;
+    };
+    try {
+      await superuser.query("create database gate_main owner lake");
+      let main = await opened("gate_main");
+      await main.db.run(`create table ${LAKE}.t (i integer)`);
+      for (let batch = 0; batch < 3; batch++) await main.db.run(`insert into ${LAKE}.t select range from range(${batch * 100}, ${batch * 100 + 100})`);
+      const shared = await named(main.db);
+      main.close();
+      await superuser.query("select pg_terminate_backend(pid) from pg_stat_activity where datname = 'gate_main'");
+      await superuser.query("create database gate_branch template gate_main owner lake");
+
+      const branch = await opened("gate_branch");
+      await branch.db.run(`insert into ${LAKE}.t select range from range(1000, 1100)`);
+      const branchFiles = await named(branch.db);
+      const ownFiles = branchFiles.filter((file) => !shared.includes(file));
+      assert.equal(ownFiles.length, 1);
+      assert.equal(await total(branch.db), 400n);
+      branch.close();
+
+      // A week of main's maintenance, a pass a day: main changes what the branch shares,
+      // merging it, deleting from it, expiring every snapshot before the pass, with the
+      // branch alive.
+      main = await opened("gate_main");
+      for (let day = 0; day < 7; day++) {
+        await main.db.run(`insert into ${LAKE}.t select range from range(${2000 + day * 100}, ${2100 + day * 100})`);
+        await main.db.run(`delete from ${LAKE}.t where i % 7 = ${day}`);
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await maintainLake(main.db, { retentionDays: 30, keepFiles: true });
+      }
+      const mainFiles = await named(main.db);
+      assert.ok(shared.some((file) => !mainFiles.includes(file)), "main's maintenance no longer names some of what it shares with the branch");
+      const remaining = await total(main.db);
+      main.close();
+
+      const again = await opened("gate_branch");
+      const missing = (await named(again.db)).filter((file) => !parquet().includes(file));
+      assert.deepEqual(missing, []);
+      assert.equal(await total(again.db), 400n);
+      again.close();
+
+      // The branch deleted, main's next pass deletes what it kept, and what the branch wrote.
+      await superuser.query("drop database gate_branch with (force)");
+      main = await opened("gate_main");
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      await maintainLake(main.db, { retentionDays: 30, keepFiles: false });
+      assert.deepEqual(parquet().filter((file) => ownFiles.includes(file) || (shared.includes(file) && !mainFiles.includes(file))), []);
+      assert.equal(await total(main.db), remaining);
+      main.close();
+    } finally {
+      await superuser.query("select pg_terminate_backend(pid) from pg_stat_activity where datname like 'gate_%'");
+      await superuser.query("drop database if exists gate_branch with (force)");
+      await superuser.query("drop database if exists gate_main with (force)");
+      await superuser.end();
+      rmSync(gateDir, { recursive: true, force: true });
+    }
   });
 
   test("a load that fails drops its connections, and the next is made on fresh ones", async () => {
@@ -895,6 +1001,33 @@ test("the lake's configuration names what is missing and refuses what is malform
     [endpoint.catalog.user, endpoint.catalog.password, endpoint.catalog.database, endpoint.s3?.key, endpoint.token, endpoint.port, endpoint.memoryLimit],
     ["lake_reader", "r", "lake", "rk", "t", 8090, "256MB"],
   );
+  assert.deepEqual([config.maintenanceIntervalMs, config.branches], [86_400_000, null]);
+  const local = { ...base, LAKE_DATA_PATH: "/data" };
+  assert.equal(loadConfig({ ...local, LAKE_MAINTENANCE_HOURS: "0" }).maintenanceIntervalMs, null);
+  assert.throws(() => loadConfig({ ...local, LAKE_MAINTENANCE_HOURS: "-1" }), /LAKE_MAINTENANCE_HOURS must be a positive number/);
+  assert.throws(() => loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
+  assert.deepEqual(loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
+});
+
+test("the lake learns Neon's branches but main from neon-control, with its token, and fails on what is not a list of them", async () => {
+  const asked: (string | undefined)[] = [];
+  let answer: { status: number; body: unknown } = { status: 200, body: { branches: [{ name: "main" }, { name: "try-codex", state: "ready" }, { name: "gone", state: "deleting" }] } };
+  const server = createServer((request, response) => {
+    asked.push(request.headers.authorization);
+    response.writeHead(answer.status, { "content-type": "application/json" }).end(JSON.stringify(answer.body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const source = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/branches`, token: "lake-token" };
+  try {
+    assert.deepEqual(await branchesBesideMain(source), ["try-codex", "gone"]);
+    assert.deepEqual(asked, ["Bearer lake-token"]);
+    answer = { status: 401, body: {} };
+    await assert.rejects(branchesBesideMain(source), /neon-control answered 401/);
+    answer = { status: 200, body: { error: "no" } };
+    await assert.rejects(branchesBesideMain(source), /no list of branches/);
+  } finally {
+    server.close();
+  }
 });
 
 test("query results print as a table, CSV, or JSON lines", () => {

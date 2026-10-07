@@ -17,7 +17,8 @@
  * it does not run its compute.
  *
  * Its API takes a token of the admin scope, as the storage controller's hooks
- * do, and answers 401 without one, and 503 until bootstrapped. It speaks JSON; a
+ * do, or for `GET /branches` alone one of the `branches` scope, the lake's, and
+ * answers 401 without one, and 503 until bootstrapped. It speaks JSON; a
  * refusal is `{ "error": "<why>" }` with its status:
  *
  * - `POST /branches`, `{ name, parent?, lsn? }`: creates the branch `name` of
@@ -61,6 +62,7 @@ import {
   type BranchRequest,
   type BranchesFile,
   branchView,
+  callScopes,
   type ComputeStack,
   computeConfig,
   creationRefused,
@@ -397,8 +399,9 @@ async function bootstrap(): Promise<void> {
   setInterval(() => void serially(repairEverySafekeeper), REPAIR_INTERVAL_MS).unref();
 }
 
-/** Whether the request bears a token of the admin scope, as the storage controller's calls do. */
-const fromAdmin = (request: IncomingMessage): boolean => bearsScope(publicKeyPem, request.headers.authorization, "admin");
+/** Whether the request bears a token of a scope its call is taken with (callScopes). */
+const authorized = (request: IncomingMessage): boolean =>
+  bearsScope(publicKeyPem, request.headers.authorization, ...callScopes(request.method ?? "", request.url ?? ""));
 
 /** Whether the request carries the compute token, which only computes are given. */
 function fromCompute(request: IncomingMessage): boolean {
@@ -449,7 +452,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const hook = method === "PUT" && (url === "/notify-attach" || url === "/notify-safekeepers");
   const api = url === "/branches" ? method === "GET" || method === "POST" : branch !== null && method === "DELETE";
   if (!hook && !api) return answer(response, 404);
-  if (!fromAdmin(request)) return answer(response, 401);
+  if (!authorized(request)) return answer(response, 401);
   if (!ready) return answer(response, 503, { error: "neon-control is bootstrapping" });
   if (url === "/notify-attach") {
     // Every compute reaches the stack's one pageserver by its Service, whichever of

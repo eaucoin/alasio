@@ -14,7 +14,7 @@ const METRICS = {
   lake_rows_total: { type: "counter", help: "Rows loaded into or deleted from the lake, by table and change" },
   lake_cycle_duration_seconds: { type: "gauge", help: "How long the last load took" },
   lake_last_success_timestamp_seconds: { type: "gauge", help: "When a load last succeeded" },
-  lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome" },
+  lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome, and whether they deleted files or kept them for Neon's branches" },
   lake_telemetry_requests_total: { type: "counter", help: "OTLP requests the telemetry intake took, by signal and outcome" },
   lake_telemetry_rows_total: { type: "counter", help: "Rows the telemetry intake wrote, by table" },
 } satisfies Record<string, Metric>;
