@@ -49,7 +49,7 @@ const codex = Command.make("codex", {}, () =>
     Command.withShortDescription("Log Codex in"),
     Command.withDescription(
       "Runs Codex's device login in alasio's pod, at this terminal: Codex shows a code to enter on a page it names, " +
-        "and keeps the login on alasio's volume, so it is done once.",
+        "and alasio keeps the login in its Neon (under the host profile, in the operator's own Codex home), so it is done once.",
     ),
   );
 

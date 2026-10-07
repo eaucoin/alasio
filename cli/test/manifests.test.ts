@@ -188,6 +188,7 @@ describe("alasio", () => {
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_KUBE_TEMPLATES"), { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" });
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_STATE_DIR"), { name: "ALASIO_STATE_DIR", value: "/var/lib/alasio/state" });
     assert.deepEqual(env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/var/lib/alasio/home" });
+    assert.deepEqual(env?.find(({ name }) => name === "ALASIO_KEEP_CODEX_LOGIN"), { name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" });
     const spec = deployment.spec?.template.spec;
     assert.deepEqual(spec?.volumes?.filter((volume) => volume.persistentVolumeClaim), []);
     assert.equal(spec?.initContainers, undefined);
@@ -233,6 +234,8 @@ describe("alasio", () => {
     assert.deepEqual(spec?.containers[0]?.env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/home/op" });
     assert.deepEqual(spec?.containers[0]?.volumeMounts?.find(({ name }) => name === "home"), { name: "home", mountPath: "/home" });
     assert.deepEqual(spec?.volumes?.find(({ name }) => name === "home"), { name: "home", hostPath: { path: "/home" } });
+    // Their home keeps their own Codex login.
+    assert.equal(spec?.containers[0]?.env?.find(({ name }) => name === "ALASIO_KEEP_CODEX_LOGIN"), undefined);
     assert.equal(spec?.volumes?.find(({ name }) => name === "alasio-home"), undefined);
   });
 

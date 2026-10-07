@@ -152,6 +152,13 @@ create table if not exists ${SCHEMA}.restart_events (
   recorded_at timestamptz not null default now()
 );
 
+-- Codex's login (its auth.json), where its home does not outlast alasio's pod; one row.
+create table if not exists ${SCHEMA}.codex_login (
+  one boolean primary key default true check (one),
+  auth text not null,
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists ${SCHEMA}.session_usage (
   session_id text primary key,
   cache_read_input_tokens integer not null,

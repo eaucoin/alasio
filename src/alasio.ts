@@ -8,6 +8,8 @@ import { Cause, Effect, Exit, Layer, type Scope } from "effect";
 import type { Pool } from "pg";
 
 import { CodexAppServer } from "./codex/app-server/client.ts";
+import { codexHome } from "./codex/env.ts";
+import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turns.ts";
 import type { AlasioConfig } from "./config.ts";
@@ -64,7 +66,7 @@ export type AlasioServices =
  * before it. The turns are made after the harnesses, Telegram and the store they report
  * to, so that stopping alasio interrupts the turns running while those are still there.
  */
-export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError> {
+export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError | CodexLoginError> {
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds))),
     Layer.provideMerge(Turns.layer()),
@@ -79,6 +81,8 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       Outbox.layer,
       WorkflowHooks.layer(options.hookPort),
       ReceivedFiles.layer(options),
+      // Before Codex is first started, which is not before a turn needs it.
+      options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
       codexServices(options),
       ActiveTurns.layer,
@@ -124,7 +128,7 @@ function codexServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<
  * started on them; when the scope closes, the app stops first, then each service in the
  * reverse of the order it was made in.
  */
-export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): Effect.fn.Return<void, TelegramAppError, Scope.Scope> {
+export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): Effect.fn.Return<void, TelegramAppError | CodexLoginError, Scope.Scope> {
   yield* Layer.build(serveTelegram(options).pipe(Layer.provide(alasioServices(options))));
   // Added last, so the first thing a stop does.
   yield* Effect.addFinalizer(() => Effect.logInfo("Shutting down..."));

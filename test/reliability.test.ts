@@ -256,6 +256,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       stateDir: join(root, ".alasio"),
       pool: await testPool(),
       stateSchema: newSchema(),
+      keepCodexLogin: false,
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,

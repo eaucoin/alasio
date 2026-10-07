@@ -53,6 +53,7 @@ if (import.meta.main) {
       stateDir: config.stateDir,
       pool,
       stateSchema: config.stateSchema,
+      keepCodexLogin: false,
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,

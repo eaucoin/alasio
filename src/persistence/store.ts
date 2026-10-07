@@ -12,6 +12,7 @@ import type { Pool } from "pg";
 import type { HarnessName } from "../harness/names.ts";
 import type { MediaAttachment } from "../telegram/client.ts";
 import { type CallbackAction, NeonCallbackRepository, type NewCallbackAction } from "./callback-repository.ts";
+import { NeonCodexLoginRepository } from "./codex-login-repository.ts";
 import {
   type Conversation,
   type HarnessSessionReference,
@@ -76,6 +77,7 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
   promptJobs: new NeonPromptJobRepository(sql, schema),
   restarts: new NeonRestartRepository(sql, schema),
   usage: new NeonUsageRepository(sql, schema),
+  codexLogin: new NeonCodexLoginRepository(sql, schema),
 });
 
 /** What alasio does with its store; each of it fails as Neon does. */
@@ -181,6 +183,11 @@ export class Store extends Context.Service<Store, {
   readonly updateSessionUsage: (sessionId: string | null | undefined, usage: SessionUsage | null | undefined) => Stored<void>;
   readonly getSessionTokens: (sessionId: string) => Stored<number>;
 
+  /** The text of Codex's auth.json as last kept, or null when none is. */
+  readonly getCodexLogin: Stored<string | null>;
+  /** Keeps `auth` as Codex's login; null, Codex logged out, keeps none. */
+  readonly setCodexLogin: (auth: string | null) => Stored<void>;
+
   /**
    * Deletes what is only kept while it is in flight, `age` after it landed: updates
    * processed, albums handled, and replies delivered.
@@ -194,7 +201,11 @@ export class Store extends Context.Service<Store, {
 const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null }: StoreOptions) {
   const database = poolDatabase(pool);
   yield* ensureSchema(database, schema);
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage } = repositories(database, schema, workingDirectory);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin } = repositories(
+    database,
+    schema,
+    workingDirectory,
+  );
 
   return Store.of({
     getState: (key) => state.getState(key),
@@ -295,6 +306,9 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
 
     updateSessionUsage: (sessionId, sessionUsage) => usage.updateSessionUsage(sessionId, sessionUsage),
     getSessionTokens: (sessionId) => usage.getSessionTokens(sessionId),
+
+    getCodexLogin: codexLogin.getCodexLogin(),
+    setCodexLogin: (auth) => codexLogin.setCodexLogin(auth),
 
     pruneTransient: (age) => {
       const ageMs = Duration.toMillis(age);

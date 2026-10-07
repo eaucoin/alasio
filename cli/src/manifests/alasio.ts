@@ -196,12 +196,14 @@ function sandboxTemplates(config: InstallConfig): { readonly configMap: V1Config
 }
 
 /** alasio's environment: where its templates, state, database and receiver are, and what the configuration adds. */
-function alasioEnv(config: InstallConfig, home: string): V1EnvVar[] {
+function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean): V1EnvVar[] {
   const { alasio, host } = config;
   return [
     { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" },
     { name: "ALASIO_STATE_DIR", value: "/var/lib/alasio/state" },
     { name: "HOME", value: home },
+    // A home of alasio's own does not outlast its pod; the operator's keeps their login.
+    ...(operatorHome ? [] : [{ name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" }]),
     { name: "ALASIO_DEPLOYMENT", value: RELEASE },
     { name: "ALASIO_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
     { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "token" } } },
@@ -257,7 +259,7 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
             image,
             imagePullPolicy: config.images.pullPolicy,
             workingDir: home,
-            env: alasioEnv(config, home),
+            env: alasioEnv(config, home, operatorHome),
             ...given("envFrom", [...alasio.envFrom]),
             ports: [{ name: "telemetry", containerPort: config.telemetry.receiverPort }],
             securityContext: restrictedContainer(),
