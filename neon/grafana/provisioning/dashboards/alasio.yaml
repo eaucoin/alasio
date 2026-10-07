@@ -1,0 +1,12 @@
+# alasio's dashboards (../../dashboards/), read-only: the repository's files are what
+# they are, and a change made in Grafana's UI is lost as it restarts.
+apiVersion: 1
+providers:
+  - name: alasio
+    folder: alasio
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/alasio/dashboards
+      foldersFromFilesStructure: false

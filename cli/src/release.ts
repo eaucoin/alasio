@@ -10,6 +10,7 @@ export const IMAGES = {
   alasio: { repository: "ghcr.io/eaucoin/alasio", tag: VERSION, digest: "" },
   agent: { repository: "ghcr.io/eaucoin/alasio-agent", tag: VERSION, digest: "" },
   lake: { repository: "ghcr.io/eaucoin/alasio-lake", tag: VERSION, digest: "" },
+  grafana: { repository: "ghcr.io/eaucoin/alasio-grafana", tag: VERSION, digest: "" },
 };
 
 /** The node image of the cluster in Docker: k3s with gVisor (cluster/node), pinned like the others. */

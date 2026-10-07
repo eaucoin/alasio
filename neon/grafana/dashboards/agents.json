@@ -1,0 +1,1475 @@
+{
+  "uid": "alasio-agents",
+  "title": "Agents",
+  "description": "Claude Code's and Codex's turns as alasio runs them, from its alasio.turn spans; the tokens they spend and the tools they call, from their transcripts; and a turn's trace, span by span.",
+  "tags": [
+    "alasio"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "schemaVersion": 41,
+  "templating": {
+    "list": [
+      {
+        "name": "trace",
+        "label": "Turn",
+        "type": "query",
+        "datasource": {
+          "type": "yesoreyeram-infinity-datasource",
+          "uid": "lake"
+        },
+        "query": {
+          "queryType": "infinity",
+          "refId": "variable",
+          "infinityQuery": {
+            "refId": "A",
+            "datasource": {
+              "type": "yesoreyeram-infinity-datasource",
+              "uid": "lake"
+            },
+            "type": "json",
+            "source": "url",
+            "parser": "backend",
+            "format": "table",
+            "url": "/query",
+            "url_options": {
+              "method": "POST",
+              "body_type": "raw",
+              "body_content_type": "text/plain",
+              "data": "select strftime(Timestamp, '%Y-%m-%d %H:%M:%S') || ', ' || SpanAttributes['alasio.conversation.id'] || ', ' || coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as __text,\nTraceId as __value\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 200"
+            },
+            "root_selector": "",
+            "columns": [
+              {
+                "selector": "__text",
+                "text": "__text",
+                "type": "string"
+              },
+              {
+                "selector": "__value",
+                "text": "__value",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "refresh": 2
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Turns",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Turns",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Turns started in the time range.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select count(*) as turns from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Failed",
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "Turns that failed: their harness failed them, or alasio did.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select count(*) filter (where (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed')) as failed from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "failed",
+              "text": "failed",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Median turn",
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "description": "From a turn's start to its reply being queued for delivery.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select quantile_cont(Duration, 0.5) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "95th percentile turn",
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select quantile_cont(Duration, 0.95) / 1e9 as seconds from otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to})"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Turns by outcome",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Completed, incomplete (the harness ended without a reply), interrupted, stopped (as alasio stopped), or failed.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, coalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, count(*) as turns\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "outcome",
+              "text": "outcome",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.outcome}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Turn durations",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "description": "By harness.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, SpanAttributes['alasio.harness'] || ', median' as series, quantile_cont(Duration, 0.5) / 1e9 as seconds\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\nunion all\nselect time_bucket(to_milliseconds(${__interval_ms}), Timestamp), SpanAttributes['alasio.harness'] || ', 95th percentile', quantile_cont(Duration, 0.95) / 1e9\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by all\norder by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "series",
+              "text": "series",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.series}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Turns",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 9
+      },
+      "description": "The latest first. A trace leads to the turn's spans, below.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select Timestamp as time, SpanAttributes['alasio.conversation.id'] as conversation, SpanAttributes['alasio.harness'] as harness,\ncoalesce(SpanAttributes['alasio.turn.outcome'], StatusCode) as outcome, Duration / 1e9 as duration, SpanAttributes['alasio.session.id'] as session,\nSpanAttributes['alasio.volume.id'] as workspace, TraceId as trace\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by Timestamp desc limit 500"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "conversation",
+              "text": "conversation",
+              "type": "string"
+            },
+            {
+              "selector": "harness",
+              "text": "harness",
+              "type": "string"
+            },
+            {
+              "selector": "outcome",
+              "text": "outcome",
+              "type": "string"
+            },
+            {
+              "selector": "duration",
+              "text": "duration",
+              "type": "number"
+            },
+            {
+              "selector": "session",
+              "text": "session",
+              "type": "string"
+            },
+            {
+              "selector": "workspace",
+              "text": "workspace",
+              "type": "string"
+            },
+            {
+              "selector": "trace",
+              "text": "trace",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "time": 0,
+              "conversation": 1,
+              "harness": 2,
+              "outcome": 3,
+              "duration": 4,
+              "session": 5,
+              "workspace": 6,
+              "trace": 7
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "The turn's spans",
+                    "url": "/d/alasio-agents/agents?var-trace=${__value.raw}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Tokens",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Claude Code's tokens",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "By the messages of Claude Code's transcripts, as their last entry counts them.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), started_at) as time, input_tokens as input, output_tokens as output,\ncache_read_input_tokens as \"cache read\", cache_creation_input_tokens as \"cache written\"\nfrom claude.messages where started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}))\non input, output, \"cache read\", \"cache written\" into name kind value tokens)\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "kind",
+              "text": "kind",
+              "type": "string"
+            },
+            {
+              "selector": "tokens",
+              "text": "tokens",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.kind}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Codex's tokens",
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "By the responses of Codex's rollouts.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time, kind, sum(tokens) as tokens from (\nunpivot (select time_bucket(to_milliseconds(${__interval_ms}), occurred_at) as time, input_tokens - coalesce(cached_input_tokens, 0) as input, cached_input_tokens as \"cache read\",\noutput_tokens as output, reasoning_output_tokens as reasoning\nfrom codex.token_usage where occurred_at >= epoch_ms(${__from}) and occurred_at < epoch_ms(${__to}))\non input, \"cache read\", output, reasoning into name kind value tokens)\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "kind",
+              "text": "kind",
+              "type": "string"
+            },
+            {
+              "selector": "tokens",
+              "text": "tokens",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.kind}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Tokens by model",
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 6
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select 'claude' as harness, model, count(*) as responses, sum(input_tokens) as input,\nsum(cache_read_input_tokens) as cache_read, sum(output_tokens) as output\nfrom claude.messages where started_at >= epoch_ms(${__from}) and started_at < epoch_ms(${__to}) group by all\nunion all\nselect 'codex', t.model, count(*), sum(u.input_tokens - coalesce(u.cached_input_tokens, 0)), sum(u.cached_input_tokens), sum(u.output_tokens)\nfrom codex.token_usage u left join codex.turns t using (home, thread_id, turn_id) where u.occurred_at >= epoch_ms(${__from}) and u.occurred_at < epoch_ms(${__to}) group by all\norder by output desc"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "harness",
+              "text": "harness",
+              "type": "string"
+            },
+            {
+              "selector": "model",
+              "text": "model",
+              "type": "string"
+            },
+            {
+              "selector": "responses",
+              "text": "responses",
+              "type": "number"
+            },
+            {
+              "selector": "input",
+              "text": "input",
+              "type": "number"
+            },
+            {
+              "selector": "cache_read",
+              "text": "cache read",
+              "type": "number"
+            },
+            {
+              "selector": "output",
+              "text": "output",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "harness": 0,
+              "model": 1,
+              "responses": 2,
+              "input": 3,
+              "cache read": 4,
+              "output": 5
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Tool calls",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Tool calls",
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 14,
+        "h": 9
+      },
+      "description": "Each tool's calls, those its result says failed (Claude Code's), and how long each took to be answered.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select harness, tool, count(*) as calls, count(*) filter (where failed) as failed,\nquantile_cont(seconds, 0.5) as median, quantile_cont(seconds, 0.95) as p95, max(seconds) as slowest\nfrom (\nselect 'claude' as harness, tool_name as tool, coalesce(is_error, false) as failed, epoch(answered_at - called_at) as seconds\nfrom claude.tool_calls where called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\nunion all\nselect 'codex', name, false, epoch(answered_at - called_at) from codex.tool_calls where called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to})\n) group by all order by calls desc"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "harness",
+              "text": "harness",
+              "type": "string"
+            },
+            {
+              "selector": "tool",
+              "text": "tool",
+              "type": "string"
+            },
+            {
+              "selector": "calls",
+              "text": "calls",
+              "type": "number"
+            },
+            {
+              "selector": "failed",
+              "text": "failed",
+              "type": "number"
+            },
+            {
+              "selector": "median",
+              "text": "median",
+              "type": "number"
+            },
+            {
+              "selector": "p95",
+              "text": "95th percentile",
+              "type": "number"
+            },
+            {
+              "selector": "slowest",
+              "text": "slowest",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "harness": 0,
+              "tool": 1,
+              "calls": 2,
+              "failed": 3,
+              "median": 4,
+              "95th percentile": 5,
+              "slowest": 6
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "median"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "95th percentile"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "slowest"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Tool calls failing",
+      "gridPos": {
+        "x": 14,
+        "y": 38,
+        "w": 10,
+        "h": 9
+      },
+      "description": "Claude Code's tool calls whose result is an error, by tool.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), called_at) as time, tool_name as tool, count(*) as failed\nfrom claude.tool_calls where is_error and called_at >= epoch_ms(${__from}) and called_at < epoch_ms(${__to}) group by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "tool",
+              "text": "tool",
+              "type": "string"
+            },
+            {
+              "selector": "failed",
+              "text": "failed",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.tool}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "A turn's trace",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "traces",
+      "title": "Trace",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 12
+      },
+      "description": "The spans of the turn chosen above: alasio's, its harness's and its workspace's bayma's. Their attributes are in the table below.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "trace",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select TraceId as traceID, SpanId as spanID, ParentSpanId as parentSpanID, SpanName as operationName,\nServiceName as serviceName, epoch_ms(Timestamp) as startTime, Duration / 1e6 as duration\nfrom otel.traces where TraceId = '${trace}'"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "traceID",
+              "text": "traceID",
+              "type": "string"
+            },
+            {
+              "selector": "spanID",
+              "text": "spanID",
+              "type": "string"
+            },
+            {
+              "selector": "parentSpanID",
+              "text": "parentSpanID",
+              "type": "string"
+            },
+            {
+              "selector": "operationName",
+              "text": "operationName",
+              "type": "string"
+            },
+            {
+              "selector": "serviceName",
+              "text": "serviceName",
+              "type": "string"
+            },
+            {
+              "selector": "startTime",
+              "text": "startTime",
+              "type": "number"
+            },
+            {
+              "selector": "duration",
+              "text": "duration",
+              "type": "number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "Spans",
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 24,
+        "h": 10
+      },
+      "description": "The trace's spans, each with its attributes and its resource's.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select Timestamp as time, ServiceName as service, SpanName as span, Duration / 1e6 as duration, StatusCode as status,\nStatusMessage as message, SpanAttributes as attributes, ResourceAttributes as resource\nfrom otel.traces where TraceId = '${trace}' order by Timestamp"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "service",
+              "text": "service",
+              "type": "string"
+            },
+            {
+              "selector": "span",
+              "text": "span",
+              "type": "string"
+            },
+            {
+              "selector": "duration",
+              "text": "duration",
+              "type": "number"
+            },
+            {
+              "selector": "status",
+              "text": "status",
+              "type": "string"
+            },
+            {
+              "selector": "message",
+              "text": "message",
+              "type": "string"
+            },
+            {
+              "selector": "attributes",
+              "text": "attributes",
+              "type": "string"
+            },
+            {
+              "selector": "resource",
+              "text": "resource",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "time": 0,
+              "service": 1,
+              "span": 2,
+              "duration": 3,
+              "status": 4,
+              "message": 5,
+              "attributes": 6,
+              "resource": 7
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 19,
+      "type": "table",
+      "title": "Logs",
+      "gridPos": {
+        "x": 0,
+        "y": 70,
+        "w": 24,
+        "h": 8
+      },
+      "description": "What was logged within the trace.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select Timestamp as time, ServiceName as service, SeverityText as severity, Body as message, LogAttributes as attributes\nfrom otel.logs where TraceId = '${trace}' order by Timestamp"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "service",
+              "text": "service",
+              "type": "string"
+            },
+            {
+              "selector": "severity",
+              "text": "severity",
+              "type": "string"
+            },
+            {
+              "selector": "message",
+              "text": "message",
+              "type": "string"
+            },
+            {
+              "selector": "attributes",
+              "text": "attributes",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "time": 0,
+              "service": 1,
+              "severity": 2,
+              "message": 3,
+              "attributes": 4
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    }
+  ]
+}

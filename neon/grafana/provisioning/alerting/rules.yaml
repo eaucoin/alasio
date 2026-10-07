@@ -1,0 +1,132 @@
+# alasio's alert rules, evaluated every minute on the lake through its query endpoint,
+# each alerting through the Telegram bot (policies.yaml). A rule whose query fails, the
+# lake's endpoint being down, alerts as a data source error.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: alasio
+    folder: alasio
+    interval: 1m
+    rules:
+      - uid: alasio-stack-unhealthy
+        title: A service of the stack is down
+        condition: down
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.service }} has answered none of the collector's scrapes for three minutes."
+        data:
+          - refId: up
+            relativeTimeRange: {from: 180, to: 0}
+            datasourceUid: lake
+            model:
+              refId: up
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select ServiceName as service, max(Value) as up
+                  from otel.metrics_gauge
+                  where MetricName = 'up' and TimeUnix > now()::timestamp - interval 3 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: service, text: service, type: string}
+                - {selector: up, text: up, type: number}
+          - refId: down
+            datasourceUid: __expr__
+            model:
+              refId: down
+              type: threshold
+              expression: up
+              conditions: [{evaluator: {type: lt, params: [1]}}]
+
+      - uid: alasio-turns-failing
+        title: Turns are failing
+        condition: failing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.failed }} of the turns of {{ $labels.conversation }} failed in the last ten minutes."
+        data:
+          - refId: failed
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: failed
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select SpanAttributes['alasio.conversation.id'] as conversation, count(*) as failed
+                  from otel.traces
+                  where SpanName = 'alasio.turn' and ServiceName = 'alasio'
+                    and (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed')
+                    and Timestamp > now()::timestamp - interval 10 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: conversation, text: conversation, type: string}
+                - {selector: failed, text: failed, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: failed
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      - uid: alasio-telemetry-absent
+        title: Telemetry is absent
+        condition: absent
+        for: 5m
+        noDataState: Alerting
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "No metric has reached the lake for five minutes: its intake, or the stack's collector, is down."
+        data:
+          - refId: points
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: points
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select count(*) as points
+                  from otel.metrics_gauge
+                  where TimeUnix > now()::timestamp - interval 5 minute
+              root_selector: ""
+              columns:
+                - {selector: points, text: points, type: number}
+          - refId: absent
+            datasourceUid: __expr__
+            model:
+              refId: absent
+              type: threshold
+              expression: points
+              conditions: [{evaluator: {type: lt, params: [1]}}]

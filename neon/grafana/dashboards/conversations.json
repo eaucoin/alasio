@@ -1,0 +1,468 @@
+{
+  "uid": "alasio-conversations",
+  "title": "Conversations",
+  "description": "Each conversation's turns, the harness sessions they ran in and the session workspaces they used, and what those spent, joined by the attributes alasio's telemetry carries: alasio.conversation.id, alasio.session.id and alasio.volume.id.",
+  "tags": [
+    "alasio"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "schemaVersion": 41,
+  "templating": {
+    "list": [
+      {
+        "name": "conversation",
+        "label": "Conversation",
+        "type": "query",
+        "datasource": {
+          "type": "yesoreyeram-infinity-datasource",
+          "uid": "lake"
+        },
+        "query": {
+          "queryType": "infinity",
+          "refId": "variable",
+          "infinityQuery": {
+            "refId": "A",
+            "datasource": {
+              "type": "yesoreyeram-infinity-datasource",
+              "uid": "lake"
+            },
+            "type": "json",
+            "source": "url",
+            "parser": "backend",
+            "format": "table",
+            "url": "/query",
+            "url_options": {
+              "method": "POST",
+              "body_type": "raw",
+              "body_content_type": "text/plain",
+              "data": "select distinct SpanAttributes['alasio.conversation.id'] as __text, SpanAttributes['alasio.conversation.id'] as __value\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) order by 1"
+            },
+            "root_selector": "",
+            "columns": [
+              {
+                "selector": "__text",
+                "text": "__text",
+                "type": "string"
+              },
+              {
+                "selector": "__value",
+                "text": "__value",
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Conversations",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Each conversation with a turn in the time range: its turns, its harness sessions (alasio.session.id) and the output tokens their transcripts count, and the session workspaces (alasio.volume.id) its turns ran in.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with turns as (\nselect SpanAttributes['alasio.conversation.id'] as conversation, SpanAttributes['alasio.harness'] as harness, SpanAttributes['alasio.session.id'] as session,\nnullif(SpanAttributes['alasio.volume.id'], '') as workspace, Timestamp, (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed') as failed\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) and SpanAttributes['alasio.conversation.id'] in (${conversation:sqlstring})\n),\nsessions as (select distinct conversation, session from turns where session is not null),\nclaude as (select s.conversation, sum(m.output_tokens) as tokens from sessions s join claude.messages m on m.session_id = s.session group by 1),\ncodex as (select s.conversation, sum(u.output_tokens) as tokens from sessions s join codex.token_usage u on u.thread_id = s.session group by 1)\nselect t.conversation, string_agg(distinct t.harness, ', ') as harnesses, count(*) as turns, count(*) filter (where t.failed) as failed,\nmax(t.Timestamp) as last_turn, count(distinct t.session) as sessions, string_agg(distinct t.workspace, ', ') as workspaces,\ncoalesce(any_value(claude.tokens), 0) + coalesce(any_value(codex.tokens), 0) as output_tokens\nfrom turns t left join claude using (conversation) left join codex using (conversation)\ngroup by 1 order by last_turn desc"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "conversation",
+              "text": "conversation",
+              "type": "string"
+            },
+            {
+              "selector": "harnesses",
+              "text": "harnesses",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            },
+            {
+              "selector": "failed",
+              "text": "failed",
+              "type": "number"
+            },
+            {
+              "selector": "last_turn",
+              "text": "last turn",
+              "type": "timestamp"
+            },
+            {
+              "selector": "sessions",
+              "text": "sessions",
+              "type": "number"
+            },
+            {
+              "selector": "workspaces",
+              "text": "session workspaces",
+              "type": "string"
+            },
+            {
+              "selector": "output_tokens",
+              "text": "output tokens",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "conversation": 0,
+              "harnesses": 1,
+              "turns": 2,
+              "failed": 3,
+              "last turn": 4,
+              "sessions": 5,
+              "session workspaces": 6,
+              "output tokens": 7
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Turns by conversation",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 7
+      },
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), Timestamp) as time, SpanAttributes['alasio.conversation.id'] as conversation, count(*) as turns\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) and SpanAttributes['alasio.conversation.id'] in (${conversation:sqlstring}) group by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "conversation",
+              "text": "conversation",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.conversation}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Sessions",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Each harness session (Claude Code's session id, Codex's thread id) with a turn in the time range, joined to its transcript: claude.messages, codex.token_usage.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with sessions as (\nselect SpanAttributes['alasio.session.id'] as session, any_value(SpanAttributes['alasio.conversation.id']) as conversation, any_value(SpanAttributes['alasio.harness']) as harness,\ncount(*) as turns, min(Timestamp) as first_turn, max(Timestamp) as last_turn\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) and SpanAttributes['alasio.conversation.id'] in (${conversation:sqlstring}) and SpanAttributes['alasio.session.id'] is not null group by 1\n)\nselect s.*, coalesce(c.messages, x.responses) as responses, coalesce(c.input, x.input) as input, coalesce(c.output, x.output) as output\nfrom sessions s\nleft join (select session_id as session, count(*) as messages, sum(input_tokens + coalesce(cache_read_input_tokens, 0)) as input, sum(output_tokens) as output\nfrom claude.messages group by 1) c using (session)\nleft join (select thread_id as session, count(*) as responses, sum(input_tokens) as input, sum(output_tokens) as output\nfrom codex.token_usage group by 1) x using (session)\norder by last_turn desc"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "session",
+              "text": "session",
+              "type": "string"
+            },
+            {
+              "selector": "conversation",
+              "text": "conversation",
+              "type": "string"
+            },
+            {
+              "selector": "harness",
+              "text": "harness",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            },
+            {
+              "selector": "first_turn",
+              "text": "first turn",
+              "type": "timestamp"
+            },
+            {
+              "selector": "last_turn",
+              "text": "last turn",
+              "type": "timestamp"
+            },
+            {
+              "selector": "responses",
+              "text": "responses",
+              "type": "number"
+            },
+            {
+              "selector": "input",
+              "text": "input tokens",
+              "type": "number"
+            },
+            {
+              "selector": "output",
+              "text": "output tokens",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "session": 0,
+              "conversation": 1,
+              "harness": 2,
+              "turns": 3,
+              "first turn": 4,
+              "last turn": 5,
+              "responses": 6,
+              "input tokens": 7,
+              "output tokens": 8
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Session workspaces",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 8
+      },
+      "description": "Each session workspace (alasio.volume.id) a turn ran in, or whose bayma sent telemetry, in the time range.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with turns as (\nselect SpanAttributes['alasio.volume.id'] as workspace, string_agg(distinct SpanAttributes['alasio.conversation.id'], ', ') as conversations, count(*) as turns, max(Timestamp) as last_turn\nfrom otel.traces where SpanName = 'alasio.turn' and ServiceName = 'alasio' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) and SpanAttributes['alasio.conversation.id'] in (${conversation:sqlstring}) and SpanAttributes['alasio.volume.id'] <> '' group by 1\n),\nbayma as (\nselect ResourceAttributes['alasio.volume.id'] as workspace, count(*) as spans, count(*) filter (where StatusCode = 'Error') as failed, max(Timestamp) as last_seen\nfrom otel.traces where ServiceName = 'bayma' and Timestamp >= epoch_ms(${__from}) and Timestamp < epoch_ms(${__to}) group by 1\n)\nselect workspace, turns.conversations, turns.turns, turns.last_turn, bayma.spans, bayma.failed, bayma.last_seen\nfrom turns full join bayma using (workspace) order by coalesce(turns.last_turn, bayma.last_seen) desc"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "workspace",
+              "text": "workspace",
+              "type": "string"
+            },
+            {
+              "selector": "conversations",
+              "text": "conversations",
+              "type": "string"
+            },
+            {
+              "selector": "turns",
+              "text": "turns",
+              "type": "number"
+            },
+            {
+              "selector": "last_turn",
+              "text": "last turn",
+              "type": "timestamp"
+            },
+            {
+              "selector": "spans",
+              "text": "bayma spans",
+              "type": "number"
+            },
+            {
+              "selector": "failed",
+              "text": "bayma spans failed",
+              "type": "number"
+            },
+            {
+              "selector": "last_seen",
+              "text": "bayma last seen",
+              "type": "timestamp"
+            }
+          ]
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "workspace": 0,
+              "conversations": 1,
+              "turns": 2,
+              "last turn": 3,
+              "bayma spans": 4,
+              "bayma spans failed": 5,
+              "bayma last seen": 6
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    }
+  ]
+}

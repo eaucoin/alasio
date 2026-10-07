@@ -3,12 +3,12 @@
  * of the images the release published, into cli/src/release.ts, which holds nothing
  * else. The release workflow runs it before it builds the package:
  *
- *   node tooling/pin-release.ts <version> alasio=<digest> alasio-agent=<digest> alasio-lake=<digest> alasio-node=<digest>
+ *   node tooling/pin-release.ts <version> alasio=<digest> alasio-agent=<digest> alasio-lake=<digest> alasio-grafana=<digest> alasio-node=<digest>
  */
 import { writeFileSync } from "node:fs";
 
 /** The images a release publishes, by the name of their repository under ghcr.io/eaucoin. */
-export const RELEASED_IMAGES = ["alasio", "alasio-agent", "alasio-lake", "alasio-node"] as const;
+export const RELEASED_IMAGES = ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-node"] as const;
 
 export type ReleasedImage = (typeof RELEASED_IMAGES)[number];
 
@@ -21,7 +21,7 @@ export interface ReleasePin {
 /** What the repository's release.ts holds between releases: a development version, no image pinned. */
 export const DEVELOPMENT: ReleasePin = {
   version: "0.0.0-development",
-  digests: { "alasio": "", "alasio-agent": "", "alasio-lake": "", "alasio-node": "" },
+  digests: { "alasio": "", "alasio-agent": "", "alasio-lake": "", "alasio-grafana": "", "alasio-node": "" },
 };
 
 const VERSION = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/u;
@@ -41,7 +41,16 @@ export function parsePin(args: readonly string[]): ReleasePin {
   const missing = RELEASED_IMAGES.filter((image) => !given.has(image));
   if (missing.length > 0) throw new Error(`no digest is given for ${missing.join(", ")}`);
   const digest = (image: ReleasedImage): string => given.get(image) ?? "";
-  return { version, digests: { "alasio": digest("alasio"), "alasio-agent": digest("alasio-agent"), "alasio-lake": digest("alasio-lake"), "alasio-node": digest("alasio-node") } };
+  return {
+    version,
+    digests: {
+      "alasio": digest("alasio"),
+      "alasio-agent": digest("alasio-agent"),
+      "alasio-lake": digest("alasio-lake"),
+      "alasio-grafana": digest("alasio-grafana"),
+      "alasio-node": digest("alasio-node"),
+    },
+  };
 }
 
 /** cli/src/release.ts as it is for `pin`. */
@@ -59,6 +68,7 @@ export const IMAGES = {
   alasio: ${image("alasio")},
   agent: ${image("alasio-agent")},
   lake: ${image("alasio-lake")},
+  grafana: ${image("alasio-grafana")},
 };
 
 /** The node image of the cluster in Docker: k3s with gVisor (cluster/node), pinned like the others. */

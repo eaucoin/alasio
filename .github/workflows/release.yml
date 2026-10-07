@@ -6,7 +6,7 @@ name: release
 #
 # The images must be public, as `npx alasio up` pulls them without a login. GitHub makes a
 # new package private, and its API cannot change a package's visibility, so the owner
-# makes each of the four public once, in its package settings, after the first release
+# makes each of the five public once, in its package settings, after the first release
 # made it; the step after the push warns of any not public yet.
 #
 # npm: with a trusted publisher configured for the package on npmjs.com (this repository,
@@ -77,7 +77,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # All four at once, each line said with its image's name, the node image with its pins
+      # All five at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts); then each one's digest.
       - id: images
         name: Build and push the images, recording their digests
@@ -86,7 +86,7 @@ jobs:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
@@ -124,12 +124,17 @@ jobs:
           push-to-registry: true
       - uses: actions/attest-build-provenance@v2
         with:
+          subject-name: ${{ env.REGISTRY }}/alasio-grafana
+          subject-digest: ${{ steps.images.outputs.alasio_grafana }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v2
+        with:
           subject-name: ${{ env.REGISTRY }}/alasio-node
           subject-digest: ${{ steps.images.outputs.alasio_node }}
           push-to-registry: true
       - name: The images are public
         run: |
-          for name in alasio alasio-agent alasio-lake alasio-node; do
+          for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node; do
             repository="${REGISTRY#ghcr.io/}/$name"
             token=$(curl -fsS "https://ghcr.io/token?scope=repository:$repository:pull" | jq -r .token)
             curl -fsS -o /dev/null -H "Authorization: Bearer $token" \
@@ -142,9 +147,10 @@ jobs:
           ALASIO: ${{ steps.images.outputs.alasio }}
           AGENT: ${{ steps.images.outputs.alasio_agent }}
           LAKE: ${{ steps.images.outputs.alasio_lake }}
+          GRAFANA: ${{ steps.images.outputs.alasio_grafana }}
           NODE: ${{ steps.images.outputs.alasio_node }}
         run: |
-          node tooling/pin-release.ts "$VERSION" "alasio=$ALASIO" "alasio-agent=$AGENT" "alasio-lake=$LAKE" "alasio-node=$NODE"
+          node tooling/pin-release.ts "$VERSION" "alasio=$ALASIO" "alasio-agent=$AGENT" "alasio-lake=$LAKE" "alasio-grafana=$GRAFANA" "alasio-node=$NODE"
           git diff cli/src/release.ts
       # Builds the command line, packs and checks its package, and runs it from an install of it.
       - run: node tooling/cli-package.ts

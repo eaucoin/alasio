@@ -791,6 +791,38 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("runs every query of Grafana's dashboards and alert rules", async () => {
+    await withLake((db) => ensureOtel(db));
+    const grafana = new URL("../neon/grafana/", import.meta.url);
+    // Each panel's and variable's query, as Infinity posts it.
+    const sql = readdirSync(new URL("dashboards/", grafana)).flatMap((file) => {
+      const dashboard: { panels: { title: string; targets?: { url_options: { data: string } }[] }[]; templating: { list: { name: string; query: { infinityQuery: { url_options: { data: string } } } }[] } } =
+        JSON.parse(readFileSync(new URL(`dashboards/${file}`, grafana), "utf8"));
+      return [
+        ...dashboard.panels.flatMap(({ title, targets = [] }) => targets.map(({ url_options }) => [`${file}: ${title}`, url_options.data])),
+        ...dashboard.templating.list.map(({ name, query }) => [`${file}: $${name}`, query.infinityQuery.url_options.data]),
+      ];
+    });
+    // Each rule's, the block after its query's `data: |`.
+    const rules = readFileSync(new URL("provisioning/alerting/rules.yaml", grafana), "utf8");
+    for (const [, indent, block] of rules.matchAll(/^( *)data: \|\n((?:\1 {2}.*\n)+)/gmu)) {
+      sql.push(["rules.yaml", (block ?? "").replaceAll(`\n${indent}  `, "\n").trim()]);
+    }
+    assert.ok(sql.length > 20, `${sql.length} queries`);
+    // Grafana's variables, as it fills them in.
+    const filled = (query: string) =>
+      [["${__from}", String(Date.now() - 3_600_000)], ["${__to}", String(Date.now())], ["${__interval_ms}", "60000"], ["${trace}", "0af7651916cd43dd8448eb211c80319c"], ["${conversation:sqlstring}", "'telegram:1'"]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), query);
+    const reader = await openReader(readerConfig);
+    try {
+      const failed: string[] = [];
+      for (const [where, query = ""] of sql) await answer(reader.db, filled(query)).catch((error: Error) => failed.push(`${where}: ${error.message}`));
+      assert.deepEqual(failed, []);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the query endpoint answers 503 while it cannot open the lake", async () => {
     const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
     const server = createServer(endpoint.handle);

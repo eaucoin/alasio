@@ -1,0 +1,26 @@
+# The lake, through its query endpoint (neon/lake/src/endpoint.ts), which runs a query,
+# the body Infinity posts to /query, as the lake's reader, and answers its rows as JSON.
+# LAKE_QUERY_URL is where the endpoint is, and LAKE_QUERY_TOKEN the token it takes, which
+# Grafana keeps encrypted. Its health is a query of the lake.
+apiVersion: 1
+datasources:
+  - name: lake
+    uid: lake
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    isDefault: true
+    editable: false
+    url: $LAKE_QUERY_URL
+    jsonData:
+      auth_method: bearerToken
+      allowedHosts: [$LAKE_QUERY_URL]
+      timeoutInSeconds: 60
+      customHealthCheckEnabled: true
+      customHealthCheckUrl: $LAKE_QUERY_URL/query
+      customHealthCheckUrlOptions:
+        method: POST
+        body_type: raw
+        body_content_type: text/plain
+        data: select count(*) from otel.traces
+    secureJsonData:
+      bearerToken: $LAKE_QUERY_TOKEN

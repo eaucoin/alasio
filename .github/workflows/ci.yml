@@ -62,7 +62,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # All four at once, each line said with its image's name, the node image with its pins
+      # All five at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), and on alasio's, alasio-codex-stand-in, which the end-to-end
       # runs install (test/e2e/codex-stand-in.Dockerfile); the step fails if any did.
       - id: push
@@ -73,7 +73,7 @@ jobs:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-node:cluster/node"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
@@ -202,7 +202,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-node alasio-codex-stand-in; do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node alasio-codex-stand-in; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
