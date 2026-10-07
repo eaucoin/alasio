@@ -16,6 +16,7 @@ import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import type { Harness, TurnPersistence } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
+import type { Store as StoreService } from "../src/persistence/store.ts";
 // Types only: effect itself is loaded once the SDK is registered, below.
 import type { Effect as EffectTypes } from "effect";
 import type { Outbox as OutboxService } from "../src/telegram/outbox.ts";
@@ -55,7 +56,7 @@ const { recordingTelegram, sentMessage } = await import("./support/telegram-call
 const { processPrompt } = await import("../src/operator/prompts.ts");
 const { eventually } = await import("./support/wait.ts");
 const { CLAUDE_HARNESS, CODEX_HARNESS } = await import("../src/harness/names.ts");
-const { SqliteStore } = await import("../src/persistence/store.ts");
+const { run: stored, testStore } = await import("./support/store.ts");
 const { sessionFsWorkspace } = await import("../src/workspace/kind.ts");
 const { AlasioLoggerLayer, withLogScope } = await import("../src/shared/log.ts");
 const { outsideTraces, resolveTelemetry, sharedResourceAttributes, TracingLayer, withoutTelemetry, withAlasioSpan, withRpcCall } = await import("../src/telemetry/index.ts");
@@ -73,7 +74,7 @@ const { botApiLayer, paramsOf } = await import("./support/bot-api.ts");
  * The Outbox over `store` and a Bot API `answer` answers, made with the tracing alasio
  * runs with (its delivery loop runs with it too), until `t` ends: what runs effects on it.
  */
-function outboxFor(t: TestContext, store: InstanceType<typeof SqliteStore>, answer: BotAnswer): <A, E>(effect: EffectTypes.Effect<A, E, OutboxService>) => Promise<A> {
+function outboxFor(t: TestContext, store: StoreService["Service"], answer: BotAnswer): <A, E>(effect: EffectTypes.Effect<A, E, OutboxService>) => Promise<A> {
   const outbox = ManagedRuntime.make(Outbox.layer.pipe(Layer.provide([botApiLayer(answer), Layer.succeed(Store, store)]), Layer.provideMerge(TracingLayer)));
   t.after(() => outbox.dispose());
   return (effect) => outbox.runPromise(effect);
@@ -290,11 +291,11 @@ test("Codex app-server requests carry their span's trace context", async () => {
 
 test("a prompt's update, turn, and reply delivery are one trace, however long the prompt waits, the turn naming its session and workspace", async () => {
   const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
-  const store = new SqliteStore(root, join(root, "alasio.sqlite"));
+  const store = await testStore();
   try {
-    const conversationId = store.upsertConversation({ chatId: "42", user: { id: 42 } });
-    store.setActiveHarness(conversationId, CODEX_HARNESS);
-    store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123"));
+    const conversationId = await stored(store.upsertConversation({ chatId: "42", user: { id: 42 } }));
+    await stored(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    await stored(store.setWorkingDirectory(conversationId, sessionFsWorkspace("fs-abc123")));
     const telegram = recordingTelegram({
       sendMessage: () => Effect.sync(() => [sentMessage(42, telegram.calls.sendMessage.length)]),
     });
@@ -342,7 +343,7 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     const harnesses = { [CODEX_HARNESS]: harness(CODEX_HARNESS), [CLAUDE_HARNESS]: harness(CLAUDE_HARNESS) };
     spans.reset();
     await withServices({ store, telegram: telegram.layer, harnesses, workspaceRoot: root, outbox }, async (alasio) => {
-      await alasio.runPromise(processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", filePaths: [] }).pipe(
+      await alasio.runPromise(processPrompt({ conversationId, chatId: "42", messageId: 9, text: "hello", files: [] }).pipe(
         withAlasioSpan("alasio.update", { kind: SpanKind.CONSUMER, parent: null }),
       ));
       // The conversation's prompt worker runs the turn, whose reply the outbox delivers.
@@ -372,36 +373,29 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     assert.ok(active);
     assert.equal(active.value, 0);
   } finally {
-    store.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("a deferred delivery records what stopped it and keeps its trace", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-telemetry-"));
-  const store = new SqliteStore(root, join(root, "alasio.sqlite"));
-  try {
-    store.upsertConversation({ chatId: "43", user: { id: 43 } });
-    const run = outboxFor(t, store, async () => {
-      throw new Error("Telegram is down");
-    });
-    spans.reset();
-    const turn = await inOtelSpan("test.turn", async (span) => {
-      await run(Effect.flatMap(Outbox, (outbox) => outbox.enqueueText({ chatId: "43", text: "reply" })));
-      await run(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
-      return span;
-    }, ROOT_CONTEXT);
-    const delivery = finishedSpan("alasio.delivery");
-    assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
-    assert.equal(delivery.status.code, SpanStatusCode.ERROR);
-    assert.equal(delivery.attributes["alasio.delivery.attempt"], 1);
-    assert.equal(store.getPendingOutboxCount(), 1);
-    const [pending] = (await metricPoints("alasio.outbox.pending")).filter((point) => point.value === 1);
-    assert.ok(pending);
-  } finally {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  }
+  const store = await testStore();
+  await stored(store.upsertConversation({ chatId: "43", user: { id: 43 } }));
+  const run = outboxFor(t, store, async () => {
+    throw new Error("Telegram is down");
+  });
+  spans.reset();
+  const turn = await inOtelSpan("test.turn", async (span) => {
+    await run(Effect.flatMap(Outbox, (outbox) => outbox.enqueueText({ chatId: "43", text: "reply" })));
+    await run(Effect.flatMap(Outbox, (delivery) => delivery.deliverDue));
+    return span;
+  }, ROOT_CONTEXT);
+  const delivery = finishedSpan("alasio.delivery");
+  assert.equal(delivery.parentSpanContext?.spanId, turn.spanContext().spanId);
+  assert.equal(delivery.status.code, SpanStatusCode.ERROR);
+  assert.equal(delivery.attributes["alasio.delivery.attempt"], 1);
+  assert.equal(await stored(store.getPendingOutboxCount), 1);
+  const [pending] = (await metricPoints("alasio.outbox.pending")).filter((point) => point.value === 1);
+  assert.ok(pending);
 });
 
 class EffectProbeError extends Schema.TaggedError<EffectProbeError>()("EffectProbeError", { message: Schema.String }) {}
@@ -465,15 +459,15 @@ test("an effect's call is a call of alasio's: a client span and a duration label
 
 /** A turn's persistence that keeps nothing: what the turn stores is not what this test looks at. */
 const forgetful: TurnPersistence = {
-  createPendingResponse: () => "pending-1",
-  updateActiveTurnPendingResponseId: () => undefined,
-  updatePendingSessionId: () => undefined,
-  updateActiveTurnSessionId: () => undefined,
-  appendBlockToPending: () => undefined,
-  markPendingResponseComplete: () => undefined,
-  markPendingAsPosted: () => undefined,
-  updateSessionUsage: () => undefined,
-  recordRestartEvent: () => undefined,
+  createPendingResponse: () => Effect.succeed("pending-1"),
+  updateActiveTurnPendingResponseId: () => Effect.void,
+  updatePendingSessionId: () => Effect.void,
+  updateActiveTurnSessionId: () => Effect.void,
+  appendBlocksToPending: () => Effect.void,
+  markPendingResponseComplete: () => Effect.void,
+  markPendingAsPosted: () => Effect.void,
+  updateSessionUsage: () => Effect.void,
+  recordRestartEvent: () => Effect.void,
 };
 
 test("Claude Code's process does not join the turn's trace, and its hooks and replies still run on alasio's logger and tracer", async () => {
@@ -520,6 +514,7 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
         chatId: "1",
         messageId: "9",
         workingDirectory: "/work",
+        modelChoice: null,
         persistence: forgetful,
         onBackgroundResponse: Deferred.succeed(replied, undefined).pipe(Effect.asVoid, withAlasioSpan("test.background-reply")),
       });

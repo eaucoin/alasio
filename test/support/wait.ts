@@ -10,11 +10,15 @@ export interface EventuallyOptions {
   readonly seen?: () => unknown;
 }
 
-/** What `probe` returns once it returns something other than undefined, within `timeoutMs`. */
-export async function eventually<T>(what: string, probe: () => T | undefined, { timeoutMs = 5_000, seen }: EventuallyOptions = {}): Promise<T> {
+/** What `probe` returns, or resolves to, once that is something other than undefined, within `timeoutMs`. */
+export async function eventually<T>(
+  what: string,
+  probe: () => T | undefined | Promise<T | undefined>,
+  { timeoutMs = 5_000, seen }: EventuallyOptions = {},
+): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const found = probe();
+    const found = await probe();
     if (found !== undefined) return found;
     if (Date.now() >= deadline) {
       throw new Error(`timed out after ${timeoutMs} ms waiting for ${what}${seen ? `; saw ${JSON.stringify(seen(), null, 2)}` : ""}`);

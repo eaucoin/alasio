@@ -1,130 +1,145 @@
-import type { Database } from "better-sqlite3";
+import { Effect } from "effect";
+
 import { newId } from "../shared/ids.ts";
-import type { SendMessageOptions } from "../telegram/client.ts";
-import type { SqliteConversationRepository } from "./conversation-repository.ts";
+import type { MediaAttachment, SendMessageOptions } from "../telegram/client.ts";
+import type { Sql, StoreError } from "./sql.ts";
 
 /**
- * The options a reply is sent with, as the Telegram client takes them. They are kept
- * as JSON, so they hold only what survives it.
+ * The options a reply is sent with, as the Telegram client takes them, but its media,
+ * which `outbox_media` keeps. They are kept as JSON, so they hold only what survives it.
  */
-export type OutboxMessageOptions = SendMessageOptions;
+export type OutboxMessageOptions = Omit<SendMessageOptions, "media">;
 
 export type OutboxState = "pending" | "sent";
 
 /** A row of `telegram_outbox`: a reply waiting for, or done with, delivery to Telegram. */
-export interface OutboxEntryRow {
+export interface OutboxEntry {
   readonly id: string;
   readonly conversation_id: string | null;
   readonly chat_id: string;
   readonly kind: "text";
   readonly text: string;
-  readonly options_json: string;
+  readonly options: OutboxMessageOptions;
   readonly pending_response_id: string | null;
   readonly state: OutboxState;
   readonly attempts: number;
-  /** Seconds since the epoch. */
-  readonly available_at: number;
+  readonly available_at: Date;
   readonly last_error: string | null;
   /** The W3C traceparent of the turn whose reply this is. */
   readonly traceparent: string | null;
-  readonly created_at: string;
-  readonly sent_at: string | null;
-}
-
-/** An outbox entry, with its options. */
-export interface OutboxEntry extends OutboxEntryRow {
-  readonly options: OutboxMessageOptions;
+  readonly created_at: Date;
+  readonly sent_at: Date | null;
 }
 
 export interface NewOutboxText {
   readonly chatId: number | string;
   readonly text: string;
-  readonly options?: OutboxMessageOptions | undefined;
+  readonly options?: SendMessageOptions | undefined;
   /** The pending response the reply delivers; one reply per pending response. */
   readonly pendingResponseId?: string | null | undefined;
   readonly traceparent?: string | null | undefined;
 }
 
-export class SqliteOutboxRepository {
-  private readonly db: Database;
-  private readonly conversations: SqliteConversationRepository;
+export class NeonOutboxRepository {
+  readonly #sql: Sql;
+  readonly #schema: string;
 
-  constructor(db: Database, conversationRepository: SqliteConversationRepository) {
-    this.db = db;
-    this.conversations = conversationRepository;
+  constructor(sql: Sql, schema: string) {
+    this.#sql = sql;
+    this.#schema = schema;
   }
 
-  enqueueText({ chatId, text, options = {}, pendingResponseId = null, traceparent = null }: NewOutboxText): string {
-    const conversationId = this.conversations.getConversationByChatId(chatId)?.id ?? null;
-    const id = newId();
-    const enqueue = this.db.transaction(() => {
-      const inserted = this.db.prepare<[
-        id: string,
-        conversationId: string | null,
-        chatId: string,
-        text: string,
-        optionsJson: string,
-        pendingResponseId: string | null,
-        traceparent: string | null,
-        availableAt: number,
-      ]>(`
-        insert into telegram_outbox
-          (id, conversation_id, chat_id, kind, text, options_json, pending_response_id, state, traceparent, available_at)
-        values (?, ?, ?, 'text', ?, ?, ?, 'pending', ?, ?)
-        on conflict (pending_response_id) where pending_response_id is not null do nothing
-      `).run(id, conversationId, String(chatId), text, JSON.stringify(options), pendingResponseId, traceparent, Date.now() / 1000);
-      if (pendingResponseId) {
-        this.db.prepare<[string]>("update response_blocks set posted = 1 where pending_response_id = ?").run(pendingResponseId);
-      }
-      if (inserted.changes > 0) {
-        return id;
-      }
-      // Only a reply already queued for this pending response conflicts with the insert.
-      return this.db.prepare<[string | null], string>("select id from telegram_outbox where pending_response_id = ?").pluck().get(pendingResponseId)!;
-    });
-    return enqueue();
+  /**
+   * Queues a reply with its media, and marks the pending response it delivers as posted:
+   * the id of the reply queued, or of the one already queued for that pending response.
+   */
+  enqueueText({ chatId, text, options = {}, pendingResponseId = null, traceparent = null }: NewOutboxText): Effect.Effect<string, StoreError> {
+    const { media = [], ...kept } = options;
+    // The statement sees the outbox as it was before it: a reply already queued for the
+    // pending response is there, one queued by it is not.
+    return this.#sql.query<{ id: string }>(
+      `with queued as (
+         insert into ${this.#schema}.telegram_outbox (id, conversation_id, chat_id, kind, text, options, pending_response_id, traceparent)
+         select $1, (select id from ${this.#schema}.conversations where transport = 'telegram' and chat_id = $2), $2, 'text', $3, $4, $5, $6
+         on conflict (pending_response_id) where pending_response_id is not null do nothing
+         returning id
+       ), media as (
+         insert into ${this.#schema}.outbox_media (outbox_id, position, id, kind, animation, file_name, content)
+         select queued.id, item.position, item.id, item.kind, item.animation, item.file_name, item.content
+         from queued, unnest($7::text[], $8::text[], $9::boolean[], $10::text[], $11::bytea[]) with ordinality
+           as item (id, kind, animation, file_name, content, position)
+       ), posted as (
+         update ${this.#schema}.responses set posted = true where id = $5
+       )
+       select id from queued
+       union all
+       select id from ${this.#schema}.telegram_outbox where pending_response_id = $5`,
+      [
+        newId(), String(chatId), text, JSON.stringify(kept), pendingResponseId, traceparent,
+        media.map((item) => item.id), media.map((item) => item.kind), media.map((item) => item.animation),
+        media.map((item) => item.fileName), media.map((item) => item.content),
+      ],
+    ).pipe(Effect.map(([row]) => row!.id));
   }
 
   /**
    * The replies due for delivery: each chat's in the order they were queued, so a reply
    * waiting to be retried holds back those queued after it to the same chat.
    */
-  getDue(limit = 20): OutboxEntry[] {
-    return this.db.prepare<[availableAt: number, limit: number], OutboxEntryRow>(`
-      select * from telegram_outbox reply
-      where state = 'pending' and available_at <= ?
-        and not exists (
-          select 1 from telegram_outbox earlier
-          where earlier.chat_id = reply.chat_id and earlier.state = 'pending'
-            and (earlier.created_at < reply.created_at or (earlier.created_at = reply.created_at and earlier.rowid < reply.rowid))
-        )
-      order by created_at asc, rowid asc
-      limit ?
-    `).all(Date.now() / 1000, limit).map((row) => ({
-      ...row,
-      // enqueueText is the only writer of options_json, and it writes an object.
-      options: JSON.parse(row.options_json || "{}") as OutboxMessageOptions,
-    }));
+  getDue(limit = 20): Effect.Effect<OutboxEntry[], StoreError> {
+    return this.#sql.query<OutboxEntry>(
+      `select * from ${this.#schema}.telegram_outbox reply
+       where state = 'pending' and available_at <= now()
+         and not exists (
+           select 1 from ${this.#schema}.telegram_outbox earlier
+           where earlier.chat_id = reply.chat_id and earlier.state = 'pending' and earlier.seq < reply.seq
+         )
+       order by seq
+       limit $1`,
+      [limit],
+    );
   }
 
-  markSent(id: string): void {
-    this.db.prepare<[string]>(`
-      update telegram_outbox
-      set state = 'sent', sent_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), last_error = null
-      where id = ?
-    `).run(id);
+  /** The media the reply shows, in the order they were queued. */
+  getMedia(id: string): Effect.Effect<MediaAttachment[], StoreError> {
+    return this.#sql.query<MediaAttachment>(
+      `select id, kind, animation, file_name as "fileName", content from ${this.#schema}.outbox_media where outbox_id = $1 order by position`,
+      [id],
+    );
   }
 
-  reschedule(id: string, error: unknown, delayMs: number): void {
-    this.db.prepare<[availableAt: number, lastError: string, id: string]>(`
-      update telegram_outbox
-      set state = 'pending', attempts = attempts + 1, available_at = ?, last_error = ?
-      where id = ?
-    `).run((Date.now() + delayMs) / 1000, String(error).slice(0, 2000), id);
+  /** Marks the reply sent, its media deleted with it. */
+  markSent(id: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `with media as (
+         delete from ${this.#schema}.outbox_media where outbox_id = $1
+       )
+       update ${this.#schema}.telegram_outbox set state = 'sent', sent_at = now(), last_error = null where id = $1`,
+      [id],
+    ));
   }
 
-  getPendingCount(): number {
+  reschedule(id: string, error: unknown, delayMs: number): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.telegram_outbox
+       set state = 'pending', attempts = attempts + 1, available_at = now() + make_interval(secs => $2), last_error = $3
+       where id = $1`,
+      [id, delayMs / 1000, String(error).slice(0, 2000)],
+    ));
+  }
+
+  /** Deletes the replies Telegram accepted more than `ageMs` ago. */
+  pruneSent(ageMs: number): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `delete from ${this.#schema}.telegram_outbox where state = 'sent' and sent_at < now() - make_interval(secs => $1)`,
+      [ageMs / 1000],
+    ));
+  }
+
+  getPendingCount(): Effect.Effect<number, StoreError> {
     // An aggregate without a group by always yields one row.
-    return this.db.prepare<[], { count: number }>("select count(*) count from telegram_outbox where state = 'pending'").get()!.count;
+    return this.#sql.query<{ count: number }>(`select count(*)::integer as count from ${this.#schema}.telegram_outbox where state = 'pending'`).pipe(
+      Effect.map(([row]) => row!.count),
+    );
   }
 }

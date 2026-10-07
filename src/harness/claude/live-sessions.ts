@@ -51,9 +51,20 @@ import {
   type CommandEventPolicy,
   createCommandEventPolicy,
 } from "../../codex/command-event-policy.ts";
-import { appendBlock, errorBlock, isVisibleCodexItem, mapItemToBlocks, type ResponseBlock } from "../../codex/event-projection.ts";
+import {
+  appendBlock,
+  completeResponse,
+  errorBlock,
+  isVisibleCodexItem,
+  mapItemToBlocks,
+  responseProjection,
+  type ResponseProjection,
+  storeBlocks,
+} from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
 import type { BaymaEndpoint, SandboxError } from "../../kube/sandboxes.ts";
+import type { ModelChoice } from "../../persistence/conversation-repository.ts";
+import type { StoreError } from "../../persistence/sql.ts";
 import { type BaymaMcpServer, type HostBaymaScope, type NoFolderWorkspaces, noFolderBayma } from "../../mcp/bayma.ts";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
@@ -96,12 +107,10 @@ export type BackgroundTask = SDKBackgroundTasksChangedMessage["tasks"][number];
  */
 export interface OperatorTurn {
   readonly promptUuids: Set<string>;
-  readonly blockSequence: ResponseBlock[];
-  readonly pendingResponseId: string;
+  readonly projection: ResponseProjection;
   readonly persistence: TurnPersistence;
   readonly turnTimer: TurnTimer;
-  readonly onStarted: (() => void) | undefined;
-  readonly onTransportCompleted: ((turn: TransportTurn) => void) | undefined;
+  readonly onTransportCompleted: ((turn: TransportTurn) => Effect.Effect<void>) | undefined;
   responseCompleted: boolean;
   interrupted: boolean;
   /** The first command the database guardrail denied in this turn. */
@@ -111,8 +120,8 @@ export interface OperatorTurn {
   /** Steers that arrived before the process was ready, pushed after the prompt. */
   readonly earlySteers: string[];
   readonly commandPolicy: CommandEventPolicy;
-  /** How the turn ended, once it has. */
-  readonly done: Deferred.Deferred<TurnResult>;
+  /** How the turn ended, once it has, and its response stored; or how storing it failed. */
+  readonly done: Deferred.Deferred<TurnResult, StoreError>;
   /** Its registration as its conversation's running turn, closed as it ends. */
   readonly registration: Scope.Closeable;
   firstEventLogged?: boolean;
@@ -121,8 +130,7 @@ export interface OperatorTurn {
 
 /** A turn Claude Code started on its own, delivered as a reply of its own. */
 export interface CliTurn {
-  readonly pendingResponseId: string;
-  readonly blockSequence: ResponseBlock[];
+  readonly projection: ResponseProjection;
   /** Prompts steered into it. */
   readonly promptUuids: Set<string>;
   /** Its registration as its conversation's running turn, closed as it ends. */
@@ -174,13 +182,12 @@ export interface ClaudeLiveSessionsOptions {
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
-  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult>;
+  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError>;
   /** The live process serving a conversation, if any (for tests and diagnostics). */
   readonly get: (threadKey: string) => ClaudeHost | null;
 }
 
-function modelKey(persistence: TurnPersistence, threadKey: string): string {
-  const choice = persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null;
+function modelKey(choice: ModelChoice | null): string {
   return JSON.stringify({ model: getClaudeModel(process.env, choice) ?? null, effort: getClaudeEffort(process.env, choice) ?? null });
 }
 
@@ -210,6 +217,12 @@ const releaseCliTurn = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void>
     }
     return Scope.close(cliTurn.registration, Exit.void);
   }).pipe(Effect.andThen(host.notifyIdle));
+
+/** Lets go of a CLI turn's response, which, never completed, is never delivered: it only tidies, so a failure is only said. */
+const letGoOfResponse = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void> =>
+  host.persistence.markPendingAsPosted(cliTurn.projection.pendingResponseId).pipe(
+    Effect.catch((error) => Effect.logWarning(`could not let go of a CLI turn's response thread=${host.threadKey}: ${error.message}`)),
+  );
 
 /**
  * The live processes of `workingDirectory`, for as long as the scope they are made in
@@ -276,20 +289,20 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     current.promptUuids.clear();
     yield* Scope.close(current.registration, Exit.void);
     if (current.blockedGuardrailCommand && !current.responseCompleted && !current.interrupted) {
-      appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
+      appendBlock(current.projection, {
         type: "text",
         content: buildDbGuardrailFallbackText(current.blockedGuardrailCommand),
       });
     }
     yield* current.turnTimer("query.finished", { guardrail_blocked: Boolean(current.blockedGuardrailCommand) });
     yield* Effect.logInfo(`turn.done completed=${current.responseCompleted} interrupted=${current.interrupted}`);
-    yield* Deferred.succeed(current.done, {
-      blockSequence: current.blockSequence,
+    yield* Deferred.complete(current.done, storeBlocks(current.projection, current.persistence).pipe(Effect.as({
+      blockSequence: current.projection.blockSequence,
       sessionId: host.sessionId,
-      pendingResponseId: current.pendingResponseId,
+      pendingResponseId: current.projection.pendingResponseId,
       interrupted: current.interrupted,
       responseCompleted: current.responseCompleted,
-    });
+    })));
     yield* host.notifyIdle;
   });
 
@@ -308,7 +321,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
           const message = error ? getErrorMessage(error) : "Claude Code exited before answering";
           yield* current.turnTimer("query.error", { error: message });
           yield* Effect.logError(`Claude Code ended during a turn thread=${host.threadKey}: ${message}`);
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message));
+          appendBlock(current.projection, errorBlock(message));
         }
       }
       yield* finishOperatorTurn(host, current);
@@ -316,7 +329,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (host.cliTurn) {
       const cliTurn = host.cliTurn;
       host.cliTurn = null;
-      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
+      yield* letGoOfResponse(host, cliTurn);
       yield* releaseCliTurn(host, cliTurn);
     }
   });
@@ -335,14 +348,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (host.cliTurn) {
       return host.cliTurn;
     }
-    const pendingResponseId = host.persistence.createPendingResponse(host.chatId, `claude-cli-turn:${randomUUID()}`, host.sessionId);
+    const pendingResponseId = yield* host.persistence.createPendingResponse(host.chatId, `claude-cli-turn:${randomUUID()}`, host.sessionId);
     const stop = Effect.fnUntraced(function*(reason: StopReason) {
       const abortReason = stopReasonText(reason);
       yield* Effect.logInfo(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
       yield* interrupt(host, abortReason);
       if (host.cliTurn === cliTurn) {
         host.cliTurn = null;
-        host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
+        yield* letGoOfResponse(host, cliTurn);
         yield* releaseCliTurn(host, cliTurn);
       }
     }, withLogScope(LOG_SCOPE));
@@ -355,8 +368,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       return yield* host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
     }, withLogScope(LOG_SCOPE));
     const cliTurn: CliTurn = {
-      pendingResponseId,
-      blockSequence: [],
+      projection: responseProjection(pendingResponseId),
       promptUuids: new Set(),
       registration: yield* Scope.make(),
     };
@@ -375,14 +387,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const projected = projectResultMessage(message);
     const text = projected?.ok ? projected.text?.trim() : `Error: ${projected?.error ?? "Claude did not complete"}`;
     if (text) {
-      appendBlock(cliTurn.blockSequence, host.persistence, cliTurn.pendingResponseId, {
+      appendBlock(cliTurn.projection, {
         type: "text",
         content: text,
         phase: "final_answer",
       });
-      host.persistence.markPendingResponseComplete(cliTurn.pendingResponseId);
+      yield* completeResponse(cliTurn.projection, host.persistence);
     } else {
-      host.persistence.markPendingAsPosted(cliTurn.pendingResponseId);
+      yield* host.persistence.markPendingAsPosted(cliTurn.projection.pendingResponseId);
     }
     yield* Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=${Boolean(text)}`);
     yield* releaseCliTurn(host, cliTurn);
@@ -400,22 +412,24 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       if (projected?.ok) {
         yield* current.turnTimer("turn.completed");
         if (projected.text?.trim()) {
-          appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, {
+          appendBlock(current.projection, {
             type: "text",
             content: projected.text,
             phase: "final_answer",
           });
         }
-        current.persistence.markPendingResponseComplete(current.pendingResponseId);
+        yield* completeResponse(current.projection, current.persistence);
         current.responseCompleted = true;
-        current.onTransportCompleted?.({ sessionId: host.sessionId, turnId: null });
+        if (current.onTransportCompleted) {
+          yield* current.onTransportCompleted({ sessionId: host.sessionId, turnId: null });
+        }
       } else {
         yield* current.turnTimer("turn.failed", { error: projected?.error ?? "unknown" });
-        appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(projected?.error ?? "Claude did not complete"));
+        appendBlock(current.projection, errorBlock(projected?.error ?? "Claude did not complete"));
       }
       const cacheRead = cacheReadTokensFromUsage(projected?.usage);
       if (host.sessionId && cacheRead !== undefined) {
-        current.persistence.updateSessionUsage(host.sessionId, { cacheReadInputTokens: cacheRead });
+        yield* current.persistence.updateSessionUsage(host.sessionId, { cacheReadInputTokens: cacheRead });
       }
       for (const uuid of answered) {
         current.promptUuids.delete(uuid);
@@ -481,13 +495,12 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       current.firstEventLogged = true;
       yield* current.turnTimer("first_event", { event_type: `${message.type}${"subtype" in message && message.subtype ? `.${message.subtype}` : ""}` });
     }
-    current?.onStarted?.();
     if (message.type === "system" && message.subtype === "init") {
       host.initialized = true;
       host.sessionId = message.session_id ?? host.sessionId;
       if (current && host.sessionId) {
-        current.persistence.updatePendingSessionId(current.pendingResponseId, host.sessionId);
-        current.persistence.updateActiveTurnSessionId(host.threadKey, host.sessionId);
+        yield* current.persistence.updatePendingSessionId(current.projection.pendingResponseId, host.sessionId);
+        yield* current.persistence.updateActiveTurnSessionId(host.threadKey, host.sessionId);
       }
       return;
     }
@@ -510,12 +523,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
           current.firstVisibleItemLogged = true;
           yield* current.turnTimer("first_visible_item", { item_type: item.type });
         }
-        mapItemToBlocks(item, {
-          blockSequence: target.blockSequence,
-          persistence: current?.persistence ?? host.persistence,
-          pendingResponseId: target.pendingResponseId,
-        });
+        mapItemToBlocks(item, target.projection);
       }
+      yield* storeBlocks(target.projection, current?.persistence ?? host.persistence);
       return;
     }
     if (message.type === "result") {
@@ -524,7 +534,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     }
     if (message.type === "auth_status" && message.error && current) {
       yield* current.turnTimer("event.error", { error: message.error });
-      appendBlock(current.blockSequence, current.persistence, current.pendingResponseId, errorBlock(message.error));
+      appendBlock(current.projection, errorBlock(message.error));
+      yield* storeBlocks(current.projection, current.persistence);
     }
   });
 
@@ -534,7 +545,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       Stream.runForEach((message) => handleMessage(host, message)),
       Effect.as(null),
       Effect.catchTag("ClaudeCodeError", (error) => Effect.succeed(error.cause)),
-      // Failing to handle what it wrote ends the process too, and the turn reports why.
+      // Failing to handle what it wrote, alasio's store failing among it, ends the process
+      // too, and the turn reports why.
+      Effect.catchTag("StoreError", Effect.succeed),
       Effect.catchDefect(Effect.succeed),
     );
     if (!host.closed) {
@@ -585,7 +598,10 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const primary = commands.find((candidate) => looksLikeSelfRestartCommand(candidate))
       ?? commands.find((candidate) => detectWorkflowWait(candidate))
       ?? firstCommand;
-    yield* policy.inspectCommand({ command: primary, sessionId: host.sessionId });
+    // The command runs whether or not what it sets off could be recorded.
+    yield* policy.inspectCommand({ command: primary, sessionId: host.sessionId }).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not record what a command sets off thread=${host.threadKey}: ${error.message}`)),
+    );
     return {};
   });
 
@@ -605,7 +621,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     const hook: HookCallback = (input) => runHook(execHook(host, input).pipe(outsideTraces));
     const options = buildClaudeQueryOptions({
       workingDirectory,
-      modelChoice: persistence.getModelChoice?.(threadKey, CLAUDE_HARNESS) ?? null,
+      modelChoice: params.modelChoice,
       claudeEnv: { ...claudeEnv, ...claudeTelemetryEnv({ conversationId: threadKey }) },
       mcpServers,
       resumeSession,
@@ -661,7 +677,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
    * for a new one, so it never reuses a process.
    */
   const hostFor = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<ClaudeHost, ClaudeCodeError> {
-    const key = modelKey(params.persistence, params.threadKey);
+    const key = modelKey(params.modelChoice);
     // A session filesystem's Sandbox is made sure of before every turn, not only when the
     // process starts: the process outlives turns, and the Sandbox may have been suspended
     // in between. Its bayma is reached at the same address either way.
@@ -678,26 +694,27 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     return host;
   });
 
-  const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult> {
-    const { prompt, threadKey, chatId, messageId, persistence, onStarted } = params;
+  const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult, StoreError> {
+    const { prompt, threadKey, chatId, messageId, persistence } = params;
     const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt });
     yield* Effect.logInfo(`Querying Claude Code (resume=${params.resumeSession})`);
     yield* turnTimer("query.start");
-    onStarted?.();
-    const pendingResponseId = persistence.createPendingResponse(chatId, messageId, params.resumeSession);
-    persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
-    const done = yield* Deferred.make<TurnResult>();
+    const pendingResponseId = yield* persistence.createPendingResponse(chatId, messageId, params.resumeSession);
+    yield* persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
+    const done = yield* Deferred.make<TurnResult, StoreError>();
     let host: ClaudeHost | null = null;
     /** Stops the turn, once its process runs it; one still starting is stopped as it ends. */
     const stop = Effect.fnUntraced(function*(reason: StopReason) {
+      // However the turn ends, the stop is done once it has.
+      const ended = Effect.ignore(Deferred.await(done));
       const live = host;
       if (!live || live.current !== current) {
-        yield* Deferred.await(done);
+        yield* ended;
         return;
       }
       const text = stopReasonText(reason);
       current.interrupted = true;
-      current.blockSequence.length = 0;
+      current.projection.blockSequence.length = 0;
       for (const uuid of current.promptUuids) {
         live.interruptedUuids.add(uuid);
       }
@@ -708,7 +725,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         live.current = null;
         yield* finishOperatorTurn(live, current);
       }
-      yield* Deferred.await(done);
+      yield* ended;
     }, withLogScope(LOG_SCOPE));
     const steer = Effect.fnUntraced(function*(steerPrompt: string) {
       const live = host;
@@ -726,11 +743,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     }, withLogScope(LOG_SCOPE));
     const current: OperatorTurn = {
       promptUuids: new Set(),
-      blockSequence: [],
-      pendingResponseId,
+      projection: responseProjection(pendingResponseId),
       persistence,
       turnTimer,
-      onStarted,
       onTransportCompleted: params.onTransportCompleted,
       responseCompleted: false,
       interrupted: false,
@@ -755,15 +770,15 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         Effect.catchTag("ClaudeCodeError", Effect.fnUntraced(function*(error) {
           yield* turnTimer("query.error", { error: error.message });
           yield* Effect.logError(`Error starting Claude Code: ${error.message}`);
-          appendBlock(current.blockSequence, persistence, pendingResponseId, errorBlock(error.message));
+          appendBlock(current.projection, errorBlock(error.message));
           return null;
         })),
       );
       if (started === null) {
-        const failed: TurnResult = { blockSequence: current.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
+        const failed: TurnResult = { blockSequence: current.projection.blockSequence, sessionId: params.resumeSession ?? null, pendingResponseId, interrupted: false, responseCompleted: false };
         // A stop asked for while the process was starting waits for how the turn ended.
-        yield* Deferred.succeed(done, failed);
-        return failed;
+        yield* Deferred.complete(done, storeBlocks(current.projection, persistence).pipe(Effect.as(failed)));
+        return yield* Deferred.await(done);
       }
       yield* turnTimer("query.created", { mode: started.mode });
       host = started;
@@ -776,17 +791,21 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       started.interruptedUuids.clear();
       const uuid = randomUUID();
       current.promptUuids.add(uuid);
-      params.onPromptDispatched?.();
+      if (params.onPromptDispatched) {
+        yield* params.onPromptDispatched;
+      }
       yield* started.channel.push(buildClaudeUserMessage(prompt, uuid));
       for (const steerPrompt of current.earlySteers.splice(0)) {
         yield* steer(steerPrompt);
       }
       // A reused process sends no new init, so the turn learns its session here.
       if (started.initialized && started.sessionId) {
-        persistence.updatePendingSessionId(pendingResponseId, started.sessionId);
-        persistence.updateActiveTurnSessionId(threadKey, started.sessionId);
+        yield* persistence.updatePendingSessionId(pendingResponseId, started.sessionId);
+        yield* persistence.updateActiveTurnSessionId(threadKey, started.sessionId);
       }
-      params.onTransportStarted?.({ sessionId: started.sessionId, turnId: null });
+      if (params.onTransportStarted) {
+        yield* params.onTransportStarted({ sessionId: started.sessionId, turnId: null });
+      }
       return yield* Deferred.await(done);
     }).pipe(Effect.ensuring(Scope.close(current.registration, Exit.void)));
   }, withLogScope(LOG_SCOPE));

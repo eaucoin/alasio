@@ -1,11 +1,10 @@
-import type { InlineKeyboardButton } from "@grammyjs/types";
 import { Effect } from "effect";
 
 import type { ConversationChat } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { type MountStore, resolveWorkingDirectory } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import { Store } from "../persistence/store.ts";
 import { TelegramClient, type TelegramError } from "../telegram/client.ts";
 import {
   MAX_LISTED_WORKSPACES,
@@ -14,11 +13,8 @@ import {
   workspaceLabel,
 } from "../workspace/policy.ts";
 import { Mounts, type WorkspaceChange, type WorkspaceChangeError } from "./mounts.ts";
-import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
+import { type ButtonDraft, type ControlCallback, type ControlPanel, closePanel, editPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
-
-/** The store's mounts and callback actions, as the workspace panel reads them. */
-export type WorkspaceControlStore = MountStore & Pick<SqliteStore, "createCallbackAction">;
 
 /** What the workspace controls run on. */
 export type WorkspaceControlServices = Store | TelegramClient | ActiveTurns | Mounts;
@@ -35,21 +31,8 @@ export function isWorkspaceControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(WORKSPACE_KIND_PREFIX);
 }
 
-function createButton(
-  store: WorkspaceControlStore,
-  conversationId: string,
-  text: string,
-  kind: string,
-  payload: CallbackPayload = {},
-): InlineKeyboardButton.CallbackButton {
-  return {
-    text,
-    callback_data: store.createCallbackAction({
-      conversationId,
-      kind: workspaceKind(kind),
-      payload,
-    }),
-  };
+function button(text: string, kind: string, payload: CallbackPayload = {}): ButtonDraft {
+  return { text, kind: workspaceKind(kind), payload };
 }
 
 function pairs<T>(items: readonly T[]): T[][] {
@@ -66,8 +49,8 @@ export type WorkspaceListing =
   | { readonly error: string };
 
 export interface WorkspacePanelRequest {
-  readonly store: WorkspaceControlStore;
-  readonly conversationId: string;
+  /** The folder mounted, if one is. */
+  readonly current: string | null;
   readonly workspaceRoot: string;
   readonly listing: WorkspaceListing;
   /** Whether a turn runs in the conversation. */
@@ -82,8 +65,7 @@ export interface WorkspacePanelRequest {
  * root (git repositories first) as buttons; anything beyond the button cap is
  * still reachable with `/workspace <name>`.
  */
-export function buildWorkspacePanel({ store, conversationId, workspaceRoot, listing, working, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): ControlPanel {
-  const current = resolveWorkingDirectory(store, conversationId);
+export function buildWorkspacePanel({ current, workspaceRoot, listing, working, notice = "", sandboxEnabled = false }: WorkspacePanelRequest): PanelDraft {
   const candidates = "candidates" in listing ? listing.candidates : [];
   const shown = candidates.slice(0, MAX_LISTED_WORKSPACES);
   const lines = [
@@ -105,25 +87,14 @@ export function buildWorkspacePanel({ store, conversationId, workspaceRoot, list
   if (notice) {
     lines.push("", truncateText(notice, 300));
   }
-  const keyboard = pairs(shown.map((candidate) => createButton(
-    store,
-    conversationId,
-    `${candidate.path === current ? "* " : ""}${candidate.git ? "" : "· "}${candidate.name}`,
-    "use",
-    { path: candidate.path },
-  )));
+  const keyboard = pairs(shown.map((candidate) =>
+    button(`${candidate.path === current ? "* " : ""}${candidate.git ? "" : "· "}${candidate.name}`, "use", { path: candidate.path })
+  ));
   if (sandboxEnabled) {
-    keyboard.push([createButton(store, conversationId, "New empty workspace…", "sessionfs")]);
+    keyboard.push([button("New empty workspace…", "sessionfs")]);
   }
-  keyboard.push([
-    createButton(store, conversationId, "New folder…", "new"),
-    createButton(store, conversationId, "Refresh", "refresh"),
-    createButton(store, conversationId, "Close", "close"),
-  ]);
-  return {
-    text: lines.join("\n"),
-    options: panelOptions({ inline_keyboard: keyboard }),
-  };
+  keyboard.push([button("New folder…", "new"), button("Refresh", "refresh"), button("Close", "close")]);
+  return { text: lines.join("\n"), keyboard };
 }
 
 /** The folders under `workspaceRoot`, as the panel lists them. */
@@ -136,24 +107,24 @@ const listWorkspaces = (workspaceRoot: string): Effect.Effect<WorkspaceListing> 
   );
 
 /** The conversation's workspace panel as it stands, with `notice` under it. */
-const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, never, Store | ActiveTurns | Mounts> {
+const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notice = ""): Effect.fn.Return<ControlPanel, StoreError, Store | ActiveTurns | Mounts> {
   const mounts = yield* Mounts;
   const working = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
-  return buildWorkspacePanel({
-    store: yield* Store,
-    conversationId,
+  const { workingDirectory } = yield* Effect.flatMap(Store, (store) => store.getMount(conversationId));
+  return yield* keepPanel(conversationId, buildWorkspacePanel({
+    current: workingDirectory,
     workspaceRoot: mounts.workspaceRoot,
     listing: yield* listWorkspaces(mounts.workspaceRoot),
     working,
     notice,
     sandboxEnabled: mounts.sessionFilesystems,
-  });
+  }));
 });
 
 /**
  * Reply used whenever a prompt or control arrives before a folder is mounted.
  */
-export const sendChooseWorkspacePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError, WorkspaceControlServices> =>
+export const sendChooseWorkspacePanel = ({ conversationId, chatId }: ConversationChat): Effect.Effect<void, TelegramError | StoreError, WorkspaceControlServices> =>
   Effect.flatMap(workspacePanel(conversationId, CHOOSE_WORKSPACE_NOTICE), (panel) => sendPanel(chatId, panel));
 
 function describeOutcome(result: WorkspaceChange): string {
@@ -168,9 +139,12 @@ function describeOutcome(result: WorkspaceChange): string {
     : `Mounted ${workspaceLabel(result.workingDirectory)} (${result.workingDirectory}). Send a message to start.`;
 }
 
-/** What to tell the operator of a change of folder: what it did, or why it did not. */
-const applyWorkspaceChange = <R>(change: Effect.Effect<WorkspaceChange, WorkspaceChangeError, R>): Effect.Effect<string, never, R> =>
-  Effect.match(change, { onFailure: (error) => error.message, onSuccess: describeOutcome });
+/** What to tell the operator of a change of folder: what it did, or why it did not. alasio's store failing is no answer. */
+const applyWorkspaceChange = <R>(change: Effect.Effect<WorkspaceChange, WorkspaceChangeError | StoreError, R>): Effect.Effect<string, StoreError, R> =>
+  change.pipe(
+    Effect.map(describeOutcome),
+    Effect.catch((error) => (error._tag === "StoreError" ? Effect.fail(error) : Effect.succeed(error.message))),
+  );
 
 /** What /workspace was asked to do: show the panel, mount a folder, or create one. */
 type WorkspaceArgs =
@@ -198,7 +172,7 @@ export interface WorkspaceTextCommand extends ConversationChat {
 
 export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversationId, chatId, args }: WorkspaceTextCommand): Effect.fn.Return<
   void,
-  TelegramError,
+  TelegramError | StoreError,
   WorkspaceControlServices
 > {
   const mounts = yield* Mounts;
@@ -214,10 +188,9 @@ export const handleWorkspaceTextCommand = Effect.fnUntraced(function*({ conversa
 
 export const handleWorkspaceControlCallback = Effect.fnUntraced(function*({ action, callbackQueryId, chatId, messageId }: ControlCallback): Effect.fn.Return<
   void,
-  TelegramError,
+  TelegramError | StoreError,
   WorkspaceControlServices
 > {
-  const store = yield* Store;
   const client = yield* TelegramClient;
   const mounts = yield* Mounts;
   const kind = action.kind.slice(WORKSPACE_KIND_PREFIX.length);
@@ -226,7 +199,7 @@ export const handleWorkspaceControlCallback = Effect.fnUntraced(function*({ acti
   if (kind === "sessionfs") {
     // Offer the internet choice before creating the empty workspace.
     yield* client.answerCallbackQuery(callbackQueryId, "Choose internet access.");
-    yield* editPanel(chatId, messageId, {
+    yield* editPanel(chatId, messageId, yield* keepPanel(conversationId, {
       text: [
         "New empty workspace",
         "",
@@ -236,11 +209,11 @@ export const handleWorkspaceControlCallback = Effect.fnUntraced(function*({ acti
         "· No internet — only the model is reachable.",
         "· Full internet — the public internet is reachable (never the host or other sessions).",
       ].join("\n"),
-      options: panelOptions({ inline_keyboard: [[
-        createButton(store, conversationId, "No internet", "sessionfs_create", { net: "none" }),
-        createButton(store, conversationId, "Full internet", "sessionfs_create", { net: "full" }),
-      ], [createButton(store, conversationId, "Back", "refresh")]] }),
-    });
+      keyboard: [
+        [button("No internet", "sessionfs_create", { net: "none" }), button("Full internet", "sessionfs_create", { net: "full" })],
+        [button("Back", "refresh")],
+      ],
+    }));
     return;
   }
   if (kind === "sessionfs_create") {

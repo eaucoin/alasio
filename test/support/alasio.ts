@@ -4,8 +4,8 @@
  * they are in production, and it talks to stand-ins at its boundaries: Telegram
  * (./telegram.ts), the Codex app-server it spawns (./codex.ts), Claude Code's queries
  * (./claude.ts), and a folder workspace's bayma. Tests talk to those stand-ins, and to
- * alasio's SQLite state through its store where a scenario is about durability; to
- * nothing inside alasio.
+ * alasio's state through its store, on the test's Postgres, where a scenario is about
+ * durability; to nothing inside alasio.
  *
  * ALASIO_TEST_LOG=1 shows alasio's own log as it runs.
  */
@@ -15,11 +15,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { Effect } from "effect";
+
 import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
-import { SqliteStore } from "../../src/persistence/store.ts";
+import type { StoreError } from "../../src/persistence/sql.ts";
+import type { Store } from "../../src/persistence/store.ts";
 import { FakeClaude } from "./claude.ts";
 import { FakeCodexAppServer } from "./codex.ts";
 import { type AlasioProcessConfig, READY } from "./alasio-main.ts";
+import { newSchema, run, testDatabaseUrl, testStore } from "./store.ts";
 import { OPERATOR_ID, TelegramStandIn } from "./telegram.ts";
 
 const ALASIO_MAIN = fileURLToPath(new URL("./alasio-main.ts", import.meta.url));
@@ -64,10 +68,12 @@ export interface RunningAlasio {
   folder(name: string): string;
   /** Stops alasio as SIGTERM does in production; the stand-ins stay up. How its process ended. */
   stop(): Promise<AlasioExit>;
-  /** Starts alasio again, on the same state directory. */
+  /** Starts alasio again, on the same state. */
   start(): Promise<void>;
-  /** Reads alasio's SQLite state through its store, for scenarios about durability. */
-  readStore<T>(read: (store: SqliteStore) => T): T;
+  /** Reads alasio's state through its store, for scenarios about durability. */
+  readStore<T>(read: (store: Store["Service"]) => Effect.Effect<T, StoreError>): Promise<T>;
+  /** The schema of the test's Postgres alasio keeps its state in, for what the store has no reader of. */
+  readonly stateSchema: string;
   /** Stops alasio if it runs, and takes everything down. */
   close(): Promise<void>;
 }
@@ -93,7 +99,10 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     CODEX_HOME: join(root, "codex-home"),
     CLAUDE_CONFIG_DIR: join(root, "claude-config"),
   });
+  const stateSchema = newSchema();
   const config: AlasioProcessConfig = {
+    databaseUrl: await testDatabaseUrl(),
+    stateSchema,
     stateDir,
     workspaceRoot,
     allowedUserIds: String(OPERATOR_ID),
@@ -148,14 +157,8 @@ export async function startAlasio({ folders = [] }: AlasioOptions = {}): Promise
     folder: (name) => join(workspaceRoot, name),
     stop,
     start,
-    readStore(read) {
-      const store = new SqliteStore(stateDir, join(stateDir, "alasio.sqlite"));
-      try {
-        return read(store);
-      } finally {
-        store.close();
-      }
-    },
+    readStore: async (read) => run(read(await testStore({ schema: stateSchema }))),
+    stateSchema,
     async close() {
       try {
         if (crashed) throw new Error(`alasio exited on its own (code ${crashed.code}, signal ${crashed.signal}):\n${output.slice(-4000)}`);

@@ -8,8 +8,9 @@ import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
 import type { CodexSessionError } from "../codex/runtime.ts";
 import { SessionFsCodex } from "../codex/sessionfs.ts";
 import { type FolderBayma, folderBayma as hostFolderBayma } from "../mcp/bayma.ts";
-import type { ModelChoice } from "../persistence/conversation-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
+import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import type { Store } from "../persistence/store.ts";
 import { type SessionFilesystemsDisabled, SessionSandboxes } from "../sandbox/index.ts";
 import type { ActiveTurns } from "./active-turns.ts";
 import { makeClaudeHarness } from "./claude/index.ts";
@@ -50,25 +51,19 @@ export interface TransportTurn {
   readonly turnId: string | null | undefined;
 }
 
-/**
- * What a turn records in alasio's store as it runs: its response, its session and usage,
- * and any restart it causes; and, where the store keeps them, the conversation's model
- * choices.
- */
-export type TurnPersistence =
-  & Pick<
-    SqliteStore,
-    | "createPendingResponse"
-    | "updateActiveTurnPendingResponseId"
-    | "updatePendingSessionId"
-    | "updateActiveTurnSessionId"
-    | "appendBlockToPending"
-    | "markPendingResponseComplete"
-    | "markPendingAsPosted"
-    | "updateSessionUsage"
-    | "recordRestartEvent"
-  >
-  & Partial<Pick<SqliteStore, "getModelChoice">>;
+/** What a turn records in alasio's store as it runs: its response, its session and usage, and any restart it causes. */
+export type TurnPersistence = Pick<
+  Store["Service"],
+  | "createPendingResponse"
+  | "updateActiveTurnPendingResponseId"
+  | "updatePendingSessionId"
+  | "updateActiveTurnSessionId"
+  | "appendBlocksToPending"
+  | "markPendingResponseComplete"
+  | "markPendingAsPosted"
+  | "updateSessionUsage"
+  | "recordRestartEvent"
+>;
 
 /** A turn to run: the operator's prompt, the session it resumes, and where it reports. */
 export interface TurnParams {
@@ -78,14 +73,14 @@ export interface TurnParams {
   readonly chatId: string;
   readonly messageId: string;
   readonly workingDirectory: string;
+  /** The model the conversation chose for the harness with /model, read as the turn starts; null for its default. */
+  readonly modelChoice: ModelChoice | null;
   readonly persistence: TurnPersistence;
   readonly attachedTurn?: AttachedTurn | null | undefined;
-  /** Called as the turn starts and as each of its events arrives. */
-  readonly onStarted?: (() => void) | undefined;
-  /** Called just before the prompt is sent, after which the agent may act on it. */
-  readonly onPromptDispatched?: (() => void) | undefined;
-  readonly onTransportStarted?: ((turn: TransportTurn) => void) | undefined;
-  readonly onTransportCompleted?: ((turn: TransportTurn) => void) | undefined;
+  /** Run just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: Effect.Effect<void> | undefined;
+  readonly onTransportStarted?: ((turn: TransportTurn) => Effect.Effect<void>) | undefined;
+  readonly onTransportCompleted?: ((turn: TransportTurn) => Effect.Effect<void>) | undefined;
   /** Run when a harness that runs on between prompts has a reply of its own to deliver. */
   readonly onBackgroundResponse?: Effect.Effect<void> | undefined;
   /** Run when such a harness frees the conversation. */
@@ -167,11 +162,11 @@ export interface Harness {
   /** Loads a session ahead of its next turn: whether it did. */
   readonly warmSession: (params: WarmSessionParams) => Effect.Effect<boolean, HarnessError>;
   /**
-   * Runs a turn to its end. It does not fail: what goes wrong ends up in its response.
-   * While it runs, it is its conversation's running turn in ActiveTurns, which stops
-   * and steers it.
+   * Runs a turn to its end. It fails only as alasio's store does: what else goes wrong
+   * ends up in its response. While it runs, it is its conversation's running turn in
+   * ActiveTurns, which stops and steers it.
    */
-  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult>;
+  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError>;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */
   readonly defaultModelChoice: () => ModelChoice;
@@ -193,31 +188,9 @@ export interface HarnessOptions {
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
 }
 
-/** Where a conversation's mounted harness and folder are read: alasio's store, or any part of it. */
-export type MountStore = Partial<Pick<SqliteStore, "getActiveHarness" | "getWorkingDirectory">>;
-
-/**
- * Resolve the active harness name for a conversation from any store shape.
- * Returns null when nothing is mounted; callers gate on that instead of
- * assuming a default.
- */
-export function resolveHarnessName(store: MountStore | null | undefined, conversationId: string): HarnessName | null {
-  const harness = store?.getActiveHarness?.(conversationId);
-  return isHarnessName(harness) ? harness : null;
-}
-
-/**
- * Resolve the folder a conversation works in, or null until one is chosen.
- */
-export function resolveWorkingDirectory(store: MountStore | null | undefined, conversationId: string): string | null {
-  const workingDirectory = store?.getWorkingDirectory?.(conversationId);
-  return typeof workingDirectory === "string" && workingDirectory.trim() ? workingDirectory : null;
-}
-
 /** The mounted service's name as the operator reads it, or "No service". */
-export function harnessLabelOf(store: MountStore | null | undefined, conversationId: string): string {
-  const name = resolveHarnessName(store, conversationId);
-  return name ? harnessDisplayName(name) : "No service";
+export function harnessLabelOf({ harness }: Pick<Mount, "harness">): string {
+  return harness ? harnessDisplayName(harness) : "No service";
 }
 
 export const NO_SERVICE_MOUNTED ="No service is mounted. Use /service to choose Codex or Claude.";
@@ -268,11 +241,11 @@ export interface HarnessesOptions extends Partial<Pick<HarnessOptions, "sessionS
 export class Harnesses extends Context.Service<Harnesses, {
   readonly names: typeof HARNESS_NAMES;
   readonly getFor: (name: string, workingDirectory: string | null | undefined) => Effect.Effect<Harness, HarnessUnavailable>;
-  /** The conversation's mounted harness in its mounted folder; none until both are mounted. */
-  readonly forConversation: (conversationId: string) => Effect.Effect<Option.Option<Harness>, HarnessUnavailable>;
-  readonly requireForConversation: (conversationId: string) => Effect.Effect<Harness, NoServiceMounted | HarnessUnavailable>;
+  /** A conversation's mounted harness in its mounted folder; none until both are mounted. */
+  readonly forMount: (mount: Mount) => Effect.Effect<Option.Option<Harness>, HarnessUnavailable>;
+  readonly requireForMount: (mount: Mount) => Effect.Effect<Harness, NoServiceMounted | HarnessUnavailable>;
 }>()("alasio/harness/Harnesses") {
-  static readonly layer = (options: HarnessesOptions = {}): Layer.Layer<Harnesses, never, Store | CodexAppServer | ActiveTurns> =>
+  static readonly layer = (options: HarnessesOptions = {}): Layer.Layer<Harnesses, never, CodexAppServer | ActiveTurns> =>
     Layer.effect(Harnesses, makeHarnesses(options));
 }
 
@@ -280,8 +253,7 @@ const makeHarnesses = Effect.fnUntraced(function*({
   overrides = {},
   folderBayma,
   ...options
-}: HarnessesOptions): Effect.fn.Return<Harnesses["Service"], never, Store | CodexAppServer | ActiveTurns | Scope.Scope> {
-  const store = yield* Store;
+}: HarnessesOptions): Effect.fn.Return<Harnesses["Service"], never, CodexAppServer | ActiveTurns | Scope.Scope> {
   // What every harness is made on: the services alasio runs with, and the scope they last for.
   const services = yield* Effect.context<CodexAppServer | ActiveTurns | Scope.Scope>();
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
@@ -315,23 +287,17 @@ const makeHarnesses = Effect.fnUntraced(function*({
         : Effect.tap(make(name, workingDirectory), (adapter) => Effect.sync(() => adapters.set(key, adapter)));
     });
 
-  const forConversation = (conversationId: string): Effect.Effect<Option.Option<Harness>, HarnessUnavailable> =>
-    Effect.suspend(() => {
-      const name = resolveHarnessName(store, conversationId);
-      const workingDirectory = resolveWorkingDirectory(store, conversationId);
-      return name && workingDirectory ? Effect.asSome(getFor(name, workingDirectory)) : Effect.succeedNone;
-    });
+  const forMount = ({ harness, workingDirectory }: Mount): Effect.Effect<Option.Option<Harness>, HarnessUnavailable> =>
+    harness && workingDirectory ? Effect.asSome(getFor(harness, workingDirectory)) : Effect.succeedNone;
 
   return Harnesses.of({
     names: HARNESS_NAMES,
     getFor,
-    forConversation,
-    requireForConversation: (conversationId) =>
-      Effect.suspend((): Effect.Effect<Option.Option<Harness>, NoServiceMounted | HarnessUnavailable> =>
-        resolveHarnessName(store, conversationId) ? forConversation(conversationId) : Effect.fail(new NoServiceMounted())
-      ).pipe(
-        Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NoWorkspaceMounted()), onSome: Effect.succeed })),
-      ),
+    forMount,
+    requireForMount: (mount) =>
+      mount.harness
+        ? forMount(mount).pipe(Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NoWorkspaceMounted()), onSome: Effect.succeed })))
+        : Effect.fail(new NoServiceMounted()),
   });
 });
 

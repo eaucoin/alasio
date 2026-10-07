@@ -19,9 +19,9 @@ const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
   // What the deployment makes workspaces from, checked before anything else starts.
   const kubeTemplates = yield* loadKubeTemplates;
-  // Claude Code's transcripts and Codex's rollouts are kept in alasio's Neon, which the
-  // deployment runs, and Codex's are mirrored from the start so no turn runs unmirrored.
-  // Neon may take minutes to answer, and a stop meanwhile stops the wait.
+  // alasio's state, Claude Code's transcripts and Codex's rollouts are kept in alasio's
+  // Neon, which the deployment runs, and Codex's are mirrored from the start so no turn
+  // runs unmirrored. Neon may take minutes to answer, and a stop meanwhile stops the wait.
   const neon = yield* Neon.make;
   const codexRollouts = yield* CodexRollouts.make({ store: neon.rollouts, home: codexHome() });
   // Session filesystems (an empty, isolated workspace per session) are on when the
@@ -32,6 +32,7 @@ const alasio = Effect.gen(function*() {
     : null;
   yield* serveAlasio({
     ...config,
+    pool: neon.pool,
     sessionStore: neon.sessionStore,
     codexRollouts,
     sessionFsCodexRollouts,

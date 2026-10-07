@@ -7,8 +7,9 @@ import { Codex, type Thread, type ThreadEvent, type ThreadOptions } from "@opena
 import { Effect, Schema, type Scope, Stream } from "effect";
 
 import { getCodexTransportMode } from "../config.ts";
-import { CODEX_HARNESS } from "../harness/names.ts";
-import type { SqliteStore } from "../persistence/store.ts";
+import type { ModelChoice } from "../persistence/conversation-repository.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import type { Store } from "../persistence/store.ts";
 import type { AppServer, AppServerEventsError } from "./app-server/client.ts";
 import type { AppServerEvent } from "./app-server/protocol.ts";
 import type { AppServerRequestError, AppServerStartError } from "./app-server/rpc-client.ts";
@@ -41,7 +42,7 @@ export class CodexTransportRefused extends Schema.TaggedError<CodexTransportRefu
 export type CodexEventsError = AppServerEventsError | CodexExecError;
 
 /** How opening a turn's events fails. */
-export type CodexOpenError = AppServerStartError | ThreadIdMissing | StaleTurnCleanupError | CodexExecError | CodexTransportRefused;
+export type CodexOpenError = AppServerStartError | ThreadIdMissing | StaleTurnCleanupError | CodexExecError | CodexTransportRefused | StoreError;
 
 /** A turn's events as they stream, with the session and turn they belong to, as far as they are known. */
 export interface CodexEventStream {
@@ -50,10 +51,8 @@ export interface CodexEventStream {
   readonly events: Stream.Stream<CodexEvent, CodexEventsError>;
 }
 
-/** Where a transport records the session a turn runs in, and reads the conversation's model choice. */
-export type TurnSessionStore =
-  & Pick<SqliteStore, "updatePendingSessionId" | "updateActiveTurnSessionId">
-  & Partial<Pick<SqliteStore, "getModelChoice">>;
+/** Where a transport records the session a turn runs in. */
+export type TurnSessionStore = Pick<Store["Service"], "updatePendingSessionId" | "updateActiveTurnSessionId">;
 
 /** A Codex session's location: its app-server, and the directory, environment, and config it runs with. */
 export interface CodexSessionOptions {
@@ -74,13 +73,15 @@ export interface CodexExecClient {
 export interface CodexStreamParams extends CodexSessionOptions {
   readonly resumeSession: string | null | undefined;
   readonly prompt: string;
+  /** The model the conversation chose for Codex; null for alasio's default. */
+  readonly modelChoice: ModelChoice | null;
   readonly persistence: TurnSessionStore;
   readonly pendingResponseId: string;
   readonly turnTimer: TurnTimer;
   /** Makes the Codex SDK client of the exec transport, for tests. */
   readonly codexFactory?: (() => CodexExecClient) | undefined;
-  /** Called just before the prompt is sent, after which the agent may act on it. */
-  readonly onPromptDispatched?: (() => void) | undefined;
+  /** Run just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: Effect.Effect<void> | undefined;
 }
 
 /** A turn already running in the app-server (a goal's), to attach to. */
@@ -111,14 +112,14 @@ export function canWarmCodexSession(): boolean {
   return CODEX_TRANSPORT !== "exec";
 }
 
-const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, persistence, pendingResponseId, turnTimer, appServer, onPromptDispatched }: CodexStreamParams) {
+const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threadKey, workingDirectory, codexEnv, codexConfig, prompt, modelChoice, persistence, pendingResponseId, turnTimer, appServer, onPromptDispatched }: CodexStreamParams) {
   const scope = { threadKey, cwd: workingDirectory, env: codexEnv, config: codexConfig };
   const sessionId = resumeSession
     ? yield* appServer.ensureThread({ threadId: resumeSession, ...scope })
     : yield* appServer.startThread(scope);
-  persistence.updatePendingSessionId(pendingResponseId, sessionId);
-  persistence.updateActiveTurnSessionId(threadKey, sessionId);
-  const { model, effort } = resolveCodexModelChoice(persistence.getModelChoice?.(threadKey, CODEX_HARNESS) ?? null);
+  yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
+  yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
+  const { model, effort } = resolveCodexModelChoice(modelChoice);
   const turnId = yield* appServer.startTurn({ threadId: sessionId, prompt, model, effort, onPromptDispatched, ...scope });
   yield* turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
   const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
@@ -129,8 +130,8 @@ const createAttachedAppServerStream = Effect.fnUntraced(function*({ sessionId, t
   if (!sessionId || !turnId) {
     return yield* new CodexTransportRefused({ message: "Cannot attach to a Codex goal turn without both session and turn ids" });
   }
-  persistence.updatePendingSessionId(pendingResponseId, sessionId);
-  persistence.updateActiveTurnSessionId(threadKey, sessionId);
+  yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
+  yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
   yield* appServer.claimTurn(sessionId, turnId);
   yield* turnTimer("app_server.goal_turn.attached", { turn_id: turnId });
   const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };
@@ -162,7 +163,7 @@ const createExecSdkStream = Effect.fnUntraced(function*({ resumeSession, working
   };
   const thread = resumeSession ? codex.resumeThread(resumeSession, threadOptions) : codex.startThread(threadOptions);
   yield* turnTimer("thread.handle.created", { mode: resumeSession ? "resume" : "start" });
-  onPromptDispatched?.();
+  if (onPromptDispatched) yield* onPromptDispatched;
   // Codex runs as long as its events are read, until the turn's scope closes.
   const signal = yield* Effect.abortSignal;
   const streamed = yield* Effect.tryPromise({

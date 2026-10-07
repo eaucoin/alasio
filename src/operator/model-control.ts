@@ -1,13 +1,13 @@
-import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect } from "effect";
 
 import { type Harness, type HarnessError, harnessDisplayName, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import { Store } from "../persistence/store.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
-import { type ControlCallback, type ControlPanel, panelOptions, sendPanel } from "./panel.ts";
+import { type ButtonDraft, type ControlCallback, type ControlPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
 
 // /model: choose a model for the mounted service, then an effort that model
@@ -38,17 +38,8 @@ export function isModelControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(MODEL_KIND_PREFIX);
 }
 
-function button(
-  store: Pick<SqliteStore, "createCallbackAction">,
-  conversationId: string,
-  text: string,
-  kind: string,
-  payload: CallbackPayload,
-): InlineKeyboardButton.CallbackButton {
-  return {
-    text,
-    callback_data: store.createCallbackAction({ conversationId, kind: modelKind(kind), payload }),
-  };
+function button(text: string, kind: string, payload: CallbackPayload): ButtonDraft {
+  return { text, kind: modelKind(kind), payload };
 }
 
 function rows<T>(buttons: readonly T[], perRow = BUTTONS_PER_ROW): T[][] {
@@ -66,20 +57,16 @@ function describeChoice(choice: ModelChoice | null): string {
   return choice.effort ? `${choice.model} at ${choice.effort} effort` : choice.model;
 }
 
-function keyboardOptions(keyboard: InlineKeyboardMarkup["inline_keyboard"]) {
-  return panelOptions({ inline_keyboard: keyboard });
-}
-
 export interface ModelPanelRequest {
   readonly harness: ModelControlHarness;
   readonly conversationId: string;
 }
 
 /** Step one: every model the mounted service offers. */
-export const buildModelPanel = Effect.fnUntraced(function*({ harness, conversationId }: ModelPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store> {
+export const buildModelPanel = Effect.fnUntraced(function*({ harness, conversationId }: ModelPanelRequest): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store> {
   const store = yield* Store;
   const models = yield* harness.listModels();
-  const chosen = store.getModelChoice(conversationId, harness.name);
+  const chosen = yield* store.getModelChoice(conversationId, harness.name);
   const current = chosen ?? harness.defaultModelChoice();
   const lines = [
     `Model for ${harness.displayName}`,
@@ -89,7 +76,7 @@ export const buildModelPanel = Effect.fnUntraced(function*({ harness, conversati
     "Choose a model, then an effort. It applies from the next turn.",
   ];
   const modelButtons = models.map((model) =>
-    button(store, conversationId, model.label, "pick", {
+    button(model.label, "pick", {
       harness: harness.name,
       model: model.id,
       label: model.label,
@@ -100,11 +87,11 @@ export const buildModelPanel = Effect.fnUntraced(function*({ harness, conversati
   const keyboard = rows(modelButtons);
   const footer = [];
   if (chosen) {
-    footer.push(button(store, conversationId, "Use default", "reset", { harness: harness.name }));
+    footer.push(button("Use default", "reset", { harness: harness.name }));
   }
-  footer.push(button(store, conversationId, "Close", "close", {}));
+  footer.push(button("Close", "close", {}));
   keyboard.push(footer);
-  return { text: lines.join("\n"), options: keyboardOptions(keyboard) };
+  return yield* keepPanel(conversationId, { text: lines.join("\n"), keyboard });
 });
 
 export interface SendModelPanelRequest extends Omit<ModelPanelRequest, "harness"> {
@@ -113,7 +100,7 @@ export interface SendModelPanelRequest extends Omit<ModelPanelRequest, "harness"
   readonly chatId: ChatId;
 }
 
-export const sendModelPanel = Effect.fnUntraced(function*({ harness, conversationId, chatId }: SendModelPanelRequest): Effect.fn.Return<void, TelegramError, Store | TelegramClient> {
+export const sendModelPanel = Effect.fnUntraced(function*({ harness, conversationId, chatId }: SendModelPanelRequest): Effect.fn.Return<void, TelegramError | StoreError, Store | TelegramClient> {
   const client = yield* TelegramClient;
   if (!harness) {
     yield* client.sendMessage(chatId, "No service is mounted. Choose one with /service first.");
@@ -121,19 +108,21 @@ export const sendModelPanel = Effect.fnUntraced(function*({ harness, conversatio
   }
   yield* buildModelPanel({ harness, conversationId }).pipe(
     Effect.matchEffect({
-      onFailure: (error) => client.sendMessage(chatId, truncateText(`Could not list ${harness.displayName} models: ${error.message}`, 400)),
+      // The models could not be listed, which the operator is told; alasio's store failing is not that.
+      onFailure: (error): Effect.Effect<unknown, TelegramError | StoreError> =>
+        error._tag === "StoreError"
+          ? Effect.fail(error)
+          : client.sendMessage(chatId, truncateText(`Could not list ${harness.displayName} models: ${error.message}`, 400)),
       onSuccess: (panel) => sendPanel(chatId, panel),
     }),
   );
 });
 
 /** Step two: the efforts the chosen model supports. */
-function buildEffortPanel({ store, conversationId, harnessName, payload }: {
-  readonly store: Pick<SqliteStore, "createCallbackAction">;
-  readonly conversationId: string;
+function buildEffortPanel({ harnessName, payload }: {
   readonly harnessName: HarnessName;
   readonly payload: ModelPick;
-}): ControlPanel {
+}): PanelDraft {
   const lines = [
     `${payload.label} (${payload.model})`,
     "",
@@ -141,16 +130,14 @@ function buildEffortPanel({ store, conversationId, harnessName, payload }: {
   ];
   const effortButtons = payload.efforts.map((effort) =>
     button(
-      store,
-      conversationId,
       effort === payload.defaultEffort ? `${effort} (default)` : effort,
       "effort",
       { harness: harnessName, model: payload.model, label: payload.label, effort },
     ),
   );
   const keyboard = rows(effortButtons, 3);
-  keyboard.push([button(store, conversationId, "Close", "close", {})]);
-  return { text: lines.join("\n"), options: keyboardOptions(keyboard) };
+  keyboard.push([button("Close", "close", {})]);
+  return { text: lines.join("\n"), keyboard };
 }
 
 function confirmation(harnessName: HarnessName, label: string, model: string, effort: string | null | undefined): string {
@@ -165,7 +152,7 @@ function stringField(payload: CallbackPayload, key: string): string | undefined 
 
 export const handleModelControlCallback = Effect.fnUntraced(function*({ action, callbackQueryId, chatId, messageId }: ControlCallback): Effect.fn.Return<
   void,
-  TelegramError,
+  TelegramError | StoreError,
   Store | TelegramClient
 > {
   const store = yield* Store;
@@ -184,7 +171,7 @@ export const handleModelControlCallback = Effect.fnUntraced(function*({ action, 
   const model = stringField(payload, "model");
   const label = stringField(payload, "label");
   if (kind === "reset" && isHarnessName(harnessName)) {
-    store.clearModelChoice(action.conversationId, harnessName);
+    yield* store.clearModelChoice(action.conversationId, harnessName);
     const text = `${harnessDisplayName(harnessName)} is back on its default model from the next turn.`;
     yield* client.answerCallbackQuery(callbackQueryId, "Reset.");
     yield* client.editMessageText(chatId, messageId, text, { format: "plain" });
@@ -194,7 +181,7 @@ export const handleModelControlCallback = Effect.fnUntraced(function*({ action, 
     const efforts = payload["efforts"];
     if (!Array.isArray(efforts) || efforts.length === 0) {
       // A model without effort control is chosen outright.
-      store.setModelChoice(action.conversationId, harnessName, { model, effort: null });
+      yield* store.setModelChoice(action.conversationId, harnessName, { model, effort: null });
       yield* client.answerCallbackQuery(callbackQueryId, "Model set.");
       yield* client.editMessageText(chatId, messageId, confirmation(harnessName, label, model, null), { format: "plain" });
       return;
@@ -205,14 +192,14 @@ export const handleModelControlCallback = Effect.fnUntraced(function*({ action, 
       efforts: efforts.filter((effort): effort is string => typeof effort === "string"),
       defaultEffort: stringField(payload, "defaultEffort") ?? null,
     };
-    const panel = buildEffortPanel({ store, conversationId: action.conversationId, harnessName, payload: pick });
+    const panel = yield* keepPanel(action.conversationId, buildEffortPanel({ harnessName, payload: pick }));
     yield* client.answerCallbackQuery(callbackQueryId, "Now choose an effort.");
     yield* client.editMessageText(chatId, messageId, panel.text, panel.options);
     return;
   }
   if (kind === "effort" && isHarnessName(harnessName) && model !== undefined && label !== undefined) {
     const effort = stringField(payload, "effort");
-    store.setModelChoice(action.conversationId, harnessName, { model, effort });
+    yield* store.setModelChoice(action.conversationId, harnessName, { model, effort });
     yield* client.answerCallbackQuery(callbackQueryId, "Model set.");
     yield* client.editMessageText(chatId, messageId, confirmation(harnessName, label, model, effort), { format: "plain" });
     return;

@@ -1,10 +1,8 @@
 import { createHash } from "node:crypto";
 import { setDefaultResultOrder } from "node:dns";
-import { createWriteStream, mkdtempSync, readFileSync } from "node:fs";
-import { basename, extname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename, extname } from "node:path";
 import { setDefaultAutoSelectFamily } from "node:net";
-import { pipeline } from "node:stream/promises";
 import type {
   ApiMethods,
   ApiResponse,
@@ -58,22 +56,21 @@ export interface TextMessageOptions extends TextMessageParams {
   readonly format?: TextFormat | undefined;
 }
 
-/** A file a rich reply shows, as codex/reply-media.ts copies it for delivery. */
+/** A file a rich reply shows, as codex/reply-media.ts reads it for delivery. */
 export interface MediaAttachment {
   /** The id its media line references (`tg://photo?id=<id>`), and its upload's name. */
   readonly id: string;
   readonly kind: MediaKind;
   /** Whether it is a GIF, which Telegram plays as an animation. */
   readonly animation: boolean;
-  /** The path of the copy to upload. */
-  readonly file: string;
+  /** The file name it is uploaded under. */
+  readonly fileName: string;
+  readonly content: Uint8Array;
 }
 
 export interface SendMessageOptions extends TextMessageOptions {
   /** The files a "rich" message's media lines show (see telegram/rich-media.ts). */
   readonly media?: readonly MediaAttachment[] | undefined;
-  /** A directory of media copied for the reply, removed once it is delivered (telegram/outbox.ts). */
-  readonly mediaDir?: string | undefined;
 }
 
 /** A text message's Bot API fields, with its text rendered as its format says. */
@@ -85,10 +82,11 @@ interface TextPayload extends TextMessageParams {
   disable_web_page_preview: boolean;
 }
 
-/** An upload of a multipart call: the file at `path`, as the part `name`. */
+/** An upload of a multipart call: `content`, as the part `name`, under the file name `fileName`. */
 export interface Upload {
   readonly name: string;
-  readonly path: string;
+  readonly fileName: string;
+  readonly content: Uint8Array;
 }
 
 export interface GetUpdatesOptions {
@@ -97,9 +95,11 @@ export interface GetUpdatesOptions {
   readonly allowedUpdates?: BotParams<"getUpdates">["allowed_updates"] | undefined;
 }
 
-/** A Telegram file downloaded to a temporary directory of its own. */
+/** A Telegram file downloaded, whole. */
 export interface DownloadedFile {
-  readonly localPath: string;
+  /** A name for it, safe to write it under: the one preferred, with the file's extension. */
+  readonly name: string;
+  readonly content: Uint8Array;
   readonly sha256: string;
   /** The file as getFile described it. */
   readonly remote: File;
@@ -183,6 +183,11 @@ function buildTextPayload(chatId: ChatId, text: string, options: TextMessageOpti
 
 function jsonBody(payload: object = {}): RequestBody {
   return { headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) };
+}
+
+/** A media item as its upload, the part its id names. */
+function uploadOf(item: MediaAttachment): Upload {
+  return { name: item.id, fileName: item.fileName, content: item.content };
 }
 
 /** The Bot API input media type for a prepared media item. */
@@ -318,7 +323,7 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
         form.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
       }
       for (const file of files) {
-        form.append(file.name, new Blob([readFileSync(file.path)]), basename(file.path));
+        form.append(file.name, new Blob([file.content]), file.fileName);
       }
       return { body: form };
     });
@@ -342,14 +347,14 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
     return callMultipart(
       "sendRichMessage",
       { chat_id: chatId, rich_message: richMessage, ...telegramOptions },
-      partMedia.map((item) => ({ name: item.id, path: item.file })),
+      partMedia.map(uploadOf),
     );
   };
 
   /** One media item as its own message: a photo, video, or animation, or a document when Telegram will not take it as media. */
   const sendMediaItem = (chatId: ChatId, item: MediaAttachment): Effect.Effect<Message, TelegramError> => {
     const media = `attach://${item.id}`;
-    const files = [{ name: item.id, path: item.file }];
+    const files = [uploadOf(item)];
     const asMedia = (): Effect.Effect<Message, TelegramError> => {
       switch (telegramMediaType(item)) {
         case "photo":
@@ -384,7 +389,7 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
       sent.push(...yield* callMultipart(
         "sendMediaGroup",
         { chat_id: chatId, media: group.map((item) => ({ type: item.kind, media: `attach://${item.id}` })), disable_notification: true },
-        group.map((item) => ({ name: item.id, path: item.file })),
+        group.map(uploadOf),
       ).pipe(
         Effect.catchIf(isBadRequest, () => Effect.forEach(group, (item) => sendMediaItem(chatId, item))),
       ));
@@ -400,7 +405,7 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
    * lost to its formatting.
    */
   const sendRichParts = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: SendMessageOptions): Effect.fn.Return<Message[], TelegramError> {
-    const { format: _format, media = [], mediaDir: _mediaDir, ...telegramOptions } = options;
+    const { format: _format, media = [], ...telegramOptions } = options;
     const byId = new Map(media.map((item) => [item.id, item]));
     const sent: Message[] = [];
     for (const part of splitRichMarkdown(text || " ")) {
@@ -455,19 +460,18 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
       }
       const ext = extname(preferredName) || extname(filePath) || "";
       const safeBase = basename(preferredName, ext).replace(/[^A-Za-z0-9_.-]+/g, "-") || "download";
-      const localPath = join(mkdtempSync(join(tmpdir(), "telegram-file-")), `${safeBase}${ext}`);
       const response = yield* Effect.tryPromise({
         try: (signal) => fetch(`${fileBase}/${filePath}`, { signal }),
         catch: (cause) => TelegramTransportError.of("getFile", cause),
       });
-      const { body } = response;
-      if (!response.ok || !body) {
+      if (!response.ok || !response.body) {
         return yield* new TelegramFileError({ message: `Telegram file download failed: HTTP ${response.status}` });
       }
-      const fileError = (cause: unknown) => new TelegramFileError({ message: cause instanceof Error ? cause.message : String(cause) });
-      yield* Effect.tryPromise({ try: () => pipeline(body, createWriteStream(localPath)), catch: fileError });
-      const sha256 = yield* Effect.try({ try: () => createHash("sha256").update(readFileSync(localPath)).digest("hex"), catch: fileError });
-      return { localPath, sha256, remote };
+      const content = new Uint8Array(yield* Effect.tryPromise({
+        try: () => response.arrayBuffer(),
+        catch: (cause) => new TelegramFileError({ message: cause instanceof Error ? cause.message : String(cause) }),
+      }));
+      return { name: `${safeBase}${ext}`, content, sha256: createHash("sha256").update(content).digest("hex"), remote };
     }),
     sendDocument: (chatId, filePath, caption) =>
       send("sendDocument", () => {

@@ -10,7 +10,6 @@ import { Clock, Context, Effect, Layer, Schema, type Scope } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { Store } from "../persistence/store.ts";
-import type { Turn } from "../persistence/turn-repository.ts";
 import type { WorkflowWaitType } from "../policy/workflow-wait.ts";
 import { withLogScope } from "../shared/log.ts";
 
@@ -23,11 +22,6 @@ export interface WorkflowWait {
   readonly startedAt: number;
 }
 
-/** Where the active turns are read from: alasio's store. */
-interface ActiveTurnSource {
-  getActiveTurns(): readonly Pick<Turn, "session_id" | "thread_key">[];
-}
-
 /** What notifyWorkflowWait posts, as the server decodes it. */
 const WorkflowHookNotification = Schema.Struct({
   session_id: Schema.NonEmptyString,
@@ -37,15 +31,6 @@ const WorkflowHookNotification = Schema.Struct({
 });
 
 const HOOK_PATH = "/hook/workflow";
-
-function findThreadKeyBySessionId(store: ActiveTurnSource, sessionId: string): string {
-  for (const turn of store.getActiveTurns()) {
-    if (turn.session_id === sessionId) {
-      return turn.thread_key;
-    }
-  }
-  return "";
-}
 
 /**
  * The workflow waits agents report, by session, as the hook server on localhost:`port`
@@ -71,12 +56,14 @@ const serveWorkflowHooks = Effect.fnUntraced(function*(port: number): Effect.fn.
       runId: notification.run_id,
       waitType: notification.wait_type ?? "unknown",
       command: notification.command ?? "",
-      threadKey: findThreadKeyBySessionId(store, notification.session_id),
+      threadKey: (yield* store.getActiveTurns).find((turn) => turn.session_id === notification.session_id)?.thread_key ?? "",
       startedAt: (yield* Clock.currentTimeMillis) / 1000,
     });
     return HttpServerResponse.text("OK");
   }).pipe(
     Effect.catchTag("SchemaError", () => Effect.succeed(HttpServerResponse.text("Missing session_id or run_id", { status: 400 }))),
+    Effect.catchTag("StoreError", (error) =>
+      Effect.logError(`Error handling workflow hook: ${error.message}`).pipe(Effect.as(HttpServerResponse.text(error.message, { status: 503 })))),
     Effect.catchTag("HttpServerError", (error) =>
       Effect.logError(`Error handling workflow hook: ${error}`).pipe(Effect.as(HttpServerResponse.text(String(error), { status: 500 })))),
   );

@@ -1,6 +1,7 @@
 import type { Update } from "@grammyjs/types";
 import { Cause, Effect } from "effect";
 
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { TelegramClient } from "./client.ts";
@@ -28,20 +29,19 @@ export const pollUpdates = Effect.fnUntraced(
     const client = yield* TelegramClient;
     const store = yield* Store;
 
-    const handle = (update: Update): Effect.Effect<void> =>
+    const handle = (update: Update): Effect.Effect<void, StoreError> =>
       processUpdate(update).pipe(
         // The raw update is already persisted before processing, so skipping it loses
         // nothing durable; re-fetching it forever would wedge the bot.
         Effect.catchCause((cause) => Effect.logError(`Skipping update ${update.update_id} after processing failure: ${describeFailure(cause)}`)),
-        Effect.andThen(Effect.sync(() => store.setTelegramOffset(update.update_id + 1))),
+        Effect.andThen(store.setTelegramOffset(update.update_id + 1)),
         Effect.uninterruptible,
       );
 
-    const poll = Effect.suspend(() => client.getUpdates({
-      offset: store.getTelegramOffset(),
-      timeout: 50,
-      allowedUpdates: ["message", "callback_query"],
-    })).pipe(
+    // An offset that cannot be read or kept is a failed poll, tried again after the
+    // backoff: an update whose offset was not kept is handled again.
+    const poll = store.getTelegramOffset.pipe(
+      Effect.flatMap((offset) => client.getUpdates({ offset, timeout: 50, allowedUpdates: ["message", "callback_query"] })),
       Effect.flatMap((updates) => Effect.forEach(updates, handle, { discard: true })),
       Effect.catch((error) => Effect.logError(`Polling failed: ${error}`).pipe(Effect.andThen(Effect.sleep(POLL_BACKOFF)))),
     );

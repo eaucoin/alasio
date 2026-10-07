@@ -6,8 +6,9 @@ import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { type HarnessError, Harnesses, type HarnessUnavailable, resolveHarnessName } from "../harness/index.ts";
+import { type HarnessError, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
+import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
 import { type OperatorCommand, parseCommand } from "./command-parser.ts";
 import { handleGoalTextCommand } from "./goal-control.ts";
@@ -20,15 +21,15 @@ import { truncateText } from "./text.ts";
 import { handleWorkspaceTextCommand, sendChooseWorkspacePanel } from "./workspace-control.ts";
 
 /** What the operator's commands and controls run on. */
-export type OperatorServices = Store | TelegramClient | ActiveTurns | Harnesses | Turns | Mounts;
+export type OperatorServices = Store | TelegramClient | ActiveTurns | Harnesses | Turns | Mounts | ReceivedFiles;
 
-/** How a command fails: the operator is told why. */
-export type CommandError = TelegramError | HarnessError | HarnessUnavailable | NewSessionError | TurnError;
+/** How a command fails: the operator is told why. Turns' errors include alasio's store's. */
+export type CommandError = TelegramError | HarnessError | HarnessUnavailable | NewSessionError | TurnError | ReceivedFileError;
 
 /** A prompt that may be a command; one with files attached never is. */
 export interface CommandText {
   readonly text: string;
-  readonly filePaths: readonly string[];
+  readonly fileIds: readonly string[];
   readonly conversationId: string;
   readonly chatId: ChatId;
   readonly messageId: number;
@@ -57,8 +58,8 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
   const activeTurns = yield* ActiveTurns;
   const turns = yield* Turns;
   const conversation = { conversationId, chatId };
-  const harnessName = resolveHarnessName(store, conversationId);
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forConversation(conversationId)));
+  const mount = yield* store.getMount(conversationId);
+  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
   const label = harness?.displayName ?? "The agent";
   if (cmd.type === "stop") {
     if (!(yield* activeTurns.isBusy(conversationId))) {
@@ -87,7 +88,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
     return true;
   }
-  if (!harnessName) {
+  if (!mount.harness) {
     // Every remaining control acts on the mounted service's own sessions or turns.
     yield* sendChooseServicePanel(conversation);
     return true;
@@ -130,7 +131,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "rewind_list") {
-    const sessionId = store.getSessionId(conversationId);
+    const { sessionId } = mount;
     if (!sessionId) {
       yield* client.sendMessage(chatId, "No session linked to this Telegram conversation. Use !resume <#> first.");
       return true;
@@ -141,7 +142,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "rewind_exec") {
-    const sessionId = store.getSessionId(conversationId);
+    const { sessionId } = mount;
     if (!sessionId) {
       yield* client.sendMessage(chatId, "No session linked. Use !resume <#> first.");
       return true;
@@ -157,7 +158,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
       yield* client.sendMessage(chatId, "Failed to create forked session.");
       return true;
     }
-    store.setSessionId(conversationId, forkedId);
+    yield* store.setSessionId(conversationId, forkedId);
     yield* client.sendMessage(chatId, `Rewound to before message ${cmd.index}:\n\n${truncateText(target.text, 700)}\n\nReady to continue from earlier state.`);
     return true;
   }
@@ -173,7 +174,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     } else {
       resolvedSessionId = cmd.ref;
     }
-    store.setSessionId(conversationId, resolvedSessionId);
+    yield* store.setSessionId(conversationId, resolvedSessionId);
     if (cmd.followUp) {
       yield* turns.run({ conversationId, chatId, messageId, prompt: cmd.followUp });
       return true;
@@ -186,7 +187,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
 });
 
 /** Handles `text` if it is a command: whether it was. */
-export const handleTextCommand = ({ text, filePaths, ...request }: CommandText): Effect.Effect<boolean, CommandError, OperatorServices> => {
+export const handleTextCommand = ({ text, fileIds, ...request }: CommandText): Effect.Effect<boolean, CommandError, OperatorServices> => {
   const cmd = parseCommand(text);
-  return !cmd || filePaths.length > 0 ? Effect.succeed(false) : handleCommand({ cmd, ...request });
+  return !cmd || fileIds.length > 0 ? Effect.succeed(false) : handleCommand({ cmd, ...request });
 };

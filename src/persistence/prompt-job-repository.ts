@@ -1,6 +1,8 @@
-import type { Database } from "better-sqlite3";
-import { type HarnessName, isHarnessName } from "../harness/names.ts";
+import { Effect } from "effect";
+
+import type { HarnessName } from "../harness/names.ts";
 import { newId } from "../shared/ids.ts";
+import type { Sql, StoreError } from "./sql.ts";
 
 /**
  * Where a prompt job is: waiting its turn (or for the operator to say what to do with
@@ -9,32 +11,28 @@ import { newId } from "../shared/ids.ts";
 export type PromptJobState = "pending" | "awaiting_choice" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
 
 /** A row of `prompt_jobs`: a prompt queued for its conversation's harness. */
-export interface PromptJobRow {
+export interface PromptJob {
   readonly id: string;
   readonly conversation_id: string;
   readonly chat_id: string;
   readonly message_id: string;
   readonly prompt: string;
-  readonly file_paths_json: string;
+  /** The files sent with the prompt, which its text names where they are written. */
+  readonly file_ids: readonly string[];
   readonly harness: HarnessName;
   readonly state: PromptJobState;
   readonly priority: number;
   readonly attempts: number;
   readonly upstream_session_id: string | null;
   readonly upstream_turn_id: string | null;
-  readonly upstream_dispatched_at: number | null;
-  readonly upstream_started_at: number | null;
-  readonly upstream_completed_at: number | null;
+  readonly upstream_dispatched_at: Date | null;
+  readonly upstream_started_at: Date | null;
+  readonly upstream_completed_at: Date | null;
   readonly last_error: string | null;
   readonly traceparent: string | null;
-  readonly created_at: number;
-  readonly started_at: number | null;
-  readonly completed_at: number | null;
-}
-
-/** A prompt job, with the paths of the files sent with its prompt. */
-export interface PromptJob extends PromptJobRow {
-  readonly filePaths: string[];
+  readonly created_at: Date;
+  readonly started_at: Date | null;
+  readonly completed_at: Date | null;
 }
 
 export interface NewPromptJob {
@@ -42,133 +40,108 @@ export interface NewPromptJob {
   readonly chatId: number | string;
   readonly messageId: number | string;
   readonly prompt: string;
-  readonly filePaths?: readonly string[] | undefined;
+  readonly fileIds?: readonly string[] | undefined;
   readonly state?: PromptJobState | undefined;
   readonly priority?: number | undefined;
-  /** The harness to run the prompt on; null while none is mounted, which refuses the job. */
-  readonly harness?: HarnessName | null | undefined;
+  /** The harness to run the prompt on; the conversation's mounted one when not given. */
+  readonly harness?: HarnessName | undefined;
   /** The W3C traceparent of the trace the prompt was queued in. */
   readonly traceparent?: string | null | undefined;
 }
 
-function mapRow(row: PromptJobRow): PromptJob;
-function mapRow(row: PromptJobRow | null | undefined): PromptJob | null;
-function mapRow(row: PromptJobRow | null | undefined): PromptJob | null {
-  // enqueue is the only writer of file_paths_json, and it writes an array of paths.
-  return row ? { ...row, filePaths: JSON.parse(row.file_paths_json || "[]") as string[] } : null;
-}
+export class NeonPromptJobRepository {
+  readonly #sql: Sql;
+  readonly #schema: string;
 
-export class SqlitePromptJobRepository {
-  private readonly db: Database;
-
-  constructor(db: Database) {
-    this.db = db;
+  constructor(sql: Sql, schema: string) {
+    this.#sql = sql;
+    this.#schema = schema;
   }
 
-  enqueue({ conversationId, chatId, messageId, prompt, filePaths = [], state = "pending", priority = 0, harness = null, traceparent = null }: NewPromptJob): PromptJob {
-    if (!isHarnessName(harness)) {
-      throw new Error(`Cannot queue a prompt for ${conversationId}: no service is mounted`);
-    }
-    const id = newId();
-    this.db.prepare<[
-      id: string,
-      conversationId: string,
-      chatId: string,
-      messageId: string,
-      prompt: string,
-      filePathsJson: string,
-      harness: HarnessName,
-      state: PromptJobState,
-      priority: number,
-      traceparent: string | null,
-      createdAt: number,
-    ]>(`
-      insert into prompt_jobs
-        (id, conversation_id, chat_id, message_id, prompt, file_paths_json, harness, state, priority, traceparent, created_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(conversation_id, message_id) do nothing
-    `).run(id, conversationId, String(chatId), String(messageId), prompt, JSON.stringify(filePaths), harness, state, priority, traceparent, Date.now() / 1000);
-    // The row is the one just inserted or the one already queued for this message.
-    return mapRow(this.db.prepare<[conversationId: string, messageId: string], PromptJobRow>("select * from prompt_jobs where conversation_id = ? and message_id = ?").get(conversationId, String(messageId))!);
+  /** Queues a prompt: the job queued, or the one already queued for its message. */
+  enqueue({ conversationId, chatId, messageId, prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
+    // The no-op update makes the job already queued the one returned.
+    return this.#sql.query<PromptJob>(
+      `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, file_ids, harness, state, priority, traceparent)
+       select $1, id, $3, $4, $5, $6, coalesce($7, active_harness), $8, $9, $10 from ${this.#schema}.conversations where id = $2
+       on conflict (conversation_id, message_id) do update set conversation_id = excluded.conversation_id
+       returning *`,
+      [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent],
+    ).pipe(Effect.map(([row]) => row!));
   }
 
-  get(id: string): PromptJob | null {
-    return mapRow(this.db.prepare<[string], PromptJobRow>("select * from prompt_jobs where id = ?").get(id));
+  get(id: string): Effect.Effect<PromptJob | null, StoreError> {
+    return this.#sql.query<PromptJob>(`select * from ${this.#schema}.prompt_jobs where id = $1`, [id]).pipe(Effect.map(([row]) => row ?? null));
   }
 
-  claimNext(conversationId: string): PromptJob | null {
-    const claim = this.db.transaction(() => {
-      const row = this.db.prepare<[string], PromptJobRow>(`
-        select * from prompt_jobs
-        where conversation_id = ? and state = 'pending'
-        order by priority desc, created_at asc
-        limit 1
-      `).get(conversationId);
-      if (!row) {
-        return null;
-      }
-      this.db.prepare<[startedAt: number, id: string]>(`
-        update prompt_jobs
-        set state = 'running', attempts = attempts + 1, started_at = ?, last_error = null
-        where id = ? and state = 'pending'
-      `).run(Date.now() / 1000, row.id);
-      return this.db.prepare<[string], PromptJobRow>("select * from prompt_jobs where id = ?").get(row.id);
-    });
-    return mapRow(claim());
+  /** Starts the conversation's next pending job, by priority and then in the order queued: the job. */
+  claimNext(conversationId: string): Effect.Effect<PromptJob | null, StoreError> {
+    return this.#sql.query<PromptJob>(
+      `update ${this.#schema}.prompt_jobs set state = 'running', attempts = attempts + 1, started_at = now(), last_error = null
+       where id = (
+         select id from ${this.#schema}.prompt_jobs
+         where conversation_id = $1 and state = 'pending'
+         order by priority desc, seq
+         limit 1
+         for update skip locked
+       )
+       returning *`,
+      [conversationId],
+    ).pipe(Effect.map(([row]) => row ?? null));
   }
 
-  setDisposition(id: string, state: PromptJobState, priority = 0): void {
-    this.db.prepare<[state: PromptJobState, priority: number, sameState: PromptJobState, completedAt: number, id: string]>(`
-      update prompt_jobs set state = ?, priority = ?, completed_at = case when ? in ('completed', 'cancelled') then ? else null end
-      where id = ?
-    `).run(state, priority, state, Date.now() / 1000, id);
-  }
-
-  complete(id: string): void {
-    this.setDisposition(id, "completed");
+  /** Settles what becomes of a job: completed and cancelled jobs are done, any other state is not. */
+  setDisposition(id: string, state: PromptJobState, priority = 0): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs
+       set state = $2, priority = $3, completed_at = case when $2 in ('completed', 'cancelled') then now() end
+       where id = $1`,
+      [id, state, priority],
+    ));
   }
 
   /** Records that the job's prompt was sent to the agent, which may act on it from then on. */
-  markDispatched(id: string): void {
-    this.db.prepare<[dispatchedAt: number, id: string]>("update prompt_jobs set upstream_dispatched_at = ? where id = ?").run(Date.now() / 1000, id);
+  markDispatched(id: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`update ${this.#schema}.prompt_jobs set upstream_dispatched_at = now() where id = $1`, [id]));
   }
 
-  markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): void {
-    this.db.prepare<[sessionId: string | null, turnId: string | null, startedAt: number, id: string]>(`
-      update prompt_jobs
-      set upstream_session_id = ?, upstream_turn_id = ?, upstream_started_at = ?
-      where id = ? and state = 'running'
-    `).run(sessionId ?? null, turnId ?? null, Date.now() / 1000, id);
+  markUpstreamStarted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs set upstream_session_id = $2, upstream_turn_id = $3, upstream_started_at = now()
+       where id = $1 and state = 'running'`,
+      [id, sessionId ?? null, turnId ?? null],
+    ));
   }
 
-  markUpstreamCompleted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): void {
-    this.db.prepare<[sessionId: string | null, turnId: string | null, completedAt: number, id: string]>(`
-      update prompt_jobs
-      set upstream_session_id = coalesce(?, upstream_session_id),
-          upstream_turn_id = coalesce(?, upstream_turn_id),
-          upstream_completed_at = ?
-      where id = ? and state = 'running'
-    `).run(sessionId ?? null, turnId ?? null, Date.now() / 1000, id);
+  markUpstreamCompleted(id: string, sessionId: string | null | undefined, turnId: string | null | undefined): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs
+       set upstream_session_id = coalesce($2, upstream_session_id), upstream_turn_id = coalesce($3, upstream_turn_id), upstream_completed_at = now()
+       where id = $1 and state = 'running'`,
+      [id, sessionId ?? null, turnId ?? null],
+    ));
   }
 
-  fail(id: string, error: unknown): void {
-    this.db.prepare<[lastError: string, completedAt: number, id: string]>(`
-      update prompt_jobs set state = 'failed', last_error = ?, completed_at = ? where id = ?
-    `).run(String(error).slice(0, 2000), Date.now() / 1000, id);
+  fail(id: string, error: unknown): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `update ${this.#schema}.prompt_jobs set state = 'failed', last_error = $2, completed_at = now() where id = $1`,
+      [id, String(error).slice(0, 2000)],
+    ));
   }
 
-  hasOpenJobs(conversationId: string): boolean {
-    const row = this.db.prepare<[string], { count: number }>(`
-      select count(*) as count from prompt_jobs
-      where conversation_id = ? and state in ('pending', 'running', 'awaiting_choice')
-    `).get(conversationId);
-    return Number(row?.count ?? 0) > 0;
+  hasOpenJobs(conversationId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query<{ open: boolean }>(
+      `select exists (
+         select 1 from ${this.#schema}.prompt_jobs where conversation_id = $1 and state in ('pending', 'running', 'awaiting_choice')
+       ) as open`,
+      [conversationId],
+    ).pipe(Effect.map(([row]) => row!.open));
   }
 
-  listPendingConversations(): string[] {
-    return this.db.prepare<[], Pick<PromptJobRow, "conversation_id">>(`
-      select distinct conversation_id from prompt_jobs where state = 'pending' order by conversation_id
-    `).all().map((row) => row.conversation_id);
+  listPendingConversations(): Effect.Effect<string[], StoreError> {
+    return this.#sql.query<{ conversation_id: string }>(
+      `select distinct conversation_id from ${this.#schema}.prompt_jobs where state = 'pending' order by conversation_id`,
+    ).pipe(Effect.map((rows) => rows.map((row) => row.conversation_id)));
   }
 
   /**
@@ -177,23 +150,24 @@ export class SqlitePromptJobRepository {
    * never sent twice, since the agent may have acted on it (the turn's restart recovery
    * continues it). Returns the conversations whose turn the agent finished.
    */
-  recoverAfterRestart(): string[] {
-    const completed = this.db.prepare<[], Pick<PromptJobRow, "conversation_id">>(`
-      select distinct conversation_id from prompt_jobs
-      where state = 'running' and upstream_completed_at is not null
-    `).all().map((row) => row.conversation_id);
-    this.db.prepare<[completedAt: number]>(`
-      update prompt_jobs set state = 'completed', completed_at = coalesce(completed_at, ?)
-      where state = 'running' and upstream_completed_at is not null
-    `).run(Date.now() / 1000);
-    this.db.prepare<[]>(`
-      update prompt_jobs set state = 'pending', started_at = null
-      where state = 'running' and upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null
-    `).run();
-    this.db.prepare<[completedAt: number]>(`
-      update prompt_jobs set state = 'interrupted', completed_at = ?
-      where state = 'running' and (upstream_dispatched_at is not null or upstream_started_at is not null) and upstream_completed_at is null
-    `).run(Date.now() / 1000);
-    return completed;
+  recoverAfterRestart(): Effect.Effect<string[], StoreError> {
+    return this.#sql.query<{ conversation_id: string }>(
+      `with settled as (
+         update ${this.#schema}.prompt_jobs set
+           state = case
+             when upstream_completed_at is not null then 'completed'
+             when upstream_dispatched_at is null and upstream_started_at is null then 'pending'
+             else 'interrupted'
+           end,
+           started_at = case when upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null then null else started_at end,
+           completed_at = case
+             when upstream_dispatched_at is null and upstream_started_at is null and upstream_completed_at is null then completed_at
+             else coalesce(completed_at, now())
+           end
+         where state = 'running'
+         returning conversation_id, state
+       )
+       select distinct conversation_id from settled where state = 'completed'`,
+    ).pipe(Effect.map((rows) => rows.map((row) => row.conversation_id)));
   }
 }

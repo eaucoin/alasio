@@ -7,8 +7,9 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { AlasioConfig } from "../config.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { harnessLabelOf, isHarnessName, resolveWorkingDirectory } from "../harness/index.ts";
+import { harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { type NetMode, type SessionError, SessionSandboxes } from "../sandbox/index.ts";
 import { newVolumeId } from "../sandbox/names.ts";
@@ -66,17 +67,17 @@ export class Mounts extends Context.Service<Mounts, {
   /** Whether the deployment offers session filesystems. */
   readonly sessionFilesystems: boolean;
   /** Mounts the service `harness` on the conversation. */
-  readonly switchHarness: (conversationId: string, harness: string) => Effect.Effect<HarnessSwitch, MountRefused>;
+  readonly switchHarness: (conversationId: string, harness: string) => Effect.Effect<HarnessSwitch, MountRefused | StoreError>;
   /** Mounts the folder `target` names under the workspace root. */
-  readonly switchWorkspace: (conversationId: string, target: string) => Effect.Effect<WorkspaceChange, MountRefused | WorkspaceFolderError>;
+  readonly switchWorkspace: (conversationId: string, target: string) => Effect.Effect<WorkspaceChange, MountRefused | WorkspaceFolderError | StoreError>;
   /** Creates a git-initialized folder `name` under the workspace root and mounts it. */
-  readonly createWorkspace: (conversationId: string, name: string) => Effect.Effect<WorkspaceChange, MountRefused | WorkspaceFolderError>;
+  readonly createWorkspace: (conversationId: string, name: string) => Effect.Effect<WorkspaceChange, MountRefused | WorkspaceFolderError | StoreError>;
   /**
    * Creates an empty session filesystem with internet access `netMode` and mounts it. The
    * workspace is the sentinel `sessionfs:<volumeId>` (src/workspace/kind.ts), so it parks
    * and restores like any other workspace; its sandbox comes up when a turn needs it.
    */
-  readonly createSessionWorkspace: (conversationId: string, netMode: NetMode) => Effect.Effect<WorkspaceChange, MountRefused | SessionError>;
+  readonly createSessionWorkspace: (conversationId: string, netMode: NetMode) => Effect.Effect<WorkspaceChange, MountRefused | SessionError | StoreError>;
 }>()("alasio/operator/Mounts") {
   static readonly layer = ({ workspaceRoot }: Pick<AlasioConfig, "workspaceRoot">): Layer.Layer<Mounts, never, Store | ActiveTurns> =>
     Layer.effect(Mounts, makeMounts(workspaceRoot));
@@ -88,24 +89,23 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
 
   /** Refuses a change while a turn runs in the conversation or prompts wait for its service. */
-  const unblocked = (conversationId: string): Effect.Effect<void, MountRefused> =>
-    Effect.flatMap(activeTurns.isBusy(conversationId), (busy) => {
-      if (busy) {
-        return Effect.fail(new MountRefused({ message: `${harnessLabelOf(store, conversationId)} is currently working. Stop the active turn before switching services.` }));
-      }
-      if (store.hasOpenPromptJobs(conversationId)) {
-        return Effect.fail(new MountRefused({ message: "Queued prompts are still waiting for the current service. Let them finish or discard them before switching." }));
-      }
-      return Effect.void;
-    });
+  const unblocked = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, MountRefused | StoreError> {
+    if (yield* activeTurns.isBusy(conversationId)) {
+      const mount = yield* store.getMount(conversationId);
+      return yield* new MountRefused({ message: `${harnessLabelOf(mount)} is currently working. Stop the active turn before switching services.` });
+    }
+    if (yield* store.hasOpenPromptJobs(conversationId)) {
+      return yield* new MountRefused({ message: "Queued prompts are still waiting for the current service. Let them finish or discard them before switching." });
+    }
+  });
 
   /** Mounts `workingDirectory`, created just now, on the conversation. */
-  const mountCreated = (conversationId: string, workingDirectory: string, logLine: string): Effect.Effect<WorkspaceChange> =>
-    Effect.suspend(() => {
-      const previous = resolveWorkingDirectory(store, conversationId);
-      store.setWorkingDirectory(conversationId, workingDirectory);
-      return Effect.as(Effect.logInfo(logLine), { switched: true, created: true, previous, workingDirectory });
-    });
+  const mountCreated = Effect.fnUntraced(function*(conversationId: string, workingDirectory: string, logLine: string): Effect.fn.Return<WorkspaceChange, StoreError> {
+    const previous = (yield* store.getMount(conversationId)).workingDirectory;
+    yield* store.setWorkingDirectory(conversationId, workingDirectory);
+    yield* Effect.logInfo(logLine);
+    return { switched: true, created: true, previous, workingDirectory };
+  });
 
   return Mounts.of({
     workspaceRoot,
@@ -114,29 +114,25 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
       if (!isHarnessName(harness)) {
         return yield* new MountRefused({ message: `Unknown service: ${harness}` });
       }
-      const previous = store.getActiveHarness(conversationId);
+      const before = yield* store.getMount(conversationId);
+      const previous = before.harness;
       if (previous === harness) {
-        return { switched: false, previous, next: harness, sessionId: store.getSessionId(conversationId) ?? null };
+        return { switched: false, previous, next: harness, sessionId: before.sessionId };
       }
       yield* unblocked(conversationId);
-      store.setActiveHarness(conversationId, harness);
+      yield* store.setActiveHarness(conversationId, harness);
       yield* Effect.logInfo(`service.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${harness}`);
-      return {
-        switched: true,
-        previous,
-        next: harness,
-        sessionId: store.getSessionId(conversationId) ?? null,
-        workingDirectory: resolveWorkingDirectory(store, conversationId),
-      };
+      const after = yield* store.getMount(conversationId);
+      return { switched: true, previous, next: harness, sessionId: after.sessionId, workingDirectory: after.workingDirectory };
     }, withLogScope(LOG_SCOPE)),
     switchWorkspace: Effect.fnUntraced(function*(conversationId, target) {
       const workingDirectory = yield* folder(() => resolveWorkspacePath({ root: workspaceRoot, candidate: target }));
-      const previous = resolveWorkingDirectory(store, conversationId);
+      const previous = (yield* store.getMount(conversationId)).workingDirectory;
       if (previous === workingDirectory) {
         return { switched: false, previous, workingDirectory };
       }
       yield* unblocked(conversationId);
-      store.setWorkingDirectory(conversationId, workingDirectory);
+      yield* store.setWorkingDirectory(conversationId, workingDirectory);
       yield* Effect.logInfo(`workspace.switched conversation=${JSON.stringify(conversationId)} from=${previous} to=${workingDirectory}`);
       return { switched: true, previous, workingDirectory };
     }, withLogScope(LOG_SCOPE)),

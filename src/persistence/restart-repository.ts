@@ -1,53 +1,66 @@
-import type { Database } from "better-sqlite3";
+import { Effect } from "effect";
+
+import type { Sql, StoreError } from "./sql.ts";
 
 /** What restarted alasio under a turn: the turn itself, the operator, or something else. */
 export type RestartCause = "self_induced" | "operator_induced" | "external_or_unknown";
 
-/**
- * A restart that cut a conversation's turn short, kept (as the payload of a row of
- * `restart_events`) until the turn is resumed after it.
- */
-export interface RestartEvent {
+/** A restart that cut a conversation's turn short, to record until the turn is resumed after it. */
+export interface NewRestartEvent {
   readonly cause: RestartCause;
   readonly thread_key: string;
-  readonly channel: string | number;
-  readonly thread_ts: string | number;
+  readonly channel: string;
+  readonly thread_ts: string;
   readonly session_id: string | null;
   /** The command that restarted alasio, for a self-induced restart. */
-  readonly command?: string;
-  readonly timestamp: number;
+  readonly command?: string | undefined;
 }
 
-export class SqliteRestartRepository {
-  private readonly db: Database;
+/** A row of `restart_events`: a restart recorded, and when. */
+export interface RestartEvent extends Required<Omit<NewRestartEvent, "command">> {
+  readonly command: string | null;
+  readonly recorded_at: Date;
+}
 
-  constructor(db: Database) {
-    this.db = db;
+export class NeonRestartRepository {
+  readonly #sql: Sql;
+  readonly #schema: string;
+
+  constructor(sql: Sql, schema: string) {
+    this.#sql = sql;
+    this.#schema = schema;
   }
 
-  recordRestartEvent(event: RestartEvent): void {
-    this.db.prepare<[threadKey: string, payloadJson: string, createdAt: number]>(`
-      insert into restart_events (thread_key, payload_json, created_at)
-      values (?, ?, ?)
-      on conflict(thread_key) do update set payload_json = excluded.payload_json, created_at = excluded.created_at
-    `).run(event.thread_key, JSON.stringify(event), Date.now() / 1000);
+  recordRestartEvent({ cause, thread_key, channel, thread_ts, session_id, command }: NewRestartEvent): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `insert into ${this.#schema}.restart_events (thread_key, cause, channel, thread_ts, session_id, command) values ($1, $2, $3, $4, $5, $6)
+       on conflict (thread_key) do update set
+         cause = excluded.cause, channel = excluded.channel, thread_ts = excluded.thread_ts,
+         session_id = excluded.session_id, command = excluded.command, recorded_at = excluded.recorded_at`,
+      [thread_key, cause, channel, thread_ts, session_id, command ?? null],
+    ));
   }
 
-  getRestartEvent(threadKey: string): RestartEvent | null {
-    const row = this.db.prepare<[string], { payload_json: string }>("select payload_json from restart_events where thread_key = ?").get(threadKey);
-    // recordRestartEvent is the only writer of the payload.
-    return row ? JSON.parse(row.payload_json) as RestartEvent : null;
+  /**
+   * Records that the conversation's active turn was cut short by a restart alasio cannot
+   * attribute, unless it has no active turn or a restart of it is already recorded.
+   */
+  recordExternalRestartEvent(threadKey: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `insert into ${this.#schema}.restart_events (thread_key, cause, channel, thread_ts, session_id)
+       select thread_key, 'external_or_unknown', channel, thread_ts, session_id from ${this.#schema}.turns where id = $1 and state = 'active'
+       on conflict (thread_key) do nothing`,
+      [threadKey],
+    ));
   }
 
-  clearRestartEvent(threadKey: string): void {
-    this.db.prepare<[string]>("delete from restart_events where thread_key = ?").run(threadKey);
+  getRestartEvent(threadKey: string): Effect.Effect<RestartEvent | null, StoreError> {
+    return this.#sql.query<RestartEvent>(`select * from ${this.#schema}.restart_events where thread_key = $1`, [threadKey]).pipe(
+      Effect.map(([row]) => row ?? null),
+    );
   }
 
-  consumeRestartEvent(threadKey: string): RestartEvent | null {
-    const event = this.getRestartEvent(threadKey);
-    if (event) {
-      this.clearRestartEvent(threadKey);
-    }
-    return event;
+  clearRestartEvent(threadKey: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.restart_events where thread_key = $1`, [threadKey]));
   }
 }

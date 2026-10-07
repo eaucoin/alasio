@@ -7,30 +7,22 @@ import { test } from "node:test";
 import type { InlineKeyboardMarkup } from "@grammyjs/types";
 import { Effect } from "effect";
 
-import { type WorkspaceControlStore, buildWorkspacePanel, handleWorkspaceControlCallback } from "../src/operator/workspace-control.ts";
-import { SqliteStore } from "../src/persistence/store.ts";
+import { buildWorkspacePanel, handleWorkspaceControlCallback } from "../src/operator/workspace-control.ts";
+import type { Store } from "../src/persistence/store.ts";
 import type { NetMode, SessionSandboxes } from "../src/sandbox/index.ts";
 import { parseWorkspace } from "../src/workspace/kind.ts";
+import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, withServices } from "./support/turns.ts";
-
-// A store whose only jobs here are minting callback ids and reporting the mounted folder.
-function fakeStore(): WorkspaceControlStore {
-  return {
-    createCallbackAction: ({ kind, payload }) => `${kind}:${JSON.stringify(payload ?? {})}`,
-    getWorkingDirectory: () => null,
-  };
-}
 
 // Buttons in a panel/edit, flattened to their labels.
 const labels = (markup: InlineKeyboardMarkup) => markup.inline_keyboard.flat().map((b) => b.text);
 
 test("the workspace panel offers New empty workspace only when session filesystems are enabled", () => {
-  const store = fakeStore();
   const panel = (sandboxEnabled: boolean) =>
-    buildWorkspacePanel({ store, conversationId: "c1", workspaceRoot: "/root", listing: { candidates: [] }, working: false, sandboxEnabled });
-  assert.ok(!labels(panel(false).options.reply_markup).includes("New empty workspace…"));
-  assert.ok(labels(panel(true).options.reply_markup).includes("New empty workspace…"));
+    buildWorkspacePanel({ current: null, workspaceRoot: "/root", listing: { candidates: [] }, working: false, sandboxEnabled }).keyboard.flat().map((button) => button.text);
+  assert.ok(!panel(false).includes("New empty workspace…"));
+  assert.ok(panel(true).includes("New empty workspace…"));
 });
 
 /** The conversation of chat 1, on Codex. */
@@ -39,16 +31,15 @@ const CONVERSATION = "telegram:1";
 /** The workspace controls' services over a conversation on Codex, with `sandbox` offering session filesystems when given. */
 async function withWorkspaceControls(
   sandbox: SessionSandboxes["Service"] | undefined,
-  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: SqliteStore) => Promise<void>,
+  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: Store["Service"]) => Promise<void>,
 ): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "alasio-workspace-sessionfs-"));
-  const store = new SqliteStore(root);
+  const store = await testStore();
   try {
-    store.setActiveHarness(store.upsertConversation({ chatId: "1", user: { id: 1 } }), "codex");
+    await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "1", user: { id: 1 } })), "codex"));
     const telegram = recordingTelegram();
     await withServices({ store, telegram: telegram.layer, workspaceRoot: root, sandbox }, (alasio) => use(alasio, telegram, store));
   } finally {
-    store.close();
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -92,7 +83,7 @@ test("choosing New empty workspace shows the internet dialog, then creates with 
     await alasio.runPromise(press("sessionfs_create", { net: "full" }));
     assert.equal(created.length, 1);
     assert.equal(created[0]?.[1], "full");
-    const workspace = parseWorkspace(store.getWorkingDirectory(CONVERSATION) ?? "");
+    const workspace = parseWorkspace((await run(store.getMount(CONVERSATION))).workingDirectory ?? "");
     assert.equal(workspace?.kind === "sessionfs" ? workspace.volumeId : null, created[0]?.[0]);
     assert.match(calls.answerCallbackQuery.at(-1)?.[1] ?? "", /Created and mounted/);
   });
@@ -102,6 +93,6 @@ test("without session filesystems, a new empty workspace is declined", async () 
   await withWorkspaceControls(undefined, async (alasio, { calls }, store) => {
     await alasio.runPromise(press("sessionfs_create", { net: "none" }));
     assert.deepEqual(calls.answerCallbackQuery.at(-1), ["cb-sessionfs_create", "Session filesystems are not enabled."]);
-    assert.equal(store.getWorkingDirectory(CONVERSATION), null);
+    assert.equal((await run(store.getMount(CONVERSATION))).workingDirectory, null);
   });
 });

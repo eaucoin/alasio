@@ -3,7 +3,7 @@ import { Effect, Option, Result } from "effect";
 
 import { type ConcurrentPromptPayload, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { Harnesses, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName, resolveHarnessName } from "../harness/index.ts";
+import { Harnesses, NO_SERVICE_MOUNTED, NO_WORKSPACE_MOUNTED, isHarnessName } from "../harness/index.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
 import { handleGoalControlCallback, isGoalControlAction } from "../operator/goal-control.ts";
 import { handleModelControlCallback, isModelControlAction } from "../operator/model-control.ts";
@@ -14,6 +14,7 @@ import type { CallbackAction } from "../persistence/callback-repository.ts";
 import { Store } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
 import { TelegramClient } from "./client.ts";
+import { ReceivedFiles } from "./files.ts";
 
 /** A concurrent prompt's button payload: askHowToHandleConcurrentPrompt is the only writer of these kinds. */
 function concurrentPromptPayload(action: CallbackAction): ConcurrentPromptPayload {
@@ -46,27 +47,26 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     return;
   }
   // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
-  const action = callbackQuery.data === undefined ? null : store.consumeCallbackAction(callbackQuery.data);
+  const action = callbackQuery.data === undefined ? null : yield* store.consumeCallbackAction(callbackQuery.data);
   if (!action) {
     yield* client.answerCallbackQuery(callbackQuery.id, "This action is no longer available.");
     return;
   }
   const { conversationId } = action;
   const closes = action.kind.endsWith(":close");
-  if (!closes
-    && Object.hasOwn(action.payload, "expectedSessionId")
-    && (store.getSessionId(conversationId) ?? null) !== action.payload["expectedSessionId"]) {
+  const mount = yield* store.getMount(conversationId);
+  if (!closes && mount.sessionId !== action.payload["expectedSessionId"]) {
     yield* client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
     return;
   }
   if (!closes
     && !isServiceControlAction(action.kind)
-    && isHarnessName(action.payload?.["expectedHarness"])
-    && store.getActiveHarness(conversationId) !== action.payload["expectedHarness"]) {
+    && isHarnessName(action.payload["expectedHarness"])
+    && mount.harness !== action.payload["expectedHarness"]) {
     yield* client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
     return;
   }
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forConversation(conversationId)));
+  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
   const chatId = callbackQuery.message?.chat?.id;
   const messageId = callbackQuery.message?.message_id;
   if (!chatId || !messageId) {
@@ -84,7 +84,7 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     return yield* handleWorkspaceControlCallback(press);
   }
   if (!harness) {
-    const reason = resolveHarnessName(store, conversationId) ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
+    const reason = mount.harness ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
     yield* client.answerCallbackQuery(callbackQuery.id, reason);
     return;
   }
@@ -94,8 +94,12 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
   }
   if (action.kind === "steer") {
     const payload = concurrentPromptPayload(action);
-    const promptJob = payload.jobId ? store.getPromptJob(payload.jobId) : null;
+    const promptJob = payload.jobId ? yield* store.getPromptJob(payload.jobId) : null;
     const prompt = promptJob?.prompt ?? payload.prompt;
+    // The files the prompt names, written again if a restart came since.
+    if (promptJob) {
+      yield* Effect.flatMap(ReceivedFiles, (files) => files.materialize(promptJob.file_ids));
+    }
     /** Keeps the message for after the running turn instead: its job made pending again, or a queued message. */
     const queueInstead = promptJob ? turns.setPromptDisposition(promptJob.id, "pending") : turns.enqueueMessage(conversationId, prompt);
     const steered = yield* activeTurns.steer(conversationId, prompt).pipe(Effect.result);
@@ -147,7 +151,7 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     const payload = concurrentPromptPayload(action);
     if (payload.jobId) {
       // First in line, scheduled once the running turn has let go.
-      store.setPromptJobDisposition(payload.jobId, "pending", 1);
+      yield* store.setPromptJobDisposition(payload.jobId, "pending", 1);
     } else {
       yield* turns.enqueueMessage(conversationId, payload.prompt, true);
     }

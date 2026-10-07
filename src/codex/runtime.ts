@@ -7,7 +7,7 @@
 import { Cause, Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect";
 
 import { buildCodexEnv } from "./env.ts";
-import { appendBlock, errorBlock, isVisibleCodexItem, mapItemToBlocks } from "./event-projection.ts";
+import { appendBlock, completeResponse, errorBlock, isVisibleCodexItem, mapItemToBlocks, responseProjection, storeBlocks } from "./event-projection.ts";
 import {
   type CodexEvent,
   type CodexTransportRefused,
@@ -37,7 +37,7 @@ import { withLogScope } from "../shared/log.ts";
 import { ActiveTurns, type RunningTurn, stopReasonText } from "../harness/active-turns.ts";
 import { CODEX_HARNESS } from "../harness/names.ts";
 import type { HarnessError, TurnParams, TurnResult } from "../harness/index.ts";
-import type { ResponseBlock } from "./event-projection.ts";
+import type { StoreError } from "../persistence/sql.ts";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -165,8 +165,8 @@ export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...para
 }, withLogScope("codex-runtime"));
 
 /**
- * A Codex turn, from its pending response to its result. It does not fail: what goes
- * wrong ends up in its response, as an error. While its events are read it is the
+ * A Codex turn, from its pending response to its result. It fails only as alasio's store
+ * does: what else goes wrong ends up in its response, as an error. While its events are read it is the
  * conversation's running turn, whose stop interrupts the reading (and so the turn
  * upstream) and is done once the turn has let go of the conversation.
  *
@@ -175,20 +175,19 @@ export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...para
  * interrupt would have Codex record it as one the user made, which the turn continued
  * after the restart is not to believe.
  */
-export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult, never, ActiveTurns> {
-  const { prompt, resumeSession, threadKey, chatId, messageId, persistence, onStarted } = params;
+export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult, StoreError, ActiveTurns> {
+  const { prompt, resumeSession, threadKey, chatId, messageId, persistence } = params;
   const activeTurns = yield* ActiveTurns;
   const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
   const turnTimer = createTurnTimer({ harness: CODEX_HARNESS, threadKey, resumeSession, prompt });
   yield* Effect.logInfo(`Querying Codex (resume=${resumeSession})`);
   yield* turnTimer("query.start");
-  onStarted?.();
-  const blockSequence: ResponseBlock[] = [];
   let sessionId: string | null | undefined = resumeSession;
   let interrupted = false;
   let responseCompleted = false;
-  const pendingResponseId = persistence.createPendingResponse(chatId, messageId, resumeSession);
-  persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
+  const pendingResponseId = yield* persistence.createPendingResponse(chatId, messageId, resumeSession);
+  yield* persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
+  const projection = responseProjection(pendingResponseId);
   // Why the turn is stopped, once it is; and its letting go of the conversation.
   const stopped = yield* Deferred.make<never, TurnStopped | GuardrailStopped>();
   const finished = yield* Deferred.make<void>();
@@ -215,12 +214,11 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       firstEventLogged = true;
       yield* turnTimer("first_event", { event_type: event.type });
     }
-    onStarted?.();
     switch (event.type) {
       case "thread.started":
         sessionId = event.thread_id;
-        persistence.updatePendingSessionId(pendingResponseId, sessionId);
-        persistence.updateActiveTurnSessionId(threadKey, sessionId);
+        yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
+        yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
         break;
       case "item.started":
       case "item.updated":
@@ -236,11 +234,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
             break;
           }
         }
-        mapItemToBlocks(event.item, {
-          blockSequence,
-          persistence,
-          pendingResponseId,
-        });
+        mapItemToBlocks(event.item, projection);
         break;
       case "turn.completed":
         yield* turnTimer("turn.completed");
@@ -249,33 +243,36 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
           yield* params.beforeResponseComplete(sessionId);
         }
         yield* turnTimer("before_response_complete.done");
-        persistence.markPendingResponseComplete(pendingResponseId);
+        yield* completeResponse(projection, persistence);
         responseCompleted = true;
-        params.onTransportCompleted?.({ sessionId, turnId });
+        if (params.onTransportCompleted) {
+          yield* params.onTransportCompleted({ sessionId, turnId });
+        }
         if (sessionId && event.usage) {
-          persistence.updateSessionUsage(sessionId, {
+          yield* persistence.updateSessionUsage(sessionId, {
             cacheReadInputTokens: event.usage.cached_input_tokens,
           });
         }
         break;
       case "usage.updated":
         if (sessionId && event.usage?.last) {
-          persistence.updateSessionUsage(sessionId, {
+          yield* persistence.updateSessionUsage(sessionId, {
             cacheReadInputTokens: event.usage.last.cachedInputTokens,
           });
         }
         break;
       case "turn.failed":
         yield* turnTimer("turn.failed", { error: event.error.message });
-        appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(event.error.message));
+        appendBlock(projection, errorBlock(event.error.message));
         break;
       case "error":
         yield* turnTimer("event.error", { error: event.message });
-        appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(event.message));
+        appendBlock(projection, errorBlock(event.message));
         break;
       default:
         break;
     }
+    yield* storeBlocks(projection, persistence);
   });
 
   /** The turn's events, read to their end, in a scope the transport keeps what it runs in. */
@@ -290,6 +287,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       codexEnv,
       codexConfig,
       prompt,
+      modelChoice: params.modelChoice,
       persistence,
       pendingResponseId,
       codexFactory: params.codexFactory,
@@ -305,7 +303,9 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       })
       : yield* openCodexEventStream(streamParams);
     sessionId = streamed.sessionId;
-    params.onTransportStarted?.({ sessionId, turnId: streamed.turnId });
+    if (params.onTransportStarted) {
+      yield* params.onTransportStarted({ sessionId, turnId: streamed.turnId });
+    }
     if (sessionId && streamed.turnId) {
       const steered = { sessionId, turnId: streamed.turnId, appServer };
       steer = (steerPrompt) => steerCodexTransportTurn({ ...steered, prompt: steerPrompt });
@@ -333,13 +333,13 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       const errMsg = getErrorMessage(failure);
       if (failure instanceof TurnStopped) {
         interrupted = true;
-        blockSequence.length = 0;
+        projection.blockSequence.length = 0;
         yield* turnTimer("query.interrupted", { reason: errMsg });
         yield* Effect.logInfo(`Codex turn interrupted by operator control: ${errMsg}`);
       } else {
         yield* turnTimer("query.error", { error: errMsg });
         yield* Effect.logError(`Error querying Codex: ${errMsg}`);
-        appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(errMsg));
+        appendBlock(projection, errorBlock(errMsg));
       }
     }
   }
@@ -348,7 +348,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   if (guardrailBlocked && blockedGuardrailCommand) {
     if (sessionId && guardrailRecoveryDepth < MAX_DB_GUARDRAIL_RECOVERY_ATTEMPTS) {
       yield* Effect.logInfo("DB guardrail matched a tool command; injecting synthetic user message back into Codex");
-      persistence.markPendingAsPosted(pendingResponseId);
+      yield* persistence.markPendingAsPosted(pendingResponseId);
       return yield* executeCodexTurn({
         ...params,
         prompt: buildDbGuardrailSyntheticText(blockedGuardrailCommand),
@@ -357,13 +357,14 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
         guardrailRecoveryDepth: guardrailRecoveryDepth + 1,
       });
     }
-    appendBlock(blockSequence, persistence, pendingResponseId, {
+    appendBlock(projection, {
       type: "text",
       content: buildDbGuardrailFallbackText(blockedGuardrailCommand),
     });
   }
+  yield* storeBlocks(projection, persistence);
   return {
-    blockSequence,
+    blockSequence: projection.blockSequence,
     sessionId,
     pendingResponseId,
     interrupted,

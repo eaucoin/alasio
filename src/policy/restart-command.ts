@@ -4,7 +4,10 @@
  * restarted by rolling it out again: `kubectl rollout restart` of `ALASIO_DEPLOYMENT`
  * (alasio unless set), which the host profile lets folder workspaces' agents do.
  */
-import type { RestartEvent } from "../persistence/restart-repository.ts";
+import type { Effect } from "effect";
+
+import type { StoreError } from "../persistence/sql.ts";
+import type { Store } from "../persistence/store.ts";
 import { resolveCommandTokens, tokenizeShellCommand, unwrapShellCommandOnce } from "./shell-command.ts";
 
 /** Where the restart detectors read ALASIO_DEPLOYMENT from; the process's environment unless given. */
@@ -13,9 +16,7 @@ export interface RestartCommandOptions {
 }
 
 /** Where a self-restart is recorded: alasio's store. */
-export interface RestartEventRecorder {
-  recordRestartEvent(event: RestartEvent): void;
-}
+export type RestartEventRecorder = Pick<Store["Service"], "recordRestartEvent">;
 
 // kubectl's global flags that take a value, which may come before or after the verb.
 const KUBECTL_VALUE_FLAGS = new Set(["-n", "--namespace", "--context", "--kubeconfig", "--cluster", "--user", "-s", "--server"]);
@@ -81,14 +82,13 @@ export function recordSelfRestartEvent(
   chatId: string,
   messageId: string,
   command: string,
-): void {
-  persistence.recordRestartEvent({
+): Effect.Effect<void, StoreError> {
+  return persistence.recordRestartEvent({
     cause: "self_induced",
     thread_key: threadKey,
     channel: chatId,
     thread_ts: messageId,
     session_id: sessionId ?? null,
     command,
-    timestamp: Date.now() / 1000,
   });
 }

@@ -1,9 +1,8 @@
-import { rmSync } from "node:fs";
-
 import type { ObservableResult } from "@opentelemetry/api";
 import { Clock, Context, Effect, Latch, Layer, Semaphore } from "effect";
 
 import type { NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { currentTraceparent, meter, withAlasioSpan } from "../telemetry/index.ts";
@@ -42,9 +41,9 @@ function retryDelayMs(item: OutboxEntry, error: TelegramError): number {
  */
 export class Outbox extends Context.Service<Outbox, {
   /** Queues a reply and wakes delivery; its delivery joins the trace it is queued in. The reply's id. */
-  readonly enqueueText: (text: OutboxText) => Effect.Effect<string>;
+  readonly enqueueText: (text: OutboxText) => Effect.Effect<string, StoreError>;
   /** A delivery pass, after the one running if one is. */
-  readonly deliverDue: Effect.Effect<void>;
+  readonly deliverDue: Effect.Effect<void, StoreError>;
 }>()("alasio/telegram/Outbox") {
   static readonly layer: Layer.Layer<Outbox, never, Store | TelegramClient> = Layer.effect(Outbox, Effect.gen(function*() {
     const store = yield* Store;
@@ -52,34 +51,38 @@ export class Outbox extends Context.Service<Outbox, {
     const passes = yield* Semaphore.make(1);
     const wakeup = yield* Latch.make();
 
+    // The gauge is read as metrics are exported, outside every fiber of alasio's.
+    const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
     yield* Effect.acquireRelease(
       Effect.sync(() => {
-        const observe = (result: ObservableResult) => result.observe(store.getPendingOutboxCount());
+        const observe = (result: ObservableResult) =>
+          runPromise(store.getPendingOutboxCount.pipe(
+            Effect.map((count) => result.observe(count)),
+            Effect.catch((error) => Effect.logWarning(`could not count the outbox's pending replies: ${error.message}`)),
+          ));
         pendingReplies.addCallback(observe);
         return observe;
       }),
       (observe) => Effect.sync(() => pendingReplies.removeCallback(observe)),
     );
 
-    /** Sends one reply, or defers it with backoff and fails with what stopped it. */
-    const deliver = Effect.fnUntraced(function*(item: OutboxEntry): Effect.fn.Return<void, TelegramError> {
-      yield* client.sendMessage(item.chat_id, item.text, item.options).pipe(
+    /** Sends one reply with its media, or defers it with backoff and fails with what stopped it. */
+    const deliver = Effect.fnUntraced(function*(item: OutboxEntry): Effect.fn.Return<void, TelegramError | StoreError> {
+      const media = yield* store.getOutboxMedia(item.id);
+      yield* client.sendMessage(item.chat_id, item.text, media.length ? { ...item.options, media } : item.options).pipe(
         Effect.tapError((error) => {
           const delayMs = retryDelayMs(item, error);
-          store.rescheduleOutbox(item.id, error, delayMs);
-          return Effect.logWarning(`Telegram outbox delivery deferred id=${item.id} delay_ms=${delayMs} error=${error.message}`);
+          return store.rescheduleOutbox(item.id, error, delayMs).pipe(
+            Effect.andThen(Effect.logWarning(`Telegram outbox delivery deferred id=${item.id} delay_ms=${delayMs} error=${error.message}`)),
+          );
         }),
       );
-      store.markOutboxSent(item.id);
-      deliveryLag.record(((yield* Clock.currentTimeMillis) - Date.parse(item.created_at)) / 1000);
-      // The copies of the media a reply showed (codex/reply-media.ts) are its own.
-      if (item.options?.mediaDir) {
-        rmSync(item.options.mediaDir, { recursive: true, force: true });
-      }
+      yield* store.markOutboxSent(item.id);
+      deliveryLag.record(((yield* Clock.currentTimeMillis) - item.created_at.getTime()) / 1000);
     });
 
     const deliverDue = passes.withPermit(Effect.gen(function*() {
-      for (const item of store.getDueOutbox(20)) {
+      for (const item of yield* store.getDueOutbox(20)) {
         const delivered = yield* deliver(item).pipe(
           withAlasioSpan("alasio.delivery", {
             parent: item.traceparent,
@@ -92,8 +95,10 @@ export class Outbox extends Context.Service<Outbox, {
       }
     })).pipe(withLogScope("telegram-app"));
 
+    // A pass that fails is tried again with the next.
     yield* wakeup.close.pipe(
       Effect.andThen(deliverDue),
+      Effect.catch((error) => Effect.logError(`Telegram outbox delivery failed: ${error.message}`).pipe(withLogScope("telegram-app"))),
       Effect.catchDefect((defect) => Effect.logError(`Telegram outbox delivery failed: ${String(defect)}`).pipe(withLogScope("telegram-app"))),
       Effect.andThen(wakeup.await.pipe(Effect.timeoutOption(DELIVERY_INTERVAL))),
       Effect.forever,
@@ -101,11 +106,10 @@ export class Outbox extends Context.Service<Outbox, {
     );
 
     return Outbox.of({
-      enqueueText: (text) => Effect.sync(() => {
-        const id = store.enqueueOutboxText({ ...text, traceparent: currentTraceparent() });
-        wakeup.openUnsafe();
-        return id;
-      }),
+      enqueueText: (text) =>
+        Effect.suspend(() => store.enqueueOutboxText({ ...text, traceparent: currentTraceparent() })).pipe(
+          Effect.tap(() => Effect.sync(() => wakeup.openUnsafe())),
+        ),
       deliverDue,
     });
   }));

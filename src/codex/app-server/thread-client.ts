@@ -44,8 +44,8 @@ export interface StartTurnOptions {
   readonly cwd: string;
   readonly model?: string | undefined;
   readonly effort?: string | null | undefined;
-  /** Called just before the prompt is sent, after which the agent may act on it. */
-  readonly onPromptDispatched?: (() => void) | undefined;
+  /** Run just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: Effect.Effect<void> | undefined;
 }
 
 export interface SteerTurnOptions {
@@ -234,7 +234,7 @@ export function makeAppServerThreads(
       }
       yield* notifications.beginTurn(threadId);
       const startedAt = yield* Clock.currentTimeNanos;
-      onPromptDispatched?.();
+      if (onPromptDispatched) yield* onPromptDispatched;
       const response = yield* rpc.request("turn/start", {
         threadId,
         input: [{ type: "text", text: prompt, text_elements: [] }],

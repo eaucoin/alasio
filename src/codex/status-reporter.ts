@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
-
 import { Clock, Deferred, Effect, Schedule, type Scope } from "effect";
 
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { formatDuration } from "../shared/human-time.ts";
 import { type ChatId, TelegramClient } from "../telegram/client.ts";
@@ -83,21 +82,21 @@ export interface UnansweredTurn {
 /** What a turn shows the operator: its status message as it runs and as it ends, and its reply. */
 export interface StatusReporter {
   /**
-   * Queues a final response for delivery, with any media it shows copied alongside. A
-   * failure to prepare the media never holds the response back: it goes as text.
+   * Queues a final response for delivery, with the media it shows. A file that cannot
+   * be attached never holds the response back: the response says why in its place.
    */
-  readonly enqueueFinalResponse: (response: FinalResponse) => Effect.Effect<void>;
+  readonly enqueueFinalResponse: (response: FinalResponse) => Effect.Effect<void, StoreError>;
   /**
    * Posts the turn's status message and keeps it current, in a fiber of the scope, until
    * the scope closes. The status message once posted; null if it could not be.
    */
   readonly statusUpdates: (updates: StatusUpdates) => Effect.Effect<Deferred.Deferred<PostedStatus | null>, never, Scope.Scope>;
-  readonly postResponse: (response: PostedResponse) => Effect.Effect<void>;
-  readonly finishWithoutResponse: (turn: UnansweredTurn) => Effect.Effect<void>;
+  readonly postResponse: (response: PostedResponse) => Effect.Effect<void, StoreError>;
+  readonly finishWithoutResponse: (turn: UnansweredTurn) => Effect.Effect<void, StoreError>;
   /** Says on the status message that alasio is restarting and the turn continues after it. */
   readonly restarting: (chatId: ChatId, status: PostedStatus | null, harnessName: string) => Effect.Effect<void>;
   /** Queues every completed response that has not been delivered. */
-  readonly flushCompletedResponses: Effect.Effect<void>;
+  readonly flushCompletedResponses: Effect.Effect<void, StoreError>;
 }
 
 /**
@@ -114,13 +113,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
   const { waits } = yield* WorkflowHooks;
 
   const enqueueFinalResponse = Effect.fnUntraced(function*({ chatId, text, pendingResponseId }: FinalResponse) {
-    let prepared: PreparedReply = { text, options: FINAL_RESPONSE_OPTIONS };
-    if (replyMedia) {
-      prepared = yield* replyMedia.prepare({ chatId, text, key: pendingResponseId ?? randomUUID() }).pipe(
-        Effect.catchTag("ReplyMediaError", (error) =>
-          Effect.logWarning(`Reply media could not be prepared; sending the response as text: ${error.message}`).pipe(Effect.as(prepared))),
-      );
-    }
+    const prepared: PreparedReply = replyMedia ? yield* replyMedia.prepare({ chatId, text }) : { text, options: FINAL_RESPONSE_OPTIONS };
     yield* outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
   });
 
@@ -168,7 +161,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     }
     if (!trimmedResponse) {
       if (pendingResponseId) {
-        store.markPendingAsPosted(pendingResponseId);
+        yield* store.markPendingAsPosted(pendingResponseId);
       }
       return;
     }
@@ -180,7 +173,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
       yield* client.editMessageText(chatId, status.messageId, statusText ?? `${harnessName} interrupted.`).pipe(Effect.ignore);
     }
     if (pendingResponseId) {
-      store.markPendingAsPosted(pendingResponseId);
+      yield* store.markPendingAsPosted(pendingResponseId);
     }
   });
 
@@ -192,12 +185,12 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     restarting: (chatId, status, harnessName) =>
       status ? client.editMessageText(chatId, status.messageId, restartingStatusText(harnessName)).pipe(Effect.ignore) : Effect.void,
     flushCompletedResponses: Effect.gen(function*() {
-      for (const completed of store.getCompletedResponsesPendingDelivery()) {
+      for (const completed of yield* store.getCompletedResponsesPendingDelivery) {
         const response = finalResponseToMarkdown(completed.blocks);
         if (response.trim()) {
           yield* enqueueFinalResponse({ chatId: completed.chatId, text: response, pendingResponseId: completed.id });
         } else {
-          store.markPendingAsPosted(completed.id);
+          yield* store.markPendingAsPosted(completed.id);
         }
       }
     }),

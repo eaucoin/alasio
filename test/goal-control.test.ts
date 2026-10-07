@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
 import type { v2 } from "../.types/codex/index.js";
@@ -12,7 +9,6 @@ import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { GoalUpdate, HarnessGoals } from "../src/harness/index.ts";
 import {
-  type GoalPanelTarget,
   type GoalTurnRequest,
   buildGoalPanel,
   buildNoActiveGoalPanel,
@@ -21,7 +17,8 @@ import {
   handleGoalControlCallback,
   handleGoalTextCommand,
 } from "../src/operator/goal-control.ts";
-import { SqliteStore } from "../src/persistence/store.ts";
+import type { Store } from "../src/persistence/store.ts";
+import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
@@ -37,14 +34,6 @@ function threadGoal(fields: Partial<v2.ThreadGoal>): v2.ThreadGoal {
     createdAt: 0,
     updatedAt: 0,
     ...fields,
-  };
-}
-
-function createStore(): GoalPanelTarget["store"] {
-  return {
-    createCallbackAction({ kind, payload }) {
-      return `${kind}:${Object.keys(payload ?? {}).length}`;
-    },
   };
 }
 
@@ -105,20 +94,20 @@ const CONVERSATION = "telegram:123";
 
 /** The goal controls' services over a Codex conversation, the turns they run (made on its store) standing in, for one test. */
 async function withGoalControls<T>(
-  { sessionId = "session-1", turns = () => ({}) }: { readonly sessionId?: string | null; readonly turns?: (store: SqliteStore) => Partial<Turns["Service"]> },
-  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: SqliteStore) => Promise<T>,
+  { sessionId = "session-1", turns = () => ({}) }: { readonly sessionId?: string | null; readonly turns?: (store: Store["Service"]) => Partial<Turns["Service"]> },
+  use: (alasio: TestAlasio, telegram: RecordingTelegram, store: Store["Service"]) => Promise<T>,
 ): Promise<T> {
-  const root = mkdtempSync(join(tmpdir(), "alasio-goal-control-"));
-  const store = new SqliteStore(root);
-  try {
-    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), "codex");
-    if (sessionId) store.setSessionId(CONVERSATION, sessionId);
-    const telegram = recordingTelegram();
-    return await withServices({ store, telegram: telegram.layer, turns: turnsStub(turns(store)) }, (alasio) => use(alasio, telegram, store));
-  } finally {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  }
+  const store = await codexConversation();
+  if (sessionId) await run(store.setSessionId(CONVERSATION, sessionId));
+  const telegram = recordingTelegram();
+  return await withServices({ store, telegram: telegram.layer, turns: turnsStub(turns(store)) }, (alasio) => use(alasio, telegram, store));
+}
+
+/** A store holding the conversation of chat 123, on Codex. */
+async function codexConversation(): Promise<Store["Service"]> {
+  const store = await testStore();
+  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), "codex"));
+  return store;
 }
 
 /** A runGoalTurn that records each goal turn asked for, and takes it over. */
@@ -133,22 +122,17 @@ function recordGoalTurns(runCalls: GoalTurnRequest[]): Pick<Turns["Service"], "r
 }
 
 test("goal panel renders no-mounted empty state", () => {
-  const panel = buildNoMountedGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
-  });
+  const panel = buildNoMountedGoalPanel();
 
   assert.match(panel.text, /^Goal\n\nNo Codex session is mounted\./);
   assert.deepEqual(
-    panel.options.reply_markup.inline_keyboard.map((row) => row.map((button) => button.text)),
+    panel.keyboard.map((row) => row.map((button) => button.text)),
     [["Sessions"], ["New Session"], ["Close"]],
   );
 });
 
 test("goal panel renders no-active empty state", () => {
   const panel = buildNoActiveGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
     sessionId: "12345678-aaaa-bbbb-cccc-123456789abc",
   });
 
@@ -156,15 +140,13 @@ test("goal panel renders no-active empty state", () => {
   assert.match(panel.text, /Session: 12345678/);
   assert.match(panel.text, /\/goal <objective>/);
   assert.deepEqual(
-    panel.options.reply_markup.inline_keyboard.map((row) => row.map((button) => button.text)),
+    panel.keyboard.map((row) => row.map((button) => button.text)),
     [["Close"]],
   );
 });
 
 test("goal panel renders active goal controls", () => {
   const panel = buildGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
     goal: threadGoal({
       objective: "Ship a clean Telegram /goal surface",
       status: "active",
@@ -179,15 +161,13 @@ test("goal panel renders active goal controls", () => {
   assert.match(panel.text, /Time: 2h 14m/);
   assert.match(panel.text, /Tokens: 184K \/ 500K/);
   assert.deepEqual(
-    panel.options.reply_markup.inline_keyboard.map((row) => row.map((button) => button.text)),
+    panel.keyboard.map((row) => row.map((button) => button.text)),
     [["Pause", "Clear"], ["Close"]],
   );
 });
 
 test("goal panel can distinguish active goal state from active turn state", () => {
   const panel = buildGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
     turnState: "working",
     goal: threadGoal({
       objective: "Keep working",
@@ -204,8 +184,6 @@ test("goal panel can distinguish active goal state from active turn state", () =
 
 test("goal panel renders inactive unfinished goal controls", () => {
   const panel = buildGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
     goal: threadGoal({
       objective: "Paused objective",
       status: "paused",
@@ -218,15 +196,13 @@ test("goal panel renders inactive unfinished goal controls", () => {
   assert.match(panel.text, /Status: paused/);
   assert.match(panel.text, /Tokens: 1.2K/);
   assert.deepEqual(
-    panel.options.reply_markup.inline_keyboard.map((row) => row.map((button) => button.text)),
+    panel.keyboard.map((row) => row.map((button) => button.text)),
     [["Resume", "Clear"], ["Close"]],
   );
 });
 
 test("replace panel requires explicit confirmation", () => {
   const panel = buildReplaceGoalPanel({
-    store: createStore(),
-    conversationId: "conversation-1",
     currentGoal: threadGoal({
       objective: "Current objective",
     }),
@@ -237,7 +213,7 @@ test("replace panel requires explicit confirmation", () => {
   assert.match(panel.text, /Current objective/);
   assert.match(panel.text, /New objective/);
   assert.deepEqual(
-    panel.options.reply_markup.inline_keyboard.map((row) => row.map((button) => button.text)),
+    panel.keyboard.map((row) => row.map((button) => button.text)),
     [["Replace Goal"], ["Keep Current Goal"], ["Close"]],
   );
 });
@@ -272,16 +248,15 @@ test("goal text command bootstraps a fresh session when none is mounted", async 
     turns: (store) => ({
       ...recordGoalTurns(runCalls),
       startNewSession: (conversationId) =>
-        Effect.sync(() => {
-          startCalls.push(conversationId);
-          store.setSessionId(conversationId, "fresh-session");
-          return "fresh-session";
-        }),
+        Effect.sync(() => startCalls.push(conversationId)).pipe(
+          Effect.andThen(store.setSessionId(conversationId, "fresh-session")),
+          Effect.as("fresh-session"),
+        ),
     }),
   }, async (alasio, { calls }, store) => {
     await alasio.runPromise(handleGoalTextCommand({ conversationId: CONVERSATION, chatId: 123, messageId: 456, args: "Refactor CI", goals: goal.goals }));
     assert.deepEqual(startCalls, [CONVERSATION]);
-    assert.equal(store.getSessionId(CONVERSATION), "fresh-session");
+    assert.equal((await run(store.getMount(CONVERSATION))).sessionId, "fresh-session");
     assert.equal(goal.calls.set.length, 1);
     assert.equal(goal.calls.set[0]?.threadId, "fresh-session");
     assert.equal(runCalls.length, 1);
@@ -378,36 +353,28 @@ test("a goal that cannot be changed says why on its panel", async () => {
 });
 
 test("goal turns use normal concurrent-message decision panel when Codex is already working", async () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-goal-control-"));
-  const store = new SqliteStore(root);
-  try {
-    const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
-    store.setActiveHarness(conversationId, "codex");
-    const { calls, layer } = recordingTelegram();
-    const handled = await withServices({ store, telegram: layer, workspaceRoot: root }, (alasio) =>
-      // Codex is working: a turn of the conversation is running.
-      alasio.runPromise(Effect.scoped(Effect.gen(function*() {
-        const activeTurns = yield* ActiveTurns;
-        yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
-        const turns = yield* Turns;
-        return yield* turns.runGoalTurn({
-          conversationId,
-          chatId: 123,
-          messageId: 456,
-          sessionId: "session-1",
-          turnId: null,
-          prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
-        });
-      }))));
+  const store = await codexConversation();
+  const { calls, layer } = recordingTelegram();
+  const handled = await withServices({ store, telegram: layer }, (alasio) =>
+    // Codex is working: a turn of the conversation is running.
+    alasio.runPromise(Effect.scoped(Effect.gen(function*() {
+      const activeTurns = yield* ActiveTurns;
+      yield* activeTurns.register(CONVERSATION, { stop: () => Effect.void, steer: () => Effect.succeed(true), cliInitiated: false });
+      const turns = yield* Turns;
+      return yield* turns.runGoalTurn({
+        conversationId: CONVERSATION,
+        chatId: 123,
+        messageId: 456,
+        sessionId: "session-1",
+        turnId: null,
+        prompt: "Continue working toward this Codex goal.\n\nRefactor CI",
+      });
+    }))));
 
-    assert.equal(handled, true);
-    assert.match(calls.sendMessage[0]?.[1] ?? "", /Codex is currently working/);
-    assert.deepEqual(
-      calls.sendMessage[0]?.[2]?.reply_markup?.inline_keyboard.map((row) => row.map((button) => button.text)),
-      [["Steer", "Queue"], ["Swerve", "Discard"]],
-    );
-  } finally {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  }
+  assert.equal(handled, true);
+  assert.match(calls.sendMessage[0]?.[1] ?? "", /Codex is currently working/);
+  assert.deepEqual(
+    calls.sendMessage[0]?.[2]?.reply_markup?.inline_keyboard.map((row) => row.map((button) => button.text)),
+    [["Steer", "Queue"], ["Swerve", "Discard"]],
+  );
 });

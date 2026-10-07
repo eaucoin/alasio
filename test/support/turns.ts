@@ -12,10 +12,11 @@ import { ActiveTurns } from "../../src/harness/active-turns.ts";
 import { type Harness, Harnesses } from "../../src/harness/index.ts";
 import type { HarnessName } from "../../src/harness/names.ts";
 import { Mounts } from "../../src/operator/mounts.ts";
-import { type SqliteStore, Store } from "../../src/persistence/store.ts";
+import { Store } from "../../src/persistence/store.ts";
 import type { AlasioServices } from "../../src/alasio.ts";
 import { SessionSandboxes } from "../../src/sandbox/index.ts";
 import { Authorizer } from "../../src/telegram/authorizer.ts";
+import { ReceivedFiles } from "../../src/telegram/files.ts";
 import type { TelegramClient } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox } from "../../src/telegram/outbox.ts";
@@ -50,7 +51,7 @@ export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
 
 /** What the test's services are made with: the store, and what the test stands in or changes. */
 export interface TestServicesOptions {
-  readonly store: SqliteStore;
+  readonly store: Store["Service"];
   /** The Telegram client: one recording every call unless given. */
   readonly telegram?: Layer.Layer<TelegramClient> | undefined;
   /** Stand-ins for a harness in every folder. */
@@ -58,7 +59,7 @@ export interface TestServicesOptions {
   /** Stands in for alasio's turns. */
   readonly turns?: Turns["Service"] | undefined;
   readonly workspaceRoot?: string | undefined;
-  /** Where a reply's media are copied; replies go as text only without it. */
+  /** Where a reply's media are copied, and received files written; replies go as text only without it. */
   readonly stateDir?: string | undefined;
   readonly allowedUserIds?: string | undefined;
   /** The outbox replies are queued to: unusedOutbox unless given. */
@@ -81,10 +82,12 @@ function testServices({
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot }), Authorizer.layer(allowedUserIds))),
-    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer(stateDir === undefined ? {} : { stateDir })),
+    Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
+      // Received files are written nowhere a test does not say.
+      ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" }),
       outbox,
       noWorkflowHooks,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.

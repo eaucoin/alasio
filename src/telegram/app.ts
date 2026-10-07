@@ -2,8 +2,9 @@
  * alasio serving Telegram: as it starts, what the last alasio left is settled (prompt jobs,
  * undelivered responses, albums, interrupted turns) and what turns resume is brought
  * back (Claude Code's transcripts, Codex's rollouts); then Telegram's updates are polled
- * and processed, undelivered responses are looked for every thirty seconds, and linked
- * sessions are warmed. All of it stops as its scope closes, polling first.
+ * and processed, undelivered responses are looked for every thirty seconds, what the
+ * store keeps only in flight is pruned daily, and linked sessions are warmed. All of it
+ * stops as its scope closes, polling first.
  */
 import type { Update } from "@grammyjs/types";
 import { Effect, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
@@ -17,6 +18,7 @@ import type { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { Harnesses } from "../harness/index.ts";
 import { CLAUDE_HARNESS, CODEX_HARNESS } from "../harness/names.ts";
 import type { CommandError, OperatorServices } from "../operator/command-handler.ts";
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -32,6 +34,15 @@ import { pollUpdates } from "./update-poller.ts";
 /** How often completed responses that were never delivered are looked for. */
 const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
 
+/**
+ * How long the store keeps what it holds only while in flight (updates processed, albums
+ * handled, replies delivered) after it lands; conversations, their messages, files,
+ * prompts, responses and the actions of buttons not yet pressed are kept.
+ */
+const TRANSIENT_RETENTION = "7 days";
+/** How often what outlived TRANSIENT_RETENTION is pruned. */
+const PRUNE_EVERY = "1 day";
+
 /** The bot's commands, as Telegram's menu offers them. */
 const NATIVE_COMMANDS = [
   { command: "service", description: "Switch between Codex and Claude" },
@@ -45,7 +56,7 @@ const NATIVE_COMMANDS = [
 
 /** What the app is made with: alasio's configuration, and what main keeps in Neon. */
 export interface TelegramAppConfig
-  extends Pick<AlasioConfig, "dbPath" | "workspaceRoot" | "workingDirectory" | "defaultHarness" | "hookPort" | "warmLinkedSessions">
+  extends Pick<AlasioConfig, "workspaceRoot" | "workingDirectory" | "defaultHarness" | "hookPort" | "warmLinkedSessions">
 {
   /** Claude Code's transcripts in Neon. */
   readonly sessionStore?: NeonSessionStore | null | undefined;
@@ -58,7 +69,7 @@ export interface TelegramAppConfig
 export type TelegramAppServices = Authorizer | MediaGroups | OperatorServices;
 
 /** How the app fails to start. */
-export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError;
+export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError | StoreError;
 
 /**
  * The app, started in its layer's scope: what it starts with runs before it serves, and
@@ -99,7 +110,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
    * any turn resumes one: imported whole the first time, then reconciled.
    */
   const adoptClaudeTranscripts = Effect.fnUntraced(function*(sessionStore: NeonSessionStore) {
-    const sessions = store.listHarnessSessionReferences(CLAUDE_HARNESS)
+    const sessions = (yield* store.listHarnessSessionReferences(CLAUDE_HARNESS))
       .map(({ sessionId, workingDirectory }) => ({ sessionId, workingDirectory: harnessDirectoryOf(workingDirectory) }))
       .filter((session): session is AdoptedSession => Boolean(session.workingDirectory));
     yield* Effect.logInfo(`  Session store: adopting ${sessions.length} Claude session(s)`);
@@ -111,7 +122,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
    * needs and this machine lacks, before any turn resumes one.
    */
   const restoreCodexRollouts = Effect.fnUntraced(function*() {
-    const references = store.listHarnessSessionReferences(CODEX_HARNESS);
+    const references = yield* store.listHarnessSessionReferences(CODEX_HARNESS);
     // Each thread goes back to the Codex home it runs from: the operator's for a folder,
     // the session-filesystem app-server's for a session filesystem.
     for (const [rollouts, sessionFs] of [[config.codexRollouts, false], [config.sessionFsCodexRollouts, true]] as const) {
@@ -131,13 +142,13 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
       return;
     }
     for (const harnessName of harnesses.names) {
-      const conversations = store.listConversationsWithSessions(harnessName);
+      const conversations = yield* store.listConversationsWithSessions(harnessName);
       if (conversations.length === 0) {
         yield* Effect.logInfo(`No linked ${harnessName} sessions to warm`);
         continue;
       }
       for (const conversation of conversations) {
-        const sessionId = conversation.session_id ?? conversation.codex_session_id;
+        const sessionId = conversation.session_id;
         const harness = yield* harnesses.getFor(harnessName, conversation.working_directory);
         if (!harness.supportsWarmup) {
           break;
@@ -148,18 +159,18 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
         );
       }
     }
-  }).pipe(Effect.catch((error) => Effect.logWarning(`Linked Codex session warmup failed: ${error.message}`)));
+  }).pipe(Effect.catch((error) => Effect.logWarning(`Linked session warmup failed: ${error.message}`)));
 
   /**
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
    * What it leads to runs on after it, so that polling goes on meanwhile.
    */
-  const processUpdate = (update: Update): Effect.Effect<void, TelegramError> =>
+  const processUpdate = (update: Update): Effect.Effect<void, TelegramError | StoreError> =>
     Effect.suspend(() => {
-      store.recordTelegramUpdate(update);
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
       return Effect.gen(function*() {
+        yield* store.recordTelegramUpdate(update);
         const callbackQuery = update.callback_query;
         if (callbackQuery) {
           yield* FiberSet.run(handling, handleCallbackQuery(callbackQuery).pipe(
@@ -173,7 +184,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
             yield* FiberSet.run(handling, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible));
           }
         }
-        store.markTelegramUpdateProcessed(update.update_id);
+        yield* store.markTelegramUpdateProcessed(update.update_id);
       }).pipe(
         Effect.tapError((error) => Effect.logError(`Failed to process update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
@@ -190,7 +201,6 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
 
   const me = yield* client.getMe;
   yield* Effect.logInfo(`Starting Telegram alasio bot as @${me.username ?? me.id}`);
-  yield* Effect.logInfo(`  State database: ${config.dbPath}`);
   yield* Effect.logInfo(`  Workspace root: ${config.workspaceRoot}`);
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
@@ -213,8 +223,15 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* pollUpdates(processUpdate).pipe(Effect.forkScoped);
   // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
   yield* turns.flushCompletedResponses.pipe(
+    Effect.catch((error) => Effect.logWarning(`Completed response recovery failed: ${error.message}`)),
     Effect.catchDefect((defect) => Effect.logWarning(`Completed response recovery failed: ${defect instanceof Error ? defect.message : String(defect)}`)),
     Effect.schedule(Schedule.spaced(COMPLETED_RESPONSE_RECOVERY)),
+    Effect.forkScoped,
+  );
+  // Pruned as alasio starts, and every day it runs after.
+  yield* store.pruneTransient(TRANSIENT_RETENTION).pipe(
+    Effect.catch((error) => Effect.logWarning(`Pruning the store failed: ${error.message}`)),
+    Effect.repeat(Schedule.spaced(PRUNE_EVERY)),
     Effect.forkScoped,
   );
   yield* Effect.forkScoped(warmLinkedSessions);

@@ -19,6 +19,7 @@ import {
   alasioFor,
   timeless,
 } from "./support/scenarios.ts";
+import { testPool } from "./support/store.ts";
 import { OPERATOR_ID } from "./support/telegram.ts";
 import { eventually } from "./support/wait.ts";
 
@@ -61,10 +62,10 @@ const RESTARTING = "alasio is restarting; Codex continues this turn after the re
  * Whether alasio has recorded that Codex accepted the turn `turnId`: a prompt whose turn
  * Codex accepted is not run again after a restart.
  */
-function accepted(alasio: RunningAlasio, turnId: string): true | undefined {
+async function accepted(alasio: RunningAlasio, turnId: string): Promise<true | undefined> {
   // The store has no reader for a prompt job's upstream turn but its database.
-  const count = alasio.readStore((store) => store.db.prepare<[string], { count: number }>("select count(*) count from prompt_jobs where upstream_turn_id = ?").get(turnId)?.count);
-  return count ? true : undefined;
+  const { rows } = await (await testPool()).query(`select 1 from ${alasio.stateSchema}.prompt_jobs where upstream_turn_id = $1`, [turnId]);
+  return rows.length > 0 ? true : undefined;
 }
 
 /** Mounts Codex on alpha and starts a turn, which Codex accepts as turn-1 on thread-1 and runs until the test ends it. */
@@ -143,10 +144,8 @@ test("a turn that ran alasio's rollout restart is continued after it as one the 
   codex.notify(itemCompleted("thread-1", "turn-1", commandExecution("c1", "kubectl -n alasio rollout restart deployment/alasio")));
   // The rollout replaces alasio while the command's turn runs, once alasio has recorded
   // that the restart is the agent's own.
-  const recorded = await eventually("alasio to record the restart", () => alasio.readStore((store) => {
-    const conversation = store.getConversationByChatId(OPERATOR_ID);
-    return (conversation && store.getRestartEvent(conversation.id)) ?? undefined;
-  }));
+  const recorded = await eventually("alasio to record the restart", async () =>
+    await alasio.readStore((store) => store.getRestartEvent(`telegram:${OPERATOR_ID}`)) ?? undefined);
   assert.deepEqual([recorded.cause, recorded.command, recorded.session_id], ["self_induced", "kubectl -n alasio rollout restart deployment/alasio", "thread-1"]);
   const mark = telegram.mark();
 

@@ -9,13 +9,20 @@ import { FetchHttpClient } from "effect/http";
 
 import { type BotMethod, type BotParams, TelegramClient } from "../../src/telegram/client.ts";
 
-/** A Bot API call a client made: the method, what it sent, and a multipart call's uploads, by name. */
+/** A file a multipart call uploaded: the part it is, its file name, and its bytes. */
+export interface BotUpload {
+  readonly name: string;
+  readonly fileName: string;
+  readonly content: Buffer;
+}
+
+/** A Bot API call a client made: the method, what it sent, and a multipart call's uploads. */
 export type BotCall<M extends BotMethod = BotMethod> = {
   [K in M]: {
     readonly method: K;
     /** A JSON call's payload, or a multipart call's fields. */
     readonly params: BotParams<K> | undefined;
-    readonly files?: readonly string[] | undefined;
+    readonly files?: readonly BotUpload[] | undefined;
   };
 }[M];
 
@@ -46,15 +53,15 @@ function fieldValue(value: string): unknown {
   }
 }
 
-/** What a call posted: its JSON payload, or its form's fields and the names of its uploads. */
-function sentBy(body: RequestInit["body"]): { readonly params: unknown; readonly files?: readonly string[] } {
+/** What a call posted: its JSON payload, or its form's fields and its uploads. */
+async function sentBy(body: RequestInit["body"]): Promise<{ readonly params: unknown; readonly files?: readonly BotUpload[] }> {
   if (typeof body === "string") return { params: JSON.parse(body) };
   assert.ok(body instanceof FormData, "a Bot API call posts JSON or a form");
   const params: Record<string, unknown> = {};
-  const files: string[] = [];
+  const files: BotUpload[] = [];
   for (const [name, value] of body) {
     if (typeof value === "string") params[name] = fieldValue(value);
-    else files.push(name);
+    else files.push({ name, fileName: value.name, content: Buffer.from(await value.arrayBuffer()) });
   }
   return { params, files };
 }
@@ -63,7 +70,7 @@ function sentBy(body: RequestInit["body"]): { readonly params: unknown; readonly
 function botApiFetch(answer: BotAnswer): typeof globalThis.fetch {
   return async (input, init) => {
     const method = String(input).split("/").at(-1);
-    const { params, files } = sentBy(init?.body);
+    const { params, files } = await sentBy(init?.body);
     // The client posts each method's params as that method's; the test reads what it drives.
     const call = { method, params, ...(files ? { files } : {}) } as BotCall;
     const aborted = new Promise<never>((_, reject) => {

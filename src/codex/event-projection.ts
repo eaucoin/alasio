@@ -1,6 +1,9 @@
 import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
+import { Effect } from "effect";
 
 import type { MessagePhase, v2 } from "../../.types/codex/index.js";
+import type { StoreError } from "../persistence/sql.ts";
+import type { Store } from "../persistence/store.ts";
 import type { PassedThroughItem } from "./app-server/protocol.ts";
 
 /*
@@ -114,15 +117,22 @@ export type ResponseBlock =
   };
 
 /** Where a pending response's blocks are stored: alasio's store. */
-export interface PendingResponseStore {
-  appendBlockToPending(pendingResponseId: string, block: ResponseBlock): void;
+export type PendingResponseStore = Pick<Store["Service"], "appendBlocksToPending" | "markPendingResponseComplete">;
+
+/**
+ * A turn's response in progress: its blocks so far, and those appended since it was
+ * last stored. Projecting an event only appends; the turn stores what an event added
+ * once it has handled it, in one statement.
+ */
+export interface ResponseProjection {
+  readonly pendingResponseId: string;
+  readonly blockSequence: ResponseBlock[];
+  readonly unstored: ResponseBlock[];
 }
 
-/** A turn's response in progress: its blocks so far, and where they are stored. */
-export interface ResponseProjection {
-  readonly blockSequence: ResponseBlock[];
-  readonly persistence: PendingResponseStore;
-  readonly pendingResponseId: string;
+/** A response with no blocks yet. */
+export function responseProjection(pendingResponseId: string): ResponseProjection {
+  return { pendingResponseId, blockSequence: [], unstored: [] };
 }
 
 // The tool's arguments are as the asking tool sent them; only the list itself is checked.
@@ -130,12 +140,18 @@ function isQuestionList(value: unknown): value is readonly AskedQuestion[] {
   return Array.isArray(value);
 }
 
-function appendBlock(blockSequence: ResponseBlock[], persistence: PendingResponseStore, pendingResponseId: string, block: ResponseBlock): void {
-    blockSequence.push(block);
-    persistence.appendBlockToPending(pendingResponseId, block);
+export function appendBlock(projection: ResponseProjection, block: ResponseBlock): void {
+  projection.blockSequence.push(block);
+  projection.unstored.push(block);
 }
 
-export { appendBlock };
+/** Stores the blocks appended since the response was last stored, if any were. */
+export const storeBlocks = (projection: ResponseProjection, persistence: PendingResponseStore): Effect.Effect<void, StoreError> =>
+  Effect.suspend(() => (projection.unstored.length === 0 ? Effect.void : persistence.appendBlocksToPending(projection.pendingResponseId, projection.unstored.splice(0))));
+
+/** Stores the response's last blocks, then marks it complete, for delivery to read it whole. */
+export const completeResponse = (projection: ResponseProjection, persistence: PendingResponseStore): Effect.Effect<void, StoreError> =>
+  storeBlocks(projection, persistence).pipe(Effect.andThen(persistence.markPendingResponseComplete(projection.pendingResponseId)));
 
 export function isVisibleCodexItem(item: CodexItem): boolean {
     switch (item.type) {
@@ -154,12 +170,11 @@ export function isVisibleCodexItem(item: CodexItem): boolean {
     }
 }
 
-export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): void {
-    const { blockSequence, persistence, pendingResponseId } = params;
+export function mapItemToBlocks(item: CodexItem, projection: ResponseProjection): void {
     switch (item.type) {
         case "agent_message":
             if (item.text?.trim()) {
-                appendBlock(blockSequence, persistence, pendingResponseId, {
+                appendBlock(projection, {
                     type: "text",
                     content: item.text,
                     phase: item.phase ?? null,
@@ -167,7 +182,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
             }
             break;
         case "command_execution":
-            appendBlock(blockSequence, persistence, pendingResponseId, {
+            appendBlock(projection, {
                 type: "tool",
                 name: "Bash",
             });
@@ -175,7 +190,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
         case "file_change":
             if (Array.isArray(item.changes)) {
                 for (const change of item.changes) {
-                    appendBlock(blockSequence, persistence, pendingResponseId, {
+                    appendBlock(projection, {
                         type: "tool",
                         name: isDeletion(change.kind) ? "Delete" : "Edit",
                     });
@@ -188,7 +203,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
             const args = item.arguments ?? {};
             const questions = typeof args === "object" && args !== null && "questions" in args ? args.questions : undefined;
             if (isQuestionList(questions) && questions.length > 0) {
-                appendBlock(blockSequence, persistence, pendingResponseId, {
+                appendBlock(projection, {
                     type: "ask_user_question",
                     tool_use_id: toolUseId,
                     questions,
@@ -196,7 +211,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
                 });
             }
             else {
-                appendBlock(blockSequence, persistence, pendingResponseId, {
+                appendBlock(projection, {
                     type: "tool",
                     name: toolName,
                 });
@@ -204,7 +219,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
             break;
         }
         case "web_search":
-            appendBlock(blockSequence, persistence, pendingResponseId, {
+            appendBlock(projection, {
                 type: "tool",
                 name: "WebSearch",
             });
@@ -214,7 +229,7 @@ export function mapItemToBlocks(item: CodexItem, params: ResponseProjection): vo
             break;
         case "error":
             if (item.message?.trim()) {
-                appendBlock(blockSequence, persistence, pendingResponseId, errorBlock(item.message));
+                appendBlock(projection, errorBlock(item.message));
             }
             break;
         default:

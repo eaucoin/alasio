@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 
+import type { StoreError } from "../persistence/sql.ts";
 import {
   buildDbGuardrailFallbackText,
   buildDbGuardrailSyntheticText,
@@ -44,7 +45,7 @@ export interface GuardrailResult {
 
 /** What a turn's shell commands set off: restart provenance, workflow waits, and the DB guardrail. */
 export interface CommandEventPolicy {
-  readonly inspectCommand: (command: InspectedCommand) => Effect.Effect<{ readonly blocked: boolean }>;
+  readonly inspectCommand: (command: InspectedCommand) => Effect.Effect<{ readonly blocked: boolean }, StoreError>;
   readonly getGuardrailResult: () => GuardrailResult;
 }
 
@@ -56,7 +57,7 @@ export function createCommandEventPolicy({ persistence, threadKey, chatId, messa
   return {
     inspectCommand: Effect.fnUntraced(function*({ command, sessionId }) {
       if (looksLikeSelfRestartCommand(command)) {
-        recordSelfRestartEvent(persistence, sessionId, threadKey, chatId, messageId, command);
+        yield* recordSelfRestartEvent(persistence, sessionId, threadKey, chatId, messageId, command);
         yield* Effect.logInfo("Recorded self-induced restart event");
       } else if (looksLikeSelfRestartNearMiss(command)) {
         yield* Effect.logWarning(`Saw potential alasio restart command that did not match self-restart detector: ${command}`);

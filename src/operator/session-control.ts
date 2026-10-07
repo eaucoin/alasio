@@ -1,4 +1,3 @@
-import type { InlineKeyboardButton } from "@grammyjs/types";
 import { Effect } from "effect";
 
 import { type ConversationBusy, Turns } from "../codex/turns.ts";
@@ -6,17 +5,18 @@ import type { ListedSession } from "../harness/claude/sessions.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import { Store } from "../persistence/store.ts";
 import { SESSIONS_PER_PAGE } from "../shared/runtime-constants.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
-import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
+import { type ButtonDraft, type ControlCallback, type ControlPanel, closePanel, editPanel, keepPanel, sendPanel } from "./panel.ts";
 import { truncateText } from "./text.ts";
 
 /** The mounted harness, as the session panels list, rewind, and resume its sessions. */
 export type SessionControlHarness = Pick<Harness, "displayName" | "sessions">;
 
 /** How starting a new session from a panel fails. */
-export type NewSessionError = NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError;
+export type NewSessionError = NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError | StoreError;
 
 const CONTROL_KIND_PREFIX = "control:";
 
@@ -40,25 +40,12 @@ function shortSessionId(sessionId: string | null | undefined): string {
   return sessionId ? sessionId.slice(0, 8) : "-";
 }
 
-function createButton(
-  store: Pick<SqliteStore, "createCallbackAction">,
-  conversationId: string,
-  text: string,
-  kind: string,
-  payload: CallbackPayload = {},
-): InlineKeyboardButton.CallbackButton {
-  return {
-    text,
-    callback_data: store.createCallbackAction({
-      conversationId,
-      kind: controlKind(kind),
-      payload,
-    }),
-  };
+function button(text: string, kind: string, payload: CallbackPayload = {}): ButtonDraft {
+  return { text, kind: controlKind(kind), payload };
 }
 
-function closeRow(store: Pick<SqliteStore, "createCallbackAction">, conversationId: string): InlineKeyboardButton.CallbackButton[] {
-  return [createButton(store, conversationId, "Close", "close")];
+function closeRow(): ButtonDraft[] {
+  return [button("Close", "close")];
 }
 
 function stringField(payload: CallbackPayload, key: string): string | undefined {
@@ -71,19 +58,24 @@ function numberField(payload: CallbackPayload, key: string): number | undefined 
   return typeof value === "number" ? value : undefined;
 }
 
-function describeSession(session: ListedSession, mountedSessionId: string | undefined): string {
+function describeSession(session: ListedSession, mountedSessionId: string | null): string {
   const marker = session.uuid === mountedSessionId ? "* " : "";
   return `${marker}${session.timestamp || "-"} - ${session.label || shortSessionId(session.uuid)}`;
 }
 
-const buildMountedSummary = Effect.fnUntraced(function*(harness: SessionControlHarness, conversationId: string): Effect.fn.Return<string[], HarnessError, Store> {
-  const store = yield* Store;
-  const sessionId = store.getSessionId(conversationId);
+/** The session mounted on the conversation, if one is. */
+const mountedSession = (conversationId: string): Effect.Effect<string | null, StoreError, Store> =>
+  Effect.flatMap(Store, (store) => store.getMount(conversationId)).pipe(Effect.map((mount) => mount.sessionId));
+
+/** A session's cache reads, as its last turn reported them. */
+const sessionTokens = (sessionId: string): Effect.Effect<number, StoreError, Store> => Effect.flatMap(Store, (store) => store.getSessionTokens(sessionId));
+
+const buildMountedSummary = Effect.fnUntraced(function*(harness: SessionControlHarness, sessionId: string | null): Effect.fn.Return<string[], HarnessError | StoreError, Store> {
   if (!sessionId) {
     return ["Mounted", `No mounted ${harness.displayName} session.`];
   }
   const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
-  const tokens = store.getSessionTokens(sessionId);
+  const tokens = yield* sessionTokens(sessionId);
   return [
     "Mounted",
     `${shortSessionId(sessionId)}${tokens ? ` - cache read ${tokens} tokens` : ""}`,
@@ -98,9 +90,12 @@ export interface SessionsPanelRequest {
   readonly page?: unknown;
 }
 
-const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1 }: SessionsPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store> {
-  const store = yield* Store;
-  const mountedSessionId = store.getSessionId(conversationId);
+const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1 }: SessionsPanelRequest): Effect.fn.Return<
+  ControlPanel,
+  HarnessError | StoreError,
+  Store
+> {
+  const mountedSessionId = yield* mountedSession(conversationId);
   const totalPages = yield* harness.sessions.getTotalSessionPages();
   const safePage = normalizePage(page, totalPages);
   const sessions = yield* harness.sessions.listSessions(safePage);
@@ -108,7 +103,7 @@ const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId
   const lines = [
     `Sessions (${harness.displayName})`,
     "",
-    ...(yield* buildMountedSummary(harness, conversationId)),
+    ...(yield* buildMountedSummary(harness, mountedSessionId)),
     "",
     `Recent sessions (page ${safePage}/${totalPages})`,
   ];
@@ -122,15 +117,13 @@ const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId
 
   const keyboard = [
     [
-      createButton(store, conversationId, "Current Session", "current"),
-      createButton(store, conversationId, "New Session", "new"),
+      button("Current Session", "current"),
+      button("New Session", "new"),
     ],
   ];
   for (const [index, session] of sessions.entries()) {
     keyboard.push([
-      createButton(
-        store,
-        conversationId,
+      button(
         `${startNumber + index}. ${truncateText(describeSession(session, mountedSessionId), 52)}`,
         "preview",
         { sessionId: session.uuid, page: safePage },
@@ -139,16 +132,13 @@ const buildSessionsPanel = Effect.fnUntraced(function*({ harness, conversationId
   }
   if (totalPages > 1) {
     keyboard.push([
-      createButton(store, conversationId, "Prev", "sessions", { page: safePage - 1 }),
-      createButton(store, conversationId, "Next", "sessions", { page: safePage + 1 }),
+      button("Prev", "sessions", { page: safePage - 1 }),
+      button("Next", "sessions", { page: safePage + 1 }),
     ]);
   }
-  keyboard.push(closeRow(store, conversationId));
+  keyboard.push(closeRow());
 
-  return {
-    text: lines.join("\n"),
-    options: panelOptions({ inline_keyboard: keyboard }),
-  };
+  return yield* keepPanel(conversationId, { text: lines.join("\n"), keyboard });
 });
 
 export interface CurrentSessionPanelRequest {
@@ -156,28 +146,29 @@ export interface CurrentSessionPanelRequest {
   readonly conversationId: string;
 }
 
-const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
-  const store = yield* Store;
-  const sessionId = store.getSessionId(conversationId);
+const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversationId }: CurrentSessionPanelRequest): Effect.fn.Return<
+  ControlPanel,
+  HarnessError | StoreError,
+  Store | ActiveTurns
+> {
+  const sessionId = yield* mountedSession(conversationId);
   if (!sessionId) {
-    return {
+    return yield* keepPanel(conversationId, {
       text: [
         `Current Session (${harness.displayName})`,
         "",
         `No ${harness.displayName} session is mounted.`,
         "Start a new session or open Sessions to mount an existing one.",
       ].join("\n"),
-      options: panelOptions({
-        inline_keyboard: [
-          [createButton(store, conversationId, "Sessions", "sessions", { page: 1 })],
-          [createButton(store, conversationId, "New Session", "new")],
-          closeRow(store, conversationId),
-        ],
-      }),
-    };
+      keyboard: [
+        [button("Sessions", "sessions", { page: 1 })],
+        [button("New Session", "new")],
+        closeRow(),
+      ],
+    });
   }
   const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
-  const tokens = store.getSessionTokens(sessionId);
+  const tokens = yield* sessionTokens(sessionId);
   const active = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
   const lines = [
     `Current Session (${harness.displayName})`,
@@ -192,19 +183,16 @@ const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversa
 
   const keyboard = [];
   if (active) {
-    keyboard.push([createButton(store, conversationId, "Stop Turn", "stop")]);
+    keyboard.push([button("Stop Turn", "stop")]);
   }
   keyboard.push([
-    createButton(store, conversationId, "Rewind", "rewind", { page: 1 }),
-    createButton(store, conversationId, "Sessions", "sessions", { page: 1 }),
+    button("Rewind", "rewind", { page: 1 }),
+    button("Sessions", "sessions", { page: 1 }),
   ]);
-  keyboard.push([createButton(store, conversationId, "New Session", "new")]);
-  keyboard.push(closeRow(store, conversationId));
+  keyboard.push([button("New Session", "new")]);
+  keyboard.push(closeRow());
 
-  return {
-    text: lines.join("\n"),
-    options: panelOptions({ inline_keyboard: keyboard }),
-  };
+  return yield* keepPanel(conversationId, { text: lines.join("\n"), keyboard });
 });
 
 const buildSessionPreviewPanel = Effect.fnUntraced(function*({ harness, conversationId, sessionId, page = 1 }: {
@@ -212,10 +200,9 @@ const buildSessionPreviewPanel = Effect.fnUntraced(function*({ harness, conversa
   readonly conversationId: string;
   readonly sessionId: string;
   readonly page?: unknown;
-}): Effect.fn.Return<ControlPanel, HarnessError, Store> {
-  const store = yield* Store;
+}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store> {
   const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
-  const mountedSessionId = store.getSessionId(conversationId);
+  const mountedSessionId = yield* mountedSession(conversationId);
   const lines = [
     "Session",
     "",
@@ -224,19 +211,17 @@ const buildSessionPreviewPanel = Effect.fnUntraced(function*({ harness, conversa
     "",
     lastMessage ? truncateText(lastMessage, 900) : "No assistant message found yet.",
   ];
-  return {
+  return yield* keepPanel(conversationId, {
     text: lines.join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        [createButton(store, conversationId, "Mount This Session", "mount", { sessionId })],
-        [
-          createButton(store, conversationId, "Rewind", "rewind", { page: 1, sessionId }),
-          createButton(store, conversationId, "Back", "sessions", { page }),
-        ],
-        closeRow(store, conversationId),
+    keyboard: [
+      [button("Mount This Session", "mount", { sessionId })],
+      [
+        button("Rewind", "rewind", { page: 1, sessionId }),
+        button("Back", "sessions", { page }),
       ],
-    }),
-  };
+      closeRow(),
+    ],
+  });
 });
 
 const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, page = 1, sessionId = null }: {
@@ -245,9 +230,8 @@ const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, 
   readonly page?: unknown;
   /** The session to rewind; the mounted one when left out. */
   readonly sessionId?: string | null | undefined;
-}): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
-  const store = yield* Store;
-  const targetSessionId = sessionId ?? store.getSessionId(conversationId);
+}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | ActiveTurns> {
+  const targetSessionId = sessionId ?? (yield* mountedSession(conversationId));
   if (!targetSessionId) {
     return yield* buildCurrentSessionPanel({ harness, conversationId });
   }
@@ -272,7 +256,7 @@ const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, 
   }
 
   const keyboard = pageMessages.map((message) => [
-    createButton(store, conversationId, `Before ${message.index}`, "rewind_preview", {
+    button(`Before ${message.index}`, "rewind_preview", {
       sessionId: targetSessionId,
       index: message.index,
       page: safePage,
@@ -280,17 +264,14 @@ const buildRewindPanel = Effect.fnUntraced(function*({ harness, conversationId, 
   ]);
   if (totalPages > 1) {
     keyboard.push([
-      createButton(store, conversationId, "Prev", "rewind", { sessionId: targetSessionId, page: safePage - 1 }),
-      createButton(store, conversationId, "Next", "rewind", { sessionId: targetSessionId, page: safePage + 1 }),
+      button("Prev", "rewind", { sessionId: targetSessionId, page: safePage - 1 }),
+      button("Next", "rewind", { sessionId: targetSessionId, page: safePage + 1 }),
     ]);
   }
-  keyboard.push([createButton(store, conversationId, "Back", "current")]);
-  keyboard.push(closeRow(store, conversationId));
+  keyboard.push([button("Back", "current")]);
+  keyboard.push(closeRow());
 
-  return {
-    text: lines.join("\n"),
-    options: panelOptions({ inline_keyboard: keyboard }),
-  };
+  return yield* keepPanel(conversationId, { text: lines.join("\n"), keyboard });
 });
 
 const buildRewindPreviewPanel = Effect.fnUntraced(function*({ harness, conversationId, sessionId, index, page = 1 }: {
@@ -299,14 +280,13 @@ const buildRewindPreviewPanel = Effect.fnUntraced(function*({ harness, conversat
   readonly sessionId: string;
   readonly index: number | undefined;
   readonly page?: unknown;
-}): Effect.fn.Return<ControlPanel, HarnessError, Store | ActiveTurns> {
-  const store = yield* Store;
+}): Effect.fn.Return<ControlPanel, HarnessError | StoreError, Store | ActiveTurns> {
   const messages = yield* harness.sessions.listSessionMessages(sessionId);
   const target = messages.find((message) => message.index === index);
   if (!target) {
     return yield* buildRewindPanel({ harness, conversationId, sessionId, page });
   }
-  return {
+  return yield* keepPanel(conversationId, {
     text: [
       "Rewind Preview",
       "",
@@ -314,21 +294,23 @@ const buildRewindPreviewPanel = Effect.fnUntraced(function*({ harness, conversat
       "",
       truncateText(target.text, 1000),
     ].join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        [createButton(store, conversationId, "Fork And Mount Here", "rewind_fork", { sessionId, index })],
-        [createButton(store, conversationId, "Back", "rewind", { sessionId, page })],
-        closeRow(store, conversationId),
-      ],
-    }),
-  };
+    keyboard: [
+      [button("Fork And Mount Here", "rewind_fork", { sessionId, index })],
+      [button("Back", "rewind", { sessionId, page })],
+      closeRow(),
+    ],
+  });
 });
 
 export interface SendSessionsPanelRequest extends SessionsPanelRequest {
   readonly chatId: ChatId;
 }
 
-export const sendSessionsPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendSessionsPanelRequest): Effect.fn.Return<void, HarnessError | TelegramError, Store | TelegramClient> {
+export const sendSessionsPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendSessionsPanelRequest): Effect.fn.Return<
+  void,
+  HarnessError | TelegramError | StoreError,
+  Store | TelegramClient
+> {
   yield* sendPanel(chatId, yield* buildSessionsPanel(request));
 });
 
@@ -338,7 +320,7 @@ export interface SendCurrentSessionPanelRequest extends CurrentSessionPanelReque
 
 export const sendCurrentSessionPanel = Effect.fnUntraced(function*({ chatId, ...request }: SendCurrentSessionPanelRequest): Effect.fn.Return<
   void,
-  HarnessError | TelegramError,
+  HarnessError | TelegramError | StoreError,
   Store | ActiveTurns | TelegramClient
 > {
   yield* sendPanel(chatId, yield* buildCurrentSessionPanel(request));
@@ -382,7 +364,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   } else if (kind === "preview" && payloadSessionId !== undefined) {
     panel = yield* buildSessionPreviewPanel({ harness, conversationId, sessionId: payloadSessionId, page: payload["page"] });
   } else if (kind === "mount" && payloadSessionId !== undefined) {
-    store.setSessionId(conversationId, payloadSessionId);
+    yield* store.setSessionId(conversationId, payloadSessionId);
     notice = "Mounted.";
     panel = yield* current;
   } else if (kind === "rewind") {
@@ -401,7 +383,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
     const target = messages.find((message) => message.index === index);
     const forkedId = target ? yield* harness.sessions.createForkedSession(payloadSessionId, target.uuid, { threadKey: conversationId }) : null;
     if (forkedId) {
-      store.setSessionId(conversationId, forkedId);
+      yield* store.setSessionId(conversationId, forkedId);
       notice = "Fork mounted.";
       panel = yield* current;
     } else {

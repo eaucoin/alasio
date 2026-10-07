@@ -5,6 +5,7 @@
  */
 import { NodeRuntime } from "@effect/platform-node";
 import { Cause, Effect, Exit, Layer, type Scope } from "effect";
+import type { Pool } from "pg";
 
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
@@ -17,6 +18,7 @@ import type { KubeTemplates } from "./kube/config.ts";
 import { KubeClient } from "./kube/client.ts";
 import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
+import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
 import { SessionSandboxes } from "./sandbox/index.ts";
 import { AlasioLoggerLayer } from "./shared/log.ts";
@@ -25,12 +27,17 @@ import { stopTelemetry } from "./telemetry/start.ts";
 import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
 import { Authorizer } from "./telegram/authorizer.ts";
 import { TelegramClient } from "./telegram/client.ts";
+import { ReceivedFiles } from "./telegram/files.ts";
 import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
 import { WorkflowHooks } from "./workflow/hook-server.ts";
 
-/** What alasio is made with: its configuration, what main keeps in Neon, and what the deployment's templates offer. */
+/** What alasio is made with: its configuration, its Neon and what main keeps there, and what the deployment's templates offer. */
 export interface AlasioOptions extends AlasioConfig, TelegramAppConfig {
+  /** The pool of alasio's Neon database, which its state is kept in. */
+  readonly pool: Pool;
+  /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
+  readonly stateSchema?: string | undefined;
   readonly kubeTemplates?: KubeTemplates | null | undefined;
   /** Stand-ins for a folder workspace's bayma and for Claude Code, in the harnesses alasio makes. */
   readonly folderBayma?: FolderBayma | undefined;
@@ -40,6 +47,7 @@ export interface AlasioOptions extends AlasioConfig, TelegramAppConfig {
 /** The services alasio's app runs on, which are always there. */
 export type AlasioServices =
   | Store
+  | ReceivedFiles
   | TelegramClient
   | Outbox
   | WorkflowHooks
@@ -56,10 +64,10 @@ export type AlasioServices =
  * before it. The turns are made after the harnesses, Telegram and the store they report
  * to, so that stopping alasio interrupts the turns running while those are still there.
  */
-export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices> {
+export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError> {
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds))),
-    Layer.provideMerge(Turns.layer(options)),
+    Layer.provideMerge(Turns.layer()),
     Layer.provideMerge(Harnesses.layer({
       sessionStore: options.sessionStore,
       codexRollouts: options.codexRollouts,
@@ -67,8 +75,18 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       folderBayma: options.folderBayma,
       claudeQueryFactory: options.claudeQueryFactory,
     })),
-    Layer.provideMerge(Layer.mergeAll(Outbox.layer, WorkflowHooks.layer(options.hookPort), workspaceServices(options), codexServices(options), ActiveTurns.layer)),
-    Layer.provideMerge(Layer.mergeAll(Store.layer(options), TelegramClient.layer(options.telegramBotToken))),
+    Layer.provideMerge(Layer.mergeAll(
+      Outbox.layer,
+      WorkflowHooks.layer(options.hookPort),
+      ReceivedFiles.layer(options),
+      workspaceServices(options),
+      codexServices(options),
+      ActiveTurns.layer,
+    )),
+    Layer.provideMerge(Layer.mergeAll(
+      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory }),
+      TelegramClient.layer(options.telegramBotToken),
+    )),
   );
 }
 

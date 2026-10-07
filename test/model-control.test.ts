@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from "@grammyjs/types";
@@ -14,25 +11,24 @@ import { CLAUDE_HARNESS, CODEX_HARNESS } from "../src/harness/names.ts";
 import { parseCommand } from "../src/operator/command-parser.ts";
 import { buildModelPanel, handleModelControlCallback, isModelControlAction, type ModelControlHarness } from "../src/operator/model-control.ts";
 import type { CallbackAction } from "../src/persistence/callback-repository.ts";
-import { SqliteStore, Store } from "../src/persistence/store.ts";
+import { Store } from "../src/persistence/store.ts";
 import type { TelegramClient } from "../src/telegram/client.ts";
+import { run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 
-async function withStore<T>(run: (store: SqliteStore, id: string) => T | Promise<T>): Promise<T> {
-  const root = mkdtempSync(join(tmpdir(), "alasio-model-"));
-  const store = new SqliteStore(root);
-  try {
-    store.upsertConversation({ chatId: 42, user: { id: 1 } });
-    store.setActiveHarness("telegram:42", CLAUDE_HARNESS);
-    return await run(store, "telegram:42");
-  } finally {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  }
+/** The conversation of chat 42, on Claude. */
+const CONVERSATION = "telegram:42";
+
+/** A store holding the conversation of chat 42, on Claude. */
+async function storeOnClaude(): Promise<Store["Service"]> {
+  const store = await testStore();
+  await run(store.upsertConversation({ chatId: 42, user: { id: 1 } }));
+  await run(store.setActiveHarness(CONVERSATION, CLAUDE_HARNESS));
+  return store;
 }
 
 /** Runs a /model effect on `store` and a Telegram client recording into `telegram`. */
-function run<A, E>(effect: Effect.Effect<A, E, Store | TelegramClient>, store: SqliteStore, telegram = recordingTelegram()): Promise<A> {
+function runControl<A, E>(effect: Effect.Effect<A, E, Store | TelegramClient>, store: Store["Service"], telegram = recordingTelegram()): Promise<A> {
   return Effect.runPromise(effect.pipe(Effect.provide(Layer.merge(Layer.succeed(Store, store), telegram.layer))));
 }
 
@@ -49,8 +45,8 @@ function callbackData(markup: InlineKeyboardMarkup | undefined, text: string): s
 }
 
 /** The action a pressed button carries, which the store hands out once. */
-function consume(store: SqliteStore, data: string): CallbackAction {
-  const action = store.consumeCallbackAction(data);
+async function consume(store: Store["Service"], data: string): Promise<CallbackAction> {
+  const action = await run(store.consumeCallbackAction(data));
   assert.ok(action, "the button's action is stored");
   return action;
 }
@@ -80,16 +76,15 @@ test("/model parses to the model command", () => {
 });
 
 test("a model choice is stored per conversation and per harness", async () => {
-  await withStore((store, id) => {
-    assert.equal(store.getModelChoice(id, CLAUDE_HARNESS), null);
-    store.setModelChoice(id, CLAUDE_HARNESS, { model: "sonnet", effort: "medium" });
-    store.setModelChoice(id, CODEX_HARNESS, { model: "gpt-6-astra", effort: "ultra" });
-    assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "sonnet", effort: "medium" });
-    assert.deepEqual(store.getModelChoice(id, CODEX_HARNESS), { model: "gpt-6-astra", effort: "ultra" });
-    store.clearModelChoice(id, CLAUDE_HARNESS);
-    assert.equal(store.getModelChoice(id, CLAUDE_HARNESS), null);
-    assert.deepEqual(store.getModelChoice(id, CODEX_HARNESS), { model: "gpt-6-astra", effort: "ultra" });
-  });
+  const store = await storeOnClaude();
+  assert.equal(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), null);
+  await run(store.setModelChoice(CONVERSATION, CLAUDE_HARNESS, { model: "sonnet", effort: "medium" }));
+  await run(store.setModelChoice(CONVERSATION, CODEX_HARNESS, { model: "gpt-6-astra", effort: "ultra" }));
+  assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), { model: "sonnet", effort: "medium" });
+  assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CODEX_HARNESS)), { model: "gpt-6-astra", effort: "ultra" });
+  await run(store.clearModelChoice(CONVERSATION, CLAUDE_HARNESS));
+  assert.equal(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), null);
+  assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CODEX_HARNESS)), { model: "gpt-6-astra", effort: "ultra" });
 });
 
 test("the Claude pin is the 1M-context variant, and a choice overrides it for the turn", () => {
@@ -119,30 +114,28 @@ test("a Codex choice replaces the pinned model and effort for the turn", () => {
 });
 
 test("/model walks model then effort, using the chosen model's own effort levels", async () => {
-  await withStore(async (store, id) => {
-    const panel = await run(buildModelPanel({ harness: claudeHarness, conversationId: id }), store);
-    assert.match(panel.text, /Current: claude-opus-5-5\[1m\] at high effort \(default\)/);
-    const pick = consume(store, callbackData(panel.options.reply_markup, "Opus (1M context)"));
-    assert.ok(isModelControlAction(pick.kind));
+  const store = await storeOnClaude();
+  const panel = await runControl(buildModelPanel({ harness: claudeHarness, conversationId: CONVERSATION }), store);
+  assert.match(panel.text, /Current: claude-opus-5-5\[1m\] at high effort \(default\)/);
+  const pick = await consume(store, callbackData(panel.options.reply_markup, "Opus (1M context)"));
+  assert.ok(isModelControlAction(pick.kind));
 
-    const telegram = recordingTelegram();
-    await run(handleModelControlCallback({ action: pick, callbackQueryId: "q1", chatId: 42, messageId: 7 }), store, telegram);
-    const [effortPanel] = telegram.calls.editMessageText;
-    const effortTexts = buttonsOf(effortPanel?.[3]?.reply_markup).map((b) => b.text);
-    assert.deepEqual(effortTexts.filter((t) => t !== "Close"), ["low", "medium", "high", "xhigh", "max"]);
-    assert.equal(store.getModelChoice(id, CLAUDE_HARNESS), null, "nothing is stored until an effort is chosen");
+  const telegram = recordingTelegram();
+  await runControl(handleModelControlCallback({ action: pick, callbackQueryId: "q1", chatId: 42, messageId: 7 }), store, telegram);
+  const [effortPanel] = telegram.calls.editMessageText;
+  const effortTexts = buttonsOf(effortPanel?.[3]?.reply_markup).map((b) => b.text);
+  assert.deepEqual(effortTexts.filter((t) => t !== "Close"), ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), null, "nothing is stored until an effort is chosen");
 
-    const max = callbackData(effortPanel?.[3]?.reply_markup, "max");
-    await run(handleModelControlCallback({ action: consume(store, max), callbackQueryId: "q2", chatId: 42, messageId: 7 }), store, telegram);
-    assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "opus[1m]", effort: "max" });
-  });
+  const max = callbackData(effortPanel?.[3]?.reply_markup, "max");
+  await runControl(handleModelControlCallback({ action: await consume(store, max), callbackQueryId: "q2", chatId: 42, messageId: 7 }), store, telegram);
+  assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), { model: "opus[1m]", effort: "max" });
 });
 
 test("a model without effort control is chosen in one step", async () => {
-  await withStore(async (store, id) => {
-    const panel = await run(buildModelPanel({ harness: claudeHarness, conversationId: id }), store);
-    const haiku = callbackData(panel.options.reply_markup, "Haiku");
-    await run(handleModelControlCallback({ action: consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 }), store);
-    assert.deepEqual(store.getModelChoice(id, CLAUDE_HARNESS), { model: "haiku", effort: null });
-  });
+  const store = await storeOnClaude();
+  const panel = await runControl(buildModelPanel({ harness: claudeHarness, conversationId: CONVERSATION }), store);
+  const haiku = callbackData(panel.options.reply_markup, "Haiku");
+  await runControl(handleModelControlCallback({ action: await consume(store, haiku), callbackQueryId: "q", chatId: 42, messageId: 7 }), store);
+  assert.deepEqual(await run(store.getModelChoice(CONVERSATION, CLAUDE_HARNESS)), { model: "haiku", effort: null });
 });

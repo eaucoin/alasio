@@ -55,8 +55,8 @@ export interface AppServerTurnOptions extends EnsureThreadOptions {
   readonly prompt: string;
   readonly model?: string | undefined;
   readonly effort?: string | null | undefined;
-  /** Called just before the prompt is sent, after which the agent may act on it. */
-  readonly onPromptDispatched?: (() => void) | undefined;
+  /** Run just before the prompt is sent, after which the agent may act on it. */
+  readonly onPromptDispatched?: Effect.Effect<void> | undefined;
 }
 
 /** A Codex app-server alasio runs: its threads' work, each turn's events, and its stop. */

@@ -20,7 +20,7 @@ import {
 } from "../src/codex/app-server/protocol.ts";
 import type { AppServerRpc } from "../src/codex/app-server/rpc-client.ts";
 import { makeAppServerThreads } from "../src/codex/app-server/thread-client.ts";
-import { type ResponseBlock, mapItemToBlocks } from "../src/codex/event-projection.ts";
+import { mapItemToBlocks, responseProjection } from "../src/codex/event-projection.ts";
 import { appServerProcess } from "./support/app-server-process.ts";
 import { agentMessage, codexThread, codexTurn } from "./support/codex-protocol.ts";
 
@@ -343,9 +343,9 @@ test("an error notification reports Codex's own message, unless Codex is retryin
 
 test("a file change shows a deletion as one, from the app-server and from exec", () => {
   const names = (changes: readonly v2.FileUpdateChange[] | SdkFileChangeItem["changes"]) => {
-    const blockSequence: ResponseBlock[] = [];
-    mapItemToBlocks({ type: "file_change", id: "item-1", changes }, { blockSequence, persistence: { appendBlockToPending() {} }, pendingResponseId: "pending-1" });
-    return blockSequence.map((block) => ("name" in block ? block.name : undefined));
+    const projection = responseProjection("pending-1");
+    mapItemToBlocks({ type: "file_change", id: "item-1", changes }, projection);
+    return projection.blockSequence.map((block) => ("name" in block ? block.name : undefined));
   };
   assert.deepEqual(names([
     { path: "a", kind: { type: "delete" }, diff: "" },

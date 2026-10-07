@@ -11,7 +11,6 @@ export interface AlasioConfig {
   readonly workingDirectory: string | null;
   readonly workspaceRoot: string;
   readonly stateDir: string;
-  readonly dbPath: string;
   readonly hookPort: number;
   readonly warmLinkedSessions: boolean;
   readonly defaultHarness: HarnessName | null;
@@ -28,23 +27,7 @@ function requireEnv(key: string): string {
   return value;
 }
 
-/**
- * Where alasio keeps its SQLite state. Defaults next to the pre-mounted working
- * directory for existing deployments, otherwise under the operator's home so a
- * second bot never shares a database with the first.
- */
-function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
-  if (env["ALASIO_STATE_DIR"]?.trim()) {
-    return env["ALASIO_STATE_DIR"].trim();
-  }
-  if (env["WORKING_DIRECTORY"]?.trim()) {
-    return join(env["WORKING_DIRECTORY"].trim(), ".alasio");
-  }
-  return join(homedir(), ".alasio");
-}
-
 export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioConfig {
-  const stateDir = resolveStateDir(env);
   return {
     telegramBotToken: requireEnv("TELEGRAM_BOT_TOKEN"),
     allowedUserIds: env["TELEGRAM_ALLOWED_USER_IDS"] ?? "",
@@ -52,8 +35,9 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     workingDirectory: env["WORKING_DIRECTORY"]?.trim() || null,
     // Every folder chosen or created from Telegram must live directly under this root.
     workspaceRoot: env["ALASIO_WORKSPACE_ROOT"]?.trim() || homedir(),
-    stateDir,
-    dbPath: join(stateDir, "alasio.sqlite"),
+    // What alasio writes to disk as it runs (received files, the session filesystems'
+    // Codex home), none of which outlasts it: its state is in Neon.
+    stateDir: env["ALASIO_STATE_DIR"]?.trim() || join(homedir(), ".alasio"),
     hookPort: resolveHookPort(env),
     warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),

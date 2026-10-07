@@ -1,4 +1,3 @@
-import type { InlineKeyboardButton } from "@grammyjs/types";
 import type { v2 } from "../../.types/codex/index.js";
 import { Effect } from "effect";
 
@@ -6,9 +5,10 @@ import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import type { HarnessError, HarnessGoals } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
-import { type SqliteStore, Store } from "../persistence/store.ts";
+import type { StoreError } from "../persistence/sql.ts";
+import { Store } from "../persistence/store.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
-import { type ControlCallback, type ControlPanel, closePanel, editPanel, panelOptions, sendPanel } from "./panel.ts";
+import { type ButtonDraft, type ControlCallback, closePanel, editPanel, keepPanel, type PanelDraft, sendPanel } from "./panel.ts";
 import type { NewSessionError } from "./session-control.ts";
 import { truncateText } from "./text.ts";
 
@@ -23,15 +23,13 @@ export interface GoalTurnRequest {
 }
 
 /** How changing a goal fails, as its panel says. */
-type GoalError = HarnessError | NewSessionError | TurnError | TelegramError;
+type GoalError = HarnessError | NewSessionError | TurnError | TelegramError | StoreError;
 
 /** What the goal controls run on: the store, Telegram, and the turns, running and to run. */
 export type GoalServices = Store | TelegramClient | ActiveTurns | Turns;
 
 /** How a goal's turn is going, as the goal panel shows it. */
 export type GoalTurnState = "working" | "starting" | "queued" | "idle";
-
-type ButtonStore = Pick<SqliteStore, "createCallbackAction">;
 
 const GOAL_KIND_PREFIX = "goal:";
 const UNFINISHED_STATUSES = new Set<v2.ThreadGoalStatus>(["active", "paused", "blocked", "usageLimited", "budgetLimited"]);
@@ -45,42 +43,16 @@ export function isGoalControlAction(kind: unknown): boolean {
   return typeof kind === "string" && kind.startsWith(GOAL_KIND_PREFIX);
 }
 
-function createButton(
-  store: ButtonStore,
-  conversationId: string,
-  text: string,
-  kind: string,
-  payload: CallbackPayload = {},
-): InlineKeyboardButton.CallbackButton {
-  return {
-    text,
-    callback_data: store.createCallbackAction({
-      conversationId,
-      kind: goalKind(kind),
-      payload,
-    }),
-  };
+function button(text: string, kind: string, payload: CallbackPayload = {}): ButtonDraft {
+  return { text, kind: goalKind(kind), payload };
 }
 
-function createSessionControlButton(
-  store: ButtonStore,
-  conversationId: string,
-  text: string,
-  kind: string,
-  payload: CallbackPayload = {},
-): InlineKeyboardButton.CallbackButton {
-  return {
-    text,
-    callback_data: store.createCallbackAction({
-      conversationId,
-      kind: `control:${kind}`,
-      payload,
-    }),
-  };
+function sessionControlButton(text: string, kind: string, payload: CallbackPayload = {}): ButtonDraft {
+  return { text, kind: `control:${kind}`, payload };
 }
 
-function closeRow(store: ButtonStore, conversationId: string): InlineKeyboardButton.CallbackButton[] {
-  return [createButton(store, conversationId, "Close", "close")];
+function closeRow(): ButtonDraft[] {
+  return [button("Close", "close")];
 }
 
 function shortSessionId(sessionId: string): string {
@@ -170,12 +142,7 @@ function shouldConfirmBeforeReplacing(goal: v2.ThreadGoal | null): goal is v2.Th
   return isUnfinishedGoal(goal);
 }
 
-export interface GoalPanelTarget {
-  readonly store: ButtonStore;
-  readonly conversationId: string;
-}
-
-export function buildNoMountedGoalPanel({ store, conversationId }: GoalPanelTarget): ControlPanel {
+export function buildNoMountedGoalPanel(): PanelDraft {
   return {
     text: [
       "Goal",
@@ -183,17 +150,15 @@ export function buildNoMountedGoalPanel({ store, conversationId }: GoalPanelTarg
       "No Codex session is mounted.",
       "Start a new session or open Sessions to mount an existing one.",
     ].join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        [createSessionControlButton(store, conversationId, "Sessions", "sessions", { page: 1 })],
-        [createSessionControlButton(store, conversationId, "New Session", "new")],
-        closeRow(store, conversationId),
-      ],
-    }),
+    keyboard: [
+      [sessionControlButton("Sessions", "sessions", { page: 1 })],
+      [sessionControlButton("New Session", "new")],
+      closeRow(),
+    ],
   };
 }
 
-export function buildNoActiveGoalPanel({ store, conversationId, sessionId }: GoalPanelTarget & { readonly sessionId: string }): ControlPanel {
+export function buildNoActiveGoalPanel({ sessionId }: { readonly sessionId: string }): PanelDraft {
   return {
     text: [
       "Goal",
@@ -205,20 +170,16 @@ export function buildNoActiveGoalPanel({ store, conversationId, sessionId }: Goa
       "Send:",
       "/goal <objective>",
     ].join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        closeRow(store, conversationId),
-      ],
-    }),
+    keyboard: [closeRow()],
   };
 }
 
-export interface GoalPanelRequest extends GoalPanelTarget {
+export interface GoalPanelRequest {
   readonly goal: v2.ThreadGoal;
   readonly turnState?: GoalTurnState | null | undefined;
 }
 
-export function buildGoalPanel({ store, conversationId, goal, turnState = null }: GoalPanelRequest): ControlPanel {
+export function buildGoalPanel({ goal, turnState = null }: GoalPanelRequest): PanelDraft {
   const formattedTurnState = formatTurnState(turnState);
   const lines = [
     "Goal",
@@ -235,30 +196,21 @@ export function buildGoalPanel({ store, conversationId, goal, turnState = null }
   }
   lines.push(formatTokenLine(goal));
 
-  const keyboard: InlineKeyboardButton.CallbackButton[][] = [];
-  if (goal.status === "active") {
-    keyboard.push([
-      createButton(store, conversationId, "Pause", "pause"),
-      createButton(store, conversationId, "Clear", "clear_confirm"),
-    ]);
-  } else {
-    keyboard.push([
-      createButton(store, conversationId, "Resume", "resume"),
-      createButton(store, conversationId, "Clear", "clear_confirm"),
-    ]);
-  }
-  keyboard.push(closeRow(store, conversationId));
-
   return {
     text: lines.join("\n"),
-    options: panelOptions({ inline_keyboard: keyboard }),
+    keyboard: [
+      goal.status === "active"
+        ? [button("Pause", "pause"), button("Clear", "clear_confirm")]
+        : [button("Resume", "resume"), button("Clear", "clear_confirm")],
+      closeRow(),
+    ],
   };
 }
 
-export function buildReplaceGoalPanel({ store, conversationId, currentGoal, objective }: GoalPanelTarget & {
+export function buildReplaceGoalPanel({ currentGoal, objective }: {
   readonly currentGoal: v2.ThreadGoal;
   readonly objective: string;
-}): ControlPanel {
+}): PanelDraft {
   return {
     text: [
       "Replace goal?",
@@ -269,30 +221,26 @@ export function buildReplaceGoalPanel({ store, conversationId, currentGoal, obje
       "New:",
       truncateText(objective, 420),
     ].join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        [createButton(store, conversationId, "Replace Goal", "replace", { objective })],
-        [createButton(store, conversationId, "Keep Current Goal", "show")],
-        closeRow(store, conversationId),
-      ],
-    }),
+    keyboard: [
+      [button("Replace Goal", "replace", { objective })],
+      [button("Keep Current Goal", "show")],
+      closeRow(),
+    ],
   };
 }
 
-function buildClearGoalConfirmationPanel({ store, conversationId, goal }: GoalPanelTarget & { readonly goal: v2.ThreadGoal }): ControlPanel {
+function buildClearGoalConfirmationPanel({ goal }: { readonly goal: v2.ThreadGoal }): PanelDraft {
   return {
     text: [
       "Clear goal?",
       "",
       truncateText(goal.objective, 700),
     ].join("\n"),
-    options: panelOptions({
-      inline_keyboard: [
-        [createButton(store, conversationId, "Clear Goal", "clear")],
-        [createButton(store, conversationId, "Keep Goal", "show")],
-        closeRow(store, conversationId),
-      ],
-    }),
+    keyboard: [
+      [button("Clear Goal", "clear")],
+      [button("Keep Goal", "show")],
+      closeRow(),
+    ],
   };
 }
 
@@ -347,17 +295,12 @@ const buildGoalPanelFromState = Effect.fnUntraced(function*({ conversationId, tu
   readonly conversationId: string;
   readonly turnState?: GoalTurnState | null;
   readonly goals: HarnessGoals;
-}): Effect.fn.Return<ControlPanel, HarnessError, Store> {
-  const store = yield* Store;
-  const sessionId = store.getSessionId(conversationId);
+}): Effect.fn.Return<PanelDraft, HarnessError | StoreError, Store> {
+  const { sessionId } = yield* Effect.flatMap(Store, (store) => store.getMount(conversationId));
   if (!sessionId) {
-    return buildNoMountedGoalPanel({ store, conversationId });
+    return buildNoMountedGoalPanel();
   }
-  const goal = yield* goals.read({ threadId: sessionId });
-  if (!isUnfinishedGoal(goal)) {
-    return buildNoActiveGoalPanel({ store, conversationId, sessionId });
-  }
-  return buildGoalPanel({ store, conversationId, goal, turnState });
+  return buildPanelForKnownGoal({ sessionId, goal: yield* goals.read({ threadId: sessionId }), turnState });
 });
 
 /** Says a goal could not be changed, and why. */
@@ -369,18 +312,16 @@ const sendErrorPanel = (chatId: ChatId, error: GoalError): Effect.Effect<void, T
   ].join("\n"), { format: "plain" })).pipe(Effect.asVoid);
 
 interface KnownGoal {
-  readonly store: ButtonStore;
-  readonly conversationId: string;
   readonly sessionId: string;
   readonly goal: v2.ThreadGoal | null;
   readonly turnState?: GoalTurnState | null;
 }
 
-function buildPanelForKnownGoal({ store, conversationId, sessionId, goal, turnState = null }: KnownGoal): ControlPanel {
+function buildPanelForKnownGoal({ sessionId, goal, turnState = null }: KnownGoal): PanelDraft {
   if (!isUnfinishedGoal(goal)) {
-    return buildNoActiveGoalPanel({ store, conversationId, sessionId });
+    return buildNoActiveGoalPanel({ sessionId });
   }
-  return buildGoalPanel({ store, conversationId, goal, turnState });
+  return buildGoalPanel({ goal, turnState });
 }
 
 interface SendGoalPanelRequest {
@@ -398,6 +339,7 @@ const sendGoalPanel = Effect.fnUntraced(function*({ conversationId, chatId, isTu
   Store | TelegramClient
 > {
   yield* buildGoalPanelFromState({ conversationId, turnState: isTurnActive ? "working" : "idle", goals }).pipe(
+    Effect.flatMap((draft) => keepPanel(conversationId, draft)),
     Effect.flatMap((panel) => sendPanel(chatId, panel)),
     Effect.catch((error) => sendErrorPanel(chatId, error)),
   );
@@ -434,15 +376,15 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
     return yield* sendGoalPanel({ conversationId, chatId, isTurnActive, goals });
   }
 
-  const sendKnownGoalPanel = (sessionId: string, goal: v2.ThreadGoal | null) =>
-    sendPanel(chatId, buildPanelForKnownGoal({ store, conversationId, sessionId, goal, turnState: "idle" }));
+  const send = (draft: PanelDraft) => Effect.flatMap(keepPanel(conversationId, draft), (panel) => sendPanel(chatId, panel));
+  const sendKnownGoalPanel = (sessionId: string, goal: v2.ThreadGoal | null) => send(buildPanelForKnownGoal({ sessionId, goal, turnState: "idle" }));
 
   yield* Effect.gen(function*() {
     const control = trimmed.toLowerCase();
-    let sessionId = store.getSessionId(conversationId);
+    let { sessionId } = yield* store.getMount(conversationId);
     if (!sessionId) {
       if (["clear", "pause", "resume", "edit"].includes(control)) {
-        return yield* sendPanel(chatId, buildNoMountedGoalPanel({ store, conversationId }));
+        return yield* send(buildNoMountedGoalPanel());
       }
       sessionId = yield* Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId));
     }
@@ -478,7 +420,7 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
 
     const currentGoal = yield* goals.read({ threadId: sessionId });
     if (shouldConfirmBeforeReplacing(currentGoal)) {
-      return yield* sendPanel(chatId, buildReplaceGoalPanel({ store, conversationId, currentGoal, objective: trimmed }));
+      return yield* send(buildReplaceGoalPanel({ currentGoal, objective: trimmed }));
     }
     const goal = yield* setFreshObjectiveGoal({ sessionId, objective: trimmed, currentGoal, goals });
     if (yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal, goals })) {
@@ -499,7 +441,7 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
   chatId,
   messageId,
   goals,
-}: GoalControlCallback): Effect.fn.Return<void, TelegramError, GoalServices> {
+}: GoalControlCallback): Effect.fn.Return<void, TelegramError | StoreError, GoalServices> {
   const store = yield* Store;
   const client = yield* TelegramClient;
   const activeTurns = yield* ActiveTurns;
@@ -507,8 +449,8 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
   const isTurnActive = yield* activeTurns.isBusy(conversationId);
   const stopActiveTurn = activeTurns.stop(conversationId, "interrupt");
   const kind = action.kind.slice(GOAL_KIND_PREFIX.length);
-  const sessionId = store.getSessionId(conversationId);
   const payload = action.payload ?? {};
+  const edit = (draft: PanelDraft) => Effect.flatMap(keepPanel(conversationId, draft), (panel) => editPanel(chatId, messageId, panel));
 
   if (kind === "close") {
     return yield* closePanel({ callbackQueryId, chatId, messageId });
@@ -519,52 +461,51 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
     return;
   }
 
+  const { sessionId } = yield* store.getMount(conversationId);
   if (!sessionId) {
     yield* client.answerCallbackQuery(callbackQueryId, "No mounted session.");
-    return yield* editPanel(chatId, messageId, buildNoMountedGoalPanel({ store, conversationId }));
+    return yield* edit(buildNoMountedGoalPanel());
   }
 
   yield* Effect.gen(function*() {
     let goalToRun: v2.ThreadGoal | null = null;
-    let panel: ControlPanel | null = null;
+    let panel: PanelDraft | null = null;
     if (kind === "show") {
       yield* client.answerCallbackQuery(callbackQueryId);
-      return yield* editPanel(chatId, messageId, yield* buildGoalPanelFromState({ conversationId, turnState: isTurnActive ? "working" : "idle", goals }));
+      return yield* edit(yield* buildGoalPanelFromState({ conversationId, turnState: isTurnActive ? "working" : "idle", goals }));
     }
     if (kind === "pause") {
       const goal = yield* goals.set({ threadId: sessionId, status: "paused" });
       yield* stopActiveTurn;
-      panel = buildPanelForKnownGoal({ store, conversationId, sessionId, goal, turnState: "idle" });
+      panel = buildPanelForKnownGoal({ sessionId, goal, turnState: "idle" });
       yield* client.answerCallbackQuery(callbackQueryId, "Paused.");
     } else if (kind === "resume") {
       goalToRun = yield* goals.set({ threadId: sessionId, status: "active" });
-      panel = buildPanelForKnownGoal({ store, conversationId, sessionId, goal: goalToRun, turnState: "starting" });
+      panel = buildPanelForKnownGoal({ sessionId, goal: goalToRun, turnState: "starting" });
       yield* client.answerCallbackQuery(callbackQueryId, "Starting.");
     } else if (kind === "replace") {
       yield* goals.clear({ threadId: sessionId });
       const objective = payload["objective"];
       goalToRun = yield* goals.set({ threadId: sessionId, objective: typeof objective === "string" ? objective : undefined, status: "active" });
-      panel = buildPanelForKnownGoal({ store, conversationId, sessionId, goal: goalToRun, turnState: "starting" });
+      panel = buildPanelForKnownGoal({ sessionId, goal: goalToRun, turnState: "starting" });
       yield* client.answerCallbackQuery(callbackQueryId, "Starting.");
     } else if (kind === "clear_confirm") {
       const goal = yield* goals.read({ threadId: sessionId });
       yield* client.answerCallbackQuery(callbackQueryId);
-      return yield* editPanel(chatId, messageId, goal
-        ? buildClearGoalConfirmationPanel({ store, conversationId, goal })
-        : buildNoActiveGoalPanel({ store, conversationId, sessionId }));
+      return yield* edit(goal ? buildClearGoalConfirmationPanel({ goal }) : buildNoActiveGoalPanel({ sessionId }));
     } else if (kind === "clear") {
       yield* goals.clear({ threadId: sessionId });
       yield* stopActiveTurn;
-      panel = buildNoActiveGoalPanel({ store, conversationId, sessionId });
+      panel = buildNoActiveGoalPanel({ sessionId });
       yield* client.answerCallbackQuery(callbackQueryId, "Cleared.");
     } else {
       yield* client.answerCallbackQuery(callbackQueryId, "Unknown action.");
       return;
     }
 
-    yield* editPanel(chatId, messageId, panel);
+    yield* edit(panel);
     if (goalToRun && !(yield* ensureGoalTurn({ conversationId, chatId, messageId, sessionId, goal: goalToRun, goals }))) {
-      yield* editPanel(chatId, messageId, buildPanelForKnownGoal({ store, conversationId, sessionId, goal: goalToRun, turnState: "idle" }));
+      yield* edit(buildPanelForKnownGoal({ sessionId, goal: goalToRun, turnState: "idle" }));
     }
   }).pipe(
     Effect.catch((error) =>

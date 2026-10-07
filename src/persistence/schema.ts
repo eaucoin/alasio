@@ -1,316 +1,240 @@
-import type { Database } from "better-sqlite3";
+/**
+ * alasio's state in Postgres: one schema, made (idempotently) as the store opens.
+ *
+ * JSON is kept as `json`, its exact text: what Telegram and the harnesses send may hold a
+ * NUL, which `jsonb` refuses. Times are `timestamptz`, and the order things were queued
+ * in is an identity column's.
+ */
+import { Effect } from "effect";
 
-const SCHEMA_VERSION = "8";
+import type { Sql, StoreError } from "./sql.ts";
 
-const SQLITE_SCHEMA_SQL = `
-  create table if not exists bot_state (
-    key text primary key,
-    value text not null,
-    updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-  );
+const ddl = (SCHEMA: string): string => `
+create schema if not exists ${SCHEMA};
 
-  create table if not exists conversations (
-    id text primary key,
-    transport text not null,
-    chat_id text not null,
-    user_id text,
-    username text,
-    first_name text,
-    last_name text,
-    codex_session_id text,
-    claude_session_id text,
-    active_harness text,
-    working_directory text,
-    claude_model text,
-    claude_effort text,
-    codex_model text,
-    codex_effort text,
-    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    unique (transport, chat_id)
-  );
+-- What alasio keeps by name: Telegram's update offset, the operator it bootstrapped.
+create table if not exists ${SCHEMA}.bot_state (
+  key text primary key,
+  value text not null,
+  updated_at timestamptz not null default now()
+);
 
-  create table if not exists workspace_sessions (
-    conversation_id text not null references conversations(id) on delete cascade,
-    harness text not null,
-    working_directory text not null,
-    session_id text,
-    updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    primary key (conversation_id, harness, working_directory)
-  );
+create table if not exists ${SCHEMA}.conversations (
+  id text primary key,
+  transport text not null,
+  chat_id text not null,
+  user_id text,
+  username text,
+  first_name text,
+  last_name text,
+  codex_session_id text,
+  claude_session_id text,
+  -- null while no service is mounted
+  active_harness text,
+  -- null while no folder is mounted
+  working_directory text,
+  -- a model and effort chosen with /model, per harness; null for the harness's default
+  claude_model text,
+  claude_effort text,
+  codex_model text,
+  codex_effort text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (transport, chat_id)
+);
 
-  -- A session filesystem is a Sandbox, which keeps its own state (src/sandbox/), so
-  -- the table that once tracked its volume goes.
-  drop table if exists session_volumes;
+-- The sessions a conversation had in the folders it mounted before, to restore.
+create table if not exists ${SCHEMA}.workspace_sessions (
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  harness text not null,
+  working_directory text not null,
+  session_id text,
+  updated_at timestamptz not null default now(),
+  primary key (conversation_id, harness, working_directory)
+);
 
-  create table if not exists telegram_updates (
-    update_id integer primary key,
-    payload_json text not null,
-    received_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    processed_at text
-  );
+create table if not exists ${SCHEMA}.telegram_updates (
+  update_id bigint primary key,
+  payload json not null,
+  received_at timestamptz not null default now(),
+  processed_at timestamptz
+);
 
-  create table if not exists messages (
-    id text primary key,
-    conversation_id text not null references conversations(id) on delete cascade,
-    direction text not null,
-    kind text not null,
-    transport_message_id text,
-    text text,
-    media_group_id text,
-    raw_json text,
-    codex_session_id text,
-    turn_id text,
-    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-  );
+create table if not exists ${SCHEMA}.messages (
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  direction text not null,
+  kind text not null,
+  transport_message_id text,
+  text text,
+  media_group_id text,
+  raw json,
+  session_id text,
+  turn_id text,
+  created_at timestamptz not null default now()
+);
 
-  create table if not exists files (
-    id text primary key,
-    message_id text references messages(id) on delete set null,
-    conversation_id text not null references conversations(id) on delete cascade,
-    telegram_file_id text not null,
-    telegram_file_unique_id text,
-    file_name text,
-    mime_type text,
-    file_size integer,
-    local_path text,
-    sha256 text,
-    raw_json text,
-    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    downloaded_at text
-  );
+create index if not exists messages_media_group on ${SCHEMA}.messages (media_group_id);
 
-  create table if not exists media_groups (
-    id text primary key,
-    conversation_id text not null references conversations(id) on delete cascade,
-    status text not null default 'pending',
-    first_update_id integer,
-    flush_after_ms integer not null,
-    created_at_ms integer not null,
-    flushed_at text
-  );
+-- Files messages carried, whole: the Bot API lets bots download 20 MB at most.
+create table if not exists ${SCHEMA}.files (
+  id text primary key,
+  message_id text references ${SCHEMA}.messages (id) on delete set null,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  telegram_file_id text not null,
+  telegram_file_unique_id text,
+  file_name text,
+  -- the name it is written under for the agent to read
+  name text not null,
+  mime_type text,
+  file_size integer not null,
+  sha256 text not null,
+  content bytea not null,
+  raw json not null,
+  created_at timestamptz not null default now()
+);
 
-  create table if not exists turns (
-    id text primary key,
-    conversation_id text not null references conversations(id) on delete cascade,
-    thread_key text not null,
-    channel text not null,
-    thread_ts text not null,
-    session_id text,
-    harness text not null default 'codex',
-    pending_response_id text,
-    prompt text,
-    state text not null,
-    started_at real not null,
-    completed_at real
-  );
+create index if not exists files_message on ${SCHEMA}.files (message_id);
 
-  create table if not exists response_blocks (
-    id text primary key,
-    pending_response_id text not null,
-    conversation_id text not null references conversations(id) on delete cascade,
-    channel text not null,
-    thread_ts text not null,
-    session_id text,
-    sequence integer not null,
-    block_json text not null,
-    posted integer not null default 0,
-    created_at real not null
-  );
+create table if not exists ${SCHEMA}.media_groups (
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  status text not null default 'pending',
+  first_update_id bigint not null,
+  created_at timestamptz not null default now(),
+  flushed_at timestamptz
+);
 
-  create table if not exists restart_events (
-    thread_key text primary key,
-    payload_json text not null,
-    created_at real not null
-  );
+-- Each conversation's latest turn, its id the conversation's.
+create table if not exists ${SCHEMA}.turns (
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  thread_key text not null,
+  channel text not null,
+  thread_ts text not null,
+  session_id text,
+  harness text not null,
+  pending_response_id text,
+  prompt text,
+  state text not null,
+  started_at timestamptz not null,
+  completed_at timestamptz
+);
 
-  create table if not exists session_usage (
-    session_id text primary key,
-    cache_read_input_tokens integer not null,
-    updated_at text not null
-  );
+create table if not exists ${SCHEMA}.responses (
+  id text primary key,
+  chat_id text not null,
+  message_id text not null,
+  session_id text,
+  completed boolean not null default false,
+  posted boolean not null default false,
+  created_at timestamptz not null default now()
+);
 
-  create table if not exists callback_actions (
-    id text primary key,
-    conversation_id text not null references conversations(id) on delete cascade,
-    kind text not null,
-    payload_json text not null,
-    consumed_at text,
-    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-  );
+create index if not exists responses_undelivered on ${SCHEMA}.responses (id) where completed and not posted;
 
-  create table if not exists telegram_outbox (
-    id text primary key,
-    conversation_id text references conversations(id) on delete cascade,
-    chat_id text not null,
-    kind text not null,
-    text text not null,
-    options_json text not null default '{}',
-    pending_response_id text,
-    state text not null default 'pending',
-    attempts integer not null default 0,
-    available_at real not null,
-    last_error text,
-    -- the W3C traceparent of the turn whose reply this is, so its delivery joins that trace
-    traceparent text,
-    created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    sent_at text
-  );
+create table if not exists ${SCHEMA}.response_blocks (
+  seq bigint generated always as identity primary key,
+  response_id text not null references ${SCHEMA}.responses (id) on delete cascade,
+  block json not null
+);
 
-  create table if not exists prompt_jobs (
-    id text primary key,
-    conversation_id text not null references conversations(id) on delete cascade,
-    chat_id text not null,
-    message_id text not null,
-    prompt text not null,
-    file_paths_json text not null default '[]',
-    harness text not null default 'codex',
-    state text not null,
-    priority integer not null default 0,
-    attempts integer not null default 0,
-    upstream_session_id text,
-    upstream_turn_id text,
-    -- when the prompt was sent to the agent, which may have acted on it since
-    upstream_dispatched_at real,
-    upstream_started_at real,
-    upstream_completed_at real,
-    last_error text,
-    -- the W3C traceparent of the update that queued the prompt, so its turn joins that
-    -- trace however long it waits, restarts included
-    traceparent text,
-    created_at real not null,
-    started_at real,
-    completed_at real,
-    unique (conversation_id, message_id)
-  );
+create index if not exists response_blocks_response on ${SCHEMA}.response_blocks (response_id, seq);
 
-  create index if not exists idx_prompt_jobs_ready
-    on prompt_jobs (conversation_id, state, priority desc, created_at asc);
+create table if not exists ${SCHEMA}.restart_events (
+  thread_key text primary key,
+  cause text not null,
+  channel text not null,
+  thread_ts text not null,
+  session_id text,
+  -- the command that restarted alasio, for a restart the agent caused
+  command text,
+  recorded_at timestamptz not null default now()
+);
 
-  create index if not exists idx_telegram_outbox_due
-    on telegram_outbox (state, available_at, created_at);
+create table if not exists ${SCHEMA}.session_usage (
+  session_id text primary key,
+  cache_read_input_tokens integer not null,
+  updated_at timestamptz not null default now()
+);
 
-  create index if not exists idx_messages_conversation_created_at
-    on messages (conversation_id, created_at);
+create table if not exists ${SCHEMA}.callback_actions (
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  kind text not null,
+  payload json not null,
+  -- what the conversation had mounted when the button was made
+  expected_session_id text,
+  expected_harness text,
+  created_at timestamptz not null default now()
+);
 
-  create index if not exists idx_messages_media_group
-    on messages (media_group_id);
+create table if not exists ${SCHEMA}.telegram_outbox (
+  seq bigint generated always as identity,
+  id text primary key,
+  conversation_id text references ${SCHEMA}.conversations (id) on delete cascade,
+  chat_id text not null,
+  kind text not null,
+  text text not null,
+  options json not null,
+  pending_response_id text,
+  state text not null default 'pending',
+  attempts integer not null default 0,
+  available_at timestamptz not null default now(),
+  last_error text,
+  -- the W3C traceparent of the turn whose reply this is, so its delivery joins that trace
+  traceparent text,
+  created_at timestamptz not null default now(),
+  sent_at timestamptz
+);
 
-  create index if not exists idx_files_message
-    on files (message_id);
+create index if not exists telegram_outbox_due on ${SCHEMA}.telegram_outbox (state, chat_id, seq);
+create unique index if not exists telegram_outbox_pending_response
+  on ${SCHEMA}.telegram_outbox (pending_response_id) where pending_response_id is not null;
 
-  create index if not exists idx_turns_state
-    on turns (state, started_at);
+-- The media a reply shows, kept with it until it is sent.
+create table if not exists ${SCHEMA}.outbox_media (
+  outbox_id text not null references ${SCHEMA}.telegram_outbox (id) on delete cascade,
+  position integer not null,
+  id text not null,
+  kind text not null,
+  animation boolean not null,
+  file_name text not null,
+  content bytea not null,
+  primary key (outbox_id, position)
+);
+
+create table if not exists ${SCHEMA}.prompt_jobs (
+  seq bigint generated always as identity,
+  id text primary key,
+  conversation_id text not null references ${SCHEMA}.conversations (id) on delete cascade,
+  chat_id text not null,
+  message_id text not null,
+  prompt text not null,
+  -- the files the prompt was sent with, as the files table keeps them
+  file_ids text[] not null default '{}',
+  harness text not null,
+  state text not null,
+  priority integer not null default 0,
+  attempts integer not null default 0,
+  upstream_session_id text,
+  upstream_turn_id text,
+  -- when the prompt was sent to the agent, which may have acted on it since
+  upstream_dispatched_at timestamptz,
+  upstream_started_at timestamptz,
+  upstream_completed_at timestamptz,
+  last_error text,
+  -- the W3C traceparent of the update that queued the prompt, so its turn joins that
+  -- trace however long it waits, restarts included
+  traceparent text,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  unique (conversation_id, message_id)
+);
+
+create index if not exists prompt_jobs_ready on ${SCHEMA}.prompt_jobs (conversation_id, state, priority desc, seq);
 `;
 
-/** A row of `pragma table_info`, as far as migrations read it. */
-interface ColumnInfo {
-  readonly name: string;
-  readonly notnull: 0 | 1;
-}
-
-export interface SchemaMigrationOptions {
-  readonly legacyWorkingDirectory?: string | null | undefined;
-}
-
-export function migrateSqliteSchema(db: Database, { legacyWorkingDirectory = null }: SchemaMigrationOptions = {}): void {
-    db.exec(SQLITE_SCHEMA_SQL);
-    const promptJobColumns = new Set(db.prepare<[], ColumnInfo>("pragma table_info(prompt_jobs)").all().map((column) => column.name));
-    if (!promptJobColumns.has("upstream_completed_at")) {
-      db.exec("alter table prompt_jobs add column upstream_completed_at real");
-    }
-    if (!promptJobColumns.has("harness")) {
-      db.exec("alter table prompt_jobs add column harness text not null default 'codex'");
-    }
-    if (!promptJobColumns.has("traceparent")) {
-      db.exec("alter table prompt_jobs add column traceparent text");
-    }
-    if (!promptJobColumns.has("upstream_dispatched_at")) {
-      db.exec("alter table prompt_jobs add column upstream_dispatched_at real");
-    }
-    if (!db.prepare<[], ColumnInfo>("pragma table_info(telegram_outbox)").all().some((column) => column.name === "traceparent")) {
-      db.exec("alter table telegram_outbox add column traceparent text");
-    }
-    const conversationColumnInfo = db.prepare<[], ColumnInfo>("pragma table_info(conversations)").all();
-    const conversationColumns = new Set(conversationColumnInfo.map((column) => column.name));
-    if (!conversationColumns.has("claude_session_id")) {
-      db.exec("alter table conversations add column claude_session_id text");
-    }
-    if (!conversationColumns.has("active_harness")) {
-      // Pre-harness rows only ever ran Codex; keep them mounted there so an upgrade
-      // does not strand existing conversations behind the service picker.
-      db.exec("alter table conversations add column active_harness text");
-      db.exec("update conversations set active_harness = 'codex' where active_harness is null");
-    } else if (conversationColumnInfo.find((column) => column.name === "active_harness")?.notnull) {
-      // Schema v5 declared active_harness not null default 'codex'. v6 makes "nothing
-      // mounted" a real state, so the constraint has to go; SQLite can only do that by
-      // swapping the column. Existing rows keep whichever harness they had.
-      db.exec(`
-        begin;
-        alter table conversations rename column active_harness to active_harness_v5;
-        alter table conversations add column active_harness text;
-        update conversations set active_harness = active_harness_v5;
-        alter table conversations drop column active_harness_v5;
-        commit;
-      `);
-    }
-    if (!conversationColumns.has("working_directory")) {
-      db.exec("alter table conversations add column working_directory text");
-    }
-    // A model and effort chosen with /model, per harness: each service has its
-    // own catalogue, so a choice made for one never applies to the other. Null
-    // means the harness's pinned default.
-    for (const column of ["claude_model", "claude_effort", "codex_model", "codex_effort"]) {
-      if (!conversationColumns.has(column)) {
-        db.exec(`alter table conversations add column ${column} text`);
-      }
-    }
-    if (legacyWorkingDirectory) {
-      // Conversations mounted before folders were per-conversation ran in the
-      // deployment's WORKING_DIRECTORY; keep them there instead of stranding them
-      // behind the folder picker.
-      db.prepare<[string]>(`
-        update conversations
-        set working_directory = ?
-        where working_directory is null and active_harness is not null
-      `).run(legacyWorkingDirectory);
-    }
-    const turnColumns = new Set(db.prepare<[], ColumnInfo>("pragma table_info(turns)").all().map((column) => column.name));
-    if (!turnColumns.has("harness")) {
-      db.exec("alter table turns add column harness text not null default 'codex'");
-    }
-    db.exec(`
-      delete from telegram_outbox
-      where pending_response_id is not null
-        and id not in (
-          select id
-          from (
-            select
-              id,
-              row_number() over (
-                partition by pending_response_id
-                order by
-                  case
-                    when state = 'sent' then 0
-                    when state = 'pending' then 1
-                    else 2
-                  end,
-                  created_at desc,
-                  id desc
-              ) as delivery_rank
-            from telegram_outbox
-            where pending_response_id is not null
-          )
-          where delivery_rank = 1
-        );
-
-      create unique index if not exists idx_telegram_outbox_pending_response
-        on telegram_outbox (pending_response_id)
-        where pending_response_id is not null;
-    `);
-    db.prepare<[string]>(`
-      insert into bot_state (key, value, updated_at)
-      values ('schema_version', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
-    `).run(SCHEMA_VERSION);
-}
+/** Makes alasio's tables in `schema` where they are missing. */
+export const ensureSchema = (sql: Sql, schema: string): Effect.Effect<void, StoreError> => Effect.asVoid(sql.query(ddl(schema)));

@@ -226,20 +226,20 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
     Scope.provide(scope),
   ));
   const persistence: TurnPersistence = {
-    createPendingResponse: () => "pending-1",
-    markPendingAsPosted: () => undefined,
-    updateActiveTurnPendingResponseId: () => undefined,
-    updatePendingSessionId: () => undefined,
-    updateActiveTurnSessionId: () => undefined,
-    appendBlockToPending: () => undefined,
-    markPendingResponseComplete: () => undefined,
-    updateSessionUsage: () => undefined,
-    recordRestartEvent: () => undefined,
+    createPendingResponse: () => Effect.succeed("pending-1"),
+    markPendingAsPosted: () => Effect.void,
+    updateActiveTurnPendingResponseId: () => Effect.void,
+    updatePendingSessionId: () => Effect.void,
+    updateActiveTurnSessionId: () => Effect.void,
+    appendBlocksToPending: () => Effect.void,
+    markPendingResponseComplete: () => Effect.void,
+    updateSessionUsage: () => Effect.void,
+    recordRestartEvent: () => Effect.void,
   };
   try {
     for (const prompt of ["hi", "again"]) {
       const result = await Effect.runPromise(harness.runTurn({
-        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, persistence,
+        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, modelChoice: null, persistence,
       }));
       assert.equal(result.responseCompleted, true);
     }

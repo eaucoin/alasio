@@ -1,5 +1,8 @@
-import type { Database } from "better-sqlite3";
+import { Effect } from "effect";
+
 import { newId } from "../shared/ids.ts";
+import { sessionOf } from "./conversation-repository.ts";
+import type { Sql, StoreError } from "./sql.ts";
 
 /**
  * What an inline button carries back when pressed. Its fields depend on the action's
@@ -7,23 +10,27 @@ import { newId } from "../shared/ids.ts";
  */
 export type CallbackPayload = Readonly<Record<string, unknown>>;
 
-/** A row of `callback_actions`: an inline button's action, waiting to be pressed once. */
+/** A row of `callback_actions`: an inline button's action, kept until it is pressed. */
 export interface CallbackActionRow {
   readonly id: string;
   readonly conversation_id: string;
   readonly kind: string;
-  readonly payload_json: string;
-  readonly consumed_at: string | null;
-  readonly created_at: string;
+  readonly payload: CallbackPayload;
+  readonly expected_session_id: string | null;
+  readonly expected_harness: string | null;
+  readonly created_at: Date;
 }
 
+/** A button's action, before it is kept. */
 export interface NewCallbackAction {
-  readonly conversationId: string;
   readonly kind: string;
   readonly payload?: CallbackPayload | undefined;
 }
 
-/** A pressed button's action. */
+/**
+ * A pressed button's action. Its payload carries, besides what the button was made
+ * with, what the conversation had mounted then: `expectedSessionId` and `expectedHarness`.
+ */
 export interface CallbackAction {
   readonly id: string;
   readonly conversationId: string;
@@ -31,37 +38,42 @@ export interface CallbackAction {
   readonly payload: CallbackPayload;
 }
 
-export class SqliteCallbackRepository {
-  private readonly db: Database;
+export class NeonCallbackRepository {
+  readonly #sql: Sql;
+  readonly #schema: string;
 
-  constructor(db: Database) {
-    this.db = db;
+  constructor(sql: Sql, schema: string) {
+    this.#sql = sql;
+    this.#schema = schema;
   }
 
-  createCallbackAction({ conversationId, kind, payload }: NewCallbackAction): string {
-    const id = newId().replace(/-/g, "").slice(0, 24);
-    this.db.prepare<[id: string, conversationId: string, kind: string, payloadJson: string]>(`
-      insert into callback_actions (id, conversation_id, kind, payload_json)
-      values (?, ?, ?, ?)
-    `).run(id, conversationId, kind, JSON.stringify(payload ?? {}));
-    return id;
+  /** Buttons' actions in the conversation, each with what the conversation has mounted now: their ids, in order. */
+  createCallbackActions(conversationId: string, actions: readonly NewCallbackAction[]): Effect.Effect<string[], StoreError> {
+    // Short, as Telegram holds a button's callback data to 64 bytes.
+    const ids = actions.map(() => newId().replace(/-/g, "").slice(0, 24));
+    return this.#sql.query(
+      `insert into ${this.#schema}.callback_actions (id, conversation_id, kind, payload, expected_session_id, expected_harness)
+       select action.id, conversations.id, action.kind, action.payload, ${sessionOf("active_harness")}, active_harness
+       from unnest($2::text[], $3::text[], $4::json[]) as action (id, kind, payload), ${this.#schema}.conversations
+       where conversations.id = $1`,
+      [conversationId, ids, actions.map((action) => action.kind), actions.map((action) => JSON.stringify(action.payload ?? {}))],
+    ).pipe(Effect.as(ids));
   }
 
-  consumeCallbackAction(id: string): CallbackAction | null {
-    const row = this.db.prepare<[string], CallbackActionRow>(`
-      select * from callback_actions
-      where id = ? and consumed_at is null
-    `).get(id);
-    if (!row) {
-      return null;
-    }
-    this.db.prepare<[string]>("update callback_actions set consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where id = ?").run(id);
-    return {
-      id: row.id,
-      conversationId: row.conversation_id,
-      kind: row.kind,
-      // createCallbackAction is the only writer, and it writes an object.
-      payload: JSON.parse(row.payload_json) as CallbackPayload,
-    };
+  /** The action of a button pressed for the first time, deleted as it acts once; null for one pressed before, or never made. */
+  consumeCallbackAction(id: string): Effect.Effect<CallbackAction | null, StoreError> {
+    return this.#sql.query<CallbackActionRow>(
+      `delete from ${this.#schema}.callback_actions where id = $1 returning *`,
+      [id],
+    ).pipe(Effect.map(([row]) =>
+      row
+        ? {
+          id: row.id,
+          conversationId: row.conversation_id,
+          kind: row.kind,
+          payload: { ...row.payload, expectedSessionId: row.expected_session_id, expectedHarness: row.expected_harness },
+        }
+        : null
+    ));
   }
 }

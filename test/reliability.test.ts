@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Array as Arr, Deferred, Effect, Exit, Fiber, Layer, Logger as EffectLogger, Scope } from "effect";
+import pg from "pg";
 import { makeAppServerNotifications } from "../src/codex/app-server/notification-queue.ts";
 import { AppServerRequestTimeout } from "../src/codex/app-server/rpc-client.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
@@ -14,11 +15,13 @@ import { recoverInterruptedTurns } from "../src/codex/restart-recovery.ts";
 import { makeStatusReporter, type StatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
-import { SqliteStore, Store } from "../src/persistence/store.ts";
+import type { StoreError } from "../src/persistence/sql.ts";
+import { Store } from "../src/persistence/store.ts";
 import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
 import { TelegramApiError } from "../src/telegram/client.ts";
 import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
+import { newSchema, run, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { noWorkflowHooks } from "./support/turns.ts";
 
@@ -29,13 +32,23 @@ const unusedClient = recordingTelegram({
 });
 
 /** The status reporter of `store`, whose replies `enqueue` queues. */
-function reporterFor(store: SqliteStore, enqueue: (text: OutboxText) => string): StatusReporter {
+function reporterFor(store: Store["Service"], enqueue: (text: OutboxText) => Effect.Effect<string, StoreError>): StatusReporter {
   return Effect.runSync(makeStatusReporter().pipe(Effect.provide(Layer.mergeAll(
     Layer.succeed(Store, store),
     unusedClient.layer,
-    Layer.succeed(Outbox, Outbox.of({ enqueueText: (text) => Effect.sync(() => enqueue(text)), deliverDue: Effect.void })),
+    Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, deliverDue: Effect.void })),
     noWorkflowHooks,
   ))));
+}
+
+/** The conversation of chat 123. */
+const CONVERSATION = "telegram:123";
+
+/** A store holding the conversation of chat 123, on Codex. */
+async function codexConversation(): Promise<Store["Service"]> {
+  const store = await testStore();
+  await run(store.setActiveHarness(await run(store.upsertConversation({ chatId: "123", user: { id: 123 } })), CODEX_HARNESS));
+  return store;
 }
 
 test("a stop is done only once the turn has let go of its conversation", async () => {
@@ -107,163 +120,125 @@ test("final response does not promote commentary when phased output lacks a fina
 });
 
 test("missing phased final answer does not enqueue fabricated completion text", async () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-response-missing-"));
-  try {
-    const store = new SqliteStore(root);
-    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-    const pendingResponseId = store.createPendingResponse("123", "9");
-    store.appendBlockToPending(pendingResponseId, { type: "text", content: "Still investigating.", phase: "commentary" });
-    store.markPendingResponseComplete(pendingResponseId);
-    const enqueued: OutboxText[] = [];
-    const reporter = reporterFor(store, (item) => {
-      enqueued.push(item);
-      return "outbox-1";
-    });
+  const store = await codexConversation();
+  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
+  await run(store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Still investigating.", phase: "commentary" }]));
+  await run(store.markPendingResponseComplete(pendingResponseId));
+  const enqueued: OutboxText[] = [];
+  const reporter = reporterFor(store, (item) => Effect.sync(() => {
+    enqueued.push(item);
+    return "outbox-1";
+  }));
 
-    await Effect.runPromise(reporter.postResponse({ chatId: "123", response: "", pendingResponseId, status: null }));
+  await run(reporter.postResponse({ chatId: "123", response: "", pendingResponseId, status: null }));
 
-    assert.deepEqual(enqueued, []);
-    // Posted as it is, with nothing to deliver.
-    assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  assert.deepEqual(enqueued, []);
+  // Posted as it is, with nothing to deliver.
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
 });
 
-test("SQLite response recovery exposes only terminal upstream responses", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-response-phase-"));
-  try {
-    const store = new SqliteStore(root);
-    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-    const pendingResponseId = store.createPendingResponse("123", "9");
-    store.appendBlockToPending(pendingResponseId, {
-      type: "text",
-      content: "The final answer.",
-      phase: "final_answer",
-    });
+test("response recovery exposes only completed responses, their blocks in order", async () => {
+  const store = await codexConversation();
+  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
+  await run(store.appendBlocksToPending(pendingResponseId, [
+    { type: "text", content: "Looking.", phase: "commentary" },
+    { type: "tool", name: "Bash" },
+  ]));
+  await run(store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "The final answer.", phase: "final_answer" }]));
 
-    assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
-    store.markPendingResponseComplete(pendingResponseId);
-    const [completed] = store.getCompletedResponsesPendingDelivery();
-    assert.ok(completed);
-    assert.equal(finalResponseToMarkdown(completed.blocks), "The final answer.");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+  await run(store.markPendingResponseComplete(pendingResponseId));
+  const [completed] = await run(store.getCompletedResponsesPendingDelivery);
+  assert.ok(completed);
+  assert.deepEqual(completed.blocks.map((block) => block["content"] ?? block["name"]), ["Looking.", "Bash", "The final answer."]);
+  assert.equal(finalResponseToMarkdown(completed.blocks), "The final answer.");
 });
 
-test("a block for a pending response that does not exist is dropped with a warning", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-response-unknown-"));
-  try {
-    const store = new SqliteStore(root);
-    store.appendBlockToPending("no-such-response", { type: "text", content: "Lost.", phase: "final_answer" });
-    assert.equal(store.db.prepare<[], { n: number }>("select count(*) as n from response_blocks").get()?.n, 0);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("a new response to a message lets go of the one before it that was never delivered", async () => {
+  const store = await codexConversation();
+  const first = await run(store.createPendingResponse("123", "9"));
+  await run(store.markPendingResponseComplete(first));
+  const second = await run(store.createPendingResponse("123", "9"));
+  await run(store.markPendingResponseComplete(second));
+  assert.deepEqual((await run(store.getCompletedResponsesPendingDelivery)).map((response) => response.id), [second]);
 });
 
 test("completed response recovery enqueues one final answer exactly once", async () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-response-once-"));
-  try {
-    const store = new SqliteStore(root);
-    store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-    const pendingResponseId = store.createPendingResponse("123", "9");
-    store.appendBlockToPending(pendingResponseId, {
-      type: "text",
-      content: "Still working.",
-      phase: "commentary",
-    });
-    store.appendBlockToPending(pendingResponseId, {
-      type: "text",
-      content: "The final answer.",
-      phase: "final_answer",
-    });
-    store.markPendingResponseComplete(pendingResponseId);
-    const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
+  const store = await codexConversation();
+  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
+  await run(store.appendBlocksToPending(pendingResponseId, [
+    { type: "text", content: "Still working.", phase: "commentary" },
+    { type: "text", content: "The final answer.", phase: "final_answer" },
+  ]));
+  await run(store.markPendingResponseComplete(pendingResponseId));
+  const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
 
-    await Effect.runPromise(reporter.flushCompletedResponses);
-    await Effect.runPromise(reporter.flushCompletedResponses);
+  await run(reporter.flushCompletedResponses);
+  await run(reporter.flushCompletedResponses);
 
-    const due = store.getDueOutbox(10);
-    assert.equal(due.length, 1);
-    assert.equal(due[0]?.text, "The final answer.");
-    assert.equal(due[0]?.pending_response_id, pendingResponseId);
-    assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  const due = await run(store.getDueOutbox(10));
+  assert.equal(due.length, 1);
+  assert.equal(due[0]?.text, "The final answer.");
+  assert.equal(due[0]?.pending_response_id, pendingResponseId);
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+  // A reply queued again for the same response is the one already queued.
+  assert.equal(await run(store.enqueueOutboxText({ chatId: "123", text: "again", pendingResponseId })), due[0]?.id);
 });
 
-test("a reply waiting to be retried holds back the replies queued after it to its chat, and no other chat's", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-outbox-order-"));
-  try {
-    const store = new SqliteStore(root);
-    for (const chatId of ["1", "2"]) store.setActiveHarness(store.upsertConversation({ chatId, user: { id: Number(chatId) } }), CODEX_HARNESS);
-    const first = store.enqueueOutboxText({ chatId: "1", text: "first" });
-    store.enqueueOutboxText({ chatId: "1", text: "second" });
-    store.enqueueOutboxText({ chatId: "2", text: "elsewhere" });
-    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["first", "elsewhere"]);
-    store.rescheduleOutbox(first, new Error("Bad Gateway"), 60_000);
-    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["elsewhere"]);
-    store.markOutboxSent(first);
-    assert.deepEqual(store.getDueOutbox().map((reply) => reply.text), ["second", "elsewhere"]);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("a reply waiting to be retried holds back the replies queued after it to its chat, and no other chat's", async () => {
+  const store = await testStore();
+  for (const chatId of ["1", "2"]) await run(store.setActiveHarness(await run(store.upsertConversation({ chatId, user: { id: Number(chatId) } })), CODEX_HARNESS));
+  const first = await run(store.enqueueOutboxText({ chatId: "1", text: "first" }));
+  await run(store.enqueueOutboxText({ chatId: "1", text: "second" }));
+  await run(store.enqueueOutboxText({ chatId: "2", text: "elsewhere" }));
+  const due = async () => (await run(store.getDueOutbox())).map((reply) => reply.text);
+  assert.deepEqual(await due(), ["first", "elsewhere"]);
+  await run(store.rescheduleOutbox(first, new Error("Bad Gateway"), 60_000));
+  assert.deepEqual(await due(), ["elsewhere"]);
+  await run(store.markOutboxSent(first));
+  assert.deepEqual(await due(), ["second", "elsewhere"]);
 });
 
-test("outbox migration keeps sent evidence over a pending duplicate", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-outbox-migration-"));
-  try {
-    const first = new SqliteStore(root);
-    first.setActiveHarness(first.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-    const pendingResponseId = first.createPendingResponse("123", "9");
-    const sentId = first.enqueueOutboxText({ chatId: "123", text: "done", pendingResponseId });
-    first.markOutboxSent(sentId);
-    first.db.exec("drop index idx_telegram_outbox_pending_response");
-    first.db.prepare(`
-      insert into telegram_outbox
-        (id, conversation_id, chat_id, kind, text, options_json, pending_response_id, state, available_at)
-      select 'duplicate-pending', conversation_id, chat_id, kind, text, options_json, pending_response_id, 'pending', available_at
-      from telegram_outbox
-      where id = ?
-    `).run(sentId);
-    first.close();
+test("prompt jobs and the outbox outlast the store they were queued through", async () => {
+  const schema = newSchema();
+  const first = await testStore({ schema });
+  const conversationId = await run(first.upsertConversation({ chatId: "123", user: { id: 123 } }));
+  await run(first.setActiveHarness(conversationId, CODEX_HARNESS));
+  const job = await run(first.enqueuePromptJob({ conversationId, chatId: "123", messageId: "9", prompt: "hello" }));
+  const claimed = await run(first.claimNextPromptJob(conversationId));
+  assert.equal(claimed?.id, job.id);
+  await run(first.enqueueOutboxText({ chatId: "123", text: "done", pendingResponseId: null }));
 
-    const migrated = new SqliteStore(root);
-    const rows = migrated.db.prepare("select id, state from telegram_outbox where pending_response_id = ?").all(pendingResponseId);
-    assert.deepEqual(rows, [{ id: sentId, state: "sent" }]);
-    migrated.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  const second = await testStore({ schema });
+  await run(second.recoverPromptJobsAfterRestart);
+  assert.equal((await run(second.claimNextPromptJob(conversationId)))?.prompt, "hello");
+  assert.equal((await run(second.getDueOutbox(10)))[0]?.text, "done");
 });
 
-test("SQLite prompt jobs and outbox survive process boundaries", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-reliability-"));
-  try {
-    const first = new SqliteStore(root);
-    const conversationId = first.upsertConversation({ chatId: "123", user: { id: 123 } });
-    first.setActiveHarness(conversationId, CODEX_HARNESS);
-    const job = first.enqueuePromptJob({ conversationId, chatId: "123", messageId: "9", prompt: "hello" });
-    const claimed = first.claimNextPromptJob(conversationId);
-    assert.equal(claimed?.id, job.id);
-    first.enqueueOutboxText({ chatId: "123", text: "done", pendingResponseId: null });
-    first.close();
+test("a prompt job is claimed by one worker however many ask at once", async () => {
+  const store = await codexConversation();
+  await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "1", prompt: "first" }));
+  await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "2", prompt: "second", priority: 1 }));
+  const claims = await Promise.all([1, 2, 3].map(() => run(store.claimNextPromptJob(CONVERSATION))));
+  assert.deepEqual(claims.map((job) => job?.prompt ?? "none").sort(), ["first", "none", "second"]);
+});
 
-    const second = new SqliteStore(root);
-    second.recoverPromptJobsAfterRestart();
-    assert.equal(second.claimNextPromptJob(conversationId)?.prompt, "hello");
-    assert.equal(second.getDueOutbox(10)[0]?.text, "done");
-    second.close();
+test("the store's schema is not one alasio's role finds first, so what the role makes unqualified goes where it always went", async () => {
+  // alasio's role makes the store, as it does in alasio's Neon.
+  await (await testPool()).query(`
+    create role alasio login password 'alasio';
+    do $$ begin execute format('grant create on database %I to alasio', current_database()); end $$;
+  `);
+  const url = new URL(await testDatabaseUrl());
+  url.username = "alasio";
+  url.password = "alasio";
+  const pool = new pg.Pool({ connectionString: url.href, max: 1 });
+  try {
+    await Effect.runPromise(Effect.provide(Store, Store.layer({ pool })));
+    const { rows } = await pool.query<{ schemas: string[] }>("select current_schemas(false)::text[] as schemas");
+    assert.deepEqual(rows[0]?.schemas, ["public"]);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await pool.end();
   }
 });
 
@@ -279,20 +254,21 @@ test("alasio's services wire the durable outbox into final response delivery", a
       workingDirectory: root,
       workspaceRoot: root,
       stateDir: join(root, ".alasio"),
-      dbPath: join(root, ".alasio", "alasio.sqlite"),
+      pool: await testPool(),
+      stateSchema: newSchema(),
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
     };
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const store = yield* Store;
-      store.setActiveHarness(store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-      const pendingResponseId = store.createPendingResponse("123", "9");
-      store.appendBlockToPending(pendingResponseId, { type: "text", content: "Delivered durably.", phase: "final_answer" });
-      store.markPendingResponseComplete(pendingResponseId);
+      yield* store.setActiveHarness(yield* store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
+      const pendingResponseId = yield* store.createPendingResponse("123", "9");
+      yield* store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Delivered durably.", phase: "final_answer" }]);
+      yield* store.markPendingResponseComplete(pendingResponseId);
       yield* (yield* Turns).flushCompletedResponses;
-      assert.deepEqual(store.getCompletedResponsesPendingDelivery(), []);
-      assert.equal(store.getPendingOutboxCount(), 1);
+      assert.deepEqual(yield* store.getCompletedResponsesPendingDelivery, []);
+      assert.equal(yield* store.getPendingOutboxCount, 1);
     }).pipe(Effect.provide(alasioServices(options)))));
   } finally {
     if (apiRoot === undefined) delete process.env["TELEGRAM_API_ROOT"];
@@ -301,144 +277,112 @@ test("alasio's services wire the durable outbox into final response delivery", a
   }
 });
 
-test("restart reconciliation preserves upstream-completed prompt jobs", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-completed-job-"));
-  try {
-    const store = new SqliteStore(root);
-    const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
-    store.setActiveHarness(conversationId, CODEX_HARNESS);
-    const job = store.enqueuePromptJob({ conversationId, chatId: "123", messageId: "10", prompt: "finish" });
-    store.claimNextPromptJob(conversationId);
-    store.markPromptJobUpstreamStarted(job.id, "session", "turn");
-    store.markPromptJobUpstreamCompleted(job.id, "session", "turn");
-    assert.deepEqual(store.recoverPromptJobsAfterRestart(), [conversationId]);
-    assert.equal(store.getPromptJob(job.id)?.state, "completed");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("restart reconciliation preserves upstream-completed prompt jobs", async () => {
+  const store = await codexConversation();
+  const job = await run(store.enqueuePromptJob({ conversationId: CONVERSATION, chatId: "123", messageId: "10", prompt: "finish" }));
+  await run(store.claimNextPromptJob(CONVERSATION));
+  await run(store.markPromptJobUpstreamStarted(job.id, "session", "turn"));
+  await run(store.markPromptJobUpstreamCompleted(job.id, "session", "turn"));
+  assert.deepEqual(await run(store.recoverPromptJobsAfterRestart), [CONVERSATION]);
+  assert.equal((await run(store.getPromptJob(job.id)))?.state, "completed");
 });
 
-test("restart reconciliation runs again only the prompts never sent to the agent", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-dispatched-job-"));
-  try {
-    const store = new SqliteStore(root);
-    const jobs = new Map<string, string>();
-    for (const [chatId, dispatched] of [["1", false], ["2", true]] as const) {
-      const conversationId = store.upsertConversation({ chatId, user: { id: Number(chatId) } });
-      store.setActiveHarness(conversationId, CODEX_HARNESS);
-      const job = store.enqueuePromptJob({ conversationId, chatId, messageId: "10", prompt: "do it" });
-      store.claimNextPromptJob(conversationId);
-      if (dispatched) store.markPromptJobDispatched(job.id);
-      jobs.set(chatId, job.id);
-    }
-    assert.deepEqual(store.recoverPromptJobsAfterRestart(), []);
-    assert.equal(store.getPromptJob(jobs.get("1") ?? "")?.state, "pending");
-    assert.equal(store.getPromptJob(jobs.get("2") ?? "")?.state, "interrupted");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
+test("restart reconciliation runs again only the prompts never sent to the agent", async () => {
+  const store = await testStore();
+  const jobs = new Map<string, string>();
+  for (const [chatId, dispatched] of [["1", false], ["2", true]] as const) {
+    const conversationId = await run(store.upsertConversation({ chatId, user: { id: Number(chatId) } }));
+    await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+    const job = await run(store.enqueuePromptJob({ conversationId, chatId, messageId: "10", prompt: "do it" }));
+    await run(store.claimNextPromptJob(conversationId));
+    if (dispatched) await run(store.markPromptJobDispatched(job.id));
+    jobs.set(chatId, job.id);
   }
+  assert.deepEqual(await run(store.recoverPromptJobsAfterRestart), []);
+  assert.equal((await run(store.getPromptJob(jobs.get("1") ?? "")))?.state, "pending");
+  assert.equal((await run(store.getPromptJob(jobs.get("2") ?? "")))?.state, "interrupted");
 });
 
 test("self-restart recovery stages a distinct durable continuation", async () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-restart-continuation-"));
-  try {
-    const store = new SqliteStore(root);
-    const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
-    store.setActiveHarness(conversationId, CODEX_HARNESS);
-    const original = store.enqueuePromptJob({
-      conversationId,
-      chatId: "123",
-      messageId: "3334",
-      prompt: "Apply the change and restart.",
-    });
-    store.claimNextPromptJob(conversationId);
-    store.markPromptJobUpstreamStarted(original.id, "session-1", "turn-1");
-    const partialResponseId = store.createPendingResponse("123", "3334", "session-1");
-    store.appendBlockToPending(partialResponseId, {
-      type: "text",
-      content: "Restarting now.",
-      phase: "commentary",
-    });
-    store.upsertActiveTurn({
-      conversationId,
-      chatId: "123",
-      messageId: "3334",
-      sessionId: "session-1",
-      pendingResponseId: partialResponseId,
-      prompt: original.prompt,
-    });
-    store.recordRestartEvent({
-      cause: "self_induced",
-      thread_key: conversationId,
-      channel: "123",
-      thread_ts: "3334",
-      session_id: "session-1",
-      timestamp: 1234,
-    });
+  const store = await codexConversation();
+  const original = await run(store.enqueuePromptJob({
+    conversationId: CONVERSATION,
+    chatId: "123",
+    messageId: "3334",
+    prompt: "Apply the change and restart.",
+  }));
+  await run(store.claimNextPromptJob(CONVERSATION));
+  await run(store.markPromptJobUpstreamStarted(original.id, "session-1", "turn-1"));
+  const partialResponseId = await run(store.createPendingResponse("123", "3334", "session-1"));
+  await run(store.appendBlocksToPending(partialResponseId, [{ type: "text", content: "Restarting now.", phase: "commentary" }]));
+  await run(store.upsertActiveTurn({
+    conversationId: CONVERSATION,
+    chatId: "123",
+    messageId: "3334",
+    sessionId: "session-1",
+    harness: CODEX_HARNESS,
+    pendingResponseId: partialResponseId,
+    prompt: original.prompt,
+  }));
+  await run(store.recordRestartEvent({ cause: "self_induced", thread_key: CONVERSATION, channel: "123", thread_ts: "3334", session_id: "session-1" }));
 
-    store.recoverPromptJobsAfterRestart();
-    Effect.runSync(recoverInterruptedTurns(store));
-    Effect.runSync(recoverInterruptedTurns(store));
+  await run(store.recoverPromptJobsAfterRestart);
+  await run(recoverInterruptedTurns(store));
+  await run(recoverInterruptedTurns(store));
 
-    assert.equal(store.getPromptJob(original.id)?.state, "interrupted");
-    assert.deepEqual(store.getActiveTurns(), []);
-    assert.equal(store.getRestartEvent(conversationId), null);
-    assert.deepEqual(
-      store.db.prepare("select distinct posted from response_blocks where pending_response_id = ?").all(partialResponseId),
-      [{ posted: 1 }],
-    );
-    assert.equal(store.db.prepare<[], { count: number }>("select count(*) count from prompt_jobs").get()?.count, 2);
-    const continuation = store.claimNextPromptJob(conversationId);
-    assert.ok(continuation);
-    assert.notEqual(continuation.message_id, "3334");
-    assert.match(continuation.message_id, /^restart:3334:/);
-    assert.match(continuation.prompt, /SYSTEM RESTART EVENT/);
-    assert.equal(store.getSessionId(conversationId), "session-1");
+  assert.equal((await run(store.getPromptJob(original.id)))?.state, "interrupted");
+  assert.deepEqual(await run(store.getActiveTurns), []);
+  assert.equal(await run(store.getRestartEvent(CONVERSATION)), null);
+  // The partial response was let go of: completed, it is still never delivered.
+  await run(store.markPendingResponseComplete(partialResponseId));
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+  const continuation = await run(store.claimNextPromptJob(CONVERSATION));
+  assert.ok(continuation);
+  assert.notEqual(continuation.message_id, "3334");
+  assert.match(continuation.message_id, /^restart:3334:/);
+  assert.match(continuation.prompt, /SYSTEM RESTART EVENT/);
+  assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "staged twice, the continuation is queued once");
+  assert.equal((await run(store.getMount(CONVERSATION))).sessionId, "session-1");
 
-    const completedResponseId = store.createPendingResponse("123", continuation.message_id, "session-1");
-    store.appendBlockToPending(completedResponseId, { type: "text", content: "Recovered commentary.", phase: "commentary" });
-    store.appendBlockToPending(completedResponseId, { type: "text", content: "Recovered final answer.", phase: "final_answer" });
-    store.markPendingResponseComplete(completedResponseId);
-    const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
-    await Effect.runPromise(reporter.flushCompletedResponses);
-    assert.deepEqual(store.getDueOutbox(10).map((item) => item.text), ["Recovered final answer."]);
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+  const completedResponseId = await run(store.createPendingResponse("123", continuation.message_id, "session-1"));
+  await run(store.appendBlocksToPending(completedResponseId, [
+    { type: "text", content: "Recovered commentary.", phase: "commentary" },
+    { type: "text", content: "Recovered final answer.", phase: "final_answer" },
+  ]));
+  await run(store.markPendingResponseComplete(completedResponseId));
+  const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
+  await run(reporter.flushCompletedResponses);
+  assert.deepEqual((await run(store.getDueOutbox(10))).map((item) => item.text), ["Recovered final answer."]);
 });
 
-test("stale turn completion cannot clear a replacement turn", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-turn-identity-"));
-  try {
-    const store = new SqliteStore(root);
-    const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
-    store.setActiveHarness(conversationId, CODEX_HARNESS);
-    store.upsertActiveTurn({ conversationId, chatId: "123", messageId: "1", pendingResponseId: "old" });
-    store.upsertActiveTurn({ conversationId, chatId: "123", messageId: "2", pendingResponseId: "new" });
-    store.clearActiveTurn(conversationId, "old");
-    assert.equal(store.getActiveTurns()[0]?.pending_response_id, "new");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("stale turn completion cannot clear a replacement turn", async () => {
+  const store = await codexConversation();
+  await run(store.upsertActiveTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "1", harness: CODEX_HARNESS, pendingResponseId: "old" }));
+  await run(store.upsertActiveTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "2", harness: CODEX_HARNESS, pendingResponseId: "new" }));
+  await run(store.clearActiveTurn(CONVERSATION, "old"));
+  assert.equal((await run(store.getActiveTurns))[0]?.pending_response_id, "new");
 });
 
-test("callback actions capture the mounted session generation", () => {
-  const root = mkdtempSync(join(tmpdir(), "alasio-callback-session-"));
-  try {
-    const store = new SqliteStore(root);
-    const conversationId = store.upsertConversation({ chatId: "123", user: { id: 123 } });
-    store.setActiveHarness(conversationId, CODEX_HARNESS);
-    store.setSessionId(conversationId, "session-a");
-    const id = store.createCallbackAction({ conversationId, kind: "goal:resume", payload: {} });
-    assert.equal(store.consumeCallbackAction(id)?.payload["expectedSessionId"], "session-a");
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test("callback actions capture the mounted session generation", async () => {
+  const store = await codexConversation();
+  await run(store.setSessionId(CONVERSATION, "session-a"));
+  const [id = ""] = await run(store.createCallbackActions(CONVERSATION, [{ kind: "goal:resume" }]));
+  assert.equal((await run(store.consumeCallbackAction(id)))?.payload["expectedSessionId"], "session-a");
+  assert.equal(await run(store.consumeCallbackAction(id)), null, "a button acts once");
+});
+
+test("what is kept only in flight is pruned once it has landed long enough ago; what is still in flight is not", async () => {
+  const store = await codexConversation();
+  const sent = await run(store.enqueueOutboxText({ chatId: "123", text: "delivered" }));
+  await run(store.markOutboxSent(sent));
+  await run(store.enqueueOutboxText({ chatId: "123", text: "waiting" }));
+  await run(store.pruneTransient("1 hour"));
+  assert.equal(await run(store.getPendingOutboxCount), 1);
+
+  const [button = ""] = await run(store.createCallbackActions(CONVERSATION, [{ kind: "queue" }]));
+  await run(store.pruneTransient(0));
+  assert.deepEqual((await run(store.getDueOutbox())).map((reply) => reply.text), ["waiting"]);
+  assert.notEqual(await run(store.consumeCallbackAction(button)), null, "a button not yet pressed acts however old it is");
 });
 
 test("Telegram API error exposes retry_after", () => {

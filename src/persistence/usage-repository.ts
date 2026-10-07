@@ -1,35 +1,37 @@
-import type { Database } from "better-sqlite3";
+import { Effect } from "effect";
+
+import type { Sql, StoreError } from "./sql.ts";
 
 /** Token usage a harness reports for a session's latest turn. */
 export interface SessionUsage {
   readonly cacheReadInputTokens?: number | null | undefined;
 }
 
-export class SqliteUsageRepository {
-  private readonly db: Database;
+export class NeonUsageRepository {
+  readonly #sql: Sql;
+  readonly #schema: string;
 
-  constructor(db: Database) {
-    this.db = db;
+  constructor(sql: Sql, schema: string) {
+    this.#sql = sql;
+    this.#schema = schema;
   }
 
-  updateSessionUsage(sessionId: string | null | undefined, usage: SessionUsage | null | undefined): void {
-    if (!sessionId || !usage) {
-      return;
+  updateSessionUsage(sessionId: string | null | undefined, usage: SessionUsage | null | undefined): Effect.Effect<void, StoreError> {
+    const tokens = usage?.cacheReadInputTokens ?? 0;
+    if (!sessionId || tokens <= 0) {
+      return Effect.void;
     }
-    const tokens = usage.cacheReadInputTokens ?? 0;
-    if (tokens <= 0) {
-      return;
-    }
-    this.db.prepare<[sessionId: string, cacheReadInputTokens: number, updatedAt: string]>(`
-      insert into session_usage (session_id, cache_read_input_tokens, updated_at)
-      values (?, ?, ?)
-      on conflict(session_id) do update set
-        cache_read_input_tokens = excluded.cache_read_input_tokens,
-        updated_at = excluded.updated_at
-    `).run(sessionId, tokens, new Date().toISOString());
+    return Effect.asVoid(this.#sql.query(
+      `insert into ${this.#schema}.session_usage (session_id, cache_read_input_tokens) values ($1, $2)
+       on conflict (session_id) do update set cache_read_input_tokens = excluded.cache_read_input_tokens, updated_at = now()`,
+      [sessionId, tokens],
+    ));
   }
 
-  getSessionTokens(sessionId: string): number {
-    return this.db.prepare<[string], { cache_read_input_tokens: number }>("select cache_read_input_tokens from session_usage where session_id = ?").get(sessionId)?.cache_read_input_tokens ?? 0;
+  getSessionTokens(sessionId: string): Effect.Effect<number, StoreError> {
+    return this.#sql.query<{ cache_read_input_tokens: number }>(
+      `select cache_read_input_tokens from ${this.#schema}.session_usage where session_id = $1`,
+      [sessionId],
+    ).pipe(Effect.map(([row]) => row?.cache_read_input_tokens ?? 0));
   }
 }

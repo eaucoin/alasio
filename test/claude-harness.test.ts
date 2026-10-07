@@ -35,7 +35,7 @@ import { BaymaNotAnswering } from "../src/kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
-import type { RestartEvent } from "../src/persistence/restart-repository.ts";
+import type { NewRestartEvent } from "../src/persistence/restart-repository.ts";
 import type { SessionUsage } from "../src/persistence/usage-repository.ts";
 import {
   assistantMessage,
@@ -64,6 +64,7 @@ interface RecordingPersistence extends TurnPersistence {
     readonly posted: string[];
     readonly pending: string[];
     readonly usage: [string | null | undefined, SessionUsage | null | undefined][];
+    readonly restarts: NewRestartEvent[];
   };
 }
 
@@ -76,21 +77,24 @@ function createPersistence(): RecordingPersistence {
     posted: [],
     pending: [],
     usage: [],
+    restarts: [],
   };
+  const record = (write: () => void) => Effect.sync(write);
   return {
     state,
-    createPendingResponse: (_chatId, messageId) => {
-      state.pending.push(String(messageId));
-      return `pending-${state.pending.length}`;
-    },
-    markPendingAsPosted: (id) => state.posted.push(id),
-    updateActiveTurnPendingResponseId: () => undefined,
-    updatePendingSessionId: (_id, sessionId) => state.sessionIds.push(sessionId),
-    updateActiveTurnSessionId: (_threadKey, sessionId) => state.activeTurnSessionIds.push(sessionId),
-    appendBlockToPending: (_id, block) => state.blocks.push(block),
-    markPendingResponseComplete: (id) => state.completed.push(id),
-    updateSessionUsage: (sessionId, turnUsage) => state.usage.push([sessionId, turnUsage]),
-    recordRestartEvent: () => undefined,
+    createPendingResponse: (_chatId, messageId) =>
+      Effect.sync(() => {
+        state.pending.push(String(messageId));
+        return `pending-${state.pending.length}`;
+      }),
+    markPendingAsPosted: (id) => record(() => state.posted.push(id)),
+    updateActiveTurnPendingResponseId: () => Effect.void,
+    updatePendingSessionId: (_id, sessionId) => record(() => state.sessionIds.push(sessionId)),
+    updateActiveTurnSessionId: (_threadKey, sessionId) => record(() => state.activeTurnSessionIds.push(sessionId)),
+    appendBlocksToPending: (_id, blocks) => record(() => state.blocks.push(...blocks)),
+    markPendingResponseComplete: (id) => record(() => state.completed.push(id)),
+    updateSessionUsage: (sessionId, turnUsage) => record(() => state.usage.push([sessionId, turnUsage])),
+    recordRestartEvent: (event) => record(() => state.restarts.push(event)),
   };
 }
 
@@ -138,7 +142,7 @@ const folderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) =>
   });
 
 /** A turn for runClaudeTurn: the turn, what its live sessions are made with, and the running turns they register in. */
-interface ClaudeTurnRun extends TurnParams {
+interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice"> {
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly queryFactory: ClaudeQueryFactory;
   readonly activeTurns?: ActiveTurns["Service"];
@@ -148,7 +152,7 @@ interface ClaudeTurnRun extends TurnParams {
 async function runClaudeTurn({ sessions, queryFactory, activeTurns = makeActiveTurns(), ...params }: ClaudeTurnRun): Promise<TurnResult> {
   return await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const liveSessions = yield* makeClaudeLiveSessions({ workingDirectory: params.workingDirectory, sessions, queryFactory, folderBayma });
-    return yield* liveSessions.runTurn(params);
+    return yield* liveSessions.runTurn({ modelChoice: null, ...params });
   })).pipe(Effect.provideService(ActiveTurns, activeTurns)));
 }
 
@@ -587,8 +591,6 @@ test("Bash, Monitor, Grep and Glob are removed and bayma exec code passes the da
 
 test("a restart through a Bun shell in bayma exec records self-induced provenance once", async () => {
   const persistence = createPersistence();
-  const restarts: RestartEvent[] = [];
-  persistence.recordRestartEvent = (event) => restarts.push(event);
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => fakeQuery((async function* run(): AsyncGenerator<SDKMessage, void> {
     const first = await readPrompt(prompt[Symbol.asyncIterator]());
     yield initMessage("s-5");
@@ -608,8 +610,8 @@ test("a restart through a Bun shell in bayma exec records self-induced provenanc
     sessions: quietSessions,
     queryFactory,
   });
-  assert.equal(restarts.length, 1);
-  assert.equal(restarts[0]?.cause, "self_induced");
+  assert.equal(persistence.state.restarts.length, 1);
+  assert.equal(persistence.state.restarts[0]?.cause, "self_induced");
 });
 
 test("Claude session api maps SDK transcripts to alasio session and rewind shapes", async () => {
@@ -800,6 +802,7 @@ function turnParams(persistence: TurnPersistence, extra: Partial<TurnParams> = {
     chatId: "1",
     messageId: "1",
     workingDirectory: "/work",
+    modelChoice: null,
     persistence,
     ...extra,
   };
@@ -847,7 +850,6 @@ test("background work keeps running after the answer and its report is delivered
 test("later prompts on the same session reuse the live process; a new session or model replaces it", async () => {
   const persistence = createPersistence();
   let model: ModelChoice | null = null;
-  persistence.getModelChoice = () => model;
   const activeTurns = makeActiveTurns();
   const cli = createFakeCli();
   const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
@@ -857,7 +859,7 @@ test("later prompts on the same session reuse the live process; a new session or
     return received;
   };
   const run = async (prompt: string, extra: Partial<TurnParams> = {}) => {
-    const turn = runTurn(liveSessions, turnParams(persistence, { prompt, ...extra }));
+    const turn = runTurn(liveSessions, turnParams(persistence, { prompt, modelChoice: model, ...extra }));
     await answer();
     return await turn;
   };
