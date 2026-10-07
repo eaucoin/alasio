@@ -1,25 +1,29 @@
 /**
  * The analytics lake (neon/lake/src/model.ts): every transcript entry and rollout line,
- * loaded from alasio's database into DuckLake, as role `lake`, which alasio makes; its
+ * loaded from alasio's database into DuckLake, as role `lake`, which alasio makes, and
+ * alasio's telemetry, which the stack's collector sends its intake (./collector.ts); its
  * catalog in Neon and its Parquet files in the object store.
  */
 import type { KubernetesObject, V1Deployment, V1Service } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
-import { componentName, NAMESPACE, neonName, restrictedContainer, s3Endpoint, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { componentName, lakeRuns, NAMESPACE, neonName, otelEnv, restrictedContainer, s3Endpoint, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+
+/** The port its telemetry intake takes OTLP over HTTP on. */
+export const LAKE_INTAKE_PORT = 4318;
 
 /** The lake's objects, when it runs, which is beside Neon. */
 export function lakeObjects(config: InstallConfig): KubernetesObject[] {
-  if (!config.lake.enabled || !config.neon.enabled) return [];
+  if (!lakeRuns(config)) return [];
   const name = componentName("lake");
   const service: V1Service = {
     apiVersion: "v1",
     kind: "Service",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels("lake") },
-    spec: { selector: selectorLabels("lake"), ports: [{ name: "metrics", port: 9464 }] },
+    spec: { selector: selectorLabels("lake"), ports: [{ name: "metrics", port: 9464 }, { name: "otlp-http", port: LAKE_INTAKE_PORT }] },
   };
-  // Live while its loads are not failing for long; ready once one has made the lake.
+  // Live while its loads are not failing for long; ready once its intake has the lake open.
   const probe = (path: string) => ({ httpGet: { path, port: "metrics" } });
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
@@ -44,10 +48,12 @@ export function lakeObjects(config: InstallConfig): KubernetesObject[] {
               { name: "LAKE_DATABASE_PORT", value: "55433" },
               { name: "LAKE_DATA_PATH", value: `s3://${config.objectStore.buckets.lake}/` },
               { name: "LAKE_S3_ENDPOINT", value: s3Endpoint(config) },
+              { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) },
               { name: "HOME", value: "/tmp" },
+              ...otelEnv(config),
             ],
             envFrom: [{ secretRef: { name } }],
-            ports: [{ name: "metrics", containerPort: 9464 }],
+            ports: [{ name: "metrics", containerPort: 9464 }, { name: "otlp-http", containerPort: LAKE_INTAKE_PORT }],
             readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },
             livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },

@@ -1,6 +1,7 @@
 /**
  * `alasio init`: asks for what alasio needs (its bot's token and who may use it, Claude
- * Code's token, whether agents work in this machine's folders, where telemetry goes),
+ * Code's token, whether agents work in this machine's folders, where telemetry goes
+ * beside the lake),
  * writes the config, makes the cluster on this machine when that is where alasio runs,
  * writes the Secrets there, and offers to start alasio.
  *
@@ -181,7 +182,7 @@ const flags = {
   telemetryEndpoint: Flag.String("telemetry-endpoint").pipe(
     Flag.optional,
     Flag.withMetavar("url"),
-    Flag.withDescription("Where alasio sends OpenTelemetry, an OTLP/HTTP endpoint; an empty one sends nothing"),
+    Flag.withDescription("Where alasio sends its telemetry beside its lake, an OTLP/HTTP endpoint; an empty one keeps it in the lake alone"),
   ),
   nonInteractive: Flag.Boolean("non-interactive").pipe(
     Flag.withDefault(false),
@@ -354,13 +355,13 @@ const chooseFolderAccess = Effect.fnUntraced(function*(given: Flags, ask: boolea
   return { uid: Number(user[1]), gid: Number(user[2]), home, folders } satisfies FolderAccess;
 });
 
-/** Where telemetry goes: an OTLP/HTTP endpoint, or empty for nowhere. */
+/** Where telemetry goes beside the lake: an OTLP/HTTP endpoint, or empty for nowhere else. */
 const chooseTelemetryEndpoint = Effect.fnUntraced(function*(given: Flags, ask: boolean, current: string) {
   const check = (value: string) => (Result.isSuccess(Schema.decodeUnknownResult(OptionalUrl)(value)) ? null : "must be an http(s) URL, or empty");
   const endpoint = yield* answer(
     given.telemetryEndpoint,
     ask,
-    () => Prompt.String({ message: "Where alasio sends OpenTelemetry, an OTLP/HTTP endpoint (empty for nowhere)", default: current, validate: validating(check) }),
+    () => Prompt.String({ message: "Where alasio sends its telemetry beside its lake, an OTLP/HTTP endpoint (empty for nowhere else)", default: current, validate: validating(check) }),
     () => Effect.succeed(current),
   );
   const refused = check(endpoint);
@@ -419,7 +420,7 @@ export const init = Command.make("init", flags, (given) =>
     Command.withShortDescription("Set alasio up: its bot, its tokens, and where it runs"),
     Command.withDescription(
       "Asks for the bot's token (checked with Telegram) and who may use it, Claude Code's token, whether agents may work in this " +
-        "machine's folders and as whom, and where telemetry goes; writes the config, which holds no secret; makes the cluster on " +
+        "machine's folders and as whom, and where telemetry goes beside the lake; writes the config, which holds no secret; makes the cluster on " +
         "this machine, k3s on the machine itself unless --target docker makes it in Docker, or --kubeconfig names another " +
         "cluster, once this machine is one it runs on, Linux on x86-64, doing what it must as root through sudo, as alasio up " +
         "does; writes the tokens there, as Secrets; and offers to start alasio. Run it " +

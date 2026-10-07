@@ -2,12 +2,10 @@
  * Neon, alasio's database: Postgres whose storage is safekeepers and a pageserver on
  * object storage, with a storage controller and its own Postgres, a storage broker, the
  * compute, neon-control (alasio's stand-in for Neon's control plane, neon/control/),
- * the setup that makes the stack's secrets, a daily backup, and a collector of the
- * stack's metrics.
+ * the setup that makes the stack's secrets, and a daily backup.
  */
 import type {
   KubernetesObject,
-  V1ConfigMap,
   V1Container,
   V1CronJob,
   V1Deployment,
@@ -26,10 +24,9 @@ import { computeId, MAIN } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   claimSpec,
-  componentName,
+  collectorRuns,
   databaseSecret,
   given,
-  goJson,
   helperResources,
   imagePullSecrets,
   NAMESPACE,
@@ -40,15 +37,13 @@ import {
   s3Endpoint,
   script,
   selectorLabels,
-  sha256,
   stackLabels,
   stackPodSpec,
   waitFor,
   waitForObjectStore,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME, VOLUME_DRIVER } from "./juicefs-csi.ts";
-import { VALKEY, VALKEY_PORT } from "./valkey.ts";
+import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`. */
@@ -499,7 +494,7 @@ function control(config: InstallConfig): KubernetesObject[] {
  * The compute: Postgres on alasio's timeline, one primary (never two on one timeline),
  * its own disk rebuilt from the safekeepers and pageserver on every start, its spec
  * fetched from neon-control. It serves compute_ctl's metrics too, which the collector
- * scrapes, and traces where alasio's telemetry goes, or nowhere.
+ * scrapes, and exports compute_ctl's traces to the collector, when it runs.
  */
 function compute(config: InstallConfig): KubernetesObject[] {
   const name = neonName("compute");
@@ -541,7 +536,7 @@ function compute(config: InstallConfig): KubernetesObject[] {
             ],
             env: [
               secretVariable(name, "NEON_CONTROL_PLANE_TOKEN"),
-              ...(config.telemetry.otlpEndpoint
+              ...(collectorRuns(config)
                 ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config)]
                 : [{ name: "OTEL_SDK_DISABLED", value: "true" }]),
             ],
@@ -656,146 +651,10 @@ function backup(config: InstallConfig): V1CronJob {
   };
 }
 
-/**
- * The stack's telemetry: every Neon service's, SeaweedFS's and the lake's Prometheus
- * metrics, and with workspace storage JuiceFS's and Valkey's, scraped and sent on as OTLP
- * where alasio's telemetry goes, when it goes anywhere. JuiceFS's are its driver's and
- * mount pods', found among the pods of the driver's namespace, which the collector may
- * list; Valkey's are read with its password. Its pod carries its configuration's
- * checksum, so it is replaced when that changes.
- */
-function collector(config: InstallConfig, endpoint: string): KubernetesObject[] {
-  const name = neonName("collector");
-  const component = "neon-collector";
-  const { telemetry, workspaceStorage } = config;
-  const safekeeper = neonName("safekeeper");
-  const targets: Record<string, string[]> = {
-    pageserver: [`${neonName("pageserver")}:9898`],
-    "storage-controller": [`${neonName("storage-controller")}:1234`],
-    "storage-broker": [`${neonName("storage-broker")}:50051`],
-    compute: [`${neonName("compute")}:3080`],
-    safekeeper: Array.from({ length: config.neon.safekeepers.replicas }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
-    ...(config.objectStore.bundled.enabled ? { seaweedfs: [`${componentName("seaweedfs")}:9327`] } : {}),
-    ...(config.lake.enabled ? { lake: [`${componentName("lake")}:9464`] } : {}),
-  };
-  // JuiceFS's pods of the name `name` in the driver's namespace: each running one at its
-  // address, on the port `port` they serve their metrics on, named by its pod. The
-  // collector reads `$` as the start of a variable, and `$$` as a `$`.
-  const juicefsJob = (job: string, name: string, port: number) => ({
-    job_name: job,
-    scrape_interval: "30s",
-    kubernetes_sd_configs: [{
-      role: "pod",
-      namespaces: { names: [workspaceStorage.csi.namespace] },
-      selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
-    }],
-    relabel_configs: [
-      { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
-      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${port}` },
-      { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
-    ],
-  });
-  // The mount pods, the clients, and the controller's and node service's, the driver.
-  const juicefs = [juicefsJob("juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob("juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)];
-  const collectorConfig = {
-    receivers: {
-      prometheus: {
-        config: {
-          scrape_configs: [
-            ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: "30s", static_configs: [{ targets: targets[job] }] })),
-            ...(workspaceStorage.enabled ? juicefs : []),
-          ],
-        },
-      },
-      ...(workspaceStorage.enabled
-        ? {
-          redis: {
-            endpoint: `${VALKEY}:${VALKEY_PORT}`,
-            password: "${env:VALKEY_PASSWORD}",
-            collection_interval: "30s",
-            // How near it is to refusing writes: used memory against this.
-            metrics: { "redis.maxmemory": { enabled: true } },
-          },
-        }
-        : {}),
-    },
-    processors: { resource: { attributes: [{ key: "service.namespace", value: "alasio-neon", action: "upsert" }] }, batch: {} },
-    exporters: { otlphttp: { endpoint, ...(telemetry.headersSecret ? { headers: "${file:/etc/otelcol/headers/headers.yaml}" } : {}) } },
-    service: {
-      telemetry: { metrics: { level: "none" } },
-      pipelines: {
-        metrics: { receivers: ["prometheus", ...(workspaceStorage.enabled ? ["redis"] : [])], processors: ["resource", "batch"], exporters: ["otlphttp"] },
-      },
-    },
-  };
-  const configMap: V1ConfigMap = {
-    apiVersion: "v1",
-    kind: "ConfigMap",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
-    data: { "config.yaml": goJson(collectorConfig, "  ") },
-  };
-  const deployment: V1Deployment = {
-    apiVersion: "apps/v1",
-    kind: "Deployment",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
-    spec: {
-      replicas: 1,
-      selector: { matchLabels: selectorLabels(component) },
-      template: {
-        metadata: { labels: stackLabels(component), annotations: { "checksum/config": sha256(goJson(collectorConfig)) } },
-        spec: {
-          ...(workspaceStorage.enabled ? { serviceAccountName: name } : {}),
-          ...stackPodSpec(config),
-          containers: [{
-            name: "collector",
-            image: imageReference(config.neon.collector.image),
-            imagePullPolicy: "IfNotPresent",
-            args: ["--config=/etc/otelcol/config.yaml"],
-            ...(workspaceStorage.enabled ? { env: [{ name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: VALKEY, key: "password" } } }] } : {}),
-            securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
-            resources: config.neon.collector.resources,
-            volumeMounts: [
-              { name: "config", mountPath: "/etc/otelcol", readOnly: true },
-              ...(telemetry.headersSecret ? [{ name: "headers", mountPath: "/etc/otelcol/headers", readOnly: true }] : []),
-            ],
-          }],
-          volumes: [
-            { name: "config", configMap: { name } },
-            // The exporter's headers: a YAML map, under the key headersKey + ".yaml" in the
-            // headers Secret, since the collector takes headers as a map.
-            ...(telemetry.headersSecret
-              ? [{ name: "headers", secret: { secretName: telemetry.headersSecret, items: [{ key: `${telemetry.headersKey}.yaml`, path: "headers.yaml" }] } }]
-              : []),
-          ],
-        },
-      },
-    },
-  };
-  if (!workspaceStorage.enabled) return [configMap, deployment];
-  // Who the collector is, and that it may find JuiceFS's pods in the driver's namespace.
-  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) } };
-  const metadata = { name, namespace: workspaceStorage.csi.namespace, labels: stackLabels(component) };
-  const role: V1Role = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "Role",
-    metadata,
-    rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }],
-  };
-  const binding: V1RoleBinding = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "RoleBinding",
-    metadata,
-    subjects: [{ kind: "ServiceAccount", name, namespace: NAMESPACE }],
-    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name },
-  };
-  return [serviceAccount, role, binding, configMap, deployment];
-}
-
 /** Neon's objects, when it runs. */
 export function neonObjects(config: InstallConfig): KubernetesObject[] {
   const { neon } = config;
   if (!neon.enabled) return [];
-  const collectorEndpoint = neon.collector.otlpEndpoint || config.telemetry.otlpEndpoint;
   return [
     ...setup(config),
     ...controllerDb(config),
@@ -806,6 +665,5 @@ export function neonObjects(config: InstallConfig): KubernetesObject[] {
     ...control(config),
     ...compute(config),
     ...(neon.backup.enabled ? [backup(config)] : []),
-    ...(neon.collector.enabled && collectorEndpoint ? collector(config, collectorEndpoint) : []),
   ];
 }

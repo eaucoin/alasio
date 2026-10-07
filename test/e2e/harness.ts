@@ -425,9 +425,9 @@ function installation(): Record<string, unknown> {
       controllerDb: { resources: { requests: { cpu: "10m", memory: "64Mi" } } },
       control: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },
       compute: { resources: { requests: { cpu: "50m", memory: "256Mi" } } },
-      collector: { resources: { requests: { cpu: "10m", memory: "64Mi" } } },
       ...on("server-0"),
     },
+    telemetry: { collector: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } },
     objectStore: {
       bundled: {
         storage: { size: "10Gi" },

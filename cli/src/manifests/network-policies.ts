@@ -1,11 +1,11 @@
 /**
- * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon and
- * workspace storage,
- * which need a cluster that enforces NetworkPolicy, as session filesystems do.
+ * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
+ * telemetry collector and workspace storage, which need a cluster that enforces
+ * NetworkPolicy, as session filesystems do.
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
-import { componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
+import { COLLECTOR_PORT, collectorRuns, componentName, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
@@ -101,7 +101,7 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
       policyTypes: ["Ingress"],
       ingress: [
         { from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
-        { from: [{ podSelector: { matchLabels: selectorLabels("neon-collector") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+        { from: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
       ],
     }),
     ...(config.objectStore.bundled.enabled
@@ -112,6 +112,25 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
       })]
       : []),
   ];
+}
+
+/**
+ * The telemetry collector takes OTLP from alasio and folder workspaces' bayma, beside the
+ * stack's own pods (neonPolicies), and from nothing else: sessions' telemetry reaches it
+ * through alasio's receiver alone.
+ */
+function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
+  return policy(componentName("collector"), NAMESPACE, "collector", {
+    podSelector: { matchLabels: selectorLabels("collector") },
+    policyTypes: ["Ingress"],
+    ingress: [{
+      from: [
+        { podSelector: { matchLabels: selectorLabels("alasio") } },
+        ...(host.enabled ? [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": host.namespace } } }] : []),
+      ],
+      ports: [{ protocol: "TCP", port: COLLECTOR_PORT }],
+    }],
+  });
 }
 
 /** The NetworkPolicies, unless they are turned off. */
@@ -142,6 +161,7 @@ export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
         : {}),
     }),
     ...(config.neon.enabled ? neonPolicies() : []),
+    ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
   ];
 }

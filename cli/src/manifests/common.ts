@@ -93,19 +93,31 @@ export function envOf(variables: Readonly<Record<string, string>>): V1EnvVar[] {
   return Object.keys(variables).sort().map((name) => ({ name, value: variables[name] ?? "" }));
 }
 
+/** Whether the lake runs: when it is on, beside Neon. */
+export function lakeRuns(config: InstallConfig): boolean {
+  return config.lake.enabled && config.neon.enabled;
+}
+
+/** Whether the stack's telemetry collector runs (./collector.ts): with the lake, or an endpoint to send to. */
+export function collectorRuns(config: InstallConfig): boolean {
+  return lakeRuns(config) || Boolean(config.telemetry.otlpEndpoint);
+}
+
+/** The port the collector takes OTLP over HTTP on. */
+export const COLLECTOR_PORT = 4318;
+
 /**
  * OpenTelemetry's standard variables, which alasio, the lake and Neon's compute export
- * with: none when no endpoint is set.
+ * with: to the collector, by a name that resolves from any namespace, as alasio passes
+ * them on to its harnesses and folder workspaces' bayma; none when it does not run.
  */
-export function otelEnv({ telemetry }: InstallConfig): V1EnvVar[] {
-  if (!telemetry.otlpEndpoint) return [];
+export function otelEnv(config: InstallConfig): V1EnvVar[] {
+  if (!collectorRuns(config)) return [];
+  const { resourceAttributes } = config.telemetry;
   return [
-    { name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: telemetry.otlpEndpoint },
-    { name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: telemetry.otlpProtocol },
-    ...(telemetry.headersSecret
-      ? [{ name: "OTEL_EXPORTER_OTLP_HEADERS", valueFrom: { secretKeyRef: { name: telemetry.headersSecret, key: telemetry.headersKey } } }]
-      : []),
-    ...(telemetry.resourceAttributes ? [{ name: "OTEL_RESOURCE_ATTRIBUTES", value: telemetry.resourceAttributes }] : []),
+    { name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: `http://${componentName("collector")}.${NAMESPACE}.svc:${COLLECTOR_PORT}` },
+    { name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf" },
+    ...(resourceAttributes ? [{ name: "OTEL_RESOURCE_ATTRIBUTES", value: resourceAttributes }] : []),
   ];
 }
 

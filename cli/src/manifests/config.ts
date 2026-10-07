@@ -121,16 +121,35 @@ const Alasio = Schema.Struct({
   affinity: Affinity,
 });
 
+/**
+ * alasio's telemetry: everything (alasio's, its harnesses', bayma's, the lake's and the
+ * stack's) goes through the stack's collector to the lake, and to otlpEndpoint too when
+ * one is set.
+ */
 const Telemetry = Schema.Struct({
-  /** Where alasio, its harnesses, bayma, the lake and Neon's collector export to; empty exports nothing. */
+  /** Where the collector also sends all it receives; empty sends it to the lake alone. */
   otlpEndpoint: defaulted(OptionalUrl, ""),
   otlpProtocol: defaulted(Schema.Literals(["http/protobuf", "http/json", "grpc"]), "http/protobuf"),
-  /** A Secret whose `headersKey` holds OTEL_EXPORTER_OTLP_HEADERS. */
+  /** A Secret whose `headersKey` holds the headers otlpEndpoint is sent, in OTEL_EXPORTER_OTLP_HEADERS's form. */
   headersSecret: defaulted(OptionalSecretName, ""),
   headersKey: defaulted(NonEmpty, "headers"),
   resourceAttributes: defaulted(Schema.String, ""),
   /** The port alasio receives session sandboxes' telemetry on. */
   receiverPort: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65535 }, { message: "must be a port from 1024 to 65535" })), 4318),
+  /** How many days of telemetry the lake keeps. */
+  retentionDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 30),
+  /** The stack's collector, through which all of it goes. */
+  collector: defaulted(
+    Schema.Struct({
+      image: Image({
+        repository: "otel/opentelemetry-collector-contrib",
+        tag: "0.161.0",
+        digest: "sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
+      }),
+      resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
+    }),
+    {},
+  ),
 });
 
 const Sessions = Schema.Struct({
@@ -241,21 +260,6 @@ const Neon = Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       schedule: defaulted(Schema.String.check(Schema.isMinLength(9, { message: "must be a cron schedule" })), "17 3 * * *"),
       keep: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 14),
-    }),
-    {},
-  ),
-  /** The stack's own metrics, scraped and sent where telemetry goes. */
-  collector: defaulted(
-    Schema.Struct({
-      enabled: defaulted(Schema.Boolean, true),
-      image: Image({
-        repository: "otel/opentelemetry-collector-contrib",
-        tag: "0.161.0",
-        digest: "sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
-      }),
-      /** Where the collector sends to, when not telemetry.otlpEndpoint. */
-      otlpEndpoint: defaulted(OptionalUrl, ""),
-      resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
     }),
     {},
   ),

@@ -402,7 +402,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const several = await alasio(["logs", "neon-safekeeper", "--since", "10m"]);
   succeeded(several);
   assert.deepEqual(several.stdout.split("\n").filter(Boolean).sort(), ["[alasio-neon-safekeeper-0] zero", "[alasio-neon-safekeeper-1] one"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, lake, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, lake, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
