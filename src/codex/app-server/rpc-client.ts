@@ -105,8 +105,9 @@ export interface AppServerRpc {
   /** Stops the app-server running, if one is. */
   readonly stop: Effect.Effect<void>;
   /**
-   * What fails once the app-server running now is gone, with why; it waits forever
-   * when none is running.
+   * What fails once the app-server started last is gone, with why, at once where it is
+   * gone already (a turn that asks only once it has crashed learns it did); it waits
+   * forever when none was started, or it was stopped.
    */
   readonly whenGone: Effect.Effect<Effect.Effect<never, AppServerGone>>;
 }
@@ -248,7 +249,7 @@ export const makeAppServerRpc = Effect.fnUntraced(function*({ spawn, onNotificat
 
     stop,
 
-    whenGone: Effect.map(ScopedRef.get(current), (connection) => Option.match(running(connection), {
+    whenGone: Effect.map(ScopedRef.get(current), (connection) => Option.match(connection, {
       onNone: () => Effect.never,
       onSome: ({ gone }) => Deferred.await(gone),
     })),
