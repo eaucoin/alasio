@@ -399,7 +399,7 @@ test("status of a stopped cluster here says that up starts it", async (t) => {
   assert.deepEqual(run.printed, ["cluster dev, in Docker 29.0.0:", "  dev-server-0: exited"]);
 });
 
-test("logs prints a component's log, each line with its pod's name when it has several", async (t) => {
+test("logs prints a component's log, each line with its pod's name when it has several pods, and its container's when several containers", async (t) => {
   const { alasio, kube } = await installed(t);
   kube.logs.set("alasio-0", "started\nlistening\n");
   const own = await alasio(["logs"]);
@@ -414,6 +414,12 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const several = await alasio(["logs", "neon-safekeeper", "--since", "10m"]);
   succeeded(several);
   assert.deepEqual(several.stdout.split("\n").filter(Boolean).sort(), ["[alasio-neon-safekeeper-0] zero", "[alasio-neon-safekeeper-1] one"]);
+  // The lake's pod's containers, each line said with its container's name.
+  kube.logs.set("alasio-lake-0/lake", "loaded\n");
+  kube.logs.set("alasio-lake-0/query", "taking queries\n");
+  const lake = await alasio(["logs", "lake"]);
+  succeeded(lake);
+  assert.deepEqual(lake.stdout.split("\n").filter(Boolean).sort(), ["[lake] loaded", "[query] taking queries"]);
   assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, grafana, lake, /u);
 });
 

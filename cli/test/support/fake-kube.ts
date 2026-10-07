@@ -99,7 +99,7 @@ export interface FakeKube {
   /** Names of workloads whose pods never run, and of volumes whose data cannot be deleted; and of Jobs that fail. */
   readonly stuck: Set<string>;
   readonly failing: Set<string>;
-  /** What a pod logs, by its name. */
+  /** What a pod logs, by its name, or a container of it, by `<pod>/<container>`. */
   readonly logs: Map<string, string>;
   readonly execs: KubeExec[];
   /** How the test answers a command run in a container; exit 0, saying nothing, unless it says. */
@@ -340,7 +340,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     if (!target) return refuse(response, 404, `the server could not find the requested resource (${url.pathname})`);
     const path = url.pathname;
     if (method === "GET" && target.sub === "log") {
-      const text = logs.get(target.name ?? "");
+      const text = logs.get(`${target.name}/${url.searchParams.get("container")}`) ?? logs.get(target.name ?? "");
       if (text === undefined) return refuse(response, 404, `pods "${target.name}" not found`);
       response.writeHead(200, { "Content-Type": "text/plain" });
       return void response.end(text);

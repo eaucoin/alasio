@@ -23,17 +23,22 @@ export const logs = Command.make(
         const stdio = yield* Stdio.Stdio;
         const found = yield* component(name);
         const pods = yield* podsOf(found);
-        const container = found.workload.spec?.template?.spec?.containers?.[0]?.name ?? name;
+        const containers = (found.workload.spec?.template?.spec?.containers ?? [{ name }]).map((container) => container.name);
         const sinceSeconds = Option.map(since, (duration) => Math.ceil(Duration.toSeconds(duration)));
-        // A component of several pods (the safekeepers, say) has each line said with its pod's name.
-        const prefixed = pods.length > 1;
-        const streams = pods.map((pod) => {
+        // A component of several pods (the safekeepers, say) has each line said with its pod's
+        // name, and one of several containers (the lake and its query endpoint) with its container's.
+        const said = (podName: string, container: string) =>
+          [...(pods.length > 1 ? [podName] : []), ...(containers.length > 1 ? [container] : [])].join("/");
+        const streams = pods.flatMap((pod) => {
           const podName = pod.metadata?.name ?? "";
-          return kube.logs(NAMESPACE, podName, { container, follow, sinceSeconds: Option.getOrUndefined(sinceSeconds) }).pipe(
-            Stream.decodeText(),
-            Stream.splitLines,
-            Stream.map((line) => `${prefixed ? `[${podName}] ` : ""}${line}\n`),
-          );
+          return containers.map((container) => {
+            const prefix = said(podName, container);
+            return kube.logs(NAMESPACE, podName, { container, follow, sinceSeconds: Option.getOrUndefined(sinceSeconds) }).pipe(
+              Stream.decodeText(),
+              Stream.splitLines,
+              Stream.map((line) => `${prefix ? `[${prefix}] ` : ""}${line}\n`),
+            );
+          });
         });
         yield* Stream.mergeAll(streams, { concurrency: "unbounded" }).pipe(Stream.run(stdio.stdout()));
       })
@@ -41,7 +46,9 @@ export const logs = Command.make(
 ).pipe(
   Command.withShortDescription("Show what alasio, or one of its components, logs"),
   Command.withDescription(
-    "Shows what alasio's pod logs, or a component's pods: each line of a component of several pods begins with its pod's name. " +
+    "Shows what alasio's pod logs, or a component's pods, each of their containers: each line of a component of several pods " +
+      "begins with its pod's name, and of several containers, as the lake's pod has its query endpoint beside it, with its " +
+      "container's. " +
       "With --follow it keeps following until interrupted; with --since, only what was logged since then.",
   ),
 );
