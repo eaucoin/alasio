@@ -40,12 +40,28 @@ export async function syncLake(db: DuckDBConnection, options: LakeSyncOptions = 
 }
 
 /**
- * Keeps the lake's files in order: merges the small files loads write, expires old
- * snapshots, and deletes the files nothing refers to any longer (DuckLake's
- * CHECKPOINT does each in turn). Records when, so a restart does not repeat it.
+ * DuckLake's maintenance, in the order its CHECKPOINT takes it: what is inlined in the
+ * catalog moved to files, snapshots past their retention expired, small files merged,
+ * files mostly deleted rewritten, and then the files nothing refers to any longer
+ * deleted: those expiry and the merges left (cleanup), and those no snapshot ever
+ * recorded (orphans), which are the two steps that delete. Each is a call of its own,
+ * so a lake whose files others still use (a branch's) can be kept without them.
+ */
+export const MAINTENANCE = [
+  "ducklake_flush_inlined_data",
+  "ducklake_expire_snapshots",
+  "ducklake_merge_adjacent_files",
+  "ducklake_rewrite_data_files",
+  "ducklake_cleanup_old_files",
+  "ducklake_delete_orphaned_files",
+] as const;
+
+/**
+ * Keeps the lake's files in order: DuckLake's maintenance (MAINTENANCE), each step on
+ * its own. Records when, so a restart does not repeat it.
  */
 export async function maintainLake(db: DuckDBConnection): Promise<void> {
-  await db.run(`checkpoint ${LAKE}`);
+  for (const step of MAINTENANCE) await db.run(`call ${step}('${LAKE}')`);
   await transaction(db, async () => {
     await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);
     await db.run(`insert into ${LAKE}.loader.meta values ('maintained_at', ${literal(new Date().toISOString())})`);
