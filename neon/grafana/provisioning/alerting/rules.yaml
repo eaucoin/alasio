@@ -1,6 +1,8 @@
 # alasio's alert rules, evaluated every minute on the lake through its query endpoint,
 # each alerting through the Telegram bot (policies.yaml). A rule whose query fails, the
-# lake's endpoint being down, alerts as a data source error.
+# lake's endpoint being down, alerts as a data source error. They count main's turns and
+# telemetry alone: a branch environment's (tagged alasio.branch) show on the Agents
+# dashboard, and page no one.
 apiVersion: 1
 groups:
   - orgId: 1
@@ -76,7 +78,7 @@ groups:
                 data: |
                   select SpanAttributes['alasio.conversation.id'] as conversation, count(*) as failed
                   from otel.traces
-                  where SpanName = 'alasio.turn' and ServiceName = 'alasio'
+                  where SpanName = 'alasio.turn' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
                     and (StatusCode = 'Error' or SpanAttributes['alasio.turn.outcome'] = 'failed')
                     and Timestamp > now()::timestamp - interval 10 minute
                   group by 1
@@ -119,7 +121,7 @@ groups:
                 data: |
                   select count(*) as points
                   from otel.metrics_gauge
-                  where TimeUnix > now()::timestamp - interval 5 minute
+                  where ResourceAttributes['alasio.branch'] is null and TimeUnix > now()::timestamp - interval 5 minute
               root_selector: ""
               columns:
                 - {selector: points, text: points, type: number}

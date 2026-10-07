@@ -970,6 +970,51 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the alert rules count main's failed turns and telemetry alone, not a branch environment's", async () => {
+    const resource = (branch: string | null) => ({ attributes: [{ key: "service.name", value: { stringValue: "alasio" } }, ...(branch ? [{ key: "alasio.branch", value: { stringValue: branch } }] : [])] });
+    const failed = (conversation: string, branch: string | null) => ({
+      resource: resource(branch),
+      scopeSpans: [{
+        spans: [{
+          traceId: createHash("md5").update(conversation).digest("hex"),
+          spanId: "00f067aa0ba902b7",
+          name: "alasio.turn",
+          startTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
+          endTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
+          attributes: [{ key: "alasio.conversation.id", value: { stringValue: conversation } }, { key: "alasio.turn.outcome", value: { stringValue: "failed" } }],
+        }],
+      }],
+    });
+    const gauge = (branch: string | null) => ({
+      resource: resource(branch),
+      scopeMetrics: [{ metrics: [{ name: "alasio.alive", gauge: { dataPoints: [{ timeUnixNano: String(BigInt(Date.now()) * 1_000_000n), asDouble: 1 }] } }] }],
+    });
+    // Each rule's query, by its title.
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const rule = (title: string) => {
+      const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf(`title: ${title}`))) ?? [];
+      return block.replaceAll(`\n${indent}  `, "\n").trim();
+    };
+    await withLake((db) => ensureOtel(db));
+    const reader = await openReader(readerConfig);
+    const points = async () => (await answer(reader.db, rule("Telemetry is absent")))[0]?.["points"];
+    try {
+      const before = await points();
+      await withLake(async (db) => {
+        await writeTelemetry(db, telemetryRows("traces", { resourceSpans: [failed("telegram:main-failed", null), failed("telegram:branch-failed", "try")] }));
+        await writeTelemetry(db, telemetryRows("metrics", { resourceMetrics: [gauge("try")] }));
+        await flushTelemetry(db);
+      });
+      const failing = (await answer(reader.db, rule("Turns are failing"))).map((row) => row["conversation"]);
+      assert.ok(failing.includes("telegram:main-failed"), JSON.stringify(failing));
+      assert.ok(!failing.includes("telegram:branch-failed"), JSON.stringify(failing));
+      // A branch's telemetry arriving does not hide main's being absent.
+      assert.equal(await points(), before);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the query endpoint answers 503 while it cannot open the lake", async () => {
     const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
     const server = createServer(endpoint.handle);
