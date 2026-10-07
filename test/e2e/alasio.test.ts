@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { V1Pod } from "@kubernetes/client-node";
+import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
 
 import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
@@ -261,6 +261,31 @@ if (inShard("sessions")) {
       await tg.say("/workspace");
       const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
       assert.match(panel.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+    });
+
+    test("alasio's pod, deleted, is rescheduled on no volume, and its conversation goes on: its mount, the buttons it had sent, and its session", async () => {
+      const volumes = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.volumes ?? [];
+      assert.deepEqual(volumes.filter((volume) => volume.persistentVolumeClaim), []);
+      await tg.say("/workspace");
+      const panel = await tg.waitFor((call) => /Folder: sessionfs:/u.test(call.payload.text ?? ""));
+      const refresh = tg.buttons(panel).find((button) => button.text === "Refresh");
+      assert.ok(refresh && "callback_data" in refresh, "the panel has a Refresh button");
+
+      const before = await kube.runningPod(NAMESPACE, RELEASE);
+      await kube.remove(ref("Pod", before, NAMESPACE));
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000);
+      assert.notEqual(await kube.runningPod(NAMESPACE, RELEASE), before);
+
+      // A button sent by the pod that is gone acts in the one that replaced it.
+      await tg.press(refresh.callback_data);
+      const refreshed = await tg.waitFor((call) => call.method === "editMessageText" && /Folder: sessionfs:/u.test(call.payload.text ?? ""));
+      assert.match(refreshed.payload.text ?? "", new RegExp(`sessionfs:${full}`, "u"));
+
+      // The next message goes on in the session the conversation had, which the new pod's
+      // Codex, not having run it, is asked to resume.
+      await tg.say("again");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
     });
   });
 }

@@ -181,14 +181,29 @@ describe("alasio", () => {
     assert.equal(deployment.spec?.strategy?.type, "Recreate");
   });
 
-  test("drives Kubernetes from the rendered templates, with its state on its own volume", () => {
-    const deployment = one<V1Deployment>(install(), "Deployment", "alasio");
+  test("drives Kubernetes from the rendered templates, and keeps no volume: its state is in Neon, its home and what it writes on emptyDirs", () => {
+    const objects = install();
+    const deployment = one<V1Deployment>(objects, "Deployment", "alasio");
     const env = container(deployment).env;
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_KUBE_TEMPLATES"), { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" });
     assert.deepEqual(env?.find(({ name }) => name === "ALASIO_STATE_DIR"), { name: "ALASIO_STATE_DIR", value: "/var/lib/alasio/state" });
     assert.deepEqual(env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/var/lib/alasio/home" });
-    assert.deepEqual(deployment.spec?.template.spec?.volumes?.find(({ name }) => name === "state"), { name: "state", persistentVolumeClaim: { claimName: "alasio" } });
-    assert.equal(deployment.spec?.template.spec?.securityContext?.runAsNonRoot, true);
+    const spec = deployment.spec?.template.spec;
+    assert.deepEqual(spec?.volumes?.filter((volume) => volume.persistentVolumeClaim), []);
+    assert.equal(spec?.initContainers, undefined);
+    assert.deepEqual(container(deployment).volumeMounts?.filter(({ name }) => name === "state" || name === "alasio-home"), [
+      { name: "state", mountPath: "/var/lib/alasio/state" },
+      { name: "alasio-home", mountPath: "/var/lib/alasio/home" },
+    ]);
+    assert.deepEqual(spec?.volumes?.filter(({ name }) => name === "state" || name === "alasio-home"), [{ name: "state", emptyDir: {} }, { name: "alasio-home", emptyDir: {} }]);
+    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-neon-control"]);
+    assert.equal(spec?.securityContext?.runAsNonRoot, true);
+  });
+
+  test("refuses the volume alasio no longer has", () => {
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, persistence: { size: "20Gi" } } });
+    assert.ok(Result.isFailure(decoded));
+    assert.match(decoded.failure.message, /persistence/u);
   });
 
   test("says every object is managed by alasio", () => {
@@ -196,13 +211,6 @@ describe("alasio", () => {
     for (const object of objects.filter(({ kind }) => kind !== "CustomResourceDefinition")) {
       assert.equal(object.metadata?.labels?.["app.kubernetes.io/managed-by"], "alasio", `${object.kind} ${object.metadata?.name}`);
     }
-  });
-
-  test("uses an existing claim instead of making one", () => {
-    const objects = install({ alasio: { persistence: { existingClaim: "mine" } } });
-    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-neon-control"]);
-    const volumes = one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.spec?.volumes;
-    assert.deepEqual(volumes?.find(({ name }) => name === "state"), { name: "state", persistentVolumeClaim: { claimName: "mine" } });
   });
 
   test("gives Claude Code its token from a Secret only when one is named", () => {
@@ -225,6 +233,7 @@ describe("alasio", () => {
     assert.deepEqual(spec?.containers[0]?.env?.find(({ name }) => name === "HOME"), { name: "HOME", value: "/home/op" });
     assert.deepEqual(spec?.containers[0]?.volumeMounts?.find(({ name }) => name === "home"), { name: "home", mountPath: "/home" });
     assert.deepEqual(spec?.volumes?.find(({ name }) => name === "home"), { name: "home", hostPath: { path: "/home" } });
+    assert.equal(spec?.volumes?.find(({ name }) => name === "alasio-home"), undefined);
   });
 
   test("renders sessions under gVisor with the egress gate, and no host profile by default", () => {

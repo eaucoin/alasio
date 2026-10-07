@@ -1,5 +1,5 @@
 /**
- * alasio itself: its Deployment and volume, its telemetry receiver's Service, the
+ * alasio itself: its Deployment, its telemetry receiver's Service, the
  * namespaces its workspaces run in, its identity in them, and the templates it makes
  * its workspaces' Sandboxes from (src/kube/config.ts).
  */
@@ -10,7 +10,6 @@ import type {
   V1EnvVar,
   V1Namespace,
   V1ObjectMeta,
-  V1PersistentVolumeClaim,
   V1Role,
   V1RoleBinding,
   V1Service,
@@ -223,13 +222,16 @@ function alasioEnv(config: InstallConfig, home: string): V1EnvVar[] {
 }
 
 /**
- * alasio's Deployment: one replica, as one Telegram poller and one SQLite writer, so an
- * update stops the old pod before the new one starts. Under the host profile it runs as
- * the operator, in their home, with the machine's mounts.
+ * alasio's Deployment: one replica, as Telegram's updates have one poller, so an update
+ * stops the old pod before the new one starts. It keeps no volume: its state is in Neon,
+ * and what it writes to disk (received files written for the agent, its home unless it
+ * is the operator's) is written again as needed, on emptyDirs. Under the
+ * host profile it runs as the operator, in their home, with the machine's mounts.
  */
 function deployment(config: InstallConfig, templatesChecksum: string): V1Deployment {
   const { alasio, host } = config;
-  const home = host.enabled && host.alasioHome ? host.home : "/var/lib/alasio/home";
+  const operatorHome = host.enabled && host.alasioHome;
+  const home = operatorHome ? host.home : "/var/lib/alasio/home";
   const uid = host.enabled ? host.uid : alasio.runAsUser;
   const gid = host.enabled ? host.gid : alasio.runAsGroup;
   const groups = [...new Set([...alasio.supplementalGroups, ...(host.enabled ? host.supplementalGroups : [])])];
@@ -250,18 +252,6 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
           terminationGracePeriodSeconds: 60,
           securityContext: { ...restrictedPod(uid, gid), ...given("supplementalGroups", groups) },
           ...imagePullSecrets(config),
-          initContainers: [
-            // alasio's state directory and, unless it is the operator's, its home, on its volume.
-            {
-              name: "prepare",
-              image,
-              imagePullPolicy: config.images.pullPolicy,
-              command: ["mkdir", "-p", "/var/lib/alasio/state", "/var/lib/alasio/home"],
-              securityContext: restrictedContainer(),
-              ...helperResources(),
-              volumeMounts: [{ name: "state", mountPath: "/var/lib/alasio" }],
-            },
-          ],
           containers: [{
             name: "alasio",
             image,
@@ -273,14 +263,16 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
-              { name: "state", mountPath: "/var/lib/alasio" },
+              { name: "state", mountPath: "/var/lib/alasio/state" },
+              ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
               { name: "templates", mountPath: "/etc/alasio", readOnly: true },
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
               ...(host.enabled ? hostVolumeMounts(config) : []),
             ],
           }],
           volumes: [
-            { name: "state", persistentVolumeClaim: { claimName: alasio.persistence.existingClaim || RELEASE } },
+            { name: "state", emptyDir: {} },
+            ...(operatorHome ? [] : [{ name: "alasio-home", emptyDir: {} }]),
             { name: "templates", configMap: { name: componentName("sandbox-templates") } },
             {
               name: "database",
@@ -295,22 +287,6 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
       },
     },
   };
-}
-
-/** alasio's volume, unless the configuration names an existing claim. */
-function volume(config: InstallConfig): V1PersistentVolumeClaim[] {
-  const { persistence } = config.alasio;
-  if (persistence.existingClaim) return [];
-  return [{
-    apiVersion: "v1",
-    kind: "PersistentVolumeClaim",
-    metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") },
-    spec: {
-      accessModes: ["ReadWriteOnce"],
-      ...(persistence.storageClassName ? { storageClassName: persistence.storageClassName } : {}),
-      resources: { requests: { storage: persistence.size } },
-    },
-  }];
 }
 
 /** Where session sandboxes export their telemetry: alasio's receiver. */
@@ -459,7 +435,6 @@ export function alasioObjects(config: InstallConfig): KubernetesObject[] {
     ...namespaces(config),
     ...identity(config),
     templates.configMap,
-    ...volume(config),
     deployment(config, templates.checksum),
     telemetryService(config),
   ];

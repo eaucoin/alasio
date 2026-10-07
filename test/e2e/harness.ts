@@ -423,7 +423,6 @@ function installation(): Record<string, unknown> {
     images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
-      persistence: { size: "2Gi" },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
     },

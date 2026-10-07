@@ -205,7 +205,6 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "CustomResourceDefinition sandboxes.agents.x-k8s.io",
     "Namespace alasio",
     "Namespace alasio-sessions",
-    "PersistentVolumeClaim alasio",
     "PersistentVolumeClaim alasio-neon-control",
   ]);
   await run(removeInstallation({ purge: true }, WAIT));

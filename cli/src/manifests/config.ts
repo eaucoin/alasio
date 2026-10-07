@@ -104,11 +104,6 @@ const Alasio = Schema.Struct({
   defaultHarness: defaulted(Schema.Literals(["", "claude", "codex"]), ""),
   /** Claude Code's login: a Secret whose `key` holds a token from `claude setup-token`; none finds it in alasio's home. */
   claude: defaulted(Schema.Struct({ existingSecret: defaulted(OptionalSecretName, ""), key: defaulted(NonEmpty, "token") }), {}),
-  /** alasio's home and state: a volume of its own, or an existing claim. */
-  persistence: defaulted(
-    Schema.Struct({ size: defaulted(Size, "20Gi"), storageClassName: defaulted(Schema.String, ""), existingClaim: defaulted(Schema.String, "") }),
-    {},
-  ),
   env: Env,
   envFrom: defaulted(Schema.Array(object<V1EnvFromSource>()), []),
   resources: Resources({ requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "8Gi" } }),

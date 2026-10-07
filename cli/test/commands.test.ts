@@ -474,7 +474,7 @@ test("uninstall asks first, and keeps alasio's data unless --purge", async (t) =
   assert.ok(kube.get(DEPLOYMENT));
   succeeded(await alasio(["uninstall"], [pressed("y")]));
   assert.equal(kube.get(DEPLOYMENT), undefined);
-  assert.ok(kube.get("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio"));
+  assert.ok(kube.get("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-neon-control"));
   assert.equal(secretValue(kube, "alasio-telegram", "token"), BOT_TOKEN);
   succeeded(await alasio(["uninstall", "--purge", "--yes"]));
   assert.equal(kube.get("/api/v1/namespaces/alasio"), undefined);
