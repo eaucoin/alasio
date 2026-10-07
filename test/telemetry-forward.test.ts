@@ -109,17 +109,11 @@ test("retries stop at the signal's timeout", async () => {
   }
 });
 
-test("a signal alasio exports over gRPC, or not at all, is not forwarded", async () => {
-  const warnings: string[] = [];
-  const forwarder = createOtlpForwarder({
-    OTEL_EXPORTER_OTLP_ENDPOINT: base,
-    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: "grpc",
-    OTEL_METRICS_EXPORTER: "none",
-  }, { warn: (message) => warnings.push(message) });
+test("a signal alasio does not export is not forwarded", async () => {
+  const forwarder = createOtlpForwarder({ OTEL_EXPORTER_OTLP_ENDPOINT: base, OTEL_METRICS_EXPORTER: "none" });
   try {
-    assert.deepEqual(forwarder.protocols, { logs: "http/protobuf" });
-    assert.equal((await forwarder.export("traces", "protobuf", Buffer.from([1]))).ok, false);
-    assert.match(warnings.join("\n"), /traces relayed from session sandboxes are not exported: alasio exports traces over grpc/);
+    assert.deepEqual(forwarder.protocols, { traces: "http/protobuf", logs: "http/protobuf" });
+    assert.equal((await forwarder.export("metrics", "protobuf", Buffer.from([1]))).ok, false);
   } finally {
     forwarder.close();
   }

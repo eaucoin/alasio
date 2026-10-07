@@ -5,10 +5,8 @@
  * timeout, compression, and TLS files from the standard variables, as OpenTelemetry's
  * own exporters send alasio's, and is retried as they retry: on 429, 502, 503, and 504
  * and on a failed connection, after the server's Retry-After or a jittered backoff,
- * within the signal's timeout.
- *
- * A signal alasio exports over gRPC is not forwarded: what is relayed comes from bayma,
- * which exports over OTLP's HTTP protocols only.
+ * within the signal's timeout. alasio's deployment has it export to the stack's
+ * collector over OTLP/HTTP, which bayma exports over too.
  */
 import { readFileSync } from "node:fs";
 import { Agent as HttpAgent, type OutgoingHttpHeaders, request as httpRequest } from "node:http";
@@ -104,10 +102,6 @@ function signalTargets(env: Readonly<NodeJS.ProcessEnv>, warn: Warn): Partial<Re
   for (const signal of SIGNALS) {
     const exporter = telemetry[signal];
     if (!exporter) continue;
-    if (!exporter.protocol.startsWith("http/")) {
-      warn(`${signal} relayed from session sandboxes are not exported: alasio exports ${signal} over ${exporter.protocol}, and bayma exports over http/protobuf or http/json only`);
-      continue;
-    }
     const url = new URL(exporter.endpoint);
     const timeout = Number(signalSetting(env, signal, "TIMEOUT"));
     const https = url.protocol === "https:";
