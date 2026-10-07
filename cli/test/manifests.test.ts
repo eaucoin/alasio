@@ -702,6 +702,29 @@ describe("workspace storage", () => {
     }
   });
 
+  test("collects the file system daily, as a JuiceFS admin on the pinned client, kept as the driver is", () => {
+    const collection = one<V1CronJob>(install(), "CronJob", "alasio-juicefs-gc");
+    assert.equal(collection.metadata?.namespace, "alasio");
+    assert.equal(collection.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com");
+    assert.equal(collection.spec?.schedule, "17 4 * * *");
+    assert.equal(collection.spec?.concurrencyPolicy, "Forbid");
+    const pod = collection.spec?.jobTemplate.spec?.template;
+    assert.equal(pod?.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+    assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true);
+    const gc = pod?.spec?.containers[0];
+    assert.ok(gc);
+    assert.equal(gc.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
+    assert.deepEqual(gc.securityContext, { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } });
+    const metaUrl = "redis://:secret@alasio-valkey.alasio.svc.cluster.local:6379/1";
+    const { root, run, remove } = runScript(gc, { META_URL: metaUrl }, { juicefs: 'echo "$@" >> "$ROOT/calls"' });
+    try {
+      run();
+      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [`gc ${metaUrl} --delete`]);
+    } finally {
+      remove();
+    }
+  });
+
   test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the collector reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>

@@ -10,8 +10,8 @@
  * the claim, as deleting its Sandbox does, deletes the directory into the file system's
  * trash. The file system's credentials, the metadata engine's URL with Valkey's password
  * and the bucket's keys, are in a Secret the stack's setup makes (./neon.ts), which the
- * driver reads, and alasio's JuiceFS admin pods (the daily quota check here), never a
- * workspace.
+ * driver reads, and alasio's JuiceFS admin pods (the daily quota check and collection
+ * here), never a workspace.
  */
 import type { KubernetesObject, V1Container, V1CronJob, V1StorageClass } from "@kubernetes/client-node";
 
@@ -30,9 +30,10 @@ export const WORKSPACES_CREDENTIALS = componentName("workspaces-juicefs");
  */
 export const JUICEFS_ADMIN: Labels = { "alasio.dev/workload": "juicefs-admin" };
 
-/** The quota check runs daily, after the database's backup. */
+/** The quota check runs daily, after the database's backup, and the collection after it. */
 const QUOTA_CHECK_SCHEDULE = "47 3 * * *";
-/** Whom the quota check runs as: nobody, as it reaches Valkey alone and writes nothing of its own. */
+const COLLECTION_SCHEDULE = "17 4 * * *";
+/** Whom the quota check and the collection run as: nobody, as they write nothing of their own. */
 const NOBODY = 65534;
 
 /** Valkey's address, as the driver's pods reach it from their own namespace. */
@@ -68,20 +69,31 @@ function storageClass({ workspaceStorage }: InstallConfig): V1StorageClass {
 }
 
 /**
- * The volumes' usage checked daily against what they hold, and repaired (guide/quota.md
- * "Usage check and fix"): a client that ends unexpectedly loses the usage it had yet to
- * write, after which a volume's quota counts wrongly. Each volume, as `juicefs quota
- * list` tables it, is checked in turn. Kept, as the driver's objects are, while the
- * volumes remain.
+ * A container of a JuiceFS admin pod, `name`, running `lines` with JuiceFS's command line
+ * of the pinned client, the file system's metadata engine's URL in `META_URL`.
  */
-function quotaCheck(config: InstallConfig): V1CronJob {
-  const component = "juicefs-quota-check";
+function adminContainer(config: InstallConfig, name: string, ...lines: string[]): V1Container {
+  return {
+    name,
+    image: imageReference(config.workspaceStorage.csi.mountImage),
+    imagePullPolicy: "IfNotPresent",
+    command: ["/bin/sh", "-c", script("set -eu", ...lines)],
+    env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }],
+    resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+  };
+}
+
+/**
+ * A daily JuiceFS admin task, `component`, whose container `name` runs `lines` restricted
+ * as nobody. Kept, as the driver's objects are, while the volumes remain.
+ */
+function dailyAdminTask(config: InstallConfig, component: string, schedule: string, name: string, ...lines: string[]): V1CronJob {
   return {
     apiVersion: "batch/v1",
     kind: "CronJob",
     metadata: { name: componentName(component), namespace: NAMESPACE, labels: { ...labels(component), ...VOLUME_DRIVER } },
     spec: {
-      schedule: QUOTA_CHECK_SCHEDULE,
+      schedule,
       concurrencyPolicy: "Forbid",
       successfulJobsHistoryLimit: 1,
       failedJobsHistoryLimit: 3,
@@ -95,33 +107,45 @@ function quotaCheck(config: InstallConfig): V1CronJob {
               restartPolicy: "Never",
               ...imagePullSecrets(config),
               securityContext: restrictedPod(NOBODY, NOBODY),
-              containers: [{
-                name: "quota-check",
-                image: imageReference(config.workspaceStorage.csi.mountImage),
-                imagePullPolicy: "IfNotPresent",
-                command: [
-                  "/bin/sh",
-                  "-c",
-                  script(
-                    "set -eu",
-                    'quotas=$(juicefs quota list "$META_URL")',
-                    // The table's rows of volumes, the directories at the file system's top
-                    // (not those deleted into its trash), whose first column is their path.
-                    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/ ]+ +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
-                    '  juicefs quota check "$META_URL" --path "$path" --repair',
-                    "done",
-                  ),
-                ],
-                env: [{ name: "META_URL", valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key: "metaurl" } } }],
-                securityContext: restrictedContainer(),
-                resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } },
-              }],
+              containers: [{ ...adminContainer(config, name, ...lines), securityContext: restrictedContainer() }],
             },
           },
         },
       },
     },
   };
+}
+
+/**
+ * The volumes' usage checked daily against what they hold, and repaired (guide/quota.md
+ * "Usage check and fix"): a client that ends unexpectedly loses the usage it had yet to
+ * write, after which a volume's quota counts wrongly. Each volume, as `juicefs quota
+ * list` tables it, is checked in turn.
+ */
+function quotaCheck(config: InstallConfig): V1CronJob {
+  return dailyAdminTask(
+    config,
+    "juicefs-quota-check",
+    QUOTA_CHECK_SCHEDULE,
+    "quota-check",
+    'quotas=$(juicefs quota list "$META_URL")',
+    // The table's rows of volumes, the directories at the file system's top (not those
+    // deleted into its trash), whose first column is their path.
+    "printf '%s\\n' \"$quotas\" | awk -F '|' '$2 ~ /^ \\/[^\\/ ]+ +$/ { gsub(/ /, \"\", $2); print $2 }' | while read -r path; do",
+    '  juicefs quota check "$META_URL" --path "$path" --repair',
+    "done",
+  );
+}
+
+/**
+ * The file system collected daily (`juicefs gc --delete`, guide/gc.md): what no file
+ * holds deleted from the bucket, and the trees of clones that never finished removed, a
+ * day after they were begun. A clone builds its tree detached and attaches it only once
+ * it is whole, and its client removes it when the clone fails; nothing but this removes
+ * one whose client ended first.
+ */
+function collection(config: InstallConfig): V1CronJob {
+  return dailyAdminTask(config, "juicefs-gc", COLLECTION_SCHEDULE, "gc", 'juicefs gc "$META_URL" --delete');
 }
 
 /**
@@ -164,8 +188,8 @@ function formatter(config: InstallConfig): V1Container {
   };
 }
 
-/** Workspace storage's objects, when it is on: Valkey, the CSI driver, the StorageClass, and the quota check. */
+/** Workspace storage's objects, when it is on: Valkey, the CSI driver, the StorageClass, the quota check and the collection. */
 export function workspaceStorageObjects(config: InstallConfig): KubernetesObject[] {
   if (!config.workspaceStorage.enabled) return [];
-  return [...valkeyObjects(config, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config)];
+  return [...valkeyObjects(config, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config)];
 }
