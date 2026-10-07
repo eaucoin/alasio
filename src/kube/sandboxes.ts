@@ -95,6 +95,8 @@ export interface SandboxManifestOptions {
   readonly template: SandboxTemplate;
   readonly labels?: Readonly<Record<string, string>>;
   readonly annotations?: Readonly<Record<string, string>>;
+  /** Whether the Sandbox is made running, as it is unless told, or suspended, its volumes made and no pod started. */
+  readonly operatingMode?: SandboxOperatingMode;
   /** Adds what is the caller's own to the pod spec, whose bayma container is `bayma`, and returns the spec. */
   readonly configure?: (spec: V1PodSpec, bayma: V1Container) => V1PodSpec;
 }
@@ -174,7 +176,8 @@ export interface Sandboxes {
   /** The Sandbox's token, or null when it has none. */
   readonly token: (name: string) => Effect.Effect<string | null, KubeApiError>;
   readonly exists: (name: string) => Effect.Effect<boolean, KubeApiError>;
-  readonly suspend: (name: string) => Effect.Effect<void, KubeApiError>;
+  /** Suspends the Sandbox, once its pod has ended: nothing in it runs, and its volumes are kept. One that is gone is left so. */
+  readonly suspend: (name: string) => Effect.Effect<void, KubeApiError | SandboxNotReady | SandboxGone>;
   readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
 }
 
@@ -248,9 +251,9 @@ export function podTemplateHash(podTemplate: V1PodTemplateSpec): string {
 /**
  * The Sandbox for `name` from a profile's `template` (`{ podTemplate,
  * volumeClaimTemplates }`, as the installation gives it), with what every Sandbox
- * needs: its labels, Running, its Service, bayma given its token, and the hash of the
- * pod template it runs. `configure(podSpec, bayma)` adds what is the caller's own and
- * returns the spec. Pure, for tests.
+ * needs: its labels, its operating mode (Running unless told), its Service, bayma given
+ * its token, and the hash of the pod template it runs. `configure(podSpec, bayma)` adds
+ * what is the caller's own and returns the spec. Pure, for tests.
  */
 export function sandboxManifest({
   name,
@@ -258,6 +261,7 @@ export function sandboxManifest({
   template,
   labels = {},
   annotations = {},
+  operatingMode = "Running",
   configure = (spec) => spec,
 }: SandboxManifestOptions): Sandbox {
   const podTemplate: V1PodTemplateSpec = structuredClone(template.podTemplate ?? {});
@@ -283,7 +287,7 @@ export function sandboxManifest({
     kind: SANDBOX_KIND,
     metadata: { name, namespace, labels: allLabels, annotations: { ...annotations, [POD_TEMPLATE_ANNOTATION]: podTemplateHash(podTemplate) } },
     spec: {
-      operatingMode: "Running",
+      operatingMode,
       service: true,
       podTemplate,
       ...(template.volumeClaimTemplates?.length ? { volumeClaimTemplates: structuredClone(template.volumeClaimTemplates) } : {}),
@@ -534,11 +538,15 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     exists: (name) => read(name).pipe(Effect.map((sandbox) => sandbox !== null)),
 
     suspend: (name) =>
-      kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
-        Effect.andThen(Effect.logInfo(`suspended Sandbox ${namespace}/${name}`)),
-        Effect.catchIf(hasStatus(404), () => Effect.void),
-        withLogScope("sandboxes"),
-      ),
+      Effect.gen(function*() {
+        const suspending = yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
+          Effect.map(stored),
+          Effect.catchIf(hasStatus(404), () => Effect.succeed(null)),
+        );
+        if (!suspending) return;
+        yield* awaitCondition(suspending, "Suspended");
+        yield* Effect.logInfo(`suspended Sandbox ${namespace}/${name}`);
+      }).pipe(withLogScope("sandboxes")),
 
     remove: (name) =>
       Effect.sync(() => tokens.delete(name)).pipe(

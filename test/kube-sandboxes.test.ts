@@ -327,6 +327,7 @@ test("every Sandbox serves bayma with its token, from a Secret it owns", () => {
     secret: { secretName: "fs-abc123-bayma-token", defaultMode: 0o440 },
   });
   assert.equal(sandbox.spec.volumeClaimTemplates?.[0]?.metadata?.name, "data");
+  assert.equal(sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile(), operatingMode: "Suspended" }).spec.operatingMode, "Suspended");
   assert.throws(
     () => sandboxManifest({ name: "x", namespace: "n", template: { podTemplate: { spec: { containers: [{ name: "other" }] } } } }),
     /no container named "bayma"/,
@@ -396,6 +397,21 @@ test("ensure resumes a suspended Sandbox and gives one left without a token its 
     ["create", "Secret", undefined],
     ["patch", "Sandbox", { spec: { operatingMode: "Running" } }],
   ]);
+});
+
+test("suspend returns once the Sandbox's pod has ended, and leaves one that is gone as it is", async () => {
+  const kube = fakeKube();
+  const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" });
+    yield* sandboxes.ensure("fs-abc123", manifest);
+    assert.ok(kube.peek("Pod", "alasio-sessions", "fs-abc123"));
+    yield* sandboxes.suspend("fs-abc123");
+    assert.equal(kube.peek("Pod", "alasio-sessions", "fs-abc123"), null);
+    yield* sandboxes.suspend("fs-gone");
+  })).finally(controller.stop);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Suspended");
 });
 
 test("a Sandbox records the pod template it runs, the same for the same template however it is written", () => {
