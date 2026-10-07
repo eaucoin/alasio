@@ -47,6 +47,7 @@ export interface SecretNames {
   compute: string;
   database: string;
   lake: string;
+  grafana: string;
   valkey: string;
   workspaces: string;
 }
@@ -121,6 +122,7 @@ export function secretNames(prefix: string): SecretNames {
     compute: `${prefix}-neon-compute`,
     database: `${prefix}-database`,
     lake: `${prefix}-lake`,
+    grafana: `${prefix}-grafana`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
   };
@@ -182,6 +184,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       password: secrets.alasioPassword,
       "lake-password": secrets.lakePassword,
       "lake-reader-password": secrets.lakeReaderPassword,
+      "grafana-password": secrets.grafanaPassword,
     },
     // The lake service's, and its query endpoint's, which each read their own.
     [names.lake]: {
@@ -191,6 +194,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       LAKE_READER_PASSWORD: secrets.lakeReaderPassword,
       LAKE_READER_S3_KEY: s3("lakeReader").accessKey,
       LAKE_READER_S3_SECRET: s3("lakeReader").secretKey,
+      LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
+    },
+    [names.grafana]: {
+      GF_DATABASE_PASSWORD: secrets.grafanaPassword,
+      GF_SECURITY_ADMIN_PASSWORD: secrets.grafanaAdminPassword,
+      GF_SECURITY_SECRET_KEY: secrets.grafanaSecretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
     },
   };

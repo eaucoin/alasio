@@ -31,6 +31,10 @@ export interface StackSecrets {
   /** The lake's query endpoint's: its reader's role's, and the token its queries carry. */
   lakeReaderPassword: string;
   lakeQueryToken: string;
+  /** Grafana's: its role's, its admin's, and the key it encrypts what it keeps secret with. */
+  grafanaPassword: string;
+  grafanaAdminPassword: string;
+  grafanaSecretKey: string;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
@@ -114,6 +118,9 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     valkeyPassword: kept(stored.valkeyPassword, () => secret()),
     lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
     lakeQueryToken: kept(stored.lakeQueryToken, () => secret()),
+    grafanaPassword: kept(stored.grafanaPassword, () => secret()),
+    grafanaAdminPassword: kept(stored.grafanaAdminPassword, () => secret()),
+    grafanaSecretKey: kept(stored.grafanaSecretKey, () => secret()),
   };
   return { secrets, changed };
 }

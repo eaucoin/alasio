@@ -107,12 +107,16 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
 
-  // The lake's query endpoint reads as a reader, in the catalog and in the object store.
+  // The lake's query endpoint reads as a reader, in the catalog and in the object store, and Grafana queries it with its token.
   assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
   assert.equal(value(kube, names.lake, "LAKE_READER_S3_KEY"), root.s3.lakeReader.accessKey);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "lakeReader")?.actions, ["Read:lake", "List:lake"]);
   assert.equal(value(kube, names.database, "lake-reader-password"), root.lakeReaderPassword);
-  assert.equal(value(kube, names.lake, "LAKE_QUERY_TOKEN"), root.lakeQueryToken);
+  assert.equal(value(kube, names.grafana, "LAKE_QUERY_TOKEN"), value(kube, names.lake, "LAKE_QUERY_TOKEN"));
+  // alasio makes Grafana's role with the password Grafana connects with.
+  assert.equal(value(kube, names.grafana, "GF_DATABASE_PASSWORD"), value(kube, names.database, "grafana-password"));
+  assert.match(value(kube, names.grafana, "GF_SECURITY_ADMIN_PASSWORD"), /^[\w-]{32}$/u);
+  assert.equal(value(kube, names.grafana, "GF_SECURITY_SECRET_KEY"), root.grafanaSecretKey);
 
   // Workspace storage's JuiceFS reaches Valkey with its password, and its own bucket alone.
   assert.equal(value(kube, names.valkey, "password"), root.valkeyPassword);
@@ -170,6 +174,9 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     valkeyPassword: "v",
     lakeReaderPassword: "r",
     lakeQueryToken: "k",
+    grafanaPassword: "g",
+    grafanaAdminPassword: "a",
+    grafanaSecretKey: "s",
   };
 }
 

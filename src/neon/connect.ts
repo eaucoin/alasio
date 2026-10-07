@@ -4,8 +4,9 @@
  *
  * It makes the analytics lake's role and catalog database either way (./lake.ts), and
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it
- * revokes them. It makes the lake reader's role (./lake.ts) when the deployment gives
- * its password, as it does while the lake runs.
+ * revokes them. It makes the lake reader's role (./lake.ts) and Grafana's role and
+ * database (./grafana.ts) when the deployment gives their passwords, as it does while
+ * they run.
  */
 import { readFileSync } from "node:fs";
 
@@ -16,6 +17,7 @@ import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts"
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
+import { ensureGrafanaRole } from "./grafana.ts";
 import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 
 /** What Neon failed with, as the database or the driver said it. */
@@ -45,6 +47,8 @@ interface NeonAccess {
   readonly lake: boolean;
   /** The lake's reader's, given while the lake runs. */
   readonly lakeReaderPassword: Option.Option<Redacted.Redacted>;
+  /** Grafana's, given while Grafana runs. */
+  readonly grafanaPassword: Option.Option<Redacted.Redacted>;
 }
 
 /** alasio's stores in an open Neon, on the pool they share. */
@@ -101,13 +105,13 @@ const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pi
 
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
- * and rollout stores' schemas, the lake's role and reads, and the lake reader's
- * role when its password is given. A pool that cannot is ended: before the next
- * attempt when this one fails, and in the background when a stop ends the wait, which
- * does not wait for it.
+ * and rollout stores' schemas, the lake's role and reads, and the lake reader's and
+ * Grafana's roles when their passwords are given. A pool that cannot is ended: before
+ * the next attempt when this one fails, and in the background when a stop ends the
+ * wait, which does not wait for it.
  */
 const openNeon = Effect.fnUntraced(function*(
-  { databaseUrl, lakePassword, lake, lakeReaderPassword }: NeonAccess,
+  { databaseUrl, lakePassword, lake, lakeReaderPassword, grafanaPassword }: NeonAccess,
   onIdleError: (error: Error) => void,
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
   const pool = new pg.Pool({
@@ -127,6 +131,7 @@ const openNeon = Effect.fnUntraced(function*(
     await ensureLakeRole(pool, Redacted.value(lakePassword));
     await syncLakeReads(pool, lake);
     if (Option.isSome(lakeReaderPassword)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderPassword.value));
+    if (Option.isSome(grafanaPassword)) await ensureGrafanaRole(pool, Redacted.value(databaseUrl), Redacted.value(grafanaPassword.value));
   }).pipe(
     Effect.tapError(() => endPool(pool)),
     Effect.onInterrupt(() => Effect.forkDetach(endPool(pool))),
@@ -147,8 +152,8 @@ const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.d
 
 /**
  * Connects to the Neon the deployment provides, from `ALASIO_DATABASE_URL` and
- * `ALASIO_LAKE_PASSWORD`, and `ALASIO_LAKE_READER_PASSWORD` if given, or their `_FILE`
- * forms, until the scope closes. The stack starts
+ * `ALASIO_LAKE_PASSWORD`, and `ALASIO_LAKE_READER_PASSWORD` and `ALASIO_GRAFANA_PASSWORD`
+ * if given, or their `_FILE` forms, until the scope closes. The stack starts
  * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
  * answer; a stop meanwhile stops the wait.
  */
@@ -157,12 +162,13 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect
   const lakePassword = yield* deploymentSecret("ALASIO_LAKE_PASSWORD");
   const lake = yield* lakeEnabled;
   const lakeReaderPassword = yield* givenSecret("ALASIO_LAKE_READER_PASSWORD");
+  const grafanaPassword = yield* givenSecret("ALASIO_GRAFANA_PASSWORD");
   const runFork = yield* FiberSet.makeRuntime();
   const onIdleError = (error: Error): void => {
     runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
   };
   const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
-    openNeon({ databaseUrl, lakePassword, lake, lakeReaderPassword }, onIdleError).pipe(
+    openNeon({ databaseUrl, lakePassword, lake, lakeReaderPassword, grafanaPassword }, onIdleError).pipe(
       Effect.retry(whileNeonStarts),
       withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
       Effect.interruptible,
