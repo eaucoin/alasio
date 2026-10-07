@@ -12,6 +12,7 @@ import type { ModelChoice, Mount } from "../persistence/conversation-repository.
 import type { StoreError } from "../persistence/sql.ts";
 import type { Store } from "../persistence/store.ts";
 import { type SessionFilesystemsDisabled, SessionSandboxes } from "../sandbox/index.ts";
+import { parseWorkspace } from "../workspace/kind.ts";
 import type { ActiveTurns } from "./active-turns.ts";
 import { makeClaudeHarness } from "./claude/index.ts";
 import type { ClaudeCodeError, ClaudeQueryFactory } from "./claude/runtime.ts";
@@ -219,8 +220,26 @@ export class UnknownHarness extends Schema.TaggedError<UnknownHarness>()("Unknow
   }
 }
 
-/** Why there is no harness to give: none of that name, no folder, or a workspace the deployment cannot serve. */
-export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled;
+/**
+ * A folder workspace, which a branch environment never works in: the folders are the
+ * machine's own files, which cannot be copied on write as a branch's data is, and a
+ * branch must change nothing of the alasio it was branched from.
+ */
+export class FolderOnBranch extends Schema.TaggedError<FolderOnBranch>()("FolderOnBranch", {
+  branch: Schema.String,
+}) {
+  override get message(): string {
+    return folderRefusedOnBranch(this.branch);
+  }
+}
+
+/** What the operator is told of a folder on the branch environment `branch`. */
+export const folderRefusedOnBranch = (branch: string): string =>
+  `This is the branch environment ${branch}, which works on copies of alasio's data. A folder is this machine's own files, ` +
+  "which cannot be copied on write, so a branch never works in one: use /workspace for a session workspace.";
+
+/** Why there is no harness to give: none of that name, no folder, or a workspace the deployment cannot serve, or a branch must not. */
+export type HarnessUnavailable = UnknownHarness | NoWorkspaceMounted | SessionFilesystemsDisabled | FolderOnBranch;
 
 /** What Harnesses.layer is given: what harnesses are made with, and test doubles. */
 export interface HarnessesOptions extends Partial<Pick<HarnessOptions, "sessionStore" | "codexRollouts" | "sessionFsCodexRollouts" | "claudeQueryFactory">> {
@@ -228,6 +247,8 @@ export interface HarnessesOptions extends Partial<Pick<HarnessOptions, "sessionS
   readonly folderBayma?: FolderBayma | undefined;
   /** Stand-ins (test doubles) for a harness in every folder. */
   readonly overrides?: Partial<Record<HarnessName, Harness>> | undefined;
+  /** The branch environment alasio is, which gives no harness in a folder; none for main. */
+  readonly branch?: string | null | undefined;
 }
 
 /**
@@ -252,6 +273,7 @@ export class Harnesses extends Context.Service<Harnesses, {
 const makeHarnesses = Effect.fnUntraced(function*({
   overrides = {},
   folderBayma,
+  branch = null,
   ...options
 }: HarnessesOptions): Effect.fn.Return<Harnesses["Service"], never, CodexAppServer | ActiveTurns | Scope.Scope> {
   // What every harness is made on: the services alasio runs with, and the scope they last for.
@@ -275,6 +297,9 @@ const makeHarnesses = Effect.fnUntraced(function*({
       }
       if (typeof workingDirectory !== "string" || !workingDirectory) {
         return Effect.fail(new NoWorkspaceMounted());
+      }
+      if (branch && parseWorkspace(workingDirectory)?.kind === "folder") {
+        return Effect.fail(new FolderOnBranch({ branch }));
       }
       const override = overrides[name];
       if (override) {

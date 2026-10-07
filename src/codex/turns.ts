@@ -367,7 +367,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     Effect.flatMap(FiberSet.run(directTurns, turn), Fiber.join);
 
   /** The conversation's prompt jobs, one at a time, for as long as it is free and has any. */
-  const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, NoServiceMounted | HarnessUnavailable | StoreError> {
+  const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, StoreError> {
     /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
       yield* store.failPromptJob(job.id, error);
@@ -379,13 +379,19 @@ const makeTurns = Effect.fnUntraced(function*() {
       if (!job) {
         return;
       }
-      const activeHarness = (yield* harnesses.requireForMount(yield* store.getMount(conversationId))).name;
-      if (job.harness !== activeHarness) {
-        yield* Effect.logWarning(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
-      }
-      // Claiming a job stamps its start, so a claimed job's started_at is set.
-      promptWait.record((job.started_at!.getTime() - job.created_at.getTime()) / 1000, { "alasio.harness": activeHarness });
-      yield* receivedFiles.materialize(job.file_ids).pipe(
+      // A mount no harness serves (none, or one the deployment cannot serve) fails the job, saying why.
+      yield* store.getMount(conversationId).pipe(
+        Effect.flatMap(harnesses.requireForMount),
+        Effect.tap(({ name: activeHarness }) =>
+          Effect.gen(function*() {
+            if (job.harness !== activeHarness) {
+              yield* Effect.logWarning(`Prompt job ${job.id} was admitted under ${job.harness} but ${activeHarness} is active; running under ${activeHarness}`);
+            }
+            // Claiming a job stamps its start, so a claimed job's started_at is set.
+            promptWait.record((job.started_at!.getTime() - job.created_at.getTime()) / 1000, { "alasio.harness": activeHarness });
+          })
+        ),
+        Effect.andThen(receivedFiles.materialize(job.file_ids)),
         Effect.andThen(run({
           conversationId,
           chatId: job.chat_id,

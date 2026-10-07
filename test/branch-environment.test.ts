@@ -12,11 +12,15 @@ import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 
 import { parentForks, serveBranchForks } from "../src/branch/fork.ts";
 import { forkToken } from "../src/branch/names.ts";
+import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { Harnesses } from "../src/harness/index.ts";
 import { KubeApiError } from "../src/kube/client.ts";
 import { Store } from "../src/persistence/store.ts";
 import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
+import { recordingTelegram } from "./support/telegram-calls.ts";
+import { withServices } from "./support/turns.ts";
 
 test("a branch's state, as it first starts, keeps its conversations and loses what was in flight where it was branched from, once", async () => {
   const schema = newSchema();
@@ -123,6 +127,25 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("a branch environment runs no turn in a folder, which it cannot copy, and says why, failing the prompt", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
+  await run(store.setActiveHarness(conversationId, "codex"));
+  await run(store.setWorkingDirectory(conversationId, "/home/operator/project"));
+  const telegram = recordingTelegram();
+  await withServices({ store, telegram: telegram.layer, branch: "try" }, async (alasio) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.submit({ conversationId, chatId: 1001, messageId: 7, prompt: "hi", fileIds: [], visibleText: "hi" })));
+    for (let waited = 0; telegram.calls.sendMessage.length === 0 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+    const [[chatId, text] = []] = telegram.calls.sendMessage;
+    assert.equal(chatId, "1001");
+    assert.match(String(text), /^Codex hit an error: This is the branch environment try, .* A folder is this machine's own files, which cannot be copied on write, so a branch never works in one: use \/workspace for a session workspace\.$/u);
+    assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
+    // A session workspace is the branch's to work in, where its deployment has them.
+    const refusal = await alasio.runPromise(Effect.flip(Effect.flatMap(Harnesses, (harnesses) => harnesses.getFor("codex", "sessionfs:fs-abc123"))));
+    assert.equal(refusal._tag, "SessionFilesystemsDisabled");
+  });
 });
 
 test("a session a branch inherited is recorded as one it made, keeping what its parent recorded of it", async () => {

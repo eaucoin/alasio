@@ -72,6 +72,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
     Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds), branchForks(options))),
     Layer.provideMerge(Turns.layer()),
     Layer.provideMerge(Harnesses.layer({
+      branch: options.branch?.name,
       sessionStore: options.sessionStore,
       codexRollouts: options.codexRollouts,
       sessionFsCodexRollouts: options.sessionFsCodexRollouts,

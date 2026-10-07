@@ -66,6 +66,8 @@ export interface TestServicesOptions {
   readonly outbox?: Layer.Layer<Outbox> | undefined;
   /** Session filesystems, where a test offers them. */
   readonly sandbox?: SessionSandboxes["Service"] | undefined;
+  /** The branch environment alasio is, if it is one. */
+  readonly branch?: string | undefined;
 }
 
 /** alasio's services over `options`, as src/alasio.ts makes them but for what the test stands in. */
@@ -79,11 +81,12 @@ function testServices({
   allowedUserIds = "",
   outbox = unusedOutbox,
   sandbox,
+  branch,
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
   return MediaGroups.layer().pipe(
     Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
-    Layer.provideMerge(Harnesses.layer({ overrides: harnesses })),
+    Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     Layer.provideMerge(Layer.mergeAll(
       ActiveTurns.layer,
       // Received files are written nowhere a test does not say.
