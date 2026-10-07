@@ -41,11 +41,25 @@ export const COLLECTOR = componentName("collector");
 const COMPONENT = "collector";
 
 /**
- * The most items (spans, data points, log records) it batches into one request, which
- * it sends at the latest 5 seconds after the first: as many as one insert of the lake
- * inlines at most (neon/lake/src/otel.ts's INLINED_ROWS), so no batch makes a file.
+ * How often it scrapes the stack. The stack's metrics are most of all the telemetry
+ * there is (the pageserver's alone half of it), some 30 points a second at this interval.
  */
-const BATCH_ITEMS = 1000;
+const SCRAPE_INTERVAL = "60s";
+
+/**
+ * How it batches spans and log records: a request of at most as many as one insert of
+ * the lake inlines (neon/lake/src/otel.ts's INLINED_ROWS), within 5 seconds of the first,
+ * so those few, which a query wants at once, are inlined in the catalog and make no file.
+ */
+const BATCH = { send_batch_size: 1000, send_batch_max_size: 1000, timeout: "5s" };
+
+/**
+ * How it batches metric points: a minute's at a time, a request of thousands, which the
+ * lake writes as a file of each kind's rather than inline in its catalog. Measured on the
+ * stack, inlining them all cost Neon some 45 KB of WAL a second and the catalog 130 MB an
+ * hour until flushed; a request every 5 seconds not inlined, 50 files a minute.
+ */
+const METRICS_BATCH = { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" };
 
 /** What it scrapes: each job's targets, by job, and with workspace storage JuiceFS's pods. */
 function scrapes(config: InstallConfig): object[] {
@@ -66,7 +80,7 @@ function scrapes(config: InstallConfig): object[] {
   // collector reads `$` as the start of a variable, and `$$` as a `$`.
   const juicefsJob = (job: string, name: string, port: number) => ({
     job_name: job,
-    scrape_interval: "30s",
+    scrape_interval: SCRAPE_INTERVAL,
     kubernetes_sd_configs: [{
       role: "pod",
       namespaces: { names: [workspaceStorage.csi.namespace] },
@@ -79,7 +93,7 @@ function scrapes(config: InstallConfig): object[] {
     ],
   });
   return [
-    ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: "30s", static_configs: [{ targets: targets[job] }] })),
+    ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: SCRAPE_INTERVAL, static_configs: [{ targets: targets[job] }] })),
     // The mount pods, the clients, and the controller's and node service's, the driver.
     ...(workspaceStorage.enabled ? [juicefsJob("juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob("juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)] : []),
   ];
@@ -101,7 +115,7 @@ function collectorConfig(config: InstallConfig): object {
     ...(lakeRuns(config) ? { "otlphttp/lake": { endpoint: `http://${componentName("lake")}:${LAKE_INTAKE_PORT}` } } : {}),
     ...(telemetry.otlpEndpoint ? externalExporter(config) : {}),
   };
-  const sent = { receivers: ["otlp"], processors: ["batch"], exporters: Object.keys(exporters) };
+  const sent = (processor: string) => ({ receivers: ["otlp"], processors: [processor], exporters: Object.keys(exporters) });
   return {
     extensions: { health_check: { endpoint: "0.0.0.0:13133" } },
     receivers: {
@@ -112,7 +126,7 @@ function collectorConfig(config: InstallConfig): object {
           redis: {
             endpoint: `${VALKEY}:${VALKEY_PORT}`,
             password: "${env:VALKEY_PASSWORD}",
-            collection_interval: "30s",
+            collection_interval: SCRAPE_INTERVAL,
             // How near it is to refusing writes: used memory against this.
             metrics: { "redis.maxmemory": { enabled: true } },
           },
@@ -120,7 +134,8 @@ function collectorConfig(config: InstallConfig): object {
         : {}),
     },
     processors: {
-      batch: { send_batch_size: BATCH_ITEMS, send_batch_max_size: BATCH_ITEMS, timeout: "5s" },
+      batch: BATCH,
+      "batch/metrics": METRICS_BATCH,
       // What the collector scrapes is the stack's.
       ...(scraped.length > 0 ? { "resource/stack": { attributes: [{ key: "service.namespace", value: "alasio-neon", action: "upsert" }] } } : {}),
     },
@@ -129,14 +144,14 @@ function collectorConfig(config: InstallConfig): object {
       extensions: ["health_check"],
       telemetry: { metrics: { level: "none" } },
       pipelines: {
-        traces: sent,
-        logs: sent,
-        metrics: sent,
+        traces: sent("batch"),
+        logs: sent("batch"),
+        metrics: sent("batch/metrics"),
         ...(scraped.length > 0
           ? {
             "metrics/stack": {
               receivers: ["prometheus", ...(workspaceStorage.enabled ? ["redis"] : [])],
-              processors: ["resource/stack", "batch"],
+              processors: ["resource/stack", "batch/metrics"],
               exporters: Object.keys(exporters),
             },
           }

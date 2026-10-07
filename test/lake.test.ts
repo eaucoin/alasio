@@ -27,7 +27,7 @@ import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION } from "../neon/lake/src/model.ts";
 import { ensureOtel, flushTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
-import type { LogsRequest } from "../neon/lake/src/otlp.ts";
+import type { LogsRequest, MetricsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
 import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
@@ -442,6 +442,14 @@ const logRequest = (service: string, ...times: bigint[]): LogsRequest => ({
   }],
 });
 
+/** A JSON export request of a gauge's point from `service` at `time`, in nanoseconds. */
+const gaugeRequest = (service: string, time: bigint): MetricsRequest => ({
+  resourceMetrics: [{
+    resource: { attributes: [{ key: "service.name", value: { stringValue: service } }] },
+    scopeMetrics: [{ metrics: [{ name: "lake.test", gauge: { dataPoints: [{ timeUnixNano: String(time), asDouble: 1 }] } }] }],
+  }],
+});
+
 /** The lake as the intake opens it: no source, the telemetry's schema ready. */
 async function openForIntake() {
   const lake = await openLake(config);
@@ -509,6 +517,16 @@ describe("telemetry", () => {
       server.close();
       await intake.stop();
     }
+  });
+
+  test("spans and log records are inlined in the catalog, and metric points written to files at once", async () => {
+    await withLake(async (db) => {
+      const files = async (table: string) => (await one<Count>(db, `select count(*) as n from ducklake_list_files('${LAKE}', '${table}', schema => 'otel')`)).n;
+      const before = { logs: await files("logs"), gauge: await files("metrics_gauge") };
+      await writeTelemetry(db, telemetryRows("logs", logRequest("inlined", NOW)));
+      await writeTelemetry(db, telemetryRows("metrics", gaugeRequest("inlined", NOW)));
+      assert.deepEqual({ logs: await files("logs"), gauge: await files("metrics_gauge") }, { logs: before.logs, gauge: before.gauge + 1n });
+    });
   });
 
   test("maintenance deletes the days of telemetry past its retention, and then their files", async () => {

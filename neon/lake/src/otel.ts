@@ -73,7 +73,10 @@ const METRIC = `
   MetricName VARCHAR, MetricDescription VARCHAR, MetricUnit VARCHAR, Attributes ${MAP},
   StartTimeUnix TIMESTAMP_NS, TimeUnix TIMESTAMP_NS`;
 
-/** Each table: its columns, and the time it is partitioned and retained by. */
+/**
+ * Each table: its columns, the time it is partitioned and retained by, and whether an
+ * insert into it is inlined in the catalog (INLINED_ROWS).
+ */
 const TABLES = {
   traces: {
     columns: `
@@ -84,6 +87,7 @@ const TABLES = {
       Events STRUCT(Timestamp TIMESTAMP_NS, Name VARCHAR, Attributes ${MAP})[],
       Links STRUCT(TraceId VARCHAR, SpanId VARCHAR, TraceState VARCHAR, Attributes ${MAP})[]`,
     time: "Timestamp",
+    inlined: true,
   },
   logs: {
     columns: `
@@ -92,26 +96,31 @@ const TABLES = {
       ResourceAttributes ${MAP}, ScopeSchemaUrl VARCHAR, ScopeName VARCHAR, ScopeVersion VARCHAR,
       ScopeAttributes ${MAP}, LogAttributes ${MAP}, EventName VARCHAR`,
     time: "Timestamp",
+    inlined: true,
   },
-  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix" },
+  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix", inlined: false },
   metrics_sum: {
     columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}, AggregationTemporality INTEGER, IsMonotonic BOOLEAN`,
     time: "TimeUnix",
+    inlined: false,
   },
   metrics_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, BucketCounts UBIGINT[], ExplicitBounds DOUBLE[], Exemplars ${EXEMPLARS},
       Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
+    inlined: false,
   },
   metrics_exponential_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, Scale INTEGER, ZeroCount UBIGINT,
       PositiveOffset INTEGER, PositiveBucketCounts UBIGINT[], NegativeOffset INTEGER, NegativeBucketCounts UBIGINT[],
       Exemplars ${EXEMPLARS}, Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
+    inlined: false,
   },
   metrics_summary: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, ValueAtQuantiles STRUCT(Quantile DOUBLE, Value DOUBLE)[], Flags UINTEGER`,
     time: "TimeUnix",
+    inlined: false,
   },
 } as const;
 
@@ -127,17 +136,20 @@ export type TelemetryRow = Readonly<Record<string, DuckDBValue>>;
 export type TelemetryRows = Partial<Record<OtelTable, TelemetryRow[]>>;
 
 /**
- * The most rows one insert into a table inlines, into the catalog, rather than writes
- * as a Parquet file of its own: as many as the collector batches at most, so every
- * request the intake takes is inlined, and the collector's frequent small batches make
- * no small files. The intake flushes what is inlined to Parquet now and then
- * (flushTelemetry), so the catalog holds at most that long's telemetry.
+ * The most rows one insert into a table of spans or log records inlines, into the
+ * catalog, rather than writes as a Parquet file of its own: as many as the collector
+ * batches them in at most, every 5 seconds, so they make no small files and are queried
+ * at once. The intake flushes what is inlined to Parquet now and then (flushTelemetry),
+ * so the catalog holds at most that long's telemetry. Metric points are never inlined:
+ * they are nearly all of it, and measured on the stack, inlining them cost Neon some 25
+ * to 45 KB of WAL a second, and the catalog 70 to 130 MB an hour until flushed; the
+ * collector sends them a minute's at a time, which the lake writes as a file a kind.
  */
 export const INLINED_ROWS = 1000;
 
 /**
  * Makes the `otel` schema's tables where they are missing, each partitioned by its
- * day, and sets how many rows of an insert it inlines.
+ * day, and sets how many rows of an insert into each it inlines.
  */
 export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await transaction(db, async () => {
@@ -153,7 +165,11 @@ export async function ensureOtel(db: DuckDBConnection): Promise<void> {
     }
   });
   // Once the schema is committed: DuckLake sets no option of a schema made in the same transaction.
-  await serially(() => db.run(`call ${LAKE}.set_option('data_inlining_row_limit', ${INLINED_ROWS}, schema => 'otel')`));
+  await serially(async () => {
+    for (const [table, { inlined }] of Object.entries(TABLES)) {
+      await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', ${inlined ? INLINED_ROWS : 0}, schema => 'otel', table_name => '${table}')`);
+    }
+  });
 }
 
 // --- Rows ---------------------------------------------------------------------------

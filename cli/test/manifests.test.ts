@@ -556,12 +556,15 @@ describe("telemetry", () => {
     const config = collectorConfig(objects);
     assert.deepEqual(config.receivers.otlp, { protocols: { http: { endpoint: "0.0.0.0:4318" } } });
     assert.deepEqual(config.exporters, { "otlphttp/lake": { endpoint: "http://alasio-lake:4318" } });
-    for (const pipeline of ["traces", "logs", "metrics"]) {
+    for (const pipeline of ["traces", "logs"]) {
       assert.deepEqual(config.service.pipelines[pipeline], { receivers: ["otlp"], processors: ["batch"], exporters: ["otlphttp/lake"] }, pipeline);
     }
-    assert.deepEqual(config.service.pipelines["metrics/stack"].exporters, ["otlphttp/lake"]);
-    // No batch larger than an insert the lake inlines.
+    assert.deepEqual(config.service.pipelines.metrics, { receivers: ["otlp"], processors: ["batch/metrics"], exporters: ["otlphttp/lake"] });
+    assert.deepEqual(config.service.pipelines["metrics/stack"], { receivers: ["prometheus", "redis"], processors: ["resource/stack", "batch/metrics"], exporters: ["otlphttp/lake"] });
+    // Spans and log records in batches no larger than an insert the lake inlines, at once;
+    // metric points a minute's at a time, which the lake writes as files.
     assert.deepEqual(config.processors.batch, { send_batch_size: 1000, send_batch_max_size: 1000, timeout: "5s" });
+    assert.deepEqual(config.processors["batch/metrics"], { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" });
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-collector").spec?.ports, [{ name: "otlp-http", port: 4318, targetPort: "otlp-http" }]);
     assert.deepEqual(one<V1Service>(objects, "Service", "alasio-lake").spec?.ports?.find(({ name }) => name === "otlp-http"), { name: "otlp-http", port: 4318 });
   });
@@ -636,10 +639,15 @@ describe("telemetry", () => {
     assert.equal(one<V1Deployment>(install(), "Deployment", "alasio-collector").spec?.template.metadata?.labels?.["alasio.dev/stack"], "neon");
   });
 
-  test("scrapes every service of the stack", () => {
-    const config = one<V1ConfigMap>(install(), "ConfigMap", "alasio-collector").data?.["config.yaml"] ?? "";
-    assert.match(config, /alasio-neon-safekeeper-2\.alasio-neon-safekeeper:7676/u);
-    assert.match(config, /alasio-lake:9464/u);
+  test("scrapes every service of the stack, every minute", () => {
+    const config = collectorConfig(install());
+    const jobs = config.receivers.prometheus.config.scrape_configs;
+    assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "safekeeper").static_configs, [{
+      targets: [0, 1, 2].map((index) => `alasio-neon-safekeeper-${index}.alasio-neon-safekeeper:7676`),
+    }]);
+    assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "lake").static_configs, [{ targets: ["alasio-lake:9464"] }]);
+    for (const job of jobs) assert.equal(job.scrape_interval, "60s", job.job_name);
+    assert.equal(config.receivers.redis.collection_interval, "60s");
   });
 
   test("scrapes JuiceFS's pods, found in the driver's namespace, and Valkey, with its password, when workspace storage is on", () => {
@@ -649,7 +657,7 @@ describe("telemetry", () => {
     for (const [job, name, port] of [["juicefs", "juicefs-mount", 9567], ["juicefs-csi", "juicefs-csi-driver", 8080]] as const) {
       assert.deepEqual(config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), {
         job_name: job,
-        scrape_interval: "30s",
+        scrape_interval: "60s",
         kubernetes_sd_configs: [{
           role: "pod",
           namespaces: { names: ["kube-system"] },
@@ -665,7 +673,7 @@ describe("telemetry", () => {
     assert.deepEqual(config.receivers.redis, {
       endpoint: "alasio-valkey:6379",
       password: "${env:VALKEY_PASSWORD}",
-      collection_interval: "30s",
+      collection_interval: "60s",
       metrics: { "redis.maxmemory": { enabled: true } },
     });
     assert.deepEqual(config.service.pipelines["metrics/stack"].receivers, ["prometheus", "redis"]);
