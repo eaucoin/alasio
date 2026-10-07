@@ -25,6 +25,7 @@ import {
   AGENTS,
   alasio,
   alasioOk,
+  alasioRunning,
   CLUSTER,
   dumpClusterState,
   type Forward,
@@ -400,6 +401,85 @@ if (inShard("telemetry")) {
       await untilInLake("log record of the lake's", "select count(*) as n from otel.logs where ServiceName = 'alasio-lake'");
       await untilInLake("metric of JuiceFS's", metricRows("MetricName like 'juicefs_%'"));
       await untilInLake("metric of Valkey's", metricRows("MetricName = 'redis.memory.used'"));
+    });
+
+    describe("Grafana", () => {
+      let grafana: Awaited<ReturnType<typeof alasioRunning>> | undefined;
+      let base = "";
+      let authorization = "";
+      /** Grafana's API, as its admin. */
+      const api = async (path: string, init: RequestInit = {}): Promise<{ status: number; body: unknown }> => {
+        const response = await fetch(`${base}${path}`, { ...init, headers: { authorization, "content-type": "application/json", ...init.headers } });
+        const text = await response.text();
+        return { status: response.status, body: text.startsWith("{") || text.startsWith("[") ? JSON.parse(text) : text };
+      };
+
+      before(async () => {
+        const password = (await alasioOk("grafana", "--password")).trim();
+        authorization = `Basic ${Buffer.from(`admin:${password}`).toString("base64")}`;
+        grafana = await alasioRunning("grafana", "--port", "0");
+        base = /http:\/\/127\.0\.0\.1:\d+/u.exec(grafana.said)?.[0] ?? "";
+        assert.ok(base, grafana.said);
+      });
+
+      after(() => {
+        grafana?.child.kill();
+      });
+
+      test("alasio grafana reaches Grafana, its data source reads the lake, and its dashboards' queries answer with the lake's rows", async (t) => {
+        assert.equal((await api("/api/health")).status, 200);
+        assert.deepEqual((await api("/api/datasources/uid/lake/health")).body, { message: "Health check successful", status: "OK" });
+        const dashboards = (await api("/api/search?type=dash-db")).body as { title: string; folderTitle: string }[];
+        assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Stack health"]);
+        // The Stack health dashboard's table of services, as its panel queries it.
+        const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
+        const services = stack.panels.find(({ title }) => title === "Services now")?.targets?.[0];
+        assert.ok(services);
+        let rows = 0;
+        for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
+          const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [services] }) })).body as {
+            results: { A: { frames?: { data: { values: unknown[][] } }[] } };
+          };
+          rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+        }
+        assert.ok(rows > 0, "the panel answered with no service");
+        // What Grafana and the lake's query endpoint hold, as their cgroups count it.
+        const memory = async (pod: string, container: string) =>
+          (await kube.execOk(NAMESPACE, pod, ["cat", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.peak"], { container })).trim().split("\n").map((bytes) => `${Math.round(Number(bytes) / 1048576)} MiB`).join(", peak ");
+        t.diagnostic(`Grafana: ${await memory(await kube.runningPod(NAMESPACE, "alasio-grafana"), "grafana")}`);
+        t.diagnostic(`the lake's query endpoint: ${await memory(await kube.runningPod(NAMESPACE, "alasio-lake"), "query")}`);
+        t.diagnostic(`the lake service: ${await memory(await kube.runningPod(NAMESPACE, "alasio-lake"), "lake")}`);
+      });
+
+      test("a turn that failed alerts each of the bot's users, through the bot", async () => {
+        // A turn that failed, as alasio records one, sent to the stack's collector as alasio sends its spans.
+        const now = BigInt(Date.now()) * 1_000_000n;
+        const attribute = (key: string, value: string) => ({ key, value: { stringValue: value } });
+        const turn = {
+          resourceSpans: [{
+            resource: { attributes: [attribute("service.name", "alasio")] },
+            scopeSpans: [{
+              scope: { name: "alasio" },
+              spans: [{
+                traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+                spanId: "00f067aa0ba902b7",
+                name: "alasio.turn",
+                kind: 1,
+                startTimeUnixNano: String(now - 2_000_000_000n),
+                endTimeUnixNano: String(now),
+                attributes: [attribute("alasio.conversation.id", "telegram:1001"), attribute("alasio.harness", "codex"), attribute("alasio.turn.outcome", "failed")],
+                status: { code: 2, message: "the harness failed" },
+              }],
+            }],
+          }],
+        };
+        await inAlasioContainer(["curl", "-fsS", "-X", "POST", "-H", "content-type: application/json", "--data-binary", "@-", "http://alasio-collector.alasio.svc:4318/v1/traces"], JSON.stringify(turn));
+        const alert = await tg.waitFor((call) => call.method === "sendMessage" && /Turns are failing/u.test(call.payload.text ?? ""), 420_000);
+        assert.equal(alert.payload.chat_id, "1001");
+        assert.match(alert.payload.text ?? "", /conversation = telegram:1001/u);
+        const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string }[] }[] } };
+        assert.equal(rules.data.groups.flatMap((group) => group.rules).find(({ name }) => name === "Turns are failing")?.state, "firing");
+      });
     });
 
     test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend too", async () => {

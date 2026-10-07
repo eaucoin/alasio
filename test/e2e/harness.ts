@@ -6,8 +6,8 @@
  * `registries` have its nodes pull from, the stand-ins it talks to instead of Telegram
  * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`,
  * running a stand-in for Codex in its place (./codex-stand-in.ts), as the run has no
- * Codex login.
- * The tests then drive it through its command line (`alasio`), the stand-ins, and the
+ * Codex login, its Grafana then made to take the Telegram stand-in for Telegram
+ * (trustTelegramStandIn). The tests then drive it through its command line (`alasio`), the stand-ins, and the
  * cluster's API (`kube`); the run is torn down by `alasio uninstall --purge`, after what
  * the cluster was doing is said, when something of the run failed.
  *
@@ -37,16 +37,30 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { CoreV1Api, type CoreV1Event, KubeConfig, type KubernetesObject, PortForward, type V1Deployment, type V1Node, type V1Pod, type V1Secret } from "@kubernetes/client-node";
+import {
+  type CoreV1Event,
+  CoreV1Api,
+  KubeConfig,
+  type KubernetesObject,
+  PortForward,
+  type V1ConfigMap,
+  type V1Deployment,
+  type V1NetworkPolicy,
+  type V1Node,
+  type V1Pod,
+  type V1Secret,
+  type V1Service,
+} from "@kubernetes/client-node";
 import { type Duration, Effect, Stream } from "effect";
 
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
-import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { installCli, packCli } from "../../tooling/cli-package.ts";
 import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
-import { OTLP, standInObjects, TELEGRAM, urlOf } from "./stand-ins.ts";
+import { OTLP, STAND_INS, standInObjects, TELEGRAM, TELEGRAM_TLS_PORT, urlOf } from "./stand-ins.ts";
 import { createTelegramStub } from "./telegram-stub.ts";
+import { CA } from "./telegram-tls.ts";
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -109,7 +123,7 @@ export const inShard = (shard: Shard): boolean => SHARD === undefined || SHARD =
  * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
  * (./codex-stand-in.Dockerfile), built on it.
  */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
 
 /** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
 const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
@@ -177,6 +191,22 @@ export async function alasioOk(...args: string[]): Promise<string> {
   const ran = await alasio(...args);
   if (ran.code !== 0) throw new Error(`alasio ${args.join(" ")} exited with ${ran.code}:\n${ran.stderr}`);
   return ran.stdout;
+}
+
+/** `alasio ...args` from its package, which runs until it is killed, as `alasio grafana` does: the process, and its first line of output, once it says it. */
+export async function alasioRunning(...args: string[]): Promise<{ readonly child: ChildProcess; readonly said: string }> {
+  const { bin, env } = current();
+  const child = spawn(bin, args, { env, stdio: ["ignore", "pipe", "inherit"] });
+  const said = await new Promise<string>((resolve, reject) => {
+    let stdout = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk;
+      if (stdout.includes("\n")) resolve(stdout.split("\n")[0] ?? "");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => reject(new Error(`alasio ${args.join(" ")} exited with ${code} before it said anything`)));
+  });
+  return { child, said };
 }
 
 /** A read-only query of the lake, as alasio lake runs one: its rows. */
@@ -420,7 +450,7 @@ function installation(): Record<string, unknown> {
   const pushed = (name: keyof typeof IMAGES) => ({ ...pulledOf(name), digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
-    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), pullPolicy: "IfNotPresent" },
+    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
@@ -452,7 +482,8 @@ function installation(): Record<string, unknown> {
         resources: { requests: { cpu: "20m", memory: "128Mi" } },
       },
     },
-    lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } } },
+    lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } },
+    grafana: { resources: { requests: { cpu: "20m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
     workspaceStorage: { backupInterval: "5m" },
     agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },
@@ -523,7 +554,7 @@ export async function setUp(): Promise<void> {
 
   if (!PUSHED) {
     const pushHost = await startRegistry();
-    for (const name of ["alasio", "alasio-agent", "alasio-lake"] as const) await push(pushHost, name);
+    for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana"] as const) await push(pushHost, name);
     // On alasio's image, which its build pulls back from the registry.
     await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }
@@ -537,6 +568,54 @@ export async function setUp(): Promise<void> {
   );
 
   await alasioOk("up", "--timeout", "20m");
+  await trustTelegramStandIn();
+}
+
+/**
+ * Makes Grafana take the Telegram stand-in for api.telegram.org, where its Telegram
+ * integration alone sends, over HTTPS (./telegram-tls.ts): the name resolves, in its pod,
+ * to the stand-in's Service, Grafana trusts the CA that signed the stand-in's
+ * certificate, and may reach it. The run's own objects and patch, beside alasio's, as no
+ * setting of alasio's points Grafana elsewhere; then Grafana's new pod is waited for.
+ */
+async function trustTelegramStandIn(): Promise<void> {
+  const grafana = componentName("grafana");
+  const ca = "alasio-e2e-telegram-ca";
+  const caMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: ca, namespace: NAMESPACE }, data: { "ca.pem": CA } };
+  const egress: V1NetworkPolicy = {
+    apiVersion: "networking.k8s.io/v1",
+    kind: "NetworkPolicy",
+    metadata: { name: "alasio-e2e-grafana-to-telegram", namespace: NAMESPACE },
+    spec: {
+      podSelector: { matchLabels: selectorLabels("grafana") },
+      policyTypes: ["Egress"],
+      egress: [{
+        to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": STAND_INS } }, podSelector: { matchLabels: { app: TELEGRAM.name } } }],
+        ports: [{ protocol: "TCP", port: TELEGRAM_TLS_PORT }],
+      }],
+    },
+  };
+  for (const object of [caMap, egress]) await kube.apply(object);
+  const service = await kube.get<V1Service>(ref("Service", TELEGRAM.service, STAND_INS));
+  const deployment = await kube.get<V1Deployment>(ref("Deployment", grafana, NAMESPACE));
+  const pod = deployment?.spec?.template.spec;
+  if (!service?.spec?.clusterIP || !pod) throw new Error("Grafana, or the Telegram stand-in's Service, is not there");
+  await kube.patch(ref("Deployment", grafana, NAMESPACE), {
+    spec: {
+      template: {
+        spec: {
+          hostAliases: [{ ip: service.spec.clusterIP, hostnames: ["api.telegram.org"] }],
+          volumes: [...(pod.volumes ?? []), { name: "telegram-ca", configMap: { name: ca } }],
+          containers: pod.containers.map((container) => ({
+            ...container,
+            env: [...(container.env ?? []), { name: "SSL_CERT_FILE", value: "/etc/alasio-e2e/ca.pem" }],
+            volumeMounts: [...(container.volumeMounts ?? []), { name: "telegram-ca", mountPath: "/etc/alasio-e2e", readOnly: true }],
+          })),
+        },
+      },
+    },
+  });
+  await kube.awaitReady([ref("Deployment", grafana, NAMESPACE)], "10 minutes");
 }
 
 /** What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods and latest events, and why each pod that is not ready is not, with its logs. */

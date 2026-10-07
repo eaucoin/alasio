@@ -11,11 +11,16 @@
  *   POST /control/callback           { data, chatId?, userId?, messageId? } queues a press
  *   GET  /control/calls?since=<n>    what alasio has called since the nth call
  *
- * The end-to-end tests run it on its own in the cluster, `node telegram-stub.ts [port]`,
- * and so it is dependency-free, for any Node; alasio's own tests run one in their process
- * through createTelegramStub (test/support/telegram.ts).
+ * The end-to-end tests run it on its own in the cluster, `node telegram-stub.ts [port]
+ * [tls-port]`, and so it is dependency-free, for any Node: with a TLS port, it serves the
+ * Bot API there too, with the certificate tls.pem and key tls.key beside it, as
+ * api.telegram.org for Grafana, which calls Telegram there alone (test/e2e/
+ * telegram-tls.ts). alasio's own tests run one in their process through
+ * createTelegramStub (test/support/telegram.ts).
  */
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer as createTlsServer } from "node:https";
 import type { CallbackQuery, Chat, Message, Opts, PhotoSize, Update, User, WebhookInfo } from "@grammyjs/types";
 
 /** The parameters of a Bot API method; files go up as multipart, hence `never`. */
@@ -23,7 +28,8 @@ type BotParams<M extends keyof Opts<never>> = Opts<never>[M];
 
 /**
  * A Bot API call's parameters, as far as the stand-in and the tests read them; the
- * others are recorded as alasio sent them, and a multipart upload by its size alone.
+ * others are recorded as they were sent, a multipart upload's fields as text, and its
+ * files by their size alone.
  */
 export interface BotApiPayload
   extends Partial<
@@ -113,8 +119,29 @@ export interface TelegramStub {
 const CHAT = 1001;
 const USER = 1001;
 
-// Bodies are as their senders speak them: the Bot API's parameters from alasio, and the
-// control endpoints' from the tests; each caller names the shape it reads.
+/** A multipart/form-data body's fields, each as text, and the bytes of its files, together. */
+export function multipartFields(body: Buffer, boundary: string): Record<string, string | number> {
+  const fields: Record<string, string | number> = {};
+  let files = 0;
+  const delimiter = Buffer.from(`--${boundary}`);
+  for (let at = body.indexOf(delimiter); at >= 0;) {
+    const next = body.indexOf(delimiter, at + delimiter.length);
+    if (next < 0) break;
+    // A part: its headers, a blank line, and its content, up to the line break before the next delimiter.
+    const part = body.subarray(at + delimiter.length + 2, next - 2);
+    const split = part.indexOf("\r\n\r\n");
+    const headers = part.subarray(0, split).toString("utf8");
+    const content = part.subarray(split + 4);
+    const name = /name="([^"]*)"/u.exec(headers)?.[1];
+    if (/filename=/u.test(headers)) files += content.length;
+    else if (name !== undefined) fields[name] = content.toString("utf8");
+    at = next;
+  }
+  return files > 0 ? { ...fields, multipartBytes: files } : fields;
+}
+
+// Bodies are as their senders speak them: the Bot API's parameters from alasio and
+// Grafana, and the control endpoints' from the tests; each caller names the shape it reads.
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   // With no encoding set, a request reads as Buffers.
@@ -122,7 +149,8 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   const body = Buffer.concat(chunks);
   const type = request.headers["content-type"] ?? "";
   if (type.startsWith("application/json")) return JSON.parse(body.toString("utf8") || "{}");
-  // Multipart uploads (sendDocument) are recorded by size only.
+  const boundary = /^multipart\/form-data;.*boundary="?([^";]+)"?/u.exec(type)?.[1];
+  if (boundary) return multipartFields(body, boundary);
   return { multipartBytes: body.length };
 }
 
@@ -298,7 +326,13 @@ export function createTelegramStub(): TelegramStub {
 
 if (import.meta.main) {
   const port = Number(process.argv[2] ?? process.env["PORT"] ?? 8081);
+  const tlsPort = process.argv[3];
   const { server } = createTelegramStub();
   server.listen(port, "0.0.0.0", () => console.log(`telegram stub on ${port}`));
+  if (tlsPort) {
+    const here = new URL(".", import.meta.url);
+    const tls = createTlsServer({ cert: readFileSync(new URL("tls.pem", here)), key: readFileSync(new URL("tls.key", here)) }, (request, response) => server.emit("request", request, response));
+    tls.listen(Number(tlsPort), "0.0.0.0", () => console.log(`telegram stub on ${tlsPort}, over TLS`));
+  }
   process.on("SIGTERM", () => server.close(() => process.exit(0)));
 }
