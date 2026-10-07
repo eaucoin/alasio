@@ -6,7 +6,7 @@ import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { type HarnessError, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
+import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
 import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
@@ -59,13 +59,13 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
   const turns = yield* Turns;
   const conversation = { conversationId, chatId };
   const mount = yield* store.getMount(conversationId);
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
-  const label = harness?.displayName ?? "The agent";
+  // What changes the mount, or stops a turn, needs no harness, which the mount may have none of.
   if (cmd.type === "stop") {
     if (!(yield* activeTurns.isBusy(conversationId))) {
       yield* client.sendMessage(chatId, "No active query to stop.");
       return true;
     }
+    const label = harnessLabelOf(mount);
     const [status] = yield* client.sendMessage(chatId, `Stopping ${label}...`);
     const interrupted = yield* activeTurns.stop(conversationId, "interrupt");
     const text = interrupted ? `${label} stopped.` : "No active query to stop.";
@@ -76,16 +76,17 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     }
     return true;
   }
-  if (cmd.type === "model") {
-    yield* sendModelPanel({ harness, ...conversation });
-    return true;
-  }
   if (cmd.type === "service") {
     yield* handleServiceTextCommand({ ...conversation, target: cmd.target });
     return true;
   }
   if (cmd.type === "workspace") {
     yield* handleWorkspaceTextCommand({ ...conversation, args: cmd.args });
+    return true;
+  }
+  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
+  if (cmd.type === "model") {
+    yield* sendModelPanel({ harness, ...conversation });
     return true;
   }
   if (!mount.harness) {

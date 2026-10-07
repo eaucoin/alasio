@@ -66,7 +66,6 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     yield* client.answerCallbackQuery(callbackQuery.id, "This panel belongs to another service. Open it again.");
     return;
   }
-  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
   const chatId = callbackQuery.message?.chat?.id;
   const messageId = callbackQuery.message?.message_id;
   if (!chatId || !messageId) {
@@ -83,6 +82,8 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
   if (isWorkspaceControlAction(action.kind)) {
     return yield* handleWorkspaceControlCallback(press);
   }
+  // Every remaining action is the mounted harness's, which the mount may have none of.
+  const harness = Option.getOrNull(yield* Effect.flatMap(Harnesses, (harnesses) => harnesses.forMount(mount)));
   if (!harness) {
     const reason = mount.harness ? NO_WORKSPACE_MOUNTED : NO_SERVICE_MOUNTED;
     yield* client.answerCallbackQuery(callbackQuery.id, reason);

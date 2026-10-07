@@ -13,11 +13,15 @@ import { Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect";
 import { parentForks, serveBranchForks } from "../src/branch/fork.ts";
 import { forkToken } from "../src/branch/names.ts";
 import { Turns } from "../src/codex/turns.ts";
+import { handleTextCommand } from "../src/operator/command-handler.ts";
+import { Mounts } from "../src/operator/mounts.ts";
+import { buildWorkspacePanel } from "../src/operator/workspace-control.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import { Harnesses } from "../src/harness/index.ts";
 import { KubeApiError } from "../src/kube/client.ts";
 import { Store } from "../src/persistence/store.ts";
 import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
+import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
@@ -145,6 +149,60 @@ test("a branch environment runs no turn in a folder, which it cannot copy, and s
     // A session workspace is the branch's to work in, where its deployment has them.
     const refusal = await alasio.runPromise(Effect.flip(Effect.flatMap(Harnesses, (harnesses) => harnesses.getFor("codex", "sessionfs:fs-abc123"))));
     assert.equal(refusal._tag, "SessionFilesystemsDisabled");
+  });
+});
+
+test("a branch environment mounts and makes no folder, forks no workspace itself, and its panel offers its session workspaces alone", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
+  await run(store.setWorkingDirectory(conversationId, "sessionfs:fs-abc123"));
+  const sandbox = SessionSandboxes.of({
+    volumes: { create: () => Effect.die("no session is made"), fork: () => Effect.die("no session is forked"), destroy: () => Effect.die("no session is deleted"), forks: Effect.succeed([]) },
+    harnessDirectory: () => "/nonexistent",
+    ensureSession: () => Effect.die("no session is brought up"),
+    readFile: () => Effect.die("no file is read"),
+  });
+  await withServices({ store, branch: "try", sandbox, workspaceRoot: tmpdir() }, async (alasio) => {
+    const refusal = (change: (mounts: Mounts["Service"]) => Effect.Effect<unknown, { readonly message: string }>) =>
+      alasio.runPromise(Effect.flip(Effect.flatMap(Mounts, change))).then(({ message }) => message);
+    assert.match(await refusal((mounts) => mounts.switchWorkspace(conversationId, tmpdir())), /^This is the branch environment try, .* A folder is this machine's own files/u);
+    assert.match(await refusal((mounts) => mounts.createWorkspace(conversationId, "new-folder")), /^This is the branch environment try, .* A folder is this machine's own files/u);
+    assert.equal(
+      await refusal((mounts) => mounts.forkSessionWorkspace(conversationId)),
+      "This is the branch environment try: its session workspaces are forked from alasio's own as it first uses them, and it forks none of them itself.",
+    );
+  });
+  const panel = buildWorkspacePanel({
+    current: "sessionfs:fs-abc123",
+    workspaceRoot: "/root",
+    listing: { candidates: [{ name: "repo", path: "/root/repo", git: true }] },
+    working: false,
+    sandboxEnabled: true,
+    sessionWorkspaces: [{ volumeId: "fs-abc123", forkedFrom: null, netMode: "none", madeAt: new Date() }],
+    branch: "try",
+  });
+  assert.deepEqual(panel.keyboard.flat().map(({ text }) => text), ["* fs-abc123", "New empty workspace…", "Refresh", "Close"]);
+  assert.match(panel.text, /This is the branch environment try\. It works on copy-on-write copies of alasio's session workspaces/u);
+});
+
+test("on a branch, a conversation mounted on a folder can still be moved off it: its workspace panel opens and its buttons act", async () => {
+  const store = await testStore();
+  const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
+  await run(store.setActiveHarness(conversationId, "codex"));
+  await run(store.setWorkingDirectory(conversationId, "/home/operator/project"));
+  const telegram = recordingTelegram();
+  await withServices({ store, telegram: telegram.layer, branch: "try", allowedUserIds: "1001" }, async (alasio) => {
+    assert.equal(await alasio.runPromise(handleTextCommand({ text: "/workspace", fileIds: [], conversationId, chatId: 1001, messageId: 7 })), true);
+    assert.match(String(telegram.calls.sendMessage.at(-1)?.[1]), /This is the branch environment try\. It works on copy-on-write copies/u);
+    const [refresh = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "workspace:refresh" }]));
+    await alasio.runPromise(handleCallbackQuery({
+      id: "press",
+      from: { id: 1001, is_bot: false, first_name: "Operator" },
+      chat_instance: "1",
+      data: refresh,
+      message: { message_id: 77, date: 0, chat: { id: 1001, type: "private", first_name: "Operator" } },
+    }));
+    assert.deepEqual(telegram.calls.answerCallbackQuery.map(([, text]) => text), ["Refreshed."]);
   });
 });
 

@@ -629,9 +629,11 @@ if (inShard("branches")) {
       await untilInLake("trace of the branch's alasio", `select count(*) as n from otel.traces where ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] = '${BRANCH}'`);
     });
 
-    test("a folder workspace main mounted is refused on the branch, saying why", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+    test("a folder workspace main mounted is refused on the branch, saying why, and so is mounting one", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       await branch.say("hi", FOLDER_CHAT);
       await branch.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /hit an error: This is the branch environment e2e, .* A folder is this machine's own files/u.test(call.payload.text ?? ""));
+      await branch.say("/workspace e2e-folder", FOLDER_CHAT);
+      await branch.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^This is the branch environment e2e, .* A folder is this machine's own files/mu.test(call.payload.text ?? ""));
     });
 
     test("the branch's alasio, compute and lake fit the run's cluster, as the metrics server measures them", async () => {

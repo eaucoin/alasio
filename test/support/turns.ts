@@ -84,7 +84,7 @@ function testServices({
   branch,
 }: TestServicesOptions): Layer.Layer<AlasioServices> {
   return MediaGroups.layer().pipe(
-    Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot }), Authorizer.layer(allowedUserIds))),
+    Layer.provideMerge(Layer.mergeAll(Mounts.layer({ workspaceRoot, branch }), Authorizer.layer(allowedUserIds))),
     Layer.provideMerge(turns ? Layer.succeed(Turns, turns) : Turns.layer()),
     Layer.provideMerge(Harnesses.layer({ overrides: harnesses, branch })),
     Layer.provideMerge(Layer.mergeAll(

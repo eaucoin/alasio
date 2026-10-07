@@ -69,7 +69,11 @@ export type AlasioServices =
  */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError | CodexLoginError> {
   return MediaGroups.layer().pipe(
-    Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds), branchForks(options))),
+    Layer.provideMerge(Layer.mergeAll(
+      Mounts.layer({ workspaceRoot: options.workspaceRoot, branch: options.branch?.name }),
+      Authorizer.layer(options.allowedUserIds),
+      branchForks(options),
+    )),
     Layer.provideMerge(Turns.layer()),
     Layer.provideMerge(Harnesses.layer({
       branch: options.branch?.name,

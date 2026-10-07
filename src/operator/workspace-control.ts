@@ -62,6 +62,8 @@ export interface WorkspacePanelRequest {
   readonly sandboxEnabled?: boolean | undefined;
   /** The session workspaces made, newest first, to switch to. */
   readonly sessionWorkspaces?: readonly MadeSessionWorkspace[] | undefined;
+  /** The branch environment alasio is, which offers no folder and forks no workspace of its own; none for main. */
+  readonly branch?: string | null | undefined;
 }
 
 /** A session workspace alasio has made. */
@@ -82,10 +84,11 @@ const FORK_HELP = [
  * Telegram-native workspace picker. Lists top-level folders under the workspace
  * root (git repositories first), and the session workspaces made, newest first, as
  * buttons; anything beyond the button cap is still reachable with `/workspace <name>`
- * or `/workspace sessionfs:<volume>`. A session workspace mounted can be forked.
+ * or `/workspace sessionfs:<volume>`. A session workspace mounted can be forked. A branch
+ * environment's offers its session workspaces alone, which it forks none of itself.
  */
-export function buildWorkspacePanel({ current, workspaceRoot, listing, working, notice = "", sandboxEnabled = false, sessionWorkspaces = [] }: WorkspacePanelRequest): PanelDraft {
-  const candidates = "candidates" in listing ? listing.candidates : [];
+export function buildWorkspacePanel({ current, workspaceRoot, listing, working, notice = "", sandboxEnabled = false, sessionWorkspaces = [], branch = null }: WorkspacePanelRequest): PanelDraft {
+  const candidates = "candidates" in listing && !branch ? listing.candidates : [];
   const shown = candidates.slice(0, MAX_LISTED_WORKSPACES);
   const sessionsShown = sessionWorkspaces.slice(0, MAX_LISTED_WORKSPACES);
   const mounted = parseWorkspace(current);
@@ -99,12 +102,14 @@ export function buildWorkspacePanel({ current, workspaceRoot, listing, working, 
     "",
     "Sessions belong to one service and one folder. Switching folders parks the current sessions and restores the ones from the chosen folder.",
     "",
-    "Type /workspace <name> to mount a folder under the root, or /workspace new <name> to create a git-initialized one.",
+    branch
+      ? `This is the branch environment ${branch}. It works on copy-on-write copies of alasio's session workspaces, each forked from alasio's own as it is first used here, and on no folder: a folder is this machine's own files, which cannot be copied.`
+      : "Type /workspace <name> to mount a folder under the root, or /workspace new <name> to create a git-initialized one.",
   ];
-  if (mounted?.kind === "sessionfs") {
+  if (mounted?.kind === "sessionfs" && !branch) {
     lines.push("", ...FORK_HELP);
   }
-  if ("error" in listing) {
+  if ("error" in listing && !branch) {
     lines.push("", `Could not list folders: ${truncateText(listing.error, 200)}`);
   } else if (candidates.length > shown.length) {
     lines.push("", `${candidates.length - shown.length} more folders are not shown; mount them by name.`);
@@ -122,13 +127,13 @@ export function buildWorkspacePanel({ current, workspaceRoot, listing, working, 
     const path = sessionFsWorkspace(workspace.volumeId);
     return button(`${path === current ? "* " : ""}${workspace.volumeId}${workspace.forkedFrom ? ` (fork of ${workspace.forkedFrom})` : ""}`, "use", { path });
   })));
-  if (mounted?.kind === "sessionfs" && sandboxEnabled) {
+  if (mounted?.kind === "sessionfs" && sandboxEnabled && !branch) {
     keyboard.push([button("Fork this workspace", "fork")]);
   }
   if (sandboxEnabled) {
     keyboard.push([button("New empty workspace…", "sessionfs")]);
   }
-  keyboard.push([button("New folder…", "new"), button("Refresh", "refresh"), button("Close", "close")]);
+  keyboard.push([...(branch ? [] : [button("New folder…", "new")]), button("Refresh", "refresh"), button("Close", "close")]);
   return { text: lines.join("\n"), keyboard };
 }
 
@@ -150,10 +155,11 @@ const workspacePanel = Effect.fnUntraced(function*(conversationId: string, notic
   return yield* keepPanel(conversationId, buildWorkspacePanel({
     current: workingDirectory,
     workspaceRoot: mounts.workspaceRoot,
-    listing: yield* listWorkspaces(mounts.workspaceRoot),
+    listing: mounts.branch ? { candidates: [] } : yield* listWorkspaces(mounts.workspaceRoot),
     working,
     notice,
     sandboxEnabled: mounts.sessionFilesystems,
+    branch: mounts.branch,
     sessionWorkspaces: mounts.sessionFilesystems
       ? (yield* store.listSessionWorkspaces).filter((workspace): workspace is MadeSessionWorkspace => workspace.madeAt !== null)
       : [],

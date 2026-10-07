@@ -7,12 +7,16 @@
  * its store before they are made and marked made once they are whole, which is what
  * lists them for the operator to switch to. One a failure or a crash left unmade is
  * deleted, at once or as alasio next starts.
+ *
+ * A branch environment mounts no folder, which it cannot copy, and forks none of its
+ * session filesystems: those it inherited are forked from its parent's as it first uses
+ * them (src/branch/fork.ts), and the parent's clones are the parent's to make.
  */
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { AlasioConfig } from "../config.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
-import { harnessLabelOf, isHarnessName } from "../harness/index.ts";
+import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
@@ -71,6 +75,8 @@ const folder = <A>(operation: () => Promise<A>): Effect.Effect<A, WorkspaceFolde
 export class Mounts extends Context.Service<Mounts, {
   /** Where the operator's folders are. */
   readonly workspaceRoot: string;
+  /** The branch environment alasio is, which mounts no folder; null for main. */
+  readonly branch: string | null;
   /** Whether the deployment offers session filesystems. */
   readonly sessionFilesystems: boolean;
   /** Mounts the service `harness` on the conversation. */
@@ -98,14 +104,18 @@ export class Mounts extends Context.Service<Mounts, {
    */
   readonly reconcileSessionWorkspaces: Effect.Effect<void, StoreError>;
 }>()("alasio/operator/Mounts") {
-  static readonly layer = ({ workspaceRoot }: Pick<AlasioConfig, "workspaceRoot">): Layer.Layer<Mounts, never, Store | ActiveTurns> =>
-    Layer.effect(Mounts, makeMounts(workspaceRoot));
+  /** The mounts of an alasio of `workspaceRoot`, the branch environment `branch` unless it is none, main. */
+  static readonly layer = ({ workspaceRoot, branch = null }: Pick<AlasioConfig, "workspaceRoot"> & { readonly branch?: string | null | undefined }): Layer.Layer<Mounts, never, Store | ActiveTurns> =>
+    Layer.effect(Mounts, makeMounts(workspaceRoot, branch));
 }
 
-const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns> {
+const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: string | null): Effect.fn.Return<Mounts["Service"], never, Store | ActiveTurns> {
   const store = yield* Store;
   const activeTurns = yield* ActiveTurns;
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
+
+  /** Refuses a folder where alasio is a branch environment. */
+  const folderAllowed: Effect.Effect<void, MountRefused> = branch ? Effect.fail(new MountRefused({ message: folderRefusedOnBranch(branch) })) : Effect.void;
 
   /** Refuses a change while a turn runs in the conversation or prompts wait for its service; `doing` is the change, as the operator is told. */
   const unblocked = Effect.fnUntraced(function*(conversationId: string, doing = "switching services"): Effect.fn.Return<void, MountRefused | StoreError> {
@@ -151,6 +161,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
 
   return Mounts.of({
     workspaceRoot,
+    branch,
     sessionFilesystems: sandbox !== null,
     switchHarness: Effect.fnUntraced(function*(conversationId, harness) {
       if (!isHarnessName(harness)) {
@@ -168,7 +179,9 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
       return { switched: true, previous, next: harness, sessionId: after.sessionId, workingDirectory: after.workingDirectory };
     }, withLogScope(LOG_SCOPE)),
     switchWorkspace: Effect.fnUntraced(function*(conversationId, target) {
-      const workingDirectory = yield* (isSessionFs(target.trim()) ? sessionWorkspace(target) : folder(() => resolveWorkspacePath({ root: workspaceRoot, candidate: target })));
+      const workingDirectory = yield* (isSessionFs(target.trim())
+        ? sessionWorkspace(target)
+        : folderAllowed.pipe(Effect.andThen(folder(() => resolveWorkspacePath({ root: workspaceRoot, candidate: target })))));
       const previous = (yield* store.getMount(conversationId)).workingDirectory;
       if (previous === workingDirectory) {
         return { switched: false, previous, workingDirectory };
@@ -179,6 +192,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
       return { switched: true, previous, workingDirectory };
     }, withLogScope(LOG_SCOPE)),
     createWorkspace: Effect.fnUntraced(function*(conversationId, name) {
+      yield* folderAllowed;
       yield* unblocked(conversationId);
       const workingDirectory = yield* folder(() => createWorkspace({ root: workspaceRoot, name }));
       return yield* mountCreated(conversationId, workingDirectory, `workspace.created conversation=${JSON.stringify(conversationId)} path=${workingDirectory}`);
@@ -199,6 +213,9 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string): Effect.fn
     forkSessionWorkspace: Effect.fnUntraced(function*(conversationId) {
       if (!sandbox) {
         return yield* new MountRefused({ message: "Session filesystems are not enabled on this deployment." });
+      }
+      if (branch) {
+        return yield* new MountRefused({ message: `This is the branch environment ${branch}: its session workspaces are forked from alasio's own as it first uses them, and it forks none of them itself.` });
       }
       const source = parseWorkspace((yield* store.getMount(conversationId)).workingDirectory);
       if (source?.kind !== "sessionfs") {
