@@ -7,9 +7,19 @@ import { HostCluster } from "../cluster/host.ts";
 import { forgetInotifyStep } from "../cluster/machine.ts";
 import { Root } from "../cluster/root.ts";
 import { loadConfig } from "../config.ts";
+import { branchNamespaces } from "../branches.ts";
 import { removeInstallation } from "../kube/apply.ts";
 import { describeTarget, dockerCluster, resolveTarget } from "../target.ts";
 import { onCluster, timeoutFlag, waitOptions } from "./common.ts";
+
+/** alasio has branch environments, which run on what removing it removes. */
+export class BranchesRemain extends Schema.TaggedError<BranchesRemain>()("BranchesRemain", {
+  branches: Schema.Array(Schema.String),
+}) {
+  override get message(): string {
+    return `alasio has the branch environments ${this.branches.join(", ")}, which run on its storage: alasio branch delete deletes each first`;
+  }
+}
 
 /** The operator did not confirm. */
 export class NotConfirmed extends Schema.TaggedError<NotConfirmed>()("NotConfirmed", {}) {
@@ -58,7 +68,14 @@ export const uninstall = Command.make(
         yield* Console.log(`alasio and the cluster ${target.cluster.name} are removed, with all their data; the config at ${config.path} is kept.`);
         return;
       }
-      const removed = yield* onCluster(() => removeInstallation({ purge }, waitOptions(timeout)));
+      const removed = yield* onCluster(() =>
+        Effect.gen(function*() {
+          // A branch environment runs on alasio's storage, which goes with it.
+          const branches = yield* branchNamespaces;
+          if (branches.length > 0) return yield* new BranchesRemain({ branches });
+          return yield* removeInstallation({ purge }, waitOptions(timeout));
+        })
+      );
       yield* Console.log(
         removed.length === 0
           ? `alasio is not installed in ${where}.`

@@ -129,19 +129,18 @@ const prune = Effect.fnUntraced(function*(desired: readonly KubernetesObject[]):
   }
 });
 
-/** Applies the installation `objects` are, deletes what it no longer has, and waits until its workloads run. */
-export const applyInstallation = Effect.fnUntraced(function*(
-  objects: readonly KubernetesObject[],
-  options: WaitOptions,
-): Effect.fn.Return<void, ApplyError, KubeApi> {
+/** The workloads of `objects`. */
+const workloadsOf = (objects: readonly KubernetesObject[]): ObjectRef[] =>
+  objects.filter((object) => WORKLOADS.some((name) => name === object.kind)).map(refOf);
+
+/** Applies `objects` in the order of PHASES, as the module says, without waiting for their workloads. */
+const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
   const kube = yield* KubeApi;
-  const desired = objects.map(labelled);
-  const unplaced = desired.filter((object) => !MADE_KINDS.some((each) => each.kind === object.kind && each.apiVersion === object.apiVersion));
+  const unplaced = objects.filter((object) => !MADE_KINDS.some((each) => each.kind === object.kind && each.apiVersion === object.apiVersion));
   if (unplaced.length > 0) return yield* Effect.die(new Error(`alasio does not apply ${unplaced.map((object) => describeRef(refOf(object))).join(", ")}`));
-  const ofPhase = (phase: readonly KindName[]) => desired.filter((object) => phase.some((name) => name === object.kind));
-  yield* Effect.logInfo(`applying ${desired.length} objects to ${kube.server}`);
+  yield* Effect.logInfo(`applying ${objects.length} objects to ${kube.server}`);
   for (const phase of PHASES) {
-    const batch = ofPhase(phase);
+    const batch = objects.filter((object) => phase.some((name) => name === object.kind));
     if (phase.includes("Job")) {
       for (const job of batch) yield* runJob(job, options);
       continue;
@@ -149,8 +148,26 @@ export const applyInstallation = Effect.fnUntraced(function*(
     yield* Effect.forEach(batch, (object) => kube.apply(object), { concurrency: 8, discard: true });
     if (phase.includes("CustomResourceDefinition")) yield* awaitReady(batch.map(refOf), options);
   }
+});
+
+/** Applies the installation `objects` are, deletes what it no longer has, and waits until its workloads run. */
+export const applyInstallation = Effect.fnUntraced(function*(
+  objects: readonly KubernetesObject[],
+  options: WaitOptions,
+): Effect.fn.Return<void, ApplyError, KubeApi> {
+  const desired = objects.map(labelled);
+  yield* applyPhases(desired, options);
   yield* prune(desired);
-  yield* awaitReady(ofPhase(WORKLOADS).map(refOf), options);
+  yield* awaitReady(workloadsOf(desired), options);
+});
+
+/**
+ * Applies `objects`, of no installation (a branch environment's, which a prune of the
+ * installation leaves be), and waits until their workloads run.
+ */
+export const applyObjects = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
+  yield* applyPhases(objects, options);
+  yield* awaitReady(workloadsOf(objects), options);
 });
 
 /**

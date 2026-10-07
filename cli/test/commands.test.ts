@@ -14,6 +14,7 @@ import { test, type TestContext } from "node:test";
 
 import { Cause, Exit } from "effect";
 
+import { forkToken } from "../../src/branch/names.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { downloads } from "../src/cluster/node.ts";
@@ -23,7 +24,7 @@ import { serveK3sInDocker } from "./support/fake-k3s.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
-import { serveFakeTelegram } from "./support/fake-telegram.ts";
+import { type FakeTelegram, serveFakeTelegram } from "./support/fake-telegram.ts";
 import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.ts";
 
 const BOT_TOKEN = "123:valid";
@@ -32,6 +33,7 @@ const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
 
 interface Rig {
   readonly kube: FakeKube;
+  readonly telegram: FakeTelegram;
   readonly docker: FakeDocker;
   readonly machine: FakeMachine;
   readonly home: string;
@@ -70,6 +72,7 @@ async function rig(t: TestContext): Promise<Rig> {
   const configFile = join(env.XDG_CONFIG_HOME, "alasio", "config.json");
   return {
     kube,
+    telegram,
     docker,
     machine,
     home,
@@ -740,4 +743,210 @@ test("a firewall that is not active, as ufw installed but not enabled, is left a
   assert.deepEqual(setup.machine.commands().filter((command) => command.startsWith("ufw") || command.startsWith("firewall-cmd")), []);
   succeeded(await setup.alasio(["uninstall", "--purge", "--yes"]));
   assert.deepEqual(setup.machine.commands().filter((command) => command.startsWith("ufw") || command.startsWith("firewall-cmd")), []);
+});
+
+/** Neon's branches as the fake neon-control keeps them, and what the computes' databases answer. */
+interface FakeNeon {
+  readonly branches: { name: string; parent: string | null; state: string; createdAt: string }[];
+  readonly asked: { readonly method: string; readonly path: string; readonly body?: unknown }[];
+  /** The active turns a branch's database has. */
+  turns: string;
+}
+
+/** A Secret of main's, as the stack's setup makes it. */
+function stackSecret(kube: FakeKube, name: string, data: Record<string, string>): void {
+  kube.put("secrets", { apiVersion: "v1", kind: "Secret", metadata: { name, namespace: "alasio" }, data: Object.fromEntries(Object.entries(data).map(([key, value]) => [key, Buffer.from(value).toString("base64")])) });
+}
+
+/**
+ * alasio installed, with the Secrets its stack's setup makes, and neon-control and the
+ * computes answering in their pods as they do: neon-control's API through curl, the
+ * databases through psql.
+ */
+async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon }> {
+  const setup = await installed(t);
+  stackSecret(setup.kube, "alasio-database", {
+    url: "postgresql://alasio:p@alasio-neon-compute:55433/alasio",
+    password: "p",
+    "lake-password": "l",
+    "lake-reader-password": "r",
+    "grafana-password": "g",
+  });
+  stackSecret(setup.kube, "alasio-lake", {
+    LAKE_DATABASE_PASSWORD: "l",
+    LAKE_S3_KEY: "k",
+    LAKE_S3_SECRET: "s",
+    LAKE_READER_PASSWORD: "r",
+    LAKE_READER_S3_KEY: "rk",
+    LAKE_READER_S3_SECRET: "rs",
+    LAKE_QUERY_TOKEN: "q",
+    LAKE_BRANCHES_TOKEN: "b",
+  });
+  stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
+  stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
+  const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0" };
+  setup.kube.onExec = ({ container, command }) => {
+    if (container === "neon-control") {
+      const method = command[command.indexOf("-X") + 1] ?? "";
+      const path = new URL(command.at(-1) ?? "").pathname;
+      const data = command.indexOf("--data-binary");
+      const body: unknown = data === -1 ? undefined : JSON.parse(command[data + 1] ?? "");
+      neon.asked.push({ method, path, ...(body === undefined ? {} : { body }) });
+      const answer = (status: number, answered?: unknown) => ({ exitCode: 0, stdout: `${answered === undefined ? "" : JSON.stringify(answered)}\n${status}` });
+      if (method === "GET") return answer(200, { branches: neon.branches });
+      if (method === "POST") {
+        const { name } = body as { name: string };
+        neon.branches.push({ name, parent: "main", state: "ready", createdAt: new Date().toISOString() });
+        return answer(201, { name, parent: "main", state: "ready" });
+      }
+      const name = path.split("/").at(-1);
+      neon.branches.splice(neon.branches.findIndex((branch) => branch.name === name), 1);
+      return answer(204);
+    }
+    if (container === "compute") {
+      const sql = command.at(-1) ?? "";
+      return { exitCode: 0, stdout: sql.includes("pg_current_wal_lsn") ? "0/1A2B3C8\n" : `${neon.turns}\n` };
+    }
+    return { exitCode: 0 };
+  };
+  return { ...setup, neon };
+}
+
+/** The value of `key` of the Secret `name` in `namespace`. */
+function secretIn(kube: FakeKube, namespace: string, name: string, key: string): string | undefined {
+  const encoded = (kube.get(`/api/v1/namespaces/${namespace}/secrets/${name}`)?.["data"] as Record<string, string> | undefined)?.[key];
+  return encoded === undefined ? undefined : Buffer.from(encoded, "base64").toString("utf8");
+}
+
+const BRANCH_DEPLOYMENT = "/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio";
+
+test("branch create branches Neon at main's latest commit, runs the branch's alasio, compute and lake on it with Secrets of its own, and refuses main's bot", async (t) => {
+  const { alasio, home, kube, neon, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  const token = (name: string, value: string) => {
+    writeFileSync(join(home, name), `${value}\n`);
+    return join(home, name);
+  };
+  assert.match(failure(await alasio(["branch", "create", "Try", "--bot-token-file", token("branch", "456:branch")])), /^Try is no branch's name: /u);
+  assert.equal(
+    failure(await alasio(["branch", "create", "try", "--bot-token-file", token("main", BOT_TOKEN)])),
+    "a branch's bot is its own: Telegram gives a bot's updates to one poller, and main's alasio polls main's bot",
+  );
+  assert.deepEqual(neon.asked, []);
+
+  const run = await alasio(["branch", "create", "try", "--bot-token-file", token("branch", "456:branch"), "--image", "registry.example:5000/alasio:next"]);
+  succeeded(run);
+  assert.deepEqual(neon.asked.filter(({ method }) => method === "POST"), [{ method: "POST", path: "/branches", body: { name: "try", lsn: "0/1A2B3C8" } }]);
+  const deployment = kube.get(BRANCH_DEPLOYMENT) as { metadata: { labels: Record<string, string> }; spec: { template: { spec: { containers: { image: string }[] } } } } | undefined;
+  assert.equal(deployment?.spec.template.spec.containers[0]?.image, "registry.example:5000/alasio:next");
+  assert.equal(deployment?.metadata.labels["alasio.dev/branch"], "try");
+  assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"));
+  assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake"));
+  // Its own bot, for main's users; main's database, lake and compute, which its copy of the data shares; its own token.
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "token"), "456:branch");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "allowedUserIds"), "42");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "url"), "postgresql://alasio:p@alasio-neon-compute:55433/alasio");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
+  // Of main's, only what the branch's alasio and lake use: nothing of Grafana's, the lake's query endpoint's, or neon-control's.
+  const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();
+  assert.deepEqual(keys("alasio-database"), ["lake-password", "url"]);
+  assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN"), "c");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);
+  assert.equal(run.printed.at(-1), "The branch try runs, on a copy of alasio's data as it is now. Message @branch_bot on Telegram to talk to it; alasio branch delete try deletes it.");
+  assert.equal(failure(await alasio(["branch", "create", "try", "--bot-token-file", token("branch", "456:branch")])), "there is a branch try already");
+});
+
+test("branch create warns when no node has the memory main's alasio, compute and lake use now, as the metrics server measures them", async (t) => {
+  const { alasio, home, kube, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  kube.put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { allocatable: { memory: "4Gi" } } });
+  kube.put("nodes", { apiVersion: "metrics.k8s.io/v1beta1", kind: "NodeMetrics", metadata: { name: "machine" }, usage: { memory: "3584Mi" } });
+  // Not the lake's query endpoint, which a branch's lake has none of.
+  for (const [component, containers] of [
+    ["alasio", { alasio: "400Mi" }],
+    ["neon-compute", { compute: "300Mi" }],
+    ["lake", { lake: "200Mi", query: "150Mi" }],
+    ["neon-pageserver", { pageserver: "1Gi" }],
+  ] as const) {
+    const labels = { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component };
+    const usage = Object.entries(containers).map(([name, memory]) => ({ name, usage: { memory } }));
+    kube.put("pods", { apiVersion: "metrics.k8s.io/v1beta1", kind: "PodMetrics", metadata: { name: `${component}-0`, namespace: "alasio", labels }, containers: usage });
+  }
+  const run = await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]);
+  succeeded(run);
+  assert.ok(run.printed.includes("Warning: a branch takes about 900 MiB, as main's alasio, compute and lake use now, and no node has more than 512 MiB free."), run.printed.join("\n"));
+});
+
+test("branch list says each branch, what it is a branch of, its age, its alasio, and the memory it requests", async (t) => {
+  const { alasio, home, telegram } = await branchable(t);
+  assert.deepEqual((await alasio(["branch", "list"])).printed, ["alasio has no branch environments."]);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  const listed = await alasio(["branch", "list"]);
+  succeeded(listed);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, its alasio ready, 2.5 GiB requested, 0 MiB used"]);
+});
+
+test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces", async (t) => {
+  const { alasio, home, kube, neon, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  neon.turns = "1";
+  assert.equal(failure(await alasio(["branch", "delete", "try"])), "its alasio has 1 turn running; --force deletes it all the same");
+  assert.ok(kube.get(BRANCH_DEPLOYMENT));
+  kube.changes.length = 0;
+  const run = await alasio(["branch", "delete", "try", "--force"]);
+  succeeded(run);
+  assert.equal(run.printed.at(-1), "The branch try is deleted, with all it had; main's data is as it was.");
+  const deleted = kube.changes.filter(({ method }) => method === "DELETE").map(({ path }) => path);
+  const at = (path: string) => deleted.indexOf(path);
+  assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
+  assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake") < at("/api/v1/namespaces/alasio-branch-try"));
+  assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
+  assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
+  assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);
+  assert.equal(failure(await alasio(["branch", "delete", "try"])), "there is no branch try");
+});
+
+test("login codex --branch logs the branch's own Codex in, in the branch's alasio's pod", async (t) => {
+  const { alasio, home, kube, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  succeeded(await alasio(["login", "codex", "--branch", "try"]));
+  assert.deepEqual(kube.execs.at(-1), { namespace: "alasio-branch-try", pod: "alasio-0", container: "alasio", command: CODEX_LOGIN, tty: false });
+});
+
+test("uninstall refuses while alasio has branch environments, which run on what it removes", async (t) => {
+  const { alasio, home, kube, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  assert.equal(failure(await alasio(["uninstall", "--yes"])), "alasio has the branch environments try, which run on its storage: alasio branch delete deletes each first");
+  assert.ok(kube.get(DEPLOYMENT));
+});
+
+test("a branch's configuration is main's with its overrides, and never the host profile, whose folders a branch cannot copy", async (t) => {
+  const { alasio, configure, config, home, kube, telegram } = await branchable(t);
+  configure({ ...(config() as object), install: { host: { enabled: true }, alasio: { defaultHarness: "claude" } } });
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  writeFileSync(join(home, "overrides.json"), JSON.stringify({ alasio: { defaultHarness: "codex", resources: { requests: { memory: "512Mi" } } }, imagePullSecrets: ["registry"] }));
+  kube.put("secrets", { apiVersion: "v1", kind: "Secret", metadata: { name: "registry", namespace: "alasio" }, type: "kubernetes.io/dockerconfigjson", data: { ".dockerconfigjson": "e30=" } });
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch"), "--overrides", join(home, "overrides.json")]));
+  const container = (kube.get(BRANCH_DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string; value?: string }[]; resources: { requests: Record<string, string> } }[]; volumes: { name: string }[] } } }).template.spec;
+  assert.equal(container.containers[0]?.env.find(({ name }) => name === "ALASIO_DEFAULT_HARNESS")?.value, "codex");
+  assert.deepEqual(container.containers[0]?.resources.requests, { cpu: "500m", memory: "512Mi" });
+  const templates = JSON.parse((kube.get("/api/v1/namespaces/alasio-branch-try/configmaps/alasio-sandbox-templates")?.["data"] as Record<string, string>)["templates.json"] ?? "");
+  assert.equal(templates.host, undefined);
+  // The pull Secrets of its images, in its own namespace.
+  assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try/secrets/registry")?.["type"], "kubernetes.io/dockerconfigjson");
+  writeFileSync(join(home, "overrides.json"), JSON.stringify({ alasio: { telegram: { existingSecret: "mine" } } }));
+  assert.match(failure(await alasio(["branch", "create", "other", "--bot-token-file", join(home, "branch"), "--overrides", join(home, "overrides.json")])), /install\.alasio\.telegram is alasio's own to say/u);
 });

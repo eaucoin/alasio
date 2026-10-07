@@ -2,6 +2,8 @@
  * What alasio's commands share: the cluster the config targets, reached; its
  * components and their pods; and the flags several commands take.
  */
+import { Readable, Writable } from "node:stream";
+
 import type { KubernetesObject, V1Pod } from "@kubernetes/client-node";
 import { Duration, Effect, Schema } from "effect";
 import { Flag } from "effect/cli";
@@ -9,10 +11,10 @@ import { Flag } from "effect/cli";
 import { DockerCluster } from "../cluster/docker.ts";
 import { HostCluster } from "../cluster/host.ts";
 import { loadConfig } from "../config.ts";
-import { kind, KubeApi, type KubeApiError } from "../kube/api.ts";
+import { type ContainerRef, kind, KubeApi, type KubeApiError, type KubeExecError } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { podProblems, selectorOf, type WaitOptions } from "../kube/rollout.ts";
-import { NAMESPACE, RELEASE } from "../manifests/common.ts";
+import { NAMESPACE, RELEASE, selectorLabels } from "../manifests/common.ts";
 import { dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 
 /** How often a wait looks. */
@@ -128,12 +130,14 @@ export const component = Effect.fnUntraced(function*(name: string): Effect.fn.Re
   return match;
 });
 
+/** The pods of `namespace` that `labels` select, the newest first. */
+const podsSelected = (namespace: string, labels: Readonly<Record<string, string>>): Effect.Effect<readonly V1Pod[], KubeApiError, KubeApi> =>
+  Effect.flatMap(KubeApi, (kube) => kube.list<V1Pod>(kind("Pod"), { namespace, labelSelector: selectorOf(labels) })).pipe(
+    Effect.map((pods) => pods.toSorted((a, b) => new Date(b.metadata?.creationTimestamp ?? 0).getTime() - new Date(a.metadata?.creationTimestamp ?? 0).getTime())),
+  );
+
 /** The pods of `of`, the newest first. */
-export const podsOf = (of: Component): Effect.Effect<readonly V1Pod[], KubeApiError, KubeApi> =>
-  Effect.flatMap(KubeApi, (kube) =>
-    kube.list<V1Pod>(kind("Pod"), { namespace: NAMESPACE, labelSelector: selectorOf(of.workload.spec?.selector?.matchLabels ?? {}) })).pipe(
-      Effect.map((pods) => pods.toSorted((a, b) => new Date(b.metadata?.creationTimestamp ?? 0).getTime() - new Date(a.metadata?.creationTimestamp ?? 0).getTime())),
-    );
+export const podsOf = (of: Component): Effect.Effect<readonly V1Pod[], KubeApiError, KubeApi> => podsSelected(NAMESPACE, of.workload.spec?.selector?.matchLabels ?? {});
 
 /** No pod of a component runs ready, so nothing can be run in one. */
 export class NoRunningPod extends Schema.TaggedError<NoRunningPod>()("NoRunningPod", {
@@ -145,13 +149,42 @@ export class NoRunningPod extends Schema.TaggedError<NoRunningPod>()("NoRunningP
   }
 }
 
-/** The newest pod of the component `name` that runs ready. */
-export const runningPod = Effect.fnUntraced(function*(name: string): Effect.fn.Return<string, KubeApiError | UnknownComponent | NoRunningPod, KubeApi> {
-  const pods = yield* podsOf(yield* component(name));
+/** The newest of `pods`, of the component `name`, that runs ready. */
+const readyPod = (name: string, pods: readonly V1Pod[]): Effect.Effect<string, NoRunningPod> => {
   const running = pods.find((pod) => pod.status?.phase === "Running" && podProblems(pod).length === 0);
-  if (!running?.metadata?.name) return yield* new NoRunningPod({ component: name, why: pods.flatMap(podProblems) });
-  return running.metadata.name;
-});
+  return running?.metadata?.name ? Effect.succeed(running.metadata.name) : Effect.fail(new NoRunningPod({ component: name, why: pods.flatMap(podProblems) }));
+};
+
+/** The newest pod of the component `name` that runs ready. */
+export const runningPod = (name: string): Effect.Effect<string, KubeApiError | UnknownComponent | NoRunningPod, KubeApi> =>
+  component(name).pipe(Effect.flatMap(podsOf), Effect.flatMap((pods) => readyPod(name, pods)));
+
+/** The newest pod of `component` in `namespace`, a branch environment's, that runs ready. */
+export const runningPodIn = (namespace: string, component: string): Effect.Effect<string, KubeApiError | NoRunningPod, KubeApi> =>
+  podsSelected(namespace, selectorLabels(component)).pipe(Effect.flatMap((pods) => readyPod(`${component} of ${namespace}`, pods)));
+
+/** What a command run in a container printed, and the code it exited with. */
+export interface Ran {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Runs `command` in the container, given `stdin` when there is one: what it printed, and its exit code. */
+export const runIn = (target: ContainerRef, command: readonly string[], stdin?: string): Effect.Effect<Ran, KubeApiError | KubeExecError, KubeApi> =>
+  Effect.flatMap(KubeApi, (kube) => {
+    const printed = { stdout: "", stderr: "" };
+    const into = (stream: "stdout" | "stderr") =>
+      new Writable({
+        write: (chunk: Buffer, _encoding, done) => {
+          printed[stream] += chunk.toString("utf8");
+          done();
+        },
+      });
+    return kube.exec(target, command, { stdin: stdin === undefined ? null : Readable.from([stdin]), stdout: into("stdout"), stderr: into("stderr"), tty: false }).pipe(
+      Effect.map((exitCode) => ({ exitCode, ...printed })),
+    );
+  });
 
 /** A command run in alasio's cluster exited with another code than 0. */
 export class CommandFailed extends Schema.TaggedError<CommandFailed>()("CommandFailed", {

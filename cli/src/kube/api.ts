@@ -60,6 +60,9 @@ const KINDS = {
   Job: { apiVersion: "batch/v1", plural: "jobs", namespaced: true },
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
   Sandbox: { apiVersion: "agents.x-k8s.io/v1beta1", plural: "sandboxes", namespaced: true },
+  // What the cluster's metrics server measures its pods and nodes using now.
+  PodMetrics: { apiVersion: "metrics.k8s.io/v1beta1", plural: "pods", namespaced: true },
+  NodeMetrics: { apiVersion: "metrics.k8s.io/v1beta1", plural: "nodes", namespaced: false },
 } as const;
 
 export type KindName = keyof typeof KINDS;

@@ -56,10 +56,11 @@ export const lake = Command.make(
       "attributes maps of text. Telemetry joins transcripts by these attributes: alasio.conversation.id, the conversation, on " +
       "alasio's alasio.turn span and on the resource of Claude Code's and folder workspaces' bayma's telemetry; " +
       "alasio.session.id, the harness's session (claude.entries.session_id, codex.lines.thread_id), on alasio.turn; " +
-      "alasio.volume.id, a session workspace, on alasio.turn and on the resource of its bayma's telemetry; alasio.branch is " +
-      "reserved for branch environments. Errors by harness: \"SELECT SpanAttributes['alasio.harness'] AS harness, " +
-      "count(*) FILTER (StatusCode = 'Error') AS failed, count(*) AS turns FROM otel.traces WHERE SpanName = 'alasio.turn' " +
-      "GROUP BY 1\". A conversation's Claude output tokens: \"SELECT conversation, sum(output_tokens) FROM (SELECT DISTINCT " +
+      "alasio.volume.id, a session workspace, on alasio.turn and on the resource of its bayma's telemetry; alasio.branch, a " +
+      "branch environment's name (alasio branch), on the resource of everything it sends. Errors by harness: " +
+      "\"SELECT SpanAttributes['alasio.harness'] AS harness, count(*) FILTER (StatusCode = 'Error') AS failed, count(*) AS turns " +
+      "FROM otel.traces WHERE SpanName = 'alasio.turn' GROUP BY 1\". A conversation's Claude output tokens: " +
+      "\"SELECT conversation, sum(output_tokens) FROM (SELECT DISTINCT " +
       "SpanAttributes['alasio.conversation.id'] AS conversation, SpanAttributes['alasio.session.id'] AS session_id FROM " +
       "otel.traces WHERE SpanName = 'alasio.turn') JOIN claude.messages USING (session_id) GROUP BY 1\".",
   ),
