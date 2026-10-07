@@ -23,6 +23,7 @@ import {
   NeonConversationRepository,
   type NewConversation,
   type NewModelChoice,
+  type WorkspaceConversation,
 } from "./conversation-repository.ts";
 import { NeonOutboxRepository, type NewOutboxText, type OutboxEntry } from "./outbox-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
@@ -105,6 +106,8 @@ export class Store extends Context.Service<Store, {
   readonly listConversationsWithSessions: (harness: HarnessName) => Stored<LinkedConversation[]>;
   /** Every session of a harness alasio points at, with the folder it runs in. */
   readonly listHarnessSessionReferences: (harness: HarnessName) => Stored<HarnessSessionReference[]>;
+  /** The conversations that know the workspace: mounting it, or keeping a session of it parked; none for one alasio never made. */
+  readonly listWorkspaceConversations: (workingDirectory: string) => Stored<WorkspaceConversation[]>;
   readonly setActiveHarness: (conversationId: string, harness: HarnessName) => Stored<void>;
   /** Mounts a folder: the sessions of the folder left are kept for it, and those kept for this one restored. */
   readonly setWorkingDirectory: (conversationId: string, workingDirectory: string) => Stored<void>;
@@ -118,6 +121,8 @@ export class Store extends Context.Service<Store, {
   readonly recordSessionWorkspace: (workspace: NewSessionWorkspace) => Stored<void>;
   /** Marks a session filesystem made, with the internet it was made with. */
   readonly markSessionWorkspaceMade: (volumeId: string, netMode: SessionWorkspaceNetMode) => Stored<void>;
+  /** Records, as made, a session filesystem a branch environment inherited, which its parent forked into it (../branch/fork.ts). */
+  readonly recordInheritedSessionWorkspace: (volumeId: string, netMode: SessionWorkspaceNetMode) => Stored<void>;
   readonly forgetSessionWorkspace: (volumeId: string) => Stored<void>;
   /** Every session filesystem recorded, made or not, newest first. */
   readonly listSessionWorkspaces: Stored<SessionWorkspace[]>;
@@ -235,6 +240,7 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     getMount: (conversationId) => conversations.getMount(conversationId),
     listConversationsWithSessions: (harness) => conversations.listConversationsWithSessions(harness),
     listHarnessSessionReferences: (harness) => conversations.listHarnessSessionReferences(harness),
+    listWorkspaceConversations: (workingDirectory) => conversations.listWorkspaceConversations(workingDirectory),
     setActiveHarness: (conversationId, harness) => conversations.setActiveHarness(conversationId, harness),
     setWorkingDirectory: (conversationId, workingDirectory) => conversations.setWorkingDirectory(conversationId, workingDirectory),
     getModelChoice: (conversationId, harness) => conversations.getModelChoice(conversationId, harness),
@@ -244,6 +250,7 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
 
     recordSessionWorkspace: (workspace) => sessionWorkspaces.record(workspace),
     markSessionWorkspaceMade: (volumeId, netMode) => sessionWorkspaces.markMade(volumeId, netMode),
+    recordInheritedSessionWorkspace: (volumeId, netMode) => sessionWorkspaces.recordInherited(volumeId, netMode),
     forgetSessionWorkspace: (volumeId) => sessionWorkspaces.forget(volumeId),
     listSessionWorkspaces: sessionWorkspaces.list(),
 

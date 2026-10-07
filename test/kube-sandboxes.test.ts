@@ -35,7 +35,7 @@ import {
   sandboxReady,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
-import { cloneJobManifest, EGRESS_GATE_SCRIPT, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
+import { cloneJobManifest, EGRESS_GATE_SCRIPT, type NetMode, SessionInheritError, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
 import type { Signal } from "../src/telemetry/config.ts";
@@ -683,6 +683,54 @@ test("a session on Kubernetes is made when created, and its files are read as it
     yield* sessions.volumes.destroy("fs-abc123");
     assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123"), null);
   }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))));
+});
+
+test("a branch environment's session it has no Sandbox of is forked from its parent's as it is first brought up, and one its parent never had is made empty", async () => {
+  const kube = fakeKube();
+  const namespace = "alasio-branch-x-sessions";
+  const asked: string[] = [];
+  const recorded: string[][] = [];
+  const inherit = {
+    // The parent, forking its session into the branch's namespace, suspended, as it does.
+    fork: (volumeId: string) =>
+      Effect.sync(() => {
+        asked.push(volumeId);
+        if (volumeId === "fs-new000") return false;
+        kube.create(sessionSandboxManifest({ volumeId, netMode: "full", profile: profile({ namespace }), telemetry: null, operatingMode: "Suspended", forkedFrom: volumeId }));
+        return true;
+      }),
+    record: (volumeId: string, netMode: NetMode) => Effect.sync(() => void recorded.push([volumeId, netMode])),
+  };
+  const controllers = ["fs-abc123", "fs-new000"].map((name) => kube.control(namespace, name));
+  const layer = SessionSandboxes.layer({ profile: profile({ namespace }), stateDir: "/tmp/alasio-kube-test", env: {}, inherit });
+  await onKube(kube, fakeBayma(kube, namespace), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.ensureSession("fs-abc123");
+    assert.equal(kube.peek("Sandbox", namespace, "fs-abc123")?.metadata.labels?.["alasio.dev/net-mode"], "full");
+    assert.equal(kube.peek("Sandbox", namespace, "fs-abc123")?.spec?.operatingMode, "Running");
+    // Once it has its own, the parent is not asked again.
+    yield* sessions.ensureSession("fs-abc123");
+    yield* sessions.ensureSession("fs-new000");
+    assert.equal(kube.peek("Sandbox", namespace, "fs-new000")?.metadata.labels?.["alasio.dev/net-mode"], "none");
+    assert.deepEqual(asked, ["fs-abc123", "fs-new000"]);
+    // Recorded as made, with its internet, as alasio records the sessions it makes; the one made empty is not the parent's.
+    assert.deepEqual(recorded, [["fs-abc123", "full"]]);
+  }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))))).finally(() => {
+    for (const controller of controllers) controller.stop();
+  });
+
+  const refusing = SessionSandboxes.layer({
+    profile: profile({ namespace }),
+    stateDir: "/tmp/alasio-kube-test",
+    env: {},
+    inherit: { fork: () => Effect.fail(new SessionInheritError({ message: "a turn runs in it" })), record: () => Effect.die("nothing is forked to record") },
+  });
+  const refused = await onKube(fakeKube(), fetch, Effect.flip(Effect.flatMap(SessionSandboxes, (sessions) => sessions.ensureSession("fs-abc123"))).pipe(
+    Effect.provide(refusing),
+    Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+  ));
+  assert.equal(refused._tag, "SessionInheritError");
+  assert.equal(refused.message, "a turn runs in it");
 });
 
 /** The installation's Job that clones a session's volume, as alasio is given it. */

@@ -81,6 +81,12 @@ export interface HarnessSessionReference {
   readonly workingDirectory: string;
 }
 
+/** A conversation that knows a workspace: mounting it now, or keeping a session of it parked. */
+export interface WorkspaceConversation {
+  readonly conversationId: string;
+  readonly mounted: boolean;
+}
+
 /** A model, and optionally a reasoning effort, chosen for a harness with /model. */
 export interface ModelChoice {
   readonly model: string;
@@ -187,6 +193,18 @@ export class NeonConversationRepository {
    * each conversation's mounted one, the ones parked per folder, and those of
    * active turns. Distinct by session.
    */
+  /** The conversations that know the workspace `workingDirectory`, each once. */
+  listWorkspaceConversations(workingDirectory: string): Effect.Effect<WorkspaceConversation[], StoreError> {
+    return this.#sql.query<WorkspaceConversation>(
+      `select id as "conversationId", bool_or(mounted) as mounted from (
+         select id, true as mounted from ${this.#schema}.conversations where working_directory = $1
+         union all
+         select conversation_id, false from ${this.#schema}.workspace_sessions where working_directory = $1
+       ) as knowing group by id`,
+      [workingDirectory],
+    );
+  }
+
   listHarnessSessionReferences(harness: HarnessName): Effect.Effect<HarnessSessionReference[], StoreError> {
     const column = SESSION_COLUMNS[harness];
     return this.#sql.query<HarnessSessionReference>(

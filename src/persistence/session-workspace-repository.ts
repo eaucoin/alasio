@@ -49,6 +49,15 @@ export class NeonSessionWorkspaceRepository {
     ));
   }
 
+  /** Records a session filesystem a branch environment inherited, forked by its parent, as made, unless it is already. */
+  recordInherited(volumeId: string, netMode: SessionWorkspaceNetMode): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `insert into ${this.#schema}.session_workspaces (volume_id, net_mode, made_at) values ($1, $2, now())
+       on conflict (volume_id) do update set net_mode = excluded.net_mode, made_at = coalesce(session_workspaces.made_at, excluded.made_at)`,
+      [volumeId, netMode],
+    ));
+  }
+
   forget(volumeId: string): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.session_workspaces where volume_id = $1`, [volumeId]));
   }

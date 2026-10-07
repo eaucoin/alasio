@@ -261,6 +261,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       warmLinkedSessions: false,
       defaultHarness: null,
       branch: null,
+      branchForkKeyFile: null,
     };
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const store = yield* Store;

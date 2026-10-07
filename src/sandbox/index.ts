@@ -25,6 +25,10 @@
  * prepares its workspace, before the clone is whole; the source is suspended while it is
  * cloned, so nothing in it writes meanwhile, and resumed after. A fork carries nothing
  * but the files: no conversation, no harness session, nothing of the source's processes.
+ *
+ * A branch environment's alasio (../branch/fork.ts) has sessions of its own, in its own
+ * namespace, and none of its parent's: a session its conversations inherited is forked
+ * from the parent's, by the parent, under the same id, as it is first brought up here.
  */
 import { createHash } from "node:crypto";
 import type { LookupAddress } from "node:dns";
@@ -112,8 +116,16 @@ export class SessionFileError extends Schema.TaggedError<SessionFileError>()("Se
   message: Schema.String,
 }) {}
 
+/**
+ * A branch environment's session could not be forked from its parent's as it was first
+ * brought up: why, as the operator is told.
+ */
+export class SessionInheritError extends Schema.TaggedError<SessionInheritError>()("SessionInheritError", {
+  message: Schema.String,
+}) {}
+
 /** How making a session's Sandbox and reaching its bayma fails. */
-export type SessionError = SandboxError | SessionTelemetryUnavailable;
+export type SessionError = SandboxError | SessionTelemetryUnavailable | SessionInheritError;
 
 /** A session could not be forked: why. */
 export class SessionForkError extends Schema.TaggedError<SessionForkError>()("SessionForkError", {
@@ -135,6 +147,23 @@ export interface SessionSandboxesOptions {
   readonly env?: Readonly<NodeJS.ProcessEnv>;
   readonly createForwarder?: (env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void) => Promise<OtlpForwarder>;
   readonly resolve?: (hostname: string) => Promise<LookupAddress>;
+  /** Where alasio is a branch environment, how it comes by the sessions it inherited. */
+  readonly inherit?: Inheritance | undefined;
+}
+
+/**
+ * How a branch environment's alasio comes by a session it inherited (../branch/fork.ts),
+ * as it is first brought up here.
+ */
+export interface Inheritance {
+  /**
+   * Forks the session `volumeId` of the alasio it was branched from into its own sessions,
+   * suspended: whether it did, which it does not for a session that one never had, made
+   * again empty here as a session that is gone is.
+   */
+  readonly fork: (volumeId: string) => Effect.Effect<boolean, SessionInheritError>;
+  /** Records a session so forked as made, with its internet, as alasio records those it makes. */
+  readonly record: (volumeId: string, netMode: NetMode) => Effect.Effect<void, SessionInheritError>;
 }
 
 /**
@@ -340,6 +369,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   env = process.env,
   createForwarder = loadForwarder,
   resolve = lookup,
+  inherit,
 }: SessionSandboxesOptions) {
   const kube = yield* KubeClient;
 
@@ -496,6 +526,25 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       Effect.map((sandbox) => (sandbox?.metadata?.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none")),
     );
 
+  /**
+   * A session there is no Sandbox of, forked from the parent's where alasio is a branch
+   * environment and the parent has it, and recorded as made.
+   */
+  const inherited = (volumeId: string): Effect.Effect<void, KubeApiError | SessionInheritError> =>
+    inherit
+      ? sandboxes.exists(volumeId).pipe(
+        Effect.flatMap((exists) => (exists ? Effect.succeed(false) : inherit.fork(volumeId))),
+        Effect.flatMap((forked) =>
+          forked
+            ? netModeOf(volumeId).pipe(
+              Effect.flatMap((netMode) => inherit.record(volumeId, netMode)),
+              Effect.andThen(Effect.logInfo(`forked session ${volumeId} from the alasio this branch was branched from`)),
+            )
+            : Effect.void
+        ),
+      )
+      : Effect.void;
+
   const readFile = Effect.fnUntraced(function*(volumeId: string, path: string, maxBytes: number): Effect.fn.Return<FileRead, KubeApiError | KubeExecError | SessionFileError> {
     // A Sandbox, as the API server returns one.
     const sandbox = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(volumeId))) as Sandbox | null;
@@ -614,7 +663,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     ensureSession: (volumeId) =>
       Effect.suspend(() => {
         const id = assertValidVolumeId(volumeId);
-        return netModeOf(id).pipe(Effect.flatMap((netMode) => ensure(id, netMode)));
+        return inherited(id).pipe(Effect.andThen(netModeOf(id)), Effect.flatMap((netMode) => ensure(id, netMode)));
       }).pipe(Effect.map((bayma) => ({ bayma }))),
 
     readFile,

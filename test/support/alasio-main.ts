@@ -14,6 +14,7 @@
 import { Effect } from "effect";
 import pg from "pg";
 
+import type { BranchEnvironment } from "../../src/config.ts";
 import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
 import { runAlasio, serveAlasio } from "../../src/alasio.ts";
 import { bridgedQueryFactory } from "./claude.ts";
@@ -31,7 +32,7 @@ export interface AlasioProcessConfig {
   /** The bayma every folder workspace is given. */
   readonly folderBayma: BaymaMcpServer;
   /** The branch environment alasio is, if it is one. */
-  readonly branch?: string;
+  readonly branch?: BranchEnvironment;
 }
 
 /** What the process tells its parent once alasio has started. */
@@ -60,6 +61,7 @@ if (import.meta.main) {
       warmLinkedSessions: false,
       defaultHarness: null,
       branch: config.branch ?? null,
+      branchForkKeyFile: null,
       folderBayma: () => Effect.succeed(config.folderBayma),
       claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
     });

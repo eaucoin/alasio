@@ -4,15 +4,16 @@
  * against the tests' stand-ins.
  */
 import { NodeRuntime } from "@effect/platform-node";
-import { Cause, Effect, Exit, Layer, type Scope } from "effect";
+import { Cause, Effect, Exit, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
+import { parentForks, serveBranchForks } from "./branch/fork.ts";
 import { CodexAppServer } from "./codex/app-server/client.ts";
 import { codexHome } from "./codex/env.ts";
 import { type CodexLoginError, keepCodexLogin } from "./codex/login.ts";
 import { SessionFsCodex, sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { Turns } from "./codex/turns.ts";
-import type { AlasioConfig } from "./config.ts";
+import type { AlasioConfig, BranchEnvironment } from "./config.ts";
 import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { Harnesses } from "./harness/index.ts";
@@ -22,7 +23,7 @@ import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
-import { SessionSandboxes } from "./sandbox/index.ts";
+import { type Inheritance, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
 import { AlasioLoggerLayer } from "./shared/log.ts";
 import { TracingLayer } from "./telemetry/index.ts";
 import { stopTelemetry } from "./telemetry/start.ts";
@@ -68,7 +69,7 @@ export type AlasioServices =
  */
 export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServices, StoreError | CodexLoginError> {
   return MediaGroups.layer().pipe(
-    Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds))),
+    Layer.provideMerge(Layer.mergeAll(Mounts.layer(options), Authorizer.layer(options.allowedUserIds), branchForks(options))),
     Layer.provideMerge(Turns.layer()),
     Layer.provideMerge(Harnesses.layer({
       sessionStore: options.sessionStore,
@@ -88,7 +89,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       ActiveTurns.layer,
     )),
     Layer.provideMerge(Layer.mergeAll(
-      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch }),
+      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name }),
       TelegramClient.layer(options.telegramBotToken),
     )),
   );
@@ -100,15 +101,53 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
  * and folder workspaces' bayma (HostBayma). They are not among AlasioServices, which are
  * always there; what uses them asks whether they are.
  */
-function workspaceServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<never> {
+function workspaceServices({ kubeTemplates, stateDir, branch }: AlasioOptions): Layer.Layer<never, never, Store> {
   const sessions = kubeTemplates?.sessions ?? null;
   const host = kubeTemplates?.host ?? null;
   if (!sessions && !host) return Layer.empty;
   return Layer.mergeAll(
     // Settings the deployment gives wrongly stop alasio as it starts.
-    sessions ? Layer.orDie(SessionSandboxes.layer({ profile: sessions, stateDir })) : Layer.empty,
+    sessions
+      ? Layer.unwrap(Effect.gen(function*() {
+        const inherit = branch ? inheritance(branch, yield* Store) : undefined;
+        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, stateDir, inherit }));
+      }))
+      : Layer.empty,
     host ? HostBayma.layer(host) : Layer.empty,
   ).pipe(Layer.provide(KubeClient.layer));
+}
+
+/**
+ * A branch environment's sessions it inherited: forked by its parent, which it asks
+ * (./branch/fork.ts), and recorded as made in its own store, as it records those it makes.
+ */
+function inheritance(branch: BranchEnvironment, store: Store["Service"]): Inheritance {
+  return {
+    fork: parentForks({ url: branch.parentForks, branch: branch.name, tokenFile: branch.tokenFile }),
+    record: (volumeId, netMode) =>
+      store.recordInheritedSessionWorkspace(volumeId, netMode).pipe(
+        Effect.mapError((error) => new SessionInheritError({ message: `the session ${volumeId} forked from the alasio this branch was branched from could not be recorded: ${error.message}` })),
+      ),
+  };
+}
+
+/**
+ * Where the deployment gives alasio the key branch environments' tokens are signed with,
+ * and it has sessions, the server they ask to fork the sessions they inherited
+ * (./branch/fork.ts), for as long as alasio runs; a server that cannot listen stops
+ * alasio as it starts.
+ */
+function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | ActiveTurns> {
+  if (!branchForkKeyFile) return Layer.empty;
+  return Layer.effectDiscard(
+    Effect.serviceOption(SessionSandboxes).pipe(
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.void,
+        onSome: (sandboxes) => Effect.provideService(serveBranchForks({ keyFile: branchForkKeyFile }), SessionSandboxes, sandboxes),
+      })),
+      Effect.orDie,
+    ),
+  );
 }
 
 /**
