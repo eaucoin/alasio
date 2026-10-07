@@ -16,6 +16,11 @@ export interface AlasioConfig {
   readonly hookPort: number;
   readonly warmLinkedSessions: boolean;
   readonly defaultHarness: HarnessName | null;
+  /**
+   * The branch environment this alasio is (`alasio branch create`), on a copy of another
+   * alasio's data; null for main.
+   */
+  readonly branch: string | null;
 }
 
 /** How alasio talks to Codex: through `codex exec` or a Codex app-server. */
@@ -44,6 +49,7 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     hookPort: resolveHookPort(env),
     warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),
+    branch: env["ALASIO_BRANCH"]?.trim() || null,
   };
 }
 

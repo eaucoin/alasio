@@ -47,13 +47,14 @@ export function newSchema(): string {
   return `alasio_test_${schemas}`;
 }
 
-/** The store in `schema` (a new one unless given), made empty where it was not made. */
-export async function testStore({ schema = newSchema(), workingDirectory = null }: {
+/** The store in `schema` (a new one unless given), made empty where it was not made, a branch environment's when `branch` names one. */
+export async function testStore({ schema = newSchema(), workingDirectory = null, branch = null }: {
   readonly schema?: string | undefined;
   readonly workingDirectory?: string | null | undefined;
+  readonly branch?: string | null | undefined;
 } = {}): Promise<Store["Service"]> {
   const { pool } = await database();
-  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory })));
+  return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch })));
 }
 
 /** Runs what a test asks of a store: its value. */

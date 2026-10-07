@@ -30,6 +30,8 @@ export interface AlasioProcessConfig {
   readonly claudeSocket: string;
   /** The bayma every folder workspace is given. */
   readonly folderBayma: BaymaMcpServer;
+  /** The branch environment alasio is, if it is one. */
+  readonly branch?: string;
 }
 
 /** What the process tells its parent once alasio has started. */
@@ -57,6 +59,7 @@ if (import.meta.main) {
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
+      branch: config.branch ?? null,
       folderBayma: () => Effect.succeed(config.folderBayma),
       claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
     });

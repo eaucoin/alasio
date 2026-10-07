@@ -260,6 +260,7 @@ test("alasio's services wire the durable outbox into final response delivery", a
       hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
+      branch: null,
     };
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const store = yield* Store;

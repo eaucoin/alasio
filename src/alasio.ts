@@ -88,7 +88,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       ActiveTurns.layer,
     )),
     Layer.provideMerge(Layer.mergeAll(
-      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory }),
+      Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch }),
       TelegramClient.layer(options.telegramBotToken),
     )),
   );

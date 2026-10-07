@@ -11,6 +11,7 @@ import type { Pool } from "pg";
 
 import type { HarnessName } from "../harness/names.ts";
 import type { MediaAttachment } from "../telegram/client.ts";
+import { startBranch } from "./branch-start.ts";
 import { type CallbackAction, NeonCallbackRepository, type NewCallbackAction } from "./callback-repository.ts";
 import { NeonCodexLoginRepository } from "./codex-login-repository.ts";
 import {
@@ -64,6 +65,8 @@ export interface StoreOptions {
   readonly schema?: string | undefined;
   /** The folder a new conversation is mounted on, if any. */
   readonly workingDirectory?: string | null | undefined;
+  /** The branch environment alasio is, whose state is made its own as it first opens (./branch-start.ts); none for main. */
+  readonly branch?: string | null | undefined;
 }
 
 /** Each of alasio's repositories, on one connection or transaction. */
@@ -208,9 +211,12 @@ export class Store extends Context.Service<Store, {
   static readonly layer = (options: StoreOptions): Layer.Layer<Store, StoreError> => Layer.effect(Store, makeStore(options));
 }
 
-const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null }: StoreOptions) {
+const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, workingDirectory = null, branch = null }: StoreOptions) {
   const database = poolDatabase(pool);
   yield* ensureSchema(database, schema);
+  if (branch && (yield* startBranch(database, schema, branch))) {
+    yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
+  }
   const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces } = repositories(
     database,
     schema,

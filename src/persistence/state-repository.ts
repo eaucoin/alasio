@@ -2,7 +2,8 @@ import { Effect } from "effect";
 
 import type { Sql, StoreError } from "./sql.ts";
 
-const TELEGRAM_OFFSET = "telegram_update_offset";
+/** The key of bot_state that holds Telegram's update offset. */
+export const TELEGRAM_OFFSET = "telegram_update_offset";
 
 export class NeonStateRepository {
   readonly #sql: Sql;
