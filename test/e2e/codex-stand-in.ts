@@ -7,13 +7,18 @@
  * turn is answered at once with ANSWER as its final answer. Every request is a server
  * span named by its method, of the trace alasio sends it in when it does, with the name
  * the client initialized with, exported where alasio's `-c otel.trace_exporter=` says,
- * from the service codex-app-server, as Codex's own are. It keeps its threads in memory
+ * from the service codex-app-server, as Codex's own are. Each thread's rollout is written
+ * as Codex writes it, under `$CODEX_HOME/sessions/`: its meta, and each turn's context,
+ * start, messages and completion, all written before the turn is said to be done, so
+ * alasio mirrors and the lake loads them as Codex's. It keeps its threads in memory
  * only, so a thread it is asked to resume that it has not seen, one an earlier process
- * ran, is resumed empty.
+ * ran, is resumed empty, in a rollout of its own.
  *
  *   codex-stand-in.ts app-server [-c key=value]... --listen stdio://
  */
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 import { context, propagation, type Span, SpanKind, trace } from "@opentelemetry/api";
@@ -38,6 +43,20 @@ import {
 
 /** What every turn answers. */
 export const ANSWER = "Answered by the end-to-end run's stand-in for Codex.";
+
+/** A line of a rollout, as Codex writes one: its time, its type, and what it says. */
+function rolloutLine(type: string, payload: object): string {
+  return `${JSON.stringify({ timestamp: new Date().toISOString(), type, payload })}\n`;
+}
+
+/**
+ * Where a thread's rollout is under the Codex home `home`, as Codex names it: by the day
+ * and the second it was made, and the thread's id.
+ */
+export function rolloutPath(home: string, threadId: string, made: Date): string {
+  const [day = "", time = ""] = made.toISOString().split("T");
+  return join(home, "sessions", ...day.split("-"), `rollout-${day}T${time.slice(0, 8).replaceAll(":", "-")}-${threadId}.jsonl`);
+}
 
 /** A request as alasio writes it: with the trace it is part of, when it is part of one. */
 type Request = ClientRequest & { readonly trace?: { readonly traceparent?: string; readonly tracestate?: string } };
@@ -101,9 +120,20 @@ async function serve(args: readonly string[]): Promise<void> {
   const notify = (notification: ServerNotification) => write(notification);
   const now = () => Math.floor(Date.now() / 1000);
 
+  /** Each thread's rollout, by its id. */
+  const rollouts = new Map<string, string>();
+  const record = (threadId: string, type: string, payload: object) => {
+    const path = rollouts.get(threadId);
+    if (path) appendFileSync(path, rolloutLine(type, payload));
+  };
+
   const newThread = (id: string, cwd: string) => {
     const thread = codexThread(id, { cwd, model: ALASIO_CODEX_MODEL, createdAt: now(), updatedAt: now() });
     threads.set(id, thread);
+    const path = rolloutPath(process.env["CODEX_HOME"] ?? "", id, new Date());
+    mkdirSync(join(path, ".."), { recursive: true });
+    rollouts.set(id, path);
+    record(id, "session_meta", { id, timestamp: new Date().toISOString(), cwd, originator: client ?? "", cli_version: "stand-in" });
     return thread;
   };
 
@@ -136,7 +166,13 @@ async function serve(args: readonly string[]): Promise<void> {
       span.setAttribute("turn.id", turn.id);
       const answer = agentMessage(randomUUID(), ANSWER, "final_answer");
       const done = codexTurn(turn.id, { items: [userMessage(randomUUID(), input), answer], itemsView: "full", status: "completed", startedAt, completedAt: now(), durationMs: 0 });
-      threads.set(threadId, { ...thread, preview: thread.preview || input.map((item) => (item.type === "text" ? item.text : "")).join(""), updatedAt: now(), turns: [...thread.turns, done] });
+      const text = input.map((item) => (item.type === "text" ? item.text : "")).join("");
+      record(threadId, "turn_context", { turn_id: turn.id, cwd: thread.cwd, model: ALASIO_CODEX_MODEL });
+      record(threadId, "event_msg", { type: "task_started", turn_id: turn.id });
+      record(threadId, "response_item", { type: "message", role: "user", content: [{ type: "input_text", text }] });
+      record(threadId, "response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: ANSWER }] });
+      record(threadId, "event_msg", { type: "task_complete", turn_id: turn.id, last_agent_message: ANSWER, duration_ms: 0 });
+      threads.set(threadId, { ...thread, preview: thread.preview || text, updatedAt: now(), turns: [...thread.turns, done] });
       // After the answer to turn/start, as Codex reports a turn once it has accepted it.
       setImmediate(() => {
         notify(turnStarted(threadId, turn));

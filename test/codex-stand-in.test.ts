@@ -1,12 +1,12 @@
 /**
  * The end-to-end run's stand-in for Codex (test/e2e/codex-stand-in.ts), as alasio runs
  * it in Codex's place: alasio's own app-server client runs a turn on it, answered with
- * the stand-in's answer, and its spans reach the exporter alasio gives Codex, in the
- * traces alasio's requests carry.
+ * the stand-in's answer and written to the thread's rollout as Codex writes it, and its
+ * spans reach the exporter alasio gives Codex, in the traces alasio's requests carry.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import { makeAppServer } from "../src/codex/app-server/client.ts";
 import type { AppServerEvent } from "../src/codex/app-server/protocol.ts";
 import { codexTelemetryArgs } from "../src/codex/app-server/telemetry.ts";
 import { buildCodexEnv } from "../src/codex/env.ts";
+import { listRolloutFiles, parseRolloutName } from "../src/codex/rollouts/files.ts";
 import { ANSWER } from "./e2e/codex-stand-in.ts";
 import { eventually } from "./support/wait.ts";
 
@@ -86,8 +87,8 @@ after(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test("alasio's app-server client runs a turn on the stand-in, which answers it with its answer", async () => {
-  const events = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+test("alasio's app-server client runs a turn on the stand-in, which answers it with its answer and writes it to the thread's rollout as Codex does", async () => {
+  const { events, threadId, turnId } = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const client = yield* makeAppServer();
     const thread = { cwd: home, env: buildCodexEnv(), threadKey: "conversation-1", config: { developer_instructions: "", mcp_servers: {} } };
     const threadId = yield* client.startThread(thread);
@@ -95,11 +96,27 @@ test("alasio's app-server client runs a turn on the stand-in, which answers it w
     const seen = yield* Stream.runCollect(client.eventsForTurn(threadId, turnId).pipe(Stream.takeUntil((event) => event.type === "turn.completed")));
     const [turn] = yield* client.listTurns({ ...thread, threadId });
     assert.equal(turn?.id, turnId);
-    return seen;
+    return { events: seen, threadId, turnId };
   })).pipe(Effect.provideService(Logger.CurrentLoggers, new Set())));
   const answered = events.flatMap((event: AppServerEvent) => (event.type === "item.completed" && event.item.type === "agent_message" ? [event.item.text] : []));
   assert.deepEqual(answered, [ANSWER]);
   assert.equal(events.at(-1)?.type, "turn.completed");
+
+  // Found where alasio's mirror finds Codex's, by Codex's naming, and complete before the turn is.
+  const [rollout, ...others] = listRolloutFiles(home);
+  assert.ok(rollout);
+  assert.deepEqual(others, []);
+  assert.equal(parseRolloutName(rollout.name)?.threadId, threadId);
+  assert.match(rollout.path, /^sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-/u);
+  const lines = readFileSync(join(home, rollout.path), "utf8").trimEnd().split("\n").map((line) => JSON.parse(line) as { type: string; payload: { type?: string; turn_id?: string; id?: string } });
+  assert.deepEqual(lines.map(({ type, payload }) => [type, payload.type ?? null, payload.turn_id ?? payload.id ?? null]), [
+    ["session_meta", null, threadId],
+    ["turn_context", null, turnId],
+    ["event_msg", "task_started", turnId],
+    ["response_item", "message", null],
+    ["response_item", "message", null],
+    ["event_msg", "task_complete", turnId],
+  ]);
 });
 
 test("each request is a server span of the trace it is sent in, exported as alasio tells Codex to, from codex-app-server", async () => {
