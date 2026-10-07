@@ -49,6 +49,7 @@ export interface SecretNames {
   database: string;
   lake: string;
   grafana: string;
+  branches: string;
   valkey: string;
   workspaces: string;
 }
@@ -124,6 +125,7 @@ export function secretNames(prefix: string): SecretNames {
     database: `${prefix}-database`,
     lake: `${prefix}-lake`,
     grafana: `${prefix}-grafana`,
+    branches: `${prefix}-branches`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
   };
@@ -204,6 +206,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       GF_SECURITY_ADMIN_PASSWORD: secrets.grafanaAdminPassword,
       GF_SECURITY_SECRET_KEY: secrets.grafanaSecretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
+    },
+    // Branch environments': the token alasio's command line manages Neon's branches with,
+    // and the key alasio signs each one's token to fork its sessions with.
+    [names.branches]: {
+      "control-token": token("admin"),
+      "fork-key": secrets.branchForkKey,
     },
   };
   const { workspaces } = config;

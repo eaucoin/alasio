@@ -34,10 +34,32 @@ export const NAMESPACE = "alasio";
  */
 export const RELEASE = "alasio";
 
+/**
+ * Where an alasio runs: main, in alasio's namespace, or a branch environment, a copy of
+ * main's data with an alasio, a compute and a lake of its own in a namespace of its own
+ * (./branch.ts), whose objects are named as main's are there. What is not branched (the
+ * rest of Neon, the object store, the collector) is main's, which a branch reaches by
+ * names that resolve from any namespace.
+ */
+export interface Environment {
+  readonly namespace: string;
+  /** The branch environment's name; null for main. */
+  readonly branch: string | null;
+}
+
+/** main: alasio's own environment. */
+export const MAIN_ENVIRONMENT: Environment = { namespace: NAMESPACE, branch: null };
+
+/** The label of a branch environment's objects and namespaces, whose value is its name. */
+export const BRANCH_LABEL = "alasio.dev/branch";
+
 /** A component's name: `alasio-<component>`. */
 export function componentName(component: string): string {
   return `${RELEASE}-${component}`;
 }
+
+/** The Secret of a branch environment's token, which its parent forks the sessions it inherited for (src/branch/fork.ts). */
+export const BRANCH_FORK_SECRET = componentName("branch-fork");
 
 /** A Neon service's name: `alasio-neon-<component>`. */
 export function neonName(component: string): string {
@@ -114,11 +136,13 @@ export const COLLECTOR_PORT = 4318;
 /**
  * OpenTelemetry's standard variables, which alasio, the lake and Neon's compute export
  * with: to the collector, by a name that resolves from any namespace, as alasio passes
- * them on to its harnesses and folder workspaces' bayma; none when it does not run.
+ * them on to its harnesses and folder workspaces' bayma; none when it does not run. A
+ * branch environment's are its resource's `alasio.branch` too, so what it sends lands in
+ * main's lake beside main's, told apart.
  */
-export function otelEnv(config: InstallConfig): V1EnvVar[] {
+export function otelEnv(config: InstallConfig, { branch }: Environment = MAIN_ENVIRONMENT): V1EnvVar[] {
   if (!collectorRuns(config)) return [];
-  const { resourceAttributes } = config.telemetry;
+  const resourceAttributes = [config.telemetry.resourceAttributes, ...(branch ? [`alasio.branch=${branch}`] : [])].filter(Boolean).join(",");
   return [
     { name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: `http://${componentName("collector")}.${NAMESPACE}.svc:${COLLECTOR_PORT}` },
     { name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf" },
@@ -168,9 +192,9 @@ export function rolePasswords(config: InstallConfig): { readonly key: string; re
   ];
 }
 
-/** The object store's S3 endpoint, as pods in alasio's namespace reach it. */
+/** The object store's S3 endpoint, as pods in any namespace reach it, a branch environment's too. */
 export function s3Endpoint(config: InstallConfig): string {
-  return config.objectStore.bundled.enabled ? `http://${componentName("seaweedfs")}:8333` : config.objectStore.external.endpoint;
+  return config.objectStore.bundled.enabled ? `http://${componentName("seaweedfs")}.${NAMESPACE}.svc:8333` : config.objectStore.external.endpoint;
 }
 
 /** What every pod of the data stack has in its spec: pull secrets, Neon's user, and placement. */

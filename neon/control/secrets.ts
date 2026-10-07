@@ -35,6 +35,8 @@ export interface StackSecrets {
   grafanaPassword: string;
   grafanaAdminPassword: string;
   grafanaSecretKey: string;
+  /** What alasio signs each branch environment's token to fork its sessions with (src/branch/names.ts). */
+  branchForkKey: string;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
@@ -121,6 +123,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     grafanaPassword: kept(stored.grafanaPassword, () => secret()),
     grafanaAdminPassword: kept(stored.grafanaAdminPassword, () => secret()),
     grafanaSecretKey: kept(stored.grafanaSecretKey, () => secret()),
+    branchForkKey: kept(stored.branchForkKey, () => secret()),
   };
   return { secrets, changed };
 }

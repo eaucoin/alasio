@@ -30,14 +30,20 @@ import type {
 import { Result } from "effect";
 
 import type { SessionsProfile } from "../../src/kube/config.ts";
-import { decodeInstallConfig, manifests } from "../src/manifests/index.ts";
+import { branchObjects } from "../src/manifests/branch.ts";
+import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
-/** The objects of the configuration `file` and the Telegram Secret every configuration names. */
-function install(file: Record<string, unknown> = {}): readonly KubernetesObject[] {
+/** The configuration `file`, with the Telegram Secret every configuration names. */
+function configOf(file: Record<string, unknown> = {}): InstallConfig {
   const { alasio, ...rest } = file;
   const decoded = decodeInstallConfig({ ...rest, alasio: { telegram: { existingSecret: "telegram" }, ...(alasio as object | undefined) } });
   if (Result.isFailure(decoded)) throw new Error(decoded.failure.message);
-  return manifests(decoded.success);
+  return decoded.success;
+}
+
+/** The objects of the configuration `file` and the Telegram Secret every configuration names. */
+function install(file: Record<string, unknown> = {}): readonly KubernetesObject[] {
+  return manifests(configOf(file));
 }
 
 /** The objects of `kind`, as that kind. */
@@ -550,17 +556,22 @@ describe("telemetry", () => {
     assert.deepEqual(container(lake).envFrom, [{ secretRef: { name: "alasio-lake" } }]);
   });
 
-  test("admits alasio and folder workspaces' bayma to the collector, beside the stack", () => {
+  test("admits alasio, folder workspaces' bayma, and branch environments' alasio, compute and lake to the collector, beside the stack", () => {
     const ingress = (objects: readonly KubernetesObject[]) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: unknown } }>(objects, "NetworkPolicy", "alasio-collector").spec;
     const alasio = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
+    const branches = { matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] };
+    const ofBranches = [
+      { namespaceSelector: branches, ...alasio },
+      { namespaceSelector: branches, podSelector: { matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" } } },
+    ];
     assert.deepEqual(ingress(install()), {
       podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" } },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [alasio], ports: [{ protocol: "TCP", port: 4318 }] }],
+      ingress: [{ from: [alasio, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }],
     });
     assert.deepEqual(ingress(install({ host: { enabled: true } })).ingress, [{
-      from: [alasio, { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-host" } } }],
+      from: [alasio, { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-host" } } }, ...ofBranches],
       ports: [{ protocol: "TCP", port: 4318 }],
     }]);
     // A pod of the stack's, as the compute and the lake are, which the stack's own policy admits.
@@ -1079,5 +1090,126 @@ describe("security", () => {
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
     const role = one<V1Role>(install({ host: { enabled: true } }), "Role", "alasio-restart");
     assert.deepEqual(role.rules?.[0], { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio"], verbs: ["get", "patch"] });
+  });
+});
+
+describe("branch environments", () => {
+  const branch = branchObjects(configOf(), "try");
+  const variable = (workload: V1Deployment, name: string) => container(workload).env?.find((env) => env.name === name)?.value;
+  /** An object of the branch's, of `kind` and `name`, in `namespace`. */
+  const of = <T extends KubernetesObject>(kind: string, name: string, namespace = "alasio-branch-try") =>
+    one<T>(branch.filter(({ metadata }) => metadata?.namespace === namespace || (kind === "Namespace" && metadata?.name === name)), kind, name);
+
+  test("are an alasio, a compute and a lake in a namespace of the branch's own, its sessions in another, everything labelled with the branch", () => {
+    assert.deepEqual(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name, metadata?.labels?.["alasio.dev/branch"]]), [
+      ["alasio-branch-try", "try"],
+      ["alasio-branch-try-sessions", "try"],
+    ]);
+    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
+    assert.deepEqual(branch.filter(({ metadata }) => metadata?.labels?.["alasio.dev/branch"] !== "try"), []);
+    assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")), []);
+    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake", "alasio-neon-compute"]);
+    // Named as main's are, as each namespace is the branch's own.
+    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-lake", "alasio-neon-compute", "alasio-telemetry"]);
+  });
+
+  test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
+    const alasio = of<V1Deployment>("Deployment", "alasio");
+    assert.equal(variable(alasio, "ALASIO_BRANCH"), "try");
+    assert.equal(variable(alasio, "ALASIO_PARENT_FORKS_URL"), "http://alasio-branches.alasio.svc:4319");
+    assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_TOKEN_FILE"), "/run/alasio/branch/token");
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), { name: "branch", secret: { secretName: "alasio-branch-fork", items: [{ key: "token", path: "token" }] } });
+    assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), "alasio-telemetry.alasio-branch-try.svc");
+    assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
+    // It makes no role for what reads main's Neon beside it, which a branch has none of.
+    assert.equal(variable(alasio, "ALASIO_LAKE_READER_PASSWORD_FILE"), undefined);
+    assert.equal(variable(alasio, "ALASIO_GRAFANA_PASSWORD_FILE"), undefined);
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-password"]);
+    for (const workload of all<V1Deployment>(branch, "Deployment")) {
+      assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);
+    }
+    const tagged = branchObjects(configOf({ telemetry: { resourceAttributes: "deployment.environment.name=prod" } }), "try");
+    assert.equal(variable(one<V1Deployment>(tagged, "Deployment", "alasio"), "OTEL_RESOURCE_ATTRIBUTES"), "deployment.environment.name=prod,alasio.branch=try");
+  });
+
+  test("make sessions in the branch's namespace alone, which it neither clones nor reaches JuiceFS's mount pods for", () => {
+    const templates = JSON.parse(of<V1ConfigMap>("ConfigMap", "alasio-sandbox-templates").data?.["templates.json"] ?? "");
+    assert.equal(templates.sessions.namespace, "alasio-branch-try-sessions");
+    assert.equal(templates.sessions.clone, undefined);
+    assert.equal(templates.sessions.mountPodNamespace, undefined);
+    assert.equal(templates.host, undefined);
+    const roles = all<V1Role>(branch, "Role");
+    assert.deepEqual(roles.map(({ metadata }) => [metadata?.namespace, metadata?.name]), [["alasio-branch-try-sessions", "alasio"], ["alasio-branch-try-sessions", "alasio-parent"]]);
+    const binding = of<V1RoleBinding>("RoleBinding", "alasio", "alasio-branch-try-sessions");
+    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio-branch-try" }]);
+    // main's alasio, which forks the sessions the branch inherited into it.
+    assert.deepEqual(of<V1Role>("Role", "alasio-parent", "alasio-branch-try-sessions").rules, [
+      { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["create", "delete"] },
+      { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] },
+    ]);
+    assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-parent", "alasio-branch-try-sessions").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
+  });
+
+  test("run a compute on the branch's timeline, from main's neon-control, and a lake that is never maintained", () => {
+    const compute = of<V1Deployment>("Deployment", "alasio-neon-compute");
+    const args = container(compute).args ?? [];
+    assert.equal(args[args.indexOf("--compute-id") + 1], "branch-try");
+    assert.equal(args[args.indexOf("--control-plane-uri") + 1], "http://alasio-neon-control.alasio.svc:8080");
+    const lake = of<V1Deployment>("Deployment", "alasio-lake");
+    assert.equal(variable(lake, "LAKE_MAINTENANCE_HOURS"), "0");
+    assert.equal(variable(lake, "LAKE_BRANCHES_URL"), undefined);
+    // Nor has it a query endpoint, as it has no Grafana.
+    assert.deepEqual(lake.spec?.template.spec?.containers.map(({ name }) => name), ["lake"]);
+    assert.deepEqual(of<V1Service>("Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["metrics", "otlp-http"]);
+    assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("grafana")), []);
+    assert.equal(variable(lake, "LAKE_DATABASE_HOST"), "alasio-neon-compute");
+    assert.equal(variable(lake, "LAKE_S3_ENDPOINT"), "http://alasio-seaweedfs.alasio.svc:8333");
+    const main = install();
+    assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio-neon-compute")).args?.at(-3), "alasio");
+    assert.equal(variable(one<V1Deployment>(main, "Deployment", "alasio-neon-control"), "NEON_PAGESERVER_HOST"), "alasio-neon-pageserver.alasio.svc");
+  });
+
+  test("confine the branch's sessions to its alasio, and its compute to its alasio and lake", () => {
+    const policy = (name: string, namespace: string) => of<KubernetesObject & { spec: Record<string, unknown> }>("NetworkPolicy", name, namespace).spec;
+    const alasio = { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try" } }, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
+    assert.deepEqual(policy("bayma-from-alasio", "alasio-branch-try-sessions")["ingress"], [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }]);
+    assert.deepEqual(policy("telemetry-to-alasio", "alasio-branch-try-sessions")["egress"], [{ to: [alasio], ports: [{ protocol: "TCP", port: 4318 }] }]);
+    assert.deepEqual(policy("alasio-alasio", "alasio-branch-try")["ingress"], [{
+      from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try-sessions" } }, podSelector: { matchLabels: { "alasio.dev/workload": "session" } } }],
+      ports: [{ protocol: "TCP", port: 4318 }],
+    }]);
+    assert.ok(policy("alasio-neon-compute", "alasio-branch-try"));
+  });
+
+  test("are admitted by main to what they share of its storage alone, and to its fork of their sessions, which only main forks", () => {
+    const main = install();
+    const policy = (name: string) => one<KubernetesObject & { spec: Record<string, unknown> }>(main, "NetworkPolicy", name).spec;
+    const branches = { matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] };
+    assert.deepEqual(policy("alasio-neon-branches"), {
+      podSelector: {
+        matchLabels: { "app.kubernetes.io/instance": "alasio" },
+        matchExpressions: [{ key: "app.kubernetes.io/component", operator: "In", values: ["neon-pageserver", "neon-safekeeper", "neon-control", "seaweedfs"] }],
+      },
+      policyTypes: ["Ingress"],
+      ingress: [{
+        from: [{ namespaceSelector: branches, podSelector: { matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" } } }],
+        ports: [6400, 5454, 8080, 8333].map((port) => ({ protocol: "TCP", port })),
+      }],
+    });
+    assert.deepEqual((policy("alasio-alasio")["ingress"] as unknown[]).at(-1), {
+      from: [{ namespaceSelector: branches, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } }],
+      ports: [{ protocol: "TCP", port: 4319 }],
+    });
+    const alasio = one<V1Deployment>(main, "Deployment", "alasio");
+    assert.equal(container(alasio).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE")?.value, "/run/alasio/branch/fork-key");
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "branch"), {
+      name: "branch",
+      secret: { secretName: "alasio-branches", items: [{ key: "fork-key", path: "fork-key" }], optional: true },
+    });
+    assert.deepEqual(one<V1Service>(main, "Service", "alasio-branches").spec?.ports, [{ name: "branch-forks", port: 4319, targetPort: "branch-forks" }]);
+    // Where main forks no session, it serves no fork.
+    const unforked = install({ sessions: { storage: { storageClassName: "fast" } } });
+    assert.equal(container(one<V1Deployment>(unforked, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
+    assert.deepEqual(all(unforked, "Service").filter(({ metadata }) => metadata?.name === "alasio-branches"), []);
   });
 });

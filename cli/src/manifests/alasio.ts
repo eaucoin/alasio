@@ -1,7 +1,8 @@
 /**
  * alasio itself: its Deployment, its telemetry receiver's Service, the
  * namespaces its workspaces run in, its identity in them, and the templates it makes
- * its workspaces' Sandboxes from (src/kube/config.ts).
+ * its workspaces' Sandboxes from (src/kube/config.ts); main's, or a branch environment's
+ * in its own namespaces (./branch.ts), and main's Service of the forks it makes for them.
  */
 import type {
   KubernetesObject,
@@ -14,13 +15,18 @@ import type {
   V1RoleBinding,
   V1Service,
   V1ServiceAccount,
+  V1Volume,
 } from "@kubernetes/client-node";
 
+import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
 import { imageReference } from "../images.ts";
 import {
+  BRANCH_FORK_SECRET,
+  BRANCH_LABEL,
   componentName,
   databaseSecret,
+  type Environment,
   envOf,
   given,
   goJson,
@@ -29,6 +35,7 @@ import {
   hostVolumes,
   imagePullSecrets,
   labels,
+  MAIN_ENVIRONMENT,
   NAMESPACE,
   otelEnv,
   RELEASE,
@@ -44,19 +51,27 @@ import { cloneJob } from "./workspace-storage.ts";
 /** The port every workspace's bayma serves MCP on. */
 const BAYMA_PORT = 7290;
 
+/** The namespace of the sessions of the alasio of `environment`: the configured one, or a branch environment's own. */
+export function sessionsNamespace(config: InstallConfig, { branch }: Environment): string {
+  return branch ? branchSessionsNamespace(branch) : config.sessions.namespace;
+}
+
 /** The namespaces whose Sandboxes alasio drives: the sessions', and the host profile's. */
-function workspaceNamespaces(config: InstallConfig): string[] {
-  return [...(config.sessions.enabled ? [config.sessions.namespace] : []), ...(config.host.enabled ? [config.host.namespace] : [])];
+function workspaceNamespaces(config: InstallConfig, environment: Environment): string[] {
+  return [...(config.sessions.enabled ? [sessionsNamespace(config, environment)] : []), ...(config.host.enabled ? [config.host.namespace] : [])];
 }
 
 /**
  * The template of session filesystems' Sandboxes: an empty, isolated workspace under
  * the sessions' runtime, restricted, on a volume of workspace storage's class when it is
  * on. alasio adds what is per Sandbox: its name and labels, bayma's token, and its
- * network mode.
+ * network mode. A branch environment's are in its own namespace, and neither clones a
+ * session (its parent does, src/branch/fork.ts) nor removes JuiceFS's mount pods, which
+ * are main's to drive.
  */
-function sessionsProfile(config: InstallConfig): SessionsProfile {
+function sessionsProfile(config: InstallConfig, environment: Environment): SessionsProfile {
   const { sessions, workspaceStorage } = config;
+  const main = environment.branch === null;
   const agent = imageReference(config.images.agent);
   const storageClassName = sessions.storage.storageClassName || (workspaceStorage.enabled ? workspaceStorage.storageClassName : "");
   // On workspace storage, the volume's mounts follow its mount pod's, as upstream's
@@ -66,12 +81,12 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
   const propagation = workspaceStorage.enabled ? { mountPropagation: "HostToContainer" } : {};
   const ownership = workspaceStorage.enabled ? { fsGroupChangePolicy: "OnRootMismatch" } : {};
   return {
-    namespace: sessions.namespace,
+    namespace: sessionsNamespace(config, environment),
     port: BAYMA_PORT,
     workspaceDir: "/workspace",
     egressGate: sessions.egressGate,
     fullModeNameservers: [...sessions.fullModeNameservers],
-    ...(mountPodsRemoved(config) ? { mountPodNamespace: workspaceStorage.csi.namespace } : {}),
+    ...(main && mountPodsRemoved(config) ? { mountPodNamespace: workspaceStorage.csi.namespace } : {}),
     podTemplate: {
       metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" } },
       spec: {
@@ -129,12 +144,12 @@ function sessionsProfile(config: InstallConfig): SessionsProfile {
         resources: { requests: { storage: sessions.storage.size } },
       },
     }],
-    ...(sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
+    ...(main && sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
   };
 }
 
 /** Whether alasio forks sessions: where their volumes are workspace storage's, which JuiceFS clones. */
-function sessionsForked({ sessions, workspaceStorage }: InstallConfig): boolean {
+export function sessionsForked({ sessions, workspaceStorage }: InstallConfig): boolean {
   return workspaceStorage.enabled && [workspaceStorage.storageClassName, ""].includes(sessions.storage.storageClassName);
 }
 
@@ -184,20 +199,60 @@ function hostProfile(config: InstallConfig): HostProfile {
 }
 
 /** The ConfigMap of the templates, and their checksum, which alasio's pod carries so it is replaced when they change. */
-function sandboxTemplates(config: InstallConfig): { readonly configMap: V1ConfigMap; readonly checksum: string } {
+function sandboxTemplates(config: InstallConfig, environment: Environment): { readonly configMap: V1ConfigMap; readonly checksum: string } {
   const name = componentName("sandbox-templates");
   const templates = goJson(
-    { ...(config.sessions.enabled ? { sessions: sessionsProfile(config) } : {}), ...(config.host.enabled ? { host: hostProfile(config) } : {}) },
+    { ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment) } : {}), ...(config.host.enabled ? { host: hostProfile(config) } : {}) },
     "  ",
   );
   return {
-    configMap: { apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace: NAMESPACE, labels: labels("alasio") }, data: { "templates.json": templates } },
+    configMap: { apiVersion: "v1", kind: "ConfigMap", metadata: { name, namespace: environment.namespace, labels: labels("alasio") }, data: { "templates.json": templates } },
     checksum: sha256(templates),
   };
 }
 
+/** Where alasio's Secrets of branch environments are mounted: main's key, or a branch's token. */
+const BRANCH_SECRETS = "/run/alasio/branch";
+
+/**
+ * What alasio is told of branch environments: main, where it forks sessions, where the
+ * key their tokens are signed with is, from the stack's Secret, which may be made after
+ * it starts; a branch, which it is, and where its parent forks the sessions it inherited
+ * for it, with its token (src/branch/fork.ts).
+ */
+function branchEnv(config: InstallConfig, { branch }: Environment): V1EnvVar[] {
+  if (branch) {
+    return [
+      { name: "ALASIO_BRANCH", value: branch },
+      { name: "ALASIO_PARENT_FORKS_URL", value: `http://${componentName("branches")}.${NAMESPACE}.svc:${BRANCH_FORK_PORT}` },
+      { name: "ALASIO_BRANCH_FORK_TOKEN_FILE", value: `${BRANCH_SECRETS}/token` },
+    ];
+  }
+  return forksForBranches(config) ? [{ name: "ALASIO_BRANCH_FORK_KEY_FILE", value: `${BRANCH_SECRETS}/fork-key` }] : [];
+}
+
+/** The volume of branch environments' Secret: main's key, kept optional, or a branch's token. */
+function branchSecretVolume(config: InstallConfig, { branch }: Environment): V1Volume[] {
+  if (branch) return [{ name: "branch", secret: { secretName: BRANCH_FORK_SECRET, items: [{ key: "token", path: "token" }] } }];
+  return forksForBranches(config) ? [{ name: "branch", secret: { secretName: componentName("branches"), items: [{ key: "fork-key", path: "fork-key" }], optional: true } }] : [];
+}
+
+/** Whether main forks its sessions for branch environments: where it has Neon to branch, and forks sessions. */
+export function forksForBranches(config: InstallConfig): boolean {
+  return config.neon.enabled && sessionsForked(config);
+}
+
+/**
+ * The roles main's alasio makes for what reads its Neon beside it (common.ts
+ * rolePasswords); a branch environment's makes none, as it has none of them, and is given
+ * none of their passwords.
+ */
+function readerRoles(config: InstallConfig, { branch }: Environment): ReturnType<typeof rolePasswords> {
+  return branch === null ? rolePasswords(config) : [];
+}
+
 /** alasio's environment: where its templates, state, database and receiver are, and what the configuration adds. */
-function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean): V1EnvVar[] {
+function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, environment: Environment): V1EnvVar[] {
   const { alasio, host } = config;
   return [
     { name: "ALASIO_KUBE_TEMPLATES", value: "/etc/alasio/templates.json" },
@@ -211,16 +266,17 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean): 
     { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "allowedUserIds" } } },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
     { name: "ALASIO_LAKE_PASSWORD_FILE", value: "/run/alasio/database/lake-password" },
-    ...rolePasswords(config).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
+    ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
-    { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${NAMESPACE}.svc` },
+    { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
     { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),
     ...(host.enabled && host.workspaceRoot ? [{ name: "ALASIO_WORKSPACE_ROOT", value: host.workspaceRoot }] : []),
     ...(alasio.claude.existingSecret
       ? [{ name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: alasio.claude.existingSecret, key: alasio.claude.key } } }]
       : []),
-    ...otelEnv(config),
+    ...branchEnv(config, environment),
+    ...otelEnv(config, environment),
     ...envOf(alasio.env),
   ];
 }
@@ -230,9 +286,12 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean): 
  * stops the old pod before the new one starts. It keeps no volume: its state is in Neon,
  * and what it writes to disk (received files written for the agent, its home unless it
  * is the operator's) is written again as needed, on emptyDirs. Under the
- * host profile it runs as the operator, in their home, with the machine's mounts.
+ * host profile it runs as the operator, in their home, with the machine's mounts. A
+ * branch environment's runs in its namespace on the branch's database, told it is the
+ * branch, with its token to ask main to fork the sessions it inherited; main's is given
+ * the key branch environments' tokens are signed with, where it forks sessions.
  */
-function deployment(config: InstallConfig, templatesChecksum: string): V1Deployment {
+function deployment(config: InstallConfig, templatesChecksum: string, environment: Environment): V1Deployment {
   const { alasio, host } = config;
   const operatorHome = host.enabled && host.alasioHome;
   const home = operatorHome ? host.home : "/var/lib/alasio/home";
@@ -240,10 +299,11 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
   const gid = host.enabled ? host.gid : alasio.runAsGroup;
   const groups = [...new Set([...alasio.supplementalGroups, ...(host.enabled ? host.supplementalGroups : [])])];
   const image = imageReference(config.images.alasio);
+  const branchSecret = branchSecretVolume(config, environment);
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
-    metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") },
+    metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") },
     spec: {
       replicas: 1,
       strategy: { type: "Recreate" },
@@ -261,9 +321,12 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
             image,
             imagePullPolicy: config.images.pullPolicy,
             workingDir: home,
-            env: alasioEnv(config, home, operatorHome),
+            env: alasioEnv(config, home, operatorHome, environment),
             ...given("envFrom", [...alasio.envFrom]),
-            ports: [{ name: "telemetry", containerPort: config.telemetry.receiverPort }],
+            ports: [
+              { name: "telemetry", containerPort: config.telemetry.receiverPort },
+              ...(environment.branch === null && forksForBranches(config) ? [{ name: "branch-forks", containerPort: BRANCH_FORK_PORT }] : []),
+            ],
             securityContext: restrictedContainer(),
             resources: alasio.resources,
             volumeMounts: [
@@ -271,6 +334,7 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
               ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
               { name: "templates", mountPath: "/etc/alasio", readOnly: true },
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
+              ...branchSecret.map(({ name }) => ({ name, mountPath: BRANCH_SECRETS, readOnly: true })),
               ...(host.enabled ? hostVolumeMounts(config) : []),
             ],
           }],
@@ -282,9 +346,10 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
               name: "database",
               secret: {
                 secretName: databaseSecret(config),
-                items: ["url", "lake-password", ...rolePasswords(config).map(({ key }) => key)].map((key) => ({ key, path: key })),
+                items: ["url", "lake-password", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
+            ...branchSecret,
             ...(host.enabled ? hostVolumes(config) : []),
           ],
           ...given("nodeSelector", { ...alasio.nodeSelector }),
@@ -297,31 +362,46 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
 }
 
 /** Where session sandboxes export their telemetry: alasio's receiver. */
-function telemetryService(config: InstallConfig): V1Service {
+function telemetryService(config: InstallConfig, environment: Environment): V1Service {
   return {
     apiVersion: "v1",
     kind: "Service",
-    metadata: { name: componentName("telemetry"), namespace: NAMESPACE, labels: labels("alasio") },
+    metadata: { name: componentName("telemetry"), namespace: environment.namespace, labels: labels("alasio") },
     spec: { selector: selectorLabels("alasio"), ports: [{ name: "otlp-http", port: config.telemetry.receiverPort, targetPort: "telemetry" }] },
+  };
+}
+
+/** Where branch environments ask main to fork the sessions they inherited (src/branch/fork.ts). */
+function branchForksService(): V1Service {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: componentName("branches"), namespace: NAMESPACE, labels: labels("alasio") },
+    spec: { selector: selectorLabels("alasio"), ports: [{ name: "branch-forks", port: BRANCH_FORK_PORT, targetPort: "branch-forks" }] },
   };
 }
 
 /**
  * The namespaces workspaces run in, which alasio makes unless told not to. Sessions'
  * enforces Pod Security "restricted": nothing privileged, no host paths, no added
- * capabilities. The host profile's is "privileged", as its pods mount the machine.
+ * capabilities. The host profile's is "privileged", as its pods mount the machine. A
+ * branch environment always has its own, beside its own namespace.
  */
-function namespaces(config: InstallConfig): V1Namespace[] {
+function namespaces(config: InstallConfig, environment: Environment): V1Namespace[] {
   const { sessions, host } = config;
+  const { branch } = environment;
+  const branched = branch ? { [BRANCH_LABEL]: branch } : {};
   return [
-    ...(sessions.enabled && sessions.createNamespace
+    ...(branch ? [{ apiVersion: "v1", kind: "Namespace", metadata: { name: environment.namespace, labels: { ...labels("alasio"), ...branched } } }] : []),
+    ...(sessions.enabled && (sessions.createNamespace || branch)
       ? [{
         apiVersion: "v1",
         kind: "Namespace",
         metadata: {
-          name: sessions.namespace,
+          name: sessionsNamespace(config, environment),
           labels: {
             ...labels("session"),
+            ...branched,
             "pod-security.kubernetes.io/enforce": "restricted",
             "pod-security.kubernetes.io/enforce-version": "latest",
             "pod-security.kubernetes.io/warn": "restricted",
@@ -355,12 +435,13 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * it installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its
  * mount pods; and nothing else.
  */
-function identity(config: InstallConfig): KubernetesObject[] {
+function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
+  const main = environment.branch === null;
   const binding = (metadata: V1ObjectMeta): V1RoleBinding => ({
     apiVersion: "rbac.authorization.k8s.io/v1",
     kind: "RoleBinding",
     metadata,
-    subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: NAMESPACE }],
+    subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: environment.namespace }],
     roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RELEASE },
   });
   const inDriverNamespace = { name: RELEASE, namespace: config.workspaceStorage.csi.namespace, labels: labels("alasio") };
@@ -377,12 +458,12 @@ function identity(config: InstallConfig): KubernetesObject[] {
     metadata: inOwnNamespace,
     rules: [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }],
   };
-  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") } };
+  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") } };
   return [
     serviceAccount,
-    ...workspaceNamespaces(config).flatMap((namespace): KubernetesObject[] => {
+    ...workspaceNamespaces(config, environment).flatMap((namespace): KubernetesObject[] => {
       const metadata = { name: RELEASE, namespace, labels: labels("alasio") };
-      const forked = sessionsForked(config) && namespace === config.sessions.namespace;
+      const forked = main && sessionsForked(config) && namespace === config.sessions.namespace;
       const role: V1Role = {
         apiVersion: "rbac.authorization.k8s.io/v1",
         kind: "Role",
@@ -397,8 +478,8 @@ function identity(config: InstallConfig): KubernetesObject[] {
       };
       return [role, binding(metadata)];
     }),
-    ...(sessionsForked(config) ? [clones, binding(inOwnNamespace)] : []),
-    ...(mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
+    ...(main && sessionsForked(config) ? [clones, binding(inOwnNamespace)] : []),
+    ...(main && mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
     ...(config.host.enabled ? hostAgentIdentity(config) : []),
   ];
 }
@@ -435,14 +516,15 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
   return [serviceAccount, role, binding];
 }
 
-/** alasio's objects. */
-export function alasioObjects(config: InstallConfig): KubernetesObject[] {
-  const templates = sandboxTemplates(config);
+/** The objects of the alasio of `environment`, main's unless a branch environment's. */
+export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
+  const templates = sandboxTemplates(config, environment);
   return [
-    ...namespaces(config),
-    ...identity(config),
+    ...namespaces(config, environment),
+    ...identity(config, environment),
     templates.configMap,
-    deployment(config, templates.checksum),
-    telemetryService(config),
+    deployment(config, templates.checksum, environment),
+    telemetryService(config, environment),
+    ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
   ];
 }

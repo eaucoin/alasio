@@ -1,11 +1,27 @@
 /**
  * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
  * telemetry collector, Grafana and workspace storage, which need a cluster that enforces
- * NetworkPolicy, as session filesystems do.
+ * NetworkPolicy, as session filesystems do; and branch environments' (./branch.ts), whose
+ * namespaces main's policies admit by the label each has, to what they share alone.
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
-import { COLLECTOR_PORT, collectorRuns, componentName, grafanaRuns, labels, NAMESPACE, RELEASE, selectorLabels } from "./common.ts";
+import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
+import { forksForBranches, sessionsNamespace } from "./alasio.ts";
+import {
+  BRANCH_LABEL,
+  COLLECTOR_PORT,
+  collectorRuns,
+  componentName,
+  type Environment,
+  given,
+  grafanaRuns,
+  labels,
+  MAIN_ENVIRONMENT,
+  NAMESPACE,
+  RELEASE,
+  selectorLabels,
+} from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
@@ -23,11 +39,17 @@ type IngressRule = Omit<V1NetworkPolicyIngressRule, "_from"> & { from?: V1Networ
 /** The label of every session's pod, which alasio gives it. */
 const SESSION = { "alasio.dev/workload": "session" };
 
-/** alasio's pod, as a peer. */
-const FROM_ALASIO: V1NetworkPolicyPeer = {
-  namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": NAMESPACE } },
-  podSelector: { matchLabels: selectorLabels("alasio") },
-};
+/** The namespace `name`, as a peer's selector. */
+const namespaceNamed = (name: string) => ({ matchLabels: { "kubernetes.io/metadata.name": name } });
+
+/** The alasio pod of `environment`, as a peer. */
+const alasioOf = ({ namespace }: Environment): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(namespace), podSelector: { matchLabels: selectorLabels("alasio") } });
+
+/** Every branch environment's namespace, as a peer's selector, by the label each has. */
+const BRANCH_NAMESPACES = { matchExpressions: [{ key: BRANCH_LABEL, operator: "Exists" }] };
+
+/** The labels of the data stack's pods, which its policy admits each other by. */
+const STACK = { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon" };
 
 /** A NetworkPolicy of `name` in `namespace`, labelled as `component`'s. */
 function policy(name: string, namespace: string, component: string, spec: NetworkPolicySpec): NetworkPolicy {
@@ -35,23 +57,26 @@ function policy(name: string, namespace: string, component: string, spec: Networ
 }
 
 /**
- * Sessions: nothing in or out but bayma from alasio, alasio's telemetry receiver (the
+ * Sessions: nothing in or out but bayma from their alasio, its telemetry receiver (the
  * one egress of a session without internet), and, for a session with internet, the
- * public internet, none of the cluster's or its network's private addresses.
+ * public internet, none of the cluster's or its network's private addresses. A branch
+ * environment's sessions are its alasio's alone, as main's are main's.
  */
-function sessionPolicies(config: InstallConfig): NetworkPolicy[] {
-  const { namespace, blockedCidrs } = config.sessions;
+function sessionPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
+  const { blockedCidrs } = config.sessions;
+  const namespace = sessionsNamespace(config, environment);
+  const alasio = alasioOf(environment);
   return [
     policy("default-deny", namespace, "session", { podSelector: {}, policyTypes: ["Ingress", "Egress"] }),
     policy("bayma-from-alasio", namespace, "session", {
       podSelector: { matchLabels: SESSION },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [FROM_ALASIO], ports: [{ protocol: "TCP", port: 7290 }] }],
+      ingress: [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }],
     }),
     policy("telemetry-to-alasio", namespace, "session", {
       podSelector: { matchLabels: SESSION },
       policyTypes: ["Egress"],
-      egress: [{ to: [FROM_ALASIO], ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }] }],
+      egress: [{ to: [alasio], ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }] }],
     }),
     policy("full-internet", namespace, "session", {
       podSelector: { matchLabels: { ...SESSION, "alasio.dev/net-mode": "full" } },
@@ -61,21 +86,42 @@ function sessionPolicies(config: InstallConfig): NetworkPolicy[] {
   ];
 }
 
-/** Neon's services, the object store, the lake and their jobs reach each other; alasio reaches the compute, its database. */
-function neonPolicies(): NetworkPolicy[] {
-  const stack = { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon" };
+/**
+ * Neon's services, the object store, the lake and their jobs reach each other; alasio
+ * reaches the compute, its database. In a branch environment, its compute and its lake
+ * reach each other, and its alasio its compute, as main's do.
+ */
+function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
-    policy(componentName("neon"), NAMESPACE, "neon", {
-      podSelector: { matchLabels: stack },
+    policy(componentName("neon"), namespace, "neon", {
+      podSelector: { matchLabels: STACK },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [{ podSelector: { matchLabels: stack } }] }],
+      ingress: [{ from: [{ podSelector: { matchLabels: STACK } }] }],
     }),
-    policy(componentName("neon-compute"), NAMESPACE, "neon", {
+    policy(componentName("neon-compute"), namespace, "neon", {
       podSelector: { matchLabels: selectorLabels("neon-compute") },
       policyTypes: ["Ingress"],
       ingress: [{ from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: 55433 }] }],
     }),
   ];
+}
+
+/**
+ * Branch environments' computes and lakes reach main's storage, which they share: the
+ * pageserver and safekeepers their timelines are on, neon-control their specs are
+ * served by, and the object store the lake's files are in; nothing else of main's, nor
+ * its compute, which is main's database.
+ */
+function branchStoragePolicy(config: InstallConfig): NetworkPolicy {
+  const shared = ["neon-pageserver", "neon-safekeeper", "neon-control", ...(config.objectStore.bundled.enabled ? ["seaweedfs"] : [])];
+  return policy(componentName("neon-branches"), NAMESPACE, "neon", {
+    podSelector: { matchLabels: { "app.kubernetes.io/instance": RELEASE }, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "In", values: shared }] },
+    policyTypes: ["Ingress"],
+    ingress: [{
+      from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } }],
+      ports: [6400, 5454, 8080, 8333].map((port) => ({ protocol: "TCP", port })),
+    }],
+  });
 }
 
 /**
@@ -117,8 +163,9 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
 
 /**
  * The telemetry collector takes OTLP from alasio and folder workspaces' bayma, beside the
- * stack's own pods (neonPolicies), and from nothing else: sessions' telemetry reaches it
- * through alasio's receiver alone.
+ * stack's own pods (neonPolicies), and from branch environments' alasio, compute and
+ * lake, and from nothing else: sessions' telemetry reaches it through their alasio's
+ * receiver alone.
  */
 function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
   return policy(componentName("collector"), NAMESPACE, "collector", {
@@ -127,7 +174,9 @@ function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
     ingress: [{
       from: [
         { podSelector: { matchLabels: selectorLabels("alasio") } },
-        ...(host.enabled ? [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": host.namespace } } }] : []),
+        ...(host.enabled ? [{ namespaceSelector: namespaceNamed(host.namespace) }] : []),
+        { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+        { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } },
       ],
       ports: [{ protocol: "TCP", port: COLLECTOR_PORT }],
     }],
@@ -169,34 +218,53 @@ function grafanaPolicies({ sessions }: InstallConfig): NetworkPolicy[] {
   ];
 }
 
-/** The NetworkPolicies, unless they are turned off. */
-export function networkPolicyObjects(config: InstallConfig): NetworkPolicy[] {
+/**
+ * alasio takes no connections but its sessions' telemetry, and, main, where it forks
+ * sessions for branch environments, their alasio's asking it to (src/branch/fork.ts).
+ */
+function alasioPolicy(config: InstallConfig, environment: Environment): NetworkPolicy {
+  const forks = environment.branch === null && forksForBranches(config);
+  const ingress: IngressRule[] = [
+    ...(config.sessions.enabled
+      ? [{
+        from: [{ namespaceSelector: namespaceNamed(sessionsNamespace(config, environment)), podSelector: { matchLabels: SESSION } }],
+        ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }],
+      }]
+      : []),
+    ...(forks
+      ? [{ from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: BRANCH_FORK_PORT }] }]
+      : []),
+  ];
+  return policy(componentName("alasio"), environment.namespace, "alasio", {
+    podSelector: { matchLabels: selectorLabels("alasio") },
+    policyTypes: ["Ingress"],
+    ...given("ingress", ingress),
+  });
+}
+
+/**
+ * The NetworkPolicies of the alasio of `environment`, unless they are turned off: main's,
+ * and those that admit branch environments to what of main's they share; or a branch
+ * environment's own.
+ */
+export function networkPolicyObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): NetworkPolicy[] {
   if (!config.networkPolicies.enabled) return [];
   const { sessions, host } = config;
+  if (environment.branch !== null) {
+    return [...(sessions.enabled ? sessionPolicies(config, environment) : []), alasioPolicy(config, environment), ...neonPolicies(environment)];
+  }
   return [
-    ...(sessions.enabled ? sessionPolicies(config) : []),
+    ...(sessions.enabled ? sessionPolicies(config, environment) : []),
     // Folder workspaces' bayma is reached by alasio alone; what it reaches is the machine's.
     ...(host.enabled
       ? [policy("bayma-from-alasio", host.namespace, "folder-bayma", {
         podSelector: {},
         policyTypes: ["Ingress"],
-        ingress: [{ from: [FROM_ALASIO], ports: [{ protocol: "TCP", port: 7290 }] }],
+        ingress: [{ from: [alasioOf(environment)], ports: [{ protocol: "TCP", port: 7290 }] }],
       })]
       : []),
-    // alasio takes no connections but sessions' telemetry.
-    policy(componentName("alasio"), NAMESPACE, "alasio", {
-      podSelector: { matchLabels: selectorLabels("alasio") },
-      policyTypes: ["Ingress"],
-      ...(sessions.enabled
-        ? {
-          ingress: [{
-            from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": sessions.namespace } }, podSelector: { matchLabels: SESSION } }],
-            ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }],
-          }],
-        }
-        : {}),
-    }),
-    ...(config.neon.enabled ? neonPolicies() : []),
+    alasioPolicy(config, environment),
+    ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

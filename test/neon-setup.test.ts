@@ -101,6 +101,8 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.database, "url"), `postgresql://alasio:${encodeURIComponent(root.alasioPassword)}@q-neon-compute:55433/alasio`);
   assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
   assert.deepEqual(verifyToken(publicKey, value(kube, names.lake, "LAKE_BRANCHES_TOKEN")), { scope: "branches" });
+  assert.deepEqual(verifyToken(publicKey, value(kube, names.branches, "control-token")), { scope: "admin" });
+  assert.equal(value(kube, names.branches, "fork-key"), root.branchForkKey);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /control_plane_api='http:\/\/q-neon-storage-controller:1234\/upcall\/v1\/'/u);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
@@ -178,6 +180,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     grafanaPassword: "g",
     grafanaAdminPassword: "a",
     grafanaSecretKey: "s",
+    branchForkKey: "f",
   };
 }
 

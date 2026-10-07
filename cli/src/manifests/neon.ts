@@ -26,9 +26,11 @@ import {
   claimSpec,
   collectorRuns,
   databaseSecret,
+  type Environment,
   given,
   helperResources,
   imagePullSecrets,
+  MAIN_ENVIRONMENT,
   NAMESPACE,
   neonName,
   otelEnv,
@@ -46,12 +48,12 @@ import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
-/** A Service of the stack's: its name and component, selecting the component's pods, on `ports`. */
-function service(name: string, component: string, ports: V1ServicePort[]): V1Service {
+/** A Service of the stack's: its name and component, selecting the component's pods, on `ports`, main's unless of `environment`. */
+function service(name: string, component: string, ports: V1ServicePort[], environment: Environment = MAIN_ENVIRONMENT): V1Service {
   return {
     apiVersion: "v1",
     kind: "Service",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
+    metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
     spec: { selector: selectorLabels(component), ports },
   };
 }
@@ -459,7 +461,8 @@ function control(config: InstallConfig): KubernetesObject[] {
             env: [
               { name: "CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
               { name: "NEON_SAFEKEEPER_HOSTS", value: safekeeperHosts.join(",") },
-              { name: "NEON_PAGESERVER_HOST", value: neonName("pageserver") },
+              // As every compute reaches it, a branch environment's in its own namespace too.
+              { name: "NEON_PAGESERVER_HOST", value: `${neonName("pageserver")}.${NAMESPACE}.svc` },
             ],
             ports: [{ name: "http", containerPort: 8080 }],
             readinessProbe: { httpGet: { path: "/healthz", port: "http" }, periodSeconds: 3 },
@@ -494,16 +497,18 @@ function control(config: InstallConfig): KubernetesObject[] {
  * The compute: Postgres on alasio's timeline, one primary (never two on one timeline),
  * its own disk rebuilt from the safekeepers and pageserver on every start, its spec
  * fetched from neon-control. It serves compute_ctl's metrics too, which the collector
- * scrapes, and exports compute_ctl's traces to the collector, when it runs.
+ * scrapes, and exports compute_ctl's traces to the collector, when it runs. A branch
+ * environment's is on the branch's timeline, in its namespace, reaching the stack's
+ * storage and neon-control in main's.
  */
-function compute(config: InstallConfig): KubernetesObject[] {
+export function compute(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
   const name = neonName("compute");
   const component = "neon-compute";
-  const control = neonName("control");
+  const control = `http://${neonName("control")}.${NAMESPACE}.svc:8080`;
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
+    metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
     spec: {
       replicas: 1,
       strategy: { type: "Recreate" },
@@ -517,7 +522,7 @@ function compute(config: InstallConfig): KubernetesObject[] {
           ...given("nodeSelector", { ...config.neon.nodeSelector }),
           ...given("tolerations", [...config.neon.tolerations]),
           terminationGracePeriodSeconds: 30,
-          initContainers: [waitFor(config, "neon-control", `http://${control}:8080/healthz`)],
+          initContainers: [waitFor(config, "neon-control", `${control}/healthz`)],
           containers: [{
             name: "compute",
             image: imageReference(config.neon.computeImage),
@@ -530,14 +535,14 @@ function compute(config: InstallConfig): KubernetesObject[] {
               "--pgbin",
               "/usr/local/bin/postgres",
               "--compute-id",
-              computeId(MAIN),
+              computeId(environment.branch ?? MAIN),
               "--control-plane-uri",
-              `http://${control}:8080`,
+              control,
             ],
             env: [
               secretVariable(name, "NEON_CONTROL_PLANE_TOKEN"),
               ...(collectorRuns(config)
-                ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config)]
+                ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config, environment)]
                 : [{ name: "OTEL_SDK_DISABLED", value: "true" }]),
             ],
             ports: [{ name: "postgres", containerPort: 55433 }, { name: "http", containerPort: 3080 }],
@@ -551,7 +556,7 @@ function compute(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service(name, component, [{ name: "postgres", port: 55433 }, { name: "http", port: 3080 }]), deployment];
+  return [service(name, component, [{ name: "postgres", port: 55433 }, { name: "http", port: 3080 }], environment), deployment];
 }
 
 /**
