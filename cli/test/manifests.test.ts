@@ -278,6 +278,9 @@ describe("neon", () => {
     const compute = one<V1Deployment>(install(), "Deployment", "alasio-neon-compute");
     assert.equal(compute.spec?.strategy?.type, "Recreate");
     assert.ok(container(compute).args?.includes("--control-plane-uri"));
+    // Main's, whose spec neon-control serves under the id it has always had.
+    const args = container(compute).args ?? [];
+    assert.equal(args[args.indexOf("--compute-id") + 1], "alasio");
     assert.deepEqual(container(compute).env?.find(({ name }) => name === "OTEL_SDK_DISABLED"), { name: "OTEL_SDK_DISABLED", value: "true" });
   });
 

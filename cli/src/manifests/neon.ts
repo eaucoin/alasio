@@ -22,6 +22,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
+import { computeId, MAIN } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   claimSpec,
@@ -424,9 +425,10 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
 }
 
 /**
- * neon-control: it bootstraps the tenant and timeline, serves the compute its spec,
- * answers the storage controller's hooks, and repairs a safekeeper that lost its disk.
- * Its record of what it bootstrapped is on a volume of its own.
+ * neon-control: it bootstraps the tenant and main's timeline, makes and deletes branches,
+ * serves each branch's compute its spec, answers the storage controller's hooks, and
+ * repairs a safekeeper that lost its disk. Its record of the branches is on a volume of
+ * its own.
  */
 function control(config: InstallConfig): KubernetesObject[] {
   const name = neonName("control");
@@ -533,7 +535,7 @@ function compute(config: InstallConfig): KubernetesObject[] {
               "--pgbin",
               "/usr/local/bin/postgres",
               "--compute-id",
-              "alasio",
+              computeId(MAIN),
               "--control-plane-uri",
               `http://${control}:8080`,
             ],

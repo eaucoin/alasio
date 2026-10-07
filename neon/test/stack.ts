@@ -19,8 +19,9 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { alasioOk, type Forward, kube, ref } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
+import { type BranchesFile, MAIN, type ReadyBranch } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
-import type { TimelineRecord } from "../control/service.ts";
+import type { StackSecrets } from "../control/secrets.ts";
 
 /** The stack's pods, by their labels. */
 const STACK = selectorOf({ "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon" });
@@ -109,9 +110,15 @@ async function inside(pod: string, method: string, url: string, scope: string, b
 /** Runs `command` in neon-control's pod: what it printed. */
 const inControl = async (command: readonly string[]) => kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, neonName("control")), command);
 
-/** What neon-control bootstrapped, which it has once the stack is up. */
-async function record(): Promise<TimelineRecord> {
-  return JSON.parse(await inControl(["cat", "/state/bootstrap.json"]));
+/** The tenant of alasio's timelines; set by the suite's first hook. */
+let tenantId: string;
+
+/** Main's timeline, as neon-control recorded it once the stack was up, and where it is placed. */
+async function record(): Promise<{ tenantId: string; timelineId: string; safekeepers: ReadyBranch["safekeepers"] }> {
+  const { branches }: BranchesFile = JSON.parse(await inControl(["cat", "/state/branches.json"]));
+  const main = branches.find((branch): branch is ReadyBranch => branch.name === MAIN && branch.state === "ready");
+  assert.ok(main, "neon-control has recorded main");
+  return { tenantId, timelineId: main.timelineId, safekeepers: main.safekeepers };
 }
 
 async function pageserverMetric(name: string) {
@@ -246,6 +253,8 @@ export function neonStack(): void {
   describe("alasio's Neon, as alasio installs it", () => {
     before(async () => {
       privateKey = await kube.secret(NAMESPACE, neonName("root"), "auth_private_key.pem");
+      const secrets: StackSecrets = JSON.parse(await kube.secret(NAMESPACE, neonName("root"), "secrets.json"));
+      tenantId = secrets.tenantId;
       forward = await kube.forward(NAMESPACE, neonName("compute"), 55433);
       const url = new URL((await kube.secret(NAMESPACE, `${RELEASE}-database`, "url")).trim());
       url.hostname = "127.0.0.1";
