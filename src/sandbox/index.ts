@@ -17,6 +17,14 @@
  * container, until its egress is confined: until the cluster's API server, a private
  * address both modes refuse, no longer answers. Where NetworkPolicy is not enforced at
  * all a session therefore never starts, rather than starting open.
+ *
+ * A session is forked where its volume can be cloned (the template's `clone`): the fork is
+ * a new session with the same internet, whose workspace and home are a copy-on-write
+ * clone of the source's, made by a Job of the installation's in alasio's namespace. Its
+ * Sandbox is made suspended, so its volume is provisioned but no pod of it starts, and
+ * prepares its workspace, before the clone is whole; the source is suspended while it is
+ * cloned, so nothing in it writes meanwhile, and resumed after. A fork carries nothing
+ * but the files: no conversation, no harness session, nothing of the source's processes.
  */
 import { createHash } from "node:crypto";
 import type { LookupAddress } from "node:dns";
@@ -24,20 +32,22 @@ import { lookup } from "node:dns/promises";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import type { V1Pod } from "@kubernetes/client-node";
-import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema } from "effect";
+import type { V1EnvVar, V1Job, V1JobCondition, V1PersistentVolumeClaim, V1Pod } from "@kubernetes/client-node";
+import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, Semaphore } from "effect";
 
 import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
   type BaymaEndpoint,
+  claimName,
   makeSandboxes,
   SANDBOX_API_VERSION,
   SANDBOX_KIND,
   type Sandbox,
   type SandboxError,
   type SandboxFault,
+  type SandboxOperatingMode,
   sameToken,
   sandboxManifest,
   tokenSecretName,
@@ -64,6 +74,16 @@ export interface SessionSandboxManifestOptions {
   readonly netMode: NetMode;
   readonly profile: SessionsProfile;
   readonly telemetry: SessionTelemetry | null;
+  /** Where the Sandbox is made: the profile's namespace unless told. */
+  readonly namespace?: string;
+  /** Whether it is made running, as it is unless told, or suspended. */
+  readonly operatingMode?: SandboxOperatingMode;
+}
+
+/** A volume claim, by its namespace and name. */
+export interface ClaimRef {
+  readonly namespace: string;
+  readonly name: string;
 }
 
 /** A file read to attach to a reply: its bytes, or a note saying why it is not attached. */
@@ -92,6 +112,11 @@ export class SessionFileError extends Schema.TaggedError<SessionFileError>()("Se
 
 /** How making a session's Sandbox and reaching its bayma fails. */
 export type SessionError = SandboxError | SessionTelemetryUnavailable;
+
+/** A session could not be forked: why. */
+export class SessionForkError extends Schema.TaggedError<SessionForkError>()("SessionForkError", {
+  message: Schema.String,
+}) {}
 
 /** A conversation's workspace is a session filesystem, and the deployment renders no sessions template. */
 export class SessionFilesystemsDisabled extends Schema.TaggedError<SessionFilesystemsDisabled>()("SessionFilesystemsDisabled", {}) {
@@ -127,6 +152,8 @@ const MOUNT_POD_VOLUME_LABEL = "volume-id";
 /** How long a restarted session's pod is waited for to go, and how often it is looked at. */
 const POD_GONE_TIMEOUT: Duration.Input = "2 minutes";
 const POLL: Duration.Input = "1 second";
+/** How long a fork's claim is waited for to be bound to its volume; its clone, as long as the Job's own deadline gives it. */
+const CLAIM_BOUND_TIMEOUT: Duration.Input = "5 minutes";
 
 /**
  * Whether the annotation `key: value` of a mount pod is the driver's reference to a target
@@ -178,13 +205,21 @@ export const EGRESS_GATE_SCRIPT = [
  * `profile` (ALASIO_KUBE_TEMPLATES `sessions`). `telemetry` is `{ endpoint, env }`, or
  * null when alasio exports none. Pure, for tests.
  */
-export function sessionSandboxManifest({ volumeId, netMode, profile, telemetry }: SessionSandboxManifestOptions): Sandbox {
+export function sessionSandboxManifest({
+  volumeId,
+  netMode,
+  profile,
+  telemetry,
+  namespace = profile.namespace,
+  operatingMode,
+}: SessionSandboxManifestOptions): Sandbox {
   const full = netMode === "full";
   return sandboxManifest({
     name: assertValidVolumeId(volumeId),
-    namespace: profile.namespace,
+    namespace,
     template: profile,
     labels: { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: full ? "full" : "none" },
+    ...(operatingMode === undefined ? {} : { operatingMode }),
     configure(spec, bayma) {
       if (telemetry) {
         bayma.env = [
@@ -216,6 +251,26 @@ export function sessionSandboxManifest({ volumeId, netMode, profile, telemetry }
   });
 }
 
+/**
+ * The Job, of the installation's `job`, that clones the claim `source` into the claim
+ * `destination`, as its containers are told. Pure, for tests.
+ */
+export function cloneJobManifest(job: V1Job, source: ClaimRef, destination: ClaimRef): V1Job {
+  const env: V1EnvVar[] = [
+    { name: "SOURCE_NAMESPACE", value: source.namespace },
+    { name: "SOURCE_CLAIM", value: source.name },
+    { name: "DESTINATION_NAMESPACE", value: destination.namespace },
+    { name: "DESTINATION_CLAIM", value: destination.name },
+  ];
+  const made = structuredClone(job);
+  for (const container of made.spec?.template.spec?.containers ?? []) container.env = [...(container.env ?? []), ...env];
+  return made;
+}
+
+/** The Job's condition that says it has ended, Complete or Failed, if it has. */
+const jobEnded = (job: V1Job): V1JobCondition | undefined =>
+  job.status?.conditions?.find(({ type, status }) => (type === "Complete" || type === "Failed") && status === "True");
+
 /** The forwarder sessions' telemetry is exported through, loaded only once it is needed. */
 async function loadForwarder(env: Readonly<NodeJS.ProcessEnv>, warn: (message: string) => void): Promise<OtlpForwarder> {
   const { createOtlpForwarder } = await import("../telemetry/forward.ts");
@@ -234,6 +289,18 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
   readonly volumes: {
     /** A new session's Sandbox, made now so its volume is ready by its first turn. */
     readonly create: (volumeId: string, netMode?: NetMode) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError>;
+    /**
+     * A new session `volumeId`, in `namespace` (the sessions' unless told), with the
+     * internet of the session `sourceVolumeId` and a clone of its files, as the module
+     * says; suspended, so its pod starts as it is first brought up. The source must be
+     * between turns, as it is suspended meanwhile, and one fork runs at a time. A fork
+     * that fails leaves no session, and the source as it was.
+     */
+    readonly fork: (
+      sourceVolumeId: string,
+      volumeId: string,
+      namespace?: string,
+    ) => Effect.Effect<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError>;
     readonly destroy: (volumeId: string) => Effect.Effect<void, KubeApiError>;
   };
   /**
@@ -439,6 +506,81 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     return yield* new SessionFileError({ message: `reading ${path} in session ${volumeId} failed (exit ${exitCode}): ${stderr.trim()}` });
   });
 
+  /** Waits until the claim is bound to its volume, which its storage has provisioned. */
+  const awaitBound = (claim: ClaimRef): Effect.Effect<void, KubeApiError | SessionForkError> =>
+    kube.read("v1", "PersistentVolumeClaim", claim.namespace, claim.name).pipe(
+      // A core claim, as the API server returns one.
+      Effect.repeat({ schedule: Schedule.spaced(POLL), until: (made) => (made as V1PersistentVolumeClaim | null)?.status?.phase === "Bound" }),
+      Effect.timeoutOrElse({
+        duration: CLAIM_BOUND_TIMEOUT,
+        orElse: () => Effect.fail(new SessionForkError({ message: `the claim ${claim.namespace}/${claim.name} was not bound to a volume within ${Duration.toSeconds(CLAIM_BOUND_TIMEOUT)}s` })),
+      }),
+      Effect.asVoid,
+    );
+
+  /**
+   * Clones the claim `source` into `destination` in a Job of the installation's `job`,
+   * waiting until it has ended, and deletes the Job, with its pod, once it has, or once it
+   * is no longer waited for.
+   */
+  const runClone = (job: V1Job, source: ClaimRef, destination: ClaimRef): Effect.Effect<void, KubeApiError | SessionForkError> =>
+    Effect.acquireUseRelease(
+      kube.create(cloneJobManifest(job, source, destination)),
+      ({ metadata }) =>
+        kube.read("batch/v1", "Job", metadata?.namespace ?? "", metadata?.name ?? "").pipe(
+          // A Job, as the API server returns one.
+          Effect.map((read) => (read ? jobEnded(read as V1Job) : undefined)),
+          Effect.repeat({ schedule: Schedule.spaced(POLL), until: (ended) => ended !== undefined }),
+          Effect.flatMap((ended) =>
+            ended?.type === "Complete" ? Effect.void : Effect.fail(new SessionForkError({ message: `the clone of ${source.namespace}/${source.name} failed: ${ended?.message || ended?.reason}` }))
+          ),
+        ),
+      ({ metadata }) =>
+        kube.remove("batch/v1", "Job", metadata?.namespace ?? "", metadata?.name ?? "").pipe(
+          Effect.catch((error) => Effect.logWarning(`could not delete the clone's Job ${metadata?.namespace}/${metadata?.name}: ${error.message}`)),
+        ),
+    );
+
+  /**
+   * `use` run while the session, `running` as it is, is suspended: nothing in it runs, and
+   * it is resumed with `netMode` afterwards. A session that cannot be resumed now is left
+   * for its next bring-up to resume, saying why.
+   */
+  const whileSuspended = <A, E>(volumeId: string, netMode: NetMode, running: boolean, use: Effect.Effect<A, E>): Effect.Effect<A, E | SessionError> =>
+    running
+      ? Effect.acquireUseRelease(
+        sandboxes.suspend(volumeId),
+        () => use,
+        () => ensure(volumeId, netMode).pipe(Effect.catch((error) => Effect.logWarning(`could not resume session ${volumeId}: ${error.message}; it resumes as it is next brought up`))),
+      )
+      : use;
+
+  // One fork at a time, so no source is resumed while another fork of it is cloned.
+  const forking = yield* Semaphore.make(1);
+
+  const fork = Effect.fnUntraced(function*(sourceVolumeId: string, volumeId: string, namespace: string): Effect.fn.Return<{ readonly volumeId: string; readonly netMode: NetMode }, SessionError | SessionForkError> {
+    const { clone } = profile;
+    if (!clone) return yield* new SessionForkError({ message: "this deployment's session filesystems cannot be cloned" });
+    // A Sandbox, as the API server returns one.
+    const source = (yield* kube.read(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, assertValidVolumeId(sourceVolumeId))) as Sandbox | null;
+    if (!source) return yield* new SessionForkError({ message: `there is no session ${sourceVolumeId} to fork` });
+    const netMode: NetMode = source.metadata.labels?.[NET_MODE_LABEL] === "full" ? "full" : "none";
+    const made = sessionSandboxManifest({ volumeId, netMode, profile, telemetry: yield* telemetry, namespace, operatingMode: "Suspended" });
+    yield* kube.create(made);
+    const claimOf = (claimNamespace: string, sandbox: string): ClaimRef => ({ namespace: claimNamespace, name: claimName(clone.claimTemplate, sandbox) });
+    const destination = claimOf(namespace, volumeId);
+    yield* awaitBound(destination).pipe(
+      Effect.andThen(whileSuspended(sourceVolumeId, netMode, source.spec.operatingMode !== "Suspended", runClone(clone.job, claimOf(profile.namespace, sourceVolumeId), destination))),
+      Effect.onError(() =>
+        kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId).pipe(
+          Effect.catch((error) => Effect.logWarning(`could not delete the failed fork ${namespace}/${volumeId}: ${error.message}`)),
+        )
+      ),
+    );
+    yield* Effect.logInfo(`forked session ${sourceVolumeId} into ${namespace}/${volumeId} (${netMode} internet)`);
+    return { volumeId, netMode };
+  });
+
   return SessionSandboxes.of({
     volumes: {
       create: (volumeId, netMode = "none") =>
@@ -447,6 +589,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
           Effect.as({ volumeId, netMode }),
           withLogScope("sandbox"),
         ),
+      fork: (sourceVolumeId, volumeId, namespace = profile.namespace) => forking.withPermit(fork(sourceVolumeId, volumeId, namespace)).pipe(withLogScope("sandbox")),
       destroy: (volumeId) => Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))),
     },
 

@@ -61,6 +61,7 @@ function volumesMade(created: (readonly [string, NetMode | undefined])[]): Sessi
         created.push([volumeId, netMode]);
         return { volumeId, netMode };
       }),
+      fork: () => Effect.die(new Error("no volume is forked")),
       destroy: () => Effect.die(new Error("no volume is destroyed")),
     },
     harnessDirectory: () => assert.fail("harnessDirectory"),

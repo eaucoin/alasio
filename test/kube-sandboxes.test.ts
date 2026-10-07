@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
 
-import type { KubernetesObject, V1Condition, V1ObjectMeta, V1Pod } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Condition, V1Job, V1ObjectMeta, V1PersistentVolumeClaimStatus, V1Pod } from "@kubernetes/client-node";
 import type { Attributes } from "@opentelemetry/api";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -35,7 +35,7 @@ import {
   sandboxReady,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
-import { EGRESS_GATE_SCRIPT, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
+import { cloneJobManifest, EGRESS_GATE_SCRIPT, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
 import type { Signal } from "../src/telemetry/config.ts";
@@ -134,10 +134,12 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
   };
   const create = <T extends KubernetesObject>(object: T): Effect.Effect<T, KubeApiError> =>
     Effect.suspend(() => {
-      calls.push(["create", object.kind, object.metadata?.name]);
-      const k = key(object.kind, object.metadata?.namespace, object.metadata?.name);
+      // As the API server names an object by its generateName.
+      const name = object.metadata?.name ?? `${object.metadata?.generateName}${uid + 1}`;
+      calls.push(["create", object.kind, name]);
+      const k = key(object.kind, object.metadata?.namespace, name);
       if (objects.has(k)) return Effect.fail(refusal(409, "exists"));
-      const stored = { ...structuredClone(object), metadata: { ...structuredClone(object.metadata), uid: `uid-${++uid}`, generation: 1 } };
+      const stored = { ...structuredClone(object), metadata: { ...structuredClone(object.metadata), name, uid: `uid-${++uid}`, generation: 1 } };
       objects.set(k, stored);
       return Effect.succeed(structuredClone(stored));
     });
@@ -681,6 +683,173 @@ test("a session on Kubernetes is made when created, and its files are read as it
     yield* sessions.volumes.destroy("fs-abc123");
     assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123"), null);
   }).pipe(Effect.provide(layer), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))));
+});
+
+/** The installation's Job that clones a session's volume, as alasio is given it. */
+const cloneJob: V1Job = {
+  apiVersion: "batch/v1",
+  kind: "Job",
+  metadata: { generateName: "alasio-workspace-clone-", namespace: "alasio" },
+  spec: { template: { spec: { restartPolicy: "Never", containers: [{ name: "clone", image: "mount@sha256:1", env: [{ name: "META_URL", value: "redis://valkey/1" }] }] } } },
+};
+
+/** What the cluster was as the clone's Job ran. */
+interface CloneSeen {
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly source: string | undefined;
+  readonly sourcePod: boolean;
+  readonly destination: string | undefined;
+  readonly destinationPod: boolean;
+  readonly claim: string | undefined;
+}
+
+/**
+ * The rest of the cluster a fork needs, every few milliseconds: agent-sandbox's controller
+ * for the Sandboxes of `sandboxes` (namespace and name), making each claim of theirs, which
+ * its storage binds a little later; and the clone's Jobs, each of which ends as `outcome`
+ * says, once what the cluster was is recorded in `clones`.
+ */
+function forkCluster(kube: FakeKube, sandboxes: readonly (readonly [string, string])[], outcome: "Complete" | "Failed") {
+  const controllers = sandboxes.map(([namespace, name]) => kube.control(namespace, name));
+  const clones: CloneSeen[] = [];
+  const timer = setInterval(() => {
+    for (const sandbox of [...kube.objects.values()].filter(({ kind }) => kind === "Sandbox")) {
+      const { namespace = "", name = "" } = sandbox.metadata;
+      const claim = kube.objects.get(`PersistentVolumeClaim/${namespace}/data-${name}`);
+      if (!claim) kube.create({ apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: `data-${name}`, namespace } });
+      else (claim as KubernetesObject & { status?: V1PersistentVolumeClaimStatus }).status = { phase: "Bound" };
+    }
+    for (const job of [...kube.objects.values()].filter(({ kind }) => kind === "Job") as (KeptObject & V1Job)[]) {
+      if (job.status) continue;
+      const env = Object.fromEntries((job.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value }) => [name, value]));
+      const sandbox = (namespace: string | undefined, name: string | undefined) => kube.objects.get(`Sandbox/${namespace}/${name}`)?.spec?.operatingMode;
+      const pod = (namespace: string | undefined, name: string | undefined) => kube.objects.has(`Pod/${namespace}/${name}`);
+      const [source, destination] = [env["SOURCE_CLAIM"], env["DESTINATION_CLAIM"]].map((claim) => claim?.replace(/^data-/u, ""));
+      clones.push({
+        env,
+        source: sandbox(env["SOURCE_NAMESPACE"], source),
+        sourcePod: pod(env["SOURCE_NAMESPACE"], source),
+        destination: sandbox(env["DESTINATION_NAMESPACE"], destination),
+        destinationPod: pod(env["DESTINATION_NAMESPACE"], destination),
+        claim: (kube.objects.get(`PersistentVolumeClaim/${env["DESTINATION_NAMESPACE"]}/${env["DESTINATION_CLAIM"]}`) as { status?: V1PersistentVolumeClaimStatus } | undefined)?.status?.phase,
+      });
+      job.status = { conditions: [{ type: outcome, status: "True", lastTransitionTime: new Date(0), reason: outcome === "Failed" ? "BackoffLimitExceeded" : "Completed", message: outcome === "Failed" ? "Job has reached the specified backoff limit" : "" }] };
+    }
+  }, 5);
+  return {
+    clones,
+    stop: () => {
+      clearInterval(timer);
+      for (const controller of controllers) controller.stop();
+    },
+  };
+}
+
+/** `effect` run on the session filesystems of `profile`, on `kube`. */
+const onSessions = <A, E>(kube: FakeKube, profile: SessionsProfile, effect: Effect.Effect<A, E, SessionSandboxes | KubeClient | Scope.Scope>) =>
+  onKube(
+    kube,
+    fakeBayma(kube, profile.namespace),
+    effect.pipe(Effect.provide(SessionSandboxes.layer({ profile, stateDir: "/tmp/alasio-kube-test", env: {} })), Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
+  );
+
+test("the Job that clones a volume is the installation's, told which claim to clone into which", () => {
+  const job = cloneJobManifest(cloneJob, { namespace: "alasio-sessions", name: "data-fs-abc123" }, { namespace: "alasio-branch-x-sessions", name: "data-fs-def456" });
+  assert.deepEqual(job.metadata, cloneJob.metadata);
+  assert.deepEqual(job.spec?.template.spec?.containers[0]?.env, [
+    { name: "META_URL", value: "redis://valkey/1" },
+    { name: "SOURCE_NAMESPACE", value: "alasio-sessions" },
+    { name: "SOURCE_CLAIM", value: "data-fs-abc123" },
+    { name: "DESTINATION_NAMESPACE", value: "alasio-branch-x-sessions" },
+    { name: "DESTINATION_CLAIM", value: "data-fs-def456" },
+  ]);
+  assert.equal(cloneJob.spec?.template.spec?.containers[0]?.env?.length, 1, "the installation's Job is left as it is");
+});
+
+test("a fork is made suspended, its claim bound, then cloned from its source, suspended meanwhile and resumed after, with its internet", async () => {
+  const kube = fakeKube();
+  const cluster = forkCluster(kube, [["alasio-sessions", "fs-abc123"], ["alasio-sessions", "fs-def456"]], "Complete");
+  const forked = await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.volumes.create("fs-abc123", "full");
+    kube.calls.length = 0;
+    return yield* sessions.volumes.fork("fs-abc123", "fs-def456");
+  })).finally(cluster.stop);
+  assert.deepEqual(forked, { volumeId: "fs-def456", netMode: "full" });
+  // As the clone ran: the source suspended, its pod ended; the fork suspended, never
+  // having had a pod, on its bound claim.
+  assert.deepEqual(cluster.clones, [{
+    env: {
+      META_URL: "redis://valkey/1",
+      SOURCE_NAMESPACE: "alasio-sessions",
+      SOURCE_CLAIM: "data-fs-abc123",
+      DESTINATION_NAMESPACE: "alasio-sessions",
+      DESTINATION_CLAIM: "data-fs-def456",
+    },
+    source: "Suspended",
+    sourcePod: false,
+    destination: "Suspended",
+    destinationPod: false,
+    claim: "Bound",
+  }]);
+  const fork = kube.peek("Sandbox", "alasio-sessions", "fs-def456");
+  assert.equal(fork?.metadata.labels?.["alasio.dev/net-mode"], "full");
+  assert.equal(fork?.spec?.operatingMode, "Suspended");
+  assert.deepEqual(fork?.metadata.annotations, sessionSandboxManifest({ volumeId: "fs-def456", netMode: "full", profile: profile(), telemetry: null }).metadata.annotations);
+  // The fork made before the clone, the source suspended and resumed around it, and the Job deleted after it.
+  const job = kube.calls.find(([verb, kind]) => verb === "create" && kind === "Job")?.[2];
+  assert.match(String(job), /^alasio-workspace-clone-/u);
+  assert.deepEqual(kube.calls.filter(([verb, kind]) => ["create", "patch", "remove"].includes(verb) && kind !== "PersistentVolumeClaim").map(([verb, kind, name, change]) => [verb, kind, name, change]), [
+    ["create", "Sandbox", "fs-def456", undefined],
+    ["patch", "Sandbox", "fs-abc123", { spec: { operatingMode: "Suspended" } }],
+    ["create", "Job", job, undefined],
+    ["remove", "Job", job, undefined],
+    ["patch", "Sandbox", "fs-abc123", { spec: { operatingMode: "Running" } }],
+  ]);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
+  assert.ok(kube.peek("Pod", "alasio-sessions", "fs-abc123"), "the source runs again");
+});
+
+test("a fork goes into the namespace it is asked into, and leaves a suspended source as it is", async () => {
+  const kube = fakeKube();
+  const cluster = forkCluster(kube, [["alasio-sessions", "fs-abc123"]], "Complete");
+  await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.volumes.create("fs-abc123");
+    yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis" }).pipe(Effect.flatMap((sandboxes) => sandboxes.suspend("fs-abc123")));
+    kube.calls.length = 0;
+    assert.deepEqual(yield* sessions.volumes.fork("fs-abc123", "fs-def456", "alasio-branch-x-sessions"), { volumeId: "fs-def456", netMode: "none" });
+  })).finally(cluster.stop);
+  assert.deepEqual(cluster.clones.map(({ env, source, destination }) => [env["DESTINATION_NAMESPACE"], env["DESTINATION_CLAIM"], source, destination]), [
+    ["alasio-branch-x-sessions", "data-fs-def456", "Suspended", "Suspended"],
+  ]);
+  assert.equal(kube.peek("Sandbox", "alasio-branch-x-sessions", "fs-def456")?.metadata.namespace, "alasio-branch-x-sessions");
+  assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch"), []);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Suspended");
+});
+
+test("a fork whose clone fails leaves no session, and its source resumed", async () => {
+  const kube = fakeKube();
+  const cluster = forkCluster(kube, [["alasio-sessions", "fs-abc123"], ["alasio-sessions", "fs-def456"]], "Failed");
+  const error = await onSessions(kube, profile({ clone: { claimTemplate: "data", job: cloneJob } }), Effect.gen(function*() {
+    const sessions = yield* SessionSandboxes;
+    yield* sessions.volumes.create("fs-abc123");
+    return yield* Effect.flip(sessions.volumes.fork("fs-abc123", "fs-def456"));
+  })).finally(cluster.stop);
+  assert.equal(error._tag, "SessionForkError");
+  assert.equal(error.message, "the clone of alasio-sessions/data-fs-abc123 failed: Job has reached the specified backoff limit");
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-def456"), null);
+  assert.deepEqual([...kube.objects.keys()].filter((key) => key.startsWith("Job/")), []);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
+});
+
+test("a session is not forked where its volume cannot be cloned, nor one that does not exist", async () => {
+  const kube = fakeKube();
+  const refused = (clone: SessionsProfile["clone"]) =>
+    onSessions(kube, profile({ clone }), Effect.flip(Effect.flatMap(SessionSandboxes, (sessions) => sessions.volumes.fork("fs-abc123", "fs-def456"))));
+  assert.equal((await refused(null)).message, "this deployment's session filesystems cannot be cloned");
+  assert.equal((await refused({ claimTemplate: "data", job: cloneJob })).message, "there is no session fs-abc123 to fork");
+  assert.deepEqual(kube.calls.filter(([verb]) => verb !== "read"), []);
 });
 
 test("a session whose workspace mount is lost is restarted as it is brought up, and one whose mount cannot be looked at is not", async () => {

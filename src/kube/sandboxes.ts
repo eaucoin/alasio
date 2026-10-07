@@ -216,6 +216,11 @@ const POLL: Duration.Input = "500 millis";
 /** How long one look at whether bayma answers may take. */
 const ANSWER_TIMEOUT_MS = 5000;
 
+/** The claim agent-sandbox makes for the Sandbox `sandbox` of its volume claim template `template`. */
+export function claimName(template: string, sandbox: string): string {
+  return `${template}-${sandbox}`;
+}
+
 /** The name of a Sandbox's token Secret. */
 export function tokenSecretName(name: string): string {
   return `${name}-bayma-token`;

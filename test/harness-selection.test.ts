@@ -145,7 +145,11 @@ const mounts = <A, E>(alasio: TestAlasio, f: (mounts: Mounts["Service"]) => Effe
 
 /** Session filesystems a test offers without making any. */
 const unusedSandbox: SessionSandboxes["Service"] = {
-  volumes: { create: () => Effect.die(new Error("no volume is made")), destroy: () => Effect.die(new Error("no volume is destroyed")) },
+  volumes: {
+    create: () => Effect.die(new Error("no volume is made")),
+    fork: () => Effect.die(new Error("no volume is forked")),
+    destroy: () => Effect.die(new Error("no volume is destroyed")),
+  },
   harnessDirectory: () => assert.fail("harnessDirectory"),
   ensureSession: () => Effect.die(new Error("no session is ensured")),
   readFile: () => Effect.die(new Error("no file is read")),
