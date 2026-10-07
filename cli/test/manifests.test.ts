@@ -928,15 +928,18 @@ describe("workspace storage", () => {
     assert.equal(cloner.image, "juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673");
     assert.deepEqual(cloner.securityContext, { privileged: true });
     assert.deepEqual(cloner.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
-    // The destination's directory has no quota at first, then the driver's.
+    // The destination's directory has no quota at first, then the driver's. The mount, run
+    // in the background, takes a while to answer, as on the box; it is up once it has.
     const juicefs = [
+      '[ "$1" = mount ] && /bin/sleep 0.3',
       'echo "$@" >> "$ROOT/calls"',
+      '[ "$1" = mount ] && : > "$ROOT/mounted"',
       'if [ "$1 $2" = "quota get" ]; then [ -e "$ROOT/quota" ] && echo "| /alasio-sessions-data-fs-def456 | 1.0 GiB |"; : > "$ROOT/quota"; fi',
       "true",
     ].join("\n");
     const recorded = (name: string) => `echo "${name} $*" >> "$ROOT/calls"`;
-    // A mount that answers at once, and a source directory the pod's group's, as kubelet made it.
-    const stat = 'case $1 in --file-system) echo fuseblk ;; --format=%a) echo 2775 ;; *) echo 1000:1000 ;; esac';
+    // /jfs a FUSE mount once the mount is up, and a source directory the pod's group's, as kubelet made it.
+    const stat = 'case $1 in --file-system) if [ -e "$ROOT/mounted" ]; then echo fuseblk; else echo overlay; fi ;; --format=%a) echo 2775 ;; *) echo 1000:1000 ;; esac';
     const env = {
       META_URL: "redis://valkey/1",
       SOURCE_NAMESPACE: "alasio-sessions",
@@ -948,7 +951,10 @@ describe("workspace storage", () => {
     const { root, run, remove } = runScript(cloner, env, commands);
     try {
       run();
-      assert.deepEqual(readFileSync(join(root, "calls"), "utf8").trim().split("\n"), [
+      const calls = readFileSync(join(root, "calls"), "utf8").trim().split("\n");
+      // It waited for the mount, a second at a time, as long as the mount took.
+      assert.ok(calls.includes("sleep 1"), calls.join("\n"));
+      assert.deepEqual(calls.filter((call) => call !== "sleep 1"), [
         "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
         "sleep 2",
         "quota get redis://valkey/1 --path /alasio-sessions-data-fs-def456",
