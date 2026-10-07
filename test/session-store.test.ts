@@ -107,16 +107,6 @@ describe("alasio's session store", () => {
     assert.deepEqual(rows, [{ doc: null }]);
   });
 
-  test("rows stored before doc existed get theirs when the schema is ensured", async () => {
-    const store = await makeStore();
-    const schema = `test_${process.pid}_${schemas}`;
-    await store.append(KEY, [E("user", { uuid: "u1" })]);
-    await pool.query(`alter table ${schema}.entries drop column doc`);
-    await store.ensureSchema();
-    const { rows } = await pool.query(`select doc->>'uuid' as uuid from ${schema}.entries`);
-    assert.deepEqual(rows, [{ uuid: "u1" }]);
-  });
-
   test("a batch beyond one insert's parameter limit keeps its order", async () => {
     const store = await makeStore();
     const entries = Array.from({ length: 12_345 }, (_, n) => E("x", { uuid: `u${n}`, n }));

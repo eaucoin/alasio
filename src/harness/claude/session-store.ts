@@ -27,7 +27,7 @@ import {
   type SessionStoreEntry,
   type SessionSummaryEntry,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { Pool, QueryResult } from "pg";
+import type { Pool } from "pg";
 
 export const DEFAULT_SCHEMA = "claude_sessions";
 
@@ -45,8 +45,6 @@ create table if not exists ${SCHEMA}.entries (
   mtime bigint not null,
   doc jsonb
 );
--- Tables made before doc existed.
-alter table ${SCHEMA}.entries add column if not exists doc jsonb;
 create unique index if not exists entries_uuid
   on ${SCHEMA}.entries (project_key, session_id, subpath, uuid) where uuid is not null;
 create index if not exists entries_key on ${SCHEMA}.entries (project_key, session_id, subpath, seq);
@@ -74,9 +72,6 @@ end $$;
 const ROWS_PER_INSERT = 5000;
 
 const subpathOf = (key: SessionKey): string => key.subpath ?? "";
-
-/** Rows given their doc at a time, for rows stored before doc existed. */
-const DOCS_PER_UPDATE = 500;
 
 /** A session the store keeps, as `listSessions()` gives it: its id and when it last changed. */
 export interface StoredSession {
@@ -127,25 +122,9 @@ export class NeonSessionStore implements SessionStore {
     this.#schema = schema;
   }
 
-  /** Creates the tables if they are missing, and fills in any missing doc. Idempotent. */
+  /** Creates the tables if they are missing. Idempotent. */
   async ensureSchema(): Promise<void> {
     await this.#pool.query(ddl(this.#schema));
-    // Rows stored before doc existed, and any whose doc Postgres would not
-    // take before, which it is offered once more.
-    for (let after: number | string = 0; ; ) {
-      const { rows }: QueryResult<{ seq: string; entry: SessionStoreEntry }> = await this.#pool.query(
-        `select seq, entry from ${this.#schema}.entries where doc is null and seq > $1 order by seq limit $2`,
-        [after, DOCS_PER_UPDATE],
-      );
-      const last = rows.at(-1);
-      if (last === undefined) return;
-      await this.#pool.query(
-        `update ${this.#schema}.entries as e set doc = ${this.#schema}.as_doc(d.doc)
-         from unnest($1::bigint[], $2::text[]) as d(seq, doc) where e.seq = d.seq`,
-        [rows.map((row) => row.seq), rows.map((row) => JSON.stringify(docOf(row.entry)))],
-      );
-      after = last.seq;
-    }
   }
 
   async append(key: SessionKey, entries: readonly SessionStoreEntry[]): Promise<void> {
