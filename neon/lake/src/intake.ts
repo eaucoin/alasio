@@ -11,8 +11,8 @@
  * its start: it opens it until that succeeds, and opens it anew whenever a write fails,
  * so it rides out the compute restarting as the loader does, and is ready whatever
  * becomes of the loader. Its requests are written one at a time, on its one
- * connection, and now and then what it wrote inlined in the catalog is flushed to
- * Parquet.
+ * connection; and every hour what it wrote inlined in the catalog is flushed to
+ * Parquet, and the small files it wrote are merged.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { promisify } from "node:util";
@@ -23,7 +23,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { queue } from "./lake.ts";
 import type { Log } from "./loader.ts";
 import type { Metrics } from "./metrics.ts";
-import { flushTelemetry, telemetryRows, writeTelemetry } from "./otel.ts";
+import { flushTelemetry, mergeTelemetry, telemetryRows, writeTelemetry } from "./otel.ts";
 import { decodeRequest, type Encoding, MalformedRequest, SIGNALS } from "./otlp.ts";
 
 const gunzipAsync = promisify(gunzip);
@@ -40,8 +40,8 @@ export interface IntakeOptions {
   log: Log;
   /** How soon an open that failed is tried again. */
   retryMs?: number;
-  /** How often what is inlined is flushed to Parquet. */
-  flushIntervalMs?: number;
+  /** How often what is inlined is flushed to Parquet, and small files merged. */
+  tidyIntervalMs?: number;
 }
 
 export interface Intake {
@@ -56,8 +56,8 @@ export interface Intake {
 /** The most a request's body may be, sent or unzipped: well past the collector's batches. */
 export const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const RETRY_MS = 10_000;
-/** How long the catalog holds the telemetry inlined in it, at most. */
-const FLUSH_INTERVAL_MS = 3_600_000;
+/** How long the catalog holds the telemetry inlined in it, and the day's files stay small, at most. */
+const TIDY_INTERVAL_MS = 3_600_000;
 
 const MEDIA_TYPES: Readonly<Record<string, Encoding>> = { "application/x-protobuf": "protobuf", "application/json": "json" };
 
@@ -85,7 +85,7 @@ async function unzip(body: Buffer): Promise<Buffer> {
 }
 
 /** Starts the intake: it opens the lake now, and keeps it open until stopped. */
-export function startIntake({ open, metrics, log, retryMs = RETRY_MS, flushIntervalMs = FLUSH_INTERVAL_MS }: IntakeOptions): Intake {
+export function startIntake({ open, metrics, log, retryMs = RETRY_MS, tidyIntervalMs = TIDY_INTERVAL_MS }: IntakeOptions): Intake {
   const stopped = new AbortController();
   const writing = queue();
   let lake: IntakeLake | null = null;
@@ -109,7 +109,7 @@ export function startIntake({ open, metrics, log, retryMs = RETRY_MS, flushInter
     wake?.();
   }
 
-  // Opens the lake whenever it is not open, and flushes it while it is.
+  // Opens the lake whenever it is not open, and tidies it while it is.
   const done = (async () => {
     while (!stopped.signal.aborted) {
       if (!lake) {
@@ -122,10 +122,13 @@ export function startIntake({ open, metrics, log, retryMs = RETRY_MS, flushInter
           continue;
         }
       }
-      await sleep(flushIntervalMs);
+      await sleep(tidyIntervalMs);
       const held = lake;
       if (stopped.signal.aborted || !held || held !== lake) continue;
-      await writing(() => flushTelemetry(held.db)).catch(drop);
+      await writing(async () => {
+        await flushTelemetry(held.db);
+        await mergeTelemetry(held.db);
+      }).catch(drop);
     }
     await writing(async () => lake?.close());
     lake = null;

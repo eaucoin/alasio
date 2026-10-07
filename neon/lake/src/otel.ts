@@ -477,6 +477,20 @@ export function flushTelemetry(db: DuckDBConnection): Promise<unknown> {
 }
 
 /**
+ * Merges each `otel` table's small files, a day's into one: the collector's minute-long
+ * batches of metric points make a file a kind a minute, some ten thousand a day, which a
+ * query of the day reads one by one. Measured on the stack, a 24-hour query of a gauge
+ * over 2 500 such files took 8.8 s cold, 1.1 s once they were merged, in 8 s. The files
+ * merged are only scheduled for deletion, which maintenance's cleanup does (./sync.ts),
+ * so a branch that still names them keeps them.
+ */
+export function mergeTelemetry(db: DuckDBConnection): Promise<unknown> {
+  return serially(async () => {
+    for (const table of OTEL_TABLES) await db.run(`call ducklake_merge_adjacent_files('${LAKE}', '${table}', schema => 'otel')`);
+  });
+}
+
+/**
  * Deletes the telemetry of the days before the last `retentionDays` whole days (UTC)
  * before `now`'s, every table's in one transaction: each day is a partition of its
  * own, so its files are deleted whole, by the maintenance that follows. Returns how many

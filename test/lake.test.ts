@@ -505,6 +505,34 @@ describe("telemetry", () => {
     }
   });
 
+  test("the intake flushes what it inlined and merges the small files it wrote, every so often", async () => {
+    const intake = startIntake({ open: openForIntake, metrics: createMetrics(), log: () => {}, tidyIntervalMs: 500 });
+    const server = createServer(intake.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const reader = await openLake(config, { readOnly: true });
+    try {
+      // A server listening on a TCP port has an address of its own.
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      for (let waited = 0; !intake.ready() && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+      const today = new Date(Number(NOW / 1_000_000n));
+      const partition = `year=${today.getUTCFullYear()}/month=${today.getUTCMonth() + 1}/day=${today.getUTCDate()}/`;
+      // Today's files, which are those the intake merges.
+      const files = async () => (await one<Count>(reader.db, `select count(*) as n from ducklake_list_files('${LAKE}', 'metrics_gauge', schema => 'otel') where contains(data_file, '${partition}')`)).n;
+      const before = await files();
+      for (const offset of [0n, 1n, 2n]) {
+        assert.equal((await post(base, "/v1/metrics", JSON.stringify(gaugeRequest("tidied", NOW + offset)), { "content-type": "application/json" })).status, 200);
+      }
+      assert.equal(await files(), before + 3n);
+      for (let waited = 0; (await files()) > 1n && waited < 30_000; waited += 200) await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(await files(), 1n);
+      assert.equal((await one<Count>(reader.db, `select count(*) as n from ${LAKE}.otel.metrics_gauge where ServiceName = 'tidied'`)).n, 3n);
+    } finally {
+      reader.close();
+      server.close();
+      await intake.stop();
+    }
+  });
+
   test("the intake answers 503 while it cannot open the lake, so the collector sends again", async () => {
     const intake = startIntake({ open: () => Promise.reject(new Error("the compute is restarting")), metrics: createMetrics(), log: () => {}, retryMs: 10 });
     const server = createServer(intake.handle);
