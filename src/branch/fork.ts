@@ -9,9 +9,11 @@
  * with the bearer forkToken(key, branch), forks its session `volumeId` into the branch's
  * sessions namespace under the same id, suspended (../sandbox/index.ts fork), and
  * answers `{ volumeId }`. It forks only a session it made, or one of its conversations
- * knows, and none while a turn runs in it, as the fork suspends it: 401 without the
- * branch's token, 404 for a session it does not know, 409 while a turn runs in it, 502
- * when the fork failed. A session forked already is answered as forked.
+ * knows, and none while a turn runs in it, as the fork suspends it: the conversations
+ * that mount it are held busy while it forks (ActiveTurns' hold), so none starts a turn
+ * under it, and their prompts that came meanwhile run after. 401 without the branch's
+ * token, 404 for a session it does not know, 409 while a turn runs in it, 502 when the
+ * fork failed. A session forked already is answered as forked.
  *
  * The key is the stack's (neon/control/kube-setup.ts), which the parent reads as each
  * request comes, from a Secret that may be made after it started; each branch is given
@@ -31,6 +33,7 @@ import { Effect, Option, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { nameProblem } from "../../neon/control/branches.ts";
+import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
 import { hasStatus } from "../kube/client.ts";
 import { Store } from "../persistence/store.ts";
@@ -69,9 +72,10 @@ export const serveBranchForks = Effect.fnUntraced(function*({
   port = BRANCH_FORK_PORT,
   host = "0.0.0.0",
   keyFile,
-}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | ActiveTurns | SessionSandboxes> {
+}: BranchForksOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope | Store | ActiveTurns | Turns | SessionSandboxes> {
   const store = yield* Store;
   const activeTurns = yield* ActiveTurns;
+  const turns = yield* Turns;
   const sandboxes = yield* SessionSandboxes;
 
   const handle = Effect.gen(function*() {
@@ -88,14 +92,18 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     const knowing = yield* store.listWorkspaceConversations(sessionFsWorkspace(volumeId));
     const made = (yield* store.listSessionWorkspaces).some((workspace) => workspace.volumeId === volumeId && workspace.madeAt !== null);
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
-    const busy = yield* Effect.forEach(knowing.filter(({ mounted }) => mounted), ({ conversationId }) => activeTurns.isBusy(conversationId));
-    if (busy.some(Boolean)) {
+    const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
+    const forked = yield* Effect.scoped(Effect.gen(function*() {
+      if (!(yield* activeTurns.hold(mounting))) return false;
+      yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
+        // Forked already, by an earlier request of the branch's.
+        Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),
+      );
+      return true;
+    })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
+    if (!forked) {
       return answer(409, { error: `a turn runs in the session ${volumeId} now, which a fork would suspend: send again once it ends` });
     }
-    yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
-      // Forked already, by an earlier request of the branch's.
-      Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),
-    );
     yield* Effect.logInfo(`forked session ${volumeId} for the branch ${branch}`);
     return answer(200, { volumeId });
   }).pipe(

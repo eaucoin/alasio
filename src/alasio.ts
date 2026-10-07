@@ -142,7 +142,7 @@ function inheritance(branch: BranchEnvironment, store: Store["Service"]): Inheri
  * (./branch/fork.ts), for as long as alasio runs; a server that cannot listen stops
  * alasio as it starts.
  */
-function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | ActiveTurns> {
+function branchForks({ branchForkKeyFile }: AlasioOptions): Layer.Layer<never, never, Store | ActiveTurns | Turns> {
   if (!branchForkKeyFile) return Layer.empty;
   return Layer.effectDiscard(
     Effect.serviceOption(SessionSandboxes).pipe(

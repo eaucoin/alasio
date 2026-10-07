@@ -4,7 +4,7 @@
  * how it is stopped and steered; whatever asks whether a conversation is busy, or stops
  * or steers its turn, asks here.
  */
-import { Context, Effect, HashMap, Layer, Option, Ref, type Scope } from "effect";
+import { Context, Deferred, Effect, HashMap, Layer, Option, Ref, type Scope } from "effect";
 
 import type { HarnessError } from "./index.ts";
 
@@ -39,6 +39,13 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
   readonly register: (conversationId: string, turn: RunningTurn, options?: RegisterOptions) => Effect.Effect<void, never, Scope.Scope>;
   /** The conversation's running turn, if it has one. */
   readonly get: (conversationId: string) => Effect.Effect<Option.Option<RunningTurn>>;
+  /**
+   * Holds the conversations busy until the scope closes, as a running turn would, for what
+   * no turn may start under (a fork, which suspends the workspace they run in): whether it
+   * holds them, which it does only where none is busy, and then all at once. A hold is not
+   * stopped: stopping it is done once it ends.
+   */
+  readonly hold: (conversationIds: readonly string[]) => Effect.Effect<boolean, never, Scope.Scope>;
   /** Whether the conversation has a running turn. */
   readonly isBusy: (conversationId: string) => Effect.Effect<boolean>;
   /** Stops the conversation's running turn for `reason`, once it has let go; whether there was one. */
@@ -64,6 +71,28 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
               : Effect.void,
         ).pipe(Effect.asVoid),
       get,
+      hold: (conversationIds) =>
+        Effect.gen(function*() {
+          const ended = yield* Deferred.make<void>();
+          const hold: RunningTurn = { stop: () => Deferred.await(ended), steer: () => Effect.succeed(false), cliInitiated: false };
+          return yield* Effect.acquireRelease(
+            Ref.modify(running, (turns) =>
+              conversationIds.some((conversationId) => HashMap.has(turns, conversationId))
+                ? [false, turns] as const
+                : [true, conversationIds.reduce((held, conversationId) => HashMap.set(held, conversationId, hold), turns)] as const),
+            (held) =>
+              Effect.andThen(
+                held
+                  ? Ref.update(running, (turns) =>
+                    conversationIds.reduce(
+                      (left, conversationId) => Option.exists(HashMap.get(left, conversationId), (current) => current === hold) ? HashMap.remove(left, conversationId) : left,
+                      turns,
+                    ))
+                  : Effect.void,
+                Deferred.succeed(ended, undefined),
+              ),
+          );
+        }),
       isBusy: (conversationId) => Effect.map(get(conversationId), Option.isSome),
       stop: (conversationId, reason) =>
         Effect.flatMap(get(conversationId), Option.match({

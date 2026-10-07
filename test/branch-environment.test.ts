@@ -24,7 +24,7 @@ import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
 import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
-import { withServices } from "./support/turns.ts";
+import { turnsStub, withServices } from "./support/turns.ts";
 
 test("a branch's state, as it first starts, keeps its conversations and loses what was in flight where it was branched from, once", async () => {
   const schema = newSchema();
@@ -85,7 +85,12 @@ test("an alasio forks a session one of its conversations knows for the branch wh
   });
   const scope = Effect.runSync(Scope.make());
   try {
-    const services = await Effect.runPromise(Layer.buildWithScope(Layer.mergeAll(ActiveTurns.layer, Layer.succeed(Store, store), Layer.succeed(SessionSandboxes, sandboxes)), scope));
+    // The conversations whose prompts are run again once a fork lets go of them.
+    const scheduled: string[] = [];
+    const turns = turnsStub({ schedule: (id) => Effect.sync(() => void scheduled.push(id)) });
+    const services = await Effect.runPromise(
+      Layer.buildWithScope(Layer.mergeAll(ActiveTurns.layer, Layer.succeed(Store, store), Layer.succeed(SessionSandboxes, sandboxes), Layer.succeed(Turns, turns)), scope),
+    );
     const { port } = await Effect.runPromise(Effect.provide(serveBranchForks({ port: 0, host: "127.0.0.1", keyFile }), services).pipe(Scope.provide(scope)));
     const tokenFile = join(directory, "token");
     const asking = (branch: string, volumeId: string) =>
@@ -127,6 +132,26 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     await Effect.runPromise(Deferred.succeed(turning, undefined));
     await Effect.runPromise(Fiber.join(turn));
     assert.deepEqual(await asking("try", "fs-abc123"), Exit.succeed(true));
+
+    // No turn starts while it forks, which would suspend the session under it; what was
+    // asked of the conversation meanwhile is run once the fork lets go of it.
+    const forking = await Effect.runPromise(Deferred.make<void>());
+    const forkEnds = await Effect.runPromise(Deferred.make<void>());
+    outcome = Effect.andThen(Deferred.succeed(forking, undefined), Deferred.await(forkEnds));
+    scheduled.length = 0;
+    const asked = asking("try", "fs-abc123");
+    await Effect.runPromise(Deferred.await(forking));
+    const busy = Effect.flatMap(ActiveTurns, (active) => active.isBusy(conversationId)).pipe(Effect.provide(services));
+    try {
+      assert.equal(await Effect.runPromise(busy), true);
+      assert.deepEqual(scheduled, []);
+    } finally {
+      await Effect.runPromise(Deferred.succeed(forkEnds, undefined));
+    }
+    assert.deepEqual(await asked, Exit.succeed(true));
+    assert.equal(await Effect.runPromise(busy), false);
+    assert.deepEqual(scheduled, [conversationId]);
+    outcome = Effect.void;
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(directory, { recursive: true, force: true });
