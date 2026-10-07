@@ -99,15 +99,17 @@ jobs:
         # The cluster in Docker on one node, and on a server with two agents, so the stack
         # and sessions spread; and k3s on the runner itself, the host target, which the
         # runner's sudo, asking for no password, lets alasio install, on one: behind ufw
-        # for one shard, as a server often is, and without a firewall for the other.
+        # for one shard, as a server often is, and without a firewall for the others.
         target: [docker]
         agents: [0, 2]
-        # The suites, in two shards that need nothing of each other's, each on a cluster
-        # of its own: alasio on Kubernetes and workspaces on JuiceFS, and Neon (test/e2e/harness.ts).
-        shard: [sessions, neon]
+        # The suites, in three shards that need nothing of each other's, each on a cluster
+        # of its own: alasio on Kubernetes and workspaces on JuiceFS, Neon, and alasio's
+        # telemetry (test/e2e/harness.ts).
+        shard: [sessions, neon, telemetry]
         include:
           - { target: host, agents: 0, shard: sessions, firewall: ufw }
           - { target: host, agents: 0, shard: neon }
+          - { target: host, agents: 0, shard: telemetry }
     steps:
       # The cluster holds Neon's images and the agent image, bayma's with every runtime
       # it serves, unpacked: far more disk than a runner starts with free, so the

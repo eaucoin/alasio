@@ -2,8 +2,8 @@
  * alasio, end to end, as its operator runs it: installed and started by its command line
  * from its npm package (./harness.ts), driven through the Telegram stand-in as its
  * operator drives it, its sessions' confinement checked from inside them, its own code
- * paths run in its pod with its ServiceAccount, its telemetry looked for where the
- * installation's goes, its workspaces' JuiceFS put through file operations, crashes and a
+ * paths run in its pod with its ServiceAccount, its telemetry looked for in its lake and
+ * where the installation's goes, its workspaces' JuiceFS put through file operations, crashes and a
  * restore (./workspace-storage.ts), its Neon through crashes and losses (neon/test/stack.ts), and
  * removed, with all it keeps, by its command line at the end.
  *
@@ -35,6 +35,7 @@ import {
   inShard,
   KEEP,
   kube,
+  lakeQuery,
   onNode,
   paths,
   ref,
@@ -178,14 +179,12 @@ if (inShard("sessions")) {
 
     before(async () => {
       telegram = await forward(TELEGRAM);
-      sink = await forward(OTLP);
       tg = operator(telegram.base);
       await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
     });
 
     after(() => {
       telegram?.close();
-      sink?.close();
     });
 
     test("a new empty workspace without internet is a session of its own, confined", async () => {
@@ -236,41 +235,6 @@ if (inShard("sessions")) {
       assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
     });
 
-    test("a session's telemetry reaches the installation's backend, stamped with the session", async () => {
-      assert.ok(sink, "the OTLP stand-in did not answer");
-      const deadline = Date.now() + 120_000;
-      let stamped: ListedExport[] = [];
-      while (Date.now() < deadline) {
-        // The sink answers what it received.
-        const listed = (await (await fetch(`${sink.base}/control/exports?contains=${none}`)).json()) as ListedExport[];
-        stamped = listed.filter((entry) => entry.contains);
-        if (stamped.some((entry) => entry.signal === "traces")) break;
-        await sleep(3000);
-      }
-      assert.ok(stamped.some((entry) => entry.signal === "traces"), "no trace of the session's bayma arrived stamped with it");
-    });
-
-    test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend", async () => {
-      assert.ok(sink, "the OTLP stand-in did not answer");
-      // JuiceFS's are its own Prometheus metrics, scraped from its clients and from its
-      // driver, whose provisioning errors only its controller counts; Valkey's, the
-      // collector's redis receiver's.
-      const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
-      const deadline = Date.now() + 180_000;
-      let missing = names;
-      while (Date.now() < deadline) {
-        const arrived = await Promise.all(missing.map(async (name) => {
-          // The sink answers what it received.
-          const listed = (await (await fetch(`${sink?.base}/control/exports?contains=${encodeURIComponent(name)}`)).json()) as ListedExport[];
-          return listed.some((entry) => entry.signal === "metrics" && entry.contains);
-        }));
-        missing = missing.filter((_, index) => !arrived[index]);
-        if (missing.length === 0) break;
-        await sleep(10_000);
-      }
-      assert.deepEqual(missing, [], "no metric of these names arrived");
-    });
-
     test("a folder conversation's bayma works on the machine as the operator, in their home", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
       const { home } = paths();
       const { url, seen } = await inAlasio<FolderBaymaSeen>("./folder-bayma.ts");
@@ -291,6 +255,79 @@ if (inShard("sessions")) {
   });
 
   workspaceStorage();
+}
+
+/** How many rows of the lake's `otel` metric tables `condition` selects, as SQL. */
+const metricRows = (condition: string) =>
+  `select sum(n) as n from (${["gauge", "sum", "histogram", "exponential_histogram", "summary"].map((kind) => `select count(*) as n from otel.metrics_${kind} where ${condition}`).join(" union all ")})`;
+
+/** Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector sends them within seconds. */
+async function untilInLake(what: string, sql: string): Promise<void> {
+  const deadline = Date.now() + 240_000;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    last = await lakeQuery(sql).then(([row]) => Number(row?.["n"] ?? 0), (error: unknown) => error);
+    if (typeof last === "number" && last > 0) return;
+    await sleep(5000);
+  }
+  assert.fail(`no ${what} arrived in the lake: ${last instanceof Error ? last.message : `${last} rows`}`);
+}
+
+/** Waits until the stand-in backend has received an export of `signal` that contains `needle`. */
+async function untilExported(signal: string, needle: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // The sink answers what it received.
+    const listed = (await (await fetch(`${sink?.base}/control/exports?contains=${encodeURIComponent(needle)}`)).json()) as ListedExport[];
+    if (listed.some((entry) => entry.signal === signal && entry.contains)) return true;
+    await sleep(5000);
+  }
+  return false;
+}
+
+if (inShard("telemetry")) {
+  describe("alasio's telemetry", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      sink = await forward(OTLP);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    after(() => {
+      telegram?.close();
+      sink?.close();
+    });
+
+    test("alasio's own traces, logs and metrics are in the lake, queryable through alasio lake", async () => {
+      await untilInLake("trace of alasio's", "select count(*) as n from otel.traces where ServiceName = 'alasio'");
+      await untilInLake("log record of alasio's", "select count(*) as n from otel.logs where ServiceName = 'alasio'");
+      await untilInLake("metric of alasio's", metricRows("ServiceName = 'alasio'"));
+    });
+
+    test("a session's bayma's telemetry is in the lake, stamped with its session, and reaches the installation's backend too", async () => {
+      const volumeId = await newSession("none");
+      await untilInLake("trace of the session's bayma", `select count(*) as n from otel.traces where ServiceName = 'bayma' and ResourceAttributes['alasio.volume.id'] = '${volumeId}'`);
+      assert.ok(await untilExported("traces", volumeId, 120_000), "no trace of the session's bayma arrived at the backend stamped with it");
+    });
+
+    test("the stack's telemetry is in the lake, the compute's and the lake's own among it", async () => {
+      // What the collector scrapes is named for its job; the lake exports its events itself.
+      await untilInLake("metric of the compute's", metricRows("ServiceName = 'compute'"));
+      await untilInLake("log record of the lake's", "select count(*) as n from otel.logs where ServiceName = 'alasio-lake'");
+      await untilInLake("metric of JuiceFS's", metricRows("MetricName like 'juicefs_%'"));
+      await untilInLake("metric of Valkey's", metricRows("MetricName = 'redis.memory.used'"));
+    });
+
+    test("the stack's collector sends JuiceFS's metrics and Valkey's to the installation's backend too", async () => {
+      // JuiceFS's are its own Prometheus metrics, scraped from its clients and from its
+      // driver, whose provisioning errors only its controller counts; Valkey's, the
+      // collector's redis receiver's.
+      const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
+      const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
+      assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
+    });
+  });
 }
 
 if (inShard("neon")) neonStack();

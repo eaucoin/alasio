@@ -79,7 +79,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "neon"] as const;
+export const SHARDS = ["sessions", "neon", "telemetry"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, every suite, when it is unset or empty. */
@@ -92,9 +92,10 @@ export function shardOf(value: string | undefined): Shard | undefined {
 
 /**
  * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
- * Kubernetes and workspaces on JuiceFS, which works on the sessions the other made, or
- * `neon`, alasio's Neon, which needs neither; every suite unless set. Each shard runs the
- * command line's suite, and uninstall's, as well.
+ * Kubernetes and workspaces on JuiceFS, which works on the sessions the other made,
+ * `neon`, alasio's Neon, which needs neither, or `telemetry`, where alasio's telemetry
+ * goes, on a session of its own; every suite unless set. Each shard runs the command
+ * line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
@@ -167,6 +168,12 @@ export async function alasioOk(...args: string[]): Promise<string> {
   const ran = await alasio(...args);
   if (ran.code !== 0) throw new Error(`alasio ${args.join(" ")} exited with ${ran.code}:\n${ran.stderr}`);
   return ran.stdout;
+}
+
+/** A read-only query of the lake, as alasio lake runs one: its rows. */
+export async function lakeQuery(sql: string): Promise<Record<string, unknown>[]> {
+  const stdout = await alasioOk("lake", "--format", "json", sql);
+  return stdout.trim().split("\n").filter(Boolean).map((line): Record<string, unknown> => JSON.parse(line));
 }
 
 /** What `child` writes and exits with; what it says on stderr, its progress, is said here too, as it says it. */

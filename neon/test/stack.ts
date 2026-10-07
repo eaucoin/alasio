@@ -17,7 +17,7 @@ import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { alasioOk, type Forward, kube, ref } from "../../test/e2e/harness.ts";
+import { alasioOk, type Forward, kube, lakeQuery, ref } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchesFile, computeId, MAIN, type ReadyBranch } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
@@ -205,12 +205,6 @@ async function runPod(name: string, spec: V1PodSpec, { timeoutMs = 300_000 }: { 
 /** The image of the workload's first container. */
 const image = (workload: V1Deployment | V1StatefulSet | null) => workload?.spec?.template.spec?.containers[0]?.image ?? "";
 const restricted = { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } };
-
-/** A read-only query of the lake, as alasio lake runs one: its rows. */
-async function lakeQuery(sql: string) {
-  const stdout = await alasioOk("lake", "--format", "json", sql);
-  return stdout.trim().split("\n").filter(Boolean).map((line): Record<string, unknown> => JSON.parse(line));
-}
 
 async function untilLoaded(check: () => Promise<boolean>, what: string) {
   const deadline = Date.now() + 300_000;
