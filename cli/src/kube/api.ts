@@ -4,19 +4,20 @@
  * a kubeconfig's credentials. Nothing of client-node's object model is between the
  * manifests and the cluster, as its serializer drops what its model lacks (a
  * NetworkPolicy's `from`, a CRD schema's `x-kubernetes-*` keys); client-node only reads
- * the kubeconfig, and runs commands in containers over its websocket.
+ * the kubeconfig, and runs commands in containers, and forwards connections to pods,
+ * over its websockets.
  *
  * Objects are addressed by their kind, as KINDS lists those alasio reads or makes, so
  * no discovery is needed.
  */
 import { type ClientRequest, type IncomingMessage, request as httpRequest, STATUS_CODES } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
-import type { Readable, Writable } from "node:stream";
+import type { Duplex, Readable, Writable } from "node:stream";
 import { buffer } from "node:stream/consumers";
 import { inspect } from "node:util";
 
 import { NodeStream } from "@effect/platform-node";
-import { Exec, KubeConfig, type KubernetesObject, type V1Status } from "@kubernetes/client-node";
+import { Exec, KubeConfig, type KubernetesObject, PortForward, type V1Status } from "@kubernetes/client-node";
 import { Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect";
 
 /** A kind of object: its API version and kind, as an object of it says them. */
@@ -157,6 +158,12 @@ export interface ContainerRef {
   readonly container: string;
 }
 
+/** A pod a connection is forwarded to. */
+export interface PodRef {
+  readonly namespace: string;
+  readonly pod: string;
+}
+
 /** Where a command run by `exec` reads and writes; `tty` gives it a terminal, whose size follows `stdout`'s. */
 export interface ExecStreams {
   readonly stdin: Readable | null;
@@ -185,6 +192,8 @@ export class KubeApi extends Context.Service<KubeApi, {
   readonly logs: (namespace: string, pod: string, options: LogOptions) => Stream.Stream<Uint8Array, KubeApiError>;
   /** Runs `command` in the container with `streams`: its exit code. Interrupting it closes the exec. */
   readonly exec: (target: ContainerRef, command: readonly string[], streams: ExecStreams) => Effect.Effect<number, KubeApiError | KubeExecError>;
+  /** Forwards `connection` to `port` of the pod, as the API server's port-forward does, until either end closes it; interrupting it closes both. */
+  readonly portForward: (target: PodRef, port: number, connection: Duplex) => Effect.Effect<void, KubeApiError>;
 }>()("alasio/kube/KubeApi") {
   /** The API `kubeconfig` reaches. */
   static readonly layer = (kubeconfig: KubeconfigRef): Layer.Layer<KubeApi, KubeconfigUnusable> =>
@@ -235,6 +244,7 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
   const server = new URL(kubeConfig.getCurrentCluster()?.server ?? "");
   const request = server.protocol === "http:" ? httpRequest : httpsRequest;
   const executor = new Exec(kubeConfig);
+  const forwarder = new PortForward(kubeConfig);
 
   /** Sends `call` with the kubeconfig's credentials. */
   const send = (call: KubeCall): Effect.Effect<ClientRequest, KubeApiError> =>
@@ -323,6 +333,33 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
     return exitCode;
   });
 
+  const portForward = ({ namespace, pod }: PodRef, port: number, connection: Duplex): Effect.Effect<void, KubeApiError> => {
+    const call: KubeCall = { method: "GET", path: `/api/v1/namespaces/${namespace}/pods/${pod}/portforward` };
+    return Effect.callback<void, KubeApiError>((resume) => {
+      let socket: { close(): void } | null = null;
+      const close = () => socket?.close();
+      connection.on("close", close);
+      forwarder.portForward(namespace, pod, [port], connection, null, connection).then((opened) => {
+        // Given no retries, the forward is its websocket.
+        const forwarded = typeof opened === "function" ? opened() : opened;
+        if (!forwarded) return resume(Effect.fail(unreachable(call, new Error("the port-forward opened no websocket"))));
+        socket = forwarded;
+        forwarded.on("close", () => {
+          connection.destroy();
+          resume(Effect.void);
+        });
+        forwarded.on("error", (cause) => resume(Effect.fail(unreachable(call, cause))));
+      }, (cause: unknown) => {
+        connection.destroy();
+        resume(Effect.fail(unreachable(call, cause)));
+      });
+      return Effect.sync(() => {
+        close();
+        connection.destroy();
+      });
+    });
+  };
+
   return KubeApi.of({
     server: server.href.replace(/\/$/u, ""),
     apply: (object) =>
@@ -357,5 +394,6 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
       );
     },
     exec,
+    portForward,
   });
 }

@@ -6,6 +6,8 @@
  */
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
+import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -81,6 +83,16 @@ async function rig(t: TestContext): Promise<Rig> {
     },
     config: () => JSON.parse(readFileSync(configFile, "utf8")),
   };
+}
+
+/** A port of the loopback no one listens on now. */
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // A server listening on a TCP port has an address of its own.
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
 }
 
 /** The message `run` failed with. */
@@ -453,6 +465,36 @@ test("lake runs the query in the lake's query container and prints its answer, i
   const refused = await alasio(["lake", "SELEC"]);
   assert.equal(failure(refused), "the lake's query exited with 2");
   assert.equal(refused.stderr, "Parser Error: syntax error\n");
+});
+
+test("grafana forwards a port here to Grafana's pod until interrupted, and prints its admin's password when asked", async (t) => {
+  const { alasio, env, kube, machine } = await installed(t);
+  // Grafana, as its pod serves it.
+  const grafana = createHttpServer((request, response) => response.end(`grafana answers ${request.url}`));
+  await new Promise<void>((resolve) => grafana.listen(0, "127.0.0.1", resolve));
+  t.after(() => grafana.close());
+  // A server listening on a TCP port has an address of its own.
+  kube.forwarded.set("alasio-grafana-0:3000", (grafana.address() as AddressInfo).port);
+  const port = await freePort();
+  let interrupt = () => {};
+  const running = runAlasio(["grafana", "--port", String(port)], { env, machine, until: new Promise((resolve) => (interrupt = resolve)) });
+  let answered: string | null = null;
+  for (let attempt = 0; attempt < 100 && answered === null; attempt++) {
+    answered = await fetch(`http://127.0.0.1:${port}/api/health`).then((response) => response.text(), () => null);
+    if (answered === null) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  interrupt();
+  const run = await running;
+  assert.equal(answered, "grafana answers /api/health");
+  assert.deepEqual(kube.forwards.at(-1), { namespace: "alasio", pod: "alasio-grafana-0", port: 3000 });
+  assert.deepEqual(run.printed, [`Grafana is at http://127.0.0.1:${port}, as admin; alasio grafana --password prints its password. Interrupt this to end it.`]);
+  await assert.rejects(fetch(`http://127.0.0.1:${port}/api/health`), "the port is closed once interrupted");
+
+  assert.equal(failure(await alasio(["grafana", "--password"])), "alasio-grafana holds no admin password: alasio up writes it");
+  kube.put("secrets", { apiVersion: "v1", kind: "Secret", metadata: { name: "alasio-grafana", namespace: "alasio" }, data: { GF_SECURITY_ADMIN_PASSWORD: Buffer.from("admin-password").toString("base64") } });
+  const password = await alasio(["grafana", "--password"]);
+  succeeded(password);
+  assert.deepEqual(password.printed, ["admin-password"]);
 });
 
 test("down stops the cluster here, keeping everything, and is not for a cluster a kubeconfig reaches", async (t) => {

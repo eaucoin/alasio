@@ -3,6 +3,7 @@ import { Command } from "effect/cli";
 
 import { asRoot } from "./commands/as-root.ts";
 import { down } from "./commands/down.ts";
+import { grafana } from "./commands/grafana.ts";
 import { init } from "./commands/init.ts";
 import { lake } from "./commands/lake.ts";
 import { login } from "./commands/login.ts";
@@ -19,6 +20,6 @@ export const alasio = Command.make("alasio").pipe(
     "Coding agents you talk to from Telegram: Claude Code and Codex, each conversation with a workspace of its own. " +
       "alasio init sets it up, alasio up starts it, in a cluster alasio makes on this machine or one a kubeconfig reaches.",
   ),
-  Command.withSubcommands([init, up, status, logs, restart, upgrade, login, lake, down, uninstall, asRoot]),
+  Command.withSubcommands([init, up, status, logs, restart, upgrade, login, lake, grafana, down, uninstall, asRoot]),
   Command.withGlobalFlags([ConfigFlag]),
 );

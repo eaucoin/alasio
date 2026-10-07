@@ -40,17 +40,18 @@ const FIT_MACHINE = { platform: "linux", arch: "x64" } as const;
 /**
  * Runs `alasio ...args` with the environment `env`, on `machine`, of the kind `kind`,
  * where k3s and gVisor are `releases`, and a terminal that answers `answers`, or stdin
- * that reads `stdin`.
+ * that reads `stdin`; interrupted, as by Ctrl-C, once `until` resolves, if given.
  */
 export async function runAlasio(
   args: readonly string[],
-  { env, machine, kind = FIT_MACHINE, releases = fakeReleases(), answers = [], stdin }: {
+  { env, machine, kind = FIT_MACHINE, releases = fakeReleases(), answers = [], stdin, until }: {
     readonly env: Readonly<Record<string, string>>;
     readonly machine: FakeMachine;
     readonly kind?: { readonly platform: string; readonly arch: string };
     readonly releases?: FakeReleases;
     readonly answers?: ReadonlyArray<readonly Terminal.UserInput[]>;
     readonly stdin?: string;
+    readonly until?: Promise<void>;
   },
 ): Promise<CliRun> {
   const terminal = fakeTerminal(answers);
@@ -61,7 +62,8 @@ export async function runAlasio(
   const config = ConfigProvider.layer(ConfigProvider.fromEnv({ env }));
   const { exit, printed } = await Effect.runPromise(
     Effect.gen(function*() {
-      const exit = yield* Effect.exit(Command.runWith(alasio, { version: "9.9.9", renderErrors: false })(args));
+      const run = Command.runWith(alasio, { version: "9.9.9", renderErrors: false })(args);
+      const exit = yield* Effect.exit(until === undefined ? run : Effect.raceFirst(run, Effect.andThen(Effect.promise(() => until), Effect.interrupt)));
       const printed = (yield* TestConsole.logLines).map(String);
       return { exit, printed };
     }).pipe(

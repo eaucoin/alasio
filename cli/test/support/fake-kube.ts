@@ -2,9 +2,11 @@
  * A Kubernetes API server in memory, over HTTPS, for the tests of alasio's command line:
  * the endpoints its KubeApi (../../src/kube/api.ts) calls. It keeps objects by their path,
  * takes server-side applies and merge patches, lists by label and field selectors,
- * deletes (a namespace with what is in it), serves pods' logs, and runs commands in
+ * deletes (a namespace with what is in it), serves pods' logs, runs commands in
  * containers over a websocket, as the API server's exec does (channel protocol v4), with
- * what the test answers. It records every change, in order, and every command.
+ * what the test answers, and forwards a pod's port, as its port-forward does, to a port
+ * of the loopback the test names. It records every change, in order, every command, and
+ * every forward.
  *
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
@@ -16,7 +18,7 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:https";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, connect } from "node:net";
 import type { Duplex } from "node:stream";
 import { buffer } from "node:stream/consumers";
 
@@ -71,6 +73,13 @@ export interface KubeExec {
   readonly tty: boolean;
 }
 
+/** A port of a pod a connection was forwarded to. */
+export interface KubeForward {
+  readonly namespace: string;
+  readonly pod: string;
+  readonly port: number;
+}
+
 /** What a command run in a container came to. */
 export interface KubeExecResult {
   readonly exitCode: number;
@@ -95,6 +104,9 @@ export interface FakeKube {
   readonly execs: KubeExec[];
   /** How the test answers a command run in a container; exit 0, saying nothing, unless it says. */
   onExec: (exec: KubeExec) => KubeExecResult;
+  readonly forwards: KubeForward[];
+  /** Where a pod's port leads, by `<pod>:<port>`: a port of the loopback, which a forward of it connects to. */
+  readonly forwarded: Map<string, number>;
   /** The object at `path`. */
   readonly get: (path: string) => KubeObject | undefined;
   /** Puts `object` at the path its kind (`plural`) and names make. */
@@ -169,6 +181,29 @@ function frame(payload: Buffer): Buffer {
   return Buffer.concat([header, payload]);
 }
 
+/**
+ * The payloads of the websocket frames at the start of `data`, a client's, which masks
+ * them, and what is left of it, a frame not yet whole; null for a closing frame.
+ */
+function clientFrames(data: Buffer): { payloads: (Buffer | null)[]; rest: Buffer } {
+  const payloads: (Buffer | null)[] = [];
+  let at = 0;
+  while (data.length - at >= 2) {
+    const opcode = (data[at] ?? 0) & 0x0f;
+    const short = (data[at + 1] ?? 0) & 0x7f;
+    const lengthBytes = short === 126 ? 2 : short === 127 ? 8 : 0;
+    const start = at + 2 + lengthBytes + 4;
+    if (data.length < start) break;
+    const length = short === 126 ? data.readUInt16BE(at + 2) : short === 127 ? Number(data.readBigUInt64BE(at + 2)) : short;
+    if (data.length < start + length) break;
+    const mask = data.subarray(start - 4, start);
+    const payload = Buffer.from(data.subarray(start, start + length).map((byte, index) => byte ^ (mask[index % 4] ?? 0)));
+    payloads.push(opcode === 0x8 ? null : payload);
+    at = start + length;
+  }
+  return { payloads, rest: data.subarray(at) };
+}
+
 /** A frame of `channel` (1 stdout, 2 stderr, 3 the exec's status), as the exec protocol has it. */
 const channel = (number: number, content: string): Buffer => frame(Buffer.concat([Buffer.from([number]), Buffer.from(content)]));
 
@@ -188,6 +223,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const failing = new Set<string>();
   const logs = new Map<string, string>();
   const execs: KubeExec[] = [];
+  const forwards: KubeForward[] = [];
+  const forwarded = new Map<string, number>();
   let version = 0;
 
   const put = (plural: string, object: KubeObject): void => {
@@ -347,19 +384,48 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const server = createServer({ cert: CERTIFICATE, key: KEY }, (request, response) => {
     buffer(request).then((body) => handle(request, body, response), (error: unknown) => response.destroy(error as Error));
   });
-  /** An exec, upgraded to a websocket: the command run as the test answers, its output and status sent, and the socket closed. */
+  /**
+   * A port-forward, upgraded to a websocket: what comes on its data channel is sent to the
+   * loopback's port the test named, and what that answers back on it, each channel first
+   * saying the port, until either end closes.
+   */
+  const portForward = (namespace: string, pod: string, port: number, socket: Duplex): void => {
+    forwards.push({ namespace, pod, port });
+    const local = forwarded.get(`${pod}:${port}`);
+    const portBytes = Buffer.from([port & 0xff, port >> 8]);
+    socket.write(Buffer.concat([frame(Buffer.concat([Buffer.from([0]), portBytes])), frame(Buffer.concat([Buffer.from([1]), portBytes]))]));
+    const close = () => socket.end(Buffer.from([0x88, 0]));
+    if (local === undefined) return void socket.end(Buffer.concat([channel(1, `no forward of ${pod}:${port}`), Buffer.from([0x88, 0])]));
+    const upstream = connect(local, "127.0.0.1");
+    upstream.on("data", (chunk: Buffer) => socket.write(frame(Buffer.concat([Buffer.from([0]), chunk]))));
+    upstream.on("end", close);
+    upstream.on("error", close);
+    let pending: Buffer = Buffer.alloc(0);
+    socket.on("data", (chunk: Buffer) => {
+      const { payloads, rest } = clientFrames(Buffer.concat([pending, chunk]));
+      pending = rest;
+      for (const payload of payloads) {
+        if (payload === null) upstream.end();
+        else if (payload[0] === 0 && payload.length > 1) upstream.write(payload.subarray(1));
+      }
+    });
+    socket.on("close", () => upstream.destroy());
+  };
+
+  /** An exec or a port-forward, upgraded to a websocket: the command run as the test answers, its output and status sent, and the socket closed. */
   const exec = (request: IncomingMessage, socket: Duplex): void => {
     const url = new URL(request.url ?? "/", "https://fake");
     const target = parse(url.pathname);
-    if (request.headers.authorization !== `Bearer ${TOKEN}` || target?.sub !== "exec") {
+    if (request.headers.authorization !== `Bearer ${TOKEN}` || (target?.sub !== "exec" && target?.sub !== "portforward")) {
       return void socket.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
     }
     const accept = createHash("sha1").update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(
       ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "Sec-WebSocket-Protocol: v4.channel.k8s.io", "", ""].join("\r\n"),
     );
-    socket.on("data", () => {});
     socket.on("error", () => socket.destroy());
+    if (target.sub === "portforward") return portForward(target.namespace ?? "", target.name ?? "", Number(url.searchParams.get("ports")), socket);
+    socket.on("data", () => {});
     const asked: KubeExec = {
       namespace: target.namespace ?? "",
       pod: target.name ?? "",
@@ -395,6 +461,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     logs,
     execs,
     onExec: () => ({ exitCode: 0 }),
+    forwards,
+    forwarded,
     get: (path) => objects.get(path),
     put,
     close: async () => {
