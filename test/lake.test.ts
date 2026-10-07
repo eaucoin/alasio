@@ -779,8 +779,11 @@ describe("the lake's reader", () => {
       assert.equal((await fetch(`${base}/query`, { method: "POST", body: "select 42 as answer" })).status, 401);
       const answered = await query("select 42 as answer");
       assert.deepEqual([answered.status, answered.headers.get("content-type"), await answered.json()], [200, "application/json", [{ answer: 42 }]]);
+      // Why, in the body, and in the status line, on one line, which is what Grafana's Infinity shows.
       const refused = await query("select nothing");
-      assert.deepEqual([refused.status, (await refused.text()).startsWith("Binder Error")], [400, true]);
+      const why = await refused.text();
+      assert.deepEqual([refused.status, why.startsWith("Binder Error"), why.includes("\n")], [400, true, true]);
+      assert.equal(refused.statusText, why.trim().replace(/\n+/gu, " "));
       await admin.query("select pg_terminate_backend(pid) from pg_stat_activity where usename = $1", [LAKE_READER_ROLE]);
       const after = await query("select count(*) as n from otel.logs where ServiceName = 'read'");
       assert.deepEqual([after.status, await after.json()], [200, [{ n: 1 }]]);
@@ -830,7 +833,7 @@ describe("the lake's reader", () => {
     try {
       const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
       const answered = await fetch(`${base}/query`, { method: "POST", headers: { authorization: `Bearer ${QUERY_TOKEN}` }, body: "select 1" });
-      assert.deepEqual([answered.status, await answered.text()], [503, "the lake cannot be read now: the compute is restarting\n"]);
+      assert.deepEqual([answered.status, answered.statusText, await answered.text()], [503, "the lake cannot be read now: the compute is restarting", "the lake cannot be read now: the compute is restarting\n"]);
     } finally {
       server.close();
       await endpoint.close();

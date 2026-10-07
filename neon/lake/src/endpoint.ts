@@ -8,7 +8,10 @@
  *   POST /query    a query in DuckDB's SQL, the request's body, with
  *                  `Authorization: Bearer <LAKE_QUERY_TOKEN>`: 200 with its rows, a JSON
  *                  array of objects; 400 with why it was refused or failed; 401 without
- *                  the token; 503 while the lake cannot be opened
+ *                  the token; 503 while the lake cannot be opened. An error is said in
+ *                  the body, and in the status line's reason as well, on one line: that
+ *                  is all Grafana's Infinity shows of an error, as it reads no body of a
+ *                  status of 400 or more
  *   GET  /healthz  200 while it serves: its liveness, and its readiness, so its pod is
  *                  ready for the intake whether or not the lake can be read
  *
@@ -44,6 +47,15 @@ export interface Endpoint {
 }
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Answers `status` with `message`: in the body, and as the status line's reason,
+ * which may hold printable ASCII alone, on one line, and is kept short.
+ */
+function refuse(response: ServerResponse, status: number, message: string): void {
+  const reason = message.replace(/[^\x20-\x7e]+/gu, " ").trim().slice(0, 1000);
+  response.writeHead(status, reason, { "content-type": "text/plain" }).end(`${message}\n`);
+}
 
 /** Whether `header` is `Bearer <token>`, compared in constant time. */
 function carries(header: string | undefined, token: string): boolean {
@@ -97,7 +109,7 @@ export function startEndpoint({ open, token, log }: EndpointOptions): Endpoint {
       return;
     }
     if (!carries(request.headers.authorization, token)) {
-      response.writeHead(401, { "content-type": "text/plain" }).end("a query carries the endpoint's bearer token\n");
+      refuse(response, 401, "a query carries the endpoint's bearer token");
       return;
     }
     const sql = await readText(request, MAX_QUERY_BYTES);
@@ -106,7 +118,8 @@ export function startEndpoint({ open, token, log }: EndpointOptions): Endpoint {
       return;
     }
     const [status, body] = await query(sql);
-    response.writeHead(status, { "content-type": status === 200 ? "application/json" : "text/plain" }).end(status === 200 ? body : `${body}\n`);
+    if (status === 200) response.writeHead(200, { "content-type": "application/json" }).end(body);
+    else refuse(response, status, body);
   }
 
   return {
