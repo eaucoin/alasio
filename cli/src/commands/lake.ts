@@ -47,7 +47,19 @@ export const lake = Command.make(
 ).pipe(
   Command.withShortDescription("Query the analytics lake"),
   Command.withDescription(
-    "Runs a read-only SQL query of the analytics lake, where every Claude Code transcript entry and Codex rollout line is a row, " +
-      "in the lake's pod, and prints its rows, as a table unless --format says CSV or JSON.",
+    "Runs a read-only SQL query of the analytics lake in the lake's pod, and prints its rows, as a table unless --format says " +
+      "CSV or JSON. The lake holds every Claude Code transcript entry (claude.entries, and claude.messages, content_blocks and " +
+      "tool_calls), every Codex rollout line (codex.lines, and codex.turns, token_usage and tool_calls), and alasio's telemetry, " +
+      "kept telemetry.retentionDays days: its spans, logs and metric points in otel.traces, otel.logs and otel.metrics_gauge, " +
+      "_sum, _histogram, _exponential_histogram and _summary, the tables of OpenTelemetry's ClickHouse exporter, their " +
+      "attributes maps of text. Telemetry joins transcripts by these attributes: alasio.conversation.id, the conversation, on " +
+      "alasio's alasio.turn span and on the resource of Claude Code's and folder workspaces' bayma's telemetry; " +
+      "alasio.session.id, the harness's session (claude.entries.session_id, codex.lines.thread_id), on alasio.turn; " +
+      "alasio.volume.id, a session workspace, on alasio.turn and on the resource of its bayma's telemetry; alasio.branch is " +
+      "reserved for branch environments. Errors by harness: \"SELECT SpanAttributes['alasio.harness'] AS harness, " +
+      "count(*) FILTER (StatusCode = 'Error') AS failed, count(*) AS turns FROM otel.traces WHERE SpanName = 'alasio.turn' " +
+      "GROUP BY 1\". A conversation's Claude output tokens: \"SELECT conversation, sum(output_tokens) FROM (SELECT DISTINCT " +
+      "SpanAttributes['alasio.conversation.id'] AS conversation, SpanAttributes['alasio.session.id'] AS session_id FROM " +
+      "otel.traces WHERE SpanName = 'alasio.turn') JOIN claude.messages USING (session_id) GROUP BY 1\".",
   ),
 );
