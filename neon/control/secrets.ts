@@ -148,6 +148,9 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
     identities: [
       { name: "neon", credentials: [secrets.s3.neon], actions: on(buckets.neon) },
       { name: "admin", credentials: [secrets.s3.admin], actions: ["Admin", "Read", "List", "Tagging", "Write"] },
+      // Branch environments' lakes are given it too: a branch's lake reads main's files where they are (DuckLake keeps
+      // every file's path relative to one data path) and writes beside them, and SeaweedFS's Write, which writing
+      // needs, deletes as well, so it cannot be narrowed to a branch's own files (cli/src/branches.ts).
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),

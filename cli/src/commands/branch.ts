@@ -158,8 +158,12 @@ export const branch = Command.make("branch").pipe(
       "copy-on-write, as the branch first uses it, unless main has a turn running in it then; main's sessions are never " +
       "touched by the branch. A folder workspace is refused, as the machine's own files cannot be copied. What was in " +
       "flight in main as it was branched (queued prompts, unsent replies, buttons) is dropped, and so is Codex's login, " +
-      "whose refresh token works once: alasio login codex --branch logs the branch's Codex in. A branch takes about the memory main's alasio, compute and lake take. Branches live " +
-      "until deleted.",
+      "whose refresh token works once: alasio login codex --branch logs the branch's Codex in. Its credentials are its own " +
+      "(its database's password, its lake's, its compute's token), none of which reaches main's database, but for two that " +
+      "cannot be narrowed: its lake has main's object store identity, as it reads main's files where they are and SeaweedFS's " +
+      "write permission deletes too; and its compute has Neon's storage token, the tenant's, as Neon's storage has no " +
+      "narrower one. A branch's pods reach main's storage services and nothing else of main's. A branch takes about the " +
+      "memory main's alasio, compute and lake take. Branches live until deleted.",
   ),
 );
 
