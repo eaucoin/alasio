@@ -1,4 +1,4 @@
-/** `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in the lake's pod. */
+/** `alasio lake [--format table|csv|json] <sql>`: a read-only query of the analytics lake, in its query endpoint's container. */
 import { PassThrough } from "node:stream";
 
 import { NodeStream } from "@effect/platform-node";
@@ -32,7 +32,7 @@ export const lake = Command.make(
         const forward = (stream: PassThrough, sink: ReturnType<Stdio.Stdio["stdout"]>) =>
           NodeStream.fromReadable({ evaluate: () => stream, onError: (cause) => cause }).pipe(Stream.run(sink), Effect.orDie);
         const [exitCode] = yield* Effect.all([
-          kube.exec({ namespace: NAMESPACE, pod, container: "lake" }, [...QUERY, "--format", format, sql], { stdin: null, stdout, stderr, tty: false }).pipe(
+          kube.exec({ namespace: NAMESPACE, pod, container: "query" }, [...QUERY, "--format", format, sql], { stdin: null, stdout, stderr, tty: false }).pipe(
             Effect.ensuring(Effect.sync(() => {
               stdout.end();
               stderr.end();
@@ -47,8 +47,9 @@ export const lake = Command.make(
 ).pipe(
   Command.withShortDescription("Query the analytics lake"),
   Command.withDescription(
-    "Runs a read-only SQL query of the analytics lake in the lake's pod, and prints its rows, as a table unless --format says " +
-      "CSV or JSON. The lake holds every Claude Code transcript entry (claude.entries, and claude.messages, content_blocks and " +
+    "Runs a read-only SQL query of the analytics lake through its query endpoint, as Grafana does, and prints its rows, as a " +
+      "table unless --format says CSV or JSON: a query is one statement, which runs for 30 s and returns 100,000 rows at most, " +
+      "a map, list or struct as JSON. The lake holds every Claude Code transcript entry (claude.entries, and claude.messages, content_blocks and " +
       "tool_calls), every Codex rollout line (codex.lines, and codex.turns, token_usage and tool_calls), and alasio's telemetry, " +
       "kept telemetry.retentionDays days: its spans, logs and metric points in otel.traces, otel.logs and otel.metrics_gauge, " +
       "_sum, _histogram, _exponential_histogram and _summary, the tables of OpenTelemetry's ClickHouse exporter, their " +

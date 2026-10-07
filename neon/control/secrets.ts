@@ -9,8 +9,8 @@ export const PAGESERVER_ID = 1;
 export const DATABASE = "alasio";
 export const ROLE = "alasio";
 
-/** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, and workspace storage's JuiceFS. */
-export type S3Identity = "neon" | "admin" | "lake" | "workspaces";
+/** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader, and workspace storage's JuiceFS. */
+export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces";
 
 export interface S3Credentials {
   accessKey: string;
@@ -28,6 +28,9 @@ export interface StackSecrets {
   computeControlToken: string;
   /** Workspace storage's Valkey's. */
   valkeyPassword: string;
+  /** The lake's query endpoint's: its reader's role's, and the token its queries carry. */
+  lakeReaderPassword: string;
+  lakeQueryToken: string;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
@@ -101,6 +104,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       neon: kept(s3.neon, () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() })),
       admin: kept(s3.admin, () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() })),
       lake: kept(s3.lake, () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() })),
+      lakeReader: kept(s3.lakeReader, () => ({ accessKey: `lakereader${hexId().slice(0, 12)}`, secretKey: secret() })),
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
     },
     controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
@@ -108,6 +112,8 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     lakePassword: kept(stored.lakePassword, () => secret()),
     computeControlToken: kept(stored.computeControlToken, () => secret()),
     valkeyPassword: kept(stored.valkeyPassword, () => secret()),
+    lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
+    lakeQueryToken: kept(stored.lakeQueryToken, () => secret()),
   };
   return { secrets, changed };
 }
@@ -123,8 +129,8 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
 
 /**
  * SeaweedFS's S3 identities: Neon, the lake and, when it is on, workspace storage, each
- * on their own bucket of `buckets`, and an admin, which makes the buckets and keeps the
- * backups.
+ * on their own bucket of `buckets`; the lake's reader, which may only read the lake's;
+ * and an admin, which makes the buckets and keeps the backups.
  */
 export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
   const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
@@ -133,6 +139,7 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
       { name: "neon", credentials: [secrets.s3.neon], actions: on(buckets.neon) },
       { name: "admin", credentials: [secrets.s3.admin], actions: ["Admin", "Read", "List", "Tagging", "Write"] },
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
+      { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),
     ],
   };

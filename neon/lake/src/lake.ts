@@ -10,13 +10,14 @@
  * other's. Their writes still take turns: DuckLake 1.0 on Postgres mishandles commits
  * that race (duplicate snapshot ids, retries run out), so every write to the lake in
  * this process is made through `serially`, one at a time, and none ever races another.
+ * The query endpoint opens it read-only, in a process of its own (./endpoint.ts).
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 
-import type { DatabaseConfig, LakeConfig } from "./config.ts";
+import type { DatabaseConfig, LakeAccess } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
@@ -32,8 +33,8 @@ export interface Lake {
 export interface OpenLakeOptions {
   /** Attach the lake read-only, for queries. */
   readOnly?: boolean;
-  /** Attach alasio's database too, read-only, for loading. */
-  source?: boolean;
+  /** alasio's database, to attach too, read-only, for loading. */
+  source?: DatabaseConfig;
   /** DuckDB's memory limit, when not the configuration's. */
   memoryLimit?: string;
 }
@@ -63,7 +64,7 @@ export function conninfo({ host, port, user, password, database }: DatabaseConfi
  * attaches alasio's database read-only, for loading; `memoryLimit` replaces the
  * configuration's. Returns `{ db, close }`, `db` a DuckDB connection.
  */
-export async function openLake(config: LakeConfig, { readOnly = false, source = !readOnly, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
+export async function openLake(config: LakeAccess, { readOnly = false, source, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
   const options: Record<string, string> = {
     memory_limit: memoryLimit,
     threads: String(config.threads),
@@ -93,7 +94,7 @@ export async function openLake(config: LakeConfig, { readOnly = false, source = 
         url_style 'path', region 'us-east-1')`);
     }
     if (source) {
-      await db.run(`attach ${literal(conninfo(config.source))} as ${SOURCE} (type postgres, read_only)`);
+      await db.run(`attach ${literal(conninfo(source))} as ${SOURCE} (type postgres, read_only)`);
     }
     // Serially, as the lake's first attach writes its catalog.
     await serially(() =>

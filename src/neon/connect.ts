@@ -4,18 +4,19 @@
  *
  * It makes the analytics lake's role and catalog database either way (./lake.ts), and
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it
- * revokes them.
+ * revokes them. It makes the lake reader's role (./lake.ts) when the deployment gives
+ * its password, as it does while the lake runs.
  */
 import { readFileSync } from "node:fs";
 
-import { Config, Context, Effect, FiberSet, Redacted, Schedule, Schema, type Scope } from "effect";
+import { Config, Context, Effect, FiberSet, Option, Redacted, Schedule, Schema, type Scope } from "effect";
 import pg, { type Pool } from "pg";
 
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
-import { ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
+import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "./lake.ts";
 
 /** What Neon failed with, as the database or the driver said it. */
 export class NeonUnavailable extends Schema.TaggedError<NeonUnavailable>()("NeonUnavailable", {
@@ -37,11 +38,13 @@ export class NeonSettingError extends Schema.TaggedError<NeonSettingError>()("Ne
   }
 }
 
-/** How to reach a deployment's Neon, and whether the lake runs. */
+/** How to reach a deployment's Neon, whether the lake runs, and the passwords of the roles alasio makes there. */
 interface NeonAccess {
   readonly databaseUrl: Redacted.Redacted;
   readonly lakePassword: Redacted.Redacted;
   readonly lake: boolean;
+  /** The lake's reader's, given while the lake runs. */
+  readonly lakeReaderPassword: Option.Option<Redacted.Redacted>;
 }
 
 /** alasio's stores in an open Neon, on the pool they share. */
@@ -72,19 +75,22 @@ const RETRIES_PER_REPORT = 12;
 const setting = (name: string): Config.Config<string> =>
   Config.String(name).pipe(Config.map((value) => value.trim()), Config.withDefault(""));
 
-/** A secret the deployment gives in the file `<key>_FILE` names, or else as `<key>` itself. */
-const deploymentSecret = Effect.fnUntraced(function*(key: string): Effect.fn.Return<Redacted.Redacted, NeonSettingError | Config.ConfigError> {
+/** A secret the deployment gives in the file `<key>_FILE` names, or else as `<key>` itself; none when it gives neither. */
+const givenSecret = Effect.fnUntraced(function*(key: string): Effect.fn.Return<Option.Option<Redacted.Redacted>, NeonSettingError | Config.ConfigError> {
   const file = yield* setting(`${key}_FILE`);
   if (file) {
     return yield* Effect.try({
-      try: () => Redacted.make(readFileSync(file, "utf8").trim()),
+      try: () => Option.some(Redacted.make(readFileSync(file, "utf8").trim())),
       catch: (cause) => new NeonSettingError({ key, cause }),
     });
   }
   const value = yield* setting(key);
-  if (!value) return yield* new NeonSettingError({ key });
-  return Redacted.make(value);
+  return value ? Option.some(Redacted.make(value)) : Option.none();
 });
+
+/** A secret the deployment must give, as givenSecret reads it. */
+const deploymentSecret = (key: string): Effect.Effect<Redacted.Redacted, NeonSettingError | Config.ConfigError> =>
+  Effect.flatMap(givenSecret(key), Option.match({ onNone: () => Effect.fail(new NeonSettingError({ key })), onSome: Effect.succeed }));
 
 /** A promise on Neon, its rejection a NeonUnavailable. */
 const onNeon = <A>(query: () => Promise<A>): Effect.Effect<A, NeonUnavailable> =>
@@ -95,12 +101,13 @@ const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pi
 
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
- * and rollout stores' schemas, and the lake's role and reads. A pool that cannot is
- * ended: before the next attempt when this one fails, and in the background when a
- * stop ends the wait, which does not wait for it.
+ * and rollout stores' schemas, the lake's role and reads, and the lake reader's
+ * role when its password is given. A pool that cannot is ended: before the next
+ * attempt when this one fails, and in the background when a stop ends the wait, which
+ * does not wait for it.
  */
 const openNeon = Effect.fnUntraced(function*(
-  { databaseUrl, lakePassword, lake }: NeonAccess,
+  { databaseUrl, lakePassword, lake, lakeReaderPassword }: NeonAccess,
   onIdleError: (error: Error) => void,
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
   const pool = new pg.Pool({
@@ -119,6 +126,7 @@ const openNeon = Effect.fnUntraced(function*(
     await rollouts.ensureSchema();
     await ensureLakeRole(pool, Redacted.value(lakePassword));
     await syncLakeReads(pool, lake);
+    if (Option.isSome(lakeReaderPassword)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderPassword.value));
   }).pipe(
     Effect.tapError(() => endPool(pool)),
     Effect.onInterrupt(() => Effect.forkDetach(endPool(pool))),
@@ -139,7 +147,8 @@ const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.d
 
 /**
  * Connects to the Neon the deployment provides, from `ALASIO_DATABASE_URL` and
- * `ALASIO_LAKE_PASSWORD` or their `_FILE` forms, until the scope closes. The stack starts
+ * `ALASIO_LAKE_PASSWORD`, and `ALASIO_LAKE_READER_PASSWORD` if given, or their `_FILE`
+ * forms, until the scope closes. The stack starts
  * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
  * answer; a stop meanwhile stops the wait.
  */
@@ -147,12 +156,13 @@ const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
   const lakePassword = yield* deploymentSecret("ALASIO_LAKE_PASSWORD");
   const lake = yield* lakeEnabled;
+  const lakeReaderPassword = yield* givenSecret("ALASIO_LAKE_READER_PASSWORD");
   const runFork = yield* FiberSet.makeRuntime();
   const onIdleError = (error: Error): void => {
     runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
   };
   const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
-    openNeon({ databaseUrl, lakePassword, lake }, onIdleError).pipe(
+    openNeon({ databaseUrl, lakePassword, lake, lakeReaderPassword }, onIdleError).pipe(
       Effect.retry(whileNeonStarts),
       withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
       Effect.interruptible,

@@ -17,7 +17,8 @@ import pg from "pg";
 
 import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
-import { type LakeConfig, loadConfig } from "../neon/lake/src/config.ts";
+import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } from "../neon/lake/src/config.ts";
+import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { startIntake } from "../neon/lake/src/intake.ts";
 import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
@@ -27,10 +28,11 @@ import { lakeModelVersion, MODEL_VERSION } from "../neon/lake/src/model.ts";
 import { ensureOtel, flushTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
 import type { LogsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
+import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
 import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
-import { ensureLakeRole, LAKE_ROLE, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
+import { ensureLakeReaderRole, ensureLakeRole, LAKE_READER_ROLE, LAKE_ROLE, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // The lake loads alasio's Neon into DuckLake. Here its source is a throwaway Postgres
@@ -38,6 +40,8 @@ import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 // role, and its files a local directory; DuckDB is the real one the lake runs.
 
 const LAKE_PASSWORD = "lake-test-password";
+const READER_PASSWORD = "reader-test-password";
+const QUERY_TOKEN = "query-test-token";
 
 // Set by the first hook.
 let postgres: TestPostgres | undefined;
@@ -46,6 +50,7 @@ let store: NeonSessionStore;
 let rollouts: NeonRolloutStore;
 let dataDir: string | undefined;
 let config: LakeConfig;
+let readerConfig: EndpointConfig;
 
 before(async () => {
   postgres = await startPostgres();
@@ -62,14 +67,21 @@ before(async () => {
   await rollouts.ensureSchema();
   // As alasio makes them as it starts (src/neon/connect.ts).
   await ensureLakeRole(admin, LAKE_PASSWORD);
+  await ensureLakeReaderRole(admin, READER_PASSWORD);
   await syncLakeReads(admin, true);
   dataDir = mkdtempSync(join(tmpdir(), "alasio-lake-data-"));
-  config = loadConfig({
-    LAKE_DATABASE_HOST: url.hostname,
-    LAKE_DATABASE_PORT: url.port,
-    LAKE_DATABASE_PASSWORD: LAKE_PASSWORD,
-    LAKE_DATA_PATH: dataDir,
-  });
+  const env = { LAKE_DATABASE_HOST: url.hostname, LAKE_DATABASE_PORT: url.port, LAKE_DATA_PATH: `${dataDir}/` };
+  config = loadConfig({ ...env, LAKE_DATABASE_PASSWORD: LAKE_PASSWORD });
+  readerConfig = loadEndpointConfig({ ...env, LAKE_READER_PASSWORD: READER_PASSWORD, LAKE_QUERY_TOKEN: QUERY_TOKEN });
+  // As the intake does as it opens the lake (neon/lake/src/service.ts): the first open makes the catalog.
+  (await openLake(config)).close();
+  const catalog = new pg.Client({ ...config.catalog });
+  await catalog.connect();
+  try {
+    await grantReads(catalog);
+  } finally {
+    await catalog.end();
+  }
 });
 
 after(async () => {
@@ -80,7 +92,7 @@ after(async () => {
 
 /** Opens the lake with a fresh, empty model, and closes it after `fn`. */
 async function withLake<T>(fn: (db: DuckDBConnection) => Promise<T>): Promise<T> {
-  const lake = await openLake(config);
+  const lake = await openLake(config, { source: config.source });
   try {
     await prepareLake(lake.db, { rebuild: true });
     return await fn(lake.db);
@@ -431,7 +443,7 @@ const logRequest = (service: string, ...times: bigint[]): LogsRequest => ({
 
 /** The lake as the intake opens it: no source, the telemetry's schema ready. */
 async function openForIntake() {
-  const lake = await openLake(config, { source: false });
+  const lake = await openLake(config);
   await ensureOtel(lake.db);
   return lake;
 }
@@ -467,7 +479,7 @@ describe("telemetry", () => {
       assert.equal((await post(base, "/v1/logs", "{}", { "content-type": "application/json", "content-encoding": "br" })).status, 415);
       assert.equal((await post(base, "/v1/profiles", "{}", { "content-type": "application/json" })).status, 404);
 
-      const reader = await openLake(config, { readOnly: true });
+      const reader = await openLake(readerConfig, { readOnly: true });
       try {
         const [span] = await rows<{ SpanName: string; conversation: string }>(reader.db, `select SpanName, SpanAttributes['alasio.conversation.id'] as conversation from ${LAKE}.otel.traces where ServiceName = 'intake-test'`);
         assert.deepEqual(span, { SpanName: "alasio.turn", conversation: "telegram:7" });
@@ -573,7 +585,7 @@ test("the lake loads the extension builds its image pins", async () => {
 
 describe("the lake", () => {
   test("a lake of another model version is rebuilt empty, and one of this version kept", async () => {
-    const lake = await openLake(config);
+    const lake = await openLake(config, { source: config.source });
     try {
       await prepareLake(lake.db, { rebuild: true });
       await syncLake(lake.db);
@@ -648,7 +660,7 @@ describe("the lake", () => {
   });
 
   test("the lake opened read-only refuses writes", async () => {
-    const lake = await openLake(config, { readOnly: true });
+    const lake = await openLake(readerConfig, { readOnly: true });
     try {
       await assert.rejects(lake.db.run(`delete from ${LAKE}.claude.entries`), /read-only|read only/i);
       assert.ok((await rows(lake.db, `select count(*) from ${LAKE}.claude.entries`)).length);
@@ -661,7 +673,7 @@ describe("the lake", () => {
     await ensureLakeRole(admin, LAKE_PASSWORD);
     const { rows } = await admin.query<{ n: number }>("select count(*)::int as n from pg_auth_members where member = $1::regrole", [LAKE_ROLE]);
     assert.equal(rows[0]?.n, 0);
-    const lake = await openLake(config);
+    const lake = await openLake(config, { source: config.source });
     lake.close(); // its password still lets it in
     const { rows: [database] } = await admin.query<{ public_connects: boolean }>("select has_database_privilege('public', 'lake', 'connect') as public_connects");
     assert.equal(database?.public_connects, false);
@@ -670,7 +682,7 @@ describe("the lake", () => {
   test("with the lake off, its role reads none of alasio's data", async () => {
     await syncLakeReads(admin, false);
     try {
-      const lake = await openLake(config);
+      const lake = await openLake(config, { source: config.source });
       try {
         await assert.rejects(rows(lake.db, "select count(*) from source.claude_sessions.entries"), /permission denied/);
       } finally {
@@ -678,6 +690,118 @@ describe("the lake", () => {
       }
     } finally {
       await syncLakeReads(admin, true);
+    }
+  });
+});
+
+// --- Reading the lake ----------------------------------------------------------------
+
+describe("the lake's reader", () => {
+  test("reads the lake as its own role, and can write nothing, reach no other file, and change no setting", async () => {
+    await withLake(async (db) => {
+      await writeTelemetry(db, telemetryRows("logs", logRequest("read", NOW)));
+      await flushTelemetry(db); // to files, which the reader reads
+    });
+    const reader = await openReader(readerConfig);
+    try {
+      assert.deepEqual(await answer(reader.db, "select Body from otel.logs where ServiceName = 'read'"), [{ Body: "an event" }]);
+      const [catalogRole] = await answer(reader.db, "from postgres_query('__ducklake_metadata_lake', 'select current_user::text as role')");
+      assert.deepEqual(catalogRole, { role: LAKE_READER_ROLE });
+      await assert.rejects(answer(reader.db, "insert into otel.logs (Body) values ('written')"), /read-only/);
+      // Its role may only read the catalog: no table of it can it change.
+      const catalog = new pg.Client({ ...config.catalog });
+      await catalog.connect();
+      try {
+        const { rows: [tables] } = await catalog.query<{ total: number; readable: number; writable: number }>(
+          `select count(*)::int as total, count(*) filter (where has_table_privilege($1, oid, 'select'))::int as readable,
+             count(*) filter (where has_table_privilege($1, oid, 'insert, update, delete, truncate'))::int as writable
+           from pg_class where relnamespace = 'ducklake'::regnamespace and relkind = 'r'`,
+          [LAKE_READER_ROLE],
+        );
+        // Those DuckLake made after the grant too, as it makes one for each table's inlined rows.
+        assert.ok(tables && tables.total > 0 && tables.readable === tables.total && tables.writable === 0, JSON.stringify(tables));
+      } finally {
+        await catalog.end();
+      }
+      await assert.rejects(answer(reader.db, "select * from read_text('/etc/hostname')"), /disabled by configuration/);
+      await assert.rejects(answer(reader.db, "copy (select 1) to '/tmp/alasio-lake-read.csv'"), /disabled by configuration/);
+      await assert.rejects(answer(reader.db, "set enable_external_access = true"), /locked/);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("answers one statement's rows as JSON: nested values as JSON text, times in RFC 3339, numbers as numbers where they fit", async () => {
+    const reader = await openReader(readerConfig);
+    try {
+      const [row] = await answer(reader.db, `select map {'k': 'v'} as map, [1, 2] as list, {'a': [{'b': map {'c': 'd'}}]} as struct,
+        42::bigint as count, 18446744073709551615::ubigint as large, 2.5::decimal(4, 2) as decimal, null as nothing,
+        '2026-10-07 04:09:17.123456789'::timestamp_ns as time, '2026-10-07 06:09:17+02'::timestamptz as zoned`);
+      assert.deepEqual(row, {
+        map: '{"k":"v"}',
+        list: "[1,2]",
+        struct: '{"a":[{"b":{"c":"d"}}]}',
+        count: 42,
+        large: "18446744073709551615",
+        decimal: 2.5,
+        nothing: null,
+        time: "2026-10-07T04:09:17.123456789Z",
+        zoned: "2026-10-07T04:09:17+00:00",
+      });
+      await assert.rejects(answer(reader.db, "select 1; select 2"), /a query is one statement, not 2/);
+      assert.equal((await answer(reader.db, "from range(10)", { maxRows: 10 })).length, 10);
+      await assert.rejects(answer(reader.db, "from range(11)", { maxRows: 10 }), /more than 10 rows/);
+      await assert.rejects(answer(reader.db, "select count(*) from range(1000000000000)", { timeoutMs: 200 }), /ran past 0.2 s/);
+      assert.deepEqual(await answer(reader.db, "select 1 as one"), [{ one: 1 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
+  test("the query endpoint answers queries that carry its token, and rides out the compute dropping its connections", async () => {
+    let opened = 0;
+    const endpoint = startEndpoint({
+      open: () => {
+        opened += 1;
+        return openReader(readerConfig);
+      },
+      token: QUERY_TOKEN,
+      log: () => {},
+    });
+    const server = createServer(endpoint.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    // A server listening on a TCP port has an address of its own.
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const query = (sql: string, token = QUERY_TOKEN) => fetch(`${base}/query`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: sql });
+    try {
+      assert.equal((await fetch(`${base}/healthz`)).status, 200);
+      assert.equal((await query("select 42 as answer", "wrong")).status, 401);
+      assert.equal((await fetch(`${base}/query`, { method: "POST", body: "select 42 as answer" })).status, 401);
+      const answered = await query("select 42 as answer");
+      assert.deepEqual([answered.status, answered.headers.get("content-type"), await answered.json()], [200, "application/json", [{ answer: 42 }]]);
+      const refused = await query("select nothing");
+      assert.deepEqual([refused.status, (await refused.text()).startsWith("Binder Error")], [400, true]);
+      await admin.query("select pg_terminate_backend(pid) from pg_stat_activity where usename = $1", [LAKE_READER_ROLE]);
+      const after = await query("select count(*) as n from otel.logs where ServiceName = 'read'");
+      assert.deepEqual([after.status, await after.json()], [200, [{ n: 1 }]]);
+      assert.equal(opened, 1);
+    } finally {
+      server.close();
+      await endpoint.close();
+    }
+  });
+
+  test("the query endpoint answers 503 while it cannot open the lake", async () => {
+    const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
+    const server = createServer(endpoint.handle);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const answered = await fetch(`${base}/query`, { method: "POST", headers: { authorization: `Bearer ${QUERY_TOKEN}` }, body: "select 1" });
+      assert.deepEqual([answered.status, await answered.text()], [503, "the lake cannot be read now: the compute is restarting\n"]);
+    } finally {
+      server.close();
+      await endpoint.close();
     }
   });
 });
@@ -728,11 +852,19 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", LAKE_INTERVAL_SECONDS: "soon" }), /LAKE_INTERVAL_SECONDS must be a positive number/);
   const config = loadConfig({ ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_S3_KEY: "k", LAKE_S3_SECRET: "s" });
   assert.deepEqual([config.source.database, config.catalog.database, config.source.user, config.intervalMs], ["alasio", "lake", "lake", 300_000]);
+  // The query endpoint has the reader's credentials alone.
+  const reader = { ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_READER_PASSWORD: "r", LAKE_READER_S3_KEY: "rk", LAKE_READER_S3_SECRET: "rs" };
+  assert.throws(() => loadEndpointConfig(reader), /LAKE_QUERY_TOKEN is not set/);
+  const endpoint = loadEndpointConfig({ ...reader, LAKE_QUERY_TOKEN: "t" });
+  assert.deepEqual(
+    [endpoint.catalog.user, endpoint.catalog.password, endpoint.catalog.database, endpoint.s3?.key, endpoint.token, endpoint.port, endpoint.memoryLimit],
+    ["lake_reader", "r", "lake", "rk", "t", 8090, "256MB"],
+  );
 });
 
 test("query results print as a table, CSV, or JSON lines", () => {
-  const results = [{ tool: "Bash", calls: 2828n, input: { command: "ls" } }, { tool: "a,b", calls: 1n, input: null }];
-  assert.equal(format(results, "json"), '{"tool":"Bash","calls":"2828","input":{"command":"ls"}}\n{"tool":"a,b","calls":"1","input":null}');
+  const results = [{ tool: "Bash", calls: 2828, input: '{"command":"ls"}' }, { tool: "a,b", calls: 1, input: null }];
+  assert.equal(format(results, "json"), '{"tool":"Bash","calls":2828,"input":"{\\"command\\":\\"ls\\"}"}\n{"tool":"a,b","calls":1,"input":null}');
   assert.equal(format(results, "csv"), 'tool,calls,input\nBash,2828,"{""command"":""ls""}"\n"a,b",1,');
   assert.equal(format(results, "table"), [
     "tool | calls | input",

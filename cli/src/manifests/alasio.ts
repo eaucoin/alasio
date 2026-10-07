@@ -34,6 +34,7 @@ import {
   RELEASE,
   restrictedContainer,
   restrictedPod,
+  rolePasswords,
   selectorLabels,
   sha256,
 } from "./common.ts";
@@ -210,6 +211,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean): 
     { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "allowedUserIds" } } },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
     { name: "ALASIO_LAKE_PASSWORD_FILE", value: "/run/alasio/database/lake-password" },
+    ...rolePasswords(config).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
     { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${NAMESPACE}.svc` },
     { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
@@ -278,7 +280,10 @@ function deployment(config: InstallConfig, templatesChecksum: string): V1Deploym
             { name: "templates", configMap: { name: componentName("sandbox-templates") } },
             {
               name: "database",
-              secret: { secretName: databaseSecret(config), items: [{ key: "url", path: "url" }, { key: "lake-password", path: "lake-password" }] },
+              secret: {
+                secretName: databaseSecret(config),
+                items: ["url", "lake-password", ...rolePasswords(config).map(({ key }) => key)].map((key) => ({ key, path: key })),
+              },
             },
             ...(host.enabled ? hostVolumes(config) : []),
           ],

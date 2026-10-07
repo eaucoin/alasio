@@ -433,7 +433,12 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
 
 const InstallStruct = Schema.Struct({
   images: defaulted(
-    Schema.Struct({ alasio: Image(IMAGES.alasio), agent: Image(IMAGES.agent), lake: Image(IMAGES.lake), pullPolicy: defaulted(PullPolicy, "IfNotPresent") }),
+    Schema.Struct({
+      alasio: Image(IMAGES.alasio),
+      agent: Image(IMAGES.agent),
+      lake: Image(IMAGES.lake),
+      pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
+    }),
     {},
   ),
   /** Pull Secrets for private registries, in alasio's namespace and the sessions and host ones. */
@@ -446,9 +451,13 @@ const InstallStruct = Schema.Struct({
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
-  /** The analytics lake, loaded from Neon into DuckLake. */
+  /** The analytics lake, loaded from Neon into DuckLake, and its query endpoint, which alasio lake reads it through. */
   lake: defaulted(
-    Schema.Struct({ enabled: defaulted(Schema.Boolean, true), resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }) }),
+    Schema.Struct({
+      enabled: defaulted(Schema.Boolean, true),
+      resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
+      query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "192Mi" }, limits: { memory: "1Gi" } }) }), {}),
+    }),
     {},
   ),
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */

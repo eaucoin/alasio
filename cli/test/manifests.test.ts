@@ -379,6 +379,33 @@ describe("neon", () => {
   });
 });
 
+/** The variables that name the files of the passwords alasio is given, and the files. */
+const passwordFiles = (workload: V1Deployment) => container(workload).env?.filter(({ name }) => name.endsWith("_PASSWORD_FILE")).map(({ name, value }) => [name, value]);
+
+describe("the lake's query endpoint", () => {
+  test("reads the lake through its query endpoint, a container of the lake's pod with the reader's credentials alone", () => {
+    const lake = one<V1Deployment>(install({ lake: { query: { resources: { limits: { memory: "2Gi" } } } } }), "Deployment", "alasio-lake");
+    const query = lake.spec?.template.spec?.containers.find(({ name }) => name === "query");
+    assert.deepEqual(query?.command, ["node", "src/endpoint.ts"]);
+    assert.equal(query?.envFrom, undefined);
+    const secrets = query?.env?.flatMap(({ name, valueFrom }) => (valueFrom?.secretKeyRef ? [`${name}=${valueFrom.secretKeyRef.name}/${valueFrom.secretKeyRef.key}`] : []));
+    assert.deepEqual(secrets, ["LAKE_READER_PASSWORD", "LAKE_READER_S3_KEY", "LAKE_READER_S3_SECRET", "LAKE_QUERY_TOKEN"].map((key) => `${key}=alasio-lake/${key}`));
+    assert.deepEqual(query?.resources?.limits, { memory: "2Gi" });
+    assert.deepEqual(query?.ports, [{ name: "query", containerPort: 8090 }]);
+  });
+
+  test("has alasio make the lake reader's role while the lake runs", () => {
+    const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
+    assert.deepEqual(passwordFiles(alasio({}))?.slice(0, 2), [
+      ["ALASIO_LAKE_PASSWORD_FILE", "/run/alasio/database/lake-password"],
+      ["ALASIO_LAKE_READER_PASSWORD_FILE", "/run/alasio/database/lake-reader-password"],
+    ]);
+    const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-password", "lake-reader-password"]);
+    assert.deepEqual(passwordFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_PASSWORD_FILE"]);
+  });
+});
+
 describe("telemetry", () => {
   /** The collector's configuration, as its ConfigMap holds it. */
   const collectorConfig = (objects: readonly KubernetesObject[]) => JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-collector").data?.["config.yaml"] ?? "");

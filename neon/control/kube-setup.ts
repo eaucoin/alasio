@@ -181,11 +181,17 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${config.computeHost}:55433/${DATABASE}`,
       password: secrets.alasioPassword,
       "lake-password": secrets.lakePassword,
+      "lake-reader-password": secrets.lakeReaderPassword,
     },
+    // The lake service's, and its query endpoint's, which each read their own.
     [names.lake]: {
       LAKE_DATABASE_PASSWORD: secrets.lakePassword,
       LAKE_S3_KEY: s3("lake").accessKey,
       LAKE_S3_SECRET: s3("lake").secretKey,
+      LAKE_READER_PASSWORD: secrets.lakeReaderPassword,
+      LAKE_READER_S3_KEY: s3("lakeReader").accessKey,
+      LAKE_READER_S3_SECRET: s3("lakeReader").secretKey,
+      LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
     },
   };
   const { workspaces } = config;

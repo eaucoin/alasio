@@ -1,6 +1,6 @@
 /**
  * alasio's side of the analytics lake (neon/lake/src/model.ts): whether it runs, its role
- * and catalog database, and what it may read.
+ * and catalog database, what it may read, and the role its query endpoint reads it as.
  *
  * The role is made here, by alasio, rather than in the compute's spec: Neon makes every
  * role in the spec a member of neon_superuser, which may read and write every table,
@@ -22,6 +22,8 @@ export const lakeEnabled: Config.Config<boolean> = Config.String("ALASIO_LAKE_EN
 /** The role the lake connects as, and the database its catalog is kept in. */
 export const LAKE_ROLE = "lake";
 const LAKE_DATABASE = "lake";
+/** The role the lake's query endpoint reads it as (neon/lake/src/reader.ts). */
+export const LAKE_READER_ROLE = "lake_reader";
 
 /** What the lake reads: the schemas and tables it loads from, as alasio's stores make them. */
 const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
@@ -44,6 +46,19 @@ export async function ensureLakeRole(pool: Pool, password: string): Promise<void
   if (database.rows.length === 0) await pool.query(`create database ${LAKE_DATABASE}`);
   await pool.query(`revoke all on database ${LAKE_DATABASE} from public`);
   await pool.query(`grant connect, create, temporary on database ${LAKE_DATABASE} to ${LAKE_ROLE}`);
+}
+
+/**
+ * Makes the lake's reader's role, a login that is a member of no other role, with
+ * `password`, which may connect to the catalog's database and nothing more: the lake's
+ * role, which owns the catalog, lets it read that (neon/lake/src/reader.ts's
+ * grantReads). Idempotent; after ensureLakeRole, which makes the database.
+ */
+export async function ensureLakeReaderRole(pool: Pool, password: string): Promise<void> {
+  const role = await pool.query("select 1 from pg_roles where rolname = $1", [LAKE_READER_ROLE]);
+  if (role.rows.length === 0) await pool.query(`create role ${LAKE_READER_ROLE} login`);
+  await pool.query(`alter role ${LAKE_READER_ROLE} with login password '${scramVerifier(password)}'`);
+  await pool.query(`grant connect on database ${LAKE_DATABASE} to ${LAKE_READER_ROLE}`);
 }
 
 /**

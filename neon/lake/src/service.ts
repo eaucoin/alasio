@@ -11,7 +11,8 @@
  * queried) and /metrics (Prometheus, for the stack's telemetry collector) on
  * LAKE_HTTP_PORT, and the intake, OTLP over HTTP, on LAKE_INTAKE_PORT, from the moment
  * it starts. It logs a JSON line per event, and exports each as telemetry too
- * (telemetry.ts).
+ * (telemetry.ts). The lake is read through the query endpoint (endpoint.ts), a
+ * process of its own beside this one.
  */
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -24,6 +25,7 @@ import { type Lake, openLake } from "./lake.ts";
 import { type LoaderLake, startLoader } from "./loader.ts";
 import { createMetrics } from "./metrics.ts";
 import { ensureOtel } from "./otel.ts";
+import { grantReads } from "./reader.ts";
 import { prepareLake } from "./sync.ts";
 import { startTelemetry } from "./telemetry.ts";
 
@@ -83,7 +85,7 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
   const lock = await takeLock(config.catalog, signal);
   let lake: Lake | undefined;
   try {
-    lake = await openLake(config);
+    lake = await openLake(config, { source: config.source });
     const rebuilt = await prepareLake(lake.db);
     log(rebuilt ? "lake built, to be loaded from the source" : "lake open");
   } catch (error) {
@@ -101,14 +103,22 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
   };
 }
 
-/** Opens the lake for the intake: no source, and the telemetry's schema made ready. */
+/**
+ * Opens the lake for the intake: no source, the telemetry's schema made ready, and the
+ * catalog, which the intake's first open makes, readable by the query endpoint's reader.
+ */
 async function openForIntake(): Promise<IntakeLake> {
-  const lake = await openLake(config, { source: false, memoryLimit: INTAKE_MEMORY_LIMIT });
+  const lake = await openLake(config, { memoryLimit: INTAKE_MEMORY_LIMIT });
+  const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: 30_000 });
   try {
     await ensureOtel(lake.db);
+    await catalog.connect();
+    await grantReads(catalog);
   } catch (error) {
     lake.close();
     throw error;
+  } finally {
+    await catalog.end().catch(() => {});
   }
   return lake;
 }

@@ -105,7 +105,14 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "workspaces"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
+
+  // The lake's query endpoint reads as a reader, in the catalog and in the object store.
+  assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
+  assert.equal(value(kube, names.lake, "LAKE_READER_S3_KEY"), root.s3.lakeReader.accessKey);
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "lakeReader")?.actions, ["Read:lake", "List:lake"]);
+  assert.equal(value(kube, names.database, "lake-reader-password"), root.lakeReaderPassword);
+  assert.equal(value(kube, names.lake, "LAKE_QUERY_TOKEN"), root.lakeQueryToken);
 
   // Workspace storage's JuiceFS reaches Valkey with its password, and its own bucket alone.
   assert.equal(value(kube, names.valkey, "password"), root.valkeyPassword);
@@ -155,12 +162,14 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
   return {
     tenantId: "tenant",
     timelineId: "timeline",
-    s3: { neon: s3, admin: s3, lake: s3, workspaces: s3 },
+    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3 },
     controllerDbPassword: "c",
     alasioPassword: "q",
     lakePassword: "l",
     computeControlToken: "t",
     valkeyPassword: "v",
+    lakeReaderPassword: "r",
+    lakeQueryToken: "k",
   };
 }
 
@@ -202,5 +211,5 @@ test("without workspace storage, neither its Secrets nor its identity are made",
   assert.equal(rendered[names.valkey], undefined);
   assert.equal(rendered[names.workspaces], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader"]);
 });

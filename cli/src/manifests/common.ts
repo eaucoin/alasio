@@ -150,6 +150,18 @@ export function databaseSecret(config: InstallConfig): string {
   return config.neon.enabled ? `${RELEASE}-database` : config.neon.external.existingSecret;
 }
 
+/**
+ * The passwords of the roles alasio makes in its Neon for what reads it beside alasio,
+ * given while that runs: the lake's query endpoint's. Each by its key in the database
+ * Secret, which the stack's setup writes it in, and the variable that names its file to
+ * alasio (src/neon/connect.ts).
+ */
+export function rolePasswords(config: InstallConfig): { readonly key: string; readonly variable: string }[] {
+  return [
+    ...(lakeRuns(config) ? [{ key: "lake-reader-password", variable: "ALASIO_LAKE_READER_PASSWORD_FILE" }] : []),
+  ];
+}
+
 /** The object store's S3 endpoint, as pods in alasio's namespace reach it. */
 export function s3Endpoint(config: InstallConfig): string {
   return config.objectStore.bundled.enabled ? `http://${componentName("seaweedfs")}:8333` : config.objectStore.external.endpoint;

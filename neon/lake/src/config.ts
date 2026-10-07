@@ -4,6 +4,8 @@
  * without a sensible default are required, so a misconfigured lake fails at once
  * rather than mid-cycle.
  *
+ * The lake service (./service.ts), which writes the lake:
+ *
  *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT  the compute, as the stack's network reaches it
  *   LAKE_DATABASE_PASSWORD                  role `lake`'s: read-only on alasio's sources,
  *                                           owner of the `lake` database, the catalog
@@ -20,10 +22,20 @@
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
  *   LAKE_INTAKE_PORT                        the telemetry intake, OTLP over HTTP (default 4318)
  *
- * Its own telemetry is configured by OpenTelemetry's standard variables (./telemetry.ts).
+ * The lake's query endpoint (./endpoint.ts), which only reads it, as its reader:
+ *
+ *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT, LAKE_CATALOG_DATABASE, LAKE_DATA_PATH,
+ *   LAKE_S3_ENDPOINT, LAKE_EXTENSION_DIRECTORY   as above
+ *   LAKE_READER_PASSWORD                    role `lake_reader`'s, which may only read the catalog
+ *   LAKE_READER_S3_KEY, LAKE_READER_S3_SECRET  the object store's read-only identity's
+ *   LAKE_QUERY_TOKEN                        the bearer token a query must carry
+ *   LAKE_QUERY_PORT                         where it takes queries (default 8090)
+ *   LAKE_MEMORY_LIMIT, LAKE_THREADS         its DuckDB's (default 256MB, 2)
+ *
+ * Their own telemetry is configured by OpenTelemetry's standard variables (./telemetry.ts).
  */
 
-/** A Postgres database the lake connects to, as role `lake`. */
+/** A Postgres database the lake connects to, as `user`. */
 export interface DatabaseConfig {
   host: string;
   port: number;
@@ -39,24 +51,35 @@ export interface S3Config {
   secret: string;
 }
 
-export interface LakeConfig {
-  /** alasio's database, which the lake loads from. */
-  source: DatabaseConfig;
+/** What the lake is opened with: its catalog and data path, whom it is opened as there, and its DuckDB's settings. */
+export interface LakeAccess {
   /** DuckLake's catalog. */
   catalog: DatabaseConfig;
   dataPath: string;
   s3: S3Config | null;
-  intervalMs: number;
-  maintenanceIntervalMs: number;
-  retentionDays: number;
   memoryLimit: string;
   threads: number;
   extensionDirectory: string | null;
+}
+
+export interface LakeConfig extends LakeAccess {
+  /** alasio's database, which the lake loads from. */
+  source: DatabaseConfig;
+  intervalMs: number;
+  maintenanceIntervalMs: number;
+  retentionDays: number;
   httpPort: number;
   intakePort: number;
 }
 
-const ROLE = "lake";
+export interface EndpointConfig extends LakeAccess {
+  token: string;
+  port: number;
+}
+
+/** The roles the lake connects as: the lake service's, and the query endpoint's. */
+export const ROLE = "lake";
+export const READER_ROLE = "lake_reader";
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
@@ -76,33 +99,51 @@ function positive(env: NodeJS.ProcessEnv, name: string, fallback: number): numbe
   return value;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
-  const database = (name: string): DatabaseConfig => ({
-    host: required(env, "LAKE_DATABASE_HOST"),
-    port: positive(env, "LAKE_DATABASE_PORT", 5432),
-    user: ROLE,
-    password: required(env, "LAKE_DATABASE_PASSWORD"),
-    database: name,
-  });
+/** The lake as `user` opens it, with the password and object store credentials of the variables `secrets` names. */
+function access(
+  env: NodeJS.ProcessEnv,
+  user: string,
+  secrets: { password: string; s3Key: string; s3Secret: string },
+  memoryLimit: string,
+): LakeAccess {
   const dataPath = required(env, "LAKE_DATA_PATH");
   return {
-    source: database(optional(env, "LAKE_SOURCE_DATABASE", "alasio")),
-    catalog: database(optional(env, "LAKE_CATALOG_DATABASE", "lake")),
+    catalog: {
+      host: required(env, "LAKE_DATABASE_HOST"),
+      port: positive(env, "LAKE_DATABASE_PORT", 5432),
+      user,
+      password: required(env, secrets.password),
+      database: optional(env, "LAKE_CATALOG_DATABASE", "lake"),
+    },
     dataPath,
     s3: dataPath.startsWith("s3://")
-      ? {
-          endpoint: required(env, "LAKE_S3_ENDPOINT"),
-          key: required(env, "LAKE_S3_KEY"),
-          secret: required(env, "LAKE_S3_SECRET"),
-        }
+      ? { endpoint: required(env, "LAKE_S3_ENDPOINT"), key: required(env, secrets.s3Key), secret: required(env, secrets.s3Secret) }
       : null,
+    memoryLimit: optional(env, "LAKE_MEMORY_LIMIT", memoryLimit),
+    threads: positive(env, "LAKE_THREADS", 2),
+    extensionDirectory: env["LAKE_EXTENSION_DIRECTORY"]?.trim() || null,
+  };
+}
+
+/** The lake service's configuration. */
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
+  const lake = access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, "1GB");
+  return {
+    ...lake,
+    source: { ...lake.catalog, database: optional(env, "LAKE_SOURCE_DATABASE", "alasio") },
     intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
     maintenanceIntervalMs: positive(env, "LAKE_MAINTENANCE_HOURS", 24) * 3_600_000,
     retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
-    memoryLimit: optional(env, "LAKE_MEMORY_LIMIT", "1GB"),
-    threads: positive(env, "LAKE_THREADS", 2),
-    extensionDirectory: env["LAKE_EXTENSION_DIRECTORY"]?.trim() || null,
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
     intakePort: positive(env, "LAKE_INTAKE_PORT", 4318),
+  };
+}
+
+/** The query endpoint's configuration. */
+export function loadEndpointConfig(env: NodeJS.ProcessEnv = process.env): EndpointConfig {
+  return {
+    ...access(env, READER_ROLE, { password: "LAKE_READER_PASSWORD", s3Key: "LAKE_READER_S3_KEY", s3Secret: "LAKE_READER_S3_SECRET" }, "256MB"),
+    token: required(env, "LAKE_QUERY_TOKEN"),
+    port: positive(env, "LAKE_QUERY_PORT", 8090),
   };
 }
