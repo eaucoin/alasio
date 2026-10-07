@@ -350,9 +350,12 @@ if (inShard("workspaces")) {
 const metricRows = (condition: string) =>
   `select sum(n) as n from (${["gauge", "sum", "histogram", "exponential_histogram", "summary"].map((kind) => `select count(*) as n from otel.metrics_${kind} where ${condition}`).join(" union all ")})`;
 
-/** Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector sends them within seconds. */
-async function untilInLake(what: string, sql: string): Promise<void> {
-  const deadline = Date.now() + 240_000;
+/**
+ * Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector
+ * sends them within seconds, and the loader loads transcripts within its interval.
+ */
+async function untilInLake(what: string, sql: string, timeoutMs = 240_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   let last: unknown;
   while (Date.now() < deadline) {
     last = await lakeQuery(sql).then(([row]) => Number(row?.["n"] ?? 0), (error: unknown) => error);
@@ -398,6 +401,24 @@ if (inShard("telemetry")) {
       const volumeId = await newSession("none");
       await untilInLake("trace of the session's bayma", `select count(*) as n from otel.traces where ServiceName = 'bayma' and ResourceAttributes['alasio.volume.id'] = '${volumeId}'`);
       assert.ok(await untilExported("traces", volumeId, 120_000), "no trace of the session's bayma arrived at the backend stamped with it");
+    });
+
+    test("a turn's spans join its transcript in the lake: alasio's turn, Codex's, and the rollout Codex wrote", async () => {
+      await tg.calls();
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      // alasio's turn names Codex's thread, Codex's span in its trace names Codex's turn, and
+      // the thread's rollout, mirrored to Neon and loaded, has that turn, completed.
+      await untilInLake(
+        "turn joined to its transcript",
+        `select count(*) as n from otel.traces turn
+          join codex.turns codex on codex.thread_id = turn.SpanAttributes['alasio.session.id']
+          join otel.traces app on app.TraceId = turn.TraceId and app.SpanAttributes['turn.id'] = codex.turn_id
+          where turn.SpanName = 'alasio.turn' and app.ServiceName = 'codex-app-server' and app.SpanName = 'turn/start' and codex.completed_at is not null`,
+        600_000,
+      );
     });
 
     test("the stack's telemetry is in the lake, the compute's and the lake's own among it", async () => {
