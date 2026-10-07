@@ -8,6 +8,7 @@
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
  */
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { after, before, describe, test } from "node:test";
 
 import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
@@ -19,8 +20,9 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { alasioOk, type Forward, kube, lakeQuery, ref } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
-import { type Branch, type BranchesFile, computeId, MAIN, type ReadyBranch } from "../control/branches.ts";
+import { type BranchesFile, type BranchView, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
+import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
 
 /** The stack's pods, by their labels. */
@@ -243,7 +245,7 @@ interface ServedComputeConfig {
 }
 
 /** A branch as neon-control's API answers it. */
-type Listed = Branch & { computeId: string };
+type Listed = BranchView;
 
 /** Registers the suite, which runs once the end-to-end run has installed alasio. */
 export function neonStack(): void {
@@ -471,6 +473,10 @@ export function neonStack(): void {
       const BRANCH = "e2e";
       /** The pod of the branch's compute, which runs as main's does, but on the branch. */
       const COMPUTE = `${computeId(BRANCH)}-compute`;
+      /** Its compute's own credentials: its role's password, and its token, which neon-control is given the hashes of. */
+      const PASSWORD = `branch-${randomUUID()}`;
+      const COMPUTE_TOKEN = `compute-${randomUUID()}`;
+      const compute = { passwordVerifier: scramVerifier(PASSWORD), tokenSha256: tokenSha256(COMPUTE_TOKEN) };
       let control: Forward | undefined;
 
       /** neon-control's API, called with `bearer`, a token of the admin scope unless given: its status, and what it answered. */
@@ -503,7 +509,7 @@ export function neonStack(): void {
 
       test("are managed with a token of the admin scope alone, not with the tenant's every compute holds", async () => {
         const tenant = signToken(privateKey, "tenant", tenantId);
-        for (const [method, path, body] of [["GET", "/branches"], ["POST", "/branches", { name: BRANCH }], ["DELETE", `/branches/${BRANCH}`], ["PUT", "/notify-attach", {}]] as const) {
+        for (const [method, path, body] of [["GET", "/branches"], ["POST", "/branches", { name: BRANCH, compute }], ["DELETE", `/branches/${BRANCH}`], ["PUT", "/notify-attach", {}]] as const) {
           assert.equal((await api(method, path, { body, bearer: tenant })).status, 401, `${method} ${path}`);
         }
         assert.deepEqual((await listed()).map(({ name, state, computeId }) => ({ name, state, computeId })), [{ name: MAIN, state: "ready", computeId: "alasio" }]);
@@ -516,25 +522,32 @@ export function neonStack(): void {
         assert.ok(point);
         await query("insert into branched select g from generate_series(101, 200) g");
 
-        const created = await api<Listed>("POST", "/branches", { body: { name: BRANCH, lsn: point.lsn } });
+        const created = await api<Listed>("POST", "/branches", { body: { name: BRANCH, lsn: point.lsn, compute } });
         assert.equal(created.status, 201, JSON.stringify(created.body));
         assert.equal(created.body.parent, MAIN);
         assert.equal(created.body.computeId, `branch-${BRANCH}`);
         assert.ok(created.body.state === "ready");
         assert.deepEqual([...created.body.safekeepers.ids].sort(), [1, 2, 3]);
-        const again = await api<Listed>("POST", "/branches", { body: { name: BRANCH } });
+        const again = await api<Listed>("POST", "/branches", { body: { name: BRANCH, compute } });
         assert.equal(again.status, 200);
         assert.equal(again.body.timelineId, created.body.timelineId);
 
-        // Main's compute's pod, under labels of its own, and with the branch's compute id.
+        // Main's compute's pod, under labels of its own, with the branch's compute id and its token.
         const template = (await kube.get<V1Deployment>(ref("Deployment", neonName("compute"), NAMESPACE)))?.spec?.template.spec;
-        const [compute] = template?.containers ?? [];
-        assert.ok(template && compute?.args);
+        const [container] = template?.containers ?? [];
+        assert.ok(template && container?.args);
         const pod: V1Pod = {
           apiVersion: "v1",
           kind: "Pod",
           metadata: { name: COMPUTE, namespace: NAMESPACE, labels: { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon", "app.kubernetes.io/component": "neon-test" } },
-          spec: { ...template, containers: [{ ...compute, args: compute.args.map((arg, at, args) => (args[at - 1] === "--compute-id" ? computeId(BRANCH) : arg)) }] },
+          spec: {
+            ...template,
+            containers: [{
+              ...container,
+              args: container.args.map((arg, at, args) => (args[at - 1] === "--compute-id" ? computeId(BRANCH) : arg)),
+              env: (container.env ?? []).map((variable) => (variable.name === "NEON_CONTROL_PLANE_TOKEN" ? { name: variable.name, value: COMPUTE_TOKEN } : variable)),
+            }],
+          },
         };
         await kube.apply(pod);
         await awaitPodReady(COMPUTE);
@@ -544,14 +557,40 @@ export function neonStack(): void {
         assert.deepEqual(await query("select count(*)::int as n, max(id) as top from branched"), [{ n: 200, top: 200 }]);
       });
 
+      test("a branch's compute is given its own spec alone, with its own token, and its role takes its own password, not main's", async () => {
+        const mainToken = await kube.secret(NAMESPACE, neonName("compute"), "NEON_CONTROL_PLANE_TOKEN");
+        const specStatus = async (id: string, bearer: string) => (await inControl([
+          "node",
+          "-e",
+          'fetch("http://127.0.0.1:8080/compute/api/v2/computes/" + process.argv[1] + "/spec", { headers: { authorization: "Bearer " + process.argv[2] } }).then((r) => process.stdout.write(String(r.status)))',
+          "--",
+          id,
+          bearer,
+        ])).trim();
+        assert.deepEqual(
+          [await specStatus(computeId(BRANCH), COMPUTE_TOKEN), await specStatus(computeId(MAIN), COMPUTE_TOKEN), await specStatus(computeId(BRANCH), mainToken), await specStatus(computeId(BRANCH), "none")],
+          ["200", "403", "403", "401"],
+        );
+        const mainPassword = (JSON.parse(await kube.secret(NAMESPACE, neonName("root"), "secrets.json")) as StackSecrets).alasioPassword;
+        const loginWith = async (password: string) => (await kube.execOk(NAMESPACE, COMPUTE, [
+          "sh",
+          "-c",
+          // By the pod's address, as alasio connects, not the loopback compute_ctl trusts.
+          'PGPASSWORD="$1" psql -h "$(hostname -i | cut -d" " -f1)" -p 55433 -U alasio -d alasio -Atc "select current_user" 2>/dev/null || echo refused',
+          "sh",
+          password,
+        ])).trim();
+        assert.deepEqual([await loginWith(PASSWORD), await loginWith(mainPassword)], ["alasio", "refused"]);
+      });
+
       test("branch from branches, at a point their parent still has, and are deleted before their parent", async () => {
-        const child = await api<Listed>("POST", "/branches", { body: { name: `${BRANCH}-child`, parent: BRANCH } });
+        const child = await api<Listed>("POST", "/branches", { body: { name: `${BRANCH}-child`, parent: BRANCH, compute } });
         assert.equal(child.status, 201, JSON.stringify(child.body));
         assert.equal(child.body.parent, BRANCH);
         assert.equal((await api("DELETE", `/branches/${BRANCH}`)).status, 412);
         assert.equal((await api("DELETE", `/branches/${MAIN}`)).status, 400);
         // Below the start of main's history, which no timeline has.
-        const early = await api("POST", "/branches", { body: { name: `${BRANCH}-early`, lsn: "0/8" } });
+        const early = await api("POST", "/branches", { body: { name: `${BRANCH}-early`, lsn: "0/8", compute } });
         assert.equal(early.status, 406, JSON.stringify(early.body));
         assert.equal((await api("POST", "/branches", { body: { name: "Early" } })).status, 400);
         assert.equal((await api("DELETE", `/branches/${BRANCH}-child`)).status, 204);

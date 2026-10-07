@@ -14,6 +14,8 @@ import { test, type TestContext } from "node:test";
 
 import { Cause, Exit } from "effect";
 
+import { tokenSha256 } from "../../neon/control/branches.ts";
+import { scramVerifier } from "../../neon/control/scram.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
@@ -836,22 +838,38 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
 
   const run = await alasio(["branch", "create", "try", "--bot-token-file", token("branch", "456:branch"), "--image", "registry.example:5000/alasio:next"]);
   succeeded(run);
-  assert.deepEqual(neon.asked.filter(({ method }) => method === "POST"), [{ method: "POST", path: "/branches", body: { name: "try", lsn: "0/1A2B3C8" } }]);
+  // Asked nothing before, as asserted: what it was asked since.
+  const posted = (neon.asked as FakeNeon["asked"]).filter(({ method }) => method === "POST");
+  assert.deepEqual(posted.map(({ path }) => path), ["/branches"]);
+  const { compute, ...branched } = (posted[0]?.body ?? {}) as { readonly compute?: { readonly passwordVerifier: string; readonly tokenSha256: string } };
+  assert.deepEqual(branched, { name: "try", lsn: "0/1A2B3C8" });
   const deployment = kube.get(BRANCH_DEPLOYMENT) as { metadata: { labels: Record<string, string> }; spec: { template: { spec: { containers: { image: string }[] } } } } | undefined;
   assert.equal(deployment?.spec.template.spec.containers[0]?.image, "registry.example:5000/alasio:next");
   assert.equal(deployment?.metadata.labels["alasio.dev/branch"], "try");
   assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"));
   assert.ok(kube.get("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake"));
-  // Its own bot, for main's users; main's database, lake and compute, which its copy of the data shares; its own token.
+  // Its own bot, for main's users; its own token to ask main to fork with.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "token"), "456:branch");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "allowedUserIds"), "42");
-  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "url"), "postgresql://alasio:p@alasio-neon-compute:55433/alasio");
+  // Its own password of alasio's role, whose verifier alone neon-control is given for its compute's spec.
+  const url = new URL(secretIn(kube, "alasio-branch-try", "alasio-database", "url") ?? "");
+  assert.deepEqual([url.username, url.host, url.pathname], ["alasio", "alasio-neon-compute:55433", "/alasio"]);
+  assert.notEqual(url.password, "p");
+  const [, iterations, salt] = /^SCRAM-SHA-256\$(\d+):([^$]+)\$/u.exec(compute?.passwordVerifier ?? "") ?? [];
+  assert.equal(iterations, "4096");
+  assert.equal(compute?.passwordVerifier, scramVerifier(decodeURIComponent(url.password), Buffer.from(salt ?? "", "base64")));
+  // Its compute's own token, whose hash alone neon-control is given; its lake's role's own password.
+  const computeToken = secretIn(kube, "alasio-branch-try", "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN") ?? "";
+  assert.notEqual(computeToken, "c");
+  assert.equal(compute?.tokenSha256, tokenSha256(computeToken));
+  const lakePassword = secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_DATABASE_PASSWORD");
+  assert.notEqual(lakePassword, "l");
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-password"), lakePassword);
+  // Of main's, only the lake's object store identity, which reads main's files where they are.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
-  // Of main's, only what the branch's alasio and lake use: nothing of Grafana's, the lake's query endpoint's, or neon-control's.
   const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();
   assert.deepEqual(keys("alasio-database"), ["lake-password", "url"]);
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
-  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN"), "c");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);

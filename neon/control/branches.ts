@@ -10,7 +10,15 @@
  * starts until the storage controller has deleted it, when its record goes. Its id and
  * branch point are recorded before the storage controller is first asked, so a creation
  * asked again, after a failure or a restart, asks for exactly the same timeline.
+ *
+ * A branch's compute has credentials of its own, which whoever asks for the branch makes
+ * and neon-control is given only the hashes of: the SCRAM verifier of the password of
+ * alasio's role on it, which its spec gives the role, and the SHA-256 of the token it
+ * fetches its spec with, which fetches its spec alone. So what a branch is given reaches
+ * neither main's compute nor another branch's spec. main's compute keeps the stack's.
  */
+import { createHash, timingSafeEqual } from "node:crypto";
+
 import type { JsonWebKeySet } from "./jwt.ts";
 import { DATABASE, ROLE } from "./secrets.ts";
 
@@ -30,6 +38,14 @@ export interface Placement {
   ids: number[];
 }
 
+/** A branch's compute's own credentials, as neon-control keeps them: hashes alone. */
+export interface ComputeCredentials {
+  /** The SCRAM verifier of the password of alasio's role on the branch. */
+  passwordVerifier: string;
+  /** The SHA-256, in hexadecimal, of the token its compute fetches its spec with. */
+  tokenSha256: string;
+}
+
 /** What every branch records, whatever its state. */
 interface BranchFields {
   name: string;
@@ -40,6 +56,8 @@ interface BranchFields {
   lsn: string | null;
   /** When neon-control first recorded it. */
   createdAt: string;
+  /** Its compute's own credentials; null for main, whose compute has the stack's. */
+  compute: ComputeCredentials | null;
 }
 
 /** A branch, as neon-control records it, and as its API answers it. */
@@ -53,11 +71,12 @@ export interface BranchesFile {
   branches: Branch[];
 }
 
-/** A branch asked for: its name, its parent, and its branch point, the parent's end if not given. */
+/** A branch asked for: its name, its parent, its branch point (the parent's end if not given), and its compute's credentials. */
 export interface BranchRequest {
   name: string;
   parent: string;
   lsn: string | null;
+  compute: ComputeCredentials;
 }
 
 /**
@@ -107,20 +126,36 @@ export function branchPoint(text: string): string | null {
   return `${(aligned >> 32n).toString(16).toUpperCase()}/${(aligned & 0xffffffffn).toString(16).toUpperCase()}`;
 }
 
-/** The branch `body` asks for: `{ name, parent?, lsn? }`, its parent main if not given. */
+/** The SHA-256 of `token`, in hexadecimal: what neon-control keeps of a compute's token. */
+export const tokenSha256 = (token: string): string => createHash("sha256").update(token).digest("hex");
+
+/** The credentials `value` gives a branch's compute, checked. */
+function computeCredentials(value: unknown): ComputeCredentials {
+  const { passwordVerifier, tokenSha256: sha, ...rest } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  if (
+    Object.keys(rest).length > 0 || typeof passwordVerifier !== "string" || !passwordVerifier.startsWith("SCRAM-SHA-256$") ||
+    typeof sha !== "string" || !/^[0-9a-f]{64}$/u.test(sha)
+  ) {
+    throw new BranchError(400, "a branch's compute is given as { passwordVerifier, tokenSha256 }: a SCRAM-SHA-256 verifier, and a SHA-256 in hexadecimal");
+  }
+  return { passwordVerifier, tokenSha256: sha };
+}
+
+/** The branch `body` asks for: `{ name, parent?, lsn?, compute }`, its parent main if not given. */
 export function branchRequest(body: unknown): BranchRequest {
-  if (typeof body !== "object" || body === null) throw new BranchError(400, "a branch is asked for as { name, parent?, lsn? }");
-  const { name, parent = MAIN, lsn = null, ...rest } = body as Record<string, unknown>;
+  if (typeof body !== "object" || body === null) throw new BranchError(400, "a branch is asked for as { name, parent?, lsn?, compute }");
+  const { name, parent = MAIN, lsn = null, compute, ...rest } = body as Record<string, unknown>;
   const unknown = Object.keys(rest);
   if (unknown.length > 0) throw new BranchError(400, `a branch has no ${unknown.join(", ")}`);
   if (typeof name !== "string") throw new BranchError(400, "a branch is asked for by its name");
   const problem = nameProblem(name);
   if (problem) throw new BranchError(400, `${name} is no branch's name: ${problem}`);
   if (typeof parent !== "string") throw new BranchError(400, "a branch's parent is a branch's name");
-  if (lsn === null) return { name, parent, lsn };
+  const credentials = computeCredentials(compute);
+  if (lsn === null) return { name, parent, lsn, compute: credentials };
   const point = typeof lsn === "string" ? branchPoint(lsn) : null;
   if (point === null) throw new BranchError(400, `${String(lsn)} is no LSN: an LSN is written <high>/<low>, in hexadecimal`);
-  return { name, parent, lsn: point };
+  return { name, parent, lsn: point, compute: credentials };
 }
 
 /** The id of the compute of the branch `name`: `alasio` for main's, `branch-<name>` for any other's. */
@@ -133,8 +168,22 @@ export function branchOfCompute(branches: readonly Branch[], id: string): ReadyB
   return branches.find((branch): branch is ReadyBranch => branch.state === "ready" && computeId(branch.name) === id);
 }
 
-/** A branch as the API answers it: its record, and its compute's id. */
-export function branchView(branch: Branch): Branch & { computeId: string } {
+/** The compute whose token `authorization` bears, by its id: main's, the stack's `mainToken`, or a branch's own; null for none. */
+export function computeOfToken(branches: readonly Branch[], authorization: string | undefined, mainToken: string): string | null {
+  const token = /^Bearer (.+)$/u.exec(authorization ?? "")?.[1];
+  if (!token) return null;
+  const same = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  if (mainToken && same(token, mainToken)) return computeId(MAIN);
+  const sha = tokenSha256(token);
+  const owner = branches.find((branch) => branch.compute !== null && same(sha, branch.compute.tokenSha256));
+  return owner ? computeId(owner.name) : null;
+}
+
+/** A branch as the API answers it: its record but its compute's credentials, and its compute's id. */
+export type BranchView = (Branch extends infer Each ? (Each extends Branch ? Omit<Each, "compute"> : never) : never) & { computeId: string };
+
+/** `branch` as the API answers it (BranchView). */
+export function branchView({ compute: _credentials, ...branch }: Branch): BranchView {
   return { ...branch, computeId: computeId(branch.name) };
 }
 
@@ -181,7 +230,7 @@ export function deleting(branches: readonly Branch[], name: string): Branch[] {
   if (!branch) throw new BranchError(404, `there is no branch ${name}`);
   const children = branches.filter((child) => child.parent === name).map((child) => child.name);
   if (children.length > 0) throw new BranchError(412, `${name} has branches of its own, deleted first: ${children.join(", ")}`);
-  return withBranch(branches, { name, parent: branch.parent, timelineId: branch.timelineId, lsn: branch.lsn, createdAt: branch.createdAt, state: "deleting" });
+  return withBranch(branches, { name, parent: branch.parent, timelineId: branch.timelineId, lsn: branch.lsn, createdAt: branch.createdAt, compute: branch.compute, state: "deleting" });
 }
 
 /** The storage controller's answer to creating a timeline, as far as neon-control reads it. */
@@ -264,7 +313,7 @@ export interface ComputeStack {
   tenantId: string;
   pageserverHost: string;
   safekeepers: readonly Safekeeper[];
-  /** The SCRAM verifier of alasio's role's password. */
+  /** The SCRAM verifier of alasio's role's password on main. */
   passwordVerifier: string;
   /** The tenant-scoped token the compute reaches the pageserver and safekeepers with. */
   storageAuthToken: string;
@@ -317,8 +366,12 @@ function setting(name: string, value: string | number, vartype: SettingType): Co
 
 /**
  * The spec of `branch`'s compute: a primary on its timeline, at its safekeepers. The role
- * and database are main's, which every branch inherits with its data, and so are the same
- * on every branch's compute.
+ * and database are main's, which every branch inherits with its data; the role's password
+ * is the branch's own.
+ *
+ * Its storage token is the tenant's, as the pageserver and safekeepers take no narrower
+ * one: a timeline is not a scope of theirs. A branch's compute could read main's timeline
+ * with it, which only Neon's storage services take, and only from the stack's pods.
  */
 export function computeConfig(branch: ReadyBranch, stack: ComputeStack): ComputeConfig {
   // The timeline was placed on safekeepers of the stack, so each id is one of theirs.
@@ -330,7 +383,7 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack): Compute
       cluster: {
         cluster_id: "alasio",
         name: "alasio",
-        roles: [{ name: ROLE, encrypted_password: stack.passwordVerifier, options: null }],
+        roles: [{ name: ROLE, encrypted_password: branch.compute?.passwordVerifier ?? stack.passwordVerifier, options: null }],
         databases: [{ name: DATABASE, owner: ROLE, options: null }],
         settings: [
           setting("listen_addresses", "0.0.0.0", "string"),

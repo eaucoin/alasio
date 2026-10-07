@@ -4,9 +4,14 @@
  *
  * A branch is made at main's database's current WAL position, so it holds every commit
  * main has made: a branch of Neon's at that position, by neon-control, and the branch's
- * objects on it, with Secrets of its own (main's database's, lake's and compute's, which
- * its copy of the data shares, its bot's, Claude Code's token when main has one, the pull
- * Secrets of its images, and its token to ask main to fork with). neon-control is called
+ * objects on it, with Secrets of its own: credentials of its own for what it runs (the
+ * password of alasio's role on its compute, which neon-control gives the role there, the
+ * lake's role's, which its alasio gives it, and its compute's token, which fetches its
+ * spec alone), none of which reaches main's compute or another branch's; its bot's;
+ * Claude Code's token when main has one; the pull Secrets of its images; and its token to
+ * ask main to fork with. Its lake has main's object store identity, as it reads main's
+ * files where they are (one data path: DuckLake keeps every file's path relative to it),
+ * and SeaweedFS's Write, which writing needs, deletes too. neon-control is called
  * in its own pod, as the API server's service proxy drops the Authorization header it
  * authenticates its callers by, which neon-control would read a token from.
  *
@@ -15,10 +20,13 @@
  * still uses), its compute stopped, its branch of Neon's deleted, and its namespaces with
  * all that is left in them.
  */
+import { randomBytes } from "node:crypto";
+
 import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1PersistentVolume, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "effect";
 
-import { type Branch, nameProblem } from "../../neon/control/branches.ts";
+import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
+import { scramVerifier } from "../../neon/control/scram.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError } from "./config.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
@@ -95,7 +103,7 @@ const refusalOf = (answer: ControlAnswer<unknown>): string =>
 
 /** Neon's branches but main, as neon-control lists them. */
 const neonBranches = Effect.gen(function*() {
-  const answer = yield* neonControl<{ readonly branches: readonly Branch[] }>("GET", "/branches");
+  const answer = yield* neonControl<{ readonly branches: readonly BranchView[] }>("GET", "/branches");
   if (answer.status !== 200 || !answer.body) return yield* new BranchRefused({ message: `neon-control did not list Neon's branches: ${refusalOf(answer)}` });
   return answer.body.branches.filter(({ parent }) => parent !== null);
 });
@@ -240,12 +248,17 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     yield* Console.log(`Warning: a branch takes about ${memoryText(memory.branch)}, as main's alasio, compute and lake use now, and no node has more than ${memoryText(memory.free)} free.`);
   }
 
+  // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
+  const own = () => randomBytes(24).toString("base64url");
+  const credentials = { alasio: own(), lake: own(), compute: own() };
+  const url = new URL(yield* requiredSecret(componentName("database"), "url"));
+  url.password = credentials.alasio;
+  const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
   const secrets = [
-    // Not the passwords of what reads main's Neon beside it (Grafana, the lake's query endpoint), which a branch has none of.
-    yield* copiedSecret(name, componentName("database"), ["url", "lake-password"]),
-    yield* copiedSecret(name, neonName("compute")),
-    // The lake service's own; not its query endpoint's, nor its token to ask neon-control with, which only main's maintenance needs.
-    ...(settings.lake.enabled ? [yield* copiedSecret(name, componentName("lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"])] : []),
+    branchSecret(name, componentName("database"), { url: url.toString(), "lake-password": credentials.lake }),
+    branchSecret(name, neonName("compute"), { NEON_CONTROL_PLANE_TOKEN: credentials.compute }),
+    // The lake service's: main's object store identity, the one thing of main's a branch is given (see the module), and its role's password.
+    ...(lake ? [{ ...lake, data: { ...lake.data, LAKE_DATABASE_PASSWORD: Buffer.from(credentials.lake, "utf8").toString("base64") } }] : []),
     ...(settings.alasio.claude.existingSecret ? [yield* copiedSecret(name, CLAUDE_SECRET)] : []),
     ...(yield* Effect.forEach(settings.imagePullSecrets, (secret) => copiedSecret(name, secret))),
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
@@ -255,7 +268,11 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   // At main's current WAL position, so the branch holds every commit main has made.
   const lsn = yield* onCompute(NAMESPACE, yield* runningPod("neon-compute"), "select pg_current_wal_lsn()");
   yield* Effect.logInfo(`branching Neon at ${lsn}`);
-  const made = yield* neonControl<Branch>("POST", "/branches", { name, lsn });
+  const made = yield* neonControl<BranchView>("POST", "/branches", {
+    name,
+    lsn,
+    compute: { passwordVerifier: scramVerifier(credentials.alasio), tokenSha256: tokenSha256(credentials.compute) },
+  });
   if (made.status !== 201 && made.status !== 200) return yield* new BranchRefused({ message: `neon-control did not make the branch ${name}: ${refusalOf(made)}` });
 
   const objects = branchObjects(settings, name);

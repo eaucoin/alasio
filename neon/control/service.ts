@@ -11,18 +11,20 @@
  * every branch's safekeepers, and reports healthy once main's compute can start.
  *
  * A compute fetches its spec as Neon's compute_ctl does from a control plane
- * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with the
- * compute token as its bearer, one for every compute; its id is `alasio` for
- * main's, `branch-<name>` for a branch's. neon-control serves a branch's spec;
- * it does not run its compute.
+ * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with its
+ * compute's own token as its bearer (401 for no compute's, 403 for another's);
+ * its id is `alasio` for main's, `branch-<name>` for a branch's. neon-control
+ * serves a branch's spec; it does not run its compute.
  *
  * Its API takes a token of the admin scope, as the storage controller's hooks
  * do, or for `GET /branches` alone one of the `branches` scope, the lake's, and
  * answers 401 without one, and 503 until bootstrapped. It speaks JSON; a
  * refusal is `{ "error": "<why>" }` with its status:
  *
- * - `POST /branches`, `{ name, parent?, lsn? }`: creates the branch `name` of
- *   `parent` (main if not given) at `lsn`, and answers it (201), or the same
+ * - `POST /branches`, `{ name, parent?, lsn?, compute }`: creates the branch
+ *   `name` of `parent` (main if not given) at `lsn`, its compute's credentials
+ *   `compute` (`{ passwordVerifier, tokenSha256 }`, ./branches.ts), and answers
+ *   it (201), or the same
  *   branch asked for again (200). Without `lsn`, the branch point is where the
  *   pageserver has the parent's WAL up to, which trails its last commits by as
  *   long as the WAL takes to reach it; a branch that must hold a commit is
@@ -48,7 +50,7 @@
  * /secrets (secrets.json, the signing key), /keys (the public key), /state (its
  * record of the branches, branches.json).
  */
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
@@ -65,6 +67,7 @@ import {
   callScopes,
   type ComputeStack,
   computeConfig,
+  computeOfToken,
   creationRefused,
   deleting,
   existingBranch,
@@ -252,7 +255,7 @@ async function ensureMain(): Promise<void> {
   const created = await controller<TimelineCreated>("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
     body: { new_timeline_id: secrets.timelineId, pg_version: PG_VERSION },
   });
-  const main = { name: MAIN, parent: null, timelineId: secrets.timelineId, lsn: null, createdAt: new Date().toISOString() };
+  const main = { name: MAIN, parent: null, timelineId: secrets.timelineId, lsn: null, createdAt: new Date().toISOString(), compute: null };
   // A timeline created is answered with its description.
   const safekeepers = placementOf(main, null, created.body!);
   save(withBranch(branches, { ...main, state: "ready", safekeepers }));
@@ -281,7 +284,15 @@ async function createBranch(request: BranchRequest): Promise<{ status: number; b
     const lsn = request.lsn ?? (await endOf(parent).catch((error: unknown) => {
       throw new BranchError(503, `the storage controller did not say where ${parent.name} ends: ${errorText(error)}`);
     }));
-    branch = { name: request.name, parent: parent.name, timelineId: randomUUID().replaceAll("-", ""), lsn, createdAt: new Date().toISOString(), state: "creating" };
+    branch = {
+      name: request.name,
+      parent: parent.name,
+      timelineId: randomUUID().replaceAll("-", ""),
+      lsn,
+      createdAt: new Date().toISOString(),
+      compute: request.compute,
+      state: "creating",
+    };
     save(withBranch(branches, branch));
   }
   const created = await controller<TimelineCreated>("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
@@ -403,12 +414,6 @@ async function bootstrap(): Promise<void> {
 const authorized = (request: IncomingMessage): boolean =>
   bearsScope(publicKeyPem, request.headers.authorization, ...callScopes(request.method ?? "", request.url ?? ""));
 
-/** Whether the request carries the compute token, which only computes are given. */
-function fromCompute(request: IncomingMessage): boolean {
-  const presented = Buffer.from(request.headers.authorization ?? "");
-  const expected = Buffer.from(`Bearer ${secrets.computeControlToken}`);
-  return Boolean(secrets.computeControlToken) && presented.length === expected.length && timingSafeEqual(presented, expected);
-}
 
 /** The request's body, parsed as JSON. */
 async function jsonBody(request: IncomingMessage): Promise<unknown> {
@@ -440,12 +445,16 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   const spec = method === "GET" ? SPEC.exec(url) : null;
   if (spec) {
-    if (!fromCompute(request)) return answer(response, 401);
+    // A compute's token is its own: main's the stack's, a branch's the one it was created with.
+    const id = decodeURIComponent(spec[1] ?? "");
+    const holder = computeOfToken(branches, request.headers.authorization, secrets.computeControlToken);
+    if (holder === null) return answer(response, 401);
     // Until bootstrapped there is no spec yet; compute_ctl retries, and then
     // its container is restarted.
     if (!ready) return answer(response, 503);
-    const branch = branchOfCompute(branches, decodeURIComponent(spec[1] ?? ""));
-    if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${spec[1]}` });
+    if (holder !== id) return answer(response, 403, { error: `the token is not the compute ${id}'s` });
+    const branch = branchOfCompute(branches, id);
+    if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
     return answer(response, 200, { ...computeConfig(branch, stack), status: "attached" });
   }
   const branch = BRANCH.exec(url);

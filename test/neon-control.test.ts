@@ -8,10 +8,12 @@ import {
   branchOfCompute,
   branchPoint,
   branchRequest,
+  branchView,
   callScopes,
   type ComputeStack,
   computeConfig,
   computeId,
+  computeOfToken,
   creationRefused,
   deleting,
   existingBranch,
@@ -19,12 +21,17 @@ import {
   placementOf,
   type ReadyBranch,
   safekeepersNotified,
+  tokenSha256,
   withNotifiedPlacement,
 } from "../neon/control/branches.ts";
 import { bearsScope, generateKeyPair, signToken } from "../neon/control/jwt.ts";
+import { scramVerifier } from "../neon/control/scram.ts";
 
 const MAIN_TIMELINE = "11111111111111111111111111111111";
 const DEV_TIMELINE = "22222222222222222222222222222222";
+
+/** dev's compute's own credentials: its role's password's verifier, and its token's hash. */
+const DEV_COMPUTE = { passwordVerifier: scramVerifier("dev-password"), tokenSha256: tokenSha256("dev-token") };
 
 const main: ReadyBranch = {
   name: "main",
@@ -32,6 +39,7 @@ const main: ReadyBranch = {
   timelineId: MAIN_TIMELINE,
   lsn: null,
   createdAt: "2026-10-07T00:00:00.000Z",
+  compute: null,
   state: "ready",
   safekeepers: { generation: 1, ids: [1, 2, 3] },
 };
@@ -41,6 +49,7 @@ const dev: ReadyBranch = {
   timelineId: DEV_TIMELINE,
   lsn: "0/16B5A58",
   createdAt: "2026-10-07T01:00:00.000Z",
+  compute: DEV_COMPUTE,
   state: "ready",
   safekeepers: { generation: 1, ids: [2, 3, 1] },
 };
@@ -68,9 +77,9 @@ describe("a branch's name", () => {
 });
 
 describe("a branch asked for", () => {
-  test("is of main at its end unless it says otherwise", () => {
-    assert.deepEqual(branchRequest({ name: "dev" }), { name: "dev", parent: "main", lsn: null });
-    assert.deepEqual(branchRequest({ name: "dev", parent: "other", lsn: "0/16b5a50" }), { name: "dev", parent: "other", lsn: "0/16B5A50" });
+  test("is of main at its end unless it says otherwise, with its compute's credentials", () => {
+    assert.deepEqual(branchRequest({ name: "dev", compute: DEV_COMPUTE }), { name: "dev", parent: "main", lsn: null, compute: DEV_COMPUTE });
+    assert.deepEqual(branchRequest({ name: "dev", parent: "other", lsn: "0/16b5a50", compute: DEV_COMPUTE }), { name: "dev", parent: "other", lsn: "0/16B5A50", compute: DEV_COMPUTE });
   });
 
   test("is at a branch point aligned as the pageserver aligns it", () => {
@@ -82,14 +91,32 @@ describe("a branch asked for", () => {
   });
 
   test("is refused when it is not one", () => {
-    for (const body of [null, "dev", { parent: "main" }, { name: "Dev" }, { name: "main" }, { name: "dev", parent: 1 }, { name: "dev", lsn: "head" }, { name: "dev", lsn: 1 }, { name: "dev", ancestor: "main" }]) {
+    const compute = DEV_COMPUTE;
+    for (
+      const body of [
+        null,
+        "dev",
+        { parent: "main", compute },
+        { name: "Dev", compute },
+        { name: "main", compute },
+        { name: "dev", parent: 1, compute },
+        { name: "dev", lsn: "head", compute },
+        { name: "dev", lsn: 1, compute },
+        { name: "dev", ancestor: "main", compute },
+        // Its compute's credentials, which are its own, and hashes alone.
+        { name: "dev" },
+        { name: "dev", compute: { ...compute, password: "dev-password" } },
+        { name: "dev", compute: { ...compute, passwordVerifier: "dev-password" } },
+        { name: "dev", compute: { ...compute, tokenSha256: "dev-token" } },
+      ]
+    ) {
       assert.equal(refusal(() => branchRequest(body)), 400, JSON.stringify(body));
     }
   });
 });
 
 describe("the branches", () => {
-  const request = { name: "dev", parent: "main", lsn: null };
+  const request = { name: "dev", parent: "main", lsn: null, compute: DEV_COMPUTE };
 
   test("create a branch of a ready parent once, and answer it when asked for again", () => {
     assert.equal(existingBranch([main], request), null);
@@ -103,13 +130,13 @@ describe("the branches", () => {
     assert.equal(refusal(() => existingBranch([main, dev], { ...request, parent: "other" })), 409);
     assert.equal(refusal(() => existingBranch([main, dev], { ...request, lsn: "0/1000000" })), 409);
     assert.equal(refusal(() => existingBranch([main, { ...dev, state: "deleting" }], request)), 409);
-    assert.equal(refusal(() => existingBranch([main, { ...dev, state: "creating" }], { name: "child", parent: "dev", lsn: null })), 409);
-    assert.equal(refusal(() => existingBranch([main], { name: "child", parent: "dev", lsn: null })), 404);
+    assert.equal(refusal(() => existingBranch([main, { ...dev, state: "creating" }], { ...request, name: "child", parent: "dev" })), 409);
+    assert.equal(refusal(() => existingBranch([main], { ...request, name: "child", parent: "dev" })), 404);
   });
 
   test("delete a branch with none of its own, never main", () => {
     const [, deleted] = deleting([main, dev], "dev");
-    assert.deepEqual(deleted, { name: "dev", parent: "main", timelineId: DEV_TIMELINE, lsn: dev.lsn, createdAt: dev.createdAt, state: "deleting" });
+    assert.deepEqual(deleted, { name: "dev", parent: "main", timelineId: DEV_TIMELINE, lsn: dev.lsn, createdAt: dev.createdAt, compute: DEV_COMPUTE, state: "deleting" });
     assert.equal(refusal(() => deleting([main, dev], "main")), 400);
     assert.equal(refusal(() => deleting([main], "dev")), 404);
     const child: Branch = { ...dev, name: "child", parent: "dev", timelineId: "3".repeat(32) };
@@ -123,6 +150,22 @@ describe("the branches", () => {
     assert.equal(branchOfCompute([main, dev], "branch-dev"), dev);
     assert.equal(branchOfCompute([main, { ...dev, state: "creating" }], "branch-dev"), undefined);
     assert.equal(branchOfCompute([main, dev], "dev"), undefined);
+  });
+
+  test("know each compute by its own token alone: main's the stack's, a branch's the one it was created with", () => {
+    const holder = (authorization: string | undefined) => computeOfToken([main, dev], authorization, "stack-token");
+    assert.equal(holder("Bearer stack-token"), "alasio");
+    assert.equal(holder("Bearer dev-token"), "branch-dev");
+    assert.equal(holder("Bearer other-token"), null);
+    assert.equal(holder("dev-token"), null);
+    assert.equal(holder(undefined), null);
+    // Its hash, which neon-control keeps, is not its token.
+    assert.equal(holder(`Bearer ${DEV_COMPUTE.tokenSha256}`), null);
+    assert.equal(computeOfToken([main, dev], "Bearer ", ""), null);
+  });
+
+  test("answer a branch without its compute's credentials", () => {
+    assert.deepEqual(Object.keys(branchView(dev)).sort(), ["computeId", "createdAt", "lsn", "name", "parent", "safekeepers", "state", "timelineId"]);
   });
 });
 
@@ -183,7 +226,7 @@ describe("safekeepers notified", () => {
   });
 });
 
-test("a branch's compute spec is main's but for its timeline and safekeepers", () => {
+test("a branch's compute spec is main's but for its timeline, its safekeepers and its role's password", () => {
   const stack: ComputeStack = {
     tenantId: "t",
     pageserverHost: "pageserver",
@@ -200,8 +243,11 @@ test("a branch's compute spec is main's but for its timeline and safekeepers", (
   assert.deepEqual(ofMain.spec.safekeeper_connstrings, ["sk-0:5454", "sk-1:5454", "sk-2:5454"]);
   const { timeline_id: _main, safekeeper_connstrings: _mainSafekeepers, safekeepers_generation: _mainGeneration, ...mainRest } = ofMain.spec;
   const { timeline_id: _dev, safekeeper_connstrings: _devSafekeepers, safekeepers_generation: _devGeneration, ...devRest } = ofDev.spec;
-  assert.deepEqual(devRest, mainRest);
-  assert.deepEqual(devRest.cluster.roles, [{ name: "alasio", encrypted_password: "SCRAM-SHA-256$verifier", options: null }]);
+  const { cluster: { roles: mainRoles, ...mainCluster }, ...mainSpec } = mainRest;
+  const { cluster: { roles: devRoles, ...devCluster }, ...devSpec } = devRest;
+  assert.deepEqual([devSpec, devCluster], [mainSpec, mainCluster]);
+  assert.deepEqual(mainRoles, [{ name: "alasio", encrypted_password: "SCRAM-SHA-256$verifier", options: null }]);
+  assert.deepEqual(devRoles, [{ name: "alasio", encrypted_password: DEV_COMPUTE.passwordVerifier, options: null }]);
 });
 
 test("neon-control takes a token of the admin scope only, not the tenant's every compute holds", () => {

@@ -625,6 +625,31 @@ if (inShard("branches")) {
       assert.ok(Number(await onDatabase(BRANCH_NAMESPACE, "select count(*) from state.messages")) > Number(messages));
     });
 
+    test("the branch's credentials are its own: main's compute takes neither its password nor its compute's token", async () => {
+      const passwordOf = async (namespace: string) => decodeURIComponent(new URL(await kube.secret(namespace, "alasio-database", "url")).password);
+      const compute = await kube.runningPod(NAMESPACE, "alasio-neon-compute");
+      // By the pod's address, as alasio connects, not the loopback compute_ctl trusts.
+      const loginWith = async (password: string) => (await kube.execOk(NAMESPACE, compute, [
+        "sh",
+        "-c",
+        'PGPASSWORD="$1" psql -h "$(hostname -i | cut -d" " -f1)" -p 55433 -U alasio -d alasio -Atc "select current_user" 2>/dev/null || echo refused',
+        "sh",
+        password,
+      ])).trim();
+      assert.deepEqual([await loginWith(await passwordOf(NAMESPACE)), await loginWith(await passwordOf(BRANCH_NAMESPACE))], ["alasio", "refused"]);
+      const control = await kube.runningPod(NAMESPACE, "alasio-neon-control");
+      const specStatus = async (id: string, token: string) => (await kube.execOk(NAMESPACE, control, [
+        "node",
+        "-e",
+        'fetch("http://127.0.0.1:8080/compute/api/v2/computes/" + process.argv[1] + "/spec", { headers: { authorization: "Bearer " + process.argv[2] } }).then((r) => process.stdout.write(String(r.status)))',
+        "--",
+        id,
+        token,
+      ])).trim();
+      const branchToken = await kube.secret(BRANCH_NAMESPACE, "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN");
+      assert.deepEqual([await specStatus(`branch-${BRANCH}`, branchToken), await specStatus("alasio", branchToken)], ["200", "403"]);
+    });
+
     test("the branch's telemetry is in main's lake, tagged with the branch", async () => {
       await untilInLake("trace of the branch's alasio", `select count(*) as n from otel.traces where ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] = '${BRANCH}'`);
     });
