@@ -32,6 +32,16 @@ export const MAIN = "main";
  */
 export const MAX_NAME_LENGTH = 30;
 
+/**
+ * How many days of each timeline's history the pageserver keeps, alasio's tenant's
+ * `pitr_interval`: so how far back a branch point, or a moment read as it was, can be.
+ * The layers only older moments need are garbage collected.
+ */
+export const HISTORY_DAYS = 1;
+
+/** HISTORY_DAYS, as alasio says it. */
+export const HISTORY = HISTORY_DAYS === 1 ? "a day" : `${HISTORY_DAYS} days`;
+
 /** Where the storage controller placed a timeline: its safekeepers, by id, at a generation. */
 export interface Placement {
   generation: number;
@@ -267,7 +277,7 @@ export function placementOf(branch: Pick<Branch, "name" | "timelineId" | "lsn">,
  */
 export function creationRefused(branch: Pick<Branch, "name" | "parent" | "lsn">, status: number | null, message: string): BranchError {
   if (status === 406 || (status === 409 && message.includes("406 Not Acceptable"))) {
-    return new BranchError(406, `${branch.parent} has no ${branch.lsn} to branch ${branch.name} from: it is below its garbage collection cutoff, or past its end (${message})`);
+    return new BranchError(406, `${branch.parent} has no ${branch.lsn} to branch ${branch.name} from: it is before the history it keeps, which goes ${HISTORY} back, or past its end (${message})`);
   }
   const answered = status === null ? message : `${status} ${message}`;
   return new BranchError(503, `the storage controller did not create ${branch.name}, which may be asked for again: ${answered}`);

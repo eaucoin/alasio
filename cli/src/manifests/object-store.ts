@@ -6,6 +6,7 @@
  */
 import type { KubernetesObject, V1CronJob, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
+import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import { claimSpec, componentName, NAMESPACE, neonName, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
@@ -28,9 +29,11 @@ const PEER_PORTS = PORTS.filter(({ name }) => /^(master|volume|filer)/u.test(nam
 
 /**
  * The lifecycle rules of Neon's bucket: old versions of the pageserver's objects expire
- * a week after they are replaced, as Neon's own point-in-time window does; the
- * safekeepers' after a day, the least S3 allows, since each re-uploads the segment it
- * writes, whole, as it grows.
+ * a day past the history Neon keeps (HISTORY_DAYS) after they are replaced, so its
+ * time-travel recovery can put the bucket back as it was at any moment of that history,
+ * with a day more to notice a deletion that should not have been; the safekeepers' after
+ * a day, the least S3 allows, since each re-uploads the segment it writes, whole, as it
+ * grows.
  */
 const LIFECYCLE = {
   Rules: [
@@ -38,7 +41,7 @@ const LIFECYCLE = {
       ID: "expire-noncurrent",
       Status: "Enabled",
       Filter: { Prefix: "pageserver/" },
-      NoncurrentVersionExpiration: { NoncurrentDays: 7 },
+      NoncurrentVersionExpiration: { NoncurrentDays: HISTORY_DAYS + 1 },
       AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
     },
     {

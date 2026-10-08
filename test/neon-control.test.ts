@@ -197,10 +197,11 @@ describe("the storage controller's answer to creating a branch", () => {
     assert.equal(refusal(() => placementOf({ name: "main", timelineId: MAIN_TIMELINE, lsn: null }, null, created)), 502);
   });
 
-  test("refusing a branch point its parent lacks is the caller's to change; any other refusal, to ask again", () => {
+  test("refusing a branch point its parent lacks is the caller's to change, saying how far back its history goes; any other refusal, to ask again", () => {
     const asked = { name: "dev", parent: "main", lsn: "0/8" };
     const wrapped = '{"msg":"pageserver 1 406 Not Acceptable: 406 Not Acceptable invalid branch start lsn: less than latest GC cutoff 0/14EE2B0"}';
     assert.equal(creationRefused(asked, 409, wrapped).status, 406);
+    assert.match(creationRefused(asked, 409, wrapped).message, /^main has no 0\/8 to branch dev from: it is before the history it keeps, which goes a day back, or past its end /u);
     assert.equal(creationRefused(asked, 406, '{"msg":"invalid branch start lsn"}').status, 406);
     assert.equal(creationRefused(asked, 409, '{"msg":"pageserver 1 429 Too Many Requests"}').status, 503);
     assert.equal(creationRefused(asked, null, "fetch failed").status, 503);

@@ -1,8 +1,9 @@
 /**
  * alasio's Neon as alasio installs it: its components killed, the whole stack stopped at
- * once, a safekeeper's volume lost, with nothing committed lost; its garbage collected,
- * its dumps restorable, its past readable, its branches made, run and deleted, and its
- * lake loading; and an upgrade that changes nothing restarting none of it.
+ * once, a safekeeper's volume lost, with nothing committed lost; a day of its history
+ * kept, its garbage collected, its dumps restorable, its past readable, its branches
+ * made, run and deleted, and its lake loading; and an upgrade that changes nothing
+ * restarting none of it.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
@@ -232,6 +233,11 @@ interface LsnAtTimestamp {
   readonly lsn: string;
 }
 
+/** What the pageserver answers of a tenant's configuration, as far as this test reads it. */
+interface TenantConfigAnswered {
+  readonly effective_config: { readonly pitr_interval: string };
+}
+
 /** What neon-control serves a compute, as far as this test changes it. */
 interface ServedComputeConfig {
   status?: unknown;
@@ -280,6 +286,11 @@ export function neonStack(): void {
       test("bootstraps its tenant and a timeline on three safekeepers", async () => {
         const { safekeepers } = await record();
         assert.deepEqual([...safekeepers.ids].sort(), [1, 2, 3]);
+      });
+
+      test("keeps a day of history, as its tenant is configured", async () => {
+        const config: TenantConfigAnswered = JSON.parse(await inside(`${neonName("pageserver")}-0`, "GET", `http://127.0.0.1:9898/v1/tenant/${tenantId}/config`, "pageserverapi"));
+        assert.equal(config.effective_config.pitr_interval, "1day");
       });
 
       test("an upgrade that changes nothing restarts nothing of the stack", async () => {

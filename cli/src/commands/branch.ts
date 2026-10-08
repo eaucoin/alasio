@@ -2,6 +2,7 @@
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted } from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 
+import { HISTORY } from "../../../neon/control/branches.ts";
 import { createBranch, deleteBranch, listBranches, memoryText } from "../branches.ts";
 import { loadConfig } from "../config.ts";
 import { readTelegramBot, type TelegramBot } from "../secrets.ts";
@@ -100,7 +101,8 @@ const create = Command.make(
       "and a lake of the branch's own, in the namespaces alasio-branch-<name> and alasio-branch-<name>-sessions, serving its own " +
       "bot (--bot-token-file), and running another image (--image) or other settings (--overrides) when given; and waits until it " +
       "runs, past --timeout saying what still waits and why. It says when no node of the cluster has the memory a branch takes, " +
-      "about what main's alasio, compute and lake use as it is measured then.",
+      `about what main's alasio, compute and lake use as it is measured then. Neon keeps ${HISTORY} of its history, so a branch point ` +
+      `can be at most ${HISTORY} back.`,
   ),
 );
 

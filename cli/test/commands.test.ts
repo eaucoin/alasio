@@ -822,6 +822,13 @@ function secretIn(kube: FakeKube, namespace: string, name: string, key: string):
 
 const BRANCH_DEPLOYMENT = "/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio";
 
+test("branch create's help says how far back Neon keeps its history, and so a branch point", async (t) => {
+  const { alasio } = await rig(t);
+  const run = await alasio(["branch", "create", "--help"]);
+  succeeded(run);
+  assert.match(run.printed.join(" ").replaceAll(/\s+/gu, " "), /Neon keeps a day of its history, so a branch point can be at most a day back\./u);
+});
+
 test("branch create branches Neon at main's latest commit, runs the branch's alasio, compute and lake on it with Secrets of its own, and refuses main's bot", async (t) => {
   const { alasio, home, kube, neon, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");

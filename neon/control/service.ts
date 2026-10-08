@@ -4,8 +4,9 @@
  *
  * On start it bootstraps what the storage services need and cannot do
  * themselves, idempotently: registers the safekeepers with the storage
- * controller, waits for the pageserver to register, and creates alasio's tenant
- * and its timeline, the branch `main`, once. It then manages branches, child
+ * controller, waits for the pageserver to register, creates alasio's tenant
+ * and its timeline, the branch `main`, once, and configures the tenant to keep
+ * a day of history (HISTORY_DAYS). It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
  * compute its spec, answers the storage controller's compute hooks, repairs
  * every branch's safekeepers, and reports healthy once main's compute can start.
@@ -32,9 +33,9 @@
  *   that is not a DNS-1123 label of at most 30 characters, or is `main`; 404 for
  *   a parent there is not; 409 for a name taken by another branch or being
  *   deleted, or a parent not ready; 406 for an `lsn` its parent no longer has,
- *   or does not reach; 503 when the storage controller did not create it, and
- *   502 when it created something else: asked again, the same timeline is
- *   asked for.
+ *   as it keeps a day of history, or does not reach; 503 when the storage
+ *   controller did not create it, and 502 when it created something else: asked
+ *   again, the same timeline is asked for.
  * - `GET /branches`: every branch, main first (200, `{ branches }`).
  * - `DELETE /branches/<name>`: deletes the branch's timeline (204). Its compute
  *   must have stopped first, which is the caller's to see to: neon-control
@@ -71,6 +72,7 @@ import {
   creationRefused,
   deleting,
   existingBranch,
+  HISTORY_DAYS,
   MAIN,
   placementOf,
   type ReadyBranch,
@@ -239,6 +241,10 @@ async function registerSafekeepers(): Promise<void> {
   log("safekeepers registered");
 }
 
+/**
+ * Creates alasio's tenant once, and gives it its configuration, whole, each time: the
+ * storage controller keeps it, and gives it the pageserver with the tenant.
+ */
 async function ensureTenant(): Promise<void> {
   const found = await controller("GET", `/control/v1/tenant/${secrets.tenantId}`, { allow: [404] });
   if (found.status === 404) {
@@ -247,6 +253,7 @@ async function ensureTenant(): Promise<void> {
     });
     log("tenant created", { tenantId: secrets.tenantId });
   }
+  await controller("PUT", "/v1/tenant/config", { body: { tenant_id: secrets.tenantId, pitr_interval: `${HISTORY_DAYS}d` } });
 }
 
 /** Creates main's timeline once, bootstrapped, recording the safekeepers it was placed on. */

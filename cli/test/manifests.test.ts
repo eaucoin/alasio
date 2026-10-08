@@ -381,6 +381,15 @@ describe("neon", () => {
     assert.equal(pass?.jobTemplate.spec?.activeDeadlineSeconds, 900);
   });
 
+  test("expires Neon's replaced objects a day past the history it keeps, and the safekeepers' re-uploads after a day", () => {
+    const lifecycle = one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+    const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
+    assert.ok(rules);
+    const expiries = (JSON.parse(rules) as { Rules: { Filter: { Prefix: string }; NoncurrentVersionExpiration: { NoncurrentDays: number } }[] }).Rules
+      .map(({ Filter, NoncurrentVersionExpiration }) => [Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]);
+    assert.deepEqual(expiries, [["pageserver/", 2], ["safekeeper/", 1]]);
+  });
+
   test("uses the operator's object store and makes no SeaweedFS when told", () => {
     const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3" } } });
     assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("alasio-seaweedfs")), []);
