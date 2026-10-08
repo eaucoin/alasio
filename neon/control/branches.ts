@@ -409,6 +409,13 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack): Compute
           setting("wal_level", "replica", "enum"),
           setting("wal_log_hints", "off", "bool"),
           setting("wal_keep_size", 0, "integer"),
+          // After a checkpoint, the first change of each page writes it to the WAL whole,
+          // and transcript search's indexes change the same pages all day: so an hour
+          // between checkpoints, not five minutes. It lengthens no recovery, as the
+          // compute starts from the pageserver, never from its own WAL. Enough WAL for a
+          // checkpoint before the hour is about 1GB, three times the busiest hour's yet.
+          setting("checkpoint_timeout", "1h", "string"),
+          setting("max_wal_size", "2GB", "string"),
           setting("wal_sender_timeout", "5s", "string"),
           setting("max_wal_senders", 10, "integer"),
           setting("max_replication_slots", 10, "integer"),

@@ -227,15 +227,17 @@ describe("safekeepers notified", () => {
   });
 });
 
+/** What every compute's spec shares in these tests. */
+const stack: ComputeStack = {
+  tenantId: "t",
+  pageserverHost: "pageserver",
+  safekeepers: [1, 2, 3].map((id) => ({ id, host: `sk-${id - 1}`, pgPort: 5454, httpPort: 7676 })),
+  passwordVerifier: "SCRAM-SHA-256$verifier",
+  storageAuthToken: "token",
+  jwks: { keys: [] },
+};
+
 test("a branch's compute spec is main's but for its timeline, its safekeepers and its role's password", () => {
-  const stack: ComputeStack = {
-    tenantId: "t",
-    pageserverHost: "pageserver",
-    safekeepers: [1, 2, 3].map((id) => ({ id, host: `sk-${id - 1}`, pgPort: 5454, httpPort: 7676 })),
-    passwordVerifier: "SCRAM-SHA-256$verifier",
-    storageAuthToken: "token",
-    jwks: { keys: [] },
-  };
   const ofMain = computeConfig(main, stack);
   const ofDev = computeConfig({ ...dev, safekeepers: { generation: 2, ids: [2, 3] } }, stack);
   assert.equal(ofDev.spec.timeline_id, DEV_TIMELINE);
@@ -249,6 +251,13 @@ test("a branch's compute spec is main's but for its timeline, its safekeepers an
   assert.deepEqual([devSpec, devCluster], [mainSpec, mainCluster]);
   assert.deepEqual(mainRoles, [{ name: "alasio", encrypted_password: "SCRAM-SHA-256$verifier", options: null }]);
   assert.deepEqual(devRoles, [{ name: "alasio", encrypted_password: DEV_COMPUTE.passwordVerifier, options: null }]);
+});
+
+test("every compute checkpoints hourly, unless an hour's WAL comes to a gigabyte first", () => {
+  for (const branch of [main, dev]) {
+    const settings = new Map(computeConfig(branch, stack).spec.cluster.settings.map(({ name, value }) => [name, value]));
+    assert.deepEqual([settings.get("checkpoint_timeout"), settings.get("max_wal_size")], ["1h", "2GB"], branch.name);
+  }
 });
 
 test("neon-control takes a token of the admin scope only, not the tenant's every compute holds", () => {

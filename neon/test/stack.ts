@@ -288,6 +288,10 @@ export function neonStack(): void {
         assert.deepEqual([...safekeepers.ids].sort(), [1, 2, 3]);
       });
 
+      test("checkpoints hourly, as its spec says", async () => {
+        assert.deepEqual(await query("select current_setting('checkpoint_timeout') as timeout, current_setting('max_wal_size') as wal"), [{ timeout: "1h", wal: "2GB" }]);
+      });
+
       test("keeps a day of history, as its tenant is configured", async () => {
         const config: TenantConfigAnswered = JSON.parse(await inside(`${neonName("pageserver")}-0`, "GET", `http://127.0.0.1:9898/v1/tenant/${tenantId}/config`, "pageserverapi"));
         assert.equal(config.effective_config.pitr_interval, "1day");
