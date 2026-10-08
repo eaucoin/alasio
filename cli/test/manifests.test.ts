@@ -345,6 +345,11 @@ describe("neon", () => {
     assert.match(container(one<V1Deployment>(objects, "Deployment", "alasio-neon-storage-controller")).command?.[2] ?? "", /--timeline-safekeeper-count 5/u);
   });
 
+  test("has each safekeeper upload the segment it writes at most hourly", () => {
+    const command = container(one<V1StatefulSet>(install(), "StatefulSet", "alasio-neon-safekeeper")).command?.[2] ?? "";
+    assert.match(command, / --partial-backup-timeout 1h /u);
+  });
+
   test("registers every safekeeper with neon-control by its stable name", () => {
     const env = container(one<V1Deployment>(install(), "Deployment", "alasio-neon-control")).env;
     assert.deepEqual(env?.find(({ name }) => name === "NEON_SAFEKEEPER_HOSTS"), {

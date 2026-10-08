@@ -323,6 +323,11 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
                 '--availability-zone "az-safekeeper-$SAFEKEEPER_ID"',
                 `--broker-endpoint http://${neonName("storage-broker")}:50051`,
                 '--remote-storage "$REMOTE_STORAGE"',
+                // It uploads the segment it writes, whole, once it has grown, at most
+                // this often, and the object store keeps each upload replaced a day: an
+                // hour apart, not fifteen minutes, a quarter as many. What the bucket
+                // lacks of the last hour is on the volume of each safekeeper.
+                "--partial-backup-timeout 1h",
                 "--pg-auth-public-key-path /keys/auth_public_key.pem",
                 "--pg-tenant-only-auth-public-key-path /keys/auth_public_key.pem",
                 "--http-auth-public-key-path /keys/auth_public_key.pem",
