@@ -15,7 +15,7 @@ import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Pod, V
 import pg, { type QueryResultRow } from "pg";
 
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { alasioOk, type Forward, kube, lakeQuery, ref } from "../../test/e2e/harness.ts";
@@ -359,6 +359,24 @@ export function neonStack(): void {
           await pageserverMetric("pageserver_deletion_queue_validated_total"),
           await pageserverMetric("pageserver_deletion_queue_executed_total"),
         );
+      });
+
+      test("the object store's lifecycle pass reads the filer's log of changes to now, not a count of changes", async () => {
+        const name = `lifecycle-${Date.now()}`;
+        const template = (await kube.get<V1CronJob>(ref("CronJob", componentName("seaweedfs-lifecycle"), NAMESPACE)))?.spec?.jobTemplate;
+        assert.ok(template?.spec);
+        // A Job of the CronJob's template, as one it starts on its schedule is.
+        const job: V1Job = { apiVersion: "batch/v1", kind: "Job", metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} }, spec: template.spec };
+        await kube.apply(job);
+        try {
+          await kube.awaitReady([ref("Job", name, NAMESPACE)], "10 minutes");
+          const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "job-name": name }) });
+          const logs = (await Promise.all(pods.map(logsOf))).join("");
+          assert.match(logs, /running shards 0-15 \(event budget=0, /u);
+          assert.match(logs, /shards 0-15 complete; cursors checkpointed/u);
+        } finally {
+          await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
+        }
       });
 
       test("backs alasio's database up to the object store, as a dump any Postgres restores", async () => {

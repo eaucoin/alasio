@@ -373,6 +373,14 @@ describe("neon", () => {
     assert.ok(container(seaweedfs).args?.includes("-volume.max=40"));
   });
 
+  test("applies the object store's lifecycle rules every hour, reading the filer's log to now, each pass done before the next", () => {
+    const pass = one<V1CronJob>(install(), "CronJob", "alasio-seaweedfs-lifecycle").spec;
+    assert.equal(pass?.schedule, "41 * * * *");
+    assert.equal(pass?.concurrencyPolicy, "Forbid");
+    assert.match(pass?.jobTemplate.spec?.template.spec?.containers[0]?.command?.[2] ?? "", /s3\.lifecycle\.run-shard -shards 0-15 -s3 alasio-seaweedfs:18333 -events 0 -runtime 10m\\n/u);
+    assert.equal(pass?.jobTemplate.spec?.activeDeadlineSeconds, 900);
+  });
+
   test("uses the operator's object store and makes no SeaweedFS when told", () => {
     const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3" } } });
     assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("alasio-seaweedfs")), []);

@@ -186,7 +186,14 @@ function server(config: InstallConfig): KubernetesObject[] {
   return [service, peersService, statefulSet];
 }
 
-/** SeaweedFS applies lifecycle rules only when asked: a pass every six hours, deleting through the S3 server's gRPC port. */
+/**
+ * SeaweedFS applies lifecycle rules only when asked: a pass every hour, deleting through
+ * the S3 server's gRPC port. A pass replays the filer's log of changes from where each
+ * shard's last stopped, which is the oldest change with an expiry not yet due; so it reads
+ * to now (`-events 0`), not a count of changes, which would hold a short rule's expiries
+ * behind a long one's until that one's came due. It stops at its runtime, well before the
+ * next, and the one after it goes on from there.
+ */
 function lifecyclePass(config: InstallConfig): V1CronJob {
   const name = componentName("seaweedfs");
   const component = "seaweedfs-lifecycle";
@@ -195,7 +202,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
     kind: "CronJob",
     metadata: { name: componentName(component), namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      schedule: "41 */6 * * *",
+      schedule: "41 * * * *",
       concurrencyPolicy: "Forbid",
       successfulJobsHistoryLimit: 1,
       failedJobsHistoryLimit: 3,
@@ -216,7 +223,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                   "/bin/sh",
                   "-c",
                   // Waits out the moment before its NetworkPolicy applies, as a new pod.
-                  `until wget -q -O /dev/null http://${name}:9333/cluster/status; do sleep 2; done && printf 's3.lifecycle.run-shard -shards 0-15 -s3 ${name}:18333 -runtime 10m\\n' | weed shell -master=${name}:9333 -filer=${name}:8888`,
+                  `until wget -q -O /dev/null http://${name}:9333/cluster/status; do sleep 2; done && printf 's3.lifecycle.run-shard -shards 0-15 -s3 ${name}:18333 -events 0 -runtime 10m\\n' | weed shell -master=${name}:9333 -filer=${name}:8888`,
                 ],
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
