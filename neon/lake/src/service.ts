@@ -24,7 +24,7 @@ import { type DatabaseConfig, loadConfig } from "./config.ts";
 import { type IntakeLake, startIntake } from "./intake.ts";
 import { type Lake, openLake } from "./lake.ts";
 import { type LoaderLake, startLoader } from "./loader.ts";
-import { createMetrics } from "./metrics.ts";
+import { createMetrics, sampleMemory } from "./metrics.ts";
 import { ensureOtel } from "./otel.ts";
 import { grantReads } from "./reader.ts";
 import { prepareLake } from "./sync.ts";
@@ -81,6 +81,9 @@ async function takeLock(catalog: DatabaseConfig, signal: AbortSignal): Promise<L
 
 const config = loadConfig();
 
+/** The lake as the loader and the intake each have it open now, whose DuckDBs' memory /metrics reports. */
+const opened: Record<"loader" | "intake", Lake | null> = { loader: null, intake: null };
+
 /** Opens the lake for loading, under the lock, its model made ready. */
 async function open(signal: AbortSignal): Promise<LoaderLake> {
   const lock = await takeLock(config.catalog, signal);
@@ -94,10 +97,12 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
     await lock.client.end().catch(() => {});
     throw error;
   }
+  opened.loader = lake;
   return {
     db: lake.db,
     lost: lock.lost,
     async close() {
+      opened.loader = null;
       lake.close();
       await lock.client.end().catch(() => {});
     },
@@ -121,7 +126,14 @@ async function openForIntake(): Promise<IntakeLake> {
   } finally {
     await catalog.end().catch(() => {});
   }
-  return lake;
+  opened.intake = lake;
+  return {
+    db: lake.db,
+    close() {
+      opened.intake = null;
+      lake.close();
+    },
+  };
 }
 
 const metrics = createMetrics();
@@ -146,7 +158,10 @@ const server = createServer((request, response) => {
     return;
   }
   if (request.method === "GET" && request.url === "/metrics") {
-    response.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(metrics.render());
+    sampleMemory(metrics, opened).then(
+      () => response.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(metrics.render()),
+      (error: unknown) => response.writeHead(500, { "content-type": "text/plain" }).end(`${error instanceof Error ? error.message : String(error)}\n`),
+    );
     return;
   }
   response.writeHead(404).end();

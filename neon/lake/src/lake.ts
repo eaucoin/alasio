@@ -24,9 +24,11 @@ import { EXTENSIONS } from "./extensions.ts";
 export const LAKE = "lake";
 export const SOURCE = "source";
 
-/** The lake, open: a DuckDB connection, and how to close it. */
+/** The lake, open: a DuckDB connection, how much memory its DuckDB holds, and how to close it. */
 export interface Lake {
   db: DuckDBConnection;
+  /** The bytes the DuckDB's buffer manager holds now, asked on a connection of its own, so it never waits on `db`'s work. */
+  memory(): Promise<number>;
   close(): void;
 }
 
@@ -59,7 +61,7 @@ export function conninfo(database: string): string {
 /**
  * Opens the lake. `readOnly` attaches it read-only, for queries; `source` also
  * attaches alasio's database of that name read-only, for loading; `memoryLimit` replaces the
- * configuration's. Returns `{ db, close }`, `db` a DuckDB connection.
+ * configuration's. Returns `{ db, memory, close }`, `db` a DuckDB connection.
  */
 export async function openLake(config: LakeAccess, { readOnly = false, source, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
   const options: Record<string, string> = {
@@ -74,10 +76,14 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
   }
   const instance = await DuckDBInstance.create(":memory:", options);
   const db = await instance.connect();
+  const meter = await instance.connect();
   const close = () => {
+    meter.closeSync();
     db.closeSync();
     instance.closeSync();
   };
+  // A sum is one row.
+  const memory = async () => Number((await rows<{ bytes: bigint }>(meter, "select coalesce(sum(memory_usage_bytes), 0) as bytes from duckdb_memory()"))[0]!.bytes);
   try {
     for (const extension of Object.keys(EXTENSIONS)) {
       if (!config.extensionDirectory) await db.run(`install ${extension}`);
@@ -104,7 +110,7 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
           (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
       )
     );
-    return { db, close };
+    return { db, memory, close };
   } catch (error) {
     close();
     throw error;

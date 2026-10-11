@@ -760,7 +760,7 @@
       "gridPos": {
         "x": 0,
         "y": 36,
-        "w": 24,
+        "w": 16,
         "h": 8
       },
       "description": "Each table of the lake, its Parquet files and their size. Rows not yet flushed to a file are in the catalog, and counted in rows only.",
@@ -850,6 +850,86 @@
       "options": {
         "showHeader": true,
         "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "The lake's memory",
+      "gridPos": {
+        "x": 16,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "description": "The memory the lake service holds, which its container's memory limit counts, and of it what V8's heap and each of its DuckDBs, the loader's and the intake's, hold.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time,\ncase MetricName when 'lake_resident_memory_bytes' then 'resident' when 'lake_heap_used_bytes' then 'V8 heap' else 'DuckDB, ' || Attributes['duckdb'] end as memory, max(Value) as bytes\nfrom otel.metrics_gauge where ServiceName = 'lake' and MetricName in ('lake_resident_memory_bytes', 'lake_heap_used_bytes', 'lake_duckdb_memory_bytes')\nand TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "memory",
+              "text": "memory",
+              "type": "string"
+            },
+            {
+              "selector": "bytes",
+              "text": "bytes",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "displayName": "${__field.labels.memory}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     }
   ]

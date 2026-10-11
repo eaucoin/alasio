@@ -24,7 +24,7 @@ import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { startIntake } from "../neon/lake/src/intake.ts";
 import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
-import { createMetrics } from "../neon/lake/src/metrics.ts";
+import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
 import { ensureOtel, flushTelemetry, mergeTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
 import type { LogsRequest, MetricsRequest } from "../neon/lake/src/otlp.ts";
@@ -940,6 +940,24 @@ describe("the lake", () => {
       const said = JSON.stringify(await rows(lake.db, "select (select list(path) from duckdb_databases()) as paths, (select list(secret_string) from duckdb_secrets()) as secrets"));
       assert.match(said, /dbname='lake'/u);
       assert.ok(!said.includes(LAKE_PASSWORD));
+    } finally {
+      lake.close();
+    }
+  });
+
+  test("the lake reports the memory its process holds, and each of its DuckDBs, 0 for one not open", async () => {
+    const lake = await openLake(config);
+    try {
+      await ensureOtel(lake.db);
+      // Staged in the DuckDB's memory first.
+      await writeTelemetry(lake.db, telemetryRows("logs", logRequest("metered", NOW)));
+      const metrics = createMetrics();
+      await sampleMemory(metrics, { loader: lake, intake: null });
+      const text = metrics.render();
+      assert.match(text, /^lake_resident_memory_bytes [1-9]\d*$/mu);
+      assert.match(text, /^lake_heap_used_bytes [1-9]\d*$/mu);
+      assert.match(text, /^lake_duckdb_memory_bytes\{duckdb="loader"\} [1-9]\d*$/mu);
+      assert.match(text, /^lake_duckdb_memory_bytes\{duckdb="intake"\} 0$/mu);
     } finally {
       lake.close();
     }

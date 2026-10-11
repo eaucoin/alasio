@@ -1,7 +1,7 @@
 /**
  * The lake's own metrics, in Prometheus's text format, for the stack's telemetry
  * collector to scrape (cli/src/manifests/collector.ts): how its loads, its maintenance
- * and its telemetry intake go, and how much each changed.
+ * and its telemetry intake go, how much each changed, and the memory the process holds.
  */
 
 interface Metric {
@@ -17,6 +17,9 @@ const METRICS = {
   lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome, and whether they deleted files or kept them for Neon's branches" },
   lake_telemetry_requests_total: { type: "counter", help: "OTLP requests the telemetry intake took, by signal and outcome" },
   lake_telemetry_rows_total: { type: "counter", help: "Rows the telemetry intake wrote, by table" },
+  lake_resident_memory_bytes: { type: "gauge", help: "The process's resident memory, what its container's memory limit counts" },
+  lake_heap_used_bytes: { type: "gauge", help: "What V8's heap holds" },
+  lake_duckdb_memory_bytes: { type: "gauge", help: "What the buffer manager of each of its DuckDBs, the loader's and the intake's, holds; 0 while it is not open" },
 } satisfies Record<string, Metric>;
 
 export type MetricName = keyof typeof METRICS;
@@ -62,4 +65,22 @@ export function createMetrics(): Metrics {
       ]).join("\n") + "\n";
     },
   };
+}
+
+/** A DuckDB whose memory is reported: the lake as openLake opened it (./lake.ts). */
+export interface MeteredDuckDB {
+  memory(): Promise<number>;
+}
+
+/**
+ * Sets the memory gauges: the process's resident memory and V8 heap, and the memory each
+ * of `duckdbs` holds, by name, 0 for one not open. Run before each scrape is answered.
+ */
+export async function sampleMemory(metrics: Pick<Metrics, "set">, duckdbs: Readonly<Record<string, MeteredDuckDB | null>>): Promise<void> {
+  const { rss, heapUsed } = process.memoryUsage();
+  metrics.set("lake_resident_memory_bytes", {}, rss);
+  metrics.set("lake_heap_used_bytes", {}, heapUsed);
+  for (const [duckdb, open] of Object.entries(duckdbs)) {
+    metrics.set("lake_duckdb_memory_bytes", { duckdb }, open ? await open.memory() : 0);
+  }
 }
