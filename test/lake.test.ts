@@ -687,6 +687,17 @@ describe("the lake", () => {
     }
   });
 
+  test("a lake built before its transcripts' row groups were bounded, model version 1, is rebuilt", async () => {
+    const lake = await openLake(config, { source: config.source });
+    try {
+      await prepareLake(lake.db, { rebuild: true });
+      await lake.db.run(`update ${LAKE}.loader.meta set value = '1' where key = 'model_version'`);
+      assert.equal(await prepareLake(lake.db), true);
+    } finally {
+      lake.close();
+    }
+  });
+
   test("maintenance runs and is recorded, and the loader loop loads, maintains, and stops", async () => {
     await withLake(async (db) => {
       const metrics = createMetrics();

@@ -27,8 +27,12 @@ export interface RebuildOptions {
   rebuild?: boolean;
 }
 
-/** Bumped whenever a table changes shape; the lake then rebuilds from its source. */
-export const MODEL_VERSION = 1;
+/**
+ * Bumped whenever a table changes shape, or its files are to be written again; the lake
+ * then rebuilds from its source. 2: the stack's transcripts, written in row groups of
+ * 122 880 rows, are written in ROW_GROUP_ROWS-row groups.
+ */
+export const MODEL_VERSION = 2;
 
 const TABLES = {
   "claude.entries": `
