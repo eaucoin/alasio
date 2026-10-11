@@ -32,33 +32,48 @@ const SOURCE_TABLE = `${SOURCE}.claude_sessions.entries`;
 /** Entries loaded per transaction, which bounds a batch's memory. */
 export const BATCH_ENTRIES = 1000;
 
-const usage = (field: string) => `try_cast(entry->'message'->'usage'->>'${field}' as BIGINT)`;
+// Each entry, and each content block, is parsed once, its fields taken in one call:
+// DuckDB keeps what each JSON function parses until a whole vector of rows is done, so
+// a field taken a call at a time parses the entry again for each, and a batch of 1000
+// entries of 11 kB (11 MB) took more than the loader's gigabyte.
+const ENTRY_FIELDS = [
+  "type", "timestamp", "parentUuid", "logicalParentUuid", "isSidechain", "isMeta", "userType", "entrypoint",
+  "cwd", "gitBranch", "version", "agentId", "promptId", "requestId",
+  "message.id", "message.role", "message.model", "message.stop_reason",
+  "message.usage.input_tokens", "message.usage.output_tokens",
+  "message.usage.cache_read_input_tokens", "message.usage.cache_creation_input_tokens",
+  "message.usage.output_tokens_details.thinking_tokens", "message.usage.service_tier",
+];
+
+/** The fields of the JSON `json` names that `fields` name, as text, a list in their order, from one parse. */
+const fieldsOf = (json: string, fields: readonly string[]) => `json_extract_string(${json}, [${fields.map((field) => `'$.${field}'`).join(", ")}])`;
+
+/** The field `name` of ENTRY_FIELDS, as text, from the list fieldsOf took. */
+const field = (name: string) => `field[${ENTRY_FIELDS.indexOf(name) + 1}]`;
 
 const INSERT_ENTRIES = `
   insert into ${LAKE}.claude.entries
   select seq, project_key, session_id, subpath, uuid, make_timestamptz(mtime * 1000),
-    entry->>'type', try_cast(entry->>'timestamp' as TIMESTAMPTZ),
-    entry->>'parentUuid', entry->>'logicalParentUuid',
-    try_cast(entry->>'isSidechain' as BOOLEAN), try_cast(entry->>'isMeta' as BOOLEAN),
-    entry->>'userType', entry->>'entrypoint', entry->>'cwd', entry->>'gitBranch', entry->>'version',
-    entry->>'agentId', entry->>'promptId', entry->>'requestId',
-    entry->'message'->>'id', entry->'message'->>'role', entry->'message'->>'model', entry->'message'->>'stop_reason',
-    ${usage("input_tokens")}, ${usage("output_tokens")},
-    ${usage("cache_read_input_tokens")}, ${usage("cache_creation_input_tokens")},
-    try_cast(entry->'message'->'usage'->'output_tokens_details'->>'thinking_tokens' as BIGINT),
-    entry->'message'->'usage'->>'service_tier',
+    ${field("type")}, try_cast(${field("timestamp")} as TIMESTAMPTZ),
+    ${field("parentUuid")}, ${field("logicalParentUuid")},
+    try_cast(${field("isSidechain")} as BOOLEAN), try_cast(${field("isMeta")} as BOOLEAN),
+    ${["userType", "entrypoint", "cwd", "gitBranch", "version", "agentId", "promptId", "requestId"].map(field).join(", ")},
+    ${["message.id", "message.role", "message.model", "message.stop_reason"].map(field).join(", ")},
+    ${["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens_details.thinking_tokens"]
+      .map((name) => `try_cast(${field(`message.usage.${name}`)} as BIGINT)`).join(", ")},
+    ${field("message.usage.service_tier")},
     entry, malformed
-  from claude_batch`;
+  from (select *, ${fieldsOf("entry", ENTRY_FIELDS)} as field from claude_batch)`;
 
 // A message's content is a string (a typed prompt) or a list of blocks; a string is
 // one text block. A tool result's content is a string or a list of blocks of its own.
 const INSERT_BLOCKS = `
   insert into ${LAKE}.claude.content_blocks
   with messages as (
-    select seq, session_id, subpath, try_cast(entry->>'timestamp' as TIMESTAMPTZ) as occurred_at,
-      entry->'message'->>'role' as role, entry->'message'->'content' as content
-    from claude_batch
-    where entry->>'type' in ('user', 'assistant')
+    select seq, session_id, subpath, try_cast(field[2]->>'$' as TIMESTAMPTZ) as occurred_at,
+      field[3]->>'$' as role, field[4] as content
+    from (select *, json_extract(entry, ['$.type', '$.timestamp', '$.message.role', '$.message.content']) as field from claude_batch)
+    where field[1]->>'$' in ('user', 'assistant')
   ),
   listed as (
     select *, case json_type(content)
@@ -72,21 +87,26 @@ const INSERT_BLOCKS = `
       unnest(range(len(blocks)))::INTEGER as block_index, unnest(blocks) as block
     from listed
     where blocks is not null
+  ),
+  parts as (
+    select *, ${fieldsOf("block", ["type", "text", "thinking", "content", "id", "tool_use_id", "name", "is_error"])} as part,
+      json_extract(block, ['$.content', '$.input']) as nested
+    from blocks
   )
-  select seq, session_id, subpath, occurred_at, block_index, role, block->>'type',
-    case block->>'type'
-      when 'text' then length(block->>'text')
-      when 'thinking' then length(block->>'thinking')
-      when 'tool_result' then case json_type(block->'content')
-        when 'VARCHAR' then length(block->>'content')
-        when 'ARRAY' then list_sum([coalesce(length(part->>'text'), 0) for part in from_json(block->'content', '["json"]')])
+  select seq, session_id, subpath, occurred_at, block_index, role, part[1],
+    case part[1]
+      when 'text' then length(part[2])
+      when 'thinking' then length(part[3])
+      when 'tool_result' then case json_type(nested[1])
+        when 'VARCHAR' then length(part[4])
+        when 'ARRAY' then list_sum([coalesce(length(item->>'text'), 0) for item in from_json(nested[1], '["json"]')])
       end
     end,
-    case block->>'type' when 'tool_use' then block->>'id' when 'tool_result' then block->>'tool_use_id' end,
-    case block->>'type' when 'tool_use' then block->>'name' end,
-    case block->>'type' when 'tool_use' then block->'input' end,
-    case block->>'type' when 'tool_result' then coalesce(try_cast(block->>'is_error' as BOOLEAN), false) end
-  from blocks`;
+    case part[1] when 'tool_use' then part[5] when 'tool_result' then part[6] end,
+    case part[1] when 'tool_use' then part[7] end,
+    case part[1] when 'tool_use' then nested[2] end,
+    case part[1] when 'tool_result' then coalesce(try_cast(part[8] as BOOLEAN), false) end
+  from parts`;
 
 /**
  * Brings the lake's entries in line with the source's. `beforeCommit`, for tests,

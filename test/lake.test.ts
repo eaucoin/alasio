@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -91,9 +91,9 @@ after(async () => {
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
 });
 
-/** Opens the lake with a fresh, empty model, and closes it after `fn`. */
-async function withLake<T>(fn: (db: DuckDBConnection) => Promise<T>): Promise<T> {
-  const lake = await openLake(config, { source: config.source });
+/** Opens the lake with a fresh, empty model, and DuckDB's `memoryLimit` where given, and closes it after `fn`. */
+async function withLake<T>(fn: (db: DuckDBConnection) => Promise<T>, { memoryLimit }: { memoryLimit?: string } = {}): Promise<T> {
+  const lake = await openLake(config, { source: config.source, ...(memoryLimit ? { memoryLimit } : {}) });
   try {
     await prepareLake(lake.db, { rebuild: true });
     return await fn(lake.db);
@@ -291,6 +291,25 @@ describe("Claude Code transcripts", () => {
       const total = counted.n;
       assert.deepEqual(await syncClaude(db, { batchEntries: 3 }), { inserted: total - 3, deleted: 0 });
     });
+  });
+
+  test("a batch of large entries loads within a memory limit that parsing each field apart would exceed", async () => {
+    // A batch of 1000 entries of 4 kB, 4 MB: with each entry parsed once, DuckDB loads it in
+    // 256 MB; parsed again for each field, it ran out of that.
+    const long = { ...KEY, sessionId: "22222222-2222-4222-8222-222222222222" };
+    await store.append(long, Array.from({ length: 1000 }, (_, index) => ({
+      type: "assistant", uuid: `long-${index}`, timestamp: at(index % 60),
+      message: { id: `msg_long_${index}`, role: "assistant", model: "claude-opus-5-5", content: [{ type: "text", text: randomBytes(2000).toString("hex") }], usage: { output_tokens: index } },
+    })));
+    try {
+      await withLake(async (db) => {
+        await syncClaude(db);
+        const { n } = await one<Count>(db, `select count(*) as n from ${LAKE}.claude.content_blocks where session_id = '${long.sessionId}' and text_chars = 4000`);
+        assert.equal(n, 1000n);
+      }, { memoryLimit: "256MB" });
+    } finally {
+      await store.delete(long);
+    }
   });
 });
 
