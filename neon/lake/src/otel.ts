@@ -148,8 +148,20 @@ export type TelemetryRows = Partial<Record<OtelTable, TelemetryRow[]>>;
 export const INLINED_ROWS = 1000;
 
 /**
+ * The size up to which the `otel` tables' files are merged, the lake's (TARGET_FILE_SIZE
+ * in ./sync.ts) being for transcripts: a file this large is left as it is, so the
+ * intake's hourly merge takes the files written since, not the whole day's again. At the
+ * lake's 64 MB, a day's file of points (some 1.5 million, 14 MB, on the stack) was
+ * rewritten every hour: measured on a day of the stack's sum points, the merge took
+ * 0.6 s and 170 MB at 02:00, 4.8 s and 350 MB at 22:00; with this, 0.4-0.5 s and some
+ * 180 MB at any hour, a day's points in a dozen files.
+ */
+export const TELEMETRY_FILE_SIZE = "1MB";
+
+/**
  * Makes the `otel` schema's tables where they are missing, each partitioned by its
- * day, and sets how many rows of an insert into each it inlines.
+ * day, and sets how many rows of an insert into each it inlines, and the size up to
+ * which their files are merged.
  */
 export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await transaction(db, async () => {
@@ -168,6 +180,7 @@ export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await serially(async () => {
     for (const [table, { inlined }] of Object.entries(TABLES)) {
       await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', ${inlined ? INLINED_ROWS : 0}, schema => 'otel', table_name => '${table}')`);
+      await db.run(`call ${LAKE}.set_option('target_file_size', '${TELEMETRY_FILE_SIZE}', schema => 'otel', table_name => '${table}')`);
     }
   });
 }
@@ -477,9 +490,9 @@ export function flushTelemetry(db: DuckDBConnection): Promise<unknown> {
 }
 
 /**
- * Merges each `otel` table's small files, a day's into one: the collector's minute-long
- * batches of metric points make a file a kind a minute, some ten thousand a day, which a
- * query of the day reads one by one. Measured on the stack, a 24-hour query of a gauge
+ * Merges each `otel` table's small files, a day's into files of up to TELEMETRY_FILE_SIZE:
+ * the collector's minute-long batches of metric points make a file a kind a minute, some
+ * ten thousand a day, which a query of the day reads one by one. Measured on the stack, a 24-hour query of a gauge
  * over 2 500 such files took 8.8 s cold, 1.1 s once they were merged, in 8 s. The files
  * merged are only scheduled for deletion, which maintenance's cleanup does (./sync.ts),
  * so a branch that still names them keeps them.

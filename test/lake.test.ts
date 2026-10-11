@@ -26,7 +26,7 @@ import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/la
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
-import { ensureOtel, flushTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
+import { ensureOtel, flushTelemetry, mergeTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
 import type { LogsRequest, MetricsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
@@ -568,6 +568,28 @@ describe("telemetry", () => {
       server.close();
       await intake.stop();
     }
+  });
+
+  test("the telemetry's merges leave a file already as large as they merge files to, and merge what came since", async () => {
+    await withLake(async (db) => {
+      const { value } = await one<{ value: string }>(db, `select value from ducklake_options('${LAKE}') where option_name = 'target_file_size' and scope_entry = 'otel.metrics_gauge'`);
+      const target = BigInt(value);
+      // A day of its own, as the hours of points the intake merged before come to make.
+      const start = NOW - 5n * DAY;
+      const day = new Date(Number(start / 1_000_000n));
+      const partition = `year=${day.getUTCFullYear()}/month=${day.getUTCMonth() + 1}/day=${day.getUTCDate()}/`;
+      const files = async () => rows<{ data_file: string; size: bigint }>(db, `select data_file, data_file_size_bytes as size from ducklake_list_files('${LAKE}', 'metrics_gauge', schema => 'otel') where contains(data_file, '${partition}')`);
+      await db.run(`insert into ${LAKE}.otel.metrics_gauge by name
+        select 'merged' as ServiceName, md5(i::VARCHAR) as MetricName, make_timestamp_ns(${start} + i) as TimeUnix, i::DOUBLE as Value
+        from range(${target / 10n}) t(i)`);
+      for (const offset of [0n, 1n, 2n]) await writeTelemetry(db, telemetryRows("metrics", gaugeRequest("merged", start + offset)));
+      const large = (await files()).filter(({ size }) => size >= target).map(({ data_file }) => data_file);
+      assert.ok(large.length > 0);
+      await mergeTelemetry(db);
+      const after = await files();
+      assert.deepEqual(after.filter(({ data_file }) => large.includes(data_file)).map(({ data_file }) => data_file).sort(), large.sort());
+      assert.equal(after.length, large.length + 1);
+    });
   });
 
   test("the intake answers 503 while it cannot open the lake, so the collector sends again", async () => {
