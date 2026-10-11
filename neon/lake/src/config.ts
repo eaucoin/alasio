@@ -74,8 +74,8 @@ export interface LakeAccess {
 }
 
 export interface LakeConfig extends LakeAccess {
-  /** alasio's database, which the lake loads from. */
-  source: DatabaseConfig;
+  /** alasio's database, which the lake loads from: on the catalog's server, read as the catalog's role. */
+  source: string;
   intervalMs: number;
   /** Null for a lake that is never maintained. */
   maintenanceIntervalMs: number | null;
@@ -151,7 +151,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
   const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
   return {
     ...lake,
-    source: { ...lake.catalog, database: optional(env, "LAKE_SOURCE_DATABASE", "alasio") },
+    source: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
     intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
     maintenanceIntervalMs: maintenanceHours === null ? null : maintenanceHours * 3_600_000,
     branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,

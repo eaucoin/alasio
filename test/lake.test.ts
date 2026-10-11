@@ -894,6 +894,35 @@ describe("the lake", () => {
     });
   });
 
+  test("a connection that fails is logged with where it was going, never with the password, which no query can read either", async () => {
+    // Nothing listens on port 1.
+    const unreachable = { ...config, catalog: { ...config.catalog, port: 1 } };
+    const logs: string[] = [];
+    const loader = startLoader({
+      open: async () => {
+        const lake = await openLake(unreachable, { source: unreachable.source });
+        return { db: lake.db, close: async () => lake.close(), lost: () => false };
+      },
+      metrics: createMetrics(),
+      log: (message, fields) => logs.push(JSON.stringify({ message, ...fields })),
+      intervalMs: 60_000,
+      maintenanceIntervalMs: null,
+      retentionDays: 30,
+    });
+    for (let waited = 0; logs.length === 0 && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+    await loader.stop();
+    assert.match(logs.join("\n"), /"load failed".*dbname='alasio'.*port 1 failed/u);
+    assert.ok(!logs.join("\n").includes(LAKE_PASSWORD));
+    const lake = await openLake(config, { source: config.source });
+    try {
+      const said = JSON.stringify(await rows(lake.db, "select (select list(path) from duckdb_databases()) as paths, (select list(secret_string) from duckdb_secrets()) as secrets"));
+      assert.match(said, /dbname='lake'/u);
+      assert.ok(!said.includes(LAKE_PASSWORD));
+    } finally {
+      lake.close();
+    }
+  });
+
   test("the lake opened read-only refuses writes", async () => {
     const lake = await openLake(readerConfig, { readOnly: true });
     try {
@@ -1204,7 +1233,7 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadConfig(base), /LAKE_S3_ENDPOINT is not set/);
   assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", LAKE_INTERVAL_SECONDS: "soon" }), /LAKE_INTERVAL_SECONDS must be a positive number/);
   const config = loadConfig({ ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_S3_KEY: "k", LAKE_S3_SECRET: "s" });
-  assert.deepEqual([config.source.database, config.catalog.database, config.source.user, config.intervalMs], ["alasio", "lake", "lake", 300_000]);
+  assert.deepEqual([config.source, config.catalog.database, config.catalog.user, config.intervalMs], ["alasio", "lake", "lake", 300_000]);
   // The query endpoint has the reader's credentials alone.
   const reader = { ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_READER_PASSWORD: "r", LAKE_READER_S3_KEY: "rk", LAKE_READER_S3_SECRET: "rs" };
   assert.throws(() => loadEndpointConfig(reader), /LAKE_QUERY_TOKEN is not set/);

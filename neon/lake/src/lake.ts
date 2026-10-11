@@ -17,7 +17,7 @@ import { join } from "node:path";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 
-import type { DatabaseConfig, LakeAccess } from "./config.ts";
+import type { LakeAccess } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
@@ -33,8 +33,8 @@ export interface Lake {
 export interface OpenLakeOptions {
   /** Attach the lake read-only, for queries. */
   readOnly?: boolean;
-  /** alasio's database, to attach too, read-only, for loading. */
-  source?: DatabaseConfig;
+  /** alasio's database, on the catalog's server, to attach too, read-only and as the catalog's role, for loading. */
+  source?: string;
   /** DuckDB's memory limit, when not the configuration's. */
   memoryLimit?: string;
 }
@@ -47,21 +47,18 @@ export function literal(value: string): string {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-/** A libpq connection string for `database` (`{ host, port, user, password, database }`). */
-export function conninfo({ host, port, user, password, database }: DatabaseConfig): string {
-  const quote = (value: string | number) => `'${String(value).replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
-  return [
-    `host=${quote(host)}`,
-    `port=${quote(port)}`,
-    `dbname=${quote(database)}`,
-    `user=${quote(user)}`,
-    `password=${quote(password)}`,
-  ].join(" ");
+/**
+ * A libpq connection string naming `database` alone: the server, the role and its
+ * password come from the DuckDB's Postgres secret (openLake), so nothing DuckDB says of a
+ * connection, which quotes this, carries the password into a log.
+ */
+export function conninfo(database: string): string {
+  return `dbname='${database.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
 }
 
 /**
  * Opens the lake. `readOnly` attaches it read-only, for queries; `source` also
- * attaches alasio's database read-only, for loading; `memoryLimit` replaces the
+ * attaches alasio's database of that name read-only, for loading; `memoryLimit` replaces the
  * configuration's. Returns `{ db, close }`, `db` a DuckDB connection.
  */
 export async function openLake(config: LakeAccess, { readOnly = false, source, memoryLimit = config.memoryLimit }: OpenLakeOptions = {}): Promise<Lake> {
@@ -93,13 +90,17 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
         endpoint ${literal(endpoint.host)}, use_ssl ${endpoint.protocol === "https:"},
         url_style 'path', region 'us-east-1')`);
     }
+    // Where every attach of Postgres connects, and as whom.
+    const { host, port, user, password } = config.catalog;
+    await db.run(`create temporary secret (
+      type postgres, host ${literal(host)}, port ${port}, user ${literal(user)}, password ${literal(password)})`);
     if (source) {
       await db.run(`attach ${literal(conninfo(source))} as ${SOURCE} (type postgres, read_only)`);
     }
     // Serially, as the lake's first attach writes its catalog.
     await serially(() =>
       db.run(
-        `attach ${literal(`ducklake:postgres:${conninfo(config.catalog)}`)} as ${LAKE}
+        `attach ${literal(`ducklake:postgres:${conninfo(config.catalog.database)}`)} as ${LAKE}
           (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
       )
     );
