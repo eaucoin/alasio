@@ -25,7 +25,7 @@ import { startIntake } from "../neon/lake/src/intake.ts";
 import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics } from "../neon/lake/src/metrics.ts";
-import { lakeModelVersion, MODEL_VERSION } from "../neon/lake/src/model.ts";
+import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
 import { ensureOtel, flushTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
 import type { LogsRequest, MetricsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
@@ -695,6 +695,19 @@ describe("the lake", () => {
       const after = await files();
       assert.deepEqual(after.filter(({ data_file }) => large.includes(data_file)).map(({ data_file }) => data_file).sort(), large.sort());
       assert.equal(after.length, large.length + 1);
+    });
+  });
+
+  test("transcripts and rollouts are written in row groups of ROW_GROUP_ROWS rows", async () => {
+    await withLake(async (db) => {
+      await db.run(`insert into ${LAKE}.claude.entries (seq) select i from range(${ROW_GROUP_ROWS + 1}) t(i)`);
+      await db.run(`insert into ${LAKE}.codex.lines (line_number) select i from range(${ROW_GROUP_ROWS + 1}) t(i)`);
+      for (const [schema, table] of [["claude", "entries"], ["codex", "lines"]] as const) {
+        const [file, ...others] = await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', '${table}', schema => '${schema}')`);
+        assert.ok(file && others.length === 0);
+        const groups = await rows<{ n: bigint }>(db, `select distinct row_group_id, row_group_num_rows as n from parquet_metadata('${file.data_file}') order by row_group_id`);
+        assert.deepEqual(groups.map(({ n }) => n), [BigInt(ROW_GROUP_ROWS), 1n], `${schema}.${table}`);
+      }
     });
   });
 

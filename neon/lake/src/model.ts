@@ -20,7 +20,7 @@
  */
 import type { DuckDBConnection } from "@duckdb/node-api";
 
-import { LAKE, rows, transaction } from "./lake.ts";
+import { LAKE, rows, serially, transaction } from "./lake.ts";
 
 export interface RebuildOptions {
   /** Drop the lake whatever its model version, to be loaded again from its source. */
@@ -127,6 +127,15 @@ const VIEWS = {
 
 const SCHEMAS = ["claude", "codex", "loader"];
 
+/**
+ * The rows of a Parquet row group of the transcripts' and rollouts' tables. DuckDB holds
+ * a whole row group in memory to write it, or to read a column of it, and its own size,
+ * 122 880 rows, suits narrow rows: at the few kilobytes of JSON an entry or a line
+ * carries, it is hundreds of megabytes (370 MB on the stack). This is some 30 MB, and a
+ * multiple of DuckDB's vector of 2048 rows, which it rounds a row group's size up to.
+ */
+export const ROW_GROUP_ROWS = 10_240;
+
 async function create(db: DuckDBConnection): Promise<void> {
   for (const schema of SCHEMAS) await db.run(`create schema if not exists ${LAKE}.${schema}`);
   for (const [table, columns] of Object.entries(TABLES)) {
@@ -154,9 +163,10 @@ export async function lakeModelVersion(db: DuckDBConnection): Promise<number | n
 }
 
 /**
- * Makes the lake's tables and views. A lake built with another model version is
- * dropped first, to be loaded again from its source; `rebuild` drops it whatever its
- * version. Returns whether it was (re)built empty.
+ * Makes the lake's tables and views, the transcripts' and rollouts' written in row
+ * groups of ROW_GROUP_ROWS. A lake built with another model version is dropped first,
+ * to be loaded again from its source; `rebuild` drops it whatever its version. Returns
+ * whether it was (re)built empty.
  */
 export async function ensureModel(db: DuckDBConnection, { rebuild = false }: RebuildOptions = {}): Promise<boolean> {
   const rebuilt = rebuild || (await lakeModelVersion(db)) !== MODEL_VERSION;
@@ -165,6 +175,12 @@ export async function ensureModel(db: DuckDBConnection, { rebuild = false }: Reb
     await drop(db);
     await create(db);
     await db.run(`insert into ${LAKE}.loader.meta values ('model_version', '${MODEL_VERSION}')`);
+  });
+  // Once the schemas are committed: DuckLake sets no option of a schema made in the same transaction.
+  await serially(async () => {
+    for (const schema of ["claude", "codex"]) {
+      await db.run(`call ${LAKE}.set_option('parquet_row_group_size', ${ROW_GROUP_ROWS}, schema => '${schema}')`);
+    }
   });
   return rebuilt;
 }
