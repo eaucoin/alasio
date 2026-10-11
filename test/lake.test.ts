@@ -436,6 +436,24 @@ describe("Codex rollouts", () => {
     });
   });
 
+  test("a file of large lines loads within a memory limit that parsing each field apart would exceed", async () => {
+    // 4000 lines of 4 kB, 16 MB, one transaction: with each line parsed once, DuckDB loads
+    // it in 256 MB; parsed again for each field, it ran out of that.
+    const name = "rollout-2026-10-01T12-00-00-thread-long.jsonl";
+    const lines = Array.from({ length: 4000 }, (_, ordinal) =>
+      line({ timestamp: at(ordinal % 60), ordinal, type: "response_item", payload: { type: "function_call_output", turn_id: TURN, output: randomBytes(2000).toString("hex") } })
+    );
+    await saveRollout(name, Buffer.from(lines.join("")));
+    try {
+      await withLake(async (db) => {
+        assert.deepEqual(await syncCodex(db), { files: 1, inserted: 4000, deleted: 0 });
+        assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.codex.lines where turn_id = '${TURN}' and payload_type = 'function_call_output'`)).n, 4000n);
+      }, { memoryLimit: "256MB" });
+    } finally {
+      await admin.query("delete from codex_sessions.rollouts where name = $1", [name]);
+    }
+  });
+
   test("the session-filesystem home is loaded beside the folder one, once the lake may read it", async () => {
     const sessionFs = new NeonRolloutStore(admin, { schema: SESSION_FS_SCHEMA });
     await sessionFs.ensureSchema();

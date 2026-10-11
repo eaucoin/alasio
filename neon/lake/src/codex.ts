@@ -68,19 +68,22 @@ export const HOMES: readonly CodexHome[] = [
 
 const NEWLINE = 0x0a;
 
+// Each line is parsed once, its fields taken in one call, as a transcript entry is
+// (./claude.ts): DuckDB keeps what each JSON function parses until a vector of rows is done.
 const INSERT_LINES = `
   insert into ${LAKE}.codex.lines
   select $1, $2, $3, $4, line_number, byte_offset,
-    try_cast(record->>'timestamp' as TIMESTAMPTZ), try_cast(record->>'ordinal' as BIGINT),
-    record->>'type', record->'payload'->>'type',
-    coalesce(record->'payload'->>'turn_id', record->'payload'->'internal_chat_message_metadata_passthrough'->>'turn_id'),
+    try_cast(field[1] as TIMESTAMPTZ), try_cast(field[2] as BIGINT), field[3], field[4], coalesce(field[5], field[6]),
     record, malformed
   from (
-    select line_number, byte_offset,
-      -- A line that is not JSON is kept as a JSON string, so the whole file is still there.
-      case when json_valid(text) then text::JSON else to_json(text) end as record,
-      not json_valid(text) as malformed
-    from codex_batch)`;
+    select *, json_extract_string(record, ['$.timestamp', '$.ordinal', '$.type', '$.payload.type', '$.payload.turn_id',
+      '$.payload.internal_chat_message_metadata_passthrough.turn_id']) as field
+    from (
+      select line_number, byte_offset,
+        -- A line that is not JSON is kept as a JSON string, so the whole file is still there.
+        case when json_valid(text) then text::JSON else to_json(text) end as record,
+        not json_valid(text) as malformed
+      from codex_batch))`;
 
 async function sourceHas(db: DuckDBConnection, schema: string): Promise<boolean> {
   const found = await rows(
