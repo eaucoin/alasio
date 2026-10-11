@@ -131,6 +131,12 @@ function server(config: InstallConfig): KubernetesObject[] {
                 `-volume.max=${bundled.volumes}`,
                 "-master.volumeSizeLimitMB=1024",
                 "-master.defaultReplication=000",
+                // Its master compacts a volume once a tenth of it is deleted, not a third
+                // as by default: Neon's objects all expire within days, so every volume
+                // comes to hold deleted ones, and the store would keep up to a third of
+                // its disk dead. A compaction copies the volume's live rest, at about half
+                // a gigabyte a second.
+                "-master.garbageThreshold=0.1",
                 "-master.telemetry=false",
                 `-volume.minFreeSpace=${bundled.minFreeSpace}`,
                 "-filer",

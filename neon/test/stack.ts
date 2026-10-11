@@ -250,6 +250,18 @@ interface ServedComputeConfig {
   [field: string]: unknown;
 }
 
+/** A volume of the object store's, as its master's /vol/status answers it, as far as this test reads it. */
+interface Volume {
+  readonly Collection: string;
+  readonly CompactRevision: number;
+  readonly DeletedByteCount: number;
+}
+
+/** What the object store's master answers at /vol/status: its volumes by data center, rack and server. */
+interface VolumeStatus {
+  readonly Volumes: { readonly DataCenters: Record<string, Record<string, Record<string, Volume[]>>> };
+}
+
 /** A branch as neon-control's API answers it. */
 type Listed = BranchView;
 
@@ -410,6 +422,35 @@ export function neonStack(): void {
         });
         assert.ok(rule("expire-noncurrent-wal"));
         assert.ok(rule("expire-noncurrent"));
+      });
+
+      test("the object store compacts a volume once a tenth of it is deleted", async () => {
+        const store = `${componentName("seaweedfs")}-0`;
+        const bucket = `vacuum-${Date.now()}`;
+        const s3 = (script: string) => kube.execOk(NAMESPACE, store, ["/bin/sh", "-c", `set -e; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
+        const master = (path: string) => kube.execOk(NAMESPACE, store, ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "seaweedfs" });
+        const volumes = async () => {
+          const status: VolumeStatus = JSON.parse(await master("/vol/status"));
+          return Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.values(nodes)).flat()
+            .filter(({ Collection }) => Collection === bucket);
+        };
+        // A bucket of its own, so a volume of its own: ten equal objects, two of them deleted.
+        await s3(`aws s3api --endpoint-url http://127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; head -c 1048576 /dev/urandom >/tmp/object; for n in 0 1 2 3 4 5 6 7 8 9; do s3 cp --quiet /tmp/object s3://${bucket}/$n; done; rm /tmp/object; s3 rm --quiet s3://${bucket}/0; s3 rm --quiet s3://${bucket}/1`);
+        try {
+          const deadline = Date.now() + 600_000;
+          let last: readonly Volume[] = [];
+          while (Date.now() < deadline) {
+            last = await volumes();
+            if (last.some(({ CompactRevision }) => CompactRevision > 0) && last.every(({ DeletedByteCount }) => DeletedByteCount === 0)) return;
+            // Once the deletions have reached the volume, a pass at the master's own
+            // threshold; while another runs, the call returns at once.
+            if (last.some(({ DeletedByteCount }) => DeletedByteCount > 0)) await master("/vol/vacuum");
+            await sleep(5000);
+          }
+          assert.fail(`the bucket's volumes were not compacted: ${JSON.stringify(last)}`);
+        } finally {
+          await s3(`s3 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+        }
       });
 
       test("backs alasio's database up to the object store, as a dump any Postgres restores", async () => {

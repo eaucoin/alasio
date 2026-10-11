@@ -378,6 +378,10 @@ describe("neon", () => {
     assert.ok(container(seaweedfs).args?.includes("-volume.max=40"));
   });
 
+  test("reclaims a volume's deleted space once it is a tenth of the volume", () => {
+    assert.ok(container(one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs")).args?.includes("-master.garbageThreshold=0.1"));
+  });
+
   test("applies the object store's lifecycle rules every hour, reading the filer's log to now, each pass done before the next", () => {
     const pass = one<V1CronJob>(install(), "CronJob", "alasio-seaweedfs-lifecycle").spec;
     assert.equal(pass?.schedule, "41 * * * *");
