@@ -394,6 +394,24 @@ export function neonStack(): void {
         }
       });
 
+      test("the object store holds Neon's bucket to its lifecycle rules, the safekeepers' full WAL segments expiring after three days", async () => {
+        const answered: { Rules: { ID: string }[] } = JSON.parse(await kube.execOk(
+          NAMESPACE,
+          `${componentName("seaweedfs")}-0`,
+          ["aws", "s3api", "--endpoint-url", "http://127.0.0.1:8333", "get-bucket-lifecycle-configuration", "--bucket", "neon"],
+          { container: "lifecycle" },
+        ));
+        const rule = (id: string) => answered.Rules.find(({ ID }) => ID === id);
+        assert.deepEqual(rule("expire-wal"), {
+          ID: "expire-wal",
+          Status: "Enabled",
+          Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: 16 * 1024 * 1024 - 1 } },
+          Expiration: { Days: 3 },
+        });
+        assert.ok(rule("expire-noncurrent-wal"));
+        assert.ok(rule("expire-noncurrent"));
+      });
+
       test("backs alasio's database up to the object store, as a dump any Postgres restores", async () => {
         const name = `backup-${Date.now()}`;
         const backup = await kube.get<V1CronJob>(ref("CronJob", neonName("backup"), NAMESPACE));

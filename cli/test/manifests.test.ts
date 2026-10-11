@@ -390,9 +390,22 @@ describe("neon", () => {
     const lifecycle = one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
     const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
     assert.ok(rules);
-    const expiries = (JSON.parse(rules) as { Rules: { Filter: { Prefix: string }; NoncurrentVersionExpiration: { NoncurrentDays: number } }[] }).Rules
-      .map(({ Filter, NoncurrentVersionExpiration }) => [Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]);
+    const expiries = (JSON.parse(rules) as { Rules: { Filter: { Prefix?: string }; NoncurrentVersionExpiration?: { NoncurrentDays: number } }[] }).Rules
+      .flatMap(({ Filter, NoncurrentVersionExpiration }) => (NoncurrentVersionExpiration ? [[Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]] : []));
     assert.deepEqual(expiries, [["pageserver/", 2], ["safekeeper/", 1]]);
+  });
+
+  test("expires the safekeepers' full WAL segments a day after the pageserver's objects can no longer be put back, not the segments they write", () => {
+    const lifecycle = one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+    const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
+    assert.ok(rules);
+    const expiring = (JSON.parse(rules) as { Rules: { Filter: unknown; Expiration?: unknown }[] }).Rules.filter(({ Expiration }) => Expiration);
+    assert.deepEqual(expiring, [{
+      ID: "expire-wal",
+      Status: "Enabled",
+      Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: 16 * 1024 * 1024 - 1 } },
+      Expiration: { Days: 3 },
+    }]);
   });
 
   test("uses the operator's object store and makes no SeaweedFS when told", () => {

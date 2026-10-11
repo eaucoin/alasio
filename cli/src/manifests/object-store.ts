@@ -28,12 +28,34 @@ const PORTS = [
 const PEER_PORTS = PORTS.filter(({ name }) => /^(master|volume|filer)/u.test(name));
 
 /**
- * The lifecycle rules of Neon's bucket: old versions of the pageserver's objects expire
- * a day past the history Neon keeps (HISTORY_DAYS) after they are replaced, so its
- * time-travel recovery can put the bucket back as it was at any moment of that history,
- * with a day more to notice a deletion that should not have been; the safekeepers' after
+ * The days back to which Neon's time-travel recovery can put the pageserver's objects:
+ * the history Neon keeps (HISTORY_DAYS), and a day more to notice a deletion that should
+ * not have been.
+ */
+const RESTORABLE_DAYS = HISTORY_DAYS + 1;
+
+/** The size of each of the safekeepers' full WAL segments, Postgres's own. */
+const WAL_SEGMENT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The lifecycle rules of Neon's bucket. Old versions of the pageserver's objects expire
+ * RESTORABLE_DAYS after they are replaced, so its time-travel recovery can put the bucket
+ * back as it was at any moment of those days. The safekeepers' old versions expire after
  * a day, the least S3 allows, since each re-uploads the segment it writes, whole, as it
  * grows.
+ *
+ * Neon deletes none of a timeline's full WAL segments while it lives, so they expire a
+ * day past RESTORABLE_DAYS. The safekeepers serve from them what they no longer hold on
+ * their volumes: to a pageserver put back as it was up to RESTORABLE_DAYS ago, which
+ * ingests again from what it had uploaded by then, and to a safekeeper that was away,
+ * from where it stopped (one away for longer is rebuilt from its peers once its volume
+ * is deleted). Otherwise the pageserver resumes from what it uploaded minutes ago, which
+ * the safekeepers keep on their volumes until it has. The segment each safekeeper writes
+ * is smaller than a full one, so it is not expired, however long it goes unchanged: a
+ * safekeeper rebuilt from its peers copies it.
+ *
+ * An operator's store (objectStore.external) is given none of this: its operator gives
+ * Neon's bucket these rules.
  */
 const LIFECYCLE = {
   Rules: [
@@ -41,7 +63,7 @@ const LIFECYCLE = {
       ID: "expire-noncurrent",
       Status: "Enabled",
       Filter: { Prefix: "pageserver/" },
-      NoncurrentVersionExpiration: { NoncurrentDays: HISTORY_DAYS + 1 },
+      NoncurrentVersionExpiration: { NoncurrentDays: RESTORABLE_DAYS },
       AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
     },
     {
@@ -50,6 +72,12 @@ const LIFECYCLE = {
       Filter: { Prefix: "safekeeper/" },
       NoncurrentVersionExpiration: { NoncurrentDays: 1 },
       AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+    },
+    {
+      ID: "expire-wal",
+      Status: "Enabled",
+      Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: WAL_SEGMENT_BYTES - 1 } },
+      Expiration: { Days: RESTORABLE_DAYS + 1 },
     },
   ],
 };
