@@ -105,6 +105,8 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.branches, "fork-key"), root.branchForkKey);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /control_plane_api='http:\/\/q-neon-storage-controller:1234\/upcall\/v1\/'/u);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
+  // It evicts layers only once the node's disk, which it shares, is nearly full: at 94 % used or under 8 GiB free.
+  assert.match(value(kube, names.pageserver, "pageserver.toml"), /^disk_usage_based_eviction=\{ max_usage_pct=94, min_avail_bytes=8589934592 \}$/mu);
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));

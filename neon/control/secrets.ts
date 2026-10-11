@@ -159,9 +159,23 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
 }
 
 /**
+ * When the pageserver evicts layers from its disk, which it downloads again when read:
+ * only once the node's disk is nearly full. It measures the whole filesystem its volume
+ * is on, which for a volume on the node's own disk is shared with everything else there.
+ * Neon's default, at 80 % used or under 2 GB free, had it evict every layer it could each
+ * minute, each a minute after downloading it again, while the stack's disk sat at 86 %
+ * for other reasons: 6 to 52 GiB an hour through the object store, whose memory it took
+ * past its limit. At 94 % used or under 8 GiB free it evicts just before the floors below
+ * which the disk is defended harder: kubelet evicts pods under 5 % free
+ * (cli/src/cluster/k3s.ts), and the bundled SeaweedFS stops writing under its
+ * minFreeSpace, 5 GiB by default.
+ */
+const LAYER_EVICTION = { maxUsagePct: 94, minAvailBytes: 8 * 1024 ** 3 };
+
+/**
  * The pageserver's configuration: where the broker and the storage controller are, its
- * remote storage, and the token it calls the controller with. Its key is read from
- * `publicKeyPath`.
+ * remote storage, the token it calls the controller with, and when it evicts layers
+ * (LAYER_EVICTION). Its key is read from `publicKeyPath`.
  */
 export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath, storage }: PageserverConfig): string {
   return [
@@ -176,6 +190,7 @@ export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath,
     `pg_auth_type='NeonJWT'`,
     `auth_validation_public_key_path=${toml(publicKeyPath)}`,
     `remote_storage=${storage}`,
+    `disk_usage_based_eviction={ max_usage_pct=${LAYER_EVICTION.maxUsagePct}, min_avail_bytes=${LAYER_EVICTION.minAvailBytes} }`,
     "",
   ].join("\n");
 }
