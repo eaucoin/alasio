@@ -23,12 +23,20 @@ export interface LakeLoad {
 export const SNAPSHOT_RETENTION = "7 days";
 /** How long a file no snapshot needs any longer is kept before it is deleted. */
 export const FILE_RETENTION = "1 day";
+/**
+ * The size up to which maintenance merges a table's files: one this large is left as it
+ * is, so a pass merges what was written since the last, not the whole table again.
+ * DuckLake's own, 512 MB, made it rewrite every transcript entry each night: on the
+ * stack, 160 000 of them in a 213 MB file, which took the lake's container past its
+ * memory limit (1536 MiB) once it had run for a few hours.
+ */
+export const TARGET_FILE_SIZE = "64MB";
 
 /**
  * Makes the lake ready to load and maintain: its model, rebuilt empty where it is
  * another version's (or `rebuild` asks), the telemetry's schema, which is never
- * rebuilt, and how long it keeps what it no longer needs. Returns whether the model was
- * rebuilt.
+ * rebuilt, how long it keeps what it no longer needs, and how large the files are that
+ * it merges. Returns whether the model was rebuilt.
  */
 export async function prepareLake(db: DuckDBConnection, { rebuild = false }: RebuildOptions = {}): Promise<boolean> {
   const rebuilt = await ensureModel(db, { rebuild });
@@ -36,6 +44,7 @@ export async function prepareLake(db: DuckDBConnection, { rebuild = false }: Reb
   await transaction(db, async () => {
     await db.run(`call ${LAKE}.set_option('expire_older_than', ${literal(SNAPSHOT_RETENTION)})`);
     await db.run(`call ${LAKE}.set_option('delete_older_than', ${literal(FILE_RETENTION)})`);
+    await db.run(`call ${LAKE}.set_option('target_file_size', ${literal(TARGET_FILE_SIZE)})`);
   });
   return rebuilt;
 }

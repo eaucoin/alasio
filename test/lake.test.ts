@@ -676,6 +676,28 @@ describe("the lake", () => {
     });
   });
 
+  test("maintenance merges the files written since its last pass, and leaves one already as large as it merges files to", async () => {
+    await withLake(async (db) => {
+      const { value } = await one<{ value: string }>(db, `select value from ducklake_options('${LAKE}') where option_name = 'target_file_size' and scope = 'GLOBAL'`);
+      const target = BigInt(value);
+      // Entries of 7 kB that hardly compress, as many as make a file past the target, as
+      // a table's history comes to be; then a day's loads, each a small file.
+      const entries = (from: number, count: number) =>
+        db.run(`insert into ${LAKE}.claude.entries (seq, entry)
+          select i, to_json(array_to_string(list_transform(range(220), x -> md5((i * 220 + x)::VARCHAR)), ''))
+          from range(${from}, ${from + count}) t(i)`);
+      await entries(0, Number(target / 7000n) + 1000);
+      for (const [from, count] of [[1_000_000, 30], [1_000_100, 40], [1_000_200, 50]] as const) await entries(from, count);
+      const files = async () => rows<{ data_file: string; size: bigint }>(db, `select data_file, data_file_size_bytes as size from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`);
+      const large = (await files()).filter(({ size }) => size >= target).map(({ data_file }) => data_file);
+      assert.ok(large.length > 0);
+      await maintainLake(db, { retentionDays: 30, keepFiles: false });
+      const after = await files();
+      assert.deepEqual(after.filter(({ data_file }) => large.includes(data_file)).map(({ data_file }) => data_file).sort(), large.sort());
+      assert.equal(after.length, large.length + 1);
+    });
+  });
+
   test("while Neon has branches the loader's maintenance deletes no file, nor when it cannot learn them; a branch's lake is never maintained", async () => {
     await withLake(async (db) => {
       const metrics = createMetrics();
