@@ -499,6 +499,10 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     sessions: {
       storage: { size: "1Gi" },
       resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: "1Gi" } },
+      // Never released within the run: its suites reach sessions by exec in their pods, which is
+      // no exec of bayma's, and a release would end their pods under them. 6.0.0 releases none,
+      // and has no such setting.
+      ...(of === "release" ? { snapshots: { releaseAfter: "24h" } } : {}),
       ...on("agent-0"),
     },
     neon: {
