@@ -153,7 +153,7 @@ const Alasio = Schema.Struct({
   claude: defaulted(Schema.Struct({ existingSecret: defaulted(OptionalSecretName, ""), key: defaulted(NonEmpty, "token") }), {}),
   env: Env,
   envFrom: defaulted(Schema.Array(object<V1EnvFromSource>()), []),
-  resources: Resources({ requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "8Gi" } }),
+  resources: Resources({ requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "8Gi" } }),
   /** Whom alasio runs as, unless the host profile says. */
   runAsUser: defaulted(Id, 1000),
   runAsGroup: defaulted(Id, 1000),
@@ -245,7 +245,7 @@ const Host = Schema.Struct({
   /** Whether alasio's home is the operator's rather than its volume. */
   alasioHome: defaulted(Schema.Boolean, true),
   env: Env,
-  resources: Resources({ requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "8Gi" } }),
+  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "8Gi" } }),
 });
 
 /** A service of Neon's with a volume. */
@@ -282,16 +282,16 @@ const Neon = Schema.Struct({
       /** How many safekeepers hold each timeline's WAL: a count, which neon-control registers them by. */
       scaling: Scaling({ min: 3, max: 3 }, { floor: true, scaled: false, most: 7 }),
       storage: Storage("20Gi"),
-      resources: Resources({ requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "1Gi" } }),
+      resources: Resources({ requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "1Gi" } }),
     }),
     {},
   ),
-  pageserver: NeonStored("50Gi", { requests: { cpu: "250m", memory: "512Mi" }, limits: { memory: "4Gi" } }),
-  storageController: NeonService({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
-  storageBroker: NeonService({ requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "256Mi" } }),
-  controllerDb: NeonStored("2Gi", { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
-  control: NeonStored("100Mi", { requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "256Mi" } }),
-  compute: NeonService({ requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "4Gi" } }),
+  pageserver: NeonStored("50Gi", { requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "4Gi" } }),
+  storageController: NeonService({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
+  storageBroker: NeonService({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
+  controllerDb: NeonStored("2Gi", { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
+  control: NeonStored("100Mi", { requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }),
+  compute: NeonService({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of
    * JuiceFS's newest dump of workspace storage's metadata beside it; of each, the last
@@ -324,7 +324,7 @@ const ObjectStore = Schema.Struct({
       volumes: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(30, { message: "must be at least 30" })), 100),
       /** The disk it leaves free. */
       minFreeSpace: defaulted(matching(/^[0-9]+(KiB|MiB|GiB|TiB)$/u, "must be a size in KiB, MiB, GiB or TiB"), "5GiB"),
-      resources: Resources({ requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "2Gi" } }),
+      resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "2Gi" } }),
     }),
     {},
   ),
@@ -454,7 +454,7 @@ const AgentSandbox = Schema.Struct({
     }),
     {},
   ),
-  resources: Resources({ requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "256Mi" } }),
+  resources: Resources({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
   nodeSelector: NodeSelector,
   tolerations: Tolerations,
   affinity: Affinity,
@@ -504,7 +504,7 @@ const InstallStruct = Schema.Struct({
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
-      query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "192Mi" }, limits: { memory: "1Gi" } }) }), {}),
+      query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
     }),
     {},
   ),

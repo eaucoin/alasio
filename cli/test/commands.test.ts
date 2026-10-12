@@ -914,7 +914,7 @@ test("branch list says each branch, what it is a branch of, its age, its alasio,
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const listed = await alasio(["branch", "list"]);
   succeeded(listed);
-  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, its alasio ready, 2.5 GiB requested, 0 MiB used"]);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, its alasio ready, 1.6 GiB requested, 0 MiB used"]);
 });
 
 test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces", async (t) => {
@@ -967,7 +967,7 @@ test("a branch's configuration is main's with its overrides, and never the host 
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch"), "--overrides", join(home, "overrides.json")]));
   const container = (kube.get(BRANCH_DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string; value?: string }[]; resources: { requests: Record<string, string> } }[]; volumes: { name: string }[] } } }).template.spec;
   assert.equal(container.containers[0]?.env.find(({ name }) => name === "ALASIO_DEFAULT_HARNESS")?.value, "codex");
-  assert.deepEqual(container.containers[0]?.resources.requests, { cpu: "500m", memory: "512Mi" });
+  assert.deepEqual(container.containers[0]?.resources.requests, { cpu: "250m", memory: "512Mi" });
   const templates = JSON.parse((kube.get("/api/v1/namespaces/alasio-branch-try/configmaps/alasio-sandbox-templates")?.["data"] as Record<string, string>)["templates.json"] ?? "");
   assert.equal(templates.host, undefined);
   // The pull Secrets of its images, in its own namespace.

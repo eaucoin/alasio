@@ -156,13 +156,13 @@ describe("configuration", () => {
     assert.equal(config.host.enabled, false);
     assert.deepEqual(config.neon.safekeepers.scaling, { min: 3, max: 3 });
     assert.equal(config.neon.image.digest, "sha256:166022a72bf9983eba96d061d794f4740edbd4c3301e66202c1180acce9a323c");
-    assert.deepEqual(config.alasio.resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "8Gi" } });
+    assert.deepEqual(config.alasio.resources, { requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "8Gi" } });
   });
 
   test("adds the quantities given to the defaults", () => {
     const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" }, resources: { limits: { cpu: 2, memory: "4Gi" } } } });
     assert.ok(Result.isSuccess(decoded));
-    assert.deepEqual(decoded.success.alasio.resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "4Gi", cpu: "2" } });
+    assert.deepEqual(decoded.success.alasio.resources, { requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "4Gi", cpu: "2" } });
   });
 
   test("refuses what alasio does not install from, saying which key", () => {
