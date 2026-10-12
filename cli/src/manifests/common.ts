@@ -153,6 +153,14 @@ export function sandboxSnapshots(config: InstallConfig): boolean {
   return config.sessions.enabled && config.sessions.runtimeClassName !== "";
 }
 
+/**
+ * Whether the node agents run (./node-agent.ts): where sandboxes are snapshotted, and
+ * Neon's setup makes the Secrets they run with, their bucket's and their token.
+ */
+export function nodeAgentRuns(config: InstallConfig): boolean {
+  return sandboxSnapshots(config) && config.neon.enabled;
+}
+
 /** The port the collector takes OTLP over HTTP on. */
 export const COLLECTOR_PORT = 4318;
 

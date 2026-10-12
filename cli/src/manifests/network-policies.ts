@@ -1,14 +1,15 @@
 /**
  * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
- * object store's parts and its filer store, the telemetry collector, Grafana and workspace
- * storage, which need a cluster that enforces NetworkPolicy, as session filesystems do; and
- * branch environments' (./branch.ts), whose namespaces main's policies admit by the label
- * each has, to what they share alone.
+ * object store's parts and its filer store, the telemetry collector, Grafana, workspace
+ * storage and the node agents, which need a cluster that enforces NetworkPolicy, as
+ * session filesystems do; and branch environments' (./branch.ts), whose namespaces main's
+ * policies admit by the label each has, to what they share alone.
  */
-import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
+import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
 import { COMPUTE_PORT } from "../../../neon/control/branches.ts";
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
+import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
 import {
   BRANCH_LABEL,
@@ -21,6 +22,7 @@ import {
   labels,
   MAIN_ENVIRONMENT,
   NAMESPACE,
+  nodeAgentRuns,
   RELEASE,
   selectorLabels,
 } from "./common.ts";
@@ -68,6 +70,15 @@ const BRANCH_NAMESPACES = { matchExpressions: [{ key: BRANCH_LABEL, operator: "E
 
 /** The labels of the data stack's pods, which its policy admits each other by. */
 const STACK = { "app.kubernetes.io/instance": RELEASE, "alasio.dev/stack": "neon" };
+
+/** The node agents' pods, as a peer. */
+const NODE_AGENT = { podSelector: { matchLabels: selectorLabels("node-agent") } };
+
+/** The cluster's DNS, as an egress rule. */
+const CLUSTER_DNS: V1NetworkPolicyEgressRule = {
+  to: [{ namespaceSelector: namespaceNamed("kube-system"), podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
+  ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
+};
 
 /** A NetworkPolicy of `name` in `namespace`, labelled as `component`'s. */
 function policy(name: string, namespace: string, component: string, spec: NetworkPolicySpec): NetworkPolicy {
@@ -286,18 +297,20 @@ function filerStorePolicies(): NetworkPolicy[] {
 }
 
 /**
- * The telemetry collector takes OTLP from alasio and folder workspaces' bayma, beside the
- * stack's own pods (neonPolicies), and from branch environments' alasio, compute and
- * lake, and from nothing else: sessions' telemetry reaches it through their alasio's
- * receiver alone.
+ * The telemetry collector takes OTLP from alasio, the node agents and folder workspaces'
+ * bayma, beside the stack's own pods (neonPolicies), and from branch environments'
+ * alasio, compute and lake, and from nothing else: sessions' telemetry reaches it through
+ * their alasio's receiver alone.
  */
-function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
+function collectorPolicy(config: InstallConfig): NetworkPolicy {
+  const { host } = config;
   return policy(componentName("collector"), NAMESPACE, "collector", {
     podSelector: { matchLabels: selectorLabels("collector") },
     policyTypes: ["Ingress"],
     ingress: [{
       from: [
         { podSelector: { matchLabels: selectorLabels("alasio") } },
+        ...(nodeAgentRuns(config) ? [NODE_AGENT] : []),
         ...(host.enabled ? [{ namespaceSelector: namespaceNamed(host.namespace) }] : []),
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } },
@@ -331,10 +344,7 @@ function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): Net
       ...(gossip.length > 0 ? { ingress: [{ from: [grafana], ports: gossip }] } : {}),
       egress: [
         ...(gossip.length > 0 ? [{ to: [grafana], ports: gossip }] : []),
-        {
-          to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
-          ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
-        },
+        CLUSTER_DNS,
         { to: [{ podSelector: { matchLabels: selectorLabels("neon-proxy") } }], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
         { to: [{ podSelector: { matchLabels: selectorLabels("lake") } }], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] },
         // The addresses sessions with internet may not reach, the cluster's and its network's, are Grafana's too.
@@ -343,6 +353,40 @@ function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): Net
     }),
     admitted("neon-proxy", PROXY_PORT),
     admitted("lake", LAKE_QUERY_PORT),
+  ];
+}
+
+/**
+ * The node agents take alasio's calls, on their API's port, and nothing else; they reach
+ * the cluster's DNS, the object store's S3 port, the bundled one's or the operator's at
+ * any address, and the collector where it runs, and nothing else. The bundled object
+ * store admits them.
+ */
+function nodeAgentPolicies(config: InstallConfig): NetworkPolicy[] {
+  const { bundled, external } = config.objectStore;
+  const seaweedfs = { podSelector: { matchLabels: selectorLabels("seaweedfs") } };
+  const endpoint = bundled.enabled ? null : new URL(external.endpoint);
+  const objectStore: V1NetworkPolicyEgressRule = endpoint
+    ? { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: Number(endpoint.port) || (endpoint.protocol === "https:" ? 443 : 80) }] }
+    : { to: [seaweedfs], ports: [{ protocol: "TCP", port: 8333 }] };
+  return [
+    policy(componentName("node-agent"), NAMESPACE, "node-agent", {
+      ...NODE_AGENT,
+      policyTypes: ["Ingress", "Egress"],
+      ingress: [{ from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] }],
+      egress: [
+        CLUSTER_DNS,
+        objectStore,
+        ...(collectorRuns(config) ? [{ to: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }] : []),
+      ],
+    }),
+    ...(bundled.enabled
+      ? [policy(componentName("seaweedfs-snapshots"), NAMESPACE, "seaweedfs", {
+        ...seaweedfs,
+        policyTypes: ["Ingress"],
+        ingress: [{ from: [NODE_AGENT], ports: [{ protocol: "TCP", port: 8333 }] }],
+      })]
+      : []),
   ];
 }
 
@@ -397,5 +441,6 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
+    ...(nodeAgentRuns(config) ? nodeAgentPolicies(config) : []),
   ];
 }

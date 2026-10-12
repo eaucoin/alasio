@@ -38,6 +38,7 @@ import {
   labels,
   MAIN_ENVIRONMENT,
   NAMESPACE,
+  nodeAgentRuns,
   ONE,
   otelEnv,
   RELEASE,
@@ -452,8 +453,9 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * files from sessions through exec, in the namespaces it owns, labelling their pods busy
  * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
  * it forks sessions, reads sessions' volume claims and runs the Jobs that clone them in its
- * own; and, where it installs JuiceFS's driver, lists and deletes pods in the driver's
- * namespace, its mount pods; and nothing else.
+ * own; where the node agents run, watches pods in its own, theirs among them; and, where
+ * it installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its
+ * mount pods; and nothing else.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const main = environment.branch === null;
@@ -477,7 +479,8 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     kind: "Role",
     metadata: inOwnNamespace,
     rules: [
-      { apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] },
+      // Its own pod's busy label; and each node's agent, found by its pod on the node.
+      { apiGroups: [""], resources: ["pods"], verbs: main && nodeAgentRuns(config) ? ["list", "watch", "patch"] : ["list", "patch"] },
       ...(main && sessionsForked(config) ? [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }] : []),
     ],
   };

@@ -1,0 +1,122 @@
+/**
+ * The node agent (src/node-agent/): one pod on every node sessions run on, which takes
+ * whole-sandbox snapshots of their sandboxes and prepares them for restores there, kept
+ * in the object store's snapshots bucket. It runs where sandboxes are snapshotted
+ * (common.ts nodeAgentRuns).
+ *
+ * It is the one component that runs runsc on a node, beside containerd's shims, as they
+ * run it, so it runs as the node does: privileged, as root, in the node's PID namespace
+ * (runsc finds a sandbox's processes by their PIDs there), with the node's paths at the
+ * same paths, as runsc and the shims open them, an image's among them: the runsc root
+ * and the systemd bus under /run, the gVisor releases and the runtimes' options files,
+ * read-only, and the snapshot cache. Pod Security admits it in alasio's namespace, which
+ * enforces no level of its own, as Kubernetes admits a privileged pod in a namespace by
+ * default; a cluster whose admission defaults otherwise must exempt it.
+ *
+ * Its bucket and the identity it is reached as are the Secret Neon's setup makes for it
+ * (neon/control/kube-setup.ts), taken whole as its environment, and the token alasio
+ * presents, the Secret both are given.
+ */
+import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
+
+import {
+  CONTAINERD,
+  GVISOR_RELEASES,
+  NODE_AGENT_PORT,
+  NODE_AGENT_TOKEN_VARIABLE,
+  SNAPSHOT_CACHE_BYTES_VARIABLE,
+  SNAPSHOT_CACHE_DIR,
+} from "../../../src/node-agent/names.ts";
+import { imageReference } from "../images.ts";
+import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRuns, otelEnv, selectorLabels } from "./common.ts";
+import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
+
+/** The Secret of the snapshots bucket, its endpoint, region and name and the agents' keys to it. */
+const SNAPSHOTS_SECRET = componentName("snapshots");
+/** The Secret of the token alasio presents to the node agents, under `token`. */
+const NODE_AGENT_SECRET = componentName("node-agent");
+
+/** The node's paths the agent has at the same paths: each one's volume, what must be there, and whether the agent only reads it. */
+const HOST_PATHS: readonly { readonly name: string; readonly path: string; readonly type: string; readonly readOnly?: true }[] = [
+  // The shims' runsc root (/run/containerd/runsc) and, where systemd runs the node, its bus.
+  { name: "run", path: "/run", type: "Directory" },
+  { name: "gvisor", path: GVISOR_RELEASES, type: "DirectoryOrCreate", readOnly: true },
+  { name: "containerd", path: CONTAINERD, type: "DirectoryOrCreate", readOnly: true },
+  { name: "snapshots", path: SNAPSHOT_CACHE_DIR, type: "DirectoryOrCreate" },
+];
+
+/** What each suffix of a size multiplies it by, as Kubernetes counts a quantity. */
+const SIZE_UNITS: Readonly<Record<string, number>> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15 };
+
+/** The bytes of a size as the configuration takes one (5Gi, 1.5G, 500000). */
+function sizeBytes(size: string): number {
+  // A size, as the configuration checks it (config.ts Size).
+  const [, amount = "0", unit = ""] = /^([0-9.]+)([A-Za-z]*)$/u.exec(size) ?? [];
+  return Math.floor(Number(amount) * (SIZE_UNITS[unit] ?? 1));
+}
+
+/** The node agents' DaemonSet. */
+function daemonSet(config: InstallConfig): V1DaemonSet {
+  const { sessions } = config;
+  const volumes: V1Volume[] = HOST_PATHS.map(({ name, path, type }) => ({ name, hostPath: { path, type } }));
+  const volumeMounts: V1VolumeMount[] = HOST_PATHS.map(({ name, path, readOnly }) => ({
+    name,
+    mountPath: path,
+    ...(readOnly ? { readOnly } : {}),
+    // What is mounted under the node's /run after the agent starts is the agent's too.
+    ...(name === "run" ? { mountPropagation: "HostToContainer" } : {}),
+  }));
+  return {
+    apiVersion: "apps/v1",
+    kind: "DaemonSet",
+    metadata: { name: componentName("node-agent"), namespace: NAMESPACE, labels: labels("node-agent") },
+    spec: {
+      selector: { matchLabels: selectorLabels("node-agent") },
+      template: {
+        metadata: { labels: labels("node-agent") },
+        spec: {
+          // A restore waits on it, as a turn does.
+          ...priority("floor"),
+          hostPID: true,
+          // It speaks to nothing of the cluster's but alasio, which calls it.
+          automountServiceAccountToken: false,
+          enableServiceLinks: false,
+          ...imagePullSecrets(config),
+          ...given("nodeSelector", { ...sessions.nodeSelector }),
+          ...given("tolerations", [...sessions.tolerations]),
+          containers: [{
+            name: "node-agent",
+            image: imageReference(config.images.alasio),
+            imagePullPolicy: config.images.pullPolicy,
+            command: ["node", "/opt/alasio/src/node-agent/main.ts"],
+            env: [
+              { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
+              { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
+              { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
+              ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
+            ],
+            envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],
+            ports: [{ name: "api", containerPort: NODE_AGENT_PORT }],
+            readinessProbe: { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 },
+            securityContext: { privileged: true, runAsUser: 0 },
+            resources: sessions.snapshots.nodeAgent.resources,
+            volumeMounts,
+          }],
+          volumes,
+        },
+      },
+    },
+  };
+}
+
+/**
+ * The node agents, where they run, and their sizing: recommended, not applied in place, as
+ * a resize would restart an agent in the middle of a snapshot's upload.
+ */
+export function nodeAgentObjects(config: InstallConfig): KubernetesObject[] {
+  if (!nodeAgentRuns(config)) return [];
+  const agents = daemonSet(config);
+  return [agents, verticalPodAutoscaler(agents, "Recommended")];
+}

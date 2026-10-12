@@ -195,6 +195,19 @@ const Telemetry = Schema.Struct({
   ),
 });
 
+/**
+ * Sessions' whole-sandbox snapshots, taken where they run under gVisor
+ * (sessions.runtimeClassName), by the node agent on each node sessions run on.
+ */
+const Snapshots = Schema.Struct({
+  /** How long a session's bayma runs no exec before its sandbox is snapshotted and its pod let go: a duration such as 5m. */
+  releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
+  /** The most of snapshots each node keeps on its disk, for restores there. */
+  nodeCache: defaulted(Size, "5Gi"),
+  /** The node agent, which takes snapshots on its node and prepares them there. */
+  nodeAgent: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "512Mi" } }) }), {}),
+});
+
 const Sessions = Schema.Struct({
   enabled: defaulted(Schema.Boolean, true),
   namespace: defaulted(Namespace, "alasio-sessions"),
@@ -221,6 +234,7 @@ const Sessions = Schema.Struct({
   ),
   nodeSelector: NodeSelector,
   tolerations: Tolerations,
+  snapshots: defaulted(Snapshots, {}),
 });
 
 const Host = Schema.Struct({
