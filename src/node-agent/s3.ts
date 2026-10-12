@@ -2,8 +2,8 @@
  * The node agent's bucket: one bucket of an S3 API, reached by path-style URLs
  * (`<endpoint>/<bucket>/<key>`, as SeaweedFS serves them), every request signed with AWS
  * Signature Version 4 (sigV4Authorization). No SDK: the agent puts objects from files and
- * gets them into files, puts and reads small JSON objects, deletes objects, and lists
- * those under a prefix, and nothing else.
+ * gets them into files, puts and reads small JSON objects, copies objects within the
+ * bucket, deletes objects, and lists those under a prefix, and nothing else.
  */
 import { createHash, createHmac } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -74,6 +74,8 @@ export interface S3Bucket {
   readonly putJson: (key: string, value: unknown) => Effect.Effect<void, S3Error>;
   /** The object `key`, parsed as JSON, or null when there is none. */
   readonly getJson: (key: string) => Effect.Effect<unknown, S3Error>;
+  /** Copies the object `from` as the object `to`, in the bucket, none of its bytes through this client. */
+  readonly copy: (from: string, to: string) => Effect.Effect<void, S3Error>;
   /** Deletes the object `key`; one there is not is gone already. */
   readonly remove: (key: string) => Effect.Effect<void, S3Error>;
   /** The keys of every object under `prefix`. */
@@ -173,10 +175,12 @@ async function failureOf(response: IncomingMessage): Promise<string> {
   return [`${response.statusCode}`, code, message].filter(Boolean).join(" ");
 }
 
-/** What a request sends: its query, its headers beyond the signed ones, and its body. */
+/** What a request sends: its query, its headers, signed or not, and its body. */
 interface Sending {
   readonly query?: Readonly<Record<string, string>>;
   readonly headers?: Readonly<Record<string, string>>;
+  /** Headers it is signed with beyond `host` and its date and payload hash, by lower-case name: every `x-amz-*` one, as S3 requires. */
+  readonly signedHeaders?: Readonly<Record<string, string>>;
   /** A body in memory, signed; or a file, streamed and not signed. */
   readonly body?: { readonly bytes: Buffer } | { readonly file: string; readonly size: number };
 }
@@ -187,15 +191,14 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
   const send = endpoint.protocol === "https:" ? httpsRequest : httpRequest;
   const base = endpoint.pathname.replace(/\/+$/u, "");
 
-  /** The path of the object `key`, or of the bucket for null. */
-  const pathOf = (key: string | null): string =>
-    `${base}/${uriEncode(options.bucket)}${key === null ? "" : `/${key.split("/").map(uriEncode).join("/")}`}`;
+  /** The object `key` as `/<bucket>/<key>`, encoded, or the bucket for null: a request's path, after the endpoint's, and a copy's source. */
+  const inBucket = (key: string | null): string => `/${uriEncode(options.bucket)}${key === null ? "" : `/${key.split("/").map(uriEncode).join("/")}`}`;
 
   /** Sends a signed request, and answers its response once it begins. */
-  const call = async (method: string, key: string | null, { query = {}, headers = {}, body }: Sending, signal: AbortSignal): Promise<IncomingMessage> => {
+  const call = async (method: string, key: string | null, { query = {}, headers = {}, signedHeaders = {}, body }: Sending, signal: AbortSignal): Promise<IncomingMessage> => {
     const payloadHash = body === undefined ? sha256Hex("") : "bytes" in body ? sha256Hex(body.bytes) : UNSIGNED_PAYLOAD;
-    const signed = { host: endpoint.host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate(new Date()) };
-    const path = pathOf(key);
+    const signed = { ...signedHeaders, host: endpoint.host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate(new Date()) };
+    const path = `${base}${inBucket(key)}`;
     const authorization = sigV4Authorization({ method, path, query, headers: signed, payloadHash }, { region: options.region, service: "s3" }, options);
     const search = canonicalQuery(query);
     const length = body === undefined ? 0 : "bytes" in body ? body.bytes.length : body.size;
@@ -270,6 +273,11 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         } catch {
           throw new Error("it is not JSON");
         }
+      }),
+
+    copy: (from, to) =>
+      attempt("copy", `${from} to ${to}`, async (signal) => {
+        await bodyText(await succeeded(await call("PUT", to, { signedHeaders: { "x-amz-copy-source": inBucket(from) } }, signal)), 0);
       }),
 
     remove: (key) =>

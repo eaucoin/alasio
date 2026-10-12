@@ -1,9 +1,9 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
- * SeaweedFS does: PutObject, GetObject, DeleteObject and ListObjectsV2, every request's
- * Signature Version 4 checked against the credentials it is given, and a signed
- * payload's hash against the payload. What it was asked is recorded in order, and a
- * request can be made to fail.
+ * SeaweedFS does: PutObject, CopyObject, GetObject, DeleteObject and ListObjectsV2, every
+ * request's Signature Version 4 checked against the credentials it is given, with every
+ * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
+ * asked is recorded in order, and a request can be made to fail.
  */
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -16,7 +16,7 @@ export interface FakeS3 {
   readonly endpoint: string;
   /** The bucket's objects, by key. */
   readonly objects: Map<string, Buffer>;
-  /** What was asked, in order: `<METHOD> <key>`, the bucket's own requests as `<METHOD> ?<query>`. */
+  /** What was asked, in order: `<METHOD> <key>`, a copy's as `PUT <key> from <source>`, the bucket's own requests as `<METHOD> ?<query>`. */
   readonly requests: string[];
   /** Answers a request with the status it gives, as S3 would with an error, rather than doing it; null does it. */
   refuse: (method: string, key: string) => number | null;
@@ -64,6 +64,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       { accessKeyId, secretAccessKey },
     );
     if (authorization !== expected) return error(response, 403, "SignatureDoesNotMatch", "the signature is not the request's");
+    const unsigned = Object.keys(request.headers).find((name) => name.startsWith("x-amz-") && !(name in headers));
+    if (unsigned !== undefined) return error(response, 403, "AccessDenied", `the header ${unsigned} is not signed`);
     if (payloadHash !== UNSIGNED_PAYLOAD && payloadHash !== createHash("sha256").update(body).digest("hex")) {
       return error(response, 400, "XAmzContentSHA256Mismatch", "the payload is not the one signed");
     }
@@ -71,7 +73,11 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     const [, named, ...path] = url.pathname.split("/");
     if (named !== bucket) return error(response, 404, "NoSuchBucket", `there is no bucket ${named}`);
     const key = path.map(decodeURIComponent).join("/");
-    requests.push(key ? `${method} ${key}` : `${method} ?${url.searchParams}`);
+    const copySource = request.headers["x-amz-copy-source"];
+    const [, sourceBucket, ...sourcePath] = typeof copySource === "string" ? copySource.split("/") : [];
+    if (sourceBucket !== undefined && sourceBucket !== bucket) return error(response, 404, "NoSuchBucket", `there is no bucket ${sourceBucket}`);
+    const source = sourceBucket === undefined ? null : sourcePath.map(decodeURIComponent).join("/");
+    requests.push(!key ? `${method} ?${url.searchParams}` : source === null ? `${method} ${key}` : `${method} ${key} from ${source}`);
     const refused = fake.refuse(method, key);
     if (refused !== null) return error(response, refused, "InternalError", "refused, as the test asks");
     if (!key && method === "GET" && url.searchParams.get("list-type") === "2") {
@@ -85,6 +91,15 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         ...page.map((name) => `<Contents><Key>${escapeXml(name)}</Key><Size>${objects.get(name)?.length}</Size></Contents>`),
         `<IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${start + pageSize}</NextContinuationToken>` : ""}</ListBucketResult>`,
       ].join(""));
+      return;
+    }
+    if (method === "PUT" && source !== null) {
+      const object = objects.get(source);
+      if (!object) return error(response, 404, "NoSuchKey", "The specified key does not exist.");
+      objects.set(key, Buffer.from(object));
+      response.writeHead(200, { "content-type": "application/xml" }).end(
+        `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"${createHash("md5").update(object).digest("hex")}"</ETag></CopyObjectResult>`,
+      );
       return;
     }
     if (method === "PUT") {

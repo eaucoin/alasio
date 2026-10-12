@@ -51,7 +51,7 @@ test("requests are signed as AWS's Signature Version 4 test suite signs them", (
 
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
 
-test("the bucket takes files and JSON, gives them back, lists a prefix across pages, and deletes, every request signed", async () => {
+test("the bucket takes files and JSON, gives them back, copies them within itself, lists a prefix across pages, and deletes, every request signed", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, pageSize: 2 });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
@@ -67,6 +67,15 @@ test("the bucket takes files and JSON, gives them back, lists a prefix across pa
     const received = await run(bucket.getFile("main/fs-abc/s1/a page+1.img", join(directory, "copy.img")));
     assert.deepEqual(received, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
     assert.deepEqual(readFileSync(join(directory, "copy.img")), pages);
+
+    // Copied in the bucket, its source named as its path is, the request signed with it.
+    await run(bucket.copy("main/fs-abc/s1/a page+1.img", "main/fs-new/s1/a page+1.img"));
+    assert.deepEqual(s3.objects.get("main/fs-new/s1/a page+1.img"), pages);
+    assert.equal(s3.requests.at(-1), "PUT main/fs-new/s1/a page+1.img from main/fs-abc/s1/a page+1.img");
+    const uncopied = await Effect.runPromiseExit(bucket.copy("main/fs-abc/s9/none", "main/fs-new/s9/none"));
+    assert.ok(Exit.isFailure(uncopied));
+    assert.match(String(uncopied.cause), /the bucket's copy of main\/fs-abc\/s9\/none to main\/fs-new\/s9\/none failed: 404 NoSuchKey/u);
+    assert.equal(s3.objects.has("main/fs-new/s9/none"), false);
 
     await run(bucket.putJson("main/fs-abc/current.json", { snapshot: "s1" }));
     assert.deepEqual(await run(bucket.getJson("main/fs-abc/current.json")), { snapshot: "s1" });
