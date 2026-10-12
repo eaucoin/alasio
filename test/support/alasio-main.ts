@@ -16,7 +16,8 @@ import pg from "pg";
 
 import type { BranchEnvironment } from "../../src/config.ts";
 import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
-import { runAlasio, serveAlasio } from "../../src/alasio.ts";
+import { serveAlasio } from "../../src/alasio.ts";
+import { runAlasio } from "../../src/shared/run.ts";
 import { bridgedQueryFactory } from "./claude.ts";
 
 /** What the test runs alasio with. */

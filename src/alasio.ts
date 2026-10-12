@@ -1,10 +1,9 @@
 /**
- * alasio assembled: the services it runs on, the app serving Telegram over them, and the
- * process that runs it. src/main.ts runs it in production, test/support/alasio-main.ts
- * against the tests' stand-ins.
+ * alasio assembled: the services it runs on, and the app serving Telegram over them.
+ * src/main.ts runs it in production, as ./shared/run.ts runs a process,
+ * test/support/alasio-main.ts against the tests' stand-ins.
  */
-import { NodeRuntime } from "@effect/platform-node";
-import { Cause, Effect, Exit, Layer, Option, type Scope } from "effect";
+import { Effect, Layer, Option, type Scope } from "effect";
 import type { Pool } from "pg";
 
 import { parentForks, serveBranchForks } from "./branch/fork.ts";
@@ -25,9 +24,6 @@ import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
 import { type Inheritance, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
-import { AlasioLoggerLayer } from "./shared/log.ts";
-import { TracingLayer } from "./telemetry/index.ts";
-import { stopTelemetry } from "./telemetry/start.ts";
 import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
 import { Authorizer } from "./telegram/authorizer.ts";
 import { TelegramClient } from "./telegram/client.ts";
@@ -187,22 +183,3 @@ export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): 
   // Added last, so the first thing a stop does.
   yield* Effect.addFinalizer(() => Effect.logInfo("Shutting down..."));
 });
-
-/**
- * Exits once the telemetry is flushed: 0 when alasio was stopped, 1 when what it runs
- * failed.
- */
-function teardown<E, A>(exit: Exit.Exit<A, E>, onExit: (code: number) => void): void {
-  void stopTelemetry().finally(() => onExit(Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause) ? 1 : 0));
-}
-
-/**
- * Runs `program` as alasio's process: with alasio's logging and tracing, until it is told
- * to stop (SIGTERM, SIGINT), when what it acquired is released in reverse, or fails.
- */
-export function runAlasio<E>(program: Effect.Effect<void, E, Scope.Scope>): void {
-  Layer.launch(Layer.effectDiscard(program)).pipe(
-    Effect.provide([AlasioLoggerLayer, TracingLayer]),
-    NodeRuntime.runMain({ disableErrorReporting: true, teardown }),
-  );
-}

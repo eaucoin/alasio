@@ -12,8 +12,9 @@ import { sessionFsCodexHome } from "./codex/sessionfs.ts";
 import { indexTranscripts } from "./harness/claude/search/index.ts";
 import { loadKubeTemplates } from "./kube/config.ts";
 import { Neon } from "./neon/connect.ts";
-import { runAlasio, serveAlasio } from "./alasio.ts";
+import { serveAlasio } from "./alasio.ts";
 import { withLogScope } from "./shared/log.ts";
+import { runAlasio } from "./shared/run.ts";
 
 const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
