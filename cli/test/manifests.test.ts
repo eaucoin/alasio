@@ -339,6 +339,17 @@ describe("alasio", () => {
     assert.doesNotMatch(json, /"host":/u);
   });
 
+  test("renders sessions' pods never restarted, their /tmp a tmpfs of gVisor's own", () => {
+    const { podTemplate } = JSON.parse(templates(install())).sessions as SessionsProfile;
+    assert.equal(podTemplate.spec?.restartPolicy, "Never");
+    assert.deepEqual(podTemplate.metadata?.annotations, {
+      "dev.gvisor.spec.mount.tmp.share": "container",
+      "dev.gvisor.spec.mount.tmp.type": "tmpfs",
+      "dev.gvisor.spec.mount.tmp.options": "rw",
+    });
+    assert.deepEqual(podTemplate.spec?.volumes, [{ name: "tmp", emptyDir: { sizeLimit: "2Gi" } }]);
+  });
+
   test("renders sessions under the cluster's default runtime when asked", () => {
     assert.doesNotMatch(templates(install({ sessions: { runtimeClassName: "" } })), /runtimeClassName/u);
   });

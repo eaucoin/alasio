@@ -94,10 +94,19 @@ function sessionsProfile(config: InstallConfig, environment: Environment): Sessi
     fullModeNameservers: [...sessions.fullModeNameservers],
     ...(main && mountPodsRemoved(config) ? { mountPodNamespace: workspaceStorage.csi.namespace } : {}),
     podTemplate: {
-      metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" } },
+      metadata: {
+        labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" },
+        // Under gVisor, /tmp is a tmpfs of the sandbox's own, by gVisor's mount hints, rather
+        // than the emptyDir's directory on the node: a snapshot of the sandbox holds it, as it
+        // holds the files that bayma's runtimes keep open there.
+        annotations: { "dev.gvisor.spec.mount.tmp.share": "container", "dev.gvisor.spec.mount.tmp.type": "tmpfs", "dev.gvisor.spec.mount.tmp.options": "rw" },
+      },
       spec: {
         ...(sessions.runtimeClassName ? { runtimeClassName: sessions.runtimeClassName } : {}),
         ...priority("turn"),
+        // A pod that ends is ended: alasio brings the session up in a new one, and nothing
+        // starts bayma again in a sandbox that a snapshot has just ended.
+        restartPolicy: "Never",
         securityContext: { ...restrictedPod(1000, 1000), ...ownership },
         ...imagePullSecrets(config),
         ...given("nodeSelector", { ...sessions.nodeSelector }),
