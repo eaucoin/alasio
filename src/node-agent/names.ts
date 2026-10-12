@@ -27,5 +27,8 @@ export const gvisorLabel = (release: string): string => release.replaceAll(".", 
  */
 export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(release)}`;
 
+/** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
+export const runscVersion = (release: string): string => `release-${release}`;
+
 /** The node's snapshot cache, where its sandboxes are restored from. */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";

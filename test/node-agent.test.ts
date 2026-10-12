@@ -1,0 +1,365 @@
+/**
+ * The node agent (src/node-agent/): its checkpoints, committed to a stand-in bucket and
+ * forgotten when they fail, its prepared snapshots, and its cache, with runsc a stand-in
+ * of its own (./support/fake-runsc.ts).
+ */
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import { Effect, Exit, Fiber, type Scope } from "effect";
+
+import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent } from "../src/node-agent/agent.ts";
+import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
+import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
+import { makeS3Bucket } from "../src/node-agent/s3.ts";
+import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
+import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
+
+const RELEASE = "release-20260921.0-eaucoin.3";
+const CONTAINER = "0123456789abcdef".repeat(4);
+const OTHER_CONTAINER = "fedcba9876543210".repeat(4);
+const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"];
+const POD_TEMPLATE = { metadata: { labels: { "alasio.dev/sandbox": "fs-abc" } }, spec: { containers: [{ name: "bayma", image: "bayma@sha256:00" }] } };
+const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
+const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
+
+const request = (workspace: string, containerId = CONTAINER): CheckpointRequest => ({
+  environment: "main",
+  workspace,
+  release: RELEASE,
+  containerId,
+  hook: HOOK,
+  podTemplate: POD_TEMPLATE,
+});
+
+const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
+
+/** A node: its releases, its cache, and its agent on the shared bucket. */
+interface Node {
+  readonly releases: FakeReleases;
+  readonly cacheDir: string;
+  readonly cache: SnapshotCache;
+  readonly agent: NodeAgent;
+}
+
+/** What a node of the test's has: its releases, and its cache's budget. */
+interface NodeOptions {
+  readonly releases?: readonly string[];
+  readonly budget?: number;
+}
+
+/** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
+async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: (name: string, options?: NodeOptions) => Effect.Effect<Node, never, Scope.Scope> }) => Effect.Effect<void, unknown, Scope.Scope>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3 }: NodeOptions = {}) =>
+    Effect.gen(function*() {
+      const releases = fakeReleases(join(root, name), installed);
+      const cacheDir = join(root, name, "cache");
+      const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
+      const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT });
+      return { releases, cacheDir, cache, agent: yield* makeNodeAgent({ node: name, runsc, cache, bucket }) };
+    });
+  try {
+    await Effect.runPromise(Effect.scoped(body({ s3, node })));
+  } finally {
+    await s3.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** The snapshot directories the cache of a node holds of a workspace, whole or not. */
+const cachedOf = (node: Node, workspace: string): string[] => {
+  const directory = join(node.cacheDir, "main", workspace);
+  return existsSync(directory) ? readdirSync(directory).sort() : [];
+};
+
+/** The bucket's keys under a prefix. */
+const keysOf = (s3: FakeS3, prefix: string): string[] => [...s3.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
+
+/** The message of what an exit failed with. */
+const failure = (exit: Exit.Exit<unknown, { readonly message: string }>): string => {
+  assert.ok(Exit.isFailure(exit));
+  const error = exit.cause.reasons.find((reason) => reason._tag === "Fail");
+  assert.ok(error && error._tag === "Fail");
+  return error.error.message;
+};
+
+test("a runtime's options file gives runsc its shim's flags", () => {
+  assert.deepEqual(
+    runscFlags([
+      "restore_direct = true",
+      "# runsc's flags",
+      "[runsc_config]",
+      '  systemd-cgroup = "true"',
+      '  "restore-validate-files" = "all" # every file',
+      "",
+      "[other]",
+      '  debug = "true"',
+    ].join("\n")),
+    ["--systemd-cgroup=true", "--restore-validate-files=all"],
+  );
+  assert.throws(() => runscFlags("[runsc_config]\n  debug = true\n"), /\[runsc_config\] holds what is not a string flag: debug = true/u);
+});
+
+test("a checkpoint saves the sandbox with its release's runsc, uploads its files, then its manifest, commits it, and lets the previous one go", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const first = yield* here.agent.checkpoint(request("fs-abc"));
+      const staged = join(here.cacheDir, "main", "fs-abc", `.${first.snapshot}`);
+      assert.deepEqual(here.releases.calls(RELEASE), [
+        [
+          `--root=${RUNSC_ROOT}`,
+          "--systemd-cgroup=true",
+          "checkpoint",
+          `--image-path=${staged}`,
+          "--compression=none",
+          "--save-restore-exec-argv=node /opt/bayma/bayma.js sandbox-hook --state-dir /home/agent/.bayma",
+          "--save-restore-exec-timeout=30s",
+          CONTAINER,
+        ],
+        [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "image", "inspect", "--json", staged],
+      ]);
+      const pages = Buffer.alloc(4096, CONTAINER);
+      const { pauseMs, uploadMs, takenAt, snapshot, ...rest } = first;
+      assert.match(snapshot, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
+      assert.ok(pauseMs >= 0 && uploadMs >= 0 && Date.parse(takenAt) <= Date.now());
+      assert.deepEqual(rest, {
+        environment: "main",
+        workspace: "fs-abc",
+        release: RELEASE,
+        image: `sha256:${sha256(`state of ${CONTAINER}`)}`,
+        cpuFeatures: ["sse", "avx"],
+        podTemplate: POD_TEMPLATE,
+        files: [
+          { path: "checkpoint.img", bytes: `state of ${CONTAINER}`.length, sha256: sha256(`state of ${CONTAINER}`) },
+          { path: "layers/pages.img", bytes: 4096, sha256: sha256(pages) },
+          { path: "pages_meta.img", bytes: `meta of ${CONTAINER}`.length, sha256: sha256(`meta of ${CONTAINER}`) },
+        ],
+        bytes: `state of ${CONTAINER}`.length + 4096 + `meta of ${CONTAINER}`.length,
+      });
+      const prefix = `main/fs-abc/${first.snapshot}`;
+      // Its files, then its manifest, then the commit.
+      assert.deepEqual(s3.requests.filter((asked) => asked.startsWith("PUT")), [
+        `PUT ${prefix}/checkpoint.img`,
+        `PUT ${prefix}/layers/pages.img`,
+        `PUT ${prefix}/pages_meta.img`,
+        `PUT ${prefix}/manifest.json`,
+        "PUT main/fs-abc/current.json",
+      ]);
+      assert.deepEqual(s3.objects.get(`${prefix}/layers/pages.img`), pages);
+      assert.deepEqual(JSON.parse(s3.objects.get("main/fs-abc/current.json")?.toString() ?? ""), first);
+      assert.deepEqual(JSON.parse(s3.objects.get(`${prefix}/manifest.json`)?.toString() ?? ""), first);
+      assert.deepEqual(yield* here.agent.current({ environment: "main", workspace: "fs-abc" }), first);
+      // The cache holds it whole, with its manifest beside its image.
+      assert.deepEqual(cachedOf(here, "fs-abc"), [first.snapshot]);
+      assert.deepEqual(JSON.parse(readFileSync(join(here.cacheDir, "main", "fs-abc", first.snapshot, "manifest.json"), "utf8")), first);
+
+      // Another workspace's snapshot is its own.
+      const other = yield* here.agent.checkpoint(request("fs-other"));
+      // The next one replaces the first, in the bucket and in the cache.
+      const second = yield* here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
+      assert.notEqual(second.snapshot, first.snapshot);
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), [
+        ...["checkpoint.img", "layers/pages.img", "manifest.json", "pages_meta.img"].map((file) => `main/fs-abc/${second.snapshot}/${file}`),
+        "main/fs-abc/current.json",
+      ]);
+      assert.deepEqual(JSON.parse(s3.objects.get("main/fs-abc/current.json")?.toString() ?? ""), second);
+      assert.equal(keysOf(s3, "main/fs-other/").length, 5);
+      assert.deepEqual(cachedOf(here, "fs-abc"), [second.snapshot]);
+      assert.deepEqual(cachedOf(here, "fs-other"), [other.snapshot]);
+    })
+  ));
+
+test("a checkpoint that fails forgets the workspace's snapshot, which the workspace has moved on from, and says so", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      yield* here.agent.checkpoint(request("fs-abc"));
+
+      // runsc fails.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
+      assert.equal(
+        failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc")))),
+        `checkpointing main/fs-abc failed: runsc checkpoint of ${RELEASE} failed: checkpoint failed: the sandbox is gone; its snapshot is forgotten, as the workspace has moved on since it was taken`,
+      );
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      assert.deepEqual(cachedOf(here, "fs-abc"), []);
+      assert.equal(yield* here.agent.current({ environment: "main", workspace: "fs-abc" }), null);
+      rmSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"));
+
+      // The commit fails, after the files went up: they go too.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      s3.refuse = (method, key) => (method === "PUT" && key === "main/fs-abc/current.json" ? 500 : null);
+      assert.match(
+        failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER)))),
+        /^checkpointing main\/fs-abc failed: the bucket's upload of main\/fs-abc\/current\.json failed: 500 InternalError refused, as the test asks; its snapshot is forgotten, as the workspace has moved on since it was taken$/u,
+      );
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      assert.deepEqual(cachedOf(here, "fs-abc"), []);
+      s3.refuse = () => null;
+
+      // An image saved by another release than the sandbox's is no snapshot of it.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      writeFileSync(join(here.releases.dirOf(RELEASE), "saved-by"), "release-20260801.0-eaucoin.1");
+      assert.equal(
+        failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc")))),
+        `checkpointing main/fs-abc failed: the snapshot of main/fs-abc is corrupt: its image says runsc release-20260801.0-eaucoin.1 saved it, not release-${RELEASE}; its snapshot is forgotten, as the workspace has moved on since it was taken`,
+      );
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      rmSync(join(here.releases.dirOf(RELEASE), "saved-by"));
+
+      // A checkpoint stopped before it is done forgets it too; meanwhile what else is asked
+      // of the workspace waits, and what is asked of another does not.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      writeFileSync(join(here.releases.dirOf(RELEASE), "hang-checkpoint"), "");
+      const runs = here.releases.calls(RELEASE).length;
+      const stopped = yield* Effect.forkChild(here.agent.checkpoint(request("fs-abc")));
+      while (here.releases.calls(RELEASE).length === runs) yield* Effect.sleep("20 millis");
+      const waiting = yield* Effect.forkChild(here.agent.prepare({ environment: "main", workspace: "fs-abc" }));
+      yield* here.agent.forget({ environment: "main", workspace: "fs-other" });
+      yield* Effect.sleep("100 millis");
+      assert.equal(waiting.pollUnsafe(), undefined);
+      yield* Fiber.interrupt(stopped);
+      assert.equal(failure(yield* Effect.exit(Fiber.join(waiting))), "main/fs-abc has no snapshot");
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      assert.deepEqual(cachedOf(here, "fs-abc"), []);
+      rmSync(join(here.releases.dirOf(RELEASE), "hang-checkpoint"));
+      const other = yield* here.agent.checkpoint(request("fs-other"));
+
+      // Once committed, a snapshot stays so, whatever fails after.
+      s3.refuse = (method, key) => (method === "GET" && key === "" ? 500 : null);
+      const kept = yield* here.agent.checkpoint(request("fs-abc"));
+      assert.equal((yield* here.agent.current({ environment: "main", workspace: "fs-abc" }))?.snapshot, kept.snapshot);
+
+      // Forgetting fails too: said as well.
+      s3.refuse = (method, key) => (key.startsWith("main/fs-other/") && method !== "GET" ? 503 : null);
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
+      assert.match(
+        failure(yield* Effect.exit(here.agent.checkpoint(request("fs-other")))),
+        /: checkpoint failed: the sandbox is gone; forgetting its snapshot, as the workspace has moved on since it was taken, failed too: the bucket's deletion of main\/fs-other\/current\.json failed: 503 InternalError/u,
+      );
+      // The node's copy is gone, and the bucket's is as the deletion left it.
+      assert.deepEqual(cachedOf(here, "fs-other"), []);
+      assert.equal(keysOf(s3, "main/fs-other/").length, 5);
+      assert.equal((yield* here.agent.current({ environment: "main", workspace: "fs-other" }))?.snapshot, other.snapshot);
+    })
+  ));
+
+test("a snapshot is prepared from the node's cache, or from the bucket, checked file by file, and only where it restores", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      assert.equal(failure(yield* Effect.exit(taker.agent.prepare(workspace))), "main/fs-abc has no snapshot");
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      const files = (snapshot: Manifest) => snapshot.files.map(({ path }) => `GET main/fs-abc/${snapshot.snapshot}/${path}`);
+      const downloads = () => s3.requests.filter((asked) => asked.startsWith("GET main/fs-abc/2"));
+
+      // The node that took it has it.
+      assert.deepEqual(yield* taker.agent.prepare(workspace), { manifest, imagePath: join(taker.cacheDir, "main", "fs-abc", manifest.snapshot) });
+      assert.deepEqual(downloads(), []);
+
+      // Another node downloads it, once.
+      const other = yield* node("node-2");
+      const prepared = yield* other.agent.prepare(workspace);
+      assert.deepEqual(prepared, { manifest, imagePath: join(other.cacheDir, "main", "fs-abc", manifest.snapshot) });
+      assert.deepEqual(downloads(), files(manifest));
+      for (const file of manifest.files) {
+        assert.equal(sha256(readFileSync(join(prepared.imagePath, file.path))), file.sha256);
+      }
+      assert.deepEqual(JSON.parse(readFileSync(join(prepared.imagePath, "manifest.json"), "utf8")), manifest);
+      yield* other.agent.prepare(workspace);
+      assert.deepEqual(downloads(), files(manifest));
+
+      // A newer snapshot replaces the older one in its cache as it is prepared.
+      const newer = yield* taker.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
+      yield* other.agent.prepare(workspace);
+      assert.deepEqual(cachedOf(other, "fs-abc"), [newer.snapshot]);
+
+      // A file that is not what the manifest says fails it, and leaves nothing of it.
+      s3.objects.set(`main/fs-abc/${newer.snapshot}/pages_meta.img`, Buffer.from("something else"));
+      const third = yield* node("node-3");
+      assert.equal(
+        failure(yield* Effect.exit(third.agent.prepare(workspace))),
+        `the snapshot of main/fs-abc is corrupt: its file pages_meta.img is 14 bytes of SHA-256 ${sha256("something else")}, where its manifest says ${newer.files[2]?.bytes} bytes of ${newer.files[2]?.sha256}`,
+      );
+      assert.deepEqual(cachedOf(third, "fs-abc"), []);
+
+      // A node without its release, or whose CPU lacks a feature it was saved with, cannot restore it.
+      const older = yield* node("node-4", { releases: ["release-20260801.0-eaucoin.1"] });
+      assert.equal(
+        failure(yield* Effect.exit(older.agent.prepare(workspace))),
+        `this node cannot restore the snapshot ${newer.snapshot} of main/fs-abc: its gVisor ${RELEASE} is not installed here`,
+      );
+      const narrower = yield* node("node-5");
+      writeFileSync(join(narrower.releases.dirOf(RELEASE), "cpu-features"), "sse,avx2");
+      assert.equal(
+        failure(yield* Effect.exit(narrower.agent.prepare(workspace))),
+        `this node cannot restore the snapshot ${newer.snapshot} of main/fs-abc: this node's CPU lacks features it was saved with: avx`,
+      );
+    })
+  ));
+
+test("checkpoints and prepares keep the node's cache within its budget, the least recently used snapshot evicted", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // Room for one snapshot of about 4 KB.
+      const taker = yield* node("node-1", { budget: 6000 });
+      yield* taker.agent.checkpoint(request("fs-abc"));
+      yield* Effect.sleep("20 millis");
+      yield* taker.agent.checkpoint(request("fs-other"));
+      assert.deepEqual([cachedOf(taker, "fs-abc").length, cachedOf(taker, "fs-other").length], [0, 1]);
+      const other = yield* node("node-2", { budget: 6000 });
+      yield* other.agent.prepare({ environment: "main", workspace: "fs-other" });
+      yield* Effect.sleep("20 millis");
+      yield* other.agent.prepare({ environment: "main", workspace: "fs-abc" });
+      assert.deepEqual([cachedOf(other, "fs-abc").length, cachedOf(other, "fs-other").length], [1, 0]);
+    })
+  ));
+
+test("the node's cache keeps within its budget, evicting the least recently used first, but none used within its grace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-cache-"));
+  try {
+    const now = Date.now();
+    const put = (cache: SnapshotCache, workspace: string, snapshot: string, minutesAgo: number) =>
+      Effect.gen(function*() {
+        const directory = yield* cache.stage("main", workspace, snapshot);
+        writeFileSync(join(directory, "pages.img"), Buffer.alloc(1000));
+        yield* cache.commit("main", workspace, snapshot);
+        const at = (now - minutesAgo * 60_000) / 1000;
+        utimesSync(cache.path("main", workspace, snapshot), at, at);
+      });
+    const names = (cached: readonly { readonly workspace: string }[]) => cached.map(({ workspace }) => workspace).sort();
+    await Effect.runPromise(Effect.gen(function*() {
+      const cache = makeSnapshotCache({ root, budget: 2500, graceMs: 5 * 60_000 });
+      yield* put(cache, "fs-old", "s1", 60);
+      yield* put(cache, "fs-older", "s1", 90);
+      yield* put(cache, "fs-new", "s1", 1);
+      // A snapshot being written counts for nothing, and is never evicted.
+      mkdirSync(join(root, "main", "fs-new", ".s2"));
+      writeFileSync(join(root, "main", "fs-new", ".s2", "pages.img"), Buffer.alloc(5000));
+      assert.equal((yield* cache.list).reduce((sum, { bytes }) => sum + bytes, 0), 3000);
+      assert.deepEqual(names(yield* cache.evict), ["fs-older"]);
+      assert.deepEqual(names(yield* cache.list), ["fs-new", "fs-old"]);
+      // Used just now, the older is kept, and the newer one goes.
+      yield* cache.use("main", "fs-old", "s1");
+      const tighter = makeSnapshotCache({ root, budget: 500, graceMs: 5 * 60_000 });
+      assert.deepEqual(names(yield* tighter.evict), []);
+      utimesSync(cache.path("main", "fs-new", "s1"), (now - 10 * 60_000) / 1000, (now - 10 * 60_000) / 1000);
+      assert.deepEqual(names(yield* tighter.evict), ["fs-new"]);
+      assert.deepEqual(names(yield* tighter.list), ["fs-old"]);
+      // What a stopped agent left half written goes as the next starts.
+      yield* tighter.clean;
+      assert.equal(existsSync(join(root, "main", "fs-new", ".s2")), false);
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
