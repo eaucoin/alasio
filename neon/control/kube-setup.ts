@@ -61,6 +61,7 @@ export interface SecretNames {
   valkey: string;
   workspaces: string;
   snapshots: string;
+  nodeAgent: string;
 }
 
 /** Workspace storage, as the setup makes its Secrets. */
@@ -158,6 +159,7 @@ export function secretNames(prefix: string): SecretNames {
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
     snapshots: `${prefix}-snapshots`,
+    nodeAgent: `${prefix}-node-agent`,
   };
 }
 
@@ -273,6 +275,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       S3_BUCKET: snapshotsBucket,
       ...aws("snapshots"),
     };
+    // The token alasio presents to the node agents, which they check: both read it here.
+    rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
   }
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };

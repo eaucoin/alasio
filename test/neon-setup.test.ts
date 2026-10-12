@@ -187,6 +187,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
     AWS_ACCESS_KEY_ID: root.s3.snapshots.accessKey,
     AWS_SECRET_ACCESS_KEY: root.s3.snapshots.secretKey,
   });
+  // alasio and the node agents read the token alasio presents them from one Secret.
+  assert.equal(value(kube, names.nodeAgent, "token"), root.nodeAgentToken);
+  assert.match(root.nodeAgentToken, /^[\w-]{32}$/u);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -256,6 +259,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreBackupPassword: "b",
     monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
+    nodeAgentToken: "n",
   };
 }
 
@@ -310,7 +314,7 @@ test("without workspace storage, neither its Secrets nor its identity are made",
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "snapshots"]);
 });
 
-test("without session sandboxes snapshotted, neither the snapshots' Secret nor their identity are made", () => {
+test("without session sandboxes snapshotted, neither the snapshots' Secret, their identity nor the node agents' token's Secret are made", () => {
   const rendered = renderSecrets({
     secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
@@ -319,6 +323,7 @@ test("without session sandboxes snapshotted, neither the snapshots' Secret nor t
   });
   const names = secretNames("q");
   assert.equal(rendered[names.snapshots], undefined);
+  assert.equal(rendered[names.nodeAgent], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
 });

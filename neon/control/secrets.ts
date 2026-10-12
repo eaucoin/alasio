@@ -72,6 +72,8 @@ export interface StackSecrets {
    * neon-control answers Neon's proxy with.
    */
   verifiers: Record<ClientRole, string>;
+  /** What alasio presents to the node agents, which keep session sandboxes' snapshots, and they check. */
+  nodeAgentToken: string;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
@@ -183,6 +185,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       [LAKE_READER_ROLE]: kept(verifiers[LAKE_READER_ROLE], () => scramVerifier(passwords.lakeReaderPassword)),
       [GRAFANA_ROLE]: kept(verifiers[GRAFANA_ROLE], () => scramVerifier(passwords.grafanaPassword)),
     },
+    nodeAgentToken: kept(stored.nodeAgentToken, () => secret()),
   };
   return { secrets, changed };
 }

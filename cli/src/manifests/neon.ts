@@ -73,8 +73,8 @@ function secretVariable(secret: string, key: string): V1EnvVar {
 
 /**
  * The stack's secrets, made once and kept, and each service's rendered from them, workspace
- * storage's among them when it is on and the snapshots bucket's when sandboxes are
- * snapshotted, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
+ * storage's among them when it is on, and the snapshots bucket's and the node agents'
+ * when sandboxes are snapshotted, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
  * anything else of alasio starts (../kube/apply.ts).
  */
 function setup(config: InstallConfig): KubernetesObject[] {
