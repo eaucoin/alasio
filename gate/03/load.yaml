@@ -1,0 +1,27 @@
+# Kafka's own clients, from AutoMQ's image, in a pod of their own, so the broker's
+# memory and CPU are measured without them: gate/03/run.sh execs its producers,
+# consumers and checks here.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: load
+  namespace: alasio
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: load
+      image: automqinc/automq:1.7.4
+      command: [sleep, infinity]
+      env:
+        - { name: LOG_DIR, value: /tmp/logs }
+        - { name: KAFKA_HEAP_OPTS, value: "-Xmx256m" }
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: [ALL] }
+      resources:
+        requests: { cpu: 100m, memory: 512Mi }
+        limits: { memory: 4Gi }

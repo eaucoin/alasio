@@ -1,0 +1,57 @@
+name: gate-03
+
+# 03's gate (gate/03/run.sh), on its track's branch alone, whenever what it runs changes.
+on:
+  push:
+    branches: [track/wave0-gates]
+    paths: [.github/workflows/gate-03.yml, gate/03/**, gate/*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # SeaweedFS's answers to compaction's copies alone, in minutes (the long run makes them
+  # again at its end).
+  etag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: gate/k3s.sh
+      - run: gate/store.sh log
+      - run: gate/03/etag.sh
+        env:
+          OUT: ${{ runner.temp }}/gate-03
+
+  automq:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: gate/k3s.sh
+      - run: gate/store.sh log
+      - run: gate/03/run.sh
+        env:
+          OUT: ${{ runner.temp }}/gate-03
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-03
+          path: ${{ runner.temp }}/gate-03
+      - name: The cluster, when something failed
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl -n alasio describe pods
+          kubectl -n alasio logs automq-0 --tail=200 || true
