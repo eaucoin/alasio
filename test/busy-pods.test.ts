@@ -61,6 +61,7 @@ async function busyPods(
     replace: unused,
     remove: unused,
     exec: unused,
+    patchPodStatus: unused,
     list: (apiVersion, kind, namespace, labelSelector) => {
       assert.deepEqual([apiVersion, kind, labelSelector], ["v1", "Pod", "alasio.dev/busy=true"]);
       return Effect.succeed([...labelled].filter((pod) => pod.startsWith(`${namespace}/`)).map((pod) => ({ metadata: { name: pod.slice(namespace.length + 1) } })));

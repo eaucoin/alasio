@@ -479,10 +479,11 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * files from sessions through exec, in the namespaces it owns, labelling their pods busy
  * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
  * it snapshots sessions, records the templates their snapshots restore into in a ConfigMap
- * of the sessions namespace; where it forks sessions, reads sessions' volume claims and
- * runs the Jobs that clone them in its own; where the node agents run, watches pods in its
- * own, theirs among them; and, where it installs JuiceFS's driver, lists and deletes pods
- * in the driver's namespace, its mount pods; and nothing else.
+ * of the sessions namespace, and sets a restored session's readiness; where it forks
+ * sessions, reads sessions' volume claims and runs the Jobs that clone them in its own;
+ * where the node agents run, watches pods in its own, theirs among them; and, where it
+ * installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount
+ * pods; and nothing else.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const main = environment.branch === null;
@@ -528,8 +529,11 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
           { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
           ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
-          // Which session templates its sessions' snapshots restore into (src/sandbox/snapshots.ts).
-          ...(snapshotted ? [{ apiGroups: [""], resources: ["configmaps"], verbs: ["get", "create", "update"] }] : []),
+          // Which session templates its sessions' snapshots restore into, and a restored
+          // session's readiness, once its sandbox is let run (src/sandbox/snapshots.ts).
+          ...(snapshotted
+            ? [{ apiGroups: [""], resources: ["configmaps"], verbs: ["get", "create", "update"] }, { apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] }]
+            : []),
         ],
       };
       return [role, binding(metadata)];

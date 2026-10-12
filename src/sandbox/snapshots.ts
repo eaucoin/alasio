@@ -32,6 +32,7 @@ import {
   SANDBOX_KIND,
   type Sandbox,
   type SandboxRestore,
+  SandboxRestoreRefused,
   type SandboxGone,
   type SandboxNotReady,
   type SandboxPodEnded,
@@ -51,6 +52,12 @@ export type SnapshotsProfile = NonNullable<SessionsProfile["snapshots"]>;
 export const SESSION_TEMPLATE_ANNOTATION = "alasio.dev/session-template";
 /** The annotation alasio's fork of gVisor restores a pod's sandbox from, naming the image on the node. */
 const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
+/** The fork's annotation that leaves a restored sandbox paused, running nothing, until it is resumed. */
+const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
+/** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
+export const RESUMED_CONDITION = "alasio.dev/resumed";
+/** How long a restored pod is waited for to run its containers, its images pulled. */
+const POD_RUNNING_TIMEOUT = "3 minutes";
 /** The ConfigMap of the sessions namespace that records the profile's template, and the one before it, by their hashes. */
 export const TEMPLATES_CONFIG_MAP = "alasio-session-templates";
 /** How often running sessions are looked at for one to release. */
@@ -77,6 +84,9 @@ export interface KeptTemplates {
   readonly current: string;
   readonly previous: string | null;
 }
+
+/** A restored pod does not run its containers yet. */
+class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", {}) {}
 
 /** What bayma's /status says: its execs running and queued, and since when none has run, if none does. */
 const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number) });
@@ -217,6 +227,41 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       return [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node);
     });
 
+  /**
+   * Lets the restored pod of session `name`, on `node`, run, once its containers run,
+   * paused: its node's agent resumes its sandbox under `release` once the pod's egress is
+   * confined there, which kube-router does a moment after the pod has its address, and the
+   * pod is then ready, by its readiness gate. A pod that ends meanwhile, whose sandbox
+   * the agent does not resume, or whose readiness cannot be set, is refused.
+   */
+  const resumeRestored = (name: string, node: string, release: string): Effect.Effect<void, SandboxRestoreRefused> =>
+    Effect.gen(function*() {
+      const running = yield* kube.read("v1", "Pod", profile.namespace, name).pipe(
+        Effect.flatMap((read): Effect.Effect<V1Pod, PodNotRunning | SandboxRestoreRefused> => {
+          // A core Pod, as the API server returns one.
+          const pod = read as V1Pod | null;
+          const statuses = pod?.status?.containerStatuses ?? [];
+          if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded" || statuses.some(({ state }) => state?.terminated)) {
+            return Effect.fail(new SandboxRestoreRefused({ reason: `its pod ended before it ran (${pod?.status?.reason ?? pod?.status?.phase ?? "terminated"})` }));
+          }
+          const ready = pod && statuses.length > 0 && statuses.every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0;
+          return ready ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
+        }),
+        Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT)]) }),
+        Effect.catchTag("PodNotRunning", () => Effect.fail(new SandboxRestoreRefused({ reason: `its pod did not run within ${POD_RUNNING_TIMEOUT}` }))),
+        Effect.catchTag("KubeApiError", (error) => Effect.fail(new SandboxRestoreRefused({ reason: error.message }))),
+      );
+      const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^containerd:\/\//u, "")] : []));
+      const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
+      yield* agents.resume(node, { ...ref(name), release, namespace: profile.namespace, pod: name, podIPs, containerIds }).pipe(
+        Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message })),
+      );
+      const now = new Date(yield* Clock.currentTimeMillis).toISOString();
+      yield* kube.patchPodStatus(profile.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
+        Effect.mapError((error) => new SandboxRestoreRefused({ reason: `its readiness could not be set: ${error.message}` })),
+      );
+    });
+
   const restore = (sandbox: StoredSandbox, desired: Sandbox): Effect.Effect<SandboxRestore | null> => {
     const name = sandbox.metadata.name;
     return Effect.gen(function*() {
@@ -249,11 +294,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         yield* Effect.logInfo(`restoring session ${name} on ${node} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
         const restoring: V1PodTemplateSpec = {
           ...base,
-          metadata: { ...base.metadata, annotations: { ...base.metadata?.annotations, [RESTORE_ANNOTATION]: prepared.success.imagePath } },
+          // Left paused, until its node's agent sees its egress confined (resumeRestored).
+          metadata: { ...base.metadata, annotations: { ...base.metadata?.annotations, [RESTORE_ANNOTATION]: prepared.success.imagePath, [RESTORE_PAUSED_ANNOTATION]: "true" } },
           spec: {
             ...base.spec,
             containers: base.spec?.containers ?? [],
             runtimeClassName: kept.runtimeClassName,
+            readinessGates: [...(base.spec?.readinessGates ?? []), { conditionType: RESUMED_CONDITION }],
             affinity: {
               ...base.spec?.affinity,
               nodeAffinity: {
@@ -265,6 +312,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         return {
           podTemplate: restoring,
           kept: base,
+          resume: resumeRestored(name, node, kept.release),
           // The session moves on from it.
           restored: Effect.sync(() => restores.add(1, { "alasio.sandbox.restore.outcome": "restored" })).pipe(Effect.andThen(forget(name, "the session restored from it runs on"))),
           failed: (failure: string) => fallBack(name, "restore", failure).pipe(Effect.asVoid),

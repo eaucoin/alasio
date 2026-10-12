@@ -765,7 +765,7 @@ const agentsOf = (agent: NodeAgent) =>
       status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
     };
     const unreachable = () => Effect.die("only pods are listed");
-    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable });
+    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable });
     return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
       Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
     );

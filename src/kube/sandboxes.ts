@@ -180,16 +180,27 @@ export interface SandboxFault {
 
 /**
  * A suspended Sandbox resumed from a snapshot of the pod it ran: the pod template it
- * resumes with, which brings that pod back, `podTemplate`; the template it keeps once the
- * pod is back, `kept`, the one that pod was made from; and what is done once the pod is
- * back, `restored`, or once it failed to come back, `failed(why)`, after which the
- * Sandbox is resumed as one that has no snapshot is.
+ * resumes with, which brings that pod back, left paused, `podTemplate`; the template it
+ * keeps once the pod is back, `kept`, the one that pod was made from; what lets the pod's
+ * sandbox run once its pod runs, which makes the pod ready, or refuses it, `resume`; and
+ * what is done once the pod is ready, `restored`, or once it failed to come back, or was
+ * refused, `failed(why)`, after which the Sandbox is resumed as one that has no snapshot is.
  */
 export interface SandboxRestore {
   readonly podTemplate: V1PodTemplateSpec;
   readonly kept: V1PodTemplateSpec;
+  readonly resume: Effect.Effect<void, SandboxRestoreRefused>;
   readonly restored: Effect.Effect<void>;
   readonly failed: (why: string) => Effect.Effect<void>;
+}
+
+/** A Sandbox restored from a snapshot of its pod is not let run: why. */
+export class SandboxRestoreRefused extends Schema.TaggedError<SandboxRestoreRefused>()("SandboxRestoreRefused", {
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return this.reason;
+  }
 }
 
 /** How bringing a Sandbox's bayma up fails. */
@@ -552,11 +563,13 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: podTemplateHash(plan.kept) } },
       spec: { operatingMode: "Running", podTemplate: mergePatch(sandbox.spec.podTemplate, plan.podTemplate) },
     }));
-    const back = yield* awaitCondition(restoring, "Ready").pipe(
+    const back = yield* plan.resume.pipe(
+      Effect.andThen(awaitCondition(restoring, "Ready")),
       Effect.map((ready) => ({ ready })),
       Effect.catchTags({
         SandboxNotReady: (error) => Effect.succeed({ why: error.message }),
         SandboxPodEnded: (error) => Effect.succeed({ why: error.message }),
+        SandboxRestoreRefused: (error) => Effect.succeed({ why: error.message }),
       }),
     );
     if ("why" in back) {

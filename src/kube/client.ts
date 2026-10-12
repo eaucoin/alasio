@@ -10,7 +10,7 @@ import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 
-import { Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, type V1Status } from "@kubernetes/client-node";
+import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status } from "@kubernetes/client-node";
 import { Context, Effect, Layer, Predicate, Result, Schema } from "effect";
 
 /** What `exec` is given beyond the command. */
@@ -115,6 +115,11 @@ export class KubeClient extends Context.Service<KubeClient, {
   readonly replace: <T extends KubernetesObject>(object: T) => Effect.Effect<T, KubeApiError>;
   /** A JSON merge patch. */
   readonly patch: (apiVersion: string, kind: string, namespace: string, name: string, patch: object) => Effect.Effect<KubernetesObject, KubeApiError>;
+  /**
+   * A strategic merge patch of the pod's status, as kubelet's own updates are merged: its
+   * conditions by their type.
+   */
+  readonly patchPodStatus: (namespace: string, name: string, patch: object) => Effect.Effect<void, KubeApiError>;
   /** Deletes it, with its dependents in the background; one already gone is not an error. */
   readonly remove: (apiVersion: string, kind: string, namespace: string, name: string) => Effect.Effect<void, KubeApiError>;
   /**
@@ -136,6 +141,7 @@ export class KubeClient extends Context.Service<KubeClient, {
 /** The client over `kubeConfig`. */
 function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
   const objects = KubernetesObjectApi.makeApiClient(kubeConfig);
+  const core = kubeConfig.makeApiClient(CoreV1Api);
   const executor = new Exec(kubeConfig);
 
   const exec = Effect.fnUntraced(function*(
@@ -205,6 +211,10 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
       call(() =>
         objects.patch(patchBody(apiVersion, kind, namespace, name, patch), undefined, undefined, "alasio", undefined, PatchStrategy.MergePatch)
       ),
+    patchPodStatus: (namespace, name, patch) =>
+      call(() =>
+        core.patchNamespacedPodStatus({ namespace, name, body: patch, fieldManager: "alasio" }, setHeaderOptions("Content-Type", PatchStrategy.StrategicMergePatch))
+      ).pipe(Effect.asVoid),
     remove: (apiVersion, kind, namespace, name) =>
       call(() => objects.delete(ref(apiVersion, kind, namespace, name), undefined, undefined, undefined, undefined, "Background")).pipe(
         Effect.asVoid,

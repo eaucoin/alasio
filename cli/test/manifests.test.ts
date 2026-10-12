@@ -1920,6 +1920,7 @@ describe("security", () => {
     });
     assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.join() === "get,create,update"));
+    assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
     // Under the cluster's default runtime, nothing is snapshotted.
     const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
     assert.equal(sessions(unsnapshotted).snapshots, undefined);

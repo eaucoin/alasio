@@ -18,6 +18,7 @@ import {
   hookOf,
   keptTemplates,
   makeSessionSnapshots,
+  RESUMED_CONDITION,
   SESSION_TEMPLATE_ANNOTATION,
   sessionTemplateHash,
   TEMPLATES_CONFIG_MAP,
@@ -78,11 +79,13 @@ const manifestOf = (podTemplate: V1PodTemplateSpec, release = CURRENT, cpuFeatur
 });
 
 /** Node agents in memory: the current snapshot, each node's holdings, and how a prepare goes on each; what they were asked. */
-function fakeAgents({ current = null, holdings = [], prepare = () => null, read }: {
+function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null }: {
   readonly current?: Manifest | null;
   readonly holdings?: readonly Holdings[];
   readonly prepare?: (node: string) => string | null;
   readonly read?: NodeAgentError;
+  /** Why the agent does not resume a restored sandbox, or null when it does. */
+  readonly resumed?: string | null;
 } = {}) {
   const asked: string[] = [];
   const checkpoints: (readonly [string, CheckpointRequest])[] = [];
@@ -104,7 +107,11 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read 
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
-    resume: () => Effect.die("nothing is resumed"),
+    resume: (node, request) =>
+      Effect.suspend(() => {
+        asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}`);
+        return resumed === null ? Effect.void : Effect.fail(new NodeAgentError({ node, call: "resume alasio-sessions/fs-abc123", status: 504, reason: resumed }));
+      }),
     holdings: (node) => Effect.succeed(holdings.find((held) => held.node === node) as Holdings),
   };
   return { agents, asked, checkpoints };
@@ -137,6 +144,13 @@ function fakeKube(objects: Map<string, KubernetesObject> = new Map()) {
         return object;
       }),
     patch: () => Effect.fail(new KubeApiError({ status: 500, cause: new Error("nothing is patched") })),
+    patchPodStatus: (namespace, name, patch) =>
+      Effect.sync(() => {
+        writes.push(`patch Pod/${name}'s status ${JSON.stringify(patch)}`);
+        const pod = objects.get(key("Pod", namespace, name)) as V1Pod | undefined;
+        const conditions = (patch as V1Pod).status?.conditions ?? [];
+        if (pod) pod.status = { ...pod.status, conditions: [...(pod.status?.conditions ?? []).filter(({ type }) => !conditions.some((set) => set.type === type)), ...conditions] };
+      }),
     remove: () => Effect.fail(new KubeApiError({ status: 500, cause: new Error("nothing is removed") })),
     exec: () => Effect.die("nothing is run"),
   });
@@ -219,6 +233,49 @@ test("a session with a snapshot on the current template is restored on a node th
   // Restored, the session moves on from it.
   await Effect.runPromise(plan.restored);
   assert.deepEqual(asked.slice(2), ["forget alasio-sessions/fs-abc123"]);
+});
+
+test("a restored pod is let run once its containers run, by its node's agent, then made ready; one that ends, or that the agent does not resume, is refused", async () => {
+  const desired = sessionOf(profile());
+  const restoredPod = (state: "running" | "terminated" | "waiting"): V1Pod => ({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "fs-abc123", namespace: "alasio-sessions" },
+    spec: { nodeName: "node-a", containers: [] },
+    status: {
+      podIPs: [{ ip: "10.42.0.7" }],
+      containerStatuses: [{
+        name: "bayma",
+        containerID: `containerd://${"b".repeat(64)}`,
+        image: "",
+        imageID: "",
+        ready: false,
+        restartCount: 0,
+        state: state === "running" ? { running: {} } : state === "terminated" ? { terminated: { exitCode: 128 } } : { waiting: { reason: "ContainerCreating" } },
+      }],
+    },
+  });
+  const resume = async (pod: V1Pod, resumed: string | null = null) => {
+    const kube = fakeKube(new Map<string, KubernetesObject>([["Pod/alasio-sessions/fs-abc123", pod]]));
+    const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], resumed });
+    const outcome = await run(kube, Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      const plan = yield* snapshotted.restore(stored(desired), desired);
+      assert.ok(plan);
+      assert.equal(plan.podTemplate.metadata?.annotations?.["dev.gvisor.internal.restore.paused"], "true");
+      assert.deepEqual(plan.podTemplate.spec?.readinessGates, [{ conditionType: RESUMED_CONDITION }]);
+      return yield* plan.resume.pipe(Effect.as("resumed"), Effect.catch((refused) => Effect.succeed(refused.message)));
+    }));
+    return { outcome, asked, writes: kube.writes };
+  };
+  const ran = await resume(restoredPod("running"));
+  assert.equal(ran.outcome, "resumed");
+  assert.deepEqual(ran.asked.slice(1), [`resume on node-a 10.42.0.7 1`]);
+  assert.match(ran.writes.at(-1) ?? "", /^patch Pod\/fs-abc123's status .*"type":"alasio.dev\/resumed","status":"True"/u);
+  assert.equal((await resume(restoredPod("terminated"))).outcome, "its pod ended before it ran (terminated)");
+  const unconfined = await resume(restoredPod("running"), "kube-router has not programmed 10.42.0.7 within 30s");
+  assert.match(unconfined.outcome, /kube-router has not programmed 10\.42\.0\.7 within 30s$/u);
+  assert.ok(!unconfined.writes.some((write) => write.startsWith("patch")));
 });
 
 test("a snapshot on the template before the current one is restored into that one, and a session restored so stays on it while it runs", async () => {

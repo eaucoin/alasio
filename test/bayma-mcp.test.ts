@@ -73,6 +73,7 @@ test("a folder conversation's bayma is its host Sandbox's endpoint, in Claude Co
       }),
     replace: () => Effect.die("alasio replaces no object"),
     patch: () => Effect.die("nothing is patched"),
+    patchPodStatus: () => Effect.die("no pod's status is patched"),
     remove: () => Effect.die("nothing is removed"),
     exec: () => Effect.die("nothing is run"),
   });

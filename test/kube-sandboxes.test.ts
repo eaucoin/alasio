@@ -31,6 +31,7 @@ import {
   type Sandbox,
   type SandboxFault,
   type SandboxRestore,
+  SandboxRestoreRefused,
   type SandboxSpec,
   type SandboxStatus,
   sandboxManifest,
@@ -174,6 +175,7 @@ function fakeKube({ onExec = () => ({ exitCode: 0, stdout: Buffer.alloc(0), stde
     }),
     replace: () => Effect.die("alasio replaces no object"),
     patch: (_apiVersion, kind, namespace, name, change) => patch(kind, namespace, name, change),
+    patchPodStatus: () => Effect.die("no pod's status is patched"),
     remove: (_apiVersion, kind, namespace, name) => Effect.suspend(() => {
       calls.push(["remove", kind, name]);
       const refused = onRemove(kind, name);
@@ -598,9 +600,10 @@ const RESTORING = "test.dev/restore-from";
  * A restore of the Sandbox `current` makes, from a snapshot of a pod of `older`'s template:
  * what it is told, in `told`.
  */
-const restoreOf = (older: Sandbox, told: string[]): SandboxRestore => ({
+const restoreOf = (older: Sandbox, told: string[], refused?: string): SandboxRestore => ({
   podTemplate: { ...older.spec.podTemplate, metadata: { ...older.spec.podTemplate.metadata, annotations: { [RESTORING]: "/snapshots/fs-abc123" } } },
   kept: older.spec.podTemplate,
+  resume: refused === undefined ? Effect.sync(() => void told.push("resumed")) : Effect.fail(new SandboxRestoreRefused({ reason: refused })),
   restored: Effect.sync(() => told.push("restored")),
   failed: (why) => Effect.sync(() => told.push(`failed: ${why}`)),
 });
@@ -629,7 +632,7 @@ test("ensure resumes a suspended Sandbox from a snapshot of its pod, by the temp
   await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
     const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore, keeps: () => true });
     yield* sandboxes.ensure("fs-abc123", () => current);
-    assert.deepEqual(told, ["restored"]);
+    assert.deepEqual(told, ["resumed", "restored"]);
     // Brought up again, its pod runs on, of the older template, which it keeps.
     kube.calls.length = 0;
     yield* sandboxes.ensure("fs-abc123", () => current);
@@ -657,9 +660,27 @@ test("a Sandbox whose restore's pod ends is suspended again, its restore told wh
     const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told)) });
     yield* sandboxes.ensure("fs-abc123", () => current);
   })).finally(controller.stop);
-  assert.deepEqual(told, ["failed: the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)"]);
+  assert.deepEqual(told, ["resumed", "failed: the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)"]);
   // The restore's pod, then one of alasio's template.
   assert.equal(controller.pods.length, 2);
+  const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
+  assert.deepEqual(resumed?.spec?.podTemplate, current.spec.podTemplate);
+  assert.equal(resumed?.spec?.operatingMode, "Running");
+});
+
+test("a Sandbox whose restored pod is not let run is suspended again, its restore told why, and resumed as it is", async () => {
+  const kube = fakeKube();
+  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  kube.create(older);
+  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { spec: { operatingMode: "Suspended" } });
+  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const told: string[] = [];
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told, "its egress was not confined within 30s")) });
+    yield* sandboxes.ensure("fs-abc123", () => current);
+  })).finally(controller.stop);
+  assert.deepEqual(told, ["failed: its egress was not confined within 30s"]);
   const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
   assert.deepEqual(resumed?.spec?.podTemplate, current.spec.podTemplate);
   assert.equal(resumed?.spec?.operatingMode, "Running");
