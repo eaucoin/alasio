@@ -1,14 +1,14 @@
 /**
  * What the clusters alasio makes on this machine, in Docker (./docker.ts) and on the
  * machine itself (./host.ts), share of k3s: how kubelet is set, the registries containerd
- * pulls from, the host aliases CoreDNS resolves, the `gvisor` RuntimeClass, nodes ready
- * since they started, the kubeconfig k3s writes made the operator's, and waits for all
- * that.
+ * pulls from, the host aliases CoreDNS resolves, the gVisor releases kept as containerd's
+ * runtimes and their RuntimeClasses, nodes ready since they started, the kubeconfig k3s
+ * writes made the operator's, and waits for all that.
  */
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
-import { type Cluster, KubeConfig, type User, type V1Node } from "@kubernetes/client-node";
+import { type Cluster, KubeConfig, type User, type V1Node, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 /** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
@@ -55,8 +55,115 @@ export const KUBELET_ARGS: readonly string[] = [
   "image-gc-low-threshold=95",
 ];
 
-/** gVisor, as containerd has it registered: the runtime `runsc` (cluster/node/config-v3.toml.tmpl). */
-export const GVISOR_RUNTIME_CLASS = { apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" };
+/**
+ * Where a node keeps the gVisor releases alasio keeps, each in a directory of its own
+ * named after it, as its release archive has them: runsc, its shim, and gvisor-bin/, the
+ * binaries runsc runs beside it.
+ */
+export const GVISOR_RELEASES = "/usr/local/lib/alasio/gvisor";
+
+/** The directory of gVisor's `release` on a node. */
+export const gvisorDirectory = (release: string): string => `${GVISOR_RELEASES}/${release}`;
+
+/** Where k3s's containerd reads its template, and runsc its options. */
+export const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
+
+/** gVisor's `release` as a DNS label, which containerd's runtimes and Kubernetes' RuntimeClasses are named with: its dots made dashes. */
+const gvisorLabel = (release: string): string => release.replaceAll(".", "-");
+
+/** The containerd runtime of gVisor's `release`, which a RuntimeClass names as its handler. */
+export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(release)}`;
+
+/**
+ * The pod annotations containerd passes on to gVisor's runtimes, and drops otherwise:
+ * those alasio's fork of gVisor restores a sandbox by, the CPU features its sandboxes are
+ * held to, and gVisor's hints for a pod's mounts.
+ */
+const GVISOR_POD_ANNOTATIONS = ["dev.gvisor.internal.restore.*", "dev.gvisor.internal.cpufeatures", "dev.gvisor.spec.mount.*"];
+
+/**
+ * The files that make each of gVisor's `releases` a runtime of k3s's containerd, by their
+ * paths: the containerd template, k3s's own configuration with a runtime for each
+ * release, which runs that release's shim, and each runtime's runsc options, which run
+ * that release's runsc, and, where `systemd` runs the machine, place its sandboxes'
+ * cgroups through systemd, as kubelet does there. alasio writes them on the machine (the
+ * host target), and puts them into each node's container (the cluster in Docker). Pure,
+ * for tests.
+ */
+export function gvisorRuntimeFiles(releases: readonly string[], { systemd }: { readonly systemd: boolean }): ReadonlyMap<string, string> {
+  const optionsPath = (release: string) => `${CONTAINERD}/${gvisorHandler(release)}.toml`;
+  const runtime = (release: string) => {
+    const table = `plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.${gvisorHandler(release)}`;
+    return [
+      "",
+      `[${table}]`,
+      `  runtime_type = "io.containerd.runsc.v1"`,
+      `  runtime_path = "${gvisorDirectory(release)}/containerd-shim-runsc-v1"`,
+      `  pod_annotations = [${GVISOR_POD_ANNOTATIONS.map((annotation) => `"${annotation}"`).join(", ")}]`,
+      "",
+      `[${table}.options]`,
+      `  TypeUrl = "io.containerd.runsc.v1.options"`,
+      `  ConfigPath = "${optionsPath(release)}"`,
+    ];
+  };
+  const options = (release: string) => [
+    `# runsc's options for gVisor ${release}, containerd's runtime ${gvisorHandler(release)}: that release's runsc,`,
+    "# which restores a sandbox from its snapshot directly, checking every file it reopens is the one saved.",
+    `binary_name = "${gvisorDirectory(release)}/runsc"`,
+    "restore_direct = true",
+    "",
+    "[runsc_config]",
+    `  restore-validate-files = "all"`,
+    ...(systemd ? ["  # Where systemd runs the machine, kubelet's cgroups are systemd's, and runsc places its sandboxes' through it too.", `  systemd-cgroup = "true"`] : []),
+  ];
+  const file = (lines: readonly string[]) => `${lines.join("\n")}\n`;
+  return new Map([
+    [`${CONTAINERD}/config-v3.toml.tmpl`, file([
+      `{{ template "base" . }}`,
+      "",
+      "# Each gVisor release alasio keeps, a runtime of its own, runsc-RELEASE (its dots made dashes), which runs that",
+      "# release's shim, with the pod annotations gVisor reads, and the runsc options beside this file.",
+      ...releases.flatMap(runtime),
+    ])],
+    ...releases.map((release) => [optionsPath(release), file(options(release))] as const),
+  ]);
+}
+
+/** The labels of the RuntimeClasses alasio makes, which tell them from others'. */
+const GVISOR_RUNTIME_CLASS_LABELS = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
+
+/**
+ * The RuntimeClasses of gVisor's `releases`, the current first: `gvisor`, which new
+ * sandboxes run with, the current release's, and `gvisor-RELEASE` (as a DNS label) for
+ * each, which a sandbox snapshotted under that release is restored with. Pure, for tests.
+ */
+export function gvisorRuntimeClasses(releases: readonly string[]): V1RuntimeClass[] {
+  const runtimeClass = (name: string, release: string): V1RuntimeClass => ({
+    apiVersion: "node.k8s.io/v1",
+    kind: "RuntimeClass",
+    metadata: { name, labels: GVISOR_RUNTIME_CLASS_LABELS },
+    handler: gvisorHandler(release),
+  });
+  return [
+    ...releases.slice(0, 1).map((release) => runtimeClass("gvisor", release)),
+    ...releases.map((release) => runtimeClass(`gvisor-${gvisorLabel(release)}`, release)),
+  ];
+}
+
+/**
+ * Of the cluster's RuntimeClasses, `existing`, the names of those to delete before
+ * `desired` are applied: alasio's that are not desired, as of a release no longer kept,
+ * and those desired with another handler, which a RuntimeClass cannot change. Pure, for
+ * tests.
+ */
+export function staleRuntimeClasses(existing: readonly V1RuntimeClass[], desired: readonly V1RuntimeClass[]): string[] {
+  const handlers = new Map(desired.map(({ metadata, handler }) => [metadata?.name, handler]));
+  return existing.flatMap(({ metadata, handler }) => {
+    const ours = Object.entries(GVISOR_RUNTIME_CLASS_LABELS).every(([key, value]) => metadata?.labels?.[key] === value);
+    const wanted = handlers.get(metadata?.name);
+    return (wanted === undefined ? ours : wanted !== handler) ? [metadata?.name ?? ""] : [];
+  });
+}
 
 /** k3s's registries.yaml of `registries`, written as JSON, which YAML reads as it is. Pure, for tests. */
 export function registriesYaml({ mirrors = {}, configs = {} }: Registries): string {

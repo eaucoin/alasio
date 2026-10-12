@@ -1,12 +1,12 @@
 /**
  * A Kubernetes API server in memory, over HTTPS, for the tests of alasio's command line:
  * the endpoints its KubeApi (../../src/kube/api.ts) calls. It keeps objects by their path,
- * takes server-side applies and merge patches, lists by label and field selectors,
- * deletes (a namespace with what is in it), serves pods' logs, runs commands in
- * containers over a websocket, as the API server's exec does (channel protocol v4), with
- * what the test answers, and forwards a pod's port, as its port-forward does, to a port
- * of the loopback the test names. It records every change, in order, every command, and
- * every forward.
+ * takes server-side applies and merge patches, refusing a RuntimeClass's handler changed
+ * as the API server does, lists by label and field selectors, deletes (a namespace with
+ * what is in it), serves pods' logs, runs commands in containers over a websocket, as the
+ * API server's exec does (channel protocol v4), with what the test answers, and forwards
+ * a pod's port, as its port-forward does, to a port of the loopback the test names. It
+ * records every change, in order, every command, and every forward.
  *
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
@@ -426,6 +426,10 @@ export async function serveFakeKube(): Promise<FakeKube> {
       changes.push({ method, path, contentType, query: url.searchParams });
       const patch = JSON.parse(body.toString("utf8")) as KubeObject;
       if (contentType === "application/merge-patch+json" && !existing) return refuse(response, 404, `${target.plural} "${target.name}" not found`);
+      // A RuntimeClass's handler cannot change, as the API server's validation has it.
+      if (existing?.kind === "RuntimeClass" && patch["handler"] !== undefined && patch["handler"] !== existing["handler"]) {
+        return refuse(response, 422, `RuntimeClass.node.k8s.io "${target.name}" is invalid: handler: Invalid value: ${JSON.stringify(patch["handler"])}: field is immutable`);
+      }
       version += 1;
       const base: KubeObject = existing ?? { ...patch, metadata: { ...patch.metadata, uid: `uid-${version}`, generation: 0, creationTimestamp: new Date().toISOString() } };
       const applied = contentType === "application/apply-patch+yaml";

@@ -10,6 +10,8 @@ import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker-engine.ts";
 import { DockerCluster, type DockerClusterOptions, freeSubnet, subnetAddress } from "../src/cluster/docker.ts";
+import { gvisorRuntimeClasses, gvisorRuntimeFiles } from "../src/cluster/k3s.ts";
+import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
@@ -96,7 +98,9 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
     "POST /volumes/create",
     "POST /volumes/create",
     "POST /volumes/create",
+    "POST /volumes/create",
     "POST /containers/create",
+    "PUT /containers/dev-server-0/archive",
     "POST /containers/dev-server-0/start",
   ]);
   assert.equal(fake.requests.find(({ path }) => path === "/images/create")?.query.get("fromImage"), "ghcr.io/eaucoin/alasio-node:test");
@@ -106,7 +110,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
     IPAM: { Config: [{ Subnet: "172.30.9.0/24" }] },
     Labels: { "alasio.cluster": "dev" },
   });
-  assert.deepEqual([...fake.volumes.keys()], ["dev-server-0-k3s", "dev-server-0-kubelet", "dev-server-0-cni", "dev-server-0-log"]);
+  assert.deepEqual([...fake.volumes.keys()], ["dev-server-0-k3s", "dev-server-0-kubelet", "dev-server-0-cni", "dev-server-0-log", "dev-server-0-snapshots"]);
 
   const { Labels, ...server } = sent(fake, "POST", "/containers/create") as { Labels: Record<string, string> };
   assert.equal(Labels["alasio.cluster"], "dev");
@@ -141,6 +145,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
         { Type: "volume", Source: "dev-server-0-kubelet", Target: "/var/lib/kubelet" },
         { Type: "volume", Source: "dev-server-0-cni", Target: "/var/lib/cni" },
         { Type: "volume", Source: "dev-server-0-log", Target: "/var/log" },
+        { Type: "volume", Source: "dev-server-0-snapshots", Target: "/var/lib/alasio/snapshots" },
         { Type: "bind", Source: options.storagePath, Target: options.storagePath },
       ],
       ExtraHosts: ["otelcol.observability:172.30.9.250"],
@@ -152,7 +157,8 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
 
   assert.equal(k3s.nodeHosts, "172.30.9.2 dev-server-0\n172.30.9.250 otelcol.observability");
   assert.deepEqual(k3s.patches, [{ metadata: { resourceVersion: "1" }, data: { NodeHosts: k3s.nodeHosts } }]);
-  assert.deepEqual(k3s.applied, [{ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor" }, handler: "runsc" }]);
+  assert.deepEqual(fake.containers.get("dev-server-0")?.files, new Map([...gvisorRuntimeFiles(gvisorReleases(NODE_PINS), { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+  assert.deepEqual(k3s.applied, [{ apiVersion: "v1", kind: "List", items: gvisorRuntimeClasses(gvisorReleases(NODE_PINS)) }]);
 
   assert.equal(statSync(kubeconfig).mode & 0o777, 0o600);
   const written = new KubeConfig();
@@ -196,12 +202,44 @@ test("up makes a node made from other settings anew, keeping its volumes", async
     "POST /volumes/create",
     "POST /volumes/create",
     "POST /volumes/create",
+    "POST /volumes/create",
     "POST /containers/create",
+    "PUT /containers/dev-server-0/archive",
     "POST /containers/dev-server-0/start",
   ]);
   const { HostConfig } = sent(fake, "POST", "/containers/create") as { HostConfig: { Mounts: unknown[] } };
   assert.deepEqual(HostConfig.Mounts.at(-1), { Type: "bind", Source: "/home", Target: "/home", ReadOnly: false });
-  assert.equal(fake.volumes.size, 4);
+  assert.equal(fake.volumes.size, 5);
+});
+
+test("up makes the nodes anew when the gVisor releases change, with their files put in before they start, and replaces their RuntimeClasses", async (t) => {
+  const { fake, k3s, kubeconfig, run } = await rig(t);
+  const runtimeClasses = () => [...k3s.runtimeClasses.values()].map(({ metadata, handler }) => `${metadata.name} ${handler}`).sort();
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, gvisor: ["20990101.0"] });
+  assert.deepEqual(runtimeClasses(), ["gvisor runsc-20990101-0", "gvisor-20990101-0 runsc-20990101-0"]);
+
+  const changes = fake.changes().length;
+  const releases = ["21000101.0", "20990101.0"];
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, gvisor: releases });
+  assert.deepEqual(fake.changes().slice(changes).filter((change) => !change.startsWith("POST /volumes")), [
+    "POST /containers/dev-server-0/stop",
+    "DELETE /containers/dev-server-0",
+    "POST /containers/create",
+    "PUT /containers/dev-server-0/archive",
+    "POST /containers/dev-server-0/start",
+    "POST /containers/dev-agent-0/stop",
+    "DELETE /containers/dev-agent-0",
+    "POST /containers/create",
+    "PUT /containers/dev-agent-0/archive",
+    "POST /containers/dev-agent-0/start",
+  ]);
+  for (const node of ["dev-server-0", "dev-agent-0"]) {
+    assert.deepEqual(fake.containers.get(node)?.files, new Map([...gvisorRuntimeFiles(releases, { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+  }
+  assert.deepEqual(runtimeClasses(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
+
+  await run((cluster) => cluster.up(kubeconfig), { agents: 1, gvisor: ["21000101.0"] });
+  assert.deepEqual(runtimeClasses(), ["gvisor runsc-21000101-0", "gvisor-21000101-0 runsc-21000101-0"]);
 });
 
 test("agents join the server with the token it made, at the addresses after it, and stop before it", async (t) => {
@@ -312,7 +350,7 @@ test("remove aborts the FUSE connections of each running node's mounts, deletes 
   assert.deepEqual(k3s.aborted, ["dev-server-0"]);
   assert.equal(fake.containers.size, 0);
   assert.equal(fake.networks.size, 0);
-  assert.equal(fake.volumes.size, 9);
+  assert.equal(fake.volumes.size, 11);
   await run((cluster) => cluster.remove({ volumes: true }));
   assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
 });
@@ -370,10 +408,12 @@ test("every node is made with the registries, as k3s's registries.yaml, and made
     "POST /containers/dev-server-0/stop",
     "DELETE /containers/dev-server-0",
     "POST /containers/create",
+    "PUT /containers/dev-server-0/archive",
     "POST /containers/dev-server-0/start",
     "POST /containers/dev-agent-0/stop",
     "DELETE /containers/dev-agent-0",
     "POST /containers/create",
+    "PUT /containers/dev-agent-0/archive",
     "POST /containers/dev-agent-0/start",
   ]);
   assert.match(environments().at(-1)?.[1]?.[0] ?? "", /"configs":\{"registry\.example:5000":\{"tls":\{"insecure_skip_verify":true\}\}\}/u);

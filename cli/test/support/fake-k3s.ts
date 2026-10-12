@@ -1,10 +1,16 @@
 /**
  * k3s in the nodes of a fake Docker (./fake-docker.ts): kubectl in the server node, over
- * an API server in memory (nodes, CoreDNS's ConfigMap, and what is applied), find and
- * the abort of FUSE's connections in every node, and the files k3s writes in the server
- * node, its kubeconfig and token.
+ * an API server in memory (nodes, CoreDNS's ConfigMap, RuntimeClasses, and what is
+ * applied), find and the abort of FUSE's connections in every node, and the files k3s
+ * writes in the server node, its kubeconfig and token.
  */
 import { type FakeContainer, type FakeDocker, type FakeDockerOptions, type FakeExecResult, serveFakeDocker } from "./fake-docker.ts";
+
+/** A RuntimeClass, as far as the fake reads it. */
+interface RuntimeClass {
+  readonly metadata: { readonly name: string; readonly labels?: Readonly<Record<string, string>> };
+  readonly handler: string;
+}
 
 /** The token the server makes, which agents join with. */
 export const K3S_TOKEN = "K10abc::server:secret";
@@ -18,6 +24,8 @@ export class FakeK3s {
   resourceVersion = 1;
   readonly patches: unknown[] = [];
   readonly applied: unknown[] = [];
+  /** The cluster's RuntimeClasses, by name. */
+  readonly runtimeClasses = new Map<string, RuntimeClass>();
   /** How many times find fails yet, as it does on a directory a pod writes in as it is removed. */
   findFailures = 0;
   /** The nodes FUSE's connections were aborted in. */
@@ -60,8 +68,23 @@ export class FakeK3s {
       this.resourceVersion += 1;
       return { exitCode: 0 };
     }
+    if (verb === "get" && args.includes("runtimeclasses")) return { exitCode: 0, stdout: JSON.stringify({ items: [...this.runtimeClasses.values()] }) };
+    if (verb === "delete" && args[1] === "runtimeclasses") {
+      for (const name of args.slice(2)) this.runtimeClasses.delete(name);
+      return { exitCode: 0 };
+    }
     if (verb === "apply") {
-      this.applied.push(JSON.parse(stdin.toString("utf8")));
+      const applied = JSON.parse(stdin.toString("utf8")) as { kind: string; items?: RuntimeClass[] } & RuntimeClass;
+      this.applied.push(applied);
+      for (const runtimeClass of applied.kind === "List" ? applied.items ?? [] : [applied]) {
+        const { name } = runtimeClass.metadata;
+        // A RuntimeClass's handler cannot change, as the API server's validation has it.
+        const existing = this.runtimeClasses.get(name);
+        if (existing && existing.handler !== runtimeClass.handler) {
+          return { exitCode: 1, stderr: `The RuntimeClass "${name}" is invalid: handler: Invalid value: "${runtimeClass.handler}": field is immutable` };
+        }
+        this.runtimeClasses.set(name, runtimeClass);
+      }
       return { exitCode: 0 };
     }
     return { exitCode: 1, stderr: `unknown command ${command.join(" ")}` };

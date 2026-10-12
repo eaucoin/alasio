@@ -1,10 +1,10 @@
 /**
  * This machine made a k3s node (cli/src/cluster/node.ts), as root: the files that set k3s
- * and its containerd, gVisor's release installed from its archive, what k3s's own scripts
- * do, and what is downloaded checked against its pin again as root.
+ * and its containerd, gVisor's releases installed from their archives and removed, what
+ * k3s's own scripts do, and what is downloaded checked against its pin again as root.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -12,12 +12,14 @@ import { test, type TestContext } from "node:test";
 import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer, Logger } from "effect";
 
+import { gvisorRuntimeFiles } from "../src/cluster/k3s.ts";
 import { Machine } from "../src/cluster/machine.ts";
-import { type Artifact, downloads, InstallGvisor, nodeFiles, type NodeStep, performNodeStep, RUNSC_TOML } from "../src/cluster/node.ts";
+import { type Artifact, ConfigureNode, downloads, InstallGvisor, nodeFiles, type NodeStep, performNodeStep, RemoveGvisor } from "../src/cluster/node.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
-import { fakeReleases } from "./support/fake-releases.ts";
+import { type FakeReleases, fakeReleases } from "./support/fake-releases.ts";
 
-const TEMPLATE = readFileSync(new URL("../../cluster/node/config-v3.toml.tmpl", import.meta.url), "utf8");
+const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
+const STORAGE = "/home/op/.local/share/alasio/storage";
 
 /** A machine of the test's, and a way to do a step on it as root. */
 function rig(t: TestContext) {
@@ -35,16 +37,16 @@ function rig(t: TestContext) {
   return { directory, machine, perform };
 }
 
-test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds; registries only when given; the template; runsc's options", () => {
-  const files = nodeFiles({ role: "server", storagePath: "/home/op/.local/share/alasio/storage" }, TEMPLATE);
-  assert.deepEqual([...files.keys()], ["/etc/rancher/k3s/config.yaml", "/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl", RUNSC_TOML]);
+test("a server's files: k3s's config, without traefik, its volumes where the config says, kubelet's thresholds; registries only when given; each gVisor release a runtime, where systemd runs the machine", () => {
+  const files = nodeFiles({ role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] });
+  assert.deepEqual([...files.keys()], ["/etc/rancher/k3s/config.yaml", `${CONTAINERD}/config-v3.toml.tmpl`, `${CONTAINERD}/runsc-20990101-0.toml`]);
   const [comment, k3s] = (files.get("/etc/rancher/k3s/config.yaml") ?? "").split("\n");
   assert.match(comment ?? "", /^# /u);
   assert.deepEqual(JSON.parse(k3s ?? ""), {
     "disable": ["traefik"],
     "cluster-cidr": "10.42.0.0/16",
     "service-cidr": "10.43.0.0/16",
-    "default-local-storage-path": "/home/op/.local/share/alasio/storage",
+    "default-local-storage-path": STORAGE,
     "kubelet-arg": [
       "kube-reserved=cpu=250m,memory=1Gi",
       "system-reserved=cpu=250m,memory=512Mi",
@@ -54,33 +56,61 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
       "image-gc-low-threshold=95",
     ],
   });
-  assert.match(files.get(RUNSC_TOML) ?? "", /\[runsc_config\]\n {2}systemd-cgroup = "true"\n$/u);
+  const runtimes = gvisorRuntimeFiles(["20990101.0"], { systemd: true });
+  for (const [path, content] of runtimes) assert.equal(files.get(path), content);
   const registries = { mirrors: { "docker.io": { endpoint: ["https://mirror.lan"] } }, configs: {} };
-  assert.equal(nodeFiles({ role: "server", storagePath: "/srv", registries }, TEMPLATE).get("/etc/rancher/k3s/registries.yaml"), `{"mirrors":{"docker.io":{"endpoint":["https://mirror.lan"]}},"configs":{}}\n`);
+  assert.equal(nodeFiles({ role: "server", storagePath: "/srv", registries, gvisor: [] }).get("/etc/rancher/k3s/registries.yaml"), `{"mirrors":{"docker.io":{"endpoint":["https://mirror.lan"]}},"configs":{}}\n`);
 });
 
-test("the containerd template, the node image's, gives runsc the options a node writes where systemd's cgroups are kubelet's, and only there", () => {
-  assert.match(TEMPLATE, new RegExp(`\\{\\{- if \\.SystemdCgroup \\}\\}[^]*ConfigPath = "${RUNSC_TOML}"\\n\\{\\{- end \\}\\}\\n$`, "u"));
-  assert.match(TEMPLATE, /^\{\{ template "base" \. \}\}\n\n\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runsc\]\n {2}runtime_type = "io\.containerd\.runsc\.v1"\n/u);
+test("configuring the node removes runsc's options for releases it no longer runs, and leaves containerd's own configuration", async (t) => {
+  const { machine, perform } = rig(t);
+  machine.write(`${CONTAINERD}/config.toml`, "# containerd's, which k3s writes from the template\n");
+  machine.write(`${CONTAINERD}/runsc.toml`, "[runsc_config]\n");
+  machine.write(`${CONTAINERD}/runsc-20980101-0.toml`, "[runsc_config]\n");
+  assert.equal(await perform(ConfigureNode.make({ config: { role: "server", storagePath: STORAGE, gvisor: ["20990101.0"] } })), null);
+  assert.deepEqual(["config.toml", "config-v3.toml.tmpl", "runsc.toml", "runsc-20980101-0.toml", "runsc-20990101-0.toml"].filter((name) => machine.has(`${CONTAINERD}/${name}`)), [
+    "config.toml",
+    "config-v3.toml.tmpl",
+    "runsc-20990101-0.toml",
+  ]);
 });
 
-/** gVisor's release archive, downloaded into `directory`, as the operator's command leaves it for root. */
-function downloaded(directory: string, releases = fakeReleases()): Artifact {
-  const download = downloads(releases.pins).gvisor;
-  const path = join(directory, "gvisor.tar.zstd");
+/** The archive of gVisor's `release`, downloaded into `directory`, as the operator's command leaves it for root. */
+function downloaded(directory: string, release = "20990101.0", releases: FakeReleases = fakeReleases({ gvisor: [release] })): Artifact {
+  const download = downloads(releases.pins).gvisor.get(release);
+  assert.ok(download);
+  const path = join(directory, `gvisor-${release}.tar.zstd`);
   writeFileSync(path, releases.served.get(download.url) ?? "");
   return { path, ...download };
 }
 
-test("gVisor's release is installed as its archive has it, runsc, its shim and gvisor-bin/, and nothing else of it", async (t) => {
+test("each gVisor release is installed in its own directory as its archive has it, runsc, its shim and gvisor-bin/, and nothing else of it", async (t) => {
   const { directory, machine, perform } = rig(t);
   assert.equal(await perform(InstallGvisor.make({ release: "20990101.0", archive: downloaded(directory) })), null);
-  assert.equal(machine.read("/usr/local/bin/runsc"), "runsc 20990101.0\n");
-  assert.equal(machine.read("/usr/local/bin/containerd-shim-runsc-v1"), "containerd-shim-runsc-v1 20990101.0\n");
-  assert.equal(machine.read("/usr/local/bin/gvisor-bin/gvisor_sentry"), "gvisor_sentry 20990101.0\n");
-  assert.equal(statSync(machine.at("/usr/local/bin/runsc")).mode & 0o777, 0o755);
-  assert.equal(machine.has("/usr/local/bin/README"), false);
-  assert.deepEqual(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? ""), { gvisor: "20990101.0" });
+  const installed = "/usr/local/lib/alasio/gvisor/20990101.0";
+  assert.equal(machine.read(`${installed}/runsc`), "runsc 20990101.0\n");
+  assert.equal(machine.read(`${installed}/containerd-shim-runsc-v1`), "containerd-shim-runsc-v1 20990101.0\n");
+  assert.equal(machine.read(`${installed}/gvisor-bin/gvisor_sentry`), "gvisor_sentry 20990101.0\n");
+  assert.equal(statSync(machine.at(`${installed}/runsc`)).mode & 0o777, 0o755);
+  assert.equal(machine.has(`${installed}/README`), false);
+  assert.equal(machine.has("/usr/local/bin/runsc"), false);
+  assert.deepEqual(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? ""), { gvisor: ["20990101.0"] });
+
+  assert.equal(await perform(InstallGvisor.make({ release: "21000101.0", archive: downloaded(directory, "21000101.0") })), null);
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/21000101.0/runsc"), "runsc 21000101.0\n");
+  assert.equal(machine.read(`${installed}/runsc`), "runsc 20990101.0\n");
+  assert.deepEqual(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? ""), { gvisor: ["20990101.0", "21000101.0"] });
+});
+
+test("a gVisor release is removed with its processes stopped, and the others kept", async (t) => {
+  const { directory, machine, perform } = rig(t);
+  for (const release of ["20990101.0", "21000101.0"]) await perform(InstallGvisor.make({ release, archive: downloaded(directory, release) }));
+  assert.equal(await perform(RemoveGvisor.make({ release: "20990101.0" })), null);
+  const removed = "/usr/local/lib/alasio/gvisor/20990101.0";
+  assert.deepEqual(machine.killed, [[`${removed}/runsc`, `${removed}/containerd-shim-runsc-v1`, `${removed}/gvisor-bin/gvisor_sentry`]]);
+  assert.equal(machine.has(removed), false);
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/21000101.0/runsc"), "runsc 21000101.0\n");
+  assert.deepEqual(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? ""), { gvisor: ["21000101.0"] });
 });
 
 test("an archive changed since it was downloaded is refused as root, and nothing of it installed", async (t) => {
@@ -88,6 +118,6 @@ test("an archive changed since it was downloaded is refused as root, and nothing
   const archive = downloaded(directory);
   writeFileSync(archive.path, "changed");
   assert.match(await perform(InstallGvisor.make({ release: "20990101.0", archive })) ?? "", /^https:\/\/github\.com\/eaucoin\/gvisor\/.* is not what alasio pins: its sha512 is /u);
-  assert.equal(machine.has("/usr/local/bin/runsc"), false);
+  assert.equal(machine.has("/usr/local/lib/alasio"), false);
   assert.equal(machine.has("/etc/rancher/k3s/alasio.json"), false);
 });

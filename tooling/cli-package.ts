@@ -23,8 +23,7 @@ const MAX_BUFFER = 16 * 1024 * 1024;
 
 /**
  * What the package must hold: its command, and what is data, not code: the CRDs it applies,
- * and the node's pins and containerd template, cluster/node's, which the host target
- * installs from.
+ * and the node's pins, cluster/node's, which the host target installs from.
  */
 export const REQUIRED = [
   "dist/cli/src/main.js",
@@ -38,7 +37,6 @@ export const REQUIRED = [
   "dist/cli/src/manifests/verticalpodautoscalers.autoscaling.k8s.io.json",
   "dist/cli/src/manifests/verticalpodautoscalercheckpoints.autoscaling.k8s.io.json",
   "dist/cluster/node/pins.json",
-  "dist/cluster/node/config-v3.toml.tmpl",
 ] as const;
 
 /** A packed package: its tarball, and the paths it holds, relative to the package. */

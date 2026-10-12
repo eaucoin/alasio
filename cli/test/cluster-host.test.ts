@@ -15,23 +15,32 @@ import { Effect, Layer, Logger } from "effect";
 
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
 import { Machine } from "../src/cluster/machine.ts";
-import { NODE_PINS } from "../src/cluster/node.ts";
+import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
 import { CERTIFICATE, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
 
-const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: NODE_PINS.gvisor.release, config: "digest" };
+const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: gvisorReleases(NODE_PINS), config: "digest" };
 const RUNNING = { loaded: true, active: "active", enabled: true };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
   const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
     planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, ...changes });
-  const none = { firewall: null, configure: false, gvisor: false, k3s: null, kubeconfig: false, renew: false };
+  const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, k3s: null, kubeconfig: false, renew: false };
   assert.deepEqual(plan({}), none);
-  assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), { firewall: null, configure: true, gvisor: true, k3s: "install", kubeconfig: true, renew: false });
+  assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), {
+    firewall: null,
+    configure: true,
+    gvisor: { install: gvisorReleases(NODE_PINS), remove: [] },
+    k3s: "install",
+    kubeconfig: true,
+    renew: false,
+  });
   assert.deepEqual(plan({ config: "another" }), { ...none, configure: true, k3s: "restart", kubeconfig: true });
-  assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: "20200101.0" } }), { ...none, gvisor: true, k3s: "restart", kubeconfig: true });
+  assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: ["20200101.0"] } }), { ...none, gvisor: { install: gvisorReleases(NODE_PINS), remove: ["20200101.0"] }, k3s: "restart", kubeconfig: true });
+  assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: [...INSTALLED.gvisor, "20200101.0"] } }), { ...none, gvisor: { install: [], remove: ["20200101.0"] }, k3s: "restart", kubeconfig: true });
+  assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: [] } }), { ...none, gvisor: { install: gvisorReleases(NODE_PINS), remove: [] }, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, k3s: "v1.30.0+k3s1" } }), { ...none, k3s: "install", kubeconfig: true });
   assert.deepEqual(plan({ unit: { ...RUNNING, active: "inactive", enabled: false } }), { ...none, k3s: "start", kubeconfig: true });
   assert.deepEqual(plan({ unit: { ...RUNNING, active: "failed" } }), { ...none, k3s: "start", kubeconfig: true });
@@ -46,6 +55,15 @@ test("planNode asks for nothing once all is as alasio installed it, and for what
   assert.deepEqual(plan({ stamp: { ...INSTALLED, firewall: opened } }), none);
   // A restart renews the certificates anyway.
   assert.deepEqual(plan({ kubeconfig: "expiring", config: "another" }), { ...none, configure: true, k3s: "restart", kubeconfig: true });
+});
+
+test("planNode installs a newly pinned gVisor release beside the one before it, and removes that once it is no longer pinned", () => {
+  const plan = (releases: readonly string[], installed: readonly string[]) =>
+    planNode(fakeReleases({ gvisor: releases }).pins, { stamp: { ...INSTALLED, k3s: "v1.99.0+k3s1", gvisor: installed }, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null });
+  assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0"]).gvisor, { install: ["21000101.0"], remove: [] });
+  assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: [], remove: [] });
+  assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: ["21010101.0"], remove: ["20990101.0"] });
+  assert.equal(plan(["21000101.0"], ["20990101.0", "21000101.0"]).k3s, "restart");
 });
 
 /** A kubeconfig whose client certificate is `certificate`. */
@@ -92,8 +110,8 @@ test("the operator's kubeconfig is read anew when it is missing, or its certific
   assert.equal(kubeconfigState(withCertificate(CERTIFICATE), new Date()), "current");
 });
 
-/** k3s on a machine of the test's, its node in a fake API, which `ready` says whether it reports ready as k3s starts. */
-async function rig(t: TestContext, ready: { since: boolean }) {
+/** k3s on a machine of the test's, from `releases`, its node in a fake API, which `ready` says whether it reports ready as k3s starts. */
+async function rig(t: TestContext, ready: { since: boolean }, releases = fakeReleases()) {
   const kube = await serveFakeKube();
   const directory = mkdtempSync(join(tmpdir(), "alasio-host-"));
   t.after(async () => {
@@ -114,14 +132,14 @@ async function rig(t: TestContext, ready: { since: boolean }) {
         Effect.provide(
           HostCluster.layer({ storagePath: join(directory, "storage"), readyTimeout: "300 millis", poll: "5 millis" }).pipe(
             Layer.provide(Root.inProcess),
-            Layer.provideMerge(Layer.mergeAll(Layer.succeed(Machine, { platform: "linux", arch: "x64", root: machine.root }), machine.layer, machine.systemd, fakeReleases().layer)),
+            Layer.provideMerge(Layer.mergeAll(Layer.succeed(Machine, { platform: "linux", arch: "x64", root: machine.root }), machine.layer, machine.systemd, releases.layer)),
             Layer.provideMerge(NodeServices.layer),
           ),
         ),
         Effect.provide(Logger.layer([])),
       ),
     );
-  return { machine, up };
+  return { kube, machine, up };
 }
 
 test("up waits for the node reported ready since k3s started anew, not before", async (t) => {
@@ -130,6 +148,19 @@ test("up waits for the node reported ready since k3s started anew, not before", 
   assert.match(await up() ?? "", /^k3s on this machine was not ready within 0\.3s, waiting for its node: not reported ready since started: machine$/u);
   ready.since = true;
   assert.equal(await up(), null);
+});
+
+test("up applies gVisor's RuntimeClasses, deleting first alasio's of releases no longer kept, and one whose handler is another, which cannot change", async (t) => {
+  const { kube, up } = await rig(t, { since: true }, fakeReleases({ gvisor: ["21000101.0", "20990101.0"] }));
+  const labels = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
+  const runtimeClass = (name: string, handler: string, labelled = true) =>
+    kube.put("runtimeclasses", { apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name, ...(labelled ? { labels } : {}) }, handler });
+  runtimeClass("gvisor", "runsc", false);
+  runtimeClass("gvisor-20980101-0", "runsc-20980101-0");
+  runtimeClass("kata", "kata", false);
+  assert.equal(await up(), null);
+  const handlers = [...kube.objects].filter(([path]) => path.startsWith("/apis/node.k8s.io/v1/runtimeclasses/")).map(([, { metadata, handler }]) => [metadata.name, handler]);
+  assert.deepEqual(handlers.sort(), [["gvisor", "runsc-21000101-0"], ["gvisor-20990101-0", "runsc-20990101-0"], ["gvisor-21000101-0", "runsc-21000101-0"], ["kata", "kata"]]);
 });
 
 test("what root's work did not do as it failed is done the next time, as alasio installed what it did", async (t) => {

@@ -331,7 +331,7 @@ describe("alasio's command line, on the alasio it installed", () => {
   test("status says the cluster's nodes run, and each of alasio's workloads is ready", async () => {
     const said = await alasioOk("status");
     if (TARGET === "host") {
-      assert.match(said, /^k3s v\S+ on this machine, with gVisor \S+:\n {2}service k3s: active, enabled\n {2}node \S+: ready\n/u);
+      assert.match(said, /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?:\n {2}service k3s: active, enabled\n {2}node \S+: ready\n/u);
     } else {
       assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));
       const nodes = [`${CLUSTER}-server-0`, ...Array.from({ length: AGENTS }, (_, index) => `${CLUSTER}-agent-${index}`)];
@@ -1439,9 +1439,7 @@ if (inShard("branches")) {
 const INSTALLED_HERE = [
   "/usr/local/bin/k3s",
   "/usr/local/bin/k3s-uninstall.sh",
-  "/usr/local/bin/runsc",
-  "/usr/local/bin/containerd-shim-runsc-v1",
-  "/usr/local/bin/gvisor-bin",
+  "/usr/local/lib/alasio",
   "/etc/systemd/system/k3s.service",
   "/etc/rancher",
   "/var/lib/rancher",
@@ -1470,7 +1468,7 @@ describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster"
       const left = INSTALLED_HERE.filter((path) => existsSync(path));
       assert.deepEqual(left, [], left.length > 0 ? await onNode("", `ls -laR ${left.join(" ")} 2>&1 | head -50`) : "");
       // Nothing of k3s's, its containerd's or gVisor's runs on, by the executables of what runs.
-      const running = "for process in /proc/[0-9]*; do readlink \"$process/exe\" 2>/dev/null; done | grep -E '^(/usr/local/bin/(k3s|runsc|containerd-shim-runsc-v1|gvisor-bin/)|/var/lib/rancher/k3s/)' || true";
+      const running = "for process in /proc/[0-9]*; do readlink \"$process/exe\" 2>/dev/null; done | grep -E '^(/usr/local/bin/k3s|/usr/local/lib/alasio/gvisor/|/var/lib/rancher/k3s/)' || true";
       assert.equal(await onNode("", running), "");
     } else {
       assert.match(status.stdout, new RegExp(`^cluster ${CLUSTER}, in Docker .*:\n {2}not made\n$`, "u"));

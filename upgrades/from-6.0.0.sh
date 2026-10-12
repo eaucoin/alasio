@@ -36,6 +36,7 @@ set -euo pipefail
 umask 077
 : "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${CONFIG:?the file of that configuration}" "${OUT:?where to record}"
 NS=alasio
+STAMP=/etc/rancher/k3s/alasio.json
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/events.log" >&2; }
 fail() {
@@ -69,10 +70,11 @@ stop() {
   }
   wait_for 300 "$1's pods to be gone" gone
 }
-# Gives each Deployment stop stopped back the replicas it ran, as a failure before the upgrade
-# leaves the installation as 6.0.0 ran it.
+# Gives each Deployment stop stopped back the replicas it ran, and the machine its stamp as
+# 6.0.0 wrote it, as a failure before the upgrade leaves the installation as 6.0.0 ran it.
 restart() {
   local file
+  [ ! -e "$OUT/alasio.json" ] || cat "$OUT/alasio.json" >"$STAMP" || log "could not write $STAMP back as 6.0.0 wrote it, kept in $OUT/alasio.json"
   for file in "$OUT"/replicas-*; do
     [ -e "$file" ] && [ "${file%.part}" = "$file" ] || continue
     k scale deploy/"${file#"$OUT/replicas-"}" --replicas="$(cat "$file")" >/dev/null || log "could not scale ${file#"$OUT/replicas-"} back to $(cat "$file")"
@@ -111,7 +113,7 @@ main_alone() {
     fail "neon-control's record holds no main ready: $(jq -c '[.branches[] | {name, state}]' "$1")"
 }
 
-for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
+for tool in jq k3s kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 [ -f "$CONFIG" ] && jq -e '.install | type == "object"' "$CONFIG" >/dev/null 2>&1 || fail "CONFIG, $CONFIG, is not alasio's configuration"
 
@@ -178,6 +180,15 @@ SQL
     mv "$CONFIG.part" "$CONFIG"
   fi
 
+  # alasio keeps each gVisor release in a directory of its own, and its stamp of what it
+  # installed on the machine lists them, where 6.0.0's named the one in /usr/local/bin. A
+  # stamp alasio cannot read is none, which would install k3s anew: its list emptied, the
+  # upgrade installs every release this one pins beside it, and keeps the rest of it.
+  [ -e "$OUT/alasio.json" ] || cp -p "$STAMP" "$OUT/alasio.json"
+  log "emptying the gVisor releases of alasio's stamp, $STAMP (6.0.0's: $(jq -c .gvisor "$OUT/alasio.json"))"
+  jq '.gvisor = []' "$OUT/alasio.json" >"$OUT/alasio.json.next"
+  cat "$OUT/alasio.json.next" >"$STAMP"
+
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"
 fi
@@ -185,7 +196,32 @@ fi
 log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
 printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
 bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
-  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it; or, to run 6.0.0 as it was instead, scale each Deployment it stopped back to the replicas OUT/replicas-<name> holds (kubectl -n $NS scale deploy/<name> --replicas=<n>)"
+  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it; or, to run 6.0.0 as it was instead, scale each Deployment it stopped back to the replicas OUT/replicas-<name> holds (kubectl -n $NS scale deploy/<name> --replicas=<n>), and write OUT/alasio.json back to $STAMP"
+
+# The pods the upgrade left running under 6.0.0's gVisor, the containerd runtime runsc, which
+# this release has none of: deleted, each comes back under the release's, as its owner makes
+# it again; then, once no sandbox of runsc's is left, of any state, and no process runs a
+# program of its, 6.0.0's gVisor goes.
+on_previous_gvisor() { k3s crictl pods -o json | jq -r '.items[] | select(.runtimeHandler == "runsc") | "\(.metadata.namespace) \(.metadata.name) \(.state)"'; }
+while read -r namespace pod state; do
+  [ -n "$pod" ] && [ "$state" = SANDBOX_READY ] || continue
+  log "deleting $namespace/$pod, which runs under 6.0.0's gVisor"
+  kubectl -n "$namespace" delete pod "$pod" --ignore-not-found --wait=false >/dev/null
+done <<<"$(on_previous_gvisor)"
+# The processes that run 6.0.0's runsc or its shim, by their PIDs.
+running_previous_gvisor() {
+  local exe
+  for exe in /proc/[0-9]*/exe; do
+    case "$(readlink "$exe" 2>/dev/null)" in /usr/local/bin/runsc | /usr/local/bin/containerd-shim-runsc-v1 | /usr/local/bin/gvisor-bin/*) echo "${exe%/exe}" ;; esac
+  done
+}
+nothing_of_previous_gvisor() {
+  local sandboxes
+  sandboxes=$(on_previous_gvisor) && [ -z "$sandboxes" ] && [ -z "$(running_previous_gvisor)" ]
+}
+wait_for 600 "no sandbox, of any state, to be left under 6.0.0's gVisor, nor any process of its" nothing_of_previous_gvisor
+log "removing 6.0.0's gVisor from /usr/local/bin"
+rm -rf /usr/local/bin/runsc /usr/local/bin/containerd-shim-runsc-v1 /usr/local/bin/gvisor-bin
 
 # What every prompt job has now, as this release writes it, required.
 k exec -i deploy/alasio-neon-compute -c compute -- psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -v ON_ERROR_STOP=1 -q <<'SQL'

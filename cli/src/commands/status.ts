@@ -157,7 +157,7 @@ export const status = Command.make("status", {}, () =>
     }
     if (target._tag === "Host") {
       const { unit, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
-      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${installed?.gvisor ? `, with gVisor ${installed.gvisor}` : ""}:`);
+      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${installed?.gvisor?.length ? `, with gVisor ${installed.gvisor.join(" and ")}` : ""}:`);
       yield* Console.log(unit.loaded ? `  service ${SERVICE}: ${unit.active}, ${unit.enabled ? "enabled" : "disabled"}` : "  not installed");
       if (unit.active === "active") {
         const nodes = yield* Effect.provide(Effect.flatMap(KubeApi, (kube) => kube.list<V1Node>(kind("Node"))), kubeApi(target));

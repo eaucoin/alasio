@@ -1,7 +1,7 @@
 /**
  * What alasio's npm package may hold (tooling/cli-package.ts): the built command line,
- * with the CRDs it applies and the node's pins and containerd template, and nothing else;
- * CI's package job checks the package npm packs against it.
+ * with the CRDs it applies and the node's pins, and nothing else; CI's package job checks
+ * the package npm packs against it.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -27,6 +27,5 @@ test("sources, tests and what is not built are refused, and what it needs is req
     "dist/cli/src/manifests/verticalpodautoscalers.autoscaling.k8s.io.json is missing",
     "dist/cli/src/manifests/verticalpodautoscalercheckpoints.autoscaling.k8s.io.json is missing",
     "dist/cluster/node/pins.json is missing",
-    "dist/cluster/node/config-v3.toml.tmpl is missing",
   ]);
 });

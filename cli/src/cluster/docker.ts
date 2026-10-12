@@ -1,8 +1,10 @@
 /**
  * The cluster in Docker: k3s in Docker's containers, made through its Engine API
- * (./docker-engine.ts) from alasio's node image (cluster/node), which is k3s with gVisor
- * registered as containerd's `runsc` runtime and an entrypoint that readies its container
- * for k3s.
+ * (./docker-engine.ts) from alasio's node image (cluster/node), which is k3s with the
+ * gVisor releases alasio keeps beside it and an entrypoint that readies its container for
+ * k3s. The files that make each release a runtime of containerd's (./k3s.ts) are put into
+ * each node's container before it first starts, and a node is made anew when they change,
+ * as when its other settings do.
  *
  * A cluster NAME is a bridge network NAME, a server container NAME-server-0 and agent
  * containers NAME-agent-I, each with named volumes for what k3s, kubelet and the CNI
@@ -23,7 +25,7 @@
  */
 import { createHash } from "node:crypto";
 
-import type { V1ConfigMap, V1NodeList } from "@kubernetes/client-node";
+import type { V1ConfigMap, V1NodeList, V1RuntimeClassList } from "@kubernetes/client-node";
 import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schedule, Schema } from "effect";
 
 import { imageReference } from "../images.ts";
@@ -33,7 +35,8 @@ import {
   awaitReady as waitFor,
   clusterKubeconfig,
   type ClusterNotReady,
-  GVISOR_RUNTIME_CLASS,
+  gvisorRuntimeClasses,
+  gvisorRuntimeFiles,
   type HostAlias,
   KUBELET_ARGS,
   nodeHostsWith,
@@ -41,9 +44,12 @@ import {
   readySince,
   type Registries,
   registriesYaml,
+  staleRuntimeClasses,
   WAITS,
   writeKubeconfig,
 } from "./k3s.ts";
+import { gvisorReleases, NODE_PINS } from "./node.ts";
+import { tarArchive, type TarEntry } from "./tar.ts";
 
 /** A path of this machine mounted in every node, at `target`. */
 export interface HostMount {
@@ -61,6 +67,8 @@ export interface DockerClusterOptions {
   readonly storagePath: string;
   /** The node image; this release's unless given. */
   readonly image?: string;
+  /** The gVisor releases the node image holds, the current first; this version's pins' unless given. */
+  readonly gvisor?: readonly string[];
   /** The network's IPv4 subnet (a.b.c.d/n); the first free 172.30.N.0/24 unless given. */
   readonly subnet?: string;
   readonly hostAliases?: readonly HostAlias[];
@@ -125,8 +133,8 @@ export class DockerCluster extends Context.Service<DockerCluster, {
   /**
    * Makes the cluster, or what of it is missing, starts what is stopped, makes nodes
    * whose image or settings changed anew, and waits until its nodes are ready; then gives
-   * CoreDNS the host aliases, applies the `gvisor` RuntimeClass, and writes a kubeconfig
-   * that reaches it to `kubeconfig` (0600).
+   * CoreDNS the host aliases, applies gVisor's RuntimeClasses, deleting those of releases
+   * no longer kept, and writes a kubeconfig that reaches it to `kubeconfig` (0600).
    */
   readonly up: (kubeconfig: string) => Effect.Effect<void, DockerClusterError>;
   /** Stops its nodes, keeping everything. */
@@ -154,6 +162,8 @@ const NODE_VOLUMES = [
   ["kubelet", "/var/lib/kubelet"],
   ["cni", "/var/lib/cni"],
   ["log", "/var/log"],
+  // The snapshots of sandboxes gVisor saves whole, which the node restores them from.
+  ["snapshots", "/var/lib/alasio/snapshots"],
 ] as const;
 
 /** The API server's port in the server node. */
@@ -224,14 +234,30 @@ const ABORT_FUSE = [
 /** kubelet's settings, as k3s's flags give them. */
 const kubeletArgs = KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`);
 
-/** A digest of `spec` that two specs share only when they are the same. */
-const specHash = (spec: ContainerCreate): string => createHash("sha256").update(JSON.stringify(spec)).digest("hex");
+/** A digest of `spec` and the `files` put into its container that two share only when they are the same. */
+const specHash = (spec: ContainerCreate, files: ReadonlyMap<string, string>): string => createHash("sha256").update(JSON.stringify([spec, [...files]])).digest("hex");
+
+/** The tar archive of `files`, by their paths, which Docker extracts at a container's root: each file with the directories it is in. */
+function filesArchive(files: ReadonlyMap<string, string>): Buffer {
+  const entries = new Map<string, TarEntry>();
+  for (const [path, content] of files) {
+    const file = path.slice(1);
+    const parts = file.split("/");
+    for (let depth = 1; depth < parts.length; depth++) {
+      const directory = `${parts.slice(0, depth).join("/")}/`;
+      entries.set(directory, { name: directory, type: "directory", mode: 0o755, content: Buffer.alloc(0) });
+    }
+    entries.set(file, { name: file, type: "file", mode: 0o644, content: Buffer.from(content) });
+  }
+  return tarArchive([...entries.values()]);
+}
 
 const makeDockerCluster = Effect.fnUntraced(function*({
   name: cluster,
   apiPort,
   storagePath,
   image = imageReference(NODE_IMAGE),
+  gvisor = gvisorReleases(NODE_PINS),
   subnet,
   hostAliases = [],
   mounts = [],
@@ -247,6 +273,9 @@ const makeDockerCluster = Effect.fnUntraced(function*({
   const nodes = [server, ...Array.from({ length: agents }, (_, index) => `${cluster}-agent-${index}`)];
 
   const unusable = (reason: string) => new ClusterUnusable({ cluster, reason });
+
+  /** The files that make each gVisor release the node image holds a runtime of containerd's, in every node. */
+  const files = gvisorRuntimeFiles(gvisor, { systemd: false });
 
   /**
    * The container of `node`, with what every node has: privileged, as k3s in Docker needs,
@@ -301,9 +330,13 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     return address ? Effect.succeed(address) : Effect.fail(unusable(`its subnet ${networkSubnet} has no room for ${nodes.length} nodes`));
   };
 
-  /** `node`'s container made as `spec` says, anew when it was made otherwise, and running. */
+  /**
+   * `node`'s container made as `spec` says, with the files put into it before it first
+   * starts, anew when it was made otherwise, and running. The files are in its k3s volume,
+   * which keeps them, and those of a node made anew replace them.
+   */
   const ensureNode = Effect.fnUntraced(function*(node: string, spec: ContainerCreate): Effect.fn.Return<void, DockerError | ClusterUnusable> {
-    const hash = specHash(spec);
+    const hash = specHash(spec, files);
     const existing = yield* docker.inspectContainer(node);
     if (existing && existing.Config.Labels?.[CLUSTER_LABEL] !== cluster) return yield* unusable(`a container named ${node} is not one of its nodes`);
     const current = existing !== null && existing.Config.Labels?.[SPEC_LABEL] === hash;
@@ -316,6 +349,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
       yield* Effect.logInfo(`making node ${node}`);
       yield* Effect.forEach(NODE_VOLUMES, ([suffix]) => docker.createVolume({ Name: `${node}-${suffix}`, Labels: labels }), { discard: true });
       yield* docker.createContainer(node, { ...spec, Labels: { ...spec.Labels, [SPEC_LABEL]: hash } });
+      yield* docker.putArchive(node, "/", filesArchive(files));
     }
     if (!current || !existing.State.Running) {
       yield* Effect.logInfo(`starting node ${node}`);
@@ -360,6 +394,18 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     if (desired === nodeHosts) return;
     const patch = { metadata: { resourceVersion: coredns.metadata?.resourceVersion }, data: { NodeHosts: desired } };
     yield* kubectl(["--namespace=kube-system", "patch", "configmap", "coredns", "--type=merge", `--patch=${JSON.stringify(patch)}`]);
+  });
+
+  /** gVisor's RuntimeClasses applied, those of releases no longer kept, or with another handler, deleted first. */
+  const applyRuntimeClasses = Effect.gen(function*() {
+    const desired = gvisorRuntimeClasses(gvisor);
+    const { items } = JSON.parse((yield* kubectl(["get", "runtimeclasses", "--output=json"])).toString("utf8")) as V1RuntimeClassList;
+    const stale = staleRuntimeClasses(items, desired);
+    if (stale.length > 0) {
+      yield* kubectl(["delete", "runtimeclasses", ...stale]);
+      yield* Effect.logInfo(`deleted RuntimeClasses ${stale.join(", ")}`);
+    }
+    yield* kubectl(["apply", "--filename=-"], { stdin: JSON.stringify({ apiVersion: "v1", kind: "List", items: desired }) });
   });
 
   /** The kubeconfig the server wrote, pointed at the API server's port on the loopback, written to `path`. */
@@ -410,7 +456,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     }
     yield* awaitReady("its nodes", Effect.flatMap(startTimes, nodesReady));
     yield* awaitReady("CoreDNS's NodeHosts", applyHostAliases);
-    yield* awaitReady("the gvisor RuntimeClass", kubectl(["apply", "--filename=-"], { stdin: JSON.stringify(GVISOR_RUNTIME_CLASS) }));
+    yield* awaitReady("gVisor's RuntimeClasses", applyRuntimeClasses);
     yield* fetchKubeconfig(kubeconfig);
     yield* Effect.logInfo(`cluster ${cluster} is up`);
   });

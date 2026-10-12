@@ -9,7 +9,11 @@
     }
   },
   "gvisor": {
-    "release": "20260921.0-eaucoin.3",
-    "sha512": "ab59ce25025c28460cc07742e7a7e0679f8bda989513c113dca2a1b6215a791e6e2134022ed5bee33524f7132eb379eb0c83d6a8e796c15d4319dfd1b1a9647b"
+    "releases": [
+      {
+        "release": "20260921.0-eaucoin.3",
+        "sha512": "ab59ce25025c28460cc07742e7a7e0679f8bda989513c113dca2a1b6215a791e6e2134022ed5bee33524f7132eb379eb0c83d6a8e796c15d4319dfd1b1a9647b"
+      }
+    ]
   }
 }

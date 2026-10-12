@@ -234,13 +234,13 @@ test("init installs k3s and gVisor here unless told otherwise, as root at once, 
   assert.deepEqual(config(), { target: { host: { storagePath } }, install: {} });
   assert.ok(run.progress.includes([
     "alasio changes this machine as root:",
-    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc, in /var/lib/rancher/k3s/agent/etc/containerd",
-    "  install gVisor 20990101.0 in /usr/local/bin: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "  install gVisor 20990101.0 in /usr/local/lib/alasio/gvisor/20990101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
     "  install k3s v1.99.0+k3s1 in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "  read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ].join("\n")), run.progress.join("\n"));
   assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
-  assert.equal(machine.read("/usr/local/bin/gvisor-bin/gvisor_sentry"), "gvisor_sentry 20990101.0\n");
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/gvisor-bin/gvisor_sentry"), "gvisor_sentry 20990101.0\n");
   assert.equal(machine.ran.length, 1);
   assert.deepEqual(machine.ran[0]?.env, {
     INSTALL_K3S_SKIP_DOWNLOAD: "true",
@@ -255,7 +255,8 @@ test("init installs k3s and gVisor here unless told otherwise, as root at once, 
   assert.equal(statSync(written).mode & 0o777, 0o600);
   assert.equal(JSON.parse(readFileSync(written, "utf8"))["current-context"], "alasio");
   assert.equal(secretValue(kube, "alasio-telegram", "token"), BOT_TOKEN);
-  assert.equal(kube.get("/apis/node.k8s.io/v1/runtimeclasses/gvisor")?.["handler"], "runsc");
+  assert.equal(kube.get("/apis/node.k8s.io/v1/runtimeclasses/gvisor")?.["handler"], "runsc-20990101-0");
+  assert.equal(kube.get("/apis/node.k8s.io/v1/runtimeclasses/gvisor-20990101-0")?.["handler"], "runsc-20990101-0");
 });
 
 test("init --target docker makes the cluster in Docker, its API on a port it keeps, its volumes under XDG_DATA_HOME", async (t) => {
@@ -868,7 +869,7 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
   const mirrored = await alasio(["up"]);
   succeeded(mirrored);
   assert.deepEqual(rootSteps(mirrored), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
     "restart the service k3s, with its new configuration",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
@@ -876,24 +877,44 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
   assert.deepEqual(machine.commands().slice(ran), ["systemctl restart k3s"]);
 });
 
-test("upgrade installs this version's k3s and gVisor in place of those installed, and up after it nothing", async (t) => {
+test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, and up after each nothing", async (t) => {
   const setup = await onHost(t);
-  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: "21000101.0" });
-  const upgraded = await runAlasio(["upgrade"], { env: setup.env, machine: setup.machine, releases: newer });
+  const { env, kube, machine } = setup;
+  const handlers = () =>
+    [...kube.objects].filter(([path]) => path.startsWith("/apis/node.k8s.io/v1/runtimeclasses/")).map(([, { metadata, handler }]) => `${metadata.name} ${String(handler)}`).sort();
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"] });
+  const upgraded = await runAlasio(["upgrade"], { env, machine, releases: newer });
   succeeded(upgraded);
   assert.deepEqual(rootSteps(upgraded), [
-    "install gVisor 21000101.0, in place of 20990101.0, in /usr/local/bin: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "install gVisor 21000101.0 in /usr/local/lib/alasio/gvisor/21000101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
     "install k3s v1.100.0+k3s1, in place of v1.99.0+k3s1, in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
-  assert.equal(setup.machine.read("/usr/local/bin/runsc"), "runsc 21000101.0\n");
-  assert.equal(setup.machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
-  assert.deepEqual(rootSteps(await runAlasio(["up"], { env: setup.env, machine: setup.machine, releases: newer })), []);
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/21000101.0/runsc"), "runsc 21000101.0\n");
+  assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
+  assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
+  assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
+  assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: newer })), []);
+  assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0:");
+
+  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
+  const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
+  succeeded(pruned);
+  assert.deepEqual(rootSteps(pruned), [
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-21000101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "stop the sandboxes of gVisor 20990101.0, which alasio no longer keeps, and remove /usr/local/lib/alasio/gvisor/20990101.0",
+    "restart the service k3s, with its new configuration",
+    "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
+  ]);
+  assert.equal(machine.has("/usr/local/lib/alasio/gvisor/20990101.0"), false);
+  assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-21000101-0 runsc-21000101-0"]);
+  assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: latest })), []);
 });
 
 test("an up or upgrade alasio refuses changes nothing of the machine first: no k3s or gVisor installed anew, nothing run as root", async (t) => {
   const setup = await onHost(t);
-  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: "21000101.0" });
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
   const run = (command: string) => runAlasio(command.split(" "), { env: setup.env, machine: setup.machine, releases: newer });
   const ran = setup.machine.ran.length;
   setup.kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-seaweedfs-0", namespace: "alasio" }, spec: {} });
@@ -918,12 +939,13 @@ test("an up or upgrade alasio refuses changes nothing of the machine first: no k
   assert.deepEqual(rootSteps(checked), []);
   assert.equal(setup.machine.ran.length, ran);
   assert.equal(setup.machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
-  assert.equal(setup.machine.read("/usr/local/bin/runsc"), "runsc 20990101.0\n");
+  assert.equal(setup.machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
+  assert.equal(setup.machine.has("/usr/local/lib/alasio/gvisor/21000101.0"), false);
 });
 
 test("upgrade refuses to change the machine for a cluster it made that does not answer, where up starts it", async (t) => {
   const setup = await onHost(t);
-  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: "21000101.0" });
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
   const run = (args: readonly string[]) => runAlasio(args, { env: setup.env, machine: setup.machine, releases: newer });
   const kubeconfig = join(dirname(setup.configFile), "kubeconfig");
   const written: { clusters: { cluster: { server: string } }[] } = JSON.parse(readFileSync(kubeconfig, "utf8"));
@@ -946,7 +968,7 @@ test("upgrade refuses to change the machine for a cluster it made that does not 
 test("a download that is not what alasio pins is refused before anything is done as root", async (t) => {
   const { env, home, machine } = await rig(t);
   const releases = fakeReleases();
-  releases.served.set(downloads(releases.pins).gvisor.url, Buffer.from("not gVisor"));
+  releases.served.set(downloads(releases.pins).gvisor.get("20990101.0")?.url ?? "", Buffer.from("not gVisor"));
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
   const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], { env, machine, releases });
@@ -970,7 +992,8 @@ test("status of k3s here says its versions, its service and node, and that up st
   succeeded(down);
   assert.deepEqual(rootSteps(down), ["stop and disable the service k3s, and stop the cluster's pods, gVisor's and those k3s-killall.sh stops"]);
   assert.deepEqual(machine.commands().slice(-2), ["systemctl disable --now k3s", "/usr/local/bin/k3s-killall.sh"]);
-  assert.deepEqual(machine.killed.at(-1), ["/usr/local/bin/runsc", "/usr/local/bin/containerd-shim-runsc-v1", "/usr/local/bin/gvisor-bin/gvisor_sentry"]);
+  const installed = "/usr/local/lib/alasio/gvisor/20990101.0";
+  assert.deepEqual(machine.killed.at(-1), [`${installed}/runsc`, `${installed}/containerd-shim-runsc-v1`, `${installed}/gvisor-bin/gvisor_sentry`]);
   const stopped = await alasio(["status"]);
   assert.equal(failure(stopped), "k3s on this machine is stopped: alasio up starts it");
   assert.deepEqual(stopped.printed, ["k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0:", "  service k3s: inactive, disabled"]);
@@ -1007,12 +1030,12 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   succeeded(run);
   assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s and gVisor themselves\? This cannot be undone/u);
   assert.deepEqual(rootSteps(run), [
-    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor from /usr/local/bin, and JuiceFS's mounts and directories, /var/lib/juicefs and /run/juicefs-csi",
+    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, and JuiceFS's mounts and directories, /var/lib/juicefs and /run/juicefs-csi",
     `remove ${storagePath}, the cluster's volumes`,
     `remove ${SYSCTL_FILE}, which raises the inotify limits at every boot`,
   ]);
   assert.deepEqual(machine.commands().slice(-3), ["systemctl stop k3s", "/usr/local/bin/k3s-uninstall.sh", "umount --lazy /var/lib/juicefs/volume/pvc one"]);
-  for (const path of ["/usr/local/bin/k3s", "/usr/local/bin/runsc", "/usr/local/bin/containerd-shim-runsc-v1", "/usr/local/bin/gvisor-bin", "/etc/rancher", "/var/lib/rancher", "/var/lib/juicefs", SYSCTL_FILE]) {
+  for (const path of ["/usr/local/bin/k3s", "/usr/local/lib/alasio", "/etc/rancher", "/var/lib/rancher", "/var/lib/juicefs", SYSCTL_FILE]) {
     assert.ok(!machine.has(path), `${path} is left`);
   }
   assert.ok(!existsSync(storagePath));

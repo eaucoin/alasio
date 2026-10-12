@@ -1,10 +1,11 @@
 /**
  * This machine made a node of k3s, as the cluster alasio makes on it outside Docker is
  * (./host.ts): k3s installed by its own install script, as the systemd service `k3s`, from
- * the binary cluster/node/pins.json pins, with gVisor beside it, containerd's runtime
- * `runsc`, and set in /etc/rancher/k3s/config.yaml. The node image (cluster/node) is
- * built from the same pins, and k3s reads the same containerd template in it, so a node
- * in Docker and one on a machine run the same k3s and gVisor alike.
+ * the binary cluster/node/pins.json pins, with each gVisor release it pins beside it, each
+ * a runtime of containerd's (./k3s.ts), and set in /etc/rancher/k3s/config.yaml. The node
+ * image (cluster/node) is built from the same pins, its gVisor releases where the machine
+ * has them, and its k3s reads the same containerd files, so a node in Docker and one on a
+ * machine run the same k3s and gVisor alike.
  *
  * Every download is checked against its pin as the operator downloads it, and again as
  * root before it is installed. What alasio installed, and the digest of the files that
@@ -18,22 +19,38 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
 
 import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
 import { Registries } from "../config.ts";
-import { clusterKubeconfig, KUBELET_ARGS, NotYet, registriesYaml } from "./k3s.ts";
+import {
+  clusterKubeconfig,
+  CONTAINERD,
+  GVISOR_RELEASES,
+  gvisorDirectory,
+  gvisorHandler,
+  gvisorRuntimeFiles,
+  KUBELET_ARGS,
+  NotYet,
+  registriesYaml,
+} from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
 import { tarEntries } from "./tar.ts";
 
-/** The k3s and gVisor a node runs, pinned. */
+/**
+ * The k3s and gVisor a node runs, pinned: k3s's release, and the gVisor releases alasio
+ * keeps, the current one first, which new sandboxes run, then at most the one before it,
+ * which sandboxes snapshotted under it are restored with.
+ */
 export type NodePins = typeof pins;
 
 /** This version's pins, cluster/node/pins.json's. */
 export const NODE_PINS: NodePins = pins;
+
+/** The gVisor releases `pins` pins, the current first. */
+export const gvisorReleases = ({ gvisor }: NodePins): string[] => gvisor.releases.map(({ release }) => release);
 
 /** A file to download, and the digest it must have. */
 export interface Download {
@@ -42,11 +59,22 @@ export interface Download {
   readonly digest: string;
 }
 
-/** Where what `pins` pins is downloaded from: k3s's binary and install script from its repository, gVisor's release from alasio's fork of it, github.com/eaucoin/gvisor. */
-export const downloads = ({ k3s, gvisor }: NodePins): { readonly k3s: Download; readonly installScript: Download; readonly gvisor: Download } => ({
+/**
+ * Where what `pins` pins is downloaded from: k3s's binary and install script from its
+ * repository, and each gVisor release, by its name, from alasio's fork of it,
+ * github.com/eaucoin/gvisor.
+ */
+export const downloads = ({ k3s, gvisor }: NodePins): {
+  readonly k3s: Download;
+  readonly installScript: Download;
+  readonly gvisor: ReadonlyMap<string, Download>;
+} => ({
   k3s: { url: `https://github.com/k3s-io/k3s/releases/download/${encodeURIComponent(k3s.version)}/k3s`, algorithm: "sha256", digest: k3s.sha256 },
   installScript: { url: `https://raw.githubusercontent.com/k3s-io/k3s/${k3s.installScript.commit}/install.sh`, algorithm: "sha256", digest: k3s.installScript.sha256 },
-  gvisor: { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(gvisor.release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: gvisor.sha512 },
+  gvisor: new Map(gvisor.releases.map(({ release, sha512 }) => [
+    release,
+    { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: sha512 },
+  ])),
 });
 
 const BIN = "/usr/local/bin";
@@ -57,9 +85,6 @@ const REGISTRIES_YAML = `${K3S_ETC}/registries.yaml`;
 const STAMP = `${K3S_ETC}/alasio.json`;
 /** The kubeconfig k3s writes, root's alone. */
 const K3S_KUBECONFIG = `${K3S_ETC}/k3s.yaml`;
-const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
-/** runsc's options, which the containerd template names where systemd runs the machine. */
-export const RUNSC_TOML = `${CONTAINERD}/runsc.toml`;
 /** The systemd service k3s's install script makes. */
 export const SERVICE = "k3s";
 const SERVICE_FILE = `/etc/systemd/system/${SERVICE}.service`;
@@ -74,31 +99,29 @@ const SERVICE_CIDR = "10.43.0.0/16";
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
 /** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
 const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;
-/** What alasio installs of gVisor's release, in BIN: runsc and its shim, and the binaries runsc runs beside it. */
+/** What alasio installs of a gVisor release, in the release's directory: runsc and its shim, and the binaries runsc runs beside it. */
 const GVISOR = ["runsc", "containerd-shim-runsc-v1", "gvisor-bin"] as const;
-/** The containerd template, cluster/node's, as this package has it. */
-const TEMPLATE_SOURCE = new URL("../../../cluster/node/config-v3.toml.tmpl", import.meta.url);
 
-/** How a node is made: a server, its volumes in `storagePath`, pulling through `registries`. */
+/**
+ * How a node is made: a server, its volumes in `storagePath`, pulling through
+ * `registries`, its containerd running each of the gVisor releases `gvisor`, the current
+ * first.
+ */
 export const NodeConfig = Schema.Struct({
   role: Schema.Literal("server"),
   storagePath: Schema.String,
   registries: Schema.optionalKey(Registries),
+  gvisor: Schema.Array(Schema.String),
 });
 export type NodeConfig = typeof NodeConfig.Type;
 
-/** The containerd template, which registers gVisor as the runtime `runsc`. */
-export const containerdTemplate: Effect.Effect<string, PlatformError.PlatformError, FileSystem.FileSystem> = Effect.flatMap(
-  FileSystem.FileSystem,
-  (fs) => fs.readFileString(fileURLToPath(TEMPLATE_SOURCE)),
-);
-
 /**
- * The files that make k3s and its containerd a node of `config`, by their paths, with the
- * containerd template `template`: k3s's config.yaml, written as JSON, which YAML reads as
- * it is, the registries, the template, and runsc's options. Pure, for tests.
+ * The files that make k3s and its containerd a node of `config`, by their paths: k3s's
+ * config.yaml, written as JSON, which YAML reads as it is, the registries, and the files
+ * that make each gVisor release a runtime of containerd's, where systemd runs the
+ * machine. Pure, for tests.
  */
-export function nodeFiles(config: NodeConfig, template: string): ReadonlyMap<string, string> {
+export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
   const k3s = {
     "disable": ["traefik"],
     "cluster-cidr": CLUSTER_CIDR,
@@ -109,8 +132,7 @@ export function nodeFiles(config: NodeConfig, template: string): ReadonlyMap<str
   return new Map([
     [CONFIG_YAML, `# k3s as alasio's cluster runs it: alasio up writes this file.\n${JSON.stringify(k3s)}\n`],
     ...(config.registries ? [[REGISTRIES_YAML, `${registriesYaml(config.registries)}\n`] as const] : []),
-    [`${CONTAINERD}/config-v3.toml.tmpl`, template],
-    [RUNSC_TOML, `# runsc's options where systemd runs the machine: its sandboxes' cgroups placed through systemd.\n[runsc_config]\n  systemd-cgroup = "true"\n`],
+    ...gvisorRuntimeFiles(config.gvisor, { systemd: true }),
   ]);
 }
 
@@ -123,13 +145,13 @@ export type Firewall = typeof Firewall.Type;
 
 /**
  * What alasio installed on this machine, as STAMP records it: k3s's version, gVisor's
- * release, the digest of the files that configure the node, and the firewall it opened
+ * releases, the digest of the files that configure the node, and the firewall it opened
  * the cluster's networks in, with those it added a rule for itself, which are all it
  * removes.
  */
 export const NodeStamp = Schema.Struct({
   k3s: Schema.optionalKey(Schema.String),
-  gvisor: Schema.optionalKey(Schema.String),
+  gvisor: Schema.optionalKey(Schema.Array(Schema.String)),
   config: Schema.optionalKey(Schema.String),
   firewall: Schema.optionalKey(Schema.Struct({ tool: Firewall, networks: Schema.Array(Schema.String), added: Schema.Array(Schema.String) })),
 });
@@ -199,8 +221,10 @@ const writeFile = Effect.fnUntraced(function*(path: string, content: string | Ui
 export const OpenFirewall = Schema.TaggedStruct("OpenFirewall", { firewall: Firewall, networks: Schema.Array(Schema.String) });
 /** The step that writes the files that configure k3s and its containerd as a node of `config`. */
 export const ConfigureNode = Schema.TaggedStruct("ConfigureNode", { config: NodeConfig });
-/** The step that installs gVisor's release, from its archive, in place of `previous`. */
-export const InstallGvisor = Schema.TaggedStruct("InstallGvisor", { release: Schema.String, previous: Schema.optionalKey(Schema.String), archive: Artifact });
+/** The step that installs a gVisor release, from its archive, in a directory of its own. */
+export const InstallGvisor = Schema.TaggedStruct("InstallGvisor", { release: Schema.String, archive: Artifact });
+/** The step that stops a gVisor release's sandboxes, and removes it. */
+export const RemoveGvisor = Schema.TaggedStruct("RemoveGvisor", { release: Schema.String });
 /** The step that installs k3s's binary, with its install script, which makes its service, enables it, and starts it anew. */
 export const InstallK3s = Schema.TaggedStruct("InstallK3s", {
   version: Schema.String,
@@ -213,14 +237,14 @@ export const InstallK3s = Schema.TaggedStruct("InstallK3s", {
 export const StartK3s = Schema.TaggedStruct("StartK3s", { restart: Schema.Boolean });
 /** The step that stops k3s's service, disabling it, and stops its pods. */
 export const StopK3s = Schema.TaggedStruct("StopK3s", {});
-/** The step that removes k3s, with its uninstall script, gVisor, and the firewall's rules for the cluster's networks alasio added, by STAMP's `firewall`. */
+/** The step that removes k3s, with its uninstall script, gVisor's releases, and the firewall's rules for the cluster's networks alasio added, by STAMP's `firewall`. */
 export const RemoveNode = Schema.TaggedStruct("RemoveNode", { firewall: Schema.optionalKey(Schema.Struct({ tool: Firewall, added: Schema.Array(Schema.String) })) });
 /** The step that removes the directory of the node's volumes. */
 export const RemoveStorage = Schema.TaggedStruct("RemoveStorage", { path: Schema.String });
 /** The step that reads k3s's kubeconfig, after restarting k3s, which renews its certificates, when `renew`. */
 export const ReadKubeconfig = Schema.TaggedStruct("ReadKubeconfig", { renew: Schema.Boolean });
 
-export const NodeStep = Schema.Union([OpenFirewall, ConfigureNode, InstallGvisor, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
+export const NodeStep = Schema.Union([OpenFirewall, ConfigureNode, InstallGvisor, RemoveGvisor, InstallK3s, StartK3s, StopK3s, RemoveNode, RemoveStorage, ReadKubeconfig]);
 export type NodeStep = typeof NodeStep.Type;
 
 /** What `step` does, as alasio says it will. */
@@ -230,10 +254,14 @@ export function describeNodeStep(step: NodeStep): string {
     case "OpenFirewall":
       return `let the cluster's pods and Services, ${step.networks.join(" and ")}, in to this machine through ${step.firewall}, as k3s needs; ` +
         "nothing else is opened, k3s's API server's port 6443 staying closed to the rest";
-    case "ConfigureNode":
-      return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime runsc, in ${CONTAINERD}`;
+    case "ConfigureNode": {
+      const runtimes = step.config.gvisor.map(gvisorHandler);
+      return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime${runtimes.length > 1 ? "s" : ""} ${runtimes.join(" and ")}, in ${CONTAINERD}`;
+    }
     case "InstallGvisor":
-      return `install gVisor ${step.release}${replacing(step.previous)} in ${BIN}: ${GVISOR.join(", ")}`;
+      return `install gVisor ${step.release} in ${gvisorDirectory(step.release)}: ${GVISOR.join(", ")}`;
+    case "RemoveGvisor":
+      return `stop the sandboxes of gVisor ${step.release}, which alasio no longer keeps, and remove ${gvisorDirectory(step.release)}`;
     case "InstallK3s":
       return `install k3s ${step.version}${replacing(step.previous)} in ${BIN}, with its own install script, as the systemd service ${SERVICE}, enabled and started anew`;
     case "StartK3s":
@@ -244,7 +272,7 @@ export function describeNodeStep(step: NodeStep): string {
       return `stop the cluster's gVisor pods, ` +
         (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.join(" and ")}, ` : "") +
         `uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
-        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor from ${BIN}, and JuiceFS's mounts and directories, ` +
+        `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor's releases in ${GVISOR_RELEASES}, and JuiceFS's mounts and directories, ` +
         JUICEFS.join(" and ");
     case "RemoveStorage":
       return `remove ${step.path}, the cluster's volumes`;
@@ -259,18 +287,26 @@ export type NodeStepError = PlatformError.PlatformError | ChecksumMismatch | Roo
 /** The services a node's step runs with. */
 type NodeServices = FileSystem.FileSystem | Machine | RootSystem;
 
-/** gVisor's executables, as this machine names them, which its processes run. */
-const gvisorExecutables = Effect.gen(function*() {
+/** The names in the directory `path` of this machine; none when it is not there. */
+const namesIn = Effect.fnUntraced(function*(path: string): Effect.fn.Return<string[], PlatformError.PlatformError, FileSystem.FileSystem | Machine> {
   const fs = yield* FileSystem.FileSystem;
   const { root } = yield* Machine;
-  const bin = under(root, `${BIN}/gvisor-bin`);
-  const beside = (yield* fs.exists(bin)) ? (yield* fs.readDirectory(bin)).map((name) => `${BIN}/gvisor-bin/${name}`) : [];
-  return [`${BIN}/runsc`, `${BIN}/containerd-shim-runsc-v1`, ...beside];
+  return (yield* fs.exists(under(root, path))) ? yield* fs.readDirectory(under(root, path)) : [];
 });
 
-/** Kills gVisor's processes, the cluster's sandboxes and their shims, which k3s's own scripts do not stop. */
-const killGvisor: Effect.Effect<void, PlatformError.PlatformError, NodeServices> = Effect.gen(function*() {
-  const killed = yield* (yield* RootSystem).kill(yield* gvisorExecutables);
+/** The gVisor releases installed on this machine, by their directories. */
+const installedGvisor = namesIn(GVISOR_RELEASES);
+
+/** The executables of gVisor's `release`, as this machine names them, which its processes run. */
+const gvisorExecutables = Effect.fnUntraced(function*(release: string): Effect.fn.Return<string[], PlatformError.PlatformError, FileSystem.FileSystem | Machine> {
+  const directory = gvisorDirectory(release);
+  const beside = (yield* namesIn(`${directory}/gvisor-bin`)).map((name) => `${directory}/gvisor-bin/${name}`);
+  return [`${directory}/runsc`, `${directory}/containerd-shim-runsc-v1`, ...beside];
+});
+
+/** Kills the processes of gVisor's `releases`, their sandboxes and shims, which k3s's own scripts do not stop. */
+const killGvisor = Effect.fnUntraced(function*(releases: readonly string[]): Effect.fn.Return<void, PlatformError.PlatformError, NodeServices> {
+  const killed = yield* (yield* RootSystem).kill((yield* Effect.forEach(releases, gvisorExecutables)).flat());
   if (killed > 0) yield* Effect.logInfo(`stopped ${killed} of gVisor's processes`);
 });
 
@@ -369,21 +405,32 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         return yield* Effect.logInfo(`${step.firewall} lets ${step.networks.join(" and ")} in`);
       }
       case "ConfigureNode": {
-        const files = nodeFiles(step.config, yield* containerdTemplate);
+        const files = nodeFiles(step.config);
         for (const [path, content] of files) yield* writeFile(under(root, path), content, path.startsWith(K3S_ETC) ? 0o600 : 0o644);
         if (!files.has(REGISTRIES_YAML)) yield* fs.remove(under(root, REGISTRIES_YAML), { force: true });
+        // runsc's options for the releases containerd no longer runs; containerd's own config.toml, k3s's, stays.
+        for (const name of yield* namesIn(CONTAINERD)) {
+          const path = `${CONTAINERD}/${name}`;
+          if (name.startsWith("runsc") && name.endsWith(".toml") && !files.has(path)) yield* fs.remove(under(root, path));
+        }
         yield* recordStamp({ config: filesDigest(files) });
         return yield* Effect.logInfo(`wrote ${[...files.keys()].join(", ")}`);
       }
       case "InstallGvisor": {
         const entries = tarEntries(Buffer.from(zstdDecompressSync(yield* verified(step.archive))));
         for (const entry of entries.filter(({ name }) => GVISOR.some((installed) => name === installed || name.startsWith(`${installed}/`)))) {
-          const path = under(root, `${BIN}/${entry.name.replace(/\/$/u, "")}`);
+          const path = under(root, `${gvisorDirectory(step.release)}/${entry.name.replace(/\/$/u, "")}`);
           if (entry.type === "directory") yield* fs.makeDirectory(path, { recursive: true, mode: entry.mode });
           else yield* writeFile(path, entry.content, entry.mode);
         }
-        yield* recordStamp({ gvisor: step.release });
+        yield* recordStamp({ gvisor: [...((yield* readStamp)?.gvisor ?? []).filter((release) => release !== step.release), step.release] });
         return yield* Effect.logInfo(`installed gVisor ${step.release}`);
+      }
+      case "RemoveGvisor": {
+        yield* killGvisor([step.release]);
+        yield* fs.remove(under(root, gvisorDirectory(step.release)), { recursive: true, force: true });
+        yield* recordStamp({ gvisor: ((yield* readStamp)?.gvisor ?? []).filter((release) => release !== step.release) });
+        return yield* Effect.logInfo(`removed gVisor ${step.release}`);
       }
       case "InstallK3s": {
         yield* writeFile(under(root, `${BIN}/k3s`), yield* verified(step.binary), 0o755);
@@ -407,23 +454,23 @@ export const performNodeStep = (step: NodeStep): Effect.Effect<string | void, No
         return yield* (step.restart ? systemctl("restart", SERVICE) : systemctl("enable", "--now", SERVICE));
       case "StopK3s": {
         yield* systemctl("disable", "--now", SERVICE);
-        yield* killGvisor;
+        yield* killGvisor(yield* installedGvisor);
         if (yield* fs.exists(under(root, KILLALL))) yield* system.run(KILLALL, []);
         return;
       }
       case "RemoveNode": {
         // k3s first, which would start the pods gVisor's end again.
         if (yield* serviceInstalled) yield* systemctl("stop", SERVICE);
-        yield* killGvisor;
+        yield* killGvisor(yield* installedGvisor);
         if (step.firewall) yield* closeFirewall(step.firewall);
         if (yield* fs.exists(under(root, UNINSTALL))) yield* system.run(UNINSTALL, []);
         yield* removeJuicefs;
         // alasio's own, and the node's password, which k3s keeps and its uninstall script leaves.
-        for (const path of [...GVISOR.map((name) => `${BIN}/${name}`), CONFIG_YAML, REGISTRIES_YAML, STAMP, CONTAINERD, NODE_PASSWORD]) {
+        for (const path of [GVISOR_RELEASES, CONFIG_YAML, REGISTRIES_YAML, STAMP, CONTAINERD, NODE_PASSWORD]) {
           yield* fs.remove(under(root, path), { recursive: true, force: true });
         }
-        // What k3s's uninstall script leaves of the directories it made, when it is empty.
-        for (const path of [K3S_ETC, "/etc/rancher", "/var/lib/rancher/k3s", "/var/lib/rancher"]) {
+        // What k3s's uninstall script leaves of the directories it made, and of alasio's, when it is empty.
+        for (const path of [K3S_ETC, "/etc/rancher", "/var/lib/rancher/k3s", "/var/lib/rancher", dirname(GVISOR_RELEASES)]) {
           const at = under(root, path);
           if ((yield* fs.exists(at)) && (yield* fs.readDirectory(at)).length === 0) yield* fs.remove(at, { recursive: true });
         }
