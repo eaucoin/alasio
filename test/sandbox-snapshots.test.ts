@@ -238,6 +238,19 @@ test("a snapshot on the template before the current one is restored into that on
   }));
 });
 
+test("a fork's snapshot, its source's, restores only onto the current template, its source's own naming the source", async () => {
+  const older = profile();
+  const newer = profile("agent@sha256:2");
+  const desired = sessionOf(newer);
+  const { agents, asked } = fakeAgents({ current: manifestOf(sessionOf(older, "fs-source").spec.podTemplate, PREVIOUS), holdings: [node("node-a", [CURRENT, PREVIOUS])] });
+  const plan = await run(fakeKube(), Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: newer, snapshots, agents, templates: templates(newer, older) });
+    return yield* snapshotted.restore(stored(desired), desired);
+  }));
+  assert.equal(plan, null);
+  assert.deepEqual(asked, ["forget alasio-sessions/fs-abc123"]);
+});
+
 test("a session without a snapshot is resumed as it is, and one whose snapshot cannot restore is too, its snapshot forgotten, saying why", async () => {
   const desired = sessionOf(profile());
   const restore = async (agents: NodeAgents, of = profile(), kept = templates(profile())) =>

@@ -25,13 +25,16 @@ import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
-import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
+import { BAYMA_CONTAINER, SANDBOX_LABEL } from "../kube/sandbox-shape.ts";
 import {
   podTemplateHash,
   SANDBOX_API_VERSION,
   SANDBOX_KIND,
   type Sandbox,
   type SandboxRestore,
+  type SandboxGone,
+  type SandboxNotReady,
+  type SandboxPodEnded,
   type Sandboxes,
   sandboxReady,
   type StoredSandbox,
@@ -163,6 +166,10 @@ export interface SessionSnapshots {
    * alasio started.
    */
   readonly watch: (sandboxes: Sandboxes, lastTurn: (name: string) => number | null) => Effect.Effect<void, never, Scope.Scope>;
+  /** Releases the running session now, idle or not, as a fork of it does: whether it was suspended. */
+  readonly release: (sandboxes: Sandboxes, name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
+  /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one; one that cannot is said so, and has none. */
+  readonly copy: (from: string, to: string) => Effect.Effect<void>;
 }
 
 /** A session's snapshots, as the module says, on the KubeClient. */
@@ -222,7 +229,9 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       const recorded = manifest.podTemplate as V1PodTemplateSpec;
       const template = sessionTemplateOf(recorded);
       // Onto the current template, it takes what is the Sandbox's own now; onto the one before, what it was saved with.
-      const base = template === templates.current ? desired.spec.podTemplate : template !== undefined && template === templates.previous ? recorded : null;
+      // A fork's is its source's, which names the source: only onto the current template, then.
+      const own = recorded.metadata?.labels?.[SANDBOX_LABEL] === name;
+      const base = template === templates.current ? desired.spec.podTemplate : template !== undefined && template === templates.previous && own ? recorded : null;
       if (!base) return yield* fallBack(name, "template", "the session template it was taken on is no longer kept");
       const nodes = yield* nodesFor(manifest).pipe(Effect.result);
       if (nodes._tag === "Failure") return yield* fallBack(name, "unreadable", nodes.failure.message);
@@ -355,6 +364,18 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     },
     restore,
     watch,
+    release: (sandboxes, name) => sandboxes.release(name, save).pipe(withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }), withLogScope("snapshots")),
+    copy: (from, to) =>
+      agents.copy(ref(from), ref(to)).pipe(
+        Effect.tap(({ snapshot }) => Effect.logInfo(`gave the fork ${to} of session ${from} its snapshot ${snapshot}`)),
+        Effect.catch((error) =>
+          error._tag === "NodeAgentError" && error.status === 404
+            ? Effect.void
+            : Effect.logWarning(`the fork ${to} of session ${from} carries no snapshot: ${error.message}`)
+        ),
+        Effect.asVoid,
+        withLogScope("snapshots"),
+      ),
   };
 });
 

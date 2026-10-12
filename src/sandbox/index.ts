@@ -642,6 +642,16 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     );
 
   /**
+   * Suspends the running session: released into a snapshot where sessions are
+   * snapshotted, so it resumes whole, and suspended plain where they are not, or where it
+   * is not ready to be.
+   */
+  const suspendWhole = (volumeId: string): Effect.Effect<void, SandboxError> =>
+    snapshots
+      ? snapshots.release(sandboxes, volumeId).pipe(Effect.flatMap((released) => (released ? Effect.void : sandboxes.suspend(volumeId))))
+      : sandboxes.suspend(volumeId);
+
+  /**
    * `use` run while the session, `running` as it is, is suspended: nothing in it runs, and
    * it is resumed with `netMode` afterwards. A session that cannot be resumed now is left
    * for its next bring-up to resume, saying why.
@@ -649,7 +659,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   const whileSuspended = <A, E>(volumeId: string, netMode: NetMode, running: boolean, use: Effect.Effect<A, E>): Effect.Effect<A, E | SessionError> =>
     running
       ? Effect.acquireUseRelease(
-        sandboxes.suspend(volumeId),
+        suspendWhole(volumeId),
         () => use,
         () => ensure(volumeId, netMode).pipe(Effect.catch((error) => Effect.logWarning(`could not resume session ${volumeId}: ${error.message}; it resumes as it is next brought up`))),
       )
@@ -670,7 +680,15 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     const claimOf = (claimNamespace: string, sandbox: string): ClaimRef => ({ namespace: claimNamespace, name: claimName(clone.claimTemplate, sandbox) });
     const destination = claimOf(namespace, volumeId);
     yield* awaitBound(destination).pipe(
-      Effect.andThen(whileSuspended(sourceVolumeId, netMode, source.spec.operatingMode !== "Suspended", runClone(clone.job, claimOf(profile.namespace, sourceVolumeId), destination))),
+      Effect.andThen(whileSuspended(
+        sourceVolumeId,
+        netMode,
+        source.spec.operatingMode !== "Suspended",
+        runClone(clone.job, claimOf(profile.namespace, sourceVolumeId), destination).pipe(
+          // Its files and its snapshot from the same moment, which it restores from as its source does.
+          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.copy(sourceVolumeId, volumeId) : Effect.void),
+        ),
+      )),
       Effect.onError(() =>
         kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId).pipe(
           Effect.catch((error) => Effect.logWarning(`could not delete the failed fork ${namespace}/${volumeId}: ${error.message}`)),
