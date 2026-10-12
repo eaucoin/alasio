@@ -11,6 +11,8 @@ import { dirname } from "node:path";
 import { type Cluster, KubeConfig, type User, type V1Node, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
+import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorLabel } from "../../../src/node-agent/names.ts";
+
 /** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
 export interface HostAlias {
   readonly ip: string;
@@ -54,25 +56,6 @@ export const KUBELET_ARGS: readonly string[] = [
   "image-gc-high-threshold=98",
   "image-gc-low-threshold=95",
 ];
-
-/**
- * Where a node keeps the gVisor releases alasio keeps, each in a directory of its own
- * named after it, as its release archive has them: runsc, its shim, and gvisor-bin/, the
- * binaries runsc runs beside it.
- */
-export const GVISOR_RELEASES = "/usr/local/lib/alasio/gvisor";
-
-/** The directory of gVisor's `release` on a node. */
-export const gvisorDirectory = (release: string): string => `${GVISOR_RELEASES}/${release}`;
-
-/** Where k3s's containerd reads its template, and runsc its options. */
-export const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
-
-/** gVisor's `release` as a DNS label, which containerd's runtimes and Kubernetes' RuntimeClasses are named with: its dots made dashes. */
-const gvisorLabel = (release: string): string => release.replaceAll(".", "-");
-
-/** The containerd runtime of gVisor's `release`, which a RuntimeClass names as its handler. */
-export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(release)}`;
 
 /**
  * The pod annotations containerd passes on to gVisor's runtimes, and drops otherwise:

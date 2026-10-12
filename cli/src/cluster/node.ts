@@ -24,18 +24,9 @@ import { zstdDecompressSync } from "node:zlib";
 import { Duration, Effect, FileSystem, Option, type PlatformError, Schedule, Schema } from "effect";
 
 import pins from "../../../cluster/node/pins.json" with { type: "json" };
+import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler } from "../../../src/node-agent/names.ts";
 import { Registries } from "../config.ts";
-import {
-  clusterKubeconfig,
-  CONTAINERD,
-  GVISOR_RELEASES,
-  gvisorDirectory,
-  gvisorHandler,
-  gvisorRuntimeFiles,
-  KUBELET_ARGS,
-  NotYet,
-  registriesYaml,
-} from "./k3s.ts";
+import { clusterKubeconfig, gvisorRuntimeFiles, KUBELET_ARGS, NotYet, registriesYaml } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
 import { tarEntries } from "./tar.ts";
 

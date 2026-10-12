@@ -28,6 +28,7 @@ import { createHash } from "node:crypto";
 import type { V1ConfigMap, V1NodeList, V1RuntimeClassList } from "@kubernetes/client-node";
 import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schedule, Schema } from "effect";
 
+import { SNAPSHOT_CACHE_DIR } from "../../../src/node-agent/names.ts";
 import { imageReference } from "../images.ts";
 import { NODE_IMAGE } from "../release.ts";
 import { type ContainerCreate, DockerEngine, type DockerError, type ExecOptions, type Mount, type NetworkInspect } from "./docker-engine.ts";
@@ -163,7 +164,7 @@ const NODE_VOLUMES = [
   ["cni", "/var/lib/cni"],
   ["log", "/var/log"],
   // The snapshots of sandboxes gVisor saves whole, which the node restores them from.
-  ["snapshots", "/var/lib/alasio/snapshots"],
+  ["snapshots", SNAPSHOT_CACHE_DIR],
 ] as const;
 
 /** The API server's port in the server node. */
