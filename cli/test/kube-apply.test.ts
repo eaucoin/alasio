@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
+import type { KubernetesObject } from "@kubernetes/client-node";
 import { Effect, Logger, Result } from "effect";
 
 import { installConfigOf } from "../src/config.ts";
@@ -118,11 +119,11 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
   assert.ok(last("PATCH networkpolicies") < first("PATCH jobs"));
   // Where the API server reaches KEDA, with what pods run as and with; KEDA itself with the workloads.
   assert.ok(last("PATCH apiservices") < first("PATCH jobs") && last("PATCH validatingwebhookconfigurations") < first("PATCH jobs"));
-  // The setup Job runs to completion, and is deleted, before any workload is applied.
-  assert.ok(first("PATCH jobs") < first("DELETE jobs"));
-  assert.ok(first("DELETE jobs") < first("PATCH deployments"));
-  assert.ok(first("DELETE jobs") < first("PATCH statefulsets"));
-  assert.deepEqual(changes.filter((change) => change.startsWith("DELETE")), ["DELETE jobs"]);
+  // The Jobs (the setup, and VPA's certificate's) run to completion, one after the other, and are deleted, before any workload is applied.
+  assert.ok(first("PATCH jobs") < first("DELETE jobs") && first("DELETE jobs") < last("PATCH jobs"));
+  assert.ok(last("DELETE jobs") < first("PATCH deployments"));
+  assert.ok(last("DELETE jobs") < first("PATCH statefulsets"));
+  assert.deepEqual(changes.filter((change) => change.startsWith("DELETE")), ["DELETE jobs", "DELETE jobs"]);
 
   for (const { method, contentType, query } of kube.changes.filter(({ method }) => method === "PATCH")) {
     assert.equal(contentType, "application/apply-patch+yaml", method);
@@ -130,7 +131,8 @@ test("an installation is applied as alasio, in the order what runs needs it, eve
     assert.equal(query.get("force"), "true");
   }
   const stored = [...kube.objects.values()].filter(({ kind }) => kind !== "Pod");
-  assert.equal(stored.length, objectsOf().length - 1);
+  // All but the Jobs, deleted once run.
+  assert.equal(stored.length, objectsOf().filter(({ kind }) => kind !== "Job").length);
   for (const object of stored) assert.equal(object.metadata.labels?.["alasio.dev/installation"], "alasio", `${object.kind} ${object.metadata.name}`);
 });
 
@@ -214,6 +216,8 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "CustomResourceDefinition scaledjobs.keda.sh",
     "CustomResourceDefinition scaledobjects.keda.sh",
     "CustomResourceDefinition triggerauthentications.keda.sh",
+    "CustomResourceDefinition verticalpodautoscalercheckpoints.autoscaling.k8s.io",
+    "CustomResourceDefinition verticalpodautoscalers.autoscaling.k8s.io",
     "Namespace alasio",
     "Namespace alasio-sessions",
     "PersistentVolumeClaim alasio-neon-control",
@@ -351,25 +355,37 @@ test("the API's refusals and what cannot be reached say which call, and why", as
   assert.equal(unusable.message, `the kubeconfig ${kubeconfig} cannot be used: it has no context elsewhere, only fake`);
 });
 
-test("KEDA is installed where the cluster has none, refused where it has its own or another provider of external metrics, and the cluster's used where it has one", async (t) => {
+test("KEDA and VPA are installed where the cluster has none, refused where it has its own (or for KEDA another provider of external metrics), and the cluster's used where it has one", async (t) => {
   const { kube, run } = await rig(t);
-  const check = (objects: readonly { kind?: string; metadata?: { name?: string } }[], installsKeda: boolean) =>
-    run(Effect.result(checkAutoscalers(objects, installsKeda))).then((result) => (Result.isFailure(result) ? result.failure.message : "fits"));
+  /** What checking the installation of `install`, with `objects` added, comes to. */
+  const check = (install: Record<string, unknown>, objects: readonly KubernetesObject[] = []) => {
+    const config = installConfigOf(install, { claude: false });
+    if (Result.isFailure(config)) throw new Error(config.failure);
+    return run(Effect.result(checkAutoscalers([...installationObjects(config.success), ...objects], config.success))).then((result) => (Result.isFailure(result) ? result.failure.message : "fits"));
+  };
+  const without = (key: string) => ({ autoscaling: { [key]: { enabled: false } } });
   const scaledObject = { apiVersion: "keda.sh/v1alpha1", kind: "ScaledObject", metadata: { name: "alasio-grafana", namespace: "alasio" } };
-  assert.equal(await check(objectsOf(), true), "fits");
-  assert.equal(await check([scaledObject], false), "this cluster has no KEDA, which scales alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
-  assert.equal(await check([], false), "fits");
+  const verticalPodAutoscaler = { apiVersion: "autoscaling.k8s.io/v1", kind: "VerticalPodAutoscaler", metadata: { name: "alasio-lake", namespace: "alasio" } };
+  const crd = (name: string) => kube.put("customresourcedefinitions", { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name } });
+  assert.equal(await check({}), "fits");
+  assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
+  assert.equal(await check(without("vpa"), [verticalPodAutoscaler]), "this cluster has no VPA, which sizes alasio-lake: install.autoscaling.vpa.enabled true installs alasio's");
+  assert.equal(await check(without("keda")), "fits");
 
-  // alasio's own, installed, is no other's.
+  // alasio's own, installed, are no other's, and not the cluster's once alasio is told to use the cluster's.
   await run(applyInstallation(objectsOf(), WAIT));
-  assert.equal(await check(objectsOf(), true), "fits");
+  assert.equal(await check({}), "fits");
+  assert.match(await check(without("vpa"), [verticalPodAutoscaler]), /^this cluster has no VPA, which sizes .*alasio-lake/u);
 
-  const crd = { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name: "scaledobjects.keda.sh" } };
-  kube.put("customresourcedefinitions", crd);
-  assert.equal(await check(objectsOf(), true), "this cluster has a KEDA of its own already, and a cluster has one: install.autoscaling.keda.enabled false uses it");
-  assert.equal(await check([scaledObject], false), "fits");
+  kube.objects.clear();
+  crd("scaledobjects.keda.sh");
+  assert.equal(await check({}), "this cluster has a KEDA of its own already, and a cluster has one: install.autoscaling.keda.enabled false uses it");
+  assert.equal(await check(without("keda"), [scaledObject]), "fits");
+  crd("verticalpodautoscalers.autoscaling.k8s.io");
+  assert.equal(await check(without("keda")), "this cluster has a VPA of its own already, and a cluster has one: install.autoscaling.vpa.enabled false uses it");
+  assert.equal(await check({ autoscaling: { keda: { enabled: false }, vpa: { enabled: false } } }, [verticalPodAutoscaler]), "fits");
 
   kube.objects.clear();
   kube.put("apiservices", { apiVersion: "apiregistration.k8s.io/v1", kind: "APIService", metadata: { name: "v1beta1.external.metrics.k8s.io" }, spec: { service: { namespace: "monitoring", name: "prometheus-adapter" } } });
-  assert.match(await check(objectsOf(), true), /^this cluster's external metrics are served by monitoring\/prometheus-adapter already, /u);
+  assert.match(await check({}), /^this cluster's external metrics are served by monitoring\/prometheus-adapter already, /u);
 });

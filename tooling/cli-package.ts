@@ -35,6 +35,8 @@ export const REQUIRED = [
   "dist/cli/src/manifests/clustertriggerauthentications.keda.sh.json",
   "dist/cli/src/manifests/cloudeventsources.eventing.keda.sh.json",
   "dist/cli/src/manifests/clustercloudeventsources.eventing.keda.sh.json",
+  "dist/cli/src/manifests/verticalpodautoscalers.autoscaling.k8s.io.json",
+  "dist/cli/src/manifests/verticalpodautoscalercheckpoints.autoscaling.k8s.io.json",
   "dist/cluster/node/pins.json",
   "dist/cluster/node/config-v3.toml.tmpl",
 ] as const;

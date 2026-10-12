@@ -24,6 +24,8 @@ test("sources, tests and what is not built are refused, and what it needs is req
     "dist/cli/src/manifests/clustertriggerauthentications.keda.sh.json is missing",
     "dist/cli/src/manifests/cloudeventsources.eventing.keda.sh.json is missing",
     "dist/cli/src/manifests/clustercloudeventsources.eventing.keda.sh.json is missing",
+    "dist/cli/src/manifests/verticalpodautoscalers.autoscaling.k8s.io.json is missing",
+    "dist/cli/src/manifests/verticalpodautoscalercheckpoints.autoscaling.k8s.io.json is missing",
     "dist/cluster/node/pins.json is missing",
     "dist/cluster/node/config-v3.toml.tmpl is missing",
   ]);

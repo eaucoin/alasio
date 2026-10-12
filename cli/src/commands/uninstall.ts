@@ -88,7 +88,7 @@ export const uninstall = Command.make(
   Command.withShortDescription("Remove alasio"),
   Command.withDescription(
     "Removes alasio's objects from its cluster, after confirmation, keeping what holds data: volumes, namespaces (with alasio's Secrets " +
-      "and its workspaces), and the CRDs (Sandboxes', and KEDA's), so alasio up installs it again as it was; and what serves volumes that remain, " +
+      "and its workspaces), and the CRDs (Sandboxes', KEDA's and VPA's), so alasio up installs it again as it was; and what serves volumes that remain, " +
       "their StorageClasses and CSI drivers. With --purge it removes those too, workspaces and their volumes before the drivers " +
       "that delete their data, and when alasio runs in the cluster it made on this machine, that cluster with all it keeps: k3s " +
       "on the machine itself, with its own uninstall script, and gVisor, or the cluster in Docker; and the file of " +

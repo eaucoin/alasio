@@ -496,6 +496,31 @@ const Autoscaling = Schema.Struct({
     }),
     {},
   ),
+  /** VPA (kubernetes/autoscaler vertical-pod-autoscaler-1.8.0), as its deploy/ installs it, with its chart's certificate Job. */
+  vpa: defaulted(
+    Schema.Struct({
+      enabled: defaulted(Schema.Boolean, true),
+      recommender: ControllerContainer(
+        { repository: "registry.k8s.io/autoscaling/vpa-recommender", tag: "1.8.0", digest: "sha256:e743e3a7e58a614f850063dba5df88eec5a19cf4cc43edb2050248df2d7dd8d3" },
+        { requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+      ),
+      updater: ControllerContainer(
+        { repository: "registry.k8s.io/autoscaling/vpa-updater", tag: "1.8.0", digest: "sha256:1d0229e52f90f645f1ee2e86ddfac8f451d166777c2aab066b9c5ab5e8bc5d5c" },
+        { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
+      ),
+      admissionController: ControllerContainer(
+        { repository: "registry.k8s.io/autoscaling/vpa-admission-controller", tag: "1.8.0", digest: "sha256:3d94f53e4c5a6891b8b32af545dda975e45842486432b69475afaf8df278d23d" },
+        { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
+      ),
+      /** What makes the admission controller's certificate, and gives its webhook the CA. */
+      certgenImage: Image({
+        repository: "registry.k8s.io/ingress-nginx/kube-webhook-certgen",
+        tag: "v1.6.9",
+        digest: "sha256:01038e7de14b78d702d2849c3aad72fd25903c4765af63cf16aa3398f5d5f2dd",
+      }),
+    }),
+    {},
+  ),
 });
 
 /** What a configuration must also hold, given what it turns off: the issue of the first it lacks. */

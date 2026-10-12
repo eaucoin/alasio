@@ -60,7 +60,7 @@ export const install = Effect.fnUntraced(function*(
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
   const objects = installationObjects(settings);
-  yield* checkAutoscalers(objects, settings.autoscaling.keda.enabled);
+  yield* checkAutoscalers(objects, settings);
   yield* applyInstallation(objects, options);
   return { bot, claude: settings.alasio.claude.existingSecret !== "" };
 });

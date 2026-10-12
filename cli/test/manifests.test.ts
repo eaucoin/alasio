@@ -1469,6 +1469,44 @@ describe("scaling", () => {
     const without = install({ autoscaling: { keda: { enabled: false } } });
     assert.deepEqual(without.filter(({ metadata }) => /keda/u.test(metadata?.name ?? "") || metadata?.name === "v1beta1.external.metrics.k8s.io").map(({ metadata }) => metadata?.name), []);
   });
+
+  test("installs VPA as its release does, its certificate made as its chart makes it, in alasio's namespace, restricted, pinned and small, on the floor; none where the cluster has its own", () => {
+    const objects = install();
+    assert.deepEqual(all(objects, "CustomResourceDefinition").map(({ metadata }) => metadata?.name).filter((name) => name?.endsWith("autoscaling.k8s.io")).sort(), [
+      "verticalpodautoscalercheckpoints.autoscaling.k8s.io",
+      "verticalpodautoscalers.autoscaling.k8s.io",
+    ]);
+    const args = (name: string) => container(one<V1Deployment>(objects, "Deployment", name)).args ?? [];
+    for (const name of ["alasio-vpa-recommender", "alasio-vpa-updater", "alasio-vpa-admission-controller"]) {
+      const deployment = one<V1Deployment>(objects, "Deployment", name);
+      assert.equal(deployment.spec?.template.spec?.priorityClassName, "alasio-floor");
+      assert.deepEqual(container(deployment).securityContext, { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true });
+      assert.match(container(deployment).image ?? "", /^registry\.k8s\.io\/autoscaling\/vpa-[-a-z]+:1\.8\.0@sha256:[0-9a-f]{64}$/u, name);
+      assert.ok(memoryBytes(container(deployment).resources?.requests?.["memory"] ?? "") <= 64 * 2 ** 20, name);
+    }
+    // It tracks what has a VerticalPodAutoscaler alone, recommends as little as a small component uses, and resizes a workload of one replica.
+    assert.deepEqual(args("alasio-vpa-recommender"), ["--memory-saver", "--pod-recommendation-min-cpu-millicores=10", "--pod-recommendation-min-memory-mb=16"]);
+    // Both take the InPlace update mode, which resizes in place and never recreates.
+    assert.deepEqual(args("alasio-vpa-updater"), ["--min-replicas=1", "--feature-gates=InPlace=true"]);
+    assert.deepEqual(args("alasio-vpa-admission-controller"), ["--register-webhook=false", "--webhook-service=alasio-vpa-webhook", "--feature-gates=InPlace=true"]);
+    const webhook = one<KubernetesObject & { webhooks: { failurePolicy: string; objectSelector: object; clientConfig: object }[] }>(objects, "MutatingWebhookConfiguration", "alasio-vpa-admission").webhooks[0];
+    assert.deepEqual([webhook?.failurePolicy, webhook?.objectSelector, webhook?.clientConfig], [
+      "Ignore",
+      { matchLabels: { "app.kubernetes.io/part-of": "alasio" } },
+      { service: { name: "alasio-vpa-webhook", namespace: "alasio", port: 443 } },
+    ]);
+    const certgen = one<V1Job>(objects, "Job", "alasio-vpa-certgen").spec?.template.spec;
+    assert.deepEqual(certgen?.initContainers?.map(({ args }) => args), [["create", "--host=alasio-vpa-webhook,alasio-vpa-webhook.alasio.svc", "--namespace=alasio", "--secret-name=alasio-vpa-tls"]]);
+    assert.deepEqual(certgen?.containers.map(({ args }) => args), [["patch", "--webhook-name=alasio-vpa-admission", "--namespace=alasio", "--secret-name=alasio-vpa-tls", "--patch-validating=false"]]);
+    assert.match(certgen?.containers[0]?.image ?? "", /^registry\.k8s\.io\/ingress-nginx\/kube-webhook-certgen:v1\.6\.9@sha256:[0-9a-f]{64}$/u);
+    // It may patch its own webhook alone.
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-vpa-certgen").rules, [
+      { apiGroups: ["admissionregistration.k8s.io"], resources: ["mutatingwebhookconfigurations"], verbs: ["get", "update", "patch"], resourceNames: ["alasio-vpa-admission"] },
+    ]);
+
+    const without = install({ autoscaling: { vpa: { enabled: false } } });
+    assert.deepEqual(without.filter(({ metadata }) => /vpa|verticalpodautoscaler/u.test(metadata?.name ?? "")).map(({ metadata }) => metadata?.name), []);
+  });
 });
 
 describe("admission", () => {

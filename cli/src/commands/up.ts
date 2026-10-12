@@ -58,7 +58,8 @@ export const up = Command.make("up", { timeout: timeoutFlag }, ({ timeout }) => 
       "Linux on x86-64: k3s on the machine itself, installing or upgrading k3s and gVisor and setting k3s as the config says, or " +
       "a cluster in Docker; for either, raising its inotify limits where they are too low for it. What it changes on the machine " +
       "it changes as root, through sudo, at once, after saying what. Then it applies alasio as the config says, " +
-      "with this version's images; and waits until it runs, saying what it waits for. Run it again after changing the config. " +
+      "with this version's images, and with KEDA and VPA, which scale and size its components, unless the cluster has its own, " +
+      "which the config then says to use; and waits until it runs, saying what it waits for. Run it again after changing the config. " +
       "Past --timeout it says what is still not running and why.",
   ),
 );
