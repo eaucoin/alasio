@@ -629,7 +629,7 @@ test("a download that is not what alasio pins is refused before anything is done
   const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], { env, machine, releases });
   assert.match(
     failure(run),
-    /^https:\/\/storage\.googleapis\.com\/gvisor\/releases\/release\/20990101\.0\/x86_64\/gvisor\.tar\.zstd is not what alasio pins: its sha512 is [0-9a-f]{128}, not [0-9a-f]{128}$/u,
+    /^https:\/\/github\.com\/eaucoin\/gvisor\/releases\/download\/release-20990101\.0\/gvisor-x86_64\.tar\.zstd is not what alasio pins: its sha512 is [0-9a-f]{128}, not [0-9a-f]{128}$/u,
   );
   assert.ok(!run.progress.some((line) => line.startsWith("alasio changes this machine")));
   assert.deepEqual(machine.ran, []);

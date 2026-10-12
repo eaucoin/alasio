@@ -86,7 +86,7 @@ test("an archive changed since it was downloaded is refused as root, and nothing
   const { directory, machine, perform } = rig(t);
   const archive = downloaded(directory);
   writeFileSync(archive.path, "changed");
-  assert.match(await perform(InstallGvisor.make({ release: "20990101.0", archive })) ?? "", /^https:\/\/storage\.googleapis\.com\/.* is not what alasio pins: its sha512 is /u);
+  assert.match(await perform(InstallGvisor.make({ release: "20990101.0", archive })) ?? "", /^https:\/\/github\.com\/eaucoin\/gvisor\/.* is not what alasio pins: its sha512 is /u);
   assert.equal(machine.has("/usr/local/bin/runsc"), false);
   assert.equal(machine.has("/etc/rancher/k3s/alasio.json"), false);
 });

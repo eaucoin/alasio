@@ -4,12 +4,12 @@
 # on, on a single machine and in CI. The k3s image, and the gVisor release with its sha512,
 # are pins.json's, whose k3s and gVisor the host target installs on a machine itself, with
 # the same containerd template: every build passes them as build arguments, as
-# tooling/node-image.ts says them.
+# tooling/node-image.ts says them. gVisor is alasio's fork of it, github.com/eaucoin/gvisor.
 ARG K3S_IMAGE
 FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS gvisor
 ARG GVISOR_RELEASE
 ARG GVISOR_SHA512
-ADD https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64/gvisor.tar.zstd /tmp/gvisor.tar.zstd
+ADD https://github.com/eaucoin/gvisor/releases/download/release-${GVISOR_RELEASE}/gvisor-x86_64.tar.zstd /tmp/gvisor.tar.zstd
 RUN echo "${GVISOR_SHA512}  /tmp/gvisor.tar.zstd" | sha512sum -c - \
  && apk add --no-cache zstd \
  && mkdir /gvisor \

@@ -42,11 +42,11 @@ export interface Download {
   readonly digest: string;
 }
 
-/** Where what `pins` pins is downloaded from: k3s's binary and install script from its repository, gVisor's release from Google's. */
+/** Where what `pins` pins is downloaded from: k3s's binary and install script from its repository, gVisor's release from alasio's fork of it, github.com/eaucoin/gvisor. */
 export const downloads = ({ k3s, gvisor }: NodePins): { readonly k3s: Download; readonly installScript: Download; readonly gvisor: Download } => ({
   k3s: { url: `https://github.com/k3s-io/k3s/releases/download/${encodeURIComponent(k3s.version)}/k3s`, algorithm: "sha256", digest: k3s.sha256 },
   installScript: { url: `https://raw.githubusercontent.com/k3s-io/k3s/${k3s.installScript.commit}/install.sh`, algorithm: "sha256", digest: k3s.installScript.sha256 },
-  gvisor: { url: `https://storage.googleapis.com/gvisor/releases/release/${gvisor.release}/x86_64/gvisor.tar.zstd`, algorithm: "sha512", digest: gvisor.sha512 },
+  gvisor: { url: `https://github.com/eaucoin/gvisor/releases/download/release-${encodeURIComponent(gvisor.release)}/gvisor-x86_64.tar.zstd`, algorithm: "sha512", digest: gvisor.sha512 },
 });
 
 const BIN = "/usr/local/bin";
