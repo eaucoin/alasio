@@ -61,10 +61,10 @@ import {
   type SandboxError,
   type SandboxFault,
   type SandboxOperatingMode,
-  sameToken,
   sandboxManifest,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
+import { sameToken } from "../shared/tokens.ts";
 import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";

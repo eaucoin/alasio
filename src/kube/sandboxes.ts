@@ -16,7 +16,7 @@
  * it replace a pod that has ended, or one whose fault only a new pod mends, so alasio
  * restarts the Sandbox of either as it brings it up.
  */
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import type {
   KubernetesObject,
@@ -218,13 +218,6 @@ export function claimName(template: string, sandbox: string): string {
  */
 export function newToken(name: string, random: () => string = () => randomBytes(32).toString("base64url")): string {
   return `${name}.${random()}`;
-}
-
-/** Whether `presented` is `expected`, compared in constant time. */
-export function sameToken(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /**

@@ -31,7 +31,6 @@ import {
   type SandboxFault,
   type SandboxSpec,
   type SandboxStatus,
-  sameToken,
   sandboxManifest,
   sandboxReady,
   tokenSecretManifest,
@@ -39,6 +38,7 @@ import {
 import { cloneJobManifest, type NetMode, SessionInheritError, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
+import { sameToken } from "../src/shared/tokens.ts";
 import type { Signal } from "../src/telemetry/config.ts";
 import type { ForwardResult, OtlpEncoding, OtlpForwarder } from "../src/telemetry/forward.ts";
 

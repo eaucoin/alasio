@@ -24,7 +24,6 @@
  * working directories and harness sessions stay as they are, and records it as a session
  * workspace it made, in its own database.
  */
-import { timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 
@@ -41,22 +40,13 @@ import { Store } from "../persistence/store.ts";
 import { SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
+import { BearerToken, sameToken } from "../shared/tokens.ts";
 import { sessionFsWorkspace } from "../workspace/kind.ts";
 import { BRANCH_FORK_PORT, branchSessionsNamespace, forkToken } from "./names.ts";
-
-/** The bearer token a request presents, from its `Authorization` header. */
-const BearerToken = Schema.TemplateLiteralParser(["Bearer ", Schema.NonEmptyString]);
 
 const FORK = /^\/branches\/([^/]+)\/sessions\/([^/]+)\/fork$/u;
 
 const answer = (status: number, body: object): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
-
-/** Whether `presented` is `expected`, compared in constant time. */
-function same(presented: string, expected: string): boolean {
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
 
 /** What serveBranchForks is given: its port, and where the key is. */
 export interface BranchForksOptions {
@@ -86,7 +76,7 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     const [, branch = "", volumeId = ""] = asked;
     const key = yield* Effect.promise(() => readFile(keyFile, "utf8").then((text) => text.trim(), () => ""));
     const bearer = Schema.decodeUnknownOption(BearerToken)(request.headers["authorization"]);
-    if (!key || nameProblem(branch) !== null || Option.isNone(bearer) || !same(bearer.value[1], forkToken(key, branch))) {
+    if (!key || nameProblem(branch) !== null || Option.isNone(bearer) || !sameToken(bearer.value[1], forkToken(key, branch))) {
       return answer(401, { error: "the request bears no branch's token" });
     }
     if (!isValidVolumeId(volumeId)) return answer(404, { error: `${volumeId} is no session's id` });

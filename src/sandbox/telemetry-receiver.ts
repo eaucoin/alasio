@@ -20,6 +20,7 @@ import { Clock, Effect, Option, Ref, Schema, type Scope, Stream } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { withLogScope } from "../shared/log.ts";
+import { BearerToken } from "../shared/tokens.ts";
 import type { Signal } from "../telemetry/config.ts";
 import type { OtlpEncoding, OtlpForwarder } from "../telemetry/forward.ts";
 import { meter, SIGNALS } from "../telemetry/index.ts";
@@ -39,9 +40,6 @@ const requests = meter.createCounter("alasio.sandbox.telemetry.received", {
   description: "OTLP requests received from bayma inside session sandboxes, by outcome",
   unit: "{request}",
 });
-
-/** The bearer token a request presents, from its `Authorization` header. */
-const BearerToken = Schema.TemplateLiteralParser(["Bearer ", Schema.NonEmptyString]);
 
 const ENCODINGS = { "application/x-protobuf": "protobuf", "application/json": "json" } as const satisfies Record<string, OtlpEncoding>;
 
