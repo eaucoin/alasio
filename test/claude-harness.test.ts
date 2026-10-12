@@ -51,6 +51,7 @@ import {
   toolUse,
   usage,
 } from "./support/claude-sdk.ts";
+import { activeTurnsHolding, type Hold } from "./support/busy-pods.ts";
 
 type TextResponseBlock = Extract<ResponseBlock, { type: "text" }>;
 
@@ -845,6 +846,37 @@ test("background work keeps running after the answer and its report is delivered
   assert.ok(events.includes("idle"));
   await closeAll();
   assert.equal(cli.state.closed, 1);
+});
+
+test("a turn holds the pod it works in busy while it runs: an operator's, and one Claude Code starts itself to report", async () => {
+  const persistence = createPersistence();
+  const holds: Hold[] = [];
+  const activeTurns = activeTurnsHolding(holds);
+  const cli = createFakeCli();
+  const pod = { namespace: "alasio-host", name: "bayma-telegram-1" };
+  const workspacePod = (threadKey: string) => (threadKey === "telegram:1" ? pod : null);
+  const { liveSessions, closeAll } = openLiveSessions(
+    { workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma, workspacePod },
+    activeTurns,
+  );
+  const turn = runTurn(liveSessions, turnParams(persistence));
+  const first = await cli.nextPrompt();
+  assert.deepEqual(holds, [{ workspace: pod, released: false }]);
+  cli.emit(initMessage("s-1"));
+  cli.emit(assistantMessage([toolUse("t1", "Bash", { command: "bun run test", run_in_background: true })]));
+  cli.emit(backgroundTasksChanged([{ task_id: "b1", task_type: "local_bash", description: "bun run test" }]));
+  cli.emit(successResult({ result: "Tests are running.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+  assert.deepEqual(holds, [{ workspace: pod, released: true }]);
+
+  cli.emit(backgroundTasksChanged([]));
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  await settle();
+  assert.deepEqual(holds.at(-1), { workspace: pod, released: false });
+  cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
+  await settle();
+  assert.deepEqual(holds, [{ workspace: pod, released: true }, { workspace: pod, released: true }]);
+  await closeAll();
 });
 
 test("later prompts on the same session reuse the live process; a new session or model replaces it", async () => {

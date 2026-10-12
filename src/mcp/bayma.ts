@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 import { Context, Effect, Layer, Option, Schema } from "effect";
 
+import type { PodRef } from "../kube/busy.ts";
 import type { KubeClient } from "../kube/client.ts";
 import type { HostProfile } from "../kube/config.ts";
 import { HARNESS_LABEL, sanitizePathToken, STATE_DIR_ARG, WORKLOAD_LABEL } from "../kube/sandbox-shape.ts";
@@ -93,6 +94,8 @@ export function hostBaymaManifest({ harness, threadKey, profile, env = process.e
 export class HostBayma extends Context.Service<HostBayma, {
   /** The bayma MCP server of one conversation under one harness, once it answers. */
   readonly ensure: (scope: HostBaymaScope) => Effect.Effect<BaymaMcpServer, SandboxError>;
+  /** Its pod, which agent-sandbox names after its Sandbox: where the conversation's turns under the harness work. */
+  readonly pod: (scope: HostBaymaScope) => PodRef;
 }>()("alasio/mcp/HostBayma") {
   static readonly layer = (profile: HostProfile, env: Readonly<NodeJS.ProcessEnv> = process.env): Layer.Layer<HostBayma, never, KubeClient> =>
     Layer.effect(
@@ -104,6 +107,7 @@ export class HostBayma extends Context.Service<HostBayma, {
             sandboxes.ensure(hostBaymaName(harness, threadKey), () => hostBaymaManifest({ harness, threadKey, profile, env })).pipe(
               Effect.map((endpoint) => ({ type: "http", ...endpoint })),
             ),
+          pod: ({ harness, threadKey }) => ({ namespace: profile.namespace, name: hostBaymaName(harness, threadKey) }),
         });
       }),
     );

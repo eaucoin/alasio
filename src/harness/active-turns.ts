@@ -2,10 +2,12 @@
  * The turns running now, one per conversation at most: a conversation with one is busy.
  * A turn registers itself for exactly as long as it runs, in a scope of its own, with
  * how it is stopped and steered; whatever asks whether a conversation is busy, or stops
- * or steers its turn, asks here.
+ * or steers its turn, asks here. Where alasio runs in a pod (BusyPods), its pod and the
+ * one the turn works in are held busy while it runs, so no drain stops either.
  */
 import { Context, Deferred, Effect, HashMap, Layer, Option, Ref, type Scope } from "effect";
 
+import { BusyPods, type PodRef } from "../kube/busy.ts";
 import type { HarnessError } from "./index.ts";
 
 /** Why the operator stops a running turn: /stop (or a panel's Stop), or a swerve to the prompt that came in meanwhile. */
@@ -29,12 +31,15 @@ export interface RunningTurn {
 export interface RegisterOptions {
   /** Registers the turn only if its conversation has none running; otherwise the registration is a no-op. */
   readonly onlyIfIdle?: boolean | undefined;
+  /** The pod the turn works in, its workspace's: held busy while the turn runs, with alasio's own. */
+  readonly workspace?: PodRef | null | undefined;
 }
 
 export class ActiveTurns extends Context.Service<ActiveTurns, {
   /**
    * Registers `turn` as `conversationId`'s running turn until the scope closes, in place
-   * of any registered before it; closing the scope leaves a later registration be.
+   * of any registered before it; closing the scope leaves a later registration be. A turn
+   * registered holds its pods busy (BusyPods) for as long.
    */
   readonly register: (conversationId: string, turn: RunningTurn, options?: RegisterOptions) => Effect.Effect<void, never, Scope.Scope>;
   /** The conversation's running turn, if it has one. */
@@ -56,6 +61,9 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
   static readonly layer: Layer.Layer<ActiveTurns> = Layer.effect(ActiveTurns, Effect.gen(function*() {
     const running = yield* Ref.make(HashMap.empty<string, RunningTurn>());
     const get = (conversationId: string) => Effect.map(Ref.get(running), HashMap.get(conversationId));
+    const busy = yield* Effect.serviceOption(BusyPods);
+    const holdBusy = (workspace: PodRef | null): Effect.Effect<void, never, Scope.Scope> =>
+      Option.match(busy, { onNone: () => Effect.void, onSome: (pods) => pods.hold(workspace) });
 
     return ActiveTurns.of({
       register: (conversationId, turn, options) =>
@@ -69,7 +77,7 @@ export class ActiveTurns extends Context.Service<ActiveTurns, {
               ? Ref.update(running, (turns) =>
                 Option.exists(HashMap.get(turns, conversationId), (current) => current === turn) ? HashMap.remove(turns, conversationId) : turns)
               : Effect.void,
-        ).pipe(Effect.asVoid),
+        ).pipe(Effect.flatMap((registered) => (registered ? holdBusy(options?.workspace ?? null) : Effect.void))),
       get,
       hold: (conversationIds) =>
         Effect.gen(function*() {

@@ -18,6 +18,7 @@ import { ActiveTurns } from "./harness/active-turns.ts";
 import type { ClaudeQueryFactory } from "./harness/claude/runtime.ts";
 import { Harnesses } from "./harness/index.ts";
 import type { KubeTemplates } from "./kube/config.ts";
+import { BusyPods } from "./kube/busy.ts";
 import { KubeClient } from "./kube/client.ts";
 import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
@@ -91,7 +92,7 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,
       workspaceServices(options),
       codexServices(options),
-      ActiveTurns.layer,
+      activeTurns(options),
     )),
     Layer.provideMerge(Layer.mergeAll(
       Store.layer({ pool: options.pool, schema: options.stateSchema, workingDirectory: options.workingDirectory, branch: options.branch?.name }),
@@ -120,6 +121,18 @@ function workspaceServices({ kubeTemplates, stateDir, branch }: AlasioOptions): 
       : Layer.empty,
     host ? HostBayma.layer(host) : Layer.empty,
   ).pipe(Layer.provide(KubeClient.layer));
+}
+
+/**
+ * The turns running, which hold the pods they run in busy (./kube/busy.ts) where alasio
+ * runs in Kubernetes, as the deployment's templates say it does, on a KubeClient of their
+ * own: its own, and its workspaces', in the namespaces the templates say; elsewhere they
+ * hold none.
+ */
+function activeTurns({ kubeTemplates }: AlasioOptions): Layer.Layer<ActiveTurns> {
+  if (!kubeTemplates) return ActiveTurns.layer;
+  const namespaces = [kubeTemplates.sessions?.namespace, kubeTemplates.host?.namespace].filter((namespace) => namespace !== undefined);
+  return ActiveTurns.layer.pipe(Layer.provide(Layer.orDie(BusyPods.layer({ namespaces })).pipe(Layer.provide(KubeClient.layer))));
 }
 
 /**

@@ -7,7 +7,8 @@ import type { ResponseBlock } from "../codex/event-projection.ts";
 import type { KeptCodexRollouts } from "../codex/rollouts/index.ts";
 import type { CodexSessionError } from "../codex/runtime.ts";
 import { SessionFsCodex } from "../codex/sessionfs.ts";
-import { type FolderBayma, folderBayma as hostFolderBayma } from "../mcp/bayma.ts";
+import type { PodRef } from "../kube/busy.ts";
+import { type FolderBayma, folderBayma as hostFolderBayma, HostBayma } from "../mcp/bayma.ts";
 import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import type { Store } from "../persistence/store.ts";
@@ -185,6 +186,8 @@ export interface HarnessOptions {
   readonly sandbox: SessionSandboxes["Service"] | null;
   /** A folder workspace's bayma. */
   readonly folderBayma: FolderBayma;
+  /** The pod a conversation's turns in the working directory work in, which they hold busy; none where none is known. */
+  readonly workspacePod?: ((threadKey: string) => PodRef | null) | undefined;
   /** How Claude Code is started: the Agent SDK's `query`, unless a test gives its own. */
   readonly claudeQueryFactory?: ClaudeQueryFactory | undefined;
 }
@@ -270,6 +273,21 @@ export class Harnesses extends Context.Service<Harnesses, {
     Layer.effect(Harnesses, makeHarnesses(options));
 }
 
+/**
+ * The pod a conversation's turns under `harness` in `workingDirectory` work in: its
+ * session's Sandbox's, or its folder's bayma's under the harness; none where the service
+ * that runs it is not there.
+ */
+export function workspacePodOf(
+  { harness, workingDirectory, threadKey }: { readonly harness: HarnessName; readonly workingDirectory: string; readonly threadKey: string },
+  sandbox: Pick<SessionSandboxes["Service"], "pod"> | null,
+  hostBayma: Pick<HostBayma["Service"], "pod"> | null,
+): PodRef | null {
+  const workspace = parseWorkspace(workingDirectory);
+  if (workspace?.kind === "sessionfs") return sandbox?.pod(workspace.volumeId) ?? null;
+  return hostBayma?.pod({ harness, threadKey }) ?? null;
+}
+
 const makeHarnesses = Effect.fnUntraced(function*({
   overrides = {},
   folderBayma,
@@ -280,13 +298,15 @@ const makeHarnesses = Effect.fnUntraced(function*({
   const services = yield* Effect.context<CodexAppServer | ActiveTurns | Scope.Scope>();
   const sandbox = Option.getOrNull(yield* Effect.serviceOption(SessionSandboxes));
   const sessionFsCodex = Option.getOrNull(yield* Effect.serviceOption(SessionFsCodex));
+  const hostBayma = Option.getOrNull(yield* Effect.serviceOption(HostBayma));
   const harnessOptions = { ...options, sandbox, folderBayma: folderBayma ?? (yield* hostFolderBayma) };
   const adapters = new Map<string, Harness>();
 
   const make = (name: HarnessName, workingDirectory: string): Effect.Effect<Harness, SessionFilesystemsDisabled> => {
+    const forDirectory = { ...harnessOptions, workingDirectory, workspacePod: (threadKey: string) => workspacePodOf({ harness: name, workingDirectory, threadKey }, sandbox, hostBayma) };
     const made: Effect.Effect<Harness, SessionFilesystemsDisabled, CodexAppServer | ActiveTurns | Scope.Scope> = name === CODEX_HARNESS
-      ? makeCodexHarness({ ...harnessOptions, workingDirectory, sessionFsCodex })
-      : makeClaudeHarness({ ...harnessOptions, workingDirectory });
+      ? makeCodexHarness({ ...forDirectory, sessionFsCodex })
+      : makeClaudeHarness(forDirectory);
     return Effect.provideContext(made, services);
   };
 

@@ -32,6 +32,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
   sandbox,
   sessionApi = null,
   folderBayma,
+  workspacePod,
   claudeQueryFactory,
 }: ClaudeHarnessOptions): Effect.fn.Return<Harness, SessionFilesystemsDisabled, ActiveTurns | Scope.Scope> {
   const workspace = parseWorkspace(workingDirectory);
@@ -49,6 +50,7 @@ export const makeClaudeHarness = Effect.fnUntraced(function*({
     sessionStore,
     sessionFsBayma,
     folderBayma: ({ threadKey }) => folderBayma({ harness: CLAUDE_HARNESS, threadKey }),
+    workspacePod,
     queryFactory: claudeQueryFactory,
   });
   return {

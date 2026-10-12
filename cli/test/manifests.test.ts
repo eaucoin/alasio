@@ -595,7 +595,7 @@ describe("Grafana", () => {
     assert.deepEqual([admits(policies, pod, pod, 9094), admits(policies, alasio, pod, 9094), admits(policies, pod, pod, 3000)], [true, false, false]);
     // Of one replica, none of that.
     const single = install();
-    assert.deepEqual(all(single, "PodDisruptionBudget").map(({ metadata }) => metadata?.name), ["alasio-neon-safekeeper"]);
+    assert.deepEqual(all(single, "PodDisruptionBudget").filter(({ metadata }) => metadata?.namespace === "alasio" && metadata.name !== "alasio-busy").map(({ metadata }) => metadata?.name), ["alasio-neon-safekeeper"]);
     assert.equal(all(single, "Service").find(({ metadata }) => metadata?.name === "alasio-grafana-peers"), undefined);
     assert.equal(container(one<V1Deployment>(single, "Deployment", "alasio-grafana")).env?.find(({ name }) => name.startsWith("GF_UNIFIED_ALERTING_HA")), undefined);
   });
@@ -1238,16 +1238,17 @@ describe("security", () => {
     assert.deepEqual(all(install({ networkPolicies: { enabled: false } }), "NetworkPolicy"), []);
   });
 
-  test("lets alasio manage only Sandboxes, their token Secrets and exec in its namespaces", () => {
+  test("lets alasio manage only Sandboxes, their token Secrets, exec and their pods' busy labels in its namespaces, and its own pod's in its own", () => {
     const roles = all<V1Role>(install({ workspaceStorage: { enabled: false } }), "Role").filter((role) => role.metadata?.name === "alasio");
-    assert.equal(roles.length, 1);
-    assert.equal(roles[0]?.metadata?.namespace, "alasio-sessions");
-    assert.deepEqual(roles[0]?.rules, [
-      { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["get", "list", "watch", "create", "patch", "delete"] },
-      { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
-      { apiGroups: [""], resources: ["pods"], verbs: ["get"] },
-      { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
-    ]);
+    assert.deepEqual(Object.fromEntries(roles.map(({ metadata, rules }) => [metadata?.namespace, rules])), {
+      "alasio-sessions": [
+        { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["get", "list", "watch", "create", "patch", "delete"] },
+        { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
+        { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
+        { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
+      ],
+      alasio: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }],
+    });
   });
 
   test("lets alasio read sessions' claims and run the Jobs that clone them in its own namespace, only where it forks sessions", () => {
@@ -1255,14 +1256,14 @@ describe("security", () => {
       Object.fromEntries(all<V1Role>(objects, "Role").filter((role) => role.metadata?.name === "alasio").map(({ metadata, rules }) => [metadata?.namespace, rules]));
     const objects = install({ host: { enabled: true } });
     const roles = rolesOf(objects);
-    assert.deepEqual(roles["alasio"], [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }]);
+    assert.deepEqual(roles["alasio"]?.at(-1), { apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] });
     assert.deepEqual(roles["alasio-sessions"]?.at(-1), { apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] });
     assert.ok(!JSON.stringify(roles["alasio-host"]).includes("persistentvolumeclaims"));
     const binding = one<V1RoleBinding>(objects.filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
     assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
     assert.deepEqual(binding.roleRef, { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "alasio" });
     const unforked = rolesOf(install({ sessions: { storage: { storageClassName: "fast" } } }));
-    assert.equal(unforked["alasio"], undefined);
+    assert.ok(!JSON.stringify(unforked["alasio"]).includes("jobs"));
     assert.ok(!JSON.stringify(unforked["alasio-sessions"]).includes("persistentvolumeclaims"));
   });
 
@@ -1338,7 +1339,13 @@ describe("branch environments", () => {
     assert.equal(templates.sessions.mountPodNamespace, undefined);
     assert.equal(templates.host, undefined);
     const roles = all<V1Role>(branch, "Role");
-    assert.deepEqual(roles.map(({ metadata }) => [metadata?.namespace, metadata?.name]), [["alasio-branch-try-sessions", "alasio"], ["alasio-branch-try-sessions", "alasio-parent"]]);
+    assert.deepEqual(roles.map(({ metadata }) => [metadata?.namespace, metadata?.name]), [
+      ["alasio-branch-try-sessions", "alasio"],
+      // Its own pod, which it labels busy as main's does.
+      ["alasio-branch-try", "alasio"],
+      ["alasio-branch-try-sessions", "alasio-parent"],
+    ]);
+    assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
     const binding = of<V1RoleBinding>("RoleBinding", "alasio", "alasio-branch-try-sessions");
     assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio-branch-try" }]);
     // main's alasio, which forks the sessions the branch inherited into it.
@@ -1513,6 +1520,46 @@ describe("scaling", () => {
         controlledValues: "RequestsOnly",
       })));
     }
+  });
+
+  test("lets no busy pod of alasio's be evicted, in its namespace and each of its workspaces', and tells alasio its pod's name to label", () => {
+    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try")];
+    const budgets = all<KubernetesObject & { spec: object }>(objects, "PodDisruptionBudget").filter(({ metadata }) => metadata?.name === "alasio-busy");
+    assert.deepEqual(budgets.map(({ metadata }) => metadata?.namespace).sort(), ["alasio", "alasio-branch-try", "alasio-branch-try-sessions", "alasio-host", "alasio-sessions"]);
+    // But one not ready, whose label a turn that may never end holds.
+    for (const { spec } of budgets) assert.deepEqual(spec, { maxUnavailable: 0, selector: { matchLabels: { "alasio.dev/busy": "true" } }, unhealthyPodEvictionPolicy: "AlwaysAllow" });
+    assert.deepEqual(container(one<V1Deployment>(install(), "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_POD"), {
+      name: "ALASIO_POD",
+      valueFrom: { fieldRef: { fieldPath: "metadata.name" } },
+    });
+  });
+
+  test("lets alasio change no more of a pod than its busy label and annotations, main's and each branch's alasio", () => {
+    const objects = install();
+    const policy = one<KubernetesObject & { spec: { matchConditions: { expression: string }[]; validations: { expression: string }[] } }>(objects, "ValidatingAdmissionPolicy", "alasio-busy-label");
+    const expression = policy.spec.matchConditions[0]?.expression ?? "";
+    const accounts = new RegExp(expression.slice(expression.indexOf("'") + 1, expression.lastIndexOf("'")), "u");
+    assert.deepEqual(
+      ["system:serviceaccount:alasio:alasio", "system:serviceaccount:alasio-branch-try:alasio", "system:serviceaccount:alasio:alasio-collector", "system:serviceaccount:kube-system:alasio"].map((user) => accounts.test(user)),
+      [true, true, false, false],
+    );
+    assert.deepEqual(policy.spec.validations.map(({ expression }) => expression.split(" ")[0]), [
+      "object.spec",
+      "object.metadata.?finalizers.orValue([])",
+      "request.userInfo.username",
+      "variables.newLabels.all(key,",
+      "variables.newAnnotations.all(key,",
+    ]);
+    // In its own namespace, its own pods alone.
+    assert.equal(
+      policy.spec.validations[2]?.expression,
+      'request.userInfo.username != "system:serviceaccount:" + request.namespace + ":alasio" || ("app.kubernetes.io/component" in variables.oldLabels && variables.oldLabels["app.kubernetes.io/component"] == "alasio")',
+    );
+    assert.ok(policy.spec.validations[1]?.expression.includes("object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])"));
+    assert.ok(policy.spec.validations[3]?.expression.includes('key in ["alasio.dev/busy"]'));
+    assert.deepEqual(one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", "alasio-busy-label").spec, { policyName: "alasio-busy-label", validationActions: ["Deny"] });
+    // The cluster's, made with main's alone; a branch makes its Sandboxes' alone.
+    assert.deepEqual(all(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy").map(({ metadata }) => metadata?.name), ["alasio-branch-try-sandboxes"]);
   });
 
   test("installs KEDA as its release does, in alasio's namespace under alasio's names, restricted, pinned and small, on the floor; none where the cluster has its own", () => {

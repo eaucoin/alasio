@@ -12,7 +12,10 @@
  *   sandbox-shape.ts): RBAC lets it make Sandboxes of any pod, as any ServiceAccount, under
  *   any runtime;
  * - a Secret alasio makes is a Sandbox's token: RBAC lets it make Secrets of any type, a
- *   ServiceAccount's token among them.
+ *   ServiceAccount's token among them;
+ * - a pod alasio patches changes its busy label and annotations alone (src/kube/busy.ts),
+ *   and in alasio's own namespace is alasio's own: RBAC lets it patch its namespaces'
+ *   pods whole, their images among it.
  *
  * Where a policy holds an object to a rendered one, `pinned` makes the CEL that says so:
  * the object's fields are the rendered ones', key for key and item for item, but for what
@@ -23,6 +26,7 @@ import { posix } from "node:path";
 import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Volume } from "@kubernetes/client-node";
 
 import { branchNamespace } from "../../../src/branch/names.ts";
+import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
   BAYMA_CONTAINER,
@@ -142,6 +146,7 @@ function admissionPolicy(
   rules: readonly { readonly apiGroups: string[]; readonly resources: string[]; readonly operations: string[] }[],
   by: string,
   validations: readonly { readonly expression: string; readonly message: string }[],
+  variables?: readonly { readonly name: string; readonly expression: string }[],
 ): KubernetesObject[] {
   const metadata = { name, labels: labels("alasio") };
   const policy = {
@@ -152,11 +157,44 @@ function admissionPolicy(
       failurePolicy: "Fail",
       matchConstraints: { resourceRules: rules.map((rule) => ({ ...rule, apiVersions: ["*"] })) },
       matchConditions: [{ name: "by-alasio", expression: by }],
+      ...(variables ? { variables } : {}),
       validations,
     },
   };
   const binding = { apiVersion: "admissionregistration.k8s.io/v1", kind: "ValidatingAdmissionPolicyBinding", metadata, spec: { policyName: name, validationActions: ["Deny"] } };
   return [policy, binding];
+}
+
+/**
+ * What alasio may change of a pod: its busy label and the annotations that go with it
+ * (src/kube/busy.ts), and nothing else; and in its own namespace, of its own pod alone,
+ * not the floor's beside it. Main's alasio's and each branch environment's.
+ */
+export function busyLabelPolicy(): KubernetesObject[] {
+  const unchanged = (field: string, keys: readonly string[]) =>
+    `variables.new${field}.all(key, key in ${JSON.stringify(keys)} || (key in variables.old${field} && variables.old${field}[key] == variables.new${field}[key])) && ` +
+    `variables.old${field}.all(key, key in ${JSON.stringify(keys)} || key in variables.new${field})`;
+  const component = "app.kubernetes.io/component";
+  return admissionPolicy(componentName("busy-label"), [{ apiGroups: [""], resources: ["pods"], operations: ["UPDATE"] }], BY_ANY_ALASIO, [
+    { expression: "object.spec == oldObject.spec", message: "alasio changes no pod's spec" },
+    {
+      expression: "object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) && " +
+        "object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])",
+      message: "alasio changes no pod's finalizers or owners",
+    },
+    {
+      expression: `request.userInfo.username != "system:serviceaccount:" + request.namespace + ":${RELEASE}" || ` +
+        `("${component}" in variables.oldLabels && variables.oldLabels["${component}"] == "alasio")`,
+      message: "alasio labels no pod of its own namespace but its own",
+    },
+    { expression: unchanged("Labels", [BUSY_LABEL]), message: `alasio changes no label of a pod's but ${BUSY_LABEL}` },
+    { expression: unchanged("Annotations", Object.keys(BUSY_ANNOTATIONS)), message: `alasio changes no annotation of a pod's but ${Object.keys(BUSY_ANNOTATIONS).join(" and ")}` },
+  ], [
+    { name: "oldLabels", expression: "oldObject.metadata.?labels.orValue({})" },
+    { name: "newLabels", expression: "object.metadata.?labels.orValue({})" },
+    { name: "oldAnnotations", expression: "oldObject.metadata.?annotations.orValue({})" },
+    { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
+  ]);
 }
 
 /**

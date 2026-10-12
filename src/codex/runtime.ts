@@ -32,6 +32,7 @@ import type { AppServerStartError } from "./app-server/rpc-client.ts";
 import type { ThreadIdMissing } from "./app-server/thread-client.ts";
 import type { CodexListingScope } from "./sessions.ts";
 import type { CodexStreamParams } from "./transport.ts";
+import type { PodRef } from "../kube/busy.ts";
 import { type FolderBayma, noFolderBayma } from "../mcp/bayma.ts";
 import { withLogScope } from "../shared/log.ts";
 import { ActiveTurns, type RunningTurn, stopReasonText } from "../harness/active-turns.ts";
@@ -88,6 +89,8 @@ export interface CodexTurnParams extends TurnParams, CodexScopeParams {
   readonly codexFactory?: CodexStreamParams["codexFactory"];
   /** How many times the DB guardrail has already sent the turn back to Codex. */
   readonly guardrailRecoveryDepth?: number | undefined;
+  /** The pod the turn works in, which it holds busy while it runs (ActiveTurns). */
+  readonly workspacePod?: PodRef | null | undefined;
 }
 
 /** The operator stopped a turn, with /stop or a swerve. */
@@ -317,7 +320,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   // interrupts the reading, which interrupts it upstream. The reading is a fiber of its
   // own, which interrupting this one leaves be.
   const reader = yield* Effect.forkDetach(readEvents);
-  const read = yield* Effect.scoped(activeTurns.register(threadKey, running).pipe(
+  const read = yield* Effect.scoped(activeTurns.register(threadKey, running, { workspace: params.workspacePod }).pipe(
     Effect.andThen(Fiber.join(reader).pipe(
       Effect.raceFirst(Deferred.await(stopped)),
       // Stopped, the reading is interrupted, and with it the turn upstream.

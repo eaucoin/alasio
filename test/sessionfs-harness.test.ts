@@ -36,6 +36,7 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
     ensured,
     volumes: { create: unused, fork: unused, destroy: unused, forks: Effect.sync(unused) },
     harnessDirectory: (volumeId) => `/state/sessionfs/workspaces/${volumeId}`,
+    pod: (volumeId) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: (volumeId) =>
       Effect.sync(() => {
         ensured.push(volumeId);

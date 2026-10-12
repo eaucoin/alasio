@@ -21,7 +21,7 @@ import type {
 import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
 import { imageReference } from "../images.ts";
-import { alasioAccount, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { alasioAccount, busyLabelPolicy, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -49,6 +49,7 @@ import {
   sha256,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { busyBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { cloneJob } from "./workspace-storage.ts";
@@ -269,6 +270,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     ...(operatorHome ? [] : [{ name: "ALASIO_KEEP_CODEX_LOGIN", value: "1" }]),
     { name: "ALASIO_DEPLOYMENT", value: RELEASE },
     { name: "ALASIO_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
+    { name: "ALASIO_POD", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
     { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "token" } } },
     { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "allowedUserIds" } } },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
@@ -438,10 +440,11 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
 
 /**
  * alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and reads
- * files from sessions through exec, in the namespaces it owns; where it forks sessions,
- * reads sessions' volume claims and runs the Jobs that clone them in its own; and, where
- * it installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its
- * mount pods; and nothing else.
+ * files from sessions through exec, in the namespaces it owns, labelling their pods busy
+ * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
+ * it forks sessions, reads sessions' volume claims and runs the Jobs that clone them in its
+ * own; and, where it installs JuiceFS's driver, lists and deletes pods in the driver's
+ * namespace, its mount pods; and nothing else.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const main = environment.branch === null;
@@ -459,12 +462,15 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     metadata: inDriverNamespace,
     rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "delete"] }],
   };
-  const inOwnNamespace = { name: RELEASE, namespace: NAMESPACE, labels: labels("alasio") };
-  const clones: V1Role = {
+  const inOwnNamespace = { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") };
+  const own: V1Role = {
     apiVersion: "rbac.authorization.k8s.io/v1",
     kind: "Role",
     metadata: inOwnNamespace,
-    rules: [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }],
+    rules: [
+      { apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] },
+      ...(main && sessionsForked(config) ? [{ apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "delete"] }] : []),
+    ],
   };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") } };
   return [
@@ -479,14 +485,15 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
         rules: [
           { apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], verbs: ["get", "list", "watch", "create", "patch", "delete"] },
           { apiGroups: [""], resources: ["secrets"], verbs: ["get", "create"] },
-          { apiGroups: [""], resources: ["pods"], verbs: ["get"] },
+          { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
           ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
         ],
       };
       return [role, binding(metadata)];
     }),
-    ...(main && sessionsForked(config) ? [clones, binding(inOwnNamespace)] : []),
+    own,
+    binding(inOwnNamespace),
     ...(main && mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
     ...(config.host.enabled ? hostAgentIdentity(config) : []),
   ];
@@ -535,10 +542,12 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     alasio,
     // It runs turns, in its harnesses, which a recreation would end.
     verticalPodAutoscaler(alasio, "Recommended"),
+    // A drain waits for the turns running in its pod and its workspaces' to end.
+    ...[environment.namespace, ...workspaceNamespaces(config, environment)].map(busyBudget),
     telemetryService(config, environment),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
     // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.
-    ...(environment.branch === null ? secretPolicy() : []),
+    ...(environment.branch === null ? [...busyLabelPolicy(), ...secretPolicy()] : []),
     ...(environment.branch === null && sessionsForked(config) ? cloneJobPolicy(cloneJob(config)) : []),
     ...sandboxPolicy(
       sandboxPolicyName(environment.namespace),

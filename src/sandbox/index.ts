@@ -39,6 +39,7 @@ import { join } from "node:path";
 import type { V1EnvVar, V1Job, V1JobCondition, V1PersistentVolumeClaim, V1Pod } from "@kubernetes/client-node";
 import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, Semaphore } from "effect";
 
+import type { PodRef } from "../kube/busy.ts";
 import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
 import { CLONE_VARIABLES, type SessionsProfile } from "../kube/config.ts";
 import {
@@ -333,6 +334,8 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
    * is asked for; synchronous, as making a directory is.
    */
   readonly harnessDirectory: (volumeId: string) => string;
+  /** The session's pod, which agent-sandbox names after its Sandbox: where its turns work. */
+  readonly pod: (volumeId: string) => PodRef;
   /**
    * Makes sure the session's Sandbox runs and bayma answers in it, resuming one that
    * was suspended; one that is gone is made again, empty, with no internet.
@@ -639,6 +642,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       ),
     },
 
+    pod: (volumeId) => ({ namespace: profile.namespace, name: assertValidVolumeId(volumeId) }),
     harnessDirectory: (volumeId) => {
       const directory = join(stateDir, "sessionfs", "workspaces", assertValidVolumeId(volumeId));
       mkdirSync(directory, { recursive: true });

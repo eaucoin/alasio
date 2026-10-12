@@ -106,6 +106,7 @@ function fakeVolumes({ forkFails = false, forking = Effect.void, forks = [] }: {
       forks: Effect.succeed(forks),
     },
     harnessDirectory: () => assert.fail("harnessDirectory"),
+    pod: () => assert.fail("pod"),
     ensureSession: () => Effect.die(new Error("no session is ensured")),
     readFile: () => Effect.die(new Error("no file is read")),
   };

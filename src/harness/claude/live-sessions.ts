@@ -62,6 +62,7 @@ import {
   storeBlocks,
 } from "../../codex/event-projection.ts";
 import { createTurnTimer, type TurnTimer } from "../../codex/turn-timing.ts";
+import type { PodRef } from "../../kube/busy.ts";
 import type { BaymaEndpoint, SandboxError } from "../../kube/sandboxes.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
@@ -177,6 +178,8 @@ export interface ClaudeLiveSessionsOptions {
   readonly sessionStore?: SessionStore | null;
   readonly sessionFsBayma?: Effect.Effect<BaymaEndpoint, SessionError> | null;
   readonly folderBayma?: (scope: Pick<HostBaymaScope, "threadKey">) => Effect.Effect<BaymaMcpServer, SandboxError | NoFolderWorkspaces>;
+  /** The pod a conversation's turns work in, which each holds busy while it runs (ActiveTurns). */
+  readonly workspacePod?: ((threadKey: string) => PodRef | null) | undefined;
   readonly queryFactory?: ClaudeQueryFactory | undefined;
 }
 
@@ -237,6 +240,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   sessionStore = null,
   sessionFsBayma = null,
   folderBayma = defaultFolderBayma,
+  workspacePod,
   queryFactory = query,
 }: ClaudeLiveSessionsOptions): Effect.fn.Return<ClaudeLiveSessions, never, Scope.Scope | ActiveTurns> {
   const scope = yield* Effect.scope;
@@ -376,7 +380,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     // The conversation is busy while it runs, so new messages get the usual Steer/Queue
     // choice; an operator's turn running already keeps the conversation its own.
     const running: RunningTurn = { cliInitiated: true, stop, steer };
-    yield* activeTurns.register(host.threadKey, running, { onlyIfIdle: true }).pipe(Scope.provide(cliTurn.registration));
+    yield* activeTurns.register(host.threadKey, running, { onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) }).pipe(Scope.provide(cliTurn.registration));
     yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
     return cliTurn;
   });
@@ -763,7 +767,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     };
     // Registered before the process is made sure of, so the conversation reads as busy at
     // once; the registration ends with the turn, or with this fiber if it is interrupted.
-    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }).pipe(Scope.provide(current.registration));
+    yield* activeTurns.register(threadKey, { cliInitiated: false, stop, steer }, { workspace: workspacePod?.(threadKey) }).pipe(Scope.provide(current.registration));
     return yield* Effect.gen(function*() {
       yield* turnTimer("env.built");
       const started = yield* hostFor(params).pipe(

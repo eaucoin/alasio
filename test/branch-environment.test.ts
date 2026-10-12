@@ -80,6 +80,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
       forks: Effect.die("the parent lists no fork for a branch"),
     },
     harnessDirectory: () => directory,
+    pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("the parent brings no session up for a branch"),
     readFile: () => Effect.die("the parent reads no file for a branch"),
   });
@@ -184,6 +185,7 @@ test("a branch environment mounts and makes no folder, forks no workspace itself
   const sandbox = SessionSandboxes.of({
     volumes: { create: () => Effect.die("no session is made"), fork: () => Effect.die("no session is forked"), destroy: () => Effect.die("no session is deleted"), forks: Effect.succeed([]) },
     harnessDirectory: () => "/nonexistent",
+    pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("no session is brought up"),
     readFile: () => Effect.die("no file is read"),
   });

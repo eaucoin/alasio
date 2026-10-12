@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { ThreadEvent } from "@openai/codex-sdk";
-import { Effect, Logger } from "effect";
+import { Effect, Layer, Logger } from "effect";
 
 import { makeAppServer } from "../src/codex/app-server/client.ts";
 import { executeCodexTurn } from "../src/codex/runtime.ts";
 import type { CodexExecClient } from "../src/codex/transport.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
+import type { PodRef } from "../src/kube/busy.ts";
+import { type Hold, recordingBusyPods } from "./support/busy-pods.ts";
 
 /** A Codex whose every thread runs one turn that edits three files, answers, and completes. */
 function codexFactory(): CodexExecClient {
@@ -51,8 +53,15 @@ function recordingPersistence(calls: string[], stored: unknown[][] = []): TurnPe
   });
 }
 
-/** Runs a turn of `codexFactory`'s Codex on `persistence`, its response made complete once `beforeResponseComplete` is done. */
-const runTurn = (persistence: TurnPersistence, beforeResponseComplete: (sessionId: string | null | undefined) => Effect.Effect<void> = () => Effect.void) =>
+/**
+ * Runs a turn of `codexFactory`'s Codex on `persistence`, its response made complete once
+ * `beforeResponseComplete` is done, in `workspacePod`, which it holds busy in `holds`.
+ */
+const runTurn = (
+  persistence: TurnPersistence,
+  beforeResponseComplete: (sessionId: string | null | undefined) => Effect.Effect<void> = () => Effect.void,
+  { workspacePod, holds = [] }: { readonly workspacePod?: PodRef; readonly holds?: Hold[] } = {},
+) =>
   Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     // The exec transport's turn, which no app-server serves.
     const appServer = yield* makeAppServer({ spawn: () => Effect.sync(() => assert.fail("no app-server runs in this test")) });
@@ -69,8 +78,18 @@ const runTurn = (persistence: TurnPersistence, beforeResponseComplete: (sessionI
       codexFactory,
       folderBayma: () => Effect.succeed({ type: "http", url: "http://bayma.alasio-host.svc:7290/mcp", headers: {} }),
       beforeResponseComplete,
+      workspacePod,
     });
-  })).pipe(Effect.provide([ActiveTurns.layer, Logger.layer([])])));
+  })).pipe(Effect.provide([ActiveTurns.layer.pipe(Layer.provide(recordingBusyPods(holds).layer)), Logger.layer([])])));
+
+test("a turn holds the pod it works in busy until it ends", async () => {
+  const holds: Hold[] = [];
+  const workspacePod = { namespace: "alasio-sessions", name: "s1" };
+  let heldMeanwhile: readonly Hold[] = [];
+  await runTurn(recordingPersistence([]), () => Effect.sync(() => (heldMeanwhile = structuredClone(holds))), { workspacePod, holds });
+  assert.deepEqual(heldMeanwhile, [{ workspace: workspacePod, released: false }]);
+  assert.deepEqual(holds, [{ workspace: workspacePod, released: true }]);
+});
 
 test("a turn's response is marked complete only once beforeResponseComplete has finished", async () => {
   const calls: string[] = [];
