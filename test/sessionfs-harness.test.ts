@@ -43,6 +43,7 @@ function fakeSandbox(): SessionSandboxes["Service"] & { readonly ensured: string
         return { bayma: BAYMA };
       }),
     readFile: unused,
+    holding: () => Effect.void,
   };
 }
 

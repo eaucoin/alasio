@@ -5,7 +5,8 @@
  *
  *     {
  *       "sessions": { "namespace", "port", "workspaceDir", "egressGate", "fullModeNameservers",
- *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates", "clone" },
+ *                     "mountPodNamespace", "podTemplate", "volumeClaimTemplates", "clone",
+ *                     "snapshots" },
  *       "host":     { "namespace", "port", "stateRoot", "podTemplate" }
  *     }
  *
@@ -86,6 +87,27 @@ const Clone = said(
 
 /** The variables a clone's Job is given, after its own, in this order (src/sandbox/index.ts). */
 export const CLONE_VARIABLES = ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"] as const;
+const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole number" }), Schema.isGreaterThan(0, { message: "must be positive" })), "must be a positive whole number");
+
+/**
+ * Session sandboxes' whole-sandbox snapshots (../sandbox/snapshots.ts): how long a session
+ * runs no exec and no turn before its Sandbox is snapshotted and released; the gVisor
+ * releases a snapshot is restored under, each by its RuntimeClass, the current one first;
+ * and where the node agents that take and prepare the snapshots are, by their pods'
+ * namespace and labels, and the port they serve on.
+ */
+const Snapshots = said(
+  Schema.Struct({
+    releaseAfterSeconds: Count,
+    releases: said(
+      Schema.Array(Schema.Struct({ release: said(Schema.NonEmptyString, "must be a release"), runtimeClassName: said(Schema.NonEmptyString, "must be a RuntimeClass's name") }))
+        .check(Schema.isMinLength(1, { message: "must name a release" })),
+      "must be a list of releases",
+    ),
+    agents: said(Schema.Struct({ namespace: Namespace, selector: said(Schema.NonEmptyString, "must be a label selector"), port: Port }), "must be an object"),
+  }),
+  "must be an object",
+);
 
 /** Whether `podTemplate`, as the installation gives it, runs a container named `bayma`. */
 function runsBayma(podTemplate: unknown): boolean {
@@ -119,6 +141,8 @@ const SessionsProfile = said(
     volumeClaimTemplates: Schema.optional(VolumeClaimTemplates),
     /** How a session's volume is cloned, where its storage can; none where it cannot, and sessions are not forked. */
     clone: Schema.optional(Schema.NullOr(Clone)),
+    /** How sessions' Sandboxes are snapshotted as they are released, where they are; none where they are not. */
+    snapshots: Schema.optional(Schema.NullOr(Snapshots)),
   }),
   "must be an object",
 ).check(Schema.makeFilter((profile) => (runsBayma(profile.podTemplate) ? undefined : baymaIssue)));

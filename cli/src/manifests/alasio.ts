@@ -20,6 +20,8 @@ import type {
 
 import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
+import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
 import {
@@ -49,7 +51,7 @@ import {
   selectorLabels,
   sha256,
 } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { durationSeconds, type InstallConfig } from "./config.ts";
 import { busyBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -162,6 +164,26 @@ function sessionsProfile(config: InstallConfig, environment: Environment): Sessi
       },
     }],
     ...(main && sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
+    ...(main && nodeAgentRuns(config) ? { snapshots: sessionSnapshots(config) } : {}),
+  };
+}
+
+/**
+ * How session sandboxes are snapshotted as they are released (src/sandbox/snapshots.ts),
+ * where the node agents run: once sessions.snapshots.releaseAfter has passed without an
+ * exec or a turn, under the gVisor releases alasio keeps, the current one first, each
+ * restored with a RuntimeClass of its own, by the agents in alasio's namespace.
+ */
+function sessionSnapshots(config: InstallConfig): NonNullable<SessionsProfile["snapshots"]> {
+  return {
+    // A duration, as the configuration checks it.
+    releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
+    releases: NODE_PINS.gvisor.releases.map(({ release }) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
+    agents: {
+      namespace: NAMESPACE,
+      selector: Object.entries(selectorLabels("node-agent")).map(([label, value]) => `${label}=${value}`).join(","),
+      port: NODE_AGENT_PORT,
+    },
   };
 }
 
@@ -293,6 +315,10 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     ...(host.enabled && host.workspaceRoot ? [{ name: "ALASIO_WORKSPACE_ROOT", value: host.workspaceRoot }] : []),
     ...(alasio.claude.existingSecret
       ? [{ name: "CLAUDE_CODE_OAUTH_TOKEN", valueFrom: { secretKeyRef: { name: alasio.claude.existingSecret, key: alasio.claude.key } } }]
+      : []),
+    // What it presents to the node agents, which snapshot its sessions.
+    ...(environment.branch === null && nodeAgentRuns(config)
+      ? [{ name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: componentName("node-agent"), key: "token" } } }]
       : []),
     ...branchEnv(config, environment),
     ...otelEnv(config, environment),
@@ -452,10 +478,11 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and reads
  * files from sessions through exec, in the namespaces it owns, labelling their pods busy
  * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
- * it forks sessions, reads sessions' volume claims and runs the Jobs that clone them in its
- * own; where the node agents run, watches pods in its own, theirs among them; and, where
- * it installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its
- * mount pods; and nothing else.
+ * it snapshots sessions, records the templates their snapshots restore into in a ConfigMap
+ * of the sessions namespace; where it forks sessions, reads sessions' volume claims and
+ * runs the Jobs that clone them in its own; where the node agents run, watches pods in its
+ * own, theirs among them; and, where it installs JuiceFS's driver, lists and deletes pods
+ * in the driver's namespace, its mount pods; and nothing else.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const main = environment.branch === null;
@@ -490,6 +517,7 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     ...workspaceNamespaces(config, environment).flatMap((namespace): KubernetesObject[] => {
       const metadata = { name: RELEASE, namespace, labels: labels("alasio") };
       const forked = main && sessionsForked(config) && namespace === config.sessions.namespace;
+      const snapshotted = main && nodeAgentRuns(config) && namespace === config.sessions.namespace;
       const role: V1Role = {
         apiVersion: "rbac.authorization.k8s.io/v1",
         kind: "Role",
@@ -500,6 +528,8 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
           { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
           ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
+          // Which session templates its sessions' snapshots restore into (src/sandbox/snapshots.ts).
+          ...(snapshotted ? [{ apiGroups: [""], resources: ["configmaps"], verbs: ["get", "create", "update"] }] : []),
         ],
       };
       return [role, binding(metadata)];

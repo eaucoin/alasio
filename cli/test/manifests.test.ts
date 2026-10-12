@@ -36,6 +36,7 @@ import { Result } from "effect";
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/capacity.ts";
+import { NODE_PINS } from "../src/cluster/node.ts";
 import { installConfigOf } from "../src/config.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
@@ -1904,6 +1905,26 @@ describe("security", () => {
       assert.deepEqual(mountPodRoles(without), []);
       assert.equal(sessions(without).mountPodNamespace, undefined);
     }
+  });
+
+  test("snapshots main's sessions where the node agents run: after releaseAfter, under the kept gVisor releases, by the agents alasio presents its token to", () => {
+    const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
+    const sessionsRole = (objects: readonly KubernetesObject[]) =>
+      all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio-sessions")?.rules ?? [];
+    const tokenOf = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN");
+    const objects = install({ sessions: { snapshots: { releaseAfter: "10m" } } });
+    assert.deepEqual(sessions(objects).snapshots, {
+      releaseAfterSeconds: 600,
+      releases: NODE_PINS.gvisor.releases.map(({ release }) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}` })),
+      agents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
+    });
+    assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
+    assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.join() === "get,create,update"));
+    // Under the cluster's default runtime, nothing is snapshotted.
+    const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
+    assert.equal(sessions(unsnapshotted).snapshots, undefined);
+    assert.equal(tokenOf(unsnapshotted), undefined);
+    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("configmaps")));
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {

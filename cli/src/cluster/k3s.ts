@@ -11,7 +11,7 @@ import { dirname } from "node:path";
 import { type Cluster, KubeConfig, type User, type V1Node, type V1RuntimeClass } from "@kubernetes/client-node";
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
-import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorLabel } from "../../../src/node-agent/names.ts";
+import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
 
 /** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
 export interface HostAlias {
@@ -129,7 +129,7 @@ export function gvisorRuntimeClasses(releases: readonly string[]): V1RuntimeClas
   });
   return [
     ...releases.slice(0, 1).map((release) => runtimeClass("gvisor", release)),
-    ...releases.map((release) => runtimeClass(`gvisor-${gvisorLabel(release)}`, release)),
+    ...releases.map((release) => runtimeClass(gvisorRuntimeClass(release), release)),
   ];
 }
 

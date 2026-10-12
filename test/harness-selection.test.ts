@@ -149,6 +149,7 @@ const unusedSandbox: SessionSandboxes["Service"] = {
   pod: () => assert.fail("pod"),
   ensureSession: () => Effect.die(new Error("no session is ensured")),
   readFile: () => Effect.die(new Error("no file is read")),
+  holding: () => Effect.void,
 };
 
 /** The buttons of a message's inline keyboard. */

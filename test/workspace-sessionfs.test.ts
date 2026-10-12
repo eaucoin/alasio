@@ -109,6 +109,7 @@ function fakeVolumes({ forkFails = false, forking = Effect.void, forks = [] }: {
     pod: () => assert.fail("pod"),
     ensureSession: () => Effect.die(new Error("no session is ensured")),
     readFile: () => Effect.die(new Error("no file is read")),
+    holding: () => Effect.void,
   };
 }
 

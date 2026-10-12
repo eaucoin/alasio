@@ -37,7 +37,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import type { V1EnvVar, V1Job, V1JobCondition, V1PersistentVolumeClaim, V1Pod } from "@kubernetes/client-node";
-import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, Semaphore } from "effect";
+import { Clock, Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import type { PodRef } from "../kube/busy.ts";
 import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
@@ -68,6 +68,8 @@ import { sameToken } from "../shared/tokens.ts";
 import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
+import { makeNodeAgents } from "./node-agents.ts";
+import { keptTemplates, makeSessionSnapshots, SESSION_TEMPLATE_ANNOTATION, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -233,10 +235,15 @@ export function sessionSandboxManifest({
   forkedFrom,
 }: SessionSandboxManifestOptions): Sandbox {
   const full = netMode === "full";
+  const { podTemplate } = profile;
   return sandboxManifest({
     name: assertValidVolumeId(volumeId),
     namespace,
-    template: profile,
+    // What the pod is made from, as its snapshots record it (./snapshots.ts).
+    template: {
+      ...profile,
+      podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, annotations: { ...podTemplate.metadata?.annotations, [SESSION_TEMPLATE_ANNOTATION]: sessionTemplateHash(profile) } } },
+    },
     labels: { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: full ? "full" : "none" },
     ...(operatingMode === undefined ? {} : { operatingMode }),
     ...(forkedFrom === undefined ? {} : { annotations: { [FORKED_FROM_ANNOTATION]: forkedFrom } }),
@@ -345,10 +352,32 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
    * session's files. `{ bytes }`, or `{ note }` saying why not.
    */
   readonly readFile: (volumeId: string, path: string, maxBytes: number) => Effect.Effect<FileRead, KubeApiError | KubeExecError | SessionFileError>;
+  /**
+   * Holds the session as one a turn runs on, for as long as the scope lasts: a session is
+   * released only once none has run on it, as no exec has, for its profile's
+   * `snapshots.releaseAfterSeconds`, so a turn that thinks between its tool calls finds
+   * its session where it left it.
+   */
+  readonly holding: (volumeId: string) => Effect.Effect<void, never, Scope.Scope>;
 }>()("alasio/sandbox/SessionSandboxes") {
   static readonly layer = (options: SessionSandboxesOptions): Layer.Layer<SessionSandboxes, Config.ConfigError, KubeClient> =>
     Layer.effect(SessionSandboxes, makeSessionSandboxes(options));
 }
+
+/**
+ * How the profile's sessions are snapshotted (./snapshots.ts): with the node agents, onto
+ * the templates the sessions namespace records as kept, the profile's recorded as the
+ * current one. Sessions that cannot be are not, saying why.
+ */
+const sessionSnapshots = Effect.fnUntraced(function*(profile: SessionsProfile, snapshots: NonNullable<SessionsProfile["snapshots"]>): Effect.fn.Return<SessionSnapshots | null, Config.ConfigError, KubeClient> {
+  const agents = yield* makeNodeAgents(snapshots.agents);
+  const templates = yield* keptTemplates(profile.namespace, sessionTemplateHash(profile)).pipe(Effect.result);
+  if (templates._tag === "Failure") {
+    yield* Effect.logWarning(`sessions are not snapshotted: the templates they restore into could not be recorded: ${templates.failure.message}`);
+    return null;
+  }
+  return yield* makeSessionSnapshots({ profile, snapshots, agents, templates: templates.success });
+});
 
 const makeSessionSandboxes = Effect.fnUntraced(function*({
   profile,
@@ -439,7 +468,20 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     );
   };
 
-  const sandboxes = yield* makeSandboxes({ namespace: profile.namespace, port: profile.port, fault: brokenMount });
+  const snapshots = profile.snapshots ? yield* sessionSnapshots(profile, profile.snapshots) : null;
+  const sandboxes = yield* makeSandboxes({
+    namespace: profile.namespace,
+    port: profile.port,
+    fault: brokenMount,
+    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore } : {}),
+  });
+  /** The turns running on each session, and when its last ended. */
+  const turns = new Map<string, { readonly running: number; readonly endedAt: number }>();
+  const lastTurn = (volumeId: string): number | null => {
+    const known = turns.get(volumeId);
+    return known === undefined ? null : known.running > 0 ? Infinity : known.endedAt;
+  };
+  if (snapshots) yield* snapshots.watch(sandboxes, lastTurn);
   const telemetryEnv = sandboxBaymaTelemetryEnv(env);
   const receiverPort = yield* ReceiverPort;
   const receiverService = yield* ReceiverService;
@@ -655,5 +697,17 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       }).pipe(Effect.map((bayma) => ({ bayma }))),
 
     readFile,
+
+    holding: (volumeId) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          const known = turns.get(volumeId);
+          turns.set(volumeId, { running: (known?.running ?? 0) + 1, endedAt: known?.endedAt ?? 0 });
+        }),
+        () =>
+          Effect.map(Clock.currentTimeMillis, (endedAt) => {
+            turns.set(volumeId, { running: (turns.get(volumeId)?.running ?? 1) - 1, endedAt });
+          }),
+      ),
   });
 }, withLogScope("sandbox"));

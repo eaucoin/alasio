@@ -1,0 +1,160 @@
+/**
+ * The node agents (../node-agent/), as alasio calls them: each node's, found by its pod
+ * there, as the profile's `snapshots.agents` select them, reached on its pod's address,
+ * with the token alasio and they are given (ALASIO_NODE_AGENT_TOKEN).
+ */
+import type { V1Pod } from "@kubernetes/client-node";
+import { Config, Duration, Effect, Redacted, Schema } from "effect";
+import { FetchHttpClient } from "effect/http";
+
+import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import { type CheckpointRequest, Manifest, type WorkspaceRef } from "../node-agent/agent.ts";
+import { NODE_AGENT_TOKEN_VARIABLE } from "../node-agent/names.ts";
+
+/** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
+export interface NodeAgentsLocation {
+  readonly namespace: string;
+  readonly selector: string;
+  readonly port: number;
+}
+
+/** A node agent could not be asked, or refused: which node's, what, the status it answered with, and why. */
+export class NodeAgentError extends Schema.TaggedError<NodeAgentError>()("NodeAgentError", {
+  node: Schema.String,
+  call: Schema.String,
+  status: Schema.optional(Schema.Number),
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the node agent of ${this.node} could not ${this.call}: ${this.reason}`;
+  }
+}
+
+/** What a node holds, as its agent says: its gVisor releases, with the CPU features each sees there, and the snapshots it has on its disk. */
+export const Holdings = Schema.Struct({
+  node: Schema.String,
+  releases: Schema.Array(Schema.Struct({ release: Schema.String, cpuFeatures: Schema.Array(Schema.String) })),
+  cached: Schema.Array(Schema.Struct({ environment: Schema.String, workspace: Schema.String, snapshot: Schema.String, bytes: Schema.Number, usedAt: Schema.String })),
+});
+export type Holdings = typeof Holdings.Type;
+
+/** A snapshot prepared on a node: what it is, and where its image is there. */
+const Prepared = Schema.Struct({ manifest: Manifest, imagePath: Schema.String });
+export type Prepared = typeof Prepared.Type;
+
+/** What an agent answers a call that fails with. */
+const Refusal = Schema.Struct({ error: Schema.String });
+
+/** The node agents; see makeNodeAgents. */
+export interface NodeAgents {
+  /** The nodes with a ready agent on them. */
+  readonly nodes: Effect.Effect<readonly string[], KubeApiError>;
+  /** Snapshots the sandbox of the container `request` names, on `node`, and commits it: its manifest. The sandbox ends. */
+  readonly checkpoint: (node: string, request: CheckpointRequest) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
+  /** The workspace's current snapshot, prepared on `node` for a restore there. */
+  readonly prepare: (node: string, workspace: WorkspaceRef) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
+  /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
+  readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
+  /** Forgets the workspace's current snapshot. */
+  readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** What `node` holds. */
+  readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
+}
+
+/** How long a checkpoint or a prepare may take: a sandbox's memory, through the store, both ways. */
+const LONG_CALL: Duration.Input = "15 minutes";
+/** How long any other call may take. */
+const SHORT_CALL: Duration.Input = "30 seconds";
+
+/** A call of an agent: what, with what, for how long; with `absent`, a 404 is an answer, not a failure. */
+interface AgentCall {
+  readonly method: "GET" | "POST" | "DELETE";
+  readonly path: string;
+  readonly body?: unknown;
+  readonly timeout: Duration.Input;
+  readonly absent?: true;
+}
+
+/** Whether `pod` runs, ready, with an address. */
+const readyAt = (pod: V1Pod): string | null =>
+  pod.status?.podIP && pod.status.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ? pod.status.podIP : null;
+
+/** The node agents at `location`, on the KubeClient, reached with FetchHttpClient.Fetch. */
+export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLocation): Effect.fn.Return<NodeAgents, Config.ConfigError, KubeClient> {
+  const kube = yield* KubeClient;
+  const fetch = yield* FetchHttpClient.Fetch;
+  const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
+
+  /** Each node's agent's address, by its node. */
+  const addresses: Effect.Effect<ReadonlyMap<string, string>, KubeApiError> = kube.list("v1", "Pod", location.namespace, location.selector).pipe(
+    // Pods, as the API server lists them.
+    Effect.map((pods) =>
+      new Map((pods as readonly V1Pod[]).flatMap((pod) => {
+        const address = readyAt(pod);
+        return address && pod.spec?.nodeName ? [[pod.spec.nodeName, `http://${address}:${location.port}`] as const] : [];
+      }))
+    ),
+  );
+
+  /** A call of the agent of `node`, `what` it is asked as a sentence ends: its answer's status and text, or why it failed. */
+  const send = (node: string, what: string, request: AgentCall): Effect.Effect<{ readonly status: number; readonly text: string }, NodeAgentError | KubeApiError> =>
+    Effect.gen(function*() {
+      const failed = (reason: string, status?: number) => new NodeAgentError({ node, call: what, reason, ...(status === undefined ? {} : { status }) });
+      const base = (yield* addresses).get(node);
+      if (!base) return yield* failed("no agent is ready there");
+      const { status, ok, text } = yield* Effect.tryPromise({
+        try: async (signal) => {
+          const response = await fetch(`${base}${request.path}`, {
+            method: request.method,
+            headers: { authorization: `Bearer ${Redacted.value(token)}`, ...(request.body === undefined ? {} : { "content-type": "application/json" }) },
+            ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+            signal: AbortSignal.any([signal, AbortSignal.timeout(Duration.toMillis(request.timeout))]),
+          });
+          return { status: response.status, ok: response.ok, text: await response.text() };
+        },
+        catch: (cause) => failed(cause instanceof Error ? cause.message : String(cause)),
+      });
+      if (ok || (status === 404 && request.absent)) return { status, text };
+      const refusal = Schema.decodeUnknownOption(Schema.fromJsonString(Refusal))(text);
+      return yield* failed(refusal._tag === "Some" ? refusal.value.error : `it answered ${status}`, status);
+    });
+
+  /** What the agent of `node` answers `request` with, as `schema` reads it. */
+  const ask = <A, I>(node: string, what: string, request: AgentCall, schema: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+    Effect.flatMap(send(node, what, request), ({ text }) =>
+      Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(text).pipe(
+        Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+      ));
+
+  /** The path of a workspace's snapshot. */
+  const snapshotPath = ({ environment, workspace }: WorkspaceRef) => `/snapshots/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}`;
+
+  /** Any node with a ready agent: each reads and forgets in the bucket as well as another. */
+  const anyNode: Effect.Effect<string, NodeAgentError | KubeApiError> = Effect.flatMap(addresses, (known) => {
+    const [first] = known.keys();
+    return first === undefined ? Effect.fail(new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" })) : Effect.succeed(first);
+  });
+
+  return {
+    nodes: Effect.map(addresses, (known) => [...known.keys()]),
+    checkpoint: (node, request) =>
+      ask(node, `snapshot ${request.environment}/${request.workspace}`, { method: "POST", path: "/checkpoints", body: request, timeout: LONG_CALL }, Manifest),
+    prepare: (node, workspace) =>
+      ask(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "POST", path: "/prepare", body: workspace, timeout: LONG_CALL }, Prepared),
+    current: (workspace) =>
+      Effect.gen(function*() {
+        const node = yield* anyNode;
+        const what = `read ${workspace.environment}/${workspace.workspace}'s snapshot`;
+        const { status, text } = yield* send(node, what, { method: "GET", path: snapshotPath(workspace), timeout: SHORT_CALL, absent: true });
+        if (status === 404) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Manifest))(text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        );
+      }),
+    forget: (workspace) =>
+      Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
+        Effect.asVoid,
+      ),
+    holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
+  };
+});

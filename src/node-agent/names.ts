@@ -31,6 +31,9 @@ export const gvisorLabel = (release: string): string => release.replaceAll(".", 
  */
 export const gvisorHandler = (release: string): string => `runsc-${gvisorLabel(release)}`;
 
+/** The RuntimeClass of gVisor's `release` alone, which a sandbox snapshotted under it is restored with. */
+export const gvisorRuntimeClass = (release: string): string => `gvisor-${gvisorLabel(release)}`;
+
 /** The version runsc of gVisor's `release` reports, and saves its images with: its release's tag. */
 export const runscVersion = (release: string): string => `release-${release}`;
 

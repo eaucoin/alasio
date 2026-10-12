@@ -84,6 +84,7 @@ test("an alasio forks a session one of its conversations knows for the branch wh
     pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("the parent brings no session up for a branch"),
     readFile: () => Effect.die("the parent reads no file for a branch"),
+    holding: () => Effect.void,
   });
   const scope = Effect.runSync(Scope.make());
   try {
@@ -189,6 +190,7 @@ test("a branch environment mounts and makes no folder, forks no workspace itself
     pod: (volumeId: string) => ({ namespace: "alasio-sessions", name: volumeId }),
     ensureSession: () => Effect.die("no session is brought up"),
     readFile: () => Effect.die("no file is read"),
+    holding: () => Effect.void,
   });
   await withServices({ store, branch: "try", sandbox, workspaceRoot: tmpdir() }, async (alasio) => {
     const refusal = (change: (mounts: Mounts["Service"]) => Effect.Effect<unknown, { readonly message: string }>) =>

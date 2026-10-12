@@ -1,0 +1,284 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import type { KubernetesObject, V1ConfigMap, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import { Effect, Layer } from "effect";
+import { FetchHttpClient } from "effect/http";
+
+import { KubeApiError, KubeClient } from "../src/kube/client.ts";
+import type { SessionsProfile } from "../src/kube/config.ts";
+import type { Sandbox, Sandboxes, StoredSandbox } from "../src/kube/sandboxes.ts";
+import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
+import { sessionSandboxManifest } from "../src/sandbox/index.ts";
+import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
+import { hookOf, keptTemplates, makeSessionSnapshots, SESSION_TEMPLATE_ANNOTATION, sessionTemplateHash, TEMPLATES_CONFIG_MAP } from "../src/sandbox/snapshots.ts";
+
+const CURRENT = "20260921.0-eaucoin.4";
+const PREVIOUS = "20260921.0-eaucoin.3";
+
+const snapshots = {
+  releaseAfterSeconds: 300,
+  releases: [{ release: CURRENT, runtimeClassName: "gvisor-20260921-0-eaucoin-4" }, { release: PREVIOUS, runtimeClassName: "gvisor-20260921-0-eaucoin-3" }],
+  agents: { namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port: 8484 },
+};
+
+const profile = (image = "agent@sha256:1"): SessionsProfile => ({
+  namespace: "alasio-sessions",
+  port: 7290,
+  workspaceDir: "/workspace",
+  podTemplate: {
+    spec: {
+      runtimeClassName: "gvisor",
+      containers: [{
+        name: "bayma",
+        image,
+        command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"],
+        args: ["mcp-http", "--port", "7290", "--state-dir", "/home/agent/.bayma"],
+      }],
+    },
+  },
+  snapshots,
+});
+
+/** The Sandbox of session `name` alasio makes from `of`. */
+const sessionOf = (of: SessionsProfile, name = "fs-abc123"): Sandbox => sessionSandboxManifest({ volumeId: name, netMode: "none", profile: of, telemetry: null });
+
+/** `sandbox` as the API server holds it, suspended. */
+const stored = (sandbox: Sandbox, operatingMode: "Running" | "Suspended" = "Suspended"): StoredSandbox => ({
+  ...sandbox,
+  metadata: { ...sandbox.metadata, uid: "uid-1" },
+  spec: { ...sandbox.spec, operatingMode },
+});
+
+/** A manifest of a snapshot of `podTemplate`, taken under `release`, saved with `cpuFeatures`. */
+const manifestOf = (podTemplate: V1PodTemplateSpec, release = CURRENT, cpuFeatures: readonly string[] = ["sse", "avx"]): Manifest => ({
+  environment: "alasio-sessions",
+  workspace: "fs-abc123",
+  snapshot: "s-1",
+  release,
+  image: "sha256:image",
+  cpuFeatures,
+  podTemplate: podTemplate as Readonly<Record<string, unknown>>,
+  files: [],
+  bytes: 1024,
+  takenAt: "2026-10-12T20:00:00.000Z",
+  pauseMs: 80,
+  uploadMs: 120,
+});
+
+/** Node agents in memory: the current snapshot, each node's holdings, and how a prepare goes on each; what they were asked. */
+function fakeAgents({ current = null, holdings = [], prepare = () => null, read }: {
+  readonly current?: Manifest | null;
+  readonly holdings?: readonly Holdings[];
+  readonly prepare?: (node: string) => string | null;
+  readonly read?: NodeAgentError;
+} = {}) {
+  const asked: string[] = [];
+  const checkpoints: (readonly [string, CheckpointRequest])[] = [];
+  const agents: NodeAgents = {
+    nodes: Effect.succeed(holdings.map(({ node }) => node)),
+    checkpoint: (node, request) =>
+      Effect.sync(() => {
+        checkpoints.push([node, request]);
+        return manifestOf(request.podTemplate as V1PodTemplateSpec, request.release);
+      }),
+    prepare: (node) =>
+      Effect.suspend(() => {
+        asked.push(`prepare on ${node}`);
+        const refused = prepare(node);
+        return refused === null
+          ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1` })
+          : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status: 409, reason: refused }));
+      }),
+    current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
+    forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
+    holdings: (node) => Effect.succeed(holdings.find((held) => held.node === node) as Holdings),
+  };
+  return { agents, asked, checkpoints };
+}
+
+/** A node holding `releases`, each with the features `cpuFeatures`, and caching `cached` snapshots. */
+const node = (name: string, releases: readonly string[], cpuFeatures: readonly string[] = ["sse", "avx", "avx2"], cached: readonly string[] = []): Holdings => ({
+  node: name,
+  releases: releases.map((release) => ({ release, cpuFeatures })),
+  cached: cached.map((snapshot) => ({ environment: "alasio-sessions", workspace: "fs-abc123", snapshot, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" })),
+});
+
+/** A KubeClient of ConfigMaps and Pods in memory, which records what it writes. */
+function fakeKube(objects: Map<string, KubernetesObject> = new Map()) {
+  const writes: string[] = [];
+  const key = (kind: string, namespace: string, name: string) => `${kind}/${namespace}/${name}`;
+  const service = KubeClient.of({
+    read: (_apiVersion, kind, namespace, name) => Effect.sync(() => structuredClone(objects.get(key(kind, namespace, name)) ?? null)),
+    list: (_apiVersion, kind, namespace) => Effect.sync(() => [...objects.values()].filter((object) => object.kind === kind && object.metadata?.namespace === namespace)),
+    create: (object) =>
+      Effect.sync(() => {
+        writes.push(`create ${object.kind}`);
+        objects.set(key(object.kind ?? "", object.metadata?.namespace ?? "", object.metadata?.name ?? ""), structuredClone(object));
+        return object;
+      }),
+    replace: (object) =>
+      Effect.sync(() => {
+        writes.push(`replace ${object.kind}`);
+        objects.set(key(object.kind ?? "", object.metadata?.namespace ?? "", object.metadata?.name ?? ""), structuredClone(object));
+        return object;
+      }),
+    patch: () => Effect.fail(new KubeApiError({ status: 500, cause: new Error("nothing is patched") })),
+    remove: () => Effect.fail(new KubeApiError({ status: 500, cause: new Error("nothing is removed") })),
+    exec: () => Effect.die("nothing is run"),
+  });
+  return { objects, writes, layer: Layer.succeed(KubeClient, service) };
+}
+
+/** `effect` run on `kube`, its bayma's status answered by `status`. */
+function run<A, E>(kube: ReturnType<typeof fakeKube>, effect: Effect.Effect<A, E, KubeClient>, status: () => unknown = () => ({ execsRunning: 0, execsQueued: 0, idleSinceMs: 0 })): Promise<A> {
+  const fetch = (async () => new Response(JSON.stringify(status()), { status: 200 })) as unknown as typeof globalThis.fetch;
+  return Effect.runPromise(effect.pipe(Effect.provide(Layer.merge(kube.layer, Layer.succeed(FetchHttpClient.Fetch, fetch)))));
+}
+
+const templates = (current: SessionsProfile, previous: SessionsProfile | null = null) => ({ current: sessionTemplateHash(current), previous: previous && sessionTemplateHash(previous) });
+
+test("bayma's hook is bayma as its container runs it, told the state directory it serves", () => {
+  const [bayma] = profile().podTemplate.spec?.containers ?? [];
+  assert.ok(bayma);
+  assert.deepEqual(hookOf(bayma), ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
+  assert.deepEqual(hookOf({ name: "bayma", command: ["bayma"], args: ["mcp-http", "--state-dir", "/state"] }), ["bayma", "sandbox-hook", "--state-dir", "/state"]);
+  assert.equal(hookOf({ name: "bayma", command: ["bayma"], args: ["mcp-http"] }), null);
+});
+
+test("a session's pod template records the profile's template it is made from", () => {
+  const made = sessionOf(profile());
+  assert.equal(made.spec.podTemplate.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION], sessionTemplateHash(profile()));
+  assert.notEqual(sessionTemplateHash(profile()), sessionTemplateHash(profile("agent@sha256:2")));
+});
+
+test("the sessions namespace records the current template and the one before it, which a new one moves along", async () => {
+  const kube = fakeKube();
+  const first = await run(kube, keptTemplates("alasio-sessions", "a"));
+  assert.deepEqual(first, { current: "a", previous: null });
+  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "a")), { current: "a", previous: null });
+  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "b")), { current: "b", previous: "a" });
+  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "b")), { current: "b", previous: "a" });
+  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "c")), { current: "c", previous: "b" });
+  assert.deepEqual((kube.objects.get(`ConfigMap/alasio-sessions/${TEMPLATES_CONFIG_MAP}`) as V1ConfigMap).data, { current: "c", previous: "b" });
+  assert.deepEqual(kube.writes, ["create ConfigMap", "replace ConfigMap", "replace ConfigMap"]);
+});
+
+test("a session with a snapshot on the current template is restored on a node that can, the one holding it first, into what it is now", async () => {
+  const desired = sessionOf(profile());
+  const manifest = manifestOf(desired.spec.podTemplate);
+  const { agents, asked } = fakeAgents({
+    current: manifest,
+    holdings: [node("node-a", [CURRENT], ["sse"]), node("node-b", [PREVIOUS]), node("node-c", [CURRENT]), node("node-d", [CURRENT], undefined, ["s-1"])],
+    prepare: (on) => (on === "node-d" ? "its image does not match its manifest" : null),
+  });
+  const plan = await run(fakeKube(), Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+    return yield* snapshotted.restore(stored(desired), desired);
+  }));
+  assert.ok(plan);
+  // node-a lacks avx, node-b the release; node-d holds it, and fails.
+  assert.deepEqual(asked, ["prepare on node-d", "prepare on node-c"]);
+  assert.deepEqual(plan.kept, desired.spec.podTemplate);
+  assert.equal(plan.podTemplate.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], "/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1");
+  assert.equal(plan.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-4");
+  assert.deepEqual(plan.podTemplate.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution, {
+    nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-c"] }] }],
+  });
+  assert.deepEqual(plan.podTemplate.spec?.containers, desired.spec.podTemplate.spec?.containers);
+  // Restored, the session moves on from it.
+  await Effect.runPromise(plan.restored);
+  assert.deepEqual(asked.slice(2), ["forget alasio-sessions/fs-abc123"]);
+});
+
+test("a snapshot on the template before the current one is restored into that one, and a session restored so stays on it while it runs", async () => {
+  const older = profile();
+  const newer = profile("agent@sha256:2");
+  const recorded = sessionOf(older).spec.podTemplate;
+  const desired = sessionOf(newer);
+  const { agents } = fakeAgents({ current: manifestOf(recorded, PREVIOUS), holdings: [node("node-a", [CURRENT, PREVIOUS])] });
+  await run(fakeKube(), Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: newer, snapshots, agents, templates: templates(newer, older) });
+    const plan = yield* snapshotted.restore(stored(desired), desired);
+    assert.ok(plan);
+    assert.deepEqual(plan.kept, recorded);
+    assert.equal(plan.podTemplate.spec?.containers[0]?.image, "agent@sha256:1");
+    assert.equal(plan.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-3");
+    assert.equal(snapshotted.keeps(stored(sessionOf(older), "Running")), true);
+    assert.equal(snapshotted.keeps(stored(desired, "Running")), false);
+  }));
+});
+
+test("a session without a snapshot is resumed as it is, and one whose snapshot cannot restore is too, its snapshot forgotten, saying why", async () => {
+  const desired = sessionOf(profile());
+  const restore = async (agents: NodeAgents, of = profile(), kept = templates(profile())) =>
+    run(fakeKube(), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: of, snapshots, agents, templates: kept });
+      return yield* snapshotted.restore(stored(desired), desired);
+    }));
+  const none = fakeAgents();
+  assert.equal(await restore(none.agents), null);
+  assert.deepEqual(none.asked, []);
+  const cases = [
+    // Taken under a release no longer kept.
+    fakeAgents({ current: manifestOf(desired.spec.podTemplate, "20260801.0-eaucoin.1"), holdings: [node("node-a", [CURRENT])] }),
+    // On a template neither current nor the one before.
+    fakeAgents({ current: manifestOf(sessionOf(profile("agent@sha256:0")).spec.podTemplate), holdings: [node("node-a", [CURRENT])] }),
+    // On no node with every CPU feature it was saved with.
+    fakeAgents({ current: manifestOf(desired.spec.podTemplate, CURRENT, ["avx512f"]), holdings: [node("node-a", [CURRENT])] }),
+    // Prepared on no node.
+    fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], prepare: () => "the bucket failed" }),
+    // Not read.
+    fakeAgents({ read: new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" }) }),
+  ];
+  for (const { agents, asked } of cases) {
+    assert.equal(await restore(agents), null);
+    assert.equal(asked.at(-1), "forget alasio-sessions/fs-abc123");
+  }
+});
+
+test("an idle session is released, its sandbox snapshotted by its node's agent, addressed to bayma's container, with bayma's hook and its template", async () => {
+  const sandbox = stored(sessionOf(profile()), "Running");
+  sandbox.status = { serviceFQDN: "fs-abc123.alasio-sessions.svc.cluster.local", conditions: [{ type: "Ready", status: "True", reason: "Ready", message: "", lastTransitionTime: new Date(0), observedGeneration: 0 }] };
+  const pod: V1Pod = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "fs-abc123", namespace: "alasio-sessions" },
+    spec: { nodeName: "node-a", runtimeClassName: "gvisor", containers: [] },
+    status: { containerStatuses: [{ name: "bayma", containerID: `containerd://${"a".repeat(64)}`, image: "", imageID: "", ready: true, restartCount: 0 }] },
+  };
+  const kube = fakeKube(new Map<string, KubernetesObject>([["Sandbox/alasio-sessions/fs-abc123", sandbox], ["Pod/alasio-sessions/fs-abc123", pod]]));
+  const { agents, checkpoints } = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
+  const saved: string[] = [];
+  const sandboxes = {
+    token: () => Effect.succeed("fs-abc123.token"),
+    release: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<"suspend" | "keep", unknown>) =>
+      Effect.map(save(sandbox), (outcome) => {
+        saved.push(`${name}: ${outcome}`);
+        return outcome === "suspend";
+      }),
+  } as unknown as Sandboxes;
+  const look = (lastTurn: number | null, status: unknown) =>
+    run(kube, Effect.scoped(Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      yield* snapshotted.watch(sandboxes, () => lastTurn);
+      yield* Effect.sleep("50 millis");
+    })), () => status);
+  // Busy, or turned on lately: not released.
+  await look(null, { execsRunning: 1, execsQueued: 0, idleSinceMs: null });
+  await look(Infinity, { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 });
+  await look(Date.now(), { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 });
+  await look(null, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() });
+  assert.deepEqual(saved, []);
+  // Idle for five minutes, with no turn since.
+  await look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 });
+  assert.deepEqual(saved, ["fs-abc123: suspend"]);
+  assert.deepEqual(checkpoints, [["node-a", {
+    environment: "alasio-sessions",
+    workspace: "fs-abc123",
+    release: CURRENT,
+    containerId: "a".repeat(64),
+    hook: ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"],
+    podTemplate: sandbox.spec.podTemplate,
+  }]]);
+});
