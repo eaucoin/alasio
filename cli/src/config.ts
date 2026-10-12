@@ -136,6 +136,9 @@ export interface OperatorConfig {
   readonly install: Readonly<Record<string, unknown>>;
 }
 
+/** Whether alasio may share `target`'s cluster with others: one a kubeconfig reaches, rather than one it makes. */
+export const sharedCluster = (target: Target): boolean => "kubeconfig" in target;
+
 /** The config file is not what alasio runs from: where, and which key and why. */
 export class OperatorConfigError extends Schema.TaggedError<OperatorConfigError>()("OperatorConfigError", {
   path: Schema.String,
@@ -158,14 +161,24 @@ export class NotInitialized extends Schema.TaggedError<NotInitialized>()("NotIni
 /**
  * The install configuration of `install`, with the Secrets alasio names: the bot's,
  * and Claude Code's when `claude`, as alasio finds Claude Code's login in its home when
- * there is none.
+ * there is none. On a cluster alasio may share with others (`shared`, one a kubeconfig
+ * reaches), its pods take no other's place unless autoscaling.preemption says.
  */
-export function installConfigOf(install: Readonly<Record<string, unknown>>, { claude }: { readonly claude: boolean }): Result.Result<InstallConfig, string> {
+export function installConfigOf(
+  install: Readonly<Record<string, unknown>>,
+  { claude, shared }: { readonly claude: boolean; readonly shared: boolean },
+): Result.Result<InstallConfig, string> {
   const alasio = Predicate.isObject(install["alasio"]) ? install["alasio"] : {};
   const own = ["telegram", "claude"].find((key) => Predicate.hasProperty(alasio, key));
   if (own) return Result.fail(`install.alasio.${own} is alasio's own to say: its Secret is the one alasio init writes`);
+  // Given as anything but a map, it is refused as it is.
+  const autoscaling = install["autoscaling"] ?? {};
   return Result.mapBoth(
-    decodeInstallConfig({ ...install, alasio: { ...alasio, telegram: { existingSecret: TELEGRAM_SECRET }, claude: { existingSecret: claude ? CLAUDE_SECRET : "" } } }),
+    decodeInstallConfig({
+      ...install,
+      alasio: { ...alasio, telegram: { existingSecret: TELEGRAM_SECRET }, claude: { existingSecret: claude ? CLAUDE_SECRET : "" } },
+      autoscaling: Predicate.isObject(autoscaling) && !Array.isArray(autoscaling) ? { preemption: !shared, ...autoscaling } : autoscaling,
+    }),
     { onFailure: (error) => `install.${error.message}`, onSuccess: (config) => config },
   );
 }
@@ -185,7 +198,7 @@ export function decodeOperatorConfig(path: string, input: unknown): Result.Resul
     return Result.fail(new OperatorConfigError({ path, reason: describeIssue((Result.isFailure(precise) ? precise : decoded).failure.issue) }));
   }
   const { target, install } = decoded.success;
-  const checked = installConfigOf(install, { claude: true });
+  const checked = installConfigOf(install, { claude: true, shared: sharedCluster(target) });
   if (Result.isFailure(checked)) return Result.fail(new OperatorConfigError({ path, reason: checked.failure }));
   return Result.succeed({ path, file: input as OperatorConfigFile, target, install });
 }

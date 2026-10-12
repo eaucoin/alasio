@@ -35,6 +35,7 @@ import { Result } from "effect";
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/branches.ts";
+import { installConfigOf } from "../src/config.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
@@ -1486,6 +1487,25 @@ describe("scaling", () => {
     assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
   });
 
+  test("lets alasio's pods take others' places only on a cluster it makes, unless told, and keeps no headroom where they may not", () => {
+    const policies = (objects: readonly KubernetesObject[]) =>
+      all<V1PriorityClass>(objects, "PriorityClass").filter(({ metadata }) => metadata?.name !== "alasio-juicefs-mount").map(({ metadata, preemptionPolicy }) => [metadata?.name, preemptionPolicy]);
+    assert.deepEqual(policies(install()), [
+      ["alasio-floor", "PreemptLowerPriority"],
+      ["alasio-turn", "PreemptLowerPriority"],
+      ["alasio-component", "PreemptLowerPriority"],
+      ["alasio-headroom", "Never"],
+    ]);
+    assert.deepEqual(new Set(policies(install({ autoscaling: { preemption: false } })).map(([, policy]) => policy)), new Set(["Never"]));
+    const ofTarget = (shared: boolean, given: Record<string, unknown> = {}) => {
+      const config = installConfigOf({ autoscaling: given }, { claude: false, shared });
+      return Result.isSuccess(config) ? config.success.autoscaling.preemption : config.failure;
+    };
+    assert.deepEqual([ofTarget(false), ofTarget(true), ofTarget(true, { preemption: true })], [true, false, true]);
+    const refused = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, autoscaling: { preemption: false, headroom: { scaling: { min: 1, max: 1 } } } });
+    assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then");
+  });
+
   test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to its memory limit", () => {
     const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try")];
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
@@ -1560,6 +1580,18 @@ describe("scaling", () => {
     assert.deepEqual(one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", "alasio-busy-label").spec, { policyName: "alasio-busy-label", validationActions: ["Deny"] });
     // The cluster's, made with main's alone; a branch makes its Sandboxes' alone.
     assert.deepEqual(all(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy").map(({ metadata }) => metadata?.name), ["alasio-branch-try-sandboxes"]);
+  });
+
+  test("keeps room for a node autoscaler only when asked: placeholders at the lowest priority, which preempt nothing", () => {
+    assert.deepEqual(all(install(), "Deployment").filter(({ metadata }) => metadata?.name === "alasio-headroom"), []);
+    const headroom = one<V1Deployment>(install({ autoscaling: { headroom: { scaling: { min: 2, max: 2 }, resources: { requests: { memory: "1Gi" } } } } }), "Deployment", "alasio-headroom");
+    assert.equal(headroom.spec?.replicas, 2);
+    assert.equal(headroom.spec?.template.spec?.priorityClassName, "alasio-headroom");
+    assert.match(container(headroom).image ?? "", /^registry\.k8s\.io\/pause:3\.10\.1@sha256:[0-9a-f]{64}$/u);
+    assert.deepEqual(container(headroom).resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: {} });
+    assert.deepEqual(all(install({ autoscaling: { headroom: { scaling: { min: 2, max: 2 } } } }), "VerticalPodAutoscaler").filter(({ metadata }) => metadata?.name === "alasio-headroom"), []);
+    const refused = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, autoscaling: { headroom: { scaling: { min: 1, max: 3 } } } });
+    assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling.max must equal min: nothing scales it between them");
   });
 
   test("installs KEDA as its release does, in alasio's namespace under alasio's names, restricted, pinned and small, on the floor; none where the cluster has its own", () => {

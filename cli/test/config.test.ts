@@ -66,8 +66,8 @@ test("the Secrets alasio names are not the config's to say", () => {
 });
 
 test("the install configuration names the bot's Secret, and Claude Code's when the cluster has it", () => {
-  const without = installConfigOf({}, { claude: false });
-  const withClaude = installConfigOf({ alasio: { defaultHarness: "codex" } }, { claude: true });
+  const without = installConfigOf({}, { claude: false, shared: false });
+  const withClaude = installConfigOf({ alasio: { defaultHarness: "codex" } }, { claude: true, shared: false });
   assert.ok(Result.isSuccess(without) && Result.isSuccess(withClaude));
   assert.equal(without.success.alasio.telegram.existingSecret, "alasio-telegram");
   assert.equal(without.success.alasio.claude.existingSecret, "");

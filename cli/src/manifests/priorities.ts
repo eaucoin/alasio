@@ -6,15 +6,20 @@
  * workspaces' bayma. Of one value, neither takes the other's place: no Grafana scaled
  * up, nor a pod of the floor recreated, ends a turn. Then alasio's other components,
  * which sleep or run once (branch environments' computes and lakes, Jobs); and last the
- * headroom's placeholders, which take no pod's place and any pod takes theirs. Each
- * class preempts those below it to be scheduled, and kubelet, short of memory, evicts the
- * lowest first.
+ * headroom's placeholders, which take no pod's place and any pod takes theirs. Kubelet,
+ * short of memory, evicts the lowest first.
+ *
+ * A pod of a class above another's takes its place to be scheduled where there is no
+ * room for it (autoscaling.preemption), alasio's and, where alasio shares the cluster,
+ * its other pods', of priority 0 unless their class says; or, where it may not, waits
+ * for room.
  *
  * JuiceFS's mount pods keep a class of their own, above these all (./juicefs-csi.ts).
  */
 import type { V1PriorityClass } from "@kubernetes/client-node";
 
 import { labels, RELEASE } from "./common.ts";
+import type { InstallConfig } from "./config.ts";
 
 /** What a pod is to the stack, which its priority follows. */
 export type Tier = "floor" | "turn" | "component" | "headroom";
@@ -38,7 +43,7 @@ export function priority(tier: Tier): { priorityClassName: string } {
 }
 
 /** The classes, which are the cluster's. */
-export function priorityClassObjects(): V1PriorityClass[] {
+export function priorityClassObjects(config: InstallConfig): V1PriorityClass[] {
   return Object.entries(TIERS).map(([tier, { value, description }]) => ({
     apiVersion: "scheduling.k8s.io/v1",
     kind: "PriorityClass",
@@ -46,7 +51,7 @@ export function priorityClassObjects(): V1PriorityClass[] {
     value,
     globalDefault: false,
     // A placeholder of the headroom never takes another pod's place.
-    preemptionPolicy: tier === "headroom" ? "Never" : "PreemptLowerPriority",
+    preemptionPolicy: config.autoscaling.preemption && tier !== "headroom" ? "PreemptLowerPriority" : "Never",
     description,
   }));
 }

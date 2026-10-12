@@ -28,7 +28,7 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
-import { installConfigOf, type OperatorConfig, OperatorConfigError } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
@@ -191,7 +191,7 @@ function merged(base: Readonly<Record<string, unknown>>, overrides: Readonly<Rec
 export const branchConfig = Effect.fnUntraced(function*(config: OperatorConfig, overrides: Readonly<Record<string, unknown>>): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
   const install = merged(config.install, merged(overrides, { host: { enabled: false } }));
-  const decoded = installConfigOf(install, { claude });
+  const decoded = installConfigOf(install, { claude, shared: sharedCluster(config.target) });
   if (Result.isFailure(decoded)) return yield* new OperatorConfigError({ path: config.path, reason: `with the branch's overrides, ${decoded.failure}` });
   return decoded.success;
 });

@@ -234,6 +234,27 @@ const handOverReplicas = Effect.fnUntraced(function*(objects: readonly Kubernete
   }), { concurrency: 8, discard: true });
 });
 
+/** A PriorityClass, as its value and preemption policy are read. */
+interface PriorityClass extends KubernetesObject {
+  readonly value?: number;
+  readonly preemptionPolicy?: string;
+}
+
+/**
+ * Deletes the PriorityClasses of `objects` whose value or preemption policy the cluster's
+ * differs in, which cannot change, so they are made anew. A pod keeps the priority it
+ * was given as it was made.
+ */
+const replaceChangedClasses = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
+  const kube = yield* KubeApi;
+  const changed = yield* Effect.filter(objects.filter(({ kind }) => kind === "PriorityClass") as PriorityClass[], (wanted) =>
+    Effect.map(kube.get<PriorityClass>(refOf(wanted)), (live) =>
+      live !== null && (live.value !== wanted.value || (live.preemptionPolicy ?? "PreemptLowerPriority") !== (wanted.preemptionPolicy ?? "PreemptLowerPriority"))));
+  for (const { metadata } of changed) yield* Effect.logInfo(`replacing PriorityClass ${metadata?.name}, whose value and preemption cannot change`);
+  yield* Effect.forEach(changed, (object) => kube.remove(refOf(object)), { discard: true });
+  yield* awaitGone(changed.map(refOf), options);
+});
+
 /** The workloads of `objects`. */
 const workloadsOf = (objects: readonly KubernetesObject[]): ObjectRef[] =>
   objects.filter((object) => WORKLOADS.some((name) => name === object.kind)).map(refOf);
@@ -250,6 +271,7 @@ const applyPhases = Effect.fnUntraced(function*(objects: readonly KubernetesObje
       for (const job of batch) yield* runJob(job, options);
       continue;
     }
+    if (phase.includes("PriorityClass")) yield* replaceChangedClasses(batch, options);
     if (phase.includes("Deployment")) yield* handOverReplicas(batch);
     yield* Effect.forEach(batch, (object) => kube.apply(object), { concurrency: 8, discard: true });
     if (phase.includes("CustomResourceDefinition")) yield* awaitReady(batch.map(refOf), options);

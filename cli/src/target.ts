@@ -40,7 +40,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
     };
   }
   const { docker } = target;
-  const install = installConfigOf(config.install, { claude: false });
+  const install = installConfigOf(config.install, { claude: false, shared: false });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   const hostProfile = install.success.host;
   const hostPaths = hostProfile.enabled ? hostProfile.mounts.map(({ hostPath, readOnly }) => ({ source: hostPath, target: hostPath, readOnly })) : [];

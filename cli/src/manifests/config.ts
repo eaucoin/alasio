@@ -468,7 +468,7 @@ const ControllerContainer = (image: Parameters<typeof Image>[0], resources: Para
  * How alasio's components scale: KEDA, which moves a component's replicas between its
  * scale's min and max on what its ScaledObject names; VPA, which sizes every workload's
  * requests from what it uses; each installed once per cluster, and off where the cluster
- * has its own already, which alasio then uses; and headroom.
+ * has its own already, which alasio then uses; and headroom for a node autoscaler.
  */
 const Autoscaling = Schema.Struct({
   /**
@@ -521,6 +521,27 @@ const Autoscaling = Schema.Struct({
     }),
     {},
   ),
+  /**
+   * Whether alasio's pods take the places of pods of lower priority to be scheduled where
+   * there is no room for them (./priorities.ts): alasio's own, and, on a cluster it shares,
+   * the cluster's others, of priority 0 unless their class says; or wait for room. So true
+   * on a cluster alasio makes, and false on one a kubeconfig reaches, unless said
+   * (installConfigOf in ../config.ts).
+   */
+  preemption: defaulted(Schema.Boolean, true),
+  /**
+   * Placeholder pods, each requesting `resources`, which any pod takes the place of: room a
+   * node autoscaler keeps ready, of use only where one runs, and where pods preempt. None
+   * unless a fixed count is given.
+   */
+  headroom: defaulted(
+    Schema.Struct({
+      scaling: Scaling({ min: 0, max: 0 }, { floor: false, scaled: false }),
+      image: Image({ repository: "registry.k8s.io/pause", tag: "3.10.1", digest: "sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c" }),
+      resources: Resources({ requests: { cpu: "500m", memory: "512Mi" }, limits: {} }),
+    }),
+    {},
+  ),
 });
 
 /** What a configuration must also hold, given what it turns off: the issue of the first it lacks. */
@@ -537,6 +558,9 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   }
   if (config.workspaceStorage.enabled && !config.neon.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
+  }
+  if (config.autoscaling.headroom.scaling.min > 0 && !config.autoscaling.preemption) {
+    return { path: ["autoscaling", "headroom", "scaling"], issue: "must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then" };
   }
   return undefined;
 }

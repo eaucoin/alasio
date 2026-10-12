@@ -27,7 +27,7 @@ const WAIT = { timeout: "2 seconds", poll: "10 millis" } as const;
 
 /** The objects of an installation of `install`. */
 function objectsOf(install: Record<string, unknown> = {}) {
-  const config = installConfigOf(install, { claude: false });
+  const config = installConfigOf(install, { claude: false, shared: false });
   if (Result.isFailure(config)) throw new Error(config.failure);
   return installationObjects(config.success);
 }
@@ -298,6 +298,25 @@ test("a ScaledObject whose controller does not run to let go of it is let go of,
   assert.ok(progress.includes("letting go of ScaledObject alasio/alasio-grafana, as its controller has not within 2s"));
 });
 
+test("a PriorityClass whose preemption changes, which cannot change, is made anew; one unchanged is left be", async (t) => {
+  const { kube, run } = await rig(t);
+  const floor = "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-floor";
+  await run(applyInstallation(objectsOf(), WAIT));
+  assert.equal(kube.get(floor)?.["preemptionPolicy"], "PreemptLowerPriority");
+  const before = kube.changes.length;
+  await run(applyInstallation(objectsOf({ autoscaling: { preemption: false } }), WAIT));
+  assert.equal(kube.get(floor)?.["preemptionPolicy"], "Never");
+  const deleted = kube.changes.slice(before).filter(({ method }) => method === "DELETE").map(({ path }) => path);
+  assert.deepEqual(deleted.filter((path) => path.includes("/priorityclasses/")).sort(), [
+    "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-component",
+    floor,
+    "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-turn",
+  ]);
+  const again = kube.changes.length;
+  await run(applyInstallation(objectsOf({ autoscaling: { preemption: false } }), WAIT));
+  assert.deepEqual(kube.changes.slice(again).filter(({ method, path }) => method === "DELETE" && path.includes("/priorityclasses/")), []);
+});
+
 test("classes and CSI drivers are applied with the namespaces, before what uses them; DaemonSets with the workloads, waited for", async (t) => {
   const { kube, run } = await rig(t);
   const objects = [...objectsOf(), ...driverObjects()];
@@ -401,7 +420,7 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const { kube, run } = await rig(t);
   /** What checking the installation of `install`, with `objects` added, comes to. */
   const check = (install: Record<string, unknown>, objects: readonly KubernetesObject[] = []) => {
-    const config = installConfigOf(install, { claude: false });
+    const config = installConfigOf(install, { claude: false, shared: false });
     if (Result.isFailure(config)) throw new Error(config.failure);
     return run(Effect.result(checkAutoscalers([...installationObjects(config.success), ...objects], config.success))).then((result) => (Result.isFailure(result) ? result.failure.message : "fits"));
   };

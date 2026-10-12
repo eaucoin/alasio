@@ -7,7 +7,7 @@
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
-import { installConfigOf, type OperatorConfig, OperatorConfigError } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
 import { KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
@@ -40,7 +40,7 @@ export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) 
 /** The install configuration of `config`, which names Claude Code's Secret when the cluster has it. */
 export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
-  const install = installConfigOf(config.install, { claude });
+  const install = installConfigOf(config.install, { claude, shared: sharedCluster(config.target) });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   return install.success;
 });
