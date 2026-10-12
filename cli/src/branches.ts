@@ -28,6 +28,7 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
+import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
@@ -115,19 +116,6 @@ const onCompute = (namespace: string, pod: string, sql: string) =>
     Effect.flatMap(succeeded(`asking the compute in ${namespace}`)),
     Effect.map((printed) => printed.trim()),
   );
-
-/** A memory quantity, in bytes. */
-export function memoryBytes(quantity: string): number {
-  const match = /^([0-9.]+)([KMGTPE]i?|k|m)?$/u.exec(quantity.trim());
-  if (!match) return 0;
-  const units: Record<string, number> = { k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18, Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60, m: 1e-3 };
-  return Number(match[1]) * (match[2] ? units[match[2]] ?? 1 : 1);
-}
-
-/** `bytes`, as people read an amount of memory. */
-export function memoryText(bytes: number): string {
-  return bytes >= 2 ** 30 ? `${(bytes / 2 ** 30).toFixed(1)} GiB` : `${Math.round(bytes / 2 ** 20)} MiB`;
-}
 
 /** A pod's or node's use of memory now, as the metrics server measures it. */
 interface MemoryUsage extends KubernetesObject {

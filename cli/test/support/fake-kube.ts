@@ -118,6 +118,8 @@ export interface FakeKube {
    * finalizer, or whose controller is gone by then, stays, being deleted.
    */
   readonly finalizers: Map<string, string>;
+  /** The paths it refuses to read, as a kubeconfig's rights may not reach them: 403. */
+  readonly forbidden: Set<string>;
   readonly execs: KubeExec[];
   /** How the test answers a command run in a container; exit 0, saying nothing, unless it says. */
   onExec: (exec: KubeExec) => KubeExecResult;
@@ -240,6 +242,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const failing = new Set<string>();
   const logs = new Map<string, string>();
   const finalizers = new Map<string, string>();
+  const forbidden = new Set<string>();
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
   const forwarded = new Map<string, number>();
@@ -366,6 +369,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const target = parse(url.pathname);
     if (!target) return refuse(response, 404, `the server could not find the requested resource (${url.pathname})`);
     const path = url.pathname;
+    if (method === "GET" && forbidden.has(path)) return refuse(response, 403, `${target.plural} is forbidden`);
     if (method === "GET" && target.sub === "log") {
       const text = logs.get(`${target.name}/${url.searchParams.get("container")}`) ?? logs.get(target.name ?? "");
       if (text === undefined) return refuse(response, 404, `pods "${target.name}" not found`);
@@ -506,6 +510,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     failing,
     logs,
     finalizers,
+    forbidden,
     execs,
     onExec: () => ({ exitCode: 0 }),
     forwards,

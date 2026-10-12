@@ -349,6 +349,66 @@ test("status says each workload's state, and fails when one is not ready", async
   assert.ok(unhealthy.printed.includes("  Deployment alasio/alasio: 0 of 1 available"));
 });
 
+test("status says each workload's replicas and scale, its requests beside VPA's recommendation, and the cluster's memory, and where no metrics server measures them", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const lines = async () => {
+    const run = await alasio(["status"]);
+    succeeded(run);
+    return run.printed;
+  };
+  const after = (printed: readonly string[], line: string) => printed[printed.indexOf(line) + 1];
+  let printed = await lines();
+  assert.equal(after(printed, "  Deployment alasio/alasio: ready"), "    1 replica; requests 250m CPU and 768 MiB");
+  assert.equal(after(printed, "  DaemonSet kube-system/juicefs-csi-node: ready"), "    requests 30m CPU and 96 MiB");
+  assert.equal(printed.at(-1), "the cluster has no metrics server: VPA recommends nothing");
+
+  const vpa = kube.get("/apis/autoscaling.k8s.io/v1/namespaces/alasio/verticalpodautoscalers/alasio");
+  assert.ok(vpa);
+  vpa.status = { recommendation: { containerRecommendations: [{ containerName: "alasio", target: { cpu: "120m", memory: "600Mi" } }] } };
+  kube.put("scaledobjects", {
+    apiVersion: "keda.sh/v1alpha1",
+    kind: "ScaledObject",
+    metadata: { name: "alasio-grafana", namespace: "alasio", labels: { "alasio.dev/installation": "alasio" } },
+    spec: { scaleTargetRef: { name: "alasio-grafana" }, minReplicaCount: 1, maxReplicaCount: 3, triggers: [{ type: "cpu", metricType: "Utilization", metadata: { value: "80" } }] },
+  });
+  kube.put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { allocatable: { memory: "14Gi" } } });
+  // What the pods that run request; a pod done requests nothing.
+  const pod = (name: string, phase: string) => ({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name, namespace: "elsewhere" },
+    spec: { containers: [{ name: "main", resources: { requests: { memory: "1Gi" } } }] },
+    status: { phase },
+  });
+  kube.put("pods", pod("running", "Running"));
+  kube.put("pods", pod("done", "Succeeded"));
+  printed = await lines();
+  assert.equal(after(printed, "  Deployment alasio/alasio: ready"), "    1 replica; requests 250m CPU and 768 MiB, VPA recommends 120m CPU and 600 MiB");
+  assert.equal(after(printed, "  Deployment alasio/alasio-grafana: ready"), "    1 replica of 1 to 3, scaled by KEDA; requests 50m CPU and 256 MiB");
+  assert.equal(printed.at(-2), "memory: 1.0 GiB requested, of 14.0 GiB the nodes have for pods");
+  assert.equal(printed.at(-1), "the cluster has no metrics server: VPA recommends nothing, and what scales on its CPU (alasio-grafana) does not scale");
+
+  kube.put("apiservices", { apiVersion: "apiregistration.k8s.io/v1", kind: "APIService", metadata: { name: "v1beta1.metrics.k8s.io" }, status: { conditions: [{ type: "Available", status: "True" }] } });
+  kube.put("nodes", { apiVersion: "metrics.k8s.io/v1beta1", kind: "NodeMetrics", metadata: { name: "machine" }, usage: { memory: "3584Mi" } });
+  assert.equal((await lines()).at(-1), "memory: 1.0 GiB requested, 3.5 GiB used, of 14.0 GiB the nodes have for pods");
+});
+
+test("status with rights in alasio's namespace alone says what it sees there, and what it does not see", async (t) => {
+  const { alasio, kube } = await installed(t);
+  for (const path of ["/apis/apps/v1/deployments", "/apis/apps/v1/statefulsets", "/apis/apps/v1/daemonsets", "/apis/keda.sh/v1alpha1/scaledobjects", "/apis/autoscaling.k8s.io/v1/verticalpodautoscalers", "/api/v1/pods", "/api/v1/nodes", "/apis/apiregistration.k8s.io/v1/apiservices/v1beta1.metrics.k8s.io"]) {
+    kube.forbidden.add(path);
+  }
+  const run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio: ready"));
+  assert.ok(!run.printed.some((line) => line.includes("kube-system")), "nothing of kube-system's is listed");
+  assert.deepEqual(run.printed.slice(-3), [
+    "  alasio's workloads outside its namespace, alasio: not seen, as this kubeconfig may list them there alone",
+    "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods",
+    "whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices",
+  ]);
+});
+
 test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
   const { alasio, configure, home, kube, machine } = await rig(t);
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });

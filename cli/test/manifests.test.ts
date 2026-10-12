@@ -34,7 +34,7 @@ import { Result } from "effect";
 
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
-import { memoryBytes } from "../src/branches.ts";
+import { memoryBytes } from "../src/capacity.ts";
 import { installConfigOf } from "../src/config.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";

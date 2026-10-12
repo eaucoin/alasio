@@ -3,7 +3,8 @@ import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted } from
 import { Argument, Command, Flag } from "effect/cli";
 
 import { HISTORY } from "../../../neon/control/branches.ts";
-import { createBranch, deleteBranch, listBranches, memoryText } from "../branches.ts";
+import { createBranch, deleteBranch, listBranches } from "../branches.ts";
+import { memoryText } from "../capacity.ts";
 import { loadConfig } from "../config.ts";
 import { readTelegramBot, type TelegramBot } from "../secrets.ts";
 import { TelegramBotApi } from "../telegram.ts";

@@ -1,6 +1,6 @@
-/** `alasio status`: what runs, and whether it is healthy. */
-import type { V1Node } from "@kubernetes/client-node";
-import { Console, Effect, Schema } from "effect";
+/** `alasio status`: what runs, and whether it is healthy; how it is scaled and sized, and the cluster's memory. */
+import type { KubernetesObject, V1Node, V1Pod } from "@kubernetes/client-node";
+import { Console, Effect, Option, Schema } from "effect";
 import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
@@ -9,10 +9,13 @@ import { readySince } from "../cluster/k3s.ts";
 import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
 import { SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
-import { describeRef, kind, KubeApi, refOf } from "../kube/api.ts";
+import { describeMemory, describeScale, describeSizing, memoryBytes, type ScaledWorkload } from "../capacity.ts";
+import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness } from "../kube/rollout.ts";
-import { RELEASE } from "../manifests/common.ts";
+import { NAMESPACE, RELEASE } from "../manifests/common.ts";
+import type { ScaledObject } from "../manifests/scalers.ts";
+import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { notRunning } from "./common.ts";
 
@@ -27,6 +30,68 @@ export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
       : `${this.notReady} of alasio's ${this.of} workloads are not ready`;
   }
 }
+
+/** What `look` finds, or none where this kubeconfig's rights do not reach it. */
+const seen = <A>(look: Effect.Effect<A, KubeApiError, KubeApi>): Effect.Effect<Option.Option<A>, KubeApiError, KubeApi> =>
+  look.pipe(Effect.map(Option.some), Effect.catchIf(hasStatus(403), () => Effect.succeedNone));
+
+/**
+ * The installation's objects of `kindOf`, in every namespace, or in alasio's alone where
+ * this kubeconfig may list no more (`whole` false); none where the cluster lacks their CRD.
+ */
+const installedOf = <T extends KubernetesObject>(kindOf: Kind): Effect.Effect<{ readonly objects: readonly T[]; readonly whole: boolean }, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const everywhere = yield* seen(kube.list<T>(kindOf, { labelSelector: INSTALLATION_SELECTOR }));
+    if (Option.isSome(everywhere)) return { objects: everywhere.value, whole: true };
+    return { objects: yield* kube.list<T>(kindOf, { namespace: NAMESPACE, labelSelector: INSTALLATION_SELECTOR }), whole: false };
+  }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed({ objects: [], whole: true })));
+
+/** The object of `objects` in `workload`'s namespace that names it `by`. */
+const of = <T extends KubernetesObject>(objects: readonly T[], workload: KubernetesObject, by: (object: T) => string | undefined): T | undefined =>
+  objects.find((object) => object.metadata?.namespace === workload.metadata?.namespace && by(object) === workload.metadata?.name);
+
+/** Where the API serves an aggregated API, as its APIService says: Available. */
+interface APIService extends KubernetesObject {
+  readonly status?: { readonly conditions?: readonly { readonly type: string; readonly status: string }[] };
+}
+
+/** A node's use of memory now, as the metrics server measures it. */
+interface NodeMetrics extends KubernetesObject {
+  readonly usage?: { readonly memory?: string };
+}
+
+/**
+ * Whether the cluster's metrics server serves, as its APIService says, null where this
+ * kubeconfig may not read it; and the cluster's memory: what its pods that run or are to
+ * request, and use now where the metrics server measures it, of what the nodes have for
+ * pods, null where this kubeconfig may not list them.
+ */
+const memory = Effect.gen(function*() {
+  const kube = yield* KubeApi;
+  const metrics = yield* seen(kube.get<APIService>({ ...kind("APIService"), name: "v1beta1.metrics.k8s.io" }));
+  const measures = Option.match(metrics, {
+    onNone: () => null,
+    onSome: (service) => service?.status?.conditions?.some(({ type, status }) => type === "Available" && status === "True") ?? false,
+  });
+  const nodes = Option.getOrNull(yield* seen(kube.list<V1Node>(kind("Node"))));
+  const pods = Option.getOrNull(yield* seen(kube.list<V1Pod>(kind("Pod"))));
+  const usage = measures ? Option.getOrNull(yield* seen(kube.list<NodeMetrics>(kind("NodeMetrics")))) : null;
+  const running = pods?.filter(({ status }) => status?.phase !== "Succeeded" && status?.phase !== "Failed");
+  return {
+    measures,
+    memory: nodes && running
+      ? {
+        requested: running.flatMap(({ spec }) => spec?.containers ?? []).reduce((sum, { resources }) => sum + memoryBytes(resources?.requests?.["memory"] ?? "0"), 0),
+        used: usage ? usage.reduce((sum, node) => sum + memoryBytes(node.usage?.memory ?? "0"), 0) : null,
+        allocatable: nodes.reduce((sum, node) => sum + memoryBytes(node.status?.allocatable?.["memory"] ?? "0"), 0),
+      }
+      : null,
+  };
+});
+
+/** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
+const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
 export const status = Command.make("status", {}, () =>
   Effect.gen(function*() {
@@ -58,21 +123,39 @@ export const status = Command.make("status", {}, () =>
     yield* Effect.provide(
       Effect.gen(function*() {
         const kube = yield* KubeApi;
-        const workloads = (yield* Effect.forEach(WORKLOADS, (name) => kube.list(kind(name), { labelSelector: INSTALLATION_SELECTOR })))
-          .flat()
-          .sort((a, b) => (a.metadata?.name ?? "").localeCompare(b.metadata?.name ?? ""));
+        const listed = yield* Effect.forEach(WORKLOADS, (name) => installedOf(kind(name)));
+        const workloads = listed.flatMap(({ objects }) => objects).sort((a, b) => (a.metadata?.name ?? "").localeCompare(b.metadata?.name ?? ""));
         const version = workloads.find((object) => object.kind === "Deployment" && object.metadata?.name === RELEASE)?.metadata?.labels?.["app.kubernetes.io/version"];
+        const scaledObjects = (yield* installedOf<ScaledObject>(kind("ScaledObject"))).objects;
+        const sizings = (yield* installedOf<VerticalPodAutoscaler>(kind("VerticalPodAutoscaler"))).objects;
         yield* Console.log(`alasio${version ? ` ${version}` : ""}, in ${describeTarget(target)} (${kube.server}):`);
         let notReady = 0;
-        for (const workload of workloads) {
+        for (const workload of workloads as readonly ScaledWorkload[]) {
           const state = readiness(workload);
+          // A DaemonSet runs a pod on every node it schedules to, of no scale of its own.
+          const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name))}; `;
+          const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
             yield* Console.log(`  ${describeRef(refOf(workload))}: ready`);
+            yield* Console.log(sizing);
             continue;
           }
           notReady += 1;
           yield* Console.log(`  ${describeRef(refOf(workload))}: ${state._tag === "Waiting" ? state.status : state.reason}`);
+          yield* Console.log(sizing);
           for (const line of yield* diagnose(refOf(workload))) yield* Console.log(`    ${line}`);
+        }
+        if (listed.some(({ whole }) => !whole)) {
+          yield* Console.log(`  alasio's workloads outside its namespace, ${NAMESPACE}: not seen, as this kubeconfig may list them there alone`);
+        }
+        const cluster = yield* memory;
+        yield* Console.log(cluster.memory ? describeMemory(cluster.memory) : "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods");
+        if (cluster.measures === null) yield* Console.log("whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices");
+        if (cluster.measures === false) {
+          const scaled = scaledObjects.filter(onResources).map(({ metadata }) => metadata?.name);
+          yield* Console.log(
+            `the cluster has no metrics server: VPA recommends nothing${scaled.length > 0 ? `, and what scales on its CPU (${scaled.join(", ")}) does not scale` : ""}`,
+          );
         }
         if (workloads.length === 0 || notReady > 0) return yield* new Unhealthy({ notReady, of: workloads.length });
       }),
@@ -83,7 +166,11 @@ export const status = Command.make("status", {}, () =>
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
-        "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready, or what it is at and why. Exits with 1 when something " +
+        "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready, or what it is at and " +
+        "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
+        "what VPA recommends once it has measured them. Then the memory the cluster's pods request and use, of what its nodes have " +
+        "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +
+        "rights do not reach, it says is not seen. Exits with 1 when something " +
         "is not ready, or the limits are too low, or this machine is not Linux on x86-64, which the cluster here needs.",
     ),
   );
