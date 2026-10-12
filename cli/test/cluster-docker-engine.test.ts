@@ -192,6 +192,23 @@ test("readFile reads the file out of the archive Docker sends, and a missing one
   assert.equal(results.missing.status, 404);
 });
 
+test("putArchive sends a tar archive to be extracted at the path given, into a container not yet started, and one that is not there is a 404", async () => {
+  const archive = tarOf("etc/config.toml", Buffer.from("a = 1\n"));
+  const results = await withDocker((docker, fake) =>
+    Effect.gen(function*() {
+      yield* docker.createContainer("n", containerCreate);
+      yield* docker.putArchive("n", "/", archive);
+      return { put: fake.requests.at(-1), files: fake.containers.get("n")?.files, missing: yield* Effect.flip(docker.putArchive("absent", "/", archive)) };
+    })
+  );
+  assert.equal(results.put?.method, "PUT");
+  assert.equal(results.put?.path, "/containers/n/archive");
+  assert.equal(results.put?.query.get("path"), "/");
+  assert.deepEqual(results.put?.body, archive);
+  assert.deepEqual(results.files, new Map([["/etc/config.toml", Buffer.from("a = 1\n")]]));
+  assert.equal(results.missing.status, 404);
+});
+
 test("a Docker that cannot be reached fails with why, and no status", async () => {
   const error = await Effect.runPromise(
     DockerEngine.pipe(Effect.flatMap((docker) => Effect.flip(docker.version)), Effect.provide(DockerEngine.layer({ DOCKER_HOST: "unix:///nonexistent/docker.sock" }))),

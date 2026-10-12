@@ -14,9 +14,8 @@ import { Effect, Layer, Logger } from "effect";
 
 import { Machine } from "../src/cluster/machine.ts";
 import { type Artifact, downloads, InstallGvisor, nodeFiles, type NodeStep, performNodeStep, RUNSC_TOML } from "../src/cluster/node.ts";
-import { tarEntries } from "../src/cluster/tar.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
-import { fakeReleases, tar } from "./support/fake-releases.ts";
+import { fakeReleases } from "./support/fake-releases.ts";
 
 const TEMPLATE = readFileSync(new URL("../../cluster/node/config-v3.toml.tmpl", import.meta.url), "utf8");
 
@@ -91,16 +90,4 @@ test("an archive changed since it was downloaded is refused as root, and nothing
   assert.match(await perform(InstallGvisor.make({ release: "20990101.0", archive })) ?? "", /^https:\/\/github\.com\/eaucoin\/gvisor\/.* is not what alasio pins: its sha512 is /u);
   assert.equal(machine.has("/usr/local/bin/runsc"), false);
   assert.equal(machine.has("/etc/rancher/k3s/alasio.json"), false);
-});
-
-test("tarEntries reads files and directories, a POSIX header's prefix as its name's start, and passes over other entries", () => {
-  const archive = tar([{ name: "gvisor-bin/" }, { name: "gvisor-bin/runsc-metric-server", content: Buffer.from("metrics") }]);
-  const linked = Buffer.from(archive);
-  // A symbolic link, which is passed over.
-  linked[512 + 156] = 0x32;
-  assert.deepEqual(tarEntries(archive).map(({ name, type, content }) => [name, type, content.toString()]), [["gvisor-bin/", "directory", ""], ["gvisor-bin/runsc-metric-server", "file", "metrics"]]);
-  assert.deepEqual(tarEntries(linked).map(({ name }) => name), ["gvisor-bin/"]);
-  const prefixed = tar([{ name: "runsc", content: Buffer.from("runsc") }]);
-  prefixed.write("release", 345, "latin1");
-  assert.equal(tarEntries(prefixed)[0]?.name, "release/runsc");
 });

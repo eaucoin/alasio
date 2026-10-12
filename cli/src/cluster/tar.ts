@@ -1,4 +1,4 @@
-/** The entries of a tar archive, as Docker's archive endpoint and gVisor's release send them. */
+/** Tar archives: read, as Docker's archive endpoint and gVisor's release send them, and written, as Docker's archive endpoint takes them. */
 
 /** An entry of a tar archive: a regular file, with its content, or a directory. */
 export interface TarEntry {
@@ -9,6 +9,9 @@ export interface TarEntry {
 }
 
 const BLOCK = 512;
+/** The most a header's name, and its prefix, hold. */
+const NAME_SIZE = 100;
+const PREFIX_SIZE = 155;
 
 /** A NUL-terminated field of a header, as text. */
 const field = (header: Buffer, start: number, end: number): string => header.toString("latin1", start, end).replace(/\0.*$/su, "");
@@ -36,4 +39,45 @@ export function tarEntries(tar: Buffer): TarEntry[] {
     offset = start + Math.ceil(size / BLOCK) * BLOCK;
   }
   return entries;
+}
+
+/** `value` in octal, as a header's numeric field of `width` bytes holds it: zero-padded, then NUL. */
+const octal = (value: number, width: number): string => `${value.toString(8).padStart(width - 1, "0")}\0`;
+
+/**
+ * `name` as a POSIX header holds it: its prefix, and the rest, split at a slash when it is
+ * longer than a header's name; a directory's own trailing slash stays with the rest.
+ */
+function splitName(name: string): { readonly prefix: string; readonly rest: string } {
+  if (name.length <= NAME_SIZE) return { prefix: "", rest: name };
+  const at = name.slice(0, -1).indexOf("/", name.length - NAME_SIZE - 1);
+  if (at <= 0 || at > PREFIX_SIZE) throw new Error(`${name} is too long a name for a tar archive's header`);
+  return { prefix: name.slice(0, at), rest: name.slice(at + 1) };
+}
+
+/** The POSIX header of `entry`, owned by root, from the epoch. */
+function header({ name, type, mode, content }: TarEntry): Buffer {
+  const block = Buffer.alloc(BLOCK);
+  const { prefix, rest } = splitName(name);
+  block.write(rest, 0, NAME_SIZE, "latin1");
+  block.write(octal(mode, 8), 100, "latin1");
+  block.write(octal(0, 8), 108, "latin1");
+  block.write(octal(0, 8), 116, "latin1");
+  block.write(octal(content.length, 12), 124, "latin1");
+  block.write(octal(0, 12), 136, "latin1");
+  block.write(type === "file" ? "0" : "5", 156, "latin1");
+  block.write("ustar\u000000", 257, "latin1");
+  block.write(prefix, 345, PREFIX_SIZE, "latin1");
+  // The checksum is the sum of the header's bytes with its own field as spaces, its last one kept.
+  block.write(" ".repeat(8), 148, "latin1");
+  block.write(octal(block.reduce((sum, byte) => sum + byte, 0), 7), 148, "latin1");
+  return block;
+}
+
+/** The POSIX tar archive of `entries`, in order: each one's header, then its content, padded to a block. */
+export function tarArchive(entries: readonly TarEntry[]): Buffer {
+  return Buffer.concat([
+    ...entries.flatMap((entry) => [header(entry), entry.content, Buffer.alloc((BLOCK - (entry.content.length % BLOCK)) % BLOCK)]),
+    Buffer.alloc(2 * BLOCK),
+  ]);
 }

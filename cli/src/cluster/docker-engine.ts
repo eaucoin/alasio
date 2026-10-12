@@ -1,7 +1,7 @@
 /**
  * Docker's Engine API, over the Unix socket Docker listens on: as much of it as the
- * cluster in Docker (./docker.ts) needs, its images, network, volumes and containers and
- * commands run in them, called with node:http, so neither the Docker CLI nor a client
+ * cluster in Docker (./docker.ts) needs, its images, network, volumes and containers, the
+ * commands run in them and the files read from and put in them, called with node:http, so neither the Docker CLI nor a client
  * library is needed. Paths are those of API version 1.44 (Docker 25), the oldest it is
  * written for.
  *
@@ -197,18 +197,21 @@ export class DockerEngine extends Context.Service<DockerEngine, {
   readonly exec: (container: string, command: readonly string[], options?: ExecOptions) => Effect.Effect<ExecResult, DockerError>;
   /** The content of the file at `path` in the container. */
   readonly readFile: (container: string, path: string) => Effect.Effect<Buffer, DockerError>;
+  /** Extracts `archive`, a tar archive, into the directory `path` of the container, running or not, and of its volumes. */
+  readonly putArchive: (container: string, path: string, archive: Buffer) => Effect.Effect<void, DockerError>;
 }>()("alasio/cluster/DockerEngine") {
   /** The Docker `env` names (dockerSocket). */
   static readonly layer = (env: Readonly<NodeJS.ProcessEnv> = process.env): Layer.Layer<DockerEngine, DockerHostUnsupported> =>
     Layer.effect(DockerEngine, Effect.map(Effect.fromResult(dockerSocket(env)), makeDockerEngine));
 }
 
-/** A call of the Engine API: its query's arrays are repeated parameters. */
+/** A call of the Engine API: its query's arrays are repeated parameters; its body is JSON, or a tar archive. */
 interface DockerCall {
-  readonly method: "GET" | "POST" | "DELETE";
+  readonly method: "GET" | "POST" | "PUT" | "DELETE";
   readonly path: string;
   readonly query?: Readonly<Record<string, string | readonly string[]>>;
   readonly body?: unknown;
+  readonly archive?: Buffer;
 }
 
 const describe = (call: DockerCall): string => `${call.method} ${call.path}`;
@@ -249,12 +252,13 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
     for (const [key, value] of Object.entries(call.query ?? {})) {
       for (const each of typeof value === "string" ? [value] : value) query.append(key, each);
     }
-    const body = call.body === undefined ? undefined : JSON.stringify(call.body);
+    const body = call.archive ?? (call.body === undefined ? undefined : JSON.stringify(call.body));
+    const type = call.archive ? "application/x-tar" : "application/json";
     const request = httpRequest({
       socketPath,
       method: call.method,
       path: `/${API_VERSION}${call.path}${query.size ? `?${query}` : ""}`,
-      headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      headers: body === undefined ? headers : { ...headers, "Content-Type": type, "Content-Length": Buffer.byteLength(body) },
     });
     request.end(body);
     return request;
@@ -402,5 +406,6 @@ function makeDockerEngine(socketPath: string): DockerEngine["Service"] {
       ),
     exec,
     readFile,
+    putArchive: (container, path, archive) => Effect.asVoid(body({ method: "PUT", path: `/containers/${name(container)}/archive`, query: { path }, archive })),
   });
 }

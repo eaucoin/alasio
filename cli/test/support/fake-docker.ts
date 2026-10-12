@@ -2,8 +2,8 @@
  * A Docker Engine in memory, serving the Engine API over a Unix socket as Docker does,
  * for the tests of the client (../../src/cluster/docker-engine.ts) and of what drives it. It
  * keeps images, networks, volumes and containers, records every request, upgrades an
- * exec's start to a raw stream as Docker does, and answers commands run in containers
- * and files read from them as the test says.
+ * exec's start to a raw stream as Docker does, answers commands run in containers and
+ * files read from them as the test says, and keeps the files put in them.
  */
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +12,9 @@ import type { Duplex } from "node:stream";
 import { buffer } from "node:stream/consumers";
 import { join } from "node:path";
 
-/** A request the fake was sent: its method, its path without the API version, its query, and its JSON body. */
+import { tarArchive, tarEntries } from "../../src/cluster/tar.ts";
+
+/** A request the fake was sent: its method, its path without the API version, its query, and its body: JSON, or a tar archive. */
 export interface DockerRequest {
   readonly method: string;
   readonly path: string;
@@ -30,11 +32,15 @@ export interface FakeExecResult {
 /** How the test answers a command run in `container`, given what it was sent on its stdin. */
 export type ExecAnswer = (container: string, command: readonly string[], stdin: Buffer) => FakeExecResult;
 
-/** A container the fake keeps: the body it was created with, its state, and when it last started (zero time before it has). */
+/**
+ * A container the fake keeps: the body it was created with, its state, when it last
+ * started (zero time before it has), and the files put in it, by their paths.
+ */
 export interface FakeContainer {
   readonly body: { readonly Labels?: Readonly<Record<string, string>> } & Record<string, unknown>;
   state: "created" | "running" | "exited";
   startedAt?: string;
+  files?: Map<string, Buffer>;
 }
 
 /** Docker's StartedAt of a container that never started. */
@@ -68,24 +74,7 @@ export interface FakeDocker {
 }
 
 /** A tar archive of one file, `name`, holding `content`, as Docker's archive endpoint sends one. */
-export function tarOf(name: string, content: Buffer): Buffer {
-  const header = Buffer.alloc(512);
-  header.write(name, 0, 100, "utf8");
-  header.write("0000644\0", 100);
-  header.write("0000000\0", 108);
-  header.write("0000000\0", 116);
-  header.write(`${content.length.toString(8).padStart(11, "0")}\0`, 124);
-  header.write("00000000000\0", 136);
-  header.write("0", 156);
-  header.write("ustar\0", 257);
-  header.write("00", 263);
-  // The checksum is the sum of the header's bytes with its own field as spaces.
-  header.write("        ", 148);
-  const checksum = header.reduce((sum, byte) => sum + byte, 0);
-  header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148);
-  const padding = Buffer.alloc((512 - (content.length % 512)) % 512);
-  return Buffer.concat([header, content, padding, Buffer.alloc(1024)]);
-}
+export const tarOf = (name: string, content: Buffer): Buffer => tarArchive([{ name, type: "file", mode: 0o644, content }]);
 
 /** Output as Docker frames it for an exec without a terminal: per stream, an 8-byte header and the bytes. */
 export function frame(stream: 1 | 2, content: string): Buffer {
@@ -136,7 +125,7 @@ export async function serveFakeDocker({
       method: request.method ?? "GET",
       path: decodeURIComponent(url.pathname.replace(/^\/v[\d.]+/u, "")),
       query: url.searchParams,
-      body: body.length ? JSON.parse(body.toString("utf8")) : undefined,
+      body: body.length === 0 ? undefined : request.headers["content-type"] === "application/x-tar" ? body : JSON.parse(body.toString("utf8")),
     };
     requests.push(recorded);
     return recorded;
@@ -213,7 +202,7 @@ export async function serveFakeDocker({
       containers.set(name, { body: body as FakeContainer["body"], state: "created" });
       return json(response, 201, { Id: name, Warnings: [] });
     }
-    if ((match = /^(GET|POST|DELETE) \/containers\/([^/]+)(?:\/(json|start|stop|exec|archive))?$/u.exec(route))) {
+    if ((match = /^(GET|POST|PUT|DELETE) \/containers\/([^/]+)(?:\/(json|start|stop|exec|archive))?$/u.exec(route))) {
       const [, verb, name = "", action] = match;
       const container = containers.get(name);
       if (!container) return refuse(response, 404, `No such container: ${name}`);
@@ -246,6 +235,12 @@ export async function serveFakeDocker({
         const id = `exec-${execs.size}`;
         execs.set(id, { container: name, command: exec.Cmd, stdin: exec.AttachStdin, exitCode: null });
         return json(response, 201, { Id: id });
+      }
+      if (verb === "PUT" && action === "archive") {
+        const directory = query.get("path") ?? "";
+        container.files ??= new Map();
+        for (const { name: file, type, content } of tarEntries(body as Buffer)) if (type === "file") container.files.set(join(directory, file), content);
+        return void response.writeHead(200).end();
       }
       if (action === "archive") {
         const content = files(name, query.get("path") ?? "");
