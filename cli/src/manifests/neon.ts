@@ -33,8 +33,10 @@ import {
   MAIN_ENVIRONMENT,
   NAMESPACE,
   neonName,
+  ONE,
   otelEnv,
   RELEASE,
+  replicasOf,
   restrictedContainer,
   s3Endpoint,
   script,
@@ -152,7 +154,7 @@ function controllerDb(config: InstallConfig): KubernetesObject[] {
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
       serviceName: name,
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
@@ -192,7 +194,7 @@ function storageBroker(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
@@ -224,7 +226,7 @@ function storageController(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels(component) },
       template: {
@@ -252,7 +254,7 @@ function storageController(config: InstallConfig): KubernetesObject[] {
                 "--listen 0.0.0.0:1234",
                 `--control-plane-url http://${neonName("control")}:8080`,
                 "--timelines-onto-safekeepers",
-                `--timeline-safekeeper-count ${config.neon.safekeepers.replicas}`,
+                `--timeline-safekeeper-count ${config.neon.safekeepers.scaling.min}`,
               ].join(" "),
             ],
             envFrom: [{ secretRef: { name } }],
@@ -296,7 +298,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
       serviceName: name,
-      replicas: config.neon.safekeepers.replicas,
+      ...replicasOf(config.neon.safekeepers.scaling),
       podManagementPolicy: "Parallel",
       selector: { matchLabels: selectorLabels(component) },
       template: {
@@ -378,7 +380,7 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
       serviceName: name,
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
@@ -437,7 +439,7 @@ function control(config: InstallConfig): KubernetesObject[] {
   const component = "neon-control";
   const safekeeper = neonName("safekeeper");
   const safekeeperHosts = Array.from(
-    { length: config.neon.safekeepers.replicas },
+    { length: config.neon.safekeepers.scaling.min },
     (_, index) => `${safekeeper}-${index}.${safekeeper}.${NAMESPACE}.svc.cluster.local`,
   );
   const claim: V1PersistentVolumeClaim = {
@@ -451,7 +453,7 @@ function control(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels(component) },
       template: {
@@ -515,7 +517,7 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
     kind: "Deployment",
     metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels(component) },
       template: {

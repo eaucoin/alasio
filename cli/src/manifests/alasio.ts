@@ -37,8 +37,10 @@ import {
   labels,
   MAIN_ENVIRONMENT,
   NAMESPACE,
+  ONE,
   otelEnv,
   RELEASE,
+  replicasOf,
   restrictedContainer,
   restrictedPod,
   rolePasswords,
@@ -305,7 +307,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
     kind: "Deployment",
     metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels("alasio") },
       template: {

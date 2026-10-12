@@ -8,7 +8,7 @@ import type { KubernetesObject, V1CronJob, V1Service, V1StatefulSet } from "@kub
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, NAMESPACE, neonName, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, NAMESPACE, neonName, ONE, replicasOf, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 
 /** Every port its servers advertise themselves on by the Service's name, gRPC's each the HTTP port plus 10000. */
@@ -111,7 +111,7 @@ function server(config: InstallConfig): KubernetesObject[] {
     metadata: { name, namespace: NAMESPACE, labels: stackLabels("seaweedfs") },
     spec: {
       serviceName: peers,
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels("seaweedfs") },
       template: {
         metadata: { labels: stackLabels("seaweedfs") },

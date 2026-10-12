@@ -17,7 +17,9 @@ import {
   lakeRuns,
   MAIN_ENVIRONMENT,
   neonName,
+  ONE,
   otelEnv,
+  replicasOf,
   restrictedContainer,
   s3Endpoint,
   selectorLabels,
@@ -89,7 +91,7 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
     kind: "Deployment",
     metadata: { name, namespace: environment.namespace, labels: stackLabels("lake") },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       // One loader: two would race each other's loads.
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels("lake") },

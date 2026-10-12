@@ -12,6 +12,7 @@ import { describe, test } from "node:test";
 
 import type {
   KubernetesObject,
+  V1ClusterRole,
   V1ConfigMap,
   V1Container,
   V1CronJob,
@@ -153,7 +154,7 @@ describe("configuration", () => {
     assert.equal(config.sessions.namespace, "alasio-sessions");
     assert.equal(config.sessions.runtimeClassName, "gvisor");
     assert.equal(config.host.enabled, false);
-    assert.equal(config.neon.safekeepers.replicas, 3);
+    assert.deepEqual(config.neon.safekeepers.scaling, { min: 3, max: 3 });
     assert.equal(config.neon.image.digest, "sha256:166022a72bf9983eba96d061d794f4740edbd4c3301e66202c1180acce9a323c");
     assert.deepEqual(config.alasio.resources, { requests: { cpu: "500m", memory: "1Gi" }, limits: { memory: "8Gi" } });
   });
@@ -181,9 +182,28 @@ describe("configuration", () => {
     // The collector is telemetry's, not Neon's.
     assert.match(refused({ neon: { collector: {} } }), /^neon\.collector /u);
     assert.match(refused({ images: { alasio: { digest: "sha256:abc" } } }), /^images\.alasio\.digest /u);
-    assert.match(refused({ neon: { safekeepers: { replicas: 8 } } }), /^neon\.safekeepers\.replicas /u);
     assert.match(refused({ objectStore: { bundled: { volumes: 29 } } }), /^objectStore\.bundled\.volumes /u);
     assert.match(refused({ host: { mounts: [{ name: "home", hostPath: "home", mountPath: "/home" }] } }), /^host\.mounts\.0\.hostPath /u);
+  });
+
+  test("takes every component's scale as { min, max }, refusing what the component cannot run, and the key it replaced", () => {
+    const refused = (file: Record<string, unknown>) => {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, ...file });
+      assert.ok(Result.isFailure(decoded));
+      return decoded.failure.message;
+    };
+    const safekeepers = (scaling: unknown) => ({ neon: { safekeepers: { scaling } } });
+    assert.deepEqual(configOf(safekeepers({ min: 5, max: 5 })).neon.safekeepers.scaling, { min: 5, max: 5 });
+    // One left out is its default, moved as far as the other needs.
+    assert.deepEqual(configOf(safekeepers({ min: 5 })).neon.safekeepers.scaling, { min: 5, max: 5 });
+    assert.deepEqual(configOf(safekeepers({ max: 1 })).neon.safekeepers.scaling, { min: 1, max: 1 });
+    assert.equal(refused(safekeepers({ min: 3, max: 2 })), "neon.safekeepers.scaling.max must be at least min");
+    assert.equal(refused(safekeepers({ min: 0, max: 0 })), "neon.safekeepers.scaling.min must be at least 1: it never sleeps");
+    assert.equal(refused(safekeepers({ min: 3, max: 5 })), "neon.safekeepers.scaling.max must equal min: nothing scales it between them");
+    assert.equal(refused(safekeepers({ min: 8, max: 8 })), "neon.safekeepers.scaling.max must be at most 7");
+    assert.equal(refused(safekeepers({ min: -1, max: 3 })), "neon.safekeepers.scaling.min must be a number of replicas, 0 or more");
+    // The key it replaced is a key alasio does not know, as any other.
+    assert.match(refused({ neon: { safekeepers: { replicas: 3 } } }), /^neon\.safekeepers\.replicas /u);
   });
 
   test("requires what stands in for what is turned off", () => {
@@ -339,8 +359,15 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers", () => {
+    const objects = install({ host: { enabled: true } });
+    const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
+    assert.ok(workloads.length > 10);
+    for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, metadata?.name === "alasio-neon-safekeeper" ? 3 : 1, metadata?.name);
+  });
+
   test("places each timeline on as many safekeepers as run", () => {
-    const objects = install({ neon: { safekeepers: { replicas: 5 } } });
+    const objects = install({ neon: { safekeepers: { scaling: { min: 5, max: 5 } } } });
     assert.equal(one<V1StatefulSet>(objects, "StatefulSet", "alasio-neon-safekeeper").spec?.replicas, 5);
     assert.match(container(one<V1Deployment>(objects, "Deployment", "alasio-neon-storage-controller")).command?.[2] ?? "", /--timeline-safekeeper-count 5/u);
   });
@@ -846,6 +873,10 @@ describe("workspace storage", () => {
     assert.equal(controller.spec?.replicas, 1);
     assert.deepEqual(controller.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "csi-resizer", "liveness-probe"]);
     assert.ok(container(controller).args?.includes("--provisioner=true"));
+    // One controller, without the elections whose renewals, after a fixed 10 s, would end it at a slow API server.
+    assert.deepEqual(controller.spec?.template.spec?.containers.filter(({ args }) => args?.includes("--leader-election")), []);
+    const provisioner = one<V1ClusterRole>(objects, "ClusterRole", "juicefs-external-provisioner-role");
+    assert.ok(!(provisioner.rules ?? []).some(({ resources }) => resources?.includes("leases")));
     assert.deepEqual(node.spec?.template.spec?.containers.map(({ name }) => name), ["juicefs-plugin", "node-driver-registrar", "liveness-probe"]);
     for (const image of images([controller, node])) assert.match(image, /:v[0-9.]+@sha256:[0-9a-f]{64}$/u, image);
     for (const plugin of [container(controller), node.spec?.template.spec?.containers[0]]) {

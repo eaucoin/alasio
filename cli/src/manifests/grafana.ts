@@ -23,6 +23,8 @@ import {
   labels,
   NAMESPACE,
   neonName,
+  ONE,
+  replicasOf,
   restrictedContainer,
   restrictedPod,
   script,
@@ -54,7 +56,7 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata,
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels("grafana") },
       template: {

@@ -19,8 +19,11 @@
  *   the file system's metadata dumped to its bucket, and a readiness probe on the mount;
  * - mount pods under a non-preempting PriorityClass (resource-optimization.md "Set
  *   non-preempting PriorityClass"), so a new one never evicts a workspace;
- * - one controller, as alasio's other controllers are, and neither the dashboard nor the
- *   snapshotter's role, which alasio does not use.
+ * - one controller, as alasio's other controllers are, and without leader election: its
+ *   StatefulSet runs one pod, which an election protects nothing in, and the driver's
+ *   elections give up a lease whose renewal takes more than a fixed 10 s, exiting the
+ *   plugin, and the resizer with it, at every slow write of the API server's;
+ * - neither the dashboard nor the snapshotter's role, which alasio does not use.
  */
 import type {
   KubernetesObject,
@@ -41,7 +44,7 @@ import type {
 
 import { imageReference } from "../images.ts";
 import { VOLUME_DRIVER_LABEL } from "../kube/apply.ts";
-import { goJson, type Labels } from "./common.ts";
+import { goJson, type Labels, ONE, replicasOf } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 
 /** The driver's name, which StorageClasses name as their provisioner. */
@@ -191,7 +194,6 @@ function identities({ workspaceStorage }: InstallConfig): KubernetesObject[] {
       rule(["batch"], ["jobs"], ["get", "create", "update", "patch", "delete", "list", "watch"]),
       rule([""], ["endpoints"], ["get", "list", "watch", "create", "update", "patch"]),
       rule(["apps"], ["daemonsets"], ["get", "list"]),
-      rule(["coordination.k8s.io"], ["leases"], ["get", "watch", "list", "delete", "update", "create"]),
       rule([""], ["configmaps"], ["get", "watch", "list", "delete", "update", "create"]),
     ]),
     role(nodeService, [
@@ -221,7 +223,8 @@ function controller(config: InstallConfig): V1StatefulSet {
     metadata: { name: CONTROLLER, namespace: csi.namespace, labels: { ...LABELS, "app.kubernetes.io/component": "controller" } },
     spec: {
       serviceName: CONTROLLER,
-      replicas: 1,
+      // One, and never more: without an election, two would provision alike.
+      ...replicasOf(ONE),
       selector: { matchLabels: CONTROLLER_POD_LABELS },
       template: {
         metadata: { labels: { ...LABELS, ...CONTROLLER_POD_LABELS } },
@@ -233,7 +236,7 @@ function controller(config: InstallConfig): V1StatefulSet {
             {
               name: "juicefs-plugin",
               image: imageReference(csi.image),
-              args: ["--endpoint=$(CSI_ENDPOINT)", "--logtostderr", "--nodeid=$(NODE_NAME)", "--leader-election", "--provisioner=true", "--config=/etc/config/config.yaml"],
+              args: ["--endpoint=$(CSI_ENDPOINT)", "--logtostderr", "--nodeid=$(NODE_NAME)", "--provisioner=true", "--config=/etc/config/config.yaml"],
               env: [{ name: "CSI_ENDPOINT", value: `unix://${CONTROLLER_SOCKET_DIR}csi.sock` }, ...pluginEnv(config)],
               ports: [{ name: "healthz", containerPort: 9909, protocol: "TCP" }],
               livenessProbe: PLUGIN_PROBE,
@@ -250,7 +253,7 @@ function controller(config: InstallConfig): V1StatefulSet {
             {
               name: "csi-resizer",
               image: imageReference(csi.resizerImage),
-              args: ["--csi-address=$(ADDRESS)", "--timeout=20s", "--leader-election", "--v=2"],
+              args: ["--csi-address=$(ADDRESS)", "--timeout=20s", "--v=2"],
               env: [{ name: "ADDRESS", value: `${CONTROLLER_SOCKET_DIR}csi.sock` }],
               resources: { requests: { cpu: "5m", memory: "24Mi" }, limits: { memory: "128Mi" } },
               volumeMounts: [{ name: "socket-dir", mountPath: CONTROLLER_SOCKET_DIR }],

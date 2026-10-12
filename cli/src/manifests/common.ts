@@ -22,7 +22,7 @@ import type {
 
 import { imageReference } from "../images.ts";
 import { VERSION } from "../release.ts";
-import type { InstallConfig } from "./config.ts";
+import type { InstallConfig, Scale } from "./config.ts";
 
 /** The namespace alasio runs in, which its objects are in unless they say another. */
 export const NAMESPACE = "alasio";
@@ -88,6 +88,20 @@ export function stackLabels(component: string): Labels {
 /** The labels that select a component's pods. */
 export function selectorLabels(component: string): Labels {
   return { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": component };
+}
+
+/** The scale of a component that runs one replica, always. */
+export const ONE: Scale = { min: 1, max: 1 };
+
+/** Whether a scaler moves a component of `scale` between its min and max. */
+export const scaled = ({ min, max }: Scale): boolean => min !== max;
+
+/**
+ * The replicas of a workload of `scale`: the count it fixes; or none where its scaler
+ * moves it, which then owns the field, as applying alasio would take it back otherwise.
+ */
+export function replicasOf(scale: Scale): { replicas?: number } {
+  return scaled(scale) ? {} : { replicas: scale.min };
 }
 
 /** The pod security context of a workload that runs restricted, as `uid` and `gid`. */

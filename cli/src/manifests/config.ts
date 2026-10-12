@@ -77,6 +77,53 @@ const quantities = (defaults: Quantities) =>
 const Resources = (defaults: { readonly requests: Quantities; readonly limits: Quantities }) =>
   defaulted(Schema.Struct({ requests: quantities(defaults.requests), limits: quantities(defaults.limits) }), {});
 
+/** How many replicas a component runs: from `min` to `max`. */
+export interface Scale {
+  readonly min: number;
+  readonly max: number;
+}
+
+const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0, { message: "must be a number of replicas, 0 or more" }));
+
+/** What a component's scale may be beyond `min <= max`, as its component allows. */
+interface ScaleLimits {
+  /** Whether it is of the floor, what never sleeps, so its `min` is at least 1. */
+  readonly floor: boolean;
+  /** Whether a scaler moves it between `min` and `max`; without one, they are equal. */
+  readonly scaled: boolean;
+  /** The most replicas it runs, if any. */
+  readonly most?: number;
+}
+
+/** What is wrong with `scale`, given `limits`: the key, and why; none when nothing is. */
+function scaleProblem({ min, max }: Scale, { floor, scaled, most }: ScaleLimits): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
+  if (min > max) return { path: ["max"], issue: "must be at least min" };
+  if (floor && min === 0) return { path: ["min"], issue: "must be at least 1: it never sleeps" };
+  if (!scaled && min !== max) return { path: ["max"], issue: "must equal min: nothing scales it between them" };
+  if (most !== undefined && max > most) return { path: ["max"], issue: `must be at most ${most}` };
+  return undefined;
+}
+
+/**
+ * A component's scale, `scaling`, as every component declares it: `{ min, max }`, how
+ * many replicas it runs. Equal, they fix the count; apart, the component's scaler moves
+ * it between them; a `min` of 0 lets it sleep. One left out is its default, moved as far
+ * as the other given needs: `{ min: 2 }` of a scale of 1 is 2 to 2.
+ */
+const Scaling = (defaults: Scale, limits: ScaleLimits) =>
+  defaulted(
+    Schema.Struct({ min: Schema.optionalKey(Count), max: Schema.optionalKey(Count) }).pipe(
+      Schema.decodeTo(Schema.Struct({ min: Count, max: Count }).check(Schema.makeFilter((scale) => scaleProblem(scale, limits))), {
+        decode: SchemaGetter.transform(({ min, max }) => ({
+          min: min ?? Math.min(defaults.min, max ?? defaults.min),
+          max: max ?? Math.max(defaults.max, min ?? defaults.max),
+        })),
+        encode: SchemaGetter.transform((scale) => scale),
+      }),
+    ),
+    {},
+  );
+
 /** A volume: its size, and its StorageClass, the cluster's default when empty. */
 const Storage = (size: string) => defaulted(Schema.Struct({ size: defaulted(Size, size), storageClassName: defaulted(Schema.String, "") }), {});
 
@@ -232,8 +279,8 @@ const Neon = Schema.Struct({
   runAsGroup: defaulted(Id, 1000),
   safekeepers: defaulted(
     Schema.Struct({
-      /** How many safekeepers hold each timeline's WAL. */
-      replicas: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 7 }, { message: "must be from 1 to 7" })), 3),
+      /** How many safekeepers hold each timeline's WAL: a count, which neon-control registers them by. */
+      scaling: Scaling({ min: 3, max: 3 }, { floor: true, scaled: false, most: 7 }),
       storage: Storage("20Gi"),
       resources: Resources({ requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "1Gi" } }),
     }),

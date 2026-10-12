@@ -25,6 +25,8 @@ import {
   lakeRuns,
   NAMESPACE,
   neonName,
+  ONE,
+  replicasOf,
   restrictedContainer,
   selectorLabels,
   sha256,
@@ -71,7 +73,7 @@ function scrapes(config: InstallConfig): object[] {
     "storage-controller": [`${neonName("storage-controller")}:1234`],
     "storage-broker": [`${neonName("storage-broker")}:50051`],
     compute: [`${neonName("compute")}:3080`],
-    safekeeper: Array.from({ length: neon.safekeepers.replicas }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
+    safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
     ...(config.objectStore.bundled.enabled ? { seaweedfs: [`${componentName("seaweedfs")}:9327`] } : {}),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
@@ -179,7 +181,7 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata,
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels(COMPONENT) },
       template: {
         metadata: { labels: stackLabels(COMPONENT), annotations: { "checksum/config": sha256(goJson(configuration)) } },

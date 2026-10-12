@@ -17,7 +17,7 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVarSource, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, imagePullSecrets, labels, NAMESPACE, restrictedContainer, restrictedPod, selectorLabels, sha256 } from "./common.ts";
+import { claimSpec, componentName, imagePullSecrets, labels, NAMESPACE, ONE, replicasOf, restrictedContainer, restrictedPod, selectorLabels, sha256 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 
@@ -71,7 +71,7 @@ export function valkeyObjects(config: InstallConfig, sidecars: readonly V1Contai
     metadata,
     spec: {
       serviceName: VALKEY,
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: selectorLabels("valkey") },
       template: {
         metadata: { labels: labels("valkey"), annotations: { "checksum/config": sha256(conf) } },

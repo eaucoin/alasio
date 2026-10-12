@@ -15,7 +15,7 @@ import type {
   V1ServiceAccount,
 } from "@kubernetes/client-node";
 
-import { given, NAMESPACE, RELEASE } from "./common.ts";
+import { given, NAMESPACE, ONE, RELEASE, replicasOf } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import sandboxes from "./sandboxes.agents.x-k8s.io.json" with { type: "json" };
 
@@ -77,7 +77,7 @@ function controller(config: InstallConfig): KubernetesObject[] {
     kind: "Deployment",
     metadata: { name: NAME, namespace: NAMESPACE, labels: LABELS },
     spec: {
-      replicas: 1,
+      ...replicasOf(ONE),
       selector: { matchLabels: { "app.kubernetes.io/name": "agent-sandbox-controller", "app.kubernetes.io/instance": RELEASE } },
       template: {
         metadata: { labels: LABELS },
