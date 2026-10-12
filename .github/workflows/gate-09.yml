@@ -1,0 +1,40 @@
+name: gate-09
+
+# 09's gate (gate/09/run.sh), on its track's branch alone, whenever what it runs changes:
+# k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon.
+on:
+  push:
+    branches: [track/wave0-gates]
+    paths: [.github/workflows/gate-09.yml, gate/09/**, gate/k3s.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lazy-pulling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+      - uses: actions/checkout@v4
+      - run: gate/09/run.sh
+        env:
+          OUT: ${{ runner.temp }}/gate-09
+      - name: The node, when something failed
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n gate describe pods || true
+          sudo journalctl -u stargz-snapshotter --no-pager | tail -100
+          sudo journalctl -u k3s --no-pager | grep -iE 'stargz|snapshot|runsc|error' | tail -100
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-09
+          path: ${{ runner.temp }}/gate-09
