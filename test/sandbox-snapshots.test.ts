@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1ConfigMap, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Effect, Layer } from "effect";
+import { Effect, Fiber, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
+import { TestClock } from "effect/testing";
 
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import type { SessionsProfile } from "../src/kube/config.ts";
@@ -11,7 +12,17 @@ import type { Sandbox, Sandboxes, StoredSandbox } from "../src/kube/sandboxes.ts
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
-import { hookOf, keptTemplates, makeSessionSnapshots, SESSION_TEMPLATE_ANNOTATION, sessionTemplateHash, TEMPLATES_CONFIG_MAP } from "../src/sandbox/snapshots.ts";
+import {
+  CPU_FEATURES_ANNOTATION,
+  cpuBaseline,
+  hookOf,
+  keptTemplates,
+  makeSessionSnapshots,
+  SESSION_TEMPLATE_ANNOTATION,
+  sessionTemplateHash,
+  TEMPLATES_CONFIG_MAP,
+  withCpuBaseline,
+} from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";
@@ -150,6 +161,23 @@ test("a session's pod template records the profile's template it is made from", 
   const made = sessionOf(profile());
   assert.equal(made.spec.podTemplate.metadata?.annotations?.[SESSION_TEMPLATE_ANNOTATION], sessionTemplateHash(profile()));
   assert.notEqual(sessionTemplateHash(profile()), sessionTemplateHash(profile("agent@sha256:2")));
+});
+
+test("sessions are held to the CPU features every node has under the current release, which their template records", async () => {
+  const { agents } = fakeAgents({ holdings: [node("node-a", [CURRENT, PREVIOUS], ["sse", "avx", "avx2"]), { ...node("node-b", [CURRENT], ["sse", "avx2", "fma"]) }] });
+  const baseline = await Effect.runPromise(cpuBaseline(agents, CURRENT));
+  assert.deepEqual(baseline, ["sse", "avx2"]);
+  const held = withCpuBaseline(profile(), baseline ?? []);
+  assert.equal(held.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "sse,avx2");
+  assert.notEqual(sessionTemplateHash(held), sessionTemplateHash(profile()));
+  assert.equal(sessionOf(held).spec.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "sse,avx2");
+  // With no agent to tell, none.
+  const none = await Effect.runPromise(Effect.gen(function*() {
+    const telling = yield* Effect.forkChild(cpuBaseline(fakeAgents().agents, CURRENT));
+    while (telling.pollUnsafe() === undefined) yield* TestClock.adjust("2 seconds");
+    return yield* Fiber.join(telling);
+  }).pipe(Effect.provide(TestClock.layer())));
+  assert.equal(none, null);
 });
 
 test("the sessions namespace records the current template and the one before it, which a new one moves along", async () => {

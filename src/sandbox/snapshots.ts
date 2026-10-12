@@ -54,6 +54,10 @@ export const TEMPLATES_CONFIG_MAP = "alasio-session-templates";
 const RELEASE_POLL: Duration.Input = "15 seconds";
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
+/** gVisor's annotation that holds a sandbox to the CPU features it names, of those its node has. */
+export const CPU_FEATURES_ANNOTATION = "dev.gvisor.internal.cpufeatures";
+/** How long alasio waits, as it starts, for a node agent to tell the CPU baseline by. */
+const BASELINE_WAIT: Duration.Input = "1 minute";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description: "Session sandboxes released, by outcome: snapshotted and suspended, kept running, or failed",
@@ -107,6 +111,35 @@ export const keptTemplates = Effect.fnUntraced(function*(namespace: string, curr
     yield* kube.replace({ ...configMap, metadata: { ...configMap.metadata, ...(version === undefined ? {} : { resourceVersion: version }) } });
   }
   return { current, previous };
+});
+
+/**
+ * The CPU features every node with an agent has under gVisor's `release`, which sessions'
+ * sandboxes are held to, so that a snapshot of one restores on any of those nodes; null
+ * when no agent tells within BASELINE_WAIT, said so. A node that joins later widens
+ * nothing, and narrows the baseline as alasio next starts.
+ */
+export const cpuBaseline = (agents: NodeAgents, release: string): Effect.Effect<readonly string[] | null> =>
+  Effect.gen(function*() {
+    const nodes = yield* agents.nodes.pipe(
+      Effect.filterOrFail((found) => found.length > 0, () => new Error("no node agent is ready")),
+      Effect.retry(Schedule.max([Schedule.spaced("2 seconds"), Schedule.during(BASELINE_WAIT)])),
+    );
+    const held = yield* Effect.forEach(nodes, (node) => agents.holdings(node));
+    const features = held.map(({ releases: installed }) => installed.find((kept) => kept.release === release)?.cpuFeatures ?? []);
+    const [first = [], ...others] = features;
+    return first.filter((feature) => others.every((other) => other.includes(feature)));
+  }).pipe(
+    Effect.catch((error) => Effect.logWarning(`sessions' sandboxes are held to no CPU baseline: ${error.message}`).pipe(Effect.as(null))),
+  );
+
+/** `profile`, its pods held to the CPU features `baseline` names, as part of the template its snapshots record. */
+export const withCpuBaseline = (profile: SessionsProfile, baseline: readonly string[]): SessionsProfile => ({
+  ...profile,
+  podTemplate: {
+    ...profile.podTemplate,
+    metadata: { ...profile.podTemplate.metadata, annotations: { ...profile.podTemplate.metadata?.annotations, [CPU_FEATURES_ANNOTATION]: baseline.join(",") } },
+  },
 });
 
 /** What a session's snapshots are given. */

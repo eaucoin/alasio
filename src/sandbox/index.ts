@@ -69,7 +69,15 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import { keptTemplates, makeSessionSnapshots, SESSION_TEMPLATE_ANNOTATION, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
+import {
+  cpuBaseline,
+  keptTemplates,
+  makeSessionSnapshots,
+  SESSION_TEMPLATE_ANNOTATION,
+  type SessionSnapshots,
+  sessionTemplateHash,
+  withCpuBaseline,
+} from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -365,22 +373,28 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
 }
 
 /**
- * How the profile's sessions are snapshotted (./snapshots.ts): with the node agents, onto
- * the templates the sessions namespace records as kept, the profile's recorded as the
- * current one. Sessions that cannot be are not, saying why.
+ * How the sessions of `given` are snapshotted (./snapshots.ts), where they are: with the
+ * node agents, their pods held to the nodes' CPU baseline, onto the templates the
+ * sessions namespace records as kept, the profile's recorded as the current one; and the
+ * profile, with that baseline. Sessions that cannot be snapshotted are not, saying why.
  */
-const sessionSnapshots = Effect.fnUntraced(function*(profile: SessionsProfile, snapshots: NonNullable<SessionsProfile["snapshots"]>): Effect.fn.Return<SessionSnapshots | null, Config.ConfigError, KubeClient> {
+const sessionSnapshots = Effect.fnUntraced(function*(given: SessionsProfile): Effect.fn.Return<{ readonly profile: SessionsProfile; readonly snapshots: SessionSnapshots | null }, Config.ConfigError, KubeClient> {
+  const { snapshots } = given;
+  const [current] = snapshots?.releases ?? [];
+  if (!snapshots || !current) return { profile: given, snapshots: null };
   const agents = yield* makeNodeAgents(snapshots.agents);
+  const baseline = yield* cpuBaseline(agents, current.release);
+  const profile = baseline ? withCpuBaseline(given, baseline) : given;
   const templates = yield* keptTemplates(profile.namespace, sessionTemplateHash(profile)).pipe(Effect.result);
   if (templates._tag === "Failure") {
     yield* Effect.logWarning(`sessions are not snapshotted: the templates they restore into could not be recorded: ${templates.failure.message}`);
-    return null;
+    return { profile, snapshots: null };
   }
-  return yield* makeSessionSnapshots({ profile, snapshots, agents, templates: templates.success });
+  return { profile, snapshots: yield* makeSessionSnapshots({ profile, snapshots, agents, templates: templates.success }) };
 });
 
 const makeSessionSandboxes = Effect.fnUntraced(function*({
-  profile,
+  profile: given,
   stateDir,
   env = process.env,
   createForwarder = loadForwarder,
@@ -388,6 +402,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   inherit,
 }: SessionSandboxesOptions) {
   const kube = yield* KubeClient;
+  const { profile, snapshots } = yield* sessionSnapshots(given);
 
   /**
    * The ids of the volumes JuiceFS's mount pods in `mountPodNamespace` serve `pod`, as
@@ -468,7 +483,6 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     );
   };
 
-  const snapshots = profile.snapshots ? yield* sessionSnapshots(profile, profile.snapshots) : null;
   const sandboxes = yield* makeSandboxes({
     namespace: profile.namespace,
     port: profile.port,
