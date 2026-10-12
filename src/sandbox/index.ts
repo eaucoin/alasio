@@ -48,8 +48,7 @@ import {
   EGRESS_GATE,
   EGRESS_GATE_SCRIPT,
   NET_MODE_LABEL,
-  TOKEN_ENV,
-  tokenSecretName,
+  TELEMETRY_TOKEN_FILE_ARGS,
   WORKLOAD_LABEL,
 } from "../kube/sandbox-shape.ts";
 import {
@@ -243,11 +242,10 @@ export function sessionSandboxManifest({
     ...(forkedFrom === undefined ? {} : { annotations: { [FORKED_FROM_ANNOTATION]: forkedFrom } }),
     configure(spec, bayma) {
       if (telemetry) {
+        bayma.args = [...(bayma.args ?? []), ...TELEMETRY_TOKEN_FILE_ARGS];
         bayma.env = [
           ...(bayma.env ?? []),
-          { name: TOKEN_ENV, valueFrom: { secretKeyRef: { name: tokenSecretName(volumeId), key: "token" } } },
           ...Object.entries({ ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: telemetry.endpoint }).map(([name, value]) => ({ name, value })),
-          { name: "OTEL_EXPORTER_OTLP_HEADERS", value: `authorization=Bearer%20$(${TOKEN_ENV})` },
         ];
       }
       return {

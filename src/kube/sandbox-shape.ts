@@ -16,9 +16,13 @@ export const TOKEN_KEY = "token";
 export const TOKEN_VOLUME = "alasio-bayma-token";
 /** The token volume's files' mode: readable by the pod's group, which is how a non-root bayma reads it. */
 export const TOKEN_MODE = 0o440;
+/** The file bayma reads its token from, which a restored Sandbox's new token replaces. */
+export const TOKEN_FILE = `${TOKEN_DIR}/${TOKEN_KEY}`;
 
 /** The arguments bayma is given after its template's: where its token is. */
-export const TOKEN_FILE_ARGS: readonly string[] = ["--token-file", `${TOKEN_DIR}/${TOKEN_KEY}`];
+export const TOKEN_FILE_ARGS: readonly string[] = ["--token-file", TOKEN_FILE];
+/** The arguments a session's bayma is given after those when it exports telemetry: the token it exports with, read from the same file for each export. */
+export const TELEMETRY_TOKEN_FILE_ARGS: readonly string[] = ["--telemetry-token-file", TOKEN_FILE];
 
 /** The name of a Sandbox's token Secret. */
 export function tokenSecretName(name: string): string {
@@ -35,9 +39,6 @@ export const WORKLOAD_LABEL = "alasio.dev/workload";
 export const NET_MODE_LABEL = "alasio.dev/net-mode";
 /** The harness a folder's bayma serves, as a path segment. */
 export const HARNESS_LABEL = "alasio.dev/harness";
-
-/** The token's environment variable in a session's bayma container, which its OTLP headers expand. */
-export const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";
 
 /** The resolvers a session with internet uses unless its template names others. */
 export const DEFAULT_FULL_MODE_NAMESERVERS: readonly string[] = ["1.1.1.1", "8.8.8.8"];

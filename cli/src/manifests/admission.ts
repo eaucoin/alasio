@@ -38,8 +38,8 @@ import {
   NET_MODE_LABEL,
   SANDBOX_LABEL,
   STATE_DIR_ARG,
+  TELEMETRY_TOKEN_FILE_ARGS,
   TOKEN_DIR,
-  TOKEN_ENV,
   TOKEN_FILE_ARGS,
   TOKEN_KEY,
   TOKEN_MODE,
@@ -272,18 +272,20 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: { readonl
   const session = "session" in workspace ? workspace.session : null;
   const bayma = spec.containers.find(({ name }) => name === BAYMA_CONTAINER);
   const tokenMount = { name: TOKEN_VOLUME, mountPath: TOKEN_DIR, readOnly: true };
-  const variables: Pinned = session
-    ? oneOf(SET, { name: TOKEN_ENV, valueFrom: { secretKeyRef: { name: OWN_TOKEN, key: TOKEN_KEY } } })
-    : SET;
   // Under the state root as hostBaymaStateDir joins it: normalized, its one slash after it.
   const stateDir = "folder" in workspace ? [STATE_DIR_ARG, matching(`${literally(posix.join(workspace.folder.stateRoot, "/"))}${PATH_TOKEN}/${PATH_TOKEN}`)] : [];
+  // A session's bayma that exports telemetry reads the token it exports with from its token's file too.
+  const args = (each: V1Container): Pinned => {
+    const own = [...(each.args ?? []), ...TOKEN_FILE_ARGS, ...stateDir];
+    return session ? oneOf(own, [...own, ...TELEMETRY_TOKEN_FILE_ARGS]) : own;
+  };
   const container = (each: V1Container): Pinned =>
     stored(
       (each.name !== BAYMA_CONTAINER ? each : {
         ...each,
-        args: [...(each.args ?? []), ...TOKEN_FILE_ARGS, ...stateDir],
+        args: args(each),
         volumeMounts: [...(each.volumeMounts ?? []), tokenMount],
-        env: optional(startingWith((each.env ?? []) as unknown as Pinned[], variables)),
+        env: optional(startingWith((each.env ?? []) as unknown as Pinned[], SET)),
       }) as unknown as PinnedMap,
     );
   const gate = session && session.egressGate !== false

@@ -582,7 +582,7 @@ test("ensure gives up on a Sandbox that does not become ready in five minutes, s
   assert.equal(error.message, "Sandbox ns/fs-abc123 did not become ready within 300s");
 });
 
-test("a session's Sandbox is confined by its labels, DNS and egress gate, and exports telemetry with its token", () => {
+test("a session's Sandbox is confined by its labels, DNS and egress gate, and exports telemetry with its token's file", () => {
   const telemetry = { endpoint: "http://10.43.0.9:4318", env: { OTEL_TRACES_EXPORTER: "otlp" } };
   const none = sessionSandboxManifest({ volumeId: "fs-abc123", netMode: "none", profile: profile(), telemetry });
   assert.equal(none.metadata.labels?.["alasio.dev/net-mode"], "none");
@@ -601,11 +601,12 @@ test("a session's Sandbox is confined by its labels, DNS and egress gate, and ex
   assert.deepEqual(gate.securityContext, { runAsUser: 1000 });
   const [bayma] = spec.containers;
   assert.ok(bayma?.env);
-  const env = Object.fromEntries(bayma.env.map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
-  assert.deepEqual(env["ALASIO_SANDBOX_TOKEN"], { secretKeyRef: { name: "fs-abc123-bayma-token", key: "token" } });
-  assert.equal(env["OTEL_EXPORTER_OTLP_ENDPOINT"], "http://10.43.0.9:4318");
-  assert.equal(env["OTEL_EXPORTER_OTLP_HEADERS"], "authorization=Bearer%20$(ALASIO_SANDBOX_TOKEN)");
-  assert.equal(env["OTEL_TRACES_EXPORTER"], "otlp");
+  assert.deepEqual(bayma.args?.slice(-2), ["--telemetry-token-file", "/run/alasio/bayma/token"]);
+  // The token is the file's alone: no variable of the pod's holds it.
+  assert.deepEqual(bayma.env.map(({ name, value }) => [name, value]), [
+    ["OTEL_TRACES_EXPORTER", "otlp"],
+    ["OTEL_EXPORTER_OTLP_ENDPOINT", "http://10.43.0.9:4318"],
+  ]);
 
   const full = sessionSandboxManifest({ volumeId: "fs-abc123", netMode: "full", profile: profile({ egressGate: false }), telemetry: null });
   assert.equal(full.metadata.labels?.["alasio.dev/net-mode"], "full");
@@ -616,6 +617,7 @@ test("a session's Sandbox is confined by its labels, DNS and egress gate, and ex
   const [fullBayma] = fullSpec.containers;
   assert.ok(fullBayma);
   assert.equal(fullBayma.env, undefined);
+  assert.ok(!fullBayma.args?.includes("--telemetry-token-file"));
   assert.throws(() => sessionSandboxManifest({ volumeId: "Bad", netMode: "none", profile: profile(), telemetry: null }), /invalid session volume id/);
 });
 
