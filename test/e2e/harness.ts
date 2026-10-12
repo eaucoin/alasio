@@ -97,7 +97,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, every suite, when it is unset or empty. */
@@ -111,9 +111,10 @@ export function shardOf(value: string | undefined): Shard | undefined {
 /**
  * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
  * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
- * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own; or
- * `branches`, branch environments; every suite unless set. Each shard runs the command line's suite, and uninstall's, as
- * well.
+ * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own;
+ * `branches`, branch environments; or `scaling`, how alasio is scaled, sized and drained,
+ * with Grafana highly available; every suite unless set. Each shard runs the command
+ * line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
@@ -491,7 +492,8 @@ function installation(): Record<string, unknown> {
       },
     },
     lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } },
-    grafana: { resources: { requests: { cpu: "20m", memory: "192Mi" } } },
+    // Two, where the run proves Grafana highly available.
+    grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "20m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
     workspaceStorage: { backupInterval: "5m" },
     agentSandbox: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },

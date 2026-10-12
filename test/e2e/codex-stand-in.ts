@@ -4,7 +4,8 @@
  * the run's install has alasio run it as Codex (ALASIO_CODEX_BIN), from the image
  * ./codex-stand-in.Dockerfile builds. It speaks the app-server's JSON-RPC over stdio as
  * Codex does, as far as alasio's turns go: threads start, resume and are listed, and each
- * turn is answered at once with ANSWER as its final answer. Every request is a server
+ * turn is answered with ANSWER as its final answer: at once, or, for a prompt `wait N`, N
+ * seconds after it starts, as a turn whose tools run that long. Every request is a server
  * span named by its method, of the trace alasio sends it in when it does, with the name
  * the client initialized with, exported where alasio's `-c otel.trace_exporter=` says,
  * from the service codex-app-server, as Codex's own are. Each thread's rollout is written
@@ -174,10 +175,13 @@ async function serve(args: readonly string[]): Promise<void> {
       record(threadId, "event_msg", { type: "task_complete", turn_id: turn.id, last_agent_message: ANSWER, duration_ms: 0 });
       threads.set(threadId, { ...thread, preview: thread.preview || text, updatedAt: now(), turns: [...thread.turns, done] });
       // After the answer to turn/start, as Codex reports a turn once it has accepted it.
+      const seconds = Number(/^wait (\d+)$/u.exec(text)?.[1] ?? 0);
       setImmediate(() => {
         notify(turnStarted(threadId, turn));
-        notify(itemCompleted(threadId, turn.id, answer));
-        notify(turnCompleted(threadId, { ...done, items: [answer], itemsView: "summary" }));
+        setTimeout(() => {
+          notify(itemCompleted(threadId, turn.id, answer));
+          notify(turnCompleted(threadId, { ...done, items: [answer], itemsView: "summary" }));
+        }, seconds * 1000);
       });
       return { turn };
     },

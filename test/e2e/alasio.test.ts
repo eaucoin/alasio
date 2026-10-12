@@ -10,16 +10,19 @@
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1Deployment, V1PersistentVolume, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1PersistentVolume, V1Pod, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 
-import { NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
+import { memoryBytes } from "../../cli/src/capacity.ts";
+import { componentName, NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
+import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -58,6 +61,9 @@ import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from
 import { workspaceStorage } from "./workspace-storage.ts";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The host profile's namespace, where folder workspaces' bayma run. */
+const HOST_NAMESPACE = "alasio-host";
 
 // What the cluster was doing is said as something of the run fails, while the cluster is
 // as it failed it: before the tests that follow change it, or remove it.
@@ -251,6 +257,36 @@ if (inShard("sessions")) {
       assert.equal(await inAlasioContainer(["cat", `${home}/e2e-folder-proof`]), `written by ${HOST_USER}`);
     });
 
+    test("alasio may make a folder's bayma's Sandbox from its template alone, and no Secret but a Sandbox's token", { skip: !HOST_PROFILE && "folder workspaces are for a single node" }, async () => {
+      const made = (await kube.list<Sandbox>("Sandbox", { namespace: HOST_NAMESPACE })).find(({ metadata }) => metadata?.name?.startsWith("bayma-"));
+      assert.ok(made?.metadata?.name, "the folder's bayma's Sandbox is made");
+      const name = made.metadata.name;
+      // As the folder's, under another name and suspended; with `args` after its bayma's.
+      const copied = (as: string, args: readonly string[] = []) => {
+        const sandbox: Sandbox = JSON.parse(JSON.stringify({ apiVersion: made.apiVersion, kind: made.kind, metadata: { name, namespace: HOST_NAMESPACE }, spec: { ...made.spec, operatingMode: "Suspended" } }).replaceAll(name, as));
+        const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma");
+        if (bayma) bayma.args = [...(bayma.args ?? []), ...args];
+        return sandbox;
+      };
+      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${HOST_NAMESPACE}/sandboxes`;
+      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-other", ["--listen", "0.0.0.0:1"])), 422);
+      // Its state anywhere but under the template's state root.
+      const elsewhere = copied("e2e-folder-elsewhere");
+      const args = elsewhere.spec.podTemplate.spec?.containers.find((container) => container.name === "bayma")?.args ?? [];
+      const at = args.indexOf("--state-dir") + 1;
+      assert.ok(at > 0, "the folder's bayma has a state directory");
+      args[at] = "/tmp/claude/e2e";
+      assert.equal(await asAlasio("POST", sandboxes, "application/json", elsewhere), 422);
+      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-folder-made")), 201);
+      await kube.remove(ref("Sandbox", "e2e-folder-made", HOST_NAMESPACE));
+      // An Opaque Secret named as a token's, holding more than a token; and one holding the token alone, which is made.
+      const secrets = `/api/v1/namespaces/${HOST_NAMESPACE}/secrets`;
+      const secret = (data: Record<string, string>) => ({ apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-folder-bayma-token" }, type: "Opaque", data });
+      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=", other: "b3RoZXI=" })), 422);
+      assert.equal(await asAlasio("POST", secrets, "application/json", secret({ token: "dG9rZW4=" })), 201);
+      await kube.remove(ref("Secret", "e2e-folder-bayma-token", HOST_NAMESPACE));
+    });
+
     test("a message runs a turn on Codex, the run's stand-in for it, whose answer reaches the operator, and its spans the lake", async () => {
       await tg.calls();
       await tg.say("/service codex");
@@ -376,6 +412,75 @@ async function untilExported(signal: string, needle: string, timeoutMs: number):
   return false;
 }
 
+/** Grafana's API, as its admin, through alasio grafana's port-forward, until it is closed. */
+interface GrafanaApi {
+  readonly api: (path: string, init?: RequestInit) => Promise<{ status: number; body: unknown }>;
+  readonly close: () => void;
+}
+
+/** Grafana's API, as its admin, through `alasio grafana`. */
+async function grafanaApi(): Promise<GrafanaApi> {
+  const password = (await alasioOk("grafana", "--password")).trim();
+  const authorization = `Basic ${Buffer.from(`admin:${password}`).toString("base64")}`;
+  const grafana = await alasioRunning("grafana", "--port", "0");
+  const base = /http:\/\/127\.0\.0\.1:\d+/u.exec(grafana.said)?.[0] ?? "";
+  assert.ok(base, grafana.said);
+  return {
+    api: async (path, init = {}) => {
+      const response = await fetch(`${base}${path}`, { ...init, headers: { authorization, "content-type": "application/json", ...init.headers } });
+      const text = await response.text();
+      return { status: response.status, body: text.startsWith("{") || text.startsWith("[") ? JSON.parse(text) : text };
+    },
+    close: () => grafana.child.kill(),
+  };
+}
+
+/** Sends the stack's collector a turn that failed, as alasio records one, as alasio sends its spans. */
+async function sendFailedTurn(): Promise<void> {
+  const now = BigInt(Date.now()) * 1_000_000n;
+  const attribute = (key: string, value: string) => ({ key, value: { stringValue: value } });
+  const turn = {
+    resourceSpans: [{
+      resource: { attributes: [attribute("service.name", "alasio")] },
+      scopeSpans: [{
+        scope: { name: "alasio" },
+        spans: [{
+          traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+          spanId: "00f067aa0ba902b7",
+          name: "alasio.turn",
+          kind: 1,
+          startTimeUnixNano: String(now - 2_000_000_000n),
+          endTimeUnixNano: String(now),
+          attributes: [attribute("alasio.conversation.id", "telegram:1001"), attribute("alasio.harness", "codex"), attribute("alasio.turn.outcome", "failed")],
+          status: { code: 2, message: "the harness failed" },
+        }],
+      }],
+    }],
+  };
+  await inAlasioContainer(["curl", "-fsS", "-X", "POST", "-H", "content-type: application/json", "--data-binary", "@-", "http://alasio-collector.alasio.svc:4318/v1/traces"], JSON.stringify(turn));
+}
+
+/**
+ * The alerts that turns are failing alasio sends through the bot until each of its two
+ * users has one, and for `more` milliseconds after: their texts, by the chat each went to.
+ */
+async function untilAlerted(more = 0): Promise<Map<string, string[]>> {
+  const alerts = new Map<string, string[]>();
+  const collect = async () => {
+    for (const call of await tg.calls()) {
+      if (call.method !== "sendMessage" || !/Turns are failing/u.test(call.payload.text ?? "")) continue;
+      const chat = String(call.payload.chat_id);
+      alerts.set(chat, [...(alerts.get(chat) ?? []), call.payload.text ?? ""]);
+    }
+  };
+  for (const deadline = Date.now() + 420_000; alerts.size < 2; await sleep(500)) {
+    if (Date.now() > deadline) assert.fail(`not each user was alerted: ${JSON.stringify([...alerts])}`);
+    await collect();
+  }
+  for (const deadline = Date.now() + more; Date.now() < deadline; await sleep(5000)) await collect();
+  return alerts;
+}
+
 if (inShard("telemetry")) {
   describe("alasio's telemetry", () => {
     before(async () => {
@@ -429,26 +534,18 @@ if (inShard("telemetry")) {
     });
 
     describe("Grafana", () => {
-      let grafana: Awaited<ReturnType<typeof alasioRunning>> | undefined;
-      let base = "";
-      let authorization = "";
-      /** Grafana's API, as its admin. */
-      const api = async (path: string, init: RequestInit = {}): Promise<{ status: number; body: unknown }> => {
-        const response = await fetch(`${base}${path}`, { ...init, headers: { authorization, "content-type": "application/json", ...init.headers } });
-        const text = await response.text();
-        return { status: response.status, body: text.startsWith("{") || text.startsWith("[") ? JSON.parse(text) : text };
+      let grafana: GrafanaApi | undefined;
+      const api: GrafanaApi["api"] = (path, init) => {
+        assert.ok(grafana, "Grafana is reached");
+        return grafana.api(path, init);
       };
 
       before(async () => {
-        const password = (await alasioOk("grafana", "--password")).trim();
-        authorization = `Basic ${Buffer.from(`admin:${password}`).toString("base64")}`;
-        grafana = await alasioRunning("grafana", "--port", "0");
-        base = /http:\/\/127\.0\.0\.1:\d+/u.exec(grafana.said)?.[0] ?? "";
-        assert.ok(base, grafana.said);
+        grafana = await grafanaApi();
       });
 
       after(() => {
-        grafana?.child.kill();
+        grafana?.close();
       });
 
       test("alasio grafana reaches Grafana, its data source reads the lake, and its dashboards' queries answer with the lake's rows", async (t) => {
@@ -489,36 +586,10 @@ if (inShard("telemetry")) {
       });
 
       test("a turn that failed alerts each of the bot's users, through the bot", async () => {
-        // A turn that failed, as alasio records one, sent to the stack's collector as alasio sends its spans.
-        const now = BigInt(Date.now()) * 1_000_000n;
-        const attribute = (key: string, value: string) => ({ key, value: { stringValue: value } });
-        const turn = {
-          resourceSpans: [{
-            resource: { attributes: [attribute("service.name", "alasio")] },
-            scopeSpans: [{
-              scope: { name: "alasio" },
-              spans: [{
-                traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
-                spanId: "00f067aa0ba902b7",
-                name: "alasio.turn",
-                kind: 1,
-                startTimeUnixNano: String(now - 2_000_000_000n),
-                endTimeUnixNano: String(now),
-                attributes: [attribute("alasio.conversation.id", "telegram:1001"), attribute("alasio.harness", "codex"), attribute("alasio.turn.outcome", "failed")],
-                status: { code: 2, message: "the harness failed" },
-              }],
-            }],
-          }],
-        };
-        await inAlasioContainer(["curl", "-fsS", "-X", "POST", "-H", "content-type: application/json", "--data-binary", "@-", "http://alasio-collector.alasio.svc:4318/v1/traces"], JSON.stringify(turn));
-        // Each user's alert, by the chat it went to, until both users have theirs.
-        const alerts = new Map<string, string>();
-        await tg.waitFor((call) => {
-          if (call.method === "sendMessage" && /Turns are failing/u.test(call.payload.text ?? "")) alerts.set(String(call.payload.chat_id), call.payload.text ?? "");
-          return alerts.size === 2;
-        }, 420_000);
+        await sendFailedTurn();
+        const alerts = await untilAlerted();
         assert.deepEqual([...alerts.keys()].sort(), ["1001", String(OTHER_OPERATOR)]);
-        for (const text of alerts.values()) assert.match(text, /conversation = telegram:1001/u);
+        for (const [text] of alerts.values()) assert.match(text ?? "", /conversation = telegram:1001/u);
         const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string }[] }[] } };
         assert.equal(rules.data.groups.flatMap((group) => group.rules).find(({ name }) => name === "Turns are failing")?.state, "firing");
       });
@@ -536,6 +607,380 @@ if (inShard("telemetry")) {
 }
 
 if (inShard("neon")) neonStack();
+
+/** The namespace of the scaling suite's own workloads. */
+const SCALING = "alasio-e2e-scaling";
+
+/** The pause image, which does nothing, as the suite's own workloads run it. */
+const PAUSE = "registry.k8s.io/pause:3.10.1@sha256:278fb9dbcca9518083ad1e11276933a2e96f23de604a3a08cc3c80002767d24c";
+
+/** A pod that does nothing, restricted, labelled `labels`, requesting `requests`, under `runtimeClassName` when given. */
+const pausePod = (labels: Record<string, string>, requests: Record<string, string>, runtimeClassName?: string) => ({
+  metadata: { labels },
+  spec: {
+    ...(runtimeClassName ? { runtimeClassName } : {}),
+    securityContext: { runAsNonRoot: true, runAsUser: 65535, runAsGroup: 65535, seccompProfile: { type: "RuntimeDefault" } },
+    containers: [{
+      name: "pause",
+      image: PAUSE,
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true },
+      resources: { requests },
+    }],
+  },
+});
+
+/** A Deployment of the suite's of `replicas` pods like `pod`, named `name`. */
+const deploymentOf = (name: string, replicas: number, pod: ReturnType<typeof pausePod>) => ({
+  apiVersion: "apps/v1",
+  kind: "Deployment",
+  metadata: { name, namespace: SCALING },
+  spec: { replicas, selector: { matchLabels: { app: name } }, template: { ...pod, metadata: { labels: { ...pod.metadata.labels, app: name } } } },
+});
+
+/** Waits until `check` gives something, every two seconds for `timeoutMs`: what it gave. */
+async function until<A>(what: string, check: () => Promise<A | undefined>, timeoutMs: number): Promise<A> {
+  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(2000)) {
+    const found = await check();
+    if (found !== undefined) return found;
+  }
+  return assert.fail(`${what}, not within ${timeoutMs / 1000}s`);
+}
+
+/** Runs kubectl on the run's cluster with `args`, given `input`: whether it succeeded, what it printed, and all it said. */
+function kubectl(args: readonly string[], input?: string): { readonly ok: boolean; readonly printed: string; readonly said: string } {
+  const run = spawnSync("kubectl", ["--kubeconfig", paths().kubeconfig, ...args], { encoding: "utf8", ...(input === undefined ? {} : { input }) });
+  return { ok: run.status === 0, printed: run.stdout, said: `${run.stdout}${run.stderr}` };
+}
+
+/** The HorizontalPodAutoscaler KEDA moves Grafana's replicas by, as its ScaledObject says, or none. */
+function kedaHpa(): V2HorizontalPodAutoscaler | null {
+  const got = kubectl(["get", "horizontalpodautoscaler", "keda-hpa-alasio-grafana", "--namespace", NAMESPACE, "--output", "json"]);
+  if (!got.ok && /NotFound/u.test(got.said)) return null;
+  assert.ok(got.ok, got.said);
+  return JSON.parse(got.printed);
+}
+
+/** Asks the API server `method` of `path`, with `body` as `contentType`, as alasio's ServiceAccount, from its pod: the status it answered. */
+async function asAlasio(method: string, path: string, contentType: string, body: unknown): Promise<number> {
+  const said = await inAlasioContainer([
+    "sh",
+    "-c",
+    'cd /var/run/secrets/kubernetes.io/serviceaccount && curl -sS -o /dev/null -w "%{http_code}" --cacert ca.crt -H "Authorization: Bearer $(cat token)" ' +
+    '-H "Content-Type: $2" -X "$0" --data-binary @- "https://kubernetes.default.svc$1"',
+    method,
+    path,
+    contentType,
+  ], JSON.stringify(body));
+  return Number(said);
+}
+
+/** Whether the pod's label says it runs a turn. */
+const labelledBusy = async (namespace: string, name: string) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.metadata?.labels?.["alasio.dev/busy"] === "true";
+
+if (inShard("scaling")) {
+  describe("how alasio is scaled, sized and drained", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await kube.apply({ apiVersion: "v1", kind: "Namespace", metadata: { name: SCALING, labels: { "pod-security.kubernetes.io/enforce": "restricted" } } });
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    test("KEDA and VPA run restricted, on pinned images, the external metrics served, within the floor's budget for them", async (t) => {
+      const controllers = ["keda-operator", "keda-metrics-apiserver", "keda-admission-webhooks", "vpa-recommender", "vpa-updater", "vpa-admission-controller"];
+      for (const controller of controllers) {
+        const pod = await kube.get<V1Pod>(ref("Pod", await kube.runningPod(NAMESPACE, componentName(controller)), NAMESPACE));
+        assert.equal(pod?.spec?.securityContext?.runAsNonRoot, true, controller);
+        assert.equal(pod?.spec?.securityContext?.seccompProfile?.type, "RuntimeDefault", controller);
+        assert.deepEqual(
+          pod?.spec?.containers.map(({ image, securityContext }) => ({
+            pinned: /@sha256:[0-9a-f]{64}$/u.test(image ?? ""),
+            drop: securityContext?.capabilities?.drop,
+            allowPrivilegeEscalation: securityContext?.allowPrivilegeEscalation,
+            readOnlyRootFilesystem: securityContext?.readOnlyRootFilesystem,
+          })),
+          [{ pinned: true, drop: ["ALL"], allowPrivilegeEscalation: false, readOnlyRootFilesystem: true }],
+          controller,
+        );
+      }
+      await until("the external metrics' APIService available", async () => {
+        const service = await kube.get<KubernetesObject & { status?: { conditions?: { type: string; status: string }[] } }>(ref("APIService", "v1beta1.external.metrics.k8s.io"));
+        return service?.status?.conditions?.some(({ type, status }) => type === "Available" && status === "True") || undefined;
+      }, 300_000);
+      // What each uses, as the metrics server measures it, against the floor's budget of 0.5 GiB for both.
+      const used = await until("every controller measured", async () => {
+        const measured = await Promise.all(controllers.map(async (controller) => {
+          const [pod] = await kube.list<KubernetesObject & { containers?: { usage?: { memory?: string } }[] }>("PodMetrics", {
+            namespace: NAMESPACE,
+            labelSelector: `app.kubernetes.io/component=${controller}`,
+          });
+          return pod?.containers?.reduce((sum, { usage }) => sum + memoryBytes(usage?.memory ?? "0"), 0);
+        }));
+        return measured.every((bytes) => bytes !== undefined) ? measured as number[] : undefined;
+      }, 300_000);
+      controllers.forEach((controller, index) => t.diagnostic(`${controller}: ${Math.round((used[index] ?? 0) / 2 ** 20)} MiB`));
+      assert.ok(used.reduce((sum, bytes) => sum + bytes, 0) < 0.5 * 2 ** 30, "KEDA and VPA within half a GiB");
+    });
+
+    test("KEDA scales a workload from none to one on what it waits on, and back to none once it has waited a while", async () => {
+      await kube.apply(deploymentOf("e2e-scaled", 0, pausePod({}, { cpu: "1m", memory: "4Mi" })));
+      const scaledObject = {
+        apiVersion: "keda.sh/v1alpha1",
+        kind: "ScaledObject",
+        metadata: { name: "e2e-scaled", namespace: SCALING },
+        spec: {
+          scaleTargetRef: { name: "e2e-scaled" },
+          minReplicaCount: 0,
+          maxReplicaCount: 1,
+          pollingInterval: 5,
+          cooldownPeriod: 15,
+          // A pod of this label is what the workload waits on.
+          triggers: [{ type: "kubernetes-workload", metadata: { podSelector: "e2e-demand=yes", value: "1" } }],
+        },
+      };
+      await kube.apply(scaledObject);
+      const replicas = async () => (await kube.get<V1Deployment>(ref("Deployment", "e2e-scaled", SCALING)))?.status?.readyReplicas ?? 0;
+      const demand = pausePod({ "e2e-demand": "yes" }, { cpu: "1m", memory: "4Mi" });
+      await kube.apply({ apiVersion: "v1", kind: "Pod", ...demand, metadata: { ...demand.metadata, name: "e2e-demand", namespace: SCALING } });
+      await until("the workload woken", async () => ((await replicas()) === 1 ? true : undefined), 180_000);
+      await kube.remove(ref("Pod", "e2e-demand", SCALING));
+      await until("the workload asleep again", async () => ((await kube.get<V1Deployment>(ref("Deployment", "e2e-scaled", SCALING)))?.spec?.replicas === 0 ? true : undefined), 180_000);
+    });
+
+    test("VPA resizes a workload's pod in place, without restarting it, under runc and under gVisor", async (t) => {
+      const sized = (name: string, runtimeClassName?: string) => [
+        // Requests far under what VPA recommends at the least, so it resizes them at once.
+        deploymentOf(name, 1, pausePod({ "app.kubernetes.io/part-of": "alasio" }, { cpu: "1m", memory: "4Mi" }, runtimeClassName)),
+        {
+          apiVersion: "autoscaling.k8s.io/v1",
+          kind: "VerticalPodAutoscaler",
+          metadata: { name, namespace: SCALING, labels: { "app.kubernetes.io/part-of": "alasio" } },
+          spec: {
+            targetRef: { apiVersion: "apps/v1", kind: "Deployment", name },
+            updatePolicy: { updateMode: "InPlace", minReplicas: 1 },
+            resourcePolicy: { containerPolicies: [{ containerName: "pause", minAllowed: { cpu: "5m", memory: "16Mi" }, controlledValues: "RequestsOnly" }] },
+          },
+        },
+      ];
+      for (const object of [...sized("e2e-sized-runc"), ...sized("e2e-sized-gvisor", "gvisor")]) await kube.apply(object);
+      await kube.awaitReady([ref("Deployment", "e2e-sized-runc", SCALING), ref("Deployment", "e2e-sized-gvisor", SCALING)], "5 minutes");
+      /** The pod of `name`'s Deployment: its uid, its container's restarts, and its memory request. */
+      const podOf = async (name: string) => {
+        const [pod] = await kube.list<V1Pod>("Pod", { namespace: SCALING, labelSelector: `app=${name}` });
+        return {
+          uid: pod?.metadata?.uid,
+          restarts: pod?.status?.containerStatuses?.[0]?.restartCount,
+          memory: pod?.spec?.containers[0]?.resources?.requests?.["memory"],
+          resize: JSON.stringify(pod?.status?.conditions?.filter(({ type }) => type.startsWith("PodResize")) ?? []),
+        };
+      };
+      const names = ["e2e-sized-runc", "e2e-sized-gvisor"];
+      const befores = await Promise.all(names.map(podOf));
+      for (const [index, name] of names.entries()) {
+        const before = befores[index] ?? assert.fail(name);
+        const resized = await until(`${name}'s pod resized`, async () => {
+          const now = await podOf(name);
+          return now.uid !== before.uid || now.memory !== before.memory ? now : undefined;
+        }, 600_000);
+        t.diagnostic(`${name}: requests ${before.memory} to ${resized.memory}, restarts ${resized.restarts}, ${resized.resize}`);
+        assert.deepEqual([resized.uid, resized.restarts], [before.uid, 0], `${name}'s pod resized in place, not recreated or restarted`);
+        assert.ok(memoryBytes(resized.memory ?? "0") >= 16 * 2 ** 20, resized.memory);
+      }
+    });
+
+    test("a turn holds alasio's pod and its session's busy until it ends", async () => {
+      const volumeId = await newSession("none");
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
+      await tg.say("wait 30");
+      await until("both pods busy", async () => ((await labelledBusy(NAMESPACE, alasioPod)) && (await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
+      await until("neither pod busy", async () => (!(await labelledBusy(NAMESPACE, alasioPod)) && !(await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+    });
+
+    test("alasio may change no more of a pod than its busy label and annotations, of its own namespace's its own alone, and make no Job, Sandbox or Secret but as it renders them", async () => {
+      const volumeId = await newSession("none");
+      const grafana = await kube.runningPod(NAMESPACE, componentName("grafana"));
+      const imageOf = async (namespace: string, name: string) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.spec?.containers[0]?.image;
+      const images = [await imageOf(SESSIONS, volumeId), await imageOf(NAMESPACE, grafana)];
+      const merged = "application/merge-patch+json";
+      const patched = "application/json-patch+json";
+      const pod = (namespace: string, name: string) => `/api/v1/namespaces/${namespace}/pods/${name}`;
+      // An image the API server lets a pod's container be changed to, but for the policy.
+      const otherImage = [{ op: "replace", path: "/spec/containers/0/image", value: "registry.k8s.io/pause:3.10.1" }];
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "alasio.dev/busy": "true" }, annotations: { "karpenter.sh/do-not-disrupt": "true" } } }), 200);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "alasio.dev/busy": null }, annotations: { "karpenter.sh/do-not-disrupt": null } } }), 200);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), patched, otherImage), 422);
+      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), patched, otherImage), 422);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { labels: { "app.kubernetes.io/component": "other" } } }), 422);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { finalizers: ["e2e.alasio.dev/held"] } }), 422);
+      assert.equal(await asAlasio("PATCH", pod(SESSIONS, volumeId), merged, { metadata: { ownerReferences: null } }), 422);
+      assert.deepEqual([await imageOf(SESSIONS, volumeId), await imageOf(NAMESPACE, grafana)], images);
+      // Of its own namespace's pods, its own alone: not the floor's beside it.
+      const busyLabel = (busy: boolean) => ({ metadata: { labels: { "alasio.dev/busy": busy ? "true" : null } } });
+      const own = await kube.runningPod(NAMESPACE, RELEASE);
+      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, grafana), merged, busyLabel(true)), 422);
+      assert.equal(await asAlasio("PATCH", pod(NAMESPACE, own), merged, busyLabel(false)), 200);
+      // A Sandbox as its session's, but under runc rather than the sessions' runtime; and as it, which is made.
+      const session = await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS));
+      assert.ok(session);
+      const copied = (name: string, runtime: boolean) => {
+        const text = JSON.stringify({ apiVersion: session.apiVersion, kind: session.kind, metadata: { name, namespace: SESSIONS }, spec: { ...session.spec, operatingMode: "Suspended" } })
+          .replaceAll(volumeId, name);
+        const sandbox: Sandbox = JSON.parse(text);
+        if (!runtime) delete sandbox.spec.podTemplate.spec?.runtimeClassName;
+        return sandbox;
+      };
+      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${SESSIONS}/sandboxes`;
+      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-runc", false)), 422);
+      assert.equal(await asAlasio("POST", sandboxes, "application/json", copied("e2e-made", true)), 201);
+      await kube.remove(ref("Sandbox", "e2e-made", SESSIONS));
+      // A Secret that would be a ServiceAccount's token.
+      const token = { apiVersion: "v1", kind: "Secret", metadata: { name: "e2e-bayma-token", annotations: { "kubernetes.io/service-account.name": "default" } }, type: "kubernetes.io/service-account-token" };
+      assert.equal(await asAlasio("POST", `/api/v1/namespaces/${SESSIONS}/secrets`, "application/json", token), 422);
+      // The clone's Job, as the installation gives it alasio, but as KEDA's operator, whose rights reach the whole cluster.
+      const templates = await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE));
+      const job: V1Job = JSON.parse(templates?.data?.["templates.json"] ?? "{}").sessions.clone.job;
+      const borrowed: V1Job = { ...job, metadata: { ...job.metadata, generateName: "e2e-borrowed-" } };
+      if (borrowed.spec?.template.spec) borrowed.spec.template.spec.serviceAccountName = componentName("keda-operator");
+      assert.equal(await asAlasio("POST", `/apis/batch/v1/namespaces/${NAMESPACE}/jobs`, "application/json", borrowed), 422);
+      const jobs = await kube.list<V1Job>("Job", { namespace: NAMESPACE });
+      assert.deepEqual(jobs.filter(({ metadata }) => metadata?.name?.startsWith("e2e-borrowed-")), []);
+    });
+
+    test("a session's pod is not evicted while a turn runs in it, and is once the turn ends", async () => {
+      const volumeId = await newSession("none");
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("wait 30");
+      await until("the session busy", async () => ((await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      // An eviction, as a drain or a node autoscaler asks one: what the API server said.
+      const evict = () => {
+        const eviction = { apiVersion: "policy/v1", kind: "Eviction", metadata: { name: volumeId, namespace: SESSIONS } };
+        return kubectl(["create", "--raw", `/api/v1/namespaces/${SESSIONS}/pods/${volumeId}/eviction`, "-f", "-"], JSON.stringify(eviction)).said;
+      };
+      assert.match(evict(), /disruption budget/u);
+      const uid = (await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.metadata?.uid;
+      assert.ok(uid, "the session's pod is not evicted");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
+      await until("the session no longer busy", async () => (!(await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      assert.doesNotMatch(evict(), /disruption budget|Error/u);
+      // Gone, or going, or made anew by its Sandbox.
+      await until("the session's pod evicted", async () => {
+        const pod = await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS));
+        return pod === null || pod.metadata?.deletionTimestamp !== undefined || pod.metadata?.uid !== uid ? true : undefined;
+      }, 60_000);
+    });
+
+    test("a node's drain waits until the turn running in a session there ends, then evicts it", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async () => {
+      const volumeId = await newSession("none");
+      const node = (await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.spec?.nodeName ?? "";
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("wait 60");
+      await until("the session busy", async () => ((await labelledBusy(SESSIONS, volumeId)) ? true : undefined), 60_000);
+      // kubectl drain, of the session's pods alone, as the node's other pods are not this test's.
+      let drained = 0;
+      const draining = onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=300s`).then((said) => {
+        drained = Date.now();
+        return said;
+      });
+      try {
+        await sleep(20_000);
+        assert.equal(drained, 0, "the drain waits while the turn runs");
+        assert.ok(await kube.get(ref("Pod", volumeId, SESSIONS)), "the session's pod is not evicted");
+        await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER, 120_000);
+        const answered = Date.now();
+        assert.match(await draining, /evicted/u);
+        assert.ok(drained >= answered, "the session was evicted once its turn had answered");
+      } finally {
+        await draining.catch(() => undefined);
+        await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
+      }
+    });
+
+    test("two Grafanas, one cluster of them, send each alert once", async () => {
+      const grafana = await grafanaApi();
+      try {
+        // Its Alertmanagers' cluster, as its metrics say it, until both are of it.
+        let cluster = "";
+        await until("both Grafanas in one cluster", async () => {
+          const metrics = String((await grafana.api("/metrics")).body);
+          cluster = metrics.split("\n").filter((line) => /alertmanager_cluster_|alertmanager_peer_/u.test(line) && !line.startsWith("#")).join("\n");
+          return /alertmanager_cluster_members(\{[^}]*\})? 2$/mu.test(cluster) ? true : undefined;
+        }, 300_000).catch(async (error: unknown) => {
+          console.error(`# Grafana's Alertmanagers' cluster:\n${cluster}`);
+          for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=grafana" })) {
+            const logged = (await kube.logs(NAMESPACE, pod.metadata?.name ?? "", "grafana")).split("\n").filter((line) => /cluster|memberlist|gossip|peer/iu.test(line));
+            console.error(`# ${pod.metadata?.name}:\n${logged.slice(-40).join("\n")}`);
+          }
+          throw error;
+        });
+        await sendFailedTurn();
+        // Each user's, and two minutes more, in which a second Grafana's would have come.
+        const alerts = await untilAlerted(120_000);
+        assert.deepEqual([...alerts.entries()].map(([chat, texts]) => [chat, texts.length]).sort(), [["1001", 1], [String(OTHER_OPERATOR), 1]]);
+      } finally {
+        grafana.close();
+      }
+    });
+
+    describe("Grafana, its scale made a range and fixed again", () => {
+      const replicas = async () => (await kube.get<V1Deployment>(ref("Deployment", "alasio-grafana", NAMESPACE)))?.spec?.replicas;
+      /** Brings alasio up with Grafana's scale `scaling`: the fewest replicas Grafana was given meanwhile. */
+      const upScaled = async (scaling: { min: number; max: number }) => {
+        const { configFile } = paths();
+        const config = JSON.parse(readFileSync(configFile, "utf8"));
+        config.install.grafana.scaling = scaling;
+        writeFileSync(configFile, JSON.stringify(config));
+        let fewest = Number.POSITIVE_INFINITY;
+        let applying = true;
+        const watching = (async () => {
+          while (applying) {
+            fewest = Math.min(fewest, (await replicas()) ?? 0);
+            await sleep(200);
+          }
+        })();
+        try {
+          await alasioOk("up", "--timeout", "20m");
+        } finally {
+          applying = false;
+          await watching;
+        }
+        return fewest;
+      };
+
+      test("keeps its two replicas as KEDA takes them over, and KEDA scales it on its CPU", async () => {
+        assert.equal(await upScaled({ min: 2, max: 4 }), 2);
+        assert.equal(await replicas(), 2);
+        const scaledObject = await until("Grafana's ScaledObject ready", async () => {
+          const found = await kube.get<KubernetesObject & { status?: { conditions?: { type: string; status: string }[] } }>(ref("ScaledObject", "alasio-grafana", NAMESPACE));
+          return found?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ? found : undefined;
+        }, 180_000);
+        assert.ok(scaledObject);
+        const hpa = kedaHpa();
+        assert.deepEqual(
+          [hpa?.spec?.minReplicas, hpa?.spec?.maxReplicas, hpa?.spec?.metrics?.map(({ type, resource }) => [type, resource?.name, resource?.target.averageUtilization])],
+          [2, 4, [["Resource", "cpu", 80]]],
+        );
+      });
+
+      test("ends at its fixed count, which KEDA's scaler, gone first, does not set back", async () => {
+        // Above the range's least, toward which KEDA's scaler, were it still there, would take an idle Grafana.
+        await upScaled({ min: 3, max: 3 });
+        assert.equal(await kube.get(ref("ScaledObject", "alasio-grafana", NAMESPACE)), null);
+        assert.equal(kedaHpa(), null);
+        await sleep(30_000);
+        assert.equal(await replicas(), 3);
+      });
+    });
+  });
+}
 
 /** The branch environment the run makes, and its namespaces. */
 const BRANCH = "e2e";
