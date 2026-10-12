@@ -104,6 +104,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read 
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
+    resume: () => Effect.die("nothing is resumed"),
     holdings: (node) => Effect.succeed(holdings.find((held) => held.node === node) as Holdings),
   };
   return { agents, asked, checkpoints };

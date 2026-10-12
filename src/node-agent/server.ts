@@ -20,6 +20,13 @@
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
  *   when `from` has none; 502 when the bucket failed, which leaves `to` without a snapshot.
+ * - `POST /resume`, `{ environment, workspace, release, namespace, pod, podIPs,
+ *   containerIds }`: resumes the workspace's sandbox, restored paused under the gVisor
+ *   `release` in the pod `namespace`/`pod` on this node, once the pod's network policies
+ *   are in force here for each of its addresses `podIPs`: the connections tracked from
+ *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
+ *   (204). 504 when its policies were not in force within the agent's wait, saying for
+ *   which address what was missing, its sandbox left paused; 500 when a command failed.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
  * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshot, in the bucket and
@@ -39,8 +46,9 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
-import { CheckpointRequest, CopyRequest, makeNodeAgent, type NodeAgent, WorkspaceRef } from "./agent.ts";
+import { CheckpointRequest, CopyRequest, makeNodeAgent, type NodeAgent, ResumeRequest, WorkspaceRef } from "./agent.ts";
 import { type CacheError, makeSnapshotCache } from "./cache.ts";
+import { makeHostCommands } from "./host.ts";
 import {
   CONTAINERD,
   GVISOR_RELEASES,
@@ -67,6 +75,7 @@ const STATUS: Readonly<Record<string, number>> = {
   Unrestorable: 409,
   SnapshotCorrupt: 422,
   S3Error: 502,
+  PoliciesNotInForce: 504,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
@@ -104,6 +113,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     if (method === "POST" && url === "/prepare") return body(WorkspaceRef).pipe(Effect.flatMap(agent.prepare), Effect.map((prepared) => answer(200, prepared)));
     if (method === "POST" && url === "/copies") {
       return body(CopyRequest).pipe(Effect.flatMap(({ from, to }) => agent.copy(from, to)), Effect.map((manifest) => answer(200, manifest)));
+    }
+    if (method === "POST" && url === "/resume") {
+      return body(ResumeRequest).pipe(Effect.flatMap(agent.resume), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "GET" && snapshot) {
       return workspaceOf(snapshot).pipe(
@@ -168,6 +180,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     runsc: makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT }),
     cache,
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
+    host: makeHostCommands(),
   });
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent });
   yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, its cache within ${budget} bytes`);

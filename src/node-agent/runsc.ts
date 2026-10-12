@@ -78,6 +78,8 @@ export interface Runsc {
    * reading it directly needs, which ends the sandbox.
    */
   readonly checkpoint: (release: string, options: CheckpointOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
+  /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
+  readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
   /** The CPU features of this node, by the names `release` gives them. */
   readonly cpuFeatures: (release: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
@@ -175,6 +177,8 @@ export function makeRunsc({ releasesDir, containerdDir, root }: RunscOptions): R
         `--save-restore-exec-timeout=${hookTimeout}`,
         containerId,
       ]).pipe(Effect.asVoid),
+
+    resume: (release, containerId) => run(release, ["resume"], [containerId]).pipe(Effect.asVoid),
 
     inspect: (release, imagePath) =>
       run(release, ["image", "inspect"], ["--json", imagePath]).pipe(

@@ -8,7 +8,7 @@ import { Config, Duration, Effect, Redacted, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { type CheckpointRequest, Manifest, type WorkspaceRef } from "../node-agent/agent.ts";
+import { type CheckpointRequest, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE } from "../node-agent/names.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
@@ -59,12 +59,20 @@ export interface NodeAgents {
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
   /** Forgets the workspace's current snapshot. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
+   * pod's network policies are in force there. An agent refuses one whose policies are
+   * not in force within its wait with 504, the sandbox left paused.
+   */
+  readonly resume: (node: string, request: ResumeRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** What `node` holds. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
 }
 
 /** How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store, both ways, or within it. */
 const LONG_CALL: Duration.Input = "15 minutes";
+/** How long a resume may take: the agent's wait for the pod's network policies, then runsc's resume of its containers. */
+const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS), Duration.seconds(30));
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
 
@@ -165,6 +173,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
         Effect.asVoid,
       ),
+    resume: (node, request) =>
+      send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: RESUME_CALL }).pipe(Effect.asVoid),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
   };
 });

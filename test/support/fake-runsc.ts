@@ -3,7 +3,7 @@
  * a script, and containerd's directory of their runtimes' options files. The script
  * records each run's arguments, one JSON line each, in `calls.jsonl` beside it, and
  * answers what the node agent asks runsc as the fork's runsc does
- * (runsc/cmd/checkpoint.go, image/inspect.go, cpu_features.go):
+ * (runsc/cmd/checkpoint.go, resume.go, image/inspect.go, cpu_features.go):
  *
  * - `checkpoint --image-path=DIR ... ID`: writes an image of three files into DIR, made
  *   from ID; or fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
@@ -11,6 +11,7 @@
  * - `image inspect --json DIR`: describes the image, as saved by the
  *   release's runsc, whose version is `release-RELEASE` (or what a file `saved-by` beside it
  *   says), with the CPU features of `image-cpu-features`;
+ * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -46,6 +47,8 @@ if (rest[0] === "checkpoint") {
     layers: [{ pages_size: 4096, path: join(image, "layers", "pages.img") }],
     memory_files: [],
   }, null, 2) + "\\n");
+} else if (rest[0] === "resume") {
+  if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "cpu-features") {
   process.stdout.write(read("cpu-features", "sse,avx,avx2") + "\\n");
 } else {

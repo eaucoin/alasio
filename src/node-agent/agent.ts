@@ -14,12 +14,20 @@
  * on since it was taken, so a checkpoint that fails forgets it rather than leave it to be
  * restored. A copy gives a workspace another's current snapshot, as a session forked
  * from another restores what the other was: its files copied in the bucket under the
- * same snapshot id, then its manifest, then its commit, as a checkpoint writes them. One
- * operation runs on a workspace at a time.
+ * same snapshot id, then its manifest, then its commit, as a checkpoint writes them.
+ *
+ * A sandbox is restored paused, in a pod of a new address, whose network policies
+ * kube-router puts in force on the node as it next syncs (./kube-router.ts): until then
+ * what the pod sends goes through, whatever they say. Its resume waits for them, then
+ * forgets the connections tracked from its addresses, then resumes its containers; one
+ * whose policies are not in force within POLICY_WAIT_MS leaves it paused.
+ *
+ * One operation on a workspace's snapshot runs at a time.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { isIP, isIPv6 } from "node:net";
 import { dirname, join, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
@@ -28,6 +36,8 @@ import { Clock, Effect, RcMap, Schema, type Scope, Semaphore } from "effect";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { CacheError, type SnapshotCache } from "./cache.ts";
+import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
+import { egressGap, type PodAddress } from "./kube-router.ts";
 import { runscVersion } from "./names.ts";
 import type { ReleaseNotInstalled, Runsc, RunscError } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
@@ -70,19 +80,41 @@ export type WorkspaceRef = typeof WorkspaceRef.Type;
 export const CopyRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef });
 export type CopyRequest = typeof CopyRequest.Type;
 
+/** A gVisor release. */
+const Release = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u));
+
+/** A container, by containerd's id. */
+const ContainerId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u));
+
 /** A request to checkpoint a workspace's sandbox. */
 export const CheckpointRequest = Schema.Struct({
   environment: Name,
   workspace: Name,
   /** The gVisor release the sandbox runs under. */
-  release: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u)),
-  /** The container whose sandbox is saved, by containerd's id, in which the hook runs. */
-  containerId: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  release: Release,
+  /** The container whose sandbox is saved, in which the hook runs. */
+  containerId: ContainerId,
   /** The program run in the container before the save: its arguments, none holding whitespace, as runsc splits them at spaces. */
   hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)),
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
 });
 export type CheckpointRequest = typeof CheckpointRequest.Type;
+
+/** A request to resume a workspace's sandbox, restored paused in a pod on this node. */
+export const ResumeRequest = Schema.Struct({
+  environment: Name,
+  workspace: Name,
+  /** The gVisor release the sandbox was restored under. */
+  release: Release,
+  /** The pod's namespace and name, as its network policies' rules name it. */
+  namespace: Name,
+  pod: Schema.String.check(Schema.isPattern(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/u), Schema.isMaxLength(253)),
+  /** The pod's addresses, one of each family it has, in their canonical form, as Kubernetes gives them. */
+  podIPs: Schema.Array(Schema.String.check(Schema.makeFilter((ip) => isIP(ip) !== 0 || "must be an IP address"))).check(Schema.isMinLength(1)),
+  /** The pod's containers, each resumed. */
+  containerIds: Schema.Array(ContainerId).check(Schema.isMinLength(1)),
+});
+export type ResumeRequest = typeof ResumeRequest.Type;
 
 /** A snapshot prepared on this node: what it is, and where its image is. */
 export interface Prepared {
@@ -141,8 +173,32 @@ export class CheckpointFailed extends Schema.TaggedError<CheckpointFailed>()("Ch
   }
 }
 
+/**
+ * How long a resume waits for a restored pod's network policies to be in force on its
+ * node. kube-router syncs as the pod gets its address, a sync of the node's whole filter
+ * table, which takes it well under a second on the nodes alasio makes; one that has not
+ * within this is behind or down, and the prompt waiting on the restore is told so rather
+ * than wait on.
+ */
+export const POLICY_WAIT_MS = 30_000;
+
+/** A pod's network policies were not in force on this node within POLICY_WAIT_MS: which address of its lacked what. Its sandbox stays paused. */
+export class PoliciesNotInForce extends Schema.TaggedError<PoliciesNotInForce>()("PoliciesNotInForce", {
+  namespace: Schema.String,
+  pod: Schema.String,
+  ip: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the network policies of ${this.namespace}/${this.pod} are not in force on this node after ${POLICY_WAIT_MS / 1000} s, its sandbox left paused: for ${this.ip}, ${this.reason}`;
+  }
+}
+
 /** How preparing a snapshot fails. */
 export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError;
+
+/** How resuming a sandbox fails. */
+export type ResumeError = PoliciesNotInForce | HostCommandError | RunscError | ReleaseNotInstalled;
 
 /** What a node agent does; see makeNodeAgent. */
 export interface NodeAgent {
@@ -156,15 +212,18 @@ export interface NodeAgent {
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError>;
   /** Forgets the workspace's snapshot, in the bucket and in the cache. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error | CacheError>;
+  /** Resumes the workspace's sandbox, restored paused, once its pod's network policies are in force on this node, as the module says. */
+  readonly resume: (request: ResumeRequest) => Effect.Effect<void, ResumeError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
 }
 
-/** What makeNodeAgent is given: this node's name, its releases, its cache, and the bucket. */
+/** What makeNodeAgent is given: this node's name, its releases, its cache, the bucket, and the commands it runs on the node. */
 export interface NodeAgentOptions {
   readonly node: string;
   readonly runsc: Runsc;
   readonly cache: SnapshotCache;
   readonly bucket: S3Bucket;
+  readonly host: HostCommands;
 }
 
 /** The file of a snapshot's manifest, in the bucket and in the cache. */
@@ -173,6 +232,8 @@ export const MANIFEST_FILE = "manifest.json";
 export const CURRENT_FILE = "current.json";
 /** How long the hook may take to ready the sandbox for its save. */
 const HOOK_TIMEOUT = "30s";
+/** How often a resume looks for a restored pod's rules. */
+const POLICY_POLL = "250 millis";
 
 const checkpoints = meter.createCounter("alasio.node_agent.checkpoints", {
   description: "Whole-sandbox checkpoints taken by the node agent, by outcome",
@@ -197,6 +258,10 @@ const copies = meter.createCounter("alasio.node_agent.copies", {
 const prepares = meter.createCounter("alasio.node_agent.prepares", {
   description: "Snapshots prepared for a restore by the node agent, by where their image came from, or why not",
   unit: "{prepare}",
+});
+const resumes = meter.createCounter("alasio.node_agent.resumes", {
+  description: "Restored sandboxes resumed by the node agent once their pods' network policies were in force, by outcome",
+  unit: "{resume}",
 });
 
 /** A snapshot's id: when it was taken, sortable, and a random part. */
@@ -226,7 +291,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
 
   const prefixOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;
@@ -467,6 +532,58 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       withAlasioSpan("alasio.node_agent.prepare", { attributes: spanAttributes(ref) }),
     );
 
+  /** What of its rules a pod's address lacks in its family's filter table on the node, as ./kube-router.ts says, or null. */
+  const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> =>
+    onNode(host, [isIPv6(address.ip) ? "ip6tables-save" : "iptables-save", "-t", "filter"]).pipe(Effect.map(({ stdout }) => egressGap(stdout, address)));
+
+  /** Waits for every address of the pod's to have its rules, POLICY_WAIT_MS at most: how long it waited, in milliseconds. */
+  const policiesInForce = ({ namespace, pod, podIPs }: ResumeRequest): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
+    Effect.gen(function*() {
+      const start = yield* Clock.currentTimeMillis;
+      for (;;) {
+        const gaps = yield* Effect.forEach(podIPs, (ip) => policyGap({ namespace, pod, ip }).pipe(Effect.map((reason) => (reason === null ? [] : [{ ip, reason }]))));
+        const [gap] = gaps.flat();
+        const waited = (yield* Clock.currentTimeMillis) - start;
+        if (gap === undefined) return waited;
+        if (waited >= POLICY_WAIT_MS) return yield* new PoliciesNotInForce({ namespace, pod, ...gap });
+        yield* Effect.sleep(POLICY_POLL);
+      }
+    });
+
+  /**
+   * Forgets the connections tracked from `ip` on the node. kube-router lets the packets of
+   * a tracked connection through before any policy (KUBE-NWPLCY-COMMON), so one tracked
+   * from the address before its rules were in force, of a pod that had it before among
+   * them, would go on through them. conntrack exits 1 where it deleted none, which is no
+   * failure.
+   */
+  const forgetConnections = (ip: string): Effect.Effect<void, HostCommandError> =>
+    onNode(
+      host,
+      ["conntrack", "-D", "-s", ip, ...(isIPv6(ip) ? ["-f", "ipv6"] : [])],
+      ({ exitCode, stderr }) => exitCode === 0 || (exitCode === 1 && stderr.includes("0 flow entries have been deleted")),
+    ).pipe(Effect.asVoid);
+
+  const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
+    Effect.gen(function*() {
+      const waited = yield* policiesInForce(request);
+      yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
+      yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
+      yield* Effect.forEach(request.containerIds, (id) => runsc.resume(request.release, id), { discard: true });
+      return waited;
+    }).pipe(
+      Effect.tap((waited) =>
+        Effect.sync(() => resumes.add(1, { outcome: "resumed" })).pipe(
+          Effect.andThen(Effect.logInfo(`resumed the sandbox of ${prefixOf(request)} in ${request.namespace}/${request.pod}, its network policies in force after ${waited} ms`)),
+        )
+      ),
+      Effect.tapError((error) => Effect.sync(() => resumes.add(1, { outcome: error._tag })).pipe(Effect.andThen(Effect.logWarning(error.message)))),
+      Effect.asVoid,
+      withAlasioSpan("alasio.node_agent.resume", {
+        attributes: { ...spanAttributes(request), "k8s.namespace.name": request.namespace, "k8s.pod.name": request.pod },
+      }),
+    );
+
   const holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError> = Effect.gen(function*() {
     const releases = yield* Effect.forEach(yield* runsc.releases, (release) => runsc.cpuFeatures(release).pipe(Effect.map((cpuFeatures) => ({ release, cpuFeatures }))));
     const cached = (yield* cache.list).map(({ usedAt, ...rest }) => ({ ...rest, usedAt: new Date(usedAt).toISOString() }));
@@ -484,6 +601,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         withAlasioSpan("alasio.node_agent.forget", { attributes: spanAttributes(ref) }),
         withLogScope("node-agent"),
       ),
+    resume: (request) => resume(request).pipe(withLogScope("node-agent")),
     holdings,
   };
 });

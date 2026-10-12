@@ -1,8 +1,10 @@
 /**
  * The node agent (src/node-agent/): its checkpoints, committed to a stand-in bucket and
- * forgotten when they fail, its copies, its prepared snapshots, its cache, its API, as
+ * forgotten when they fail, its copies, its prepared snapshots, its cache, its resumes of
+ * restored sandboxes once kube-router's rules for their pods are in force, its API, as
  * alasio's client (src/sandbox/node-agents.ts) calls it too, and its process, with runsc a
- * stand-in of its own (./support/fake-runsc.ts).
+ * stand-in of its own (./support/fake-runsc.ts) and the node's commands answered from
+ * fixtures (./support/kube-router-rules.ts).
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -14,10 +16,13 @@ import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
 import { ConfigProvider, Effect, Exit, Fiber, Layer, type Scope } from "effect";
+import { TestClock } from "effect/testing";
 
 import { KubeClient } from "../src/kube/client.ts";
-import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent } from "../src/node-agent/agent.ts";
+import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent, PoliciesNotInForce, type ResumeRequest } from "../src/node-agent/agent.ts";
 import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
+import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
+import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
@@ -25,6 +30,7 @@ import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
+import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
 
 const RELEASE = "release-20260921.0-eaucoin.3";
 const CONTAINER = "0123456789abcdef".repeat(4);
@@ -45,11 +51,63 @@ const request = (workspace: string, containerId = CONTAINER): CheckpointRequest 
 
 const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 
-/** A node: its releases, its cache, and its agent on the shared bucket. */
+const SESSIONS = "alasio-sessions";
+const POD = "fs-abc123";
+const POD_IP = "10.42.0.15";
+const POD_IPV6 = "fd00:42::f";
+
+const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
+  environment: "main",
+  workspace: "fs-abc",
+  release: RELEASE,
+  namespace: SESSIONS,
+  pod: POD,
+  podIPs,
+  containerIds,
+});
+
+/** What conntrack says where it deleted no connection, as it exits 1. */
+const NO_CONNECTIONS: HostRun = { exitCode: 1, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted.\n" };
+
+/**
+ * Commands run on a node of the test's, answered as the node would: its filter tables
+ * (kube-router's rules for the pod POD at POD_IP and POD_IPV6 in them unless the test
+ * sets others), conntrack deleting no connection, and what `answer` gives in place of
+ * either; what was run, in order.
+ */
+interface FakeHost {
+  readonly host: HostCommands;
+  readonly ran: string[][];
+  ipv4: string;
+  ipv6: string;
+  answer: (command: readonly string[]) => HostRun | null;
+}
+
+function fakeHost(): FakeHost {
+  const fake: FakeHost = {
+    ran: [],
+    ipv4: filterTable([clusterDns("10.42.0.3"), sessionPod(POD, POD_IP)]),
+    ipv6: filterTable([clusterDns("fd00:42::3"), sessionPod(POD, POD_IPV6)], { family: 6 }),
+    answer: () => null,
+    host: {
+      run: (command) =>
+        Effect.sync(() => {
+          fake.ran.push([...command]);
+          const [program] = command;
+          return fake.answer(command) ??
+            (program === "conntrack" ? NO_CONNECTIONS : { exitCode: 0, stdout: program === "ip6tables-save" ? fake.ipv6 : fake.ipv4, stderr: "" });
+        }),
+    },
+  };
+  return fake;
+}
+
+/** A node: its releases, its cache, the commands run on it, and its agent on the shared bucket. */
 interface Node {
   readonly releases: FakeReleases;
   readonly cacheDir: string;
   readonly cache: SnapshotCache;
+  readonly host: FakeHost;
   readonly agent: NodeAgent;
 }
 
@@ -70,7 +128,8 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const cacheDir = join(root, name, "cache");
       const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
       const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT });
-      return { releases, cacheDir, cache, agent: yield* makeNodeAgent({ node: name, runsc, cache, bucket }) };
+      const host = fakeHost();
+      return { releases, cacheDir, cache, host, agent: yield* makeNodeAgent({ node: name, runsc, cache, bucket, host: host.host }) };
     });
   try {
     await Effect.runPromise(Effect.scoped(body({ s3, node })));
@@ -462,6 +521,146 @@ test("the node's cache keeps within its budget, evicting the least recently used
   }
 });
 
+test("a pod's address has kube-router's rules once a jump of what it sends, commented as the pod's, reaches a chain running it through a policy and rejecting the rest", () => {
+  const address = { namespace: SESSIONS, pod: POD, ip: POD_IP };
+  const gap = (table: string, of = address) => egressGap(table, of);
+  const noJump = `KUBE-ROUTER-FORWARD has no jump of what it sends to the chain of ${SESSIONS}/${POD}`;
+  const programmed = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-other", "10.42.0.9"), sessionPod(POD, POD_IP)]);
+  assert.equal(gap(programmed), null);
+  // Matched by what the rules say, whatever a sync named the chains.
+  assert.equal(gap(filterTable([sessionPod(POD, POD_IP)], { sync: "1791844099000000000" })), null);
+
+  // Before a sync wrote them, or another pod's at the address, as a pod that had it before.
+  assert.equal(gap(filterTable([clusterDns("10.42.0.3"), sessionPod("fs-other", "10.42.0.9")])), noJump);
+  assert.equal(gap(filterTable([sessionPod("fs-old999", POD_IP)])), noJump);
+  assert.equal(gap(filterTable([sessionPod("fs-abc1234", POD_IP)])), noJump);
+  assert.equal(gap(filterTable([sessionPod(POD, POD_IP, "alasio-sessions-br-1")])), noJump);
+  assert.equal(gap(programmed, { ...address, ip: "10.42.0.1" }), noJump);
+
+  // A chain that runs what the pod sends through no policy of its own lets it all through.
+  const chain = /KUBE-POD-FW-[A-Z2-7]{16}/u;
+  const unselected = gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [] }]));
+  assert.match(unselected ?? "", new RegExp(`^the chain of ${SESSIONS}/${POD}, ${chain.source}, runs what it sends through no network policy$`, "u"));
+  assert.match(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "bayma-from-alasio", type: "ingress" }] }])) ?? "", /runs what it sends through no network policy$/u);
+  assert.equal(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "telemetry-to-alasio", type: "egress" }] }])), null);
+
+  // A jump commented as a policy's, to a chain that is none.
+  const unpoliced = programmed.replace(/(nw policy [a-z-]+" -j )KUBE-NWPLCY-[A-Z2-7]{16}/gu, (_jump, kept: string) => `${kept}ACCEPT`);
+  assert.match(gap(unpoliced) ?? "", /runs what it sends through no network policy$/u);
+
+  // One that does not reject what no policy let through: without the rule, or with another.
+  const rejection = `--comment "rule to REJECT traffic destined for POD name:${POD} namespace: ${SESSIONS}" -m mark ! --mark 0x10000/0x10000 -j REJECT`;
+  const rejecting = (instead: string | null) =>
+    gap(programmed.split("\n").flatMap((line) => (line.includes(rejection) ? (instead === null ? [] : [line.replace(rejection, instead)]) : [line])).join("\n"));
+  const unrejected = /, does not reject what its network policies do not let through$/u;
+  assert.match(rejecting(null) ?? "", unrejected);
+  assert.match(rejecting(rejection.replace(" ! --mark", " --mark")) ?? "", unrejected);
+  assert.match(rejecting(rejection.replace("0x10000/0x10000", "0x20000/0x20000")) ?? "", unrejected);
+  assert.match(rejecting(rejection.replace("namespace: alasio-sessions", "namespace: alasio")) ?? "", unrejected);
+  assert.equal(rejecting(rejection), null);
+
+  // An IPv6 address, in its family's table, as a /128.
+  const v6 = filterTable([sessionPod(POD, POD_IPV6)], { family: 6 });
+  assert.match(v6, /-A KUBE-ROUTER-FORWARD -s fd00:42::f\/128 -m comment --comment "rule to jump traffic from POD name:fs-abc123 namespace: alasio-sessions to chain KUBE-POD-FW-/u);
+  assert.equal(gap(v6, { ...address, ip: POD_IPV6 }), null);
+  assert.equal(gap(programmed, { ...address, ip: POD_IPV6 }), noJump);
+});
+
+test("a resume waits for the pod's rules on every address, forgets the connections tracked from them, then resumes each container", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { host } = here;
+      const programmed = host.ipv4;
+      host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest([POD_IP, POD_IPV6])));
+      yield* TestClock.adjust("1 second");
+      // Looked for every 250 ms, its sandbox untouched meanwhile.
+      assert.equal(resuming.pollUnsafe(), undefined);
+      assert.deepEqual(host.ran.slice(0, 2), [["iptables-save", "-t", "filter"], ["ip6tables-save", "-t", "filter"]]);
+      assert.equal(host.ran.length, 10);
+      assert.deepEqual(here.releases.calls(RELEASE), []);
+
+      host.ipv4 = programmed;
+      host.answer = (command) => (command[0] === "conntrack" && command.includes(POD_IPV6) ? { exitCode: 0, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): 2 flow entries have been deleted.\n" } : null);
+      yield* TestClock.adjust("250 millis");
+      yield* Fiber.join(resuming);
+      assert.deepEqual(host.ran.slice(10), [
+        ["iptables-save", "-t", "filter"],
+        ["ip6tables-save", "-t", "filter"],
+        ["conntrack", "-D", "-s", POD_IP],
+        ["conntrack", "-D", "-s", POD_IPV6, "-f", "ipv6"],
+      ]);
+      assert.deepEqual(here.releases.calls(RELEASE), [
+        [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "resume", CONTAINER],
+        [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "resume", OTHER_CONTAINER],
+      ]);
+    }).pipe(Effect.provide(TestClock.layer()))
+  ));
+
+test("a resume whose pod's rules do not come within its wait, or whose commands fail, leaves the sandbox paused, saying why", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { host } = here;
+      const programmed = host.ipv6;
+
+      // Its IPv6 address's rules do not come.
+      host.ipv6 = filterTable([sessionPod("fs-old999", POD_IPV6)], { family: 6 });
+      const waiting = yield* Effect.forkChild(here.agent.resume(resumeRequest([POD_IP, POD_IPV6])));
+      yield* TestClock.adjust("29 seconds");
+      assert.equal(waiting.pollUnsafe(), undefined);
+      yield* TestClock.adjust("1 second");
+      assert.equal(
+        failure(yield* Effect.exit(Fiber.join(waiting))),
+        `the network policies of ${SESSIONS}/${POD} are not in force on this node after 30 s, its sandbox left paused: for ${POD_IPV6}, KUBE-ROUTER-FORWARD has no jump of what it sends to the chain of ${SESSIONS}/${POD}`,
+      );
+      assert.equal(host.ran.filter(([program]) => program === "conntrack").length, 0);
+      assert.deepEqual(here.releases.calls(RELEASE), []);
+      host.ipv6 = programmed;
+
+      // The node has no ip6tables-save, as nsenter says.
+      host.answer = ([program]) => (program === "ip6tables-save" ? { exitCode: 127, stdout: "", stderr: "nsenter: failed to execute ip6tables-save: No such file or directory\n" } : null);
+      assert.equal(
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest([POD_IPV6])))),
+        "ip6tables-save -t filter on the node failed: nsenter: failed to execute ip6tables-save: No such file or directory",
+      );
+
+      // conntrack fails, as it does deleting none.
+      host.answer = ([program]) => (program === "conntrack" ? { exitCode: 1, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): Operation failed: Operation not permitted\n" } : null);
+      assert.equal(
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest()))),
+        `conntrack -D -s ${POD_IP} on the node failed: conntrack v1.4.8 (conntrack-tools): Operation failed: Operation not permitted`,
+      );
+      assert.deepEqual(here.releases.calls(RELEASE), []);
+      host.answer = () => null;
+
+      // runsc fails.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
+      assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), `runsc resume of ${RELEASE} failed: resume failed: the container is gone`);
+    }).pipe(Effect.provide(TestClock.layer()))
+  ));
+
+test("commands run on the node enter its mounts and network from its PID 1, with k3s's binaries on their PATH, and say how they exited", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-host-"));
+  try {
+    const nsenter = join(root, "nsenter");
+    writeFileSync(nsenter, '#!/bin/sh\necho "$*"\necho "PATH=$PATH"\nshift 5\nif [ "$1" = fail ]; then echo "it failed" >&2; exit 4; fi\n', { mode: 0o755 });
+    const host = makeHostCommands(nsenter);
+    assert.deepEqual(await Effect.runPromise(host.run(["iptables-save", "-t", "filter"])), {
+      exitCode: 0,
+      stdout: `--target 1 --mount --net -- iptables-save -t filter\nPATH=${NODE_PATH}\n`,
+      stderr: "",
+    });
+    assert.equal(NODE_PATH, "/var/lib/rancher/k3s/data/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/rancher/k3s/data/current/bin/aux");
+    assert.deepEqual(await Effect.runPromise(host.run(["fail"])), { exitCode: 4, stdout: `--target 1 --mount --net -- fail\nPATH=${NODE_PATH}\n`, stderr: "it failed\n" });
+    const missing = await Effect.runPromise(Effect.flip(makeHostCommands(join(root, "none")).run(["conntrack", "-L"])));
+    assert.match(missing.message, /^conntrack -L on the node failed: .*ENOENT/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
@@ -541,27 +740,42 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
       assert.deepEqual(cachedOf(here, "fs-abc"), []);
 
+      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(), podIPs: ["10.42.0.300"] }));
+      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(), podIPs: [] }));
+      error(400, /containerIds/u)(yield* call("POST", "/resume", { ...resumeRequest(), containerIds: ["short"] }));
+      error(400, /pod/u)(yield* call("POST", "/resume", { ...resumeRequest(), pod: "fs_abc123" }));
+      assert.deepEqual(yield* call("POST", "/resume", resumeRequest()), { status: 204, body: null });
+      assert.deepEqual(here.releases.calls(RELEASE).slice(-2).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
       error(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* call("POST", "/checkpoints", request("fs-abc")));
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
+      error(500, `runsc resume of ${RELEASE} failed: resume failed: the container is gone`)(yield* call("POST", "/resume", resumeRequest()));
       error(404, "there is no GET /snapshots")(yield* call("GET", "/snapshots"));
     })
   ));
+
+/** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes. */
+const agentsOf = (agent: NodeAgent) =>
+  Effect.gen(function*() {
+    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent });
+    const pod: V1Pod = {
+      metadata: { name: "node-agent-1", namespace: "alasio" },
+      spec: { nodeName: "node-1", containers: [] },
+      status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
+    };
+    const unreachable = () => Effect.die("only pods are listed");
+    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable });
+    return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
+      Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
+    );
+  });
 
 test("alasio has a snapshot copied by any ready agent, and is answered its manifest, or why not", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
-      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent });
-      const pod: V1Pod = {
-        metadata: { name: "node-agent-1", namespace: "alasio" },
-        spec: { nodeName: "node-1", containers: [] },
-        status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
-      };
-      const unreachable = () => Effect.die("only pods are listed");
-      const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable });
-      const agents = yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
-        Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
-      );
+      const agents = yield* agentsOf(here.agent);
       const from = { environment: "main", workspace: "fs-abc" };
       const fork = { environment: "main", workspace: "fs-fork" };
 
@@ -570,6 +784,21 @@ test("alasio has a snapshot copied by any ready agent, and is answered its manif
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 404);
       const source = yield* here.agent.checkpoint(request("fs-abc"));
       assert.deepEqual(yield* agents.copy(from, fork), { ...source, workspace: "fs-fork" });
+    })
+  ));
+
+test("alasio has a restored sandbox resumed by its node's agent, or is told why not", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest());
+      assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
+
+      // An agent whose wait ended answers 504.
+      const late = new PoliciesNotInForce({ namespace: SESSIONS, pod: POD, ip: POD_IP, reason: "KUBE-ROUTER-FORWARD has no jump of what it sends" });
+      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest()));
+      assert.equal(refused.message, `the node agent of node-1 could not resume main/fs-abc's sandbox: ${late.message}`);
+      assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
     })
   ));
 

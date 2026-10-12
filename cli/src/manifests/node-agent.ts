@@ -1,17 +1,19 @@
 /**
  * The node agent (src/node-agent/): one pod on every node sessions run on, which takes
  * whole-sandbox snapshots of their sandboxes and prepares them for restores there, kept
- * in the object store's snapshots bucket. It runs where sandboxes are snapshotted
+ * in the object store's snapshots bucket, and resumes a restored one once its pod's
+ * network policies are in force there. It runs where sandboxes are snapshotted
  * (common.ts nodeAgentRuns).
  *
  * It is the one component that runs runsc on a node, beside containerd's shims, as they
  * run it, so it runs as the node does: privileged, as root, in the node's PID namespace
- * (runsc finds a sandbox's processes by their PIDs there), with the node's paths at the
- * same paths, as runsc and the shims open them, an image's among them: the runsc root
- * and the systemd bus under /run, the gVisor releases and the runtimes' options files,
- * read-only, and the snapshot cache. Pod Security admits it in alasio's namespace, which
- * enforces no level of its own, as Kubernetes admits a privileged pod in a namespace by
- * default; a cluster whose admission defaults otherwise must exempt it.
+ * (runsc finds a sandbox's processes by their PIDs there, and the agent enters the
+ * node's mounts and network from its PID 1, to read its packet filter), with the node's
+ * paths at the same paths, as runsc and the shims open them, an image's among them: the
+ * runsc root and the systemd bus under /run, the gVisor releases and the runtimes'
+ * options files, read-only, and the snapshot cache. Pod Security admits it in alasio's
+ * namespace, which enforces no level of its own, as Kubernetes admits a privileged pod
+ * in a namespace by default; a cluster whose admission defaults otherwise must exempt it.
  *
  * Its bucket and the identity it is reached as are the Secret Neon's setup makes for it
  * (neon/control/kube-setup.ts), taken whole as its environment, and the token alasio
