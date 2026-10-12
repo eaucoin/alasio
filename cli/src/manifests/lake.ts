@@ -27,6 +27,7 @@ import {
   stackPodSpec,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 
 /** The port its telemetry intake takes OTLP over HTTP on. */
 export const LAKE_INTAKE_PORT = 4318;
@@ -98,6 +99,8 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
       template: {
         metadata: { labels: stackLabels("lake") },
         spec: {
+          // Main's serves Grafana's alerts, which never sleep; a branch's nothing.
+          ...priority(main ? "floor" : "component"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 60,
           containers: [

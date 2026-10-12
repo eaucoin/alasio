@@ -10,6 +10,7 @@ import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import { claimSpec, componentName, NAMESPACE, neonName, ONE, replicasOf, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 
 /** Every port its servers advertise themselves on by the Service's name, gRPC's each the HTTP port plus 10000. */
 const PORTS = [
@@ -116,6 +117,7 @@ function server(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels("seaweedfs") },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           containers: [
@@ -251,6 +253,7 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
             metadata: { labels: stackLabels(component) },
             spec: {
               restartPolicy: "Never",
+              ...priority("component"),
               ...stackPodSpec(config),
               containers: [{
                 name: "lifecycle",

@@ -34,6 +34,7 @@ import {
   stackPodSpec,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
 import { LAKE_INTAKE_PORT } from "./lake.ts";
 import { VALKEY, VALKEY_PORT } from "./valkey.ts";
@@ -187,6 +188,7 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
         metadata: { labels: stackLabels(COMPONENT), annotations: { "checksum/config": sha256(goJson(configuration)) } },
         spec: {
           ...(workspaceStorage.enabled ? { serviceAccountName: COLLECTOR } : {}),
+          ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
             name: "collector",

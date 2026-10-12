@@ -20,6 +20,7 @@ import { imageReference } from "../images.ts";
 import { claimSpec, componentName, imagePullSecrets, labels, NAMESPACE, ONE, replicasOf, restrictedContainer, restrictedPod, selectorLabels, sha256 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { priority } from "./priorities.ts";
 
 /** Valkey's name: its Service's, its StatefulSet's, and its password's Secret's. */
 export const VALKEY = componentName("valkey");
@@ -76,6 +77,7 @@ export function valkeyObjects(config: InstallConfig, sidecars: readonly V1Contai
       template: {
         metadata: { labels: labels("valkey"), annotations: { "checksum/config": sha256(conf) } },
         spec: {
+          ...priority("floor"),
           ...imagePullSecrets(config),
           securityContext: restrictedPod(VALKEY_UID, VALKEY_UID),
           // Long enough for its last snapshot and fsync as it stops.

@@ -32,6 +32,7 @@ import {
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
+import { priority } from "./priorities.ts";
 
 /** Grafana's name, its Secret's, and its pods' component. */
 export const GRAFANA = componentName("grafana");
@@ -64,6 +65,7 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
         spec: {
           automountServiceAccountToken: false,
           enableServiceLinks: false,
+          ...priority("floor"),
           securityContext: restrictedPod(GRAFANA_USER, GRAFANA_USER),
           ...imagePullSecrets(config),
           initContainers: [{

@@ -17,6 +17,7 @@ import type {
 
 import { given, NAMESPACE, ONE, RELEASE, replicasOf } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 import sandboxes from "./sandboxes.agents.x-k8s.io.json" with { type: "json" };
 
 /**
@@ -83,6 +84,7 @@ function controller(config: InstallConfig): KubernetesObject[] {
         metadata: { labels: LABELS },
         spec: {
           serviceAccountName: NAME,
+          ...priority("floor"),
           securityContext: { runAsNonRoot: true, seccompProfile: { type: "RuntimeDefault" } },
           containers: [{
             name: "controller",

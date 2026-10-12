@@ -48,6 +48,7 @@ import {
   sha256,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 import { cloneJob } from "./workspace-storage.ts";
 
 /** The port every workspace's bayma serves MCP on. */
@@ -93,6 +94,7 @@ function sessionsProfile(config: InstallConfig, environment: Environment): Sessi
       metadata: { labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "session" } },
       spec: {
         ...(sessions.runtimeClassName ? { runtimeClassName: sessions.runtimeClassName } : {}),
+        ...priority("turn"),
         securityContext: { ...restrictedPod(1000, 1000), ...ownership },
         ...imagePullSecrets(config),
         ...given("nodeSelector", { ...sessions.nodeSelector }),
@@ -167,6 +169,7 @@ function hostProfile(config: InstallConfig): HostProfile {
       spec: {
         // May restart alasio, by rolling out its Deployment, as an agent restarts it.
         serviceAccountName: componentName("host-agent"),
+        ...priority("turn"),
         securityContext: {
           runAsUser: host.uid,
           runAsGroup: host.gid,
@@ -314,6 +317,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
         metadata: { labels: labels("alasio"), annotations: { "checksum/sandbox-templates": templatesChecksum } },
         spec: {
           serviceAccountName: RELEASE,
+          ...priority("turn"),
           // alasio finishes its turns' bookkeeping and records what it interrupts as it stops.
           terminationGracePeriodSeconds: 60,
           securityContext: { ...restrictedPod(uid, gid), ...given("supplementalGroups", groups) },

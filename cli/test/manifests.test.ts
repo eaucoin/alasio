@@ -22,6 +22,7 @@ import type {
   V1Job,
   V1LabelSelector,
   V1Namespace,
+  V1PodSpec,
   V1PriorityClass,
   V1Role,
   V1RoleBinding,
@@ -1132,15 +1133,16 @@ describe("workspace storage", () => {
 
   test("leaves the driver to the cluster when told", () => {
     const objects = install({ workspaceStorage: { csi: { enabled: false } } });
-    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "PriorityClass"), ...all(objects, "DaemonSet")], []);
-    assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("juicefs-")), []);
+    assert.deepEqual([...all(objects, "CSIDriver"), ...all(objects, "DaemonSet")], []);
+    assert.deepEqual(objects.filter((object) => /^(alasio-)?juicefs-(csi|mount)/u.test(object.metadata?.name ?? "")), []);
     assert.ok(one(objects, "StorageClass", "alasio-workspaces"));
     assert.ok(one(objects, "StatefulSet", "alasio-valkey"));
   });
 
   test("installs nothing of it when it is off", () => {
     const objects = install({ workspaceStorage: { enabled: false } });
-    for (const kind of ["CSIDriver", "PriorityClass", "DaemonSet", "StorageClass"]) assert.deepEqual(all(objects, kind), [], kind);
+    for (const kind of ["CSIDriver", "DaemonSet", "StorageClass"]) assert.deepEqual(all(objects, kind), [], kind);
+    assert.deepEqual(all(objects, "PriorityClass").filter(({ metadata }) => metadata?.name === "alasio-juicefs-mount"), []);
     assert.deepEqual(objects.filter(({ metadata }) => /valkey|juicefs|workspaces/u.test(metadata?.name ?? "")), []);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), undefined);
     const buckets = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
@@ -1380,5 +1382,45 @@ describe("branch environments", () => {
     const unforked = install({ sessions: { storage: { storageClassName: "fast" } } });
     assert.equal(container(one<V1Deployment>(unforked, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
     assert.deepEqual(all(unforked, "Service").filter(({ metadata }) => metadata?.name === "alasio-branches"), []);
+  });
+});
+
+/** Every pod spec of `objects`, by what makes it: its workload's, Job's or CronJob's name, or the templates' Sandboxes'. */
+function podSpecs(objects: readonly KubernetesObject[]): [string, V1PodSpec][] {
+  const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet"), ...all<V1Job>(objects, "Job")];
+  const parsed = JSON.parse(templates(objects)) as { sessions?: SessionsProfile & { clone?: { job: V1Job } }; host?: { podTemplate: { spec: V1PodSpec } } };
+  return [
+    ...workloads.map(({ metadata, spec }): [string, V1PodSpec] => [metadata?.name ?? "", spec?.template.spec ?? { containers: [] }]),
+    ...all<V1CronJob>(objects, "CronJob").map(({ metadata, spec }): [string, V1PodSpec] => [metadata?.name ?? "", spec?.jobTemplate.spec?.template.spec ?? { containers: [] }]),
+    ...(parsed.sessions ? [["session", parsed.sessions.podTemplate.spec as V1PodSpec] as [string, V1PodSpec]] : []),
+    ...(parsed.sessions?.clone ? [["clone", parsed.sessions.clone.job.spec?.template.spec ?? { containers: [] }] as [string, V1PodSpec]] : []),
+    ...(parsed.host ? [["folder-bayma", parsed.host.podTemplate.spec] as [string, V1PodSpec]] : []),
+  ];
+}
+
+describe("scaling", () => {
+  test("runs every pod under a PriorityClass: the floor's and what runs turns given up last, of one value, so neither takes the other's place; the headroom's first and preempting nothing", () => {
+    const objects = install({ host: { enabled: true } });
+    const classes = new Map(all<V1PriorityClass>(objects, "PriorityClass").map((each) => [each.metadata?.name ?? "", each]));
+    const value = (name: string) => classes.get(name)?.value ?? Number.NaN;
+    assert.equal(value("alasio-floor"), value("alasio-turn"));
+    assert.ok(value("alasio-turn") > value("alasio-component") && value("alasio-component") > value("alasio-headroom"));
+    assert.ok(value("alasio-juicefs-mount") > value("alasio-floor"));
+    assert.deepEqual([...classes.values()].filter(({ preemptionPolicy }) => preemptionPolicy === "Never").map(({ metadata }) => metadata?.name).sort(), ["alasio-headroom", "alasio-juicefs-mount"]);
+    const tiers = new Map(podSpecs(objects).map(([name, spec]) => [name, spec.priorityClassName]));
+    for (const [name, priorityClassName] of [...tiers, ...podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName])]) {
+      assert.ok(priorityClassName && (classes.has(priorityClassName) || priorityClassName.startsWith("system-")), name);
+    }
+    assert.deepEqual(
+      ["alasio-neon-safekeeper", "alasio-neon-pageserver", "alasio-seaweedfs", "alasio-valkey", "alasio-grafana", "alasio-collector", "alasio-lake"].map((name) => tiers.get(name)),
+      Array(7).fill("alasio-floor"),
+    );
+    // Main's compute is alasio's database, which every turn needs.
+    assert.equal(tiers.get("alasio-neon-compute"), "alasio-floor");
+    assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup", "clone"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
+    assert.deepEqual(["alasio", "session", "folder-bayma"].map((name) => tiers.get(name)), Array(3).fill("alasio-turn"));
+    // A branch's alasio runs turns; its lake serves no alert, and its compute sleeps.
+    const branch = new Map(podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName]));
+    assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
   });
 });

@@ -18,6 +18,7 @@ import type { KubernetesObject, V1Container, V1CronJob, V1Job, V1StorageClass } 
 import { imageReference } from "../images.ts";
 import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, script } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { priority } from "./priorities.ts";
 import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { VALKEY, VALKEY_PASSWORD, VALKEY_PORT, valkeyObjects } from "./valkey.ts";
 
@@ -112,6 +113,7 @@ function dailyAdminTask(config: InstallConfig, component: string, schedule: stri
             metadata: { labels: { ...labels(component), ...JUICEFS_ADMIN } },
             spec: {
               restartPolicy: "Never",
+              ...priority("component"),
               ...imagePullSecrets(config),
               securityContext: restrictedPod(NOBODY, NOBODY),
               containers: [{ ...adminContainer(config, name, ...lines), securityContext: restrictedContainer() }],
@@ -190,6 +192,7 @@ export function cloneJob(config: InstallConfig): V1Job {
         metadata: { labels: { ...labels(component), ...JUICEFS_ADMIN } },
         spec: {
           restartPolicy: "Never",
+          ...priority("component"),
           ...imagePullSecrets(config),
           containers: [{
             ...adminContainer(

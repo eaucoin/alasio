@@ -48,6 +48,7 @@ import {
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
+import { priority } from "./priorities.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`, main's unless of `environment`. */
@@ -100,6 +101,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
         spec: {
           serviceAccountName: name,
           restartPolicy: "Never",
+          ...priority("component"),
           ...stackPodSpec(config),
           containers: [{
             name: "setup",
@@ -159,6 +161,7 @@ function controllerDb(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
             name: "postgres",
@@ -199,6 +202,7 @@ function storageBroker(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
             name: "storage-broker",
@@ -232,6 +236,7 @@ function storageController(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           initContainers: [{
             name: "wait-for-controller-db",
@@ -304,6 +309,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           ...given("initContainers", waitForObjectStore(config)),
@@ -385,6 +391,7 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           initContainers: [
@@ -459,6 +466,7 @@ function control(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
             name: "neon-control",
@@ -523,6 +531,8 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          // Main's is alasio's database, which every turn needs; a branch's sleeps.
+          ...priority(environment.branch === null ? "floor" : "component"),
           ...imagePullSecrets(config),
           // The compute image runs as its own postgres user.
           securityContext: { fsGroup: config.neon.runAsGroup, seccompProfile: { type: "RuntimeDefault" } },
@@ -651,6 +661,7 @@ function backup(config: InstallConfig): V1CronJob {
             metadata: { labels: stackLabels(component) },
             spec: {
               restartPolicy: "Never",
+              ...priority("component"),
               ...stackPodSpec(config),
               initContainers: [dump],
               containers: [upload],
