@@ -12,9 +12,15 @@
  *
  * agent-sandbox never changes a pod it has made, so a Sandbox records the pod template
  * it runs, and one made from another than alasio's current template (as after an upgrade
- * that brings a newer bayma) is moved onto it the next time alasio brings it up. Nor does
- * it replace a pod that has ended, or one whose fault only a new pod mends, so alasio
- * restarts the Sandbox of either as it brings it up.
+ * that brings a newer bayma) is moved onto it the next time alasio brings it up, unless
+ * its caller keeps it on its own while its pod runs. Nor does it replace a pod that has
+ * ended, or one whose fault only a new pod mends, so alasio restarts the Sandbox of either
+ * as it brings it up.
+ *
+ * A running Sandbox may be released: its pod saved, by its caller, and ended, and the
+ * Sandbox suspended; a suspended one may be resumed from such a save, its pod brought
+ * back, by the template the save gives. One change of a Sandbox's running happens at a
+ * time: a bring-up waits for a release, and the other way round.
  */
 import { createHash, randomBytes } from "node:crypto";
 
@@ -28,7 +34,7 @@ import type {
   V1PodTemplateSpec,
   V1Secret,
 } from "@kubernetes/client-node";
-import { Clock, Duration, Effect, Fiber, FiberMap, Option, Schedule, Schema, type Scope } from "effect";
+import { Clock, Duration, Effect, Fiber, FiberMap, Option, Schedule, Schema, type Scope, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { withLogScope } from "../shared/log.ts";
@@ -121,6 +127,17 @@ export class SandboxNotReady extends Schema.TaggedError<SandboxNotReady>()("Sand
   }
 }
 
+/** A Sandbox's pod ended as alasio waited for it to be ready: agent-sandbox makes no other in its place. */
+export class SandboxPodEnded extends Schema.TaggedError<SandboxPodEnded>()("SandboxPodEnded", {
+  namespace: Schema.String,
+  name: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the pod of Sandbox ${this.namespace}/${this.name} ended (${this.reason})`;
+  }
+}
+
 /** A Sandbox was deleted while alasio made it, or while it started. */
 export class SandboxGone extends Schema.TaggedError<SandboxGone>()("SandboxGone", {
   namespace: Schema.String,
@@ -161,8 +178,22 @@ export interface SandboxFault {
   readonly beforeResume: Effect.Effect<void>;
 }
 
+/**
+ * A suspended Sandbox resumed from a snapshot of the pod it ran: the pod template it
+ * resumes with, which brings that pod back, `podTemplate`; the template it keeps once the
+ * pod is back, `kept`, the one that pod was made from; and what is done once the pod is
+ * back, `restored`, or once it failed to come back, `failed(why)`, after which the
+ * Sandbox is resumed as one that has no snapshot is.
+ */
+export interface SandboxRestore {
+  readonly podTemplate: V1PodTemplateSpec;
+  readonly kept: V1PodTemplateSpec;
+  readonly restored: Effect.Effect<void>;
+  readonly failed: (why: string) => Effect.Effect<void>;
+}
+
 /** How bringing a Sandbox's bayma up fails. */
-export type SandboxError = KubeApiError | SandboxNotReady | SandboxGone | SandboxTokenMissing | BaymaNotAnswering;
+export type SandboxError = KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone | SandboxTokenMissing | BaymaNotAnswering;
 
 /** The Sandboxes of one namespace; see makeSandboxes. */
 export interface Sandboxes {
@@ -178,7 +209,13 @@ export interface Sandboxes {
   readonly token: (name: string) => Effect.Effect<string | null, KubeApiError>;
   readonly exists: (name: string) => Effect.Effect<boolean, KubeApiError>;
   /** Suspends the Sandbox, once its pod has ended: nothing in it runs, and its volumes are kept. One that is gone is left so. */
-  readonly suspend: (name: string) => Effect.Effect<void, KubeApiError | SandboxNotReady | SandboxGone>;
+  readonly suspend: (name: string) => Effect.Effect<void, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
+  /**
+   * Releases the Sandbox, ready and running, with no bring-up of it meanwhile: `save` is
+   * given it, then, as `save` says, it is suspended, its pod ended, or left running.
+   * Whether it was suspended; a Sandbox not ready and running is left as it is.
+   */
+  readonly release: <E>(name: string, save: (sandbox: StoredSandbox) => Effect.Effect<"suspend" | "keep", E>) => Effect.Effect<boolean, E | KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
   readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
 }
 
@@ -196,6 +233,18 @@ export interface SandboxesOptions {
    * looked at as it is brought up, or null when nothing is.
    */
   readonly fault?: (name: string) => Effect.Effect<SandboxFault | null>;
+  /**
+   * Whether the running Sandbox `sandbox`, whose pod was made from another template than
+   * alasio's current one, stays on it while that pod runs rather than being moved onto the
+   * current one, as none is unless this says so.
+   */
+  readonly keeps?: (sandbox: StoredSandbox) => boolean;
+  /**
+   * How the suspended Sandbox `sandbox`, which `desired` is made from, is resumed from a
+   * snapshot of its pod, or null when it is resumed as it is (moved onto alasio's current
+   * template first, when it is on another).
+   */
+  readonly restore?: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | null>;
 }
 
 /** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
@@ -347,10 +396,23 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   readyTimeout = READY_TIMEOUT,
   poll = POLL,
   fault,
+  keeps = () => false,
+  restore,
 }: SandboxesOptions): Effect.fn.Return<Sandboxes, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const fetch = yield* FetchHttpClient.Fetch;
   const ensuring = yield* FiberMap.make<string, BaymaEndpoint, SandboxError>();
+  // One change of a Sandbox's running at a time: a bring-up waits for a release, and the other way round.
+  const changing = new Map<string, Semaphore.Semaphore>();
+  const exclusively = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.suspend(() => {
+      let semaphore = changing.get(name);
+      if (!semaphore) {
+        semaphore = Semaphore.makeUnsafe(1);
+        changing.set(name, semaphore);
+      }
+      return semaphore.withPermit(effect);
+    });
   // A token never changes once its Secret exists, so each is read once.
   const tokens = new Map<string, string>();
 
@@ -404,14 +466,21 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       reason: condition(sandbox, type)?.message || undefined,
     });
 
-  /** The Sandbox once its controller says its `type` condition holds, looked at every `poll` for `readyTimeout`. */
-  const awaitCondition = (initial: StoredSandbox, type: SandboxConditionType): Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> => {
+  /**
+   * The Sandbox once its controller says its `type` condition holds, looked at every `poll`
+   * for `readyTimeout`; one whose pod ends while it is waited for to be ready never is.
+   */
+  const awaitCondition = (initial: StoredSandbox, type: SandboxConditionType): Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> => {
     const name = initial.metadata.name;
-    const check = (sandbox: StoredSandbox): Effect.Effect<StoredSandbox, SandboxNotReady> =>
-      holds(sandbox, type) ? Effect.succeed(sandbox) : Effect.fail(notYet(sandbox, type));
-    const again: Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> = Effect.sleep(poll).pipe(
+    const check = (sandbox: StoredSandbox): Effect.Effect<StoredSandbox, SandboxNotReady | SandboxPodEnded> =>
+      holds(sandbox, type)
+        ? Effect.succeed(sandbox)
+        : type === "Ready" && podEnded(sandbox)
+        ? Effect.fail(new SandboxPodEnded({ namespace, name, reason: condition(sandbox, "Ready")?.reason ?? "" }))
+        : Effect.fail(notYet(sandbox, type));
+    const again: Effect.Effect<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> = Effect.sleep(poll).pipe(
       Effect.andThen(read(name)),
-      Effect.flatMap((sandbox): Effect.Effect<StoredSandbox, SandboxNotReady | SandboxGone> =>
+      Effect.flatMap((sandbox): Effect.Effect<StoredSandbox, SandboxNotReady | SandboxPodEnded | SandboxGone> =>
         sandbox ? check(sandbox) : Effect.fail(new SandboxGone({ namespace, name, during: "started" }))
       ),
     );
@@ -443,7 +512,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
    * suspending ends its pod and keeps its volumes, so the pod it resumes with is made
    * from that template.
    */
-  const moveOnto = Effect.fnUntraced(function*(sandbox: StoredSandbox, desired: Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+  const moveOnto = Effect.fnUntraced(function*(sandbox: StoredSandbox, desired: Sandbox): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`moving Sandbox ${namespace}/${name} onto its current pod template`);
     const moved = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
@@ -459,7 +528,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
    * again, and the pod it resumes with is new. `why` says which, after "whose", and
    * `beforeResume` is done once it is suspended.
    */
-  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string, beforeResume: Effect.Effect<void> = Effect.void): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxGone> {
+  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string, beforeResume: Effect.Effect<void> = Effect.void): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}`);
     const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
@@ -468,22 +537,69 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return restarted;
   });
 
+  /**
+   * `sandbox`, suspended, resumed from a snapshot of its pod as `plan` says: running the
+   * template that brings that pod back, then, once it is back, keeping the template it was
+   * made from. One whose pod does not come back is suspended again, `plan` told why.
+   */
+  const restoreFrom = Effect.fnUntraced(function*(
+    sandbox: StoredSandbox,
+    plan: SandboxRestore,
+  ): Effect.fn.Return<{ readonly restored: StoredSandbox } | { readonly failed: StoredSandbox }, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
+    const name = sandbox.metadata.name;
+    yield* Effect.logInfo(`restoring Sandbox ${namespace}/${name} from a snapshot of its pod`);
+    const restoring = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
+      metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: podTemplateHash(plan.kept) } },
+      spec: { operatingMode: "Running", podTemplate: mergePatch(sandbox.spec.podTemplate, plan.podTemplate) },
+    }));
+    const back = yield* awaitCondition(restoring, "Ready").pipe(
+      Effect.map((ready) => ({ ready })),
+      Effect.catchTags({
+        SandboxNotReady: (error) => Effect.succeed({ why: error.message }),
+        SandboxPodEnded: (error) => Effect.succeed({ why: error.message }),
+      }),
+    );
+    if ("why" in back) {
+      yield* plan.failed(back.why);
+      const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
+      return { failed: yield* awaitCondition(suspending, "Suspended") };
+    }
+    // The pod runs on; the template now says what it was made from, for any pod after it.
+    const restored = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { podTemplate: mergePatch(back.ready.spec.podTemplate, plan.kept) } }));
+    yield* plan.restored;
+    yield* Effect.logInfo(`restored Sandbox ${namespace}/${name}`);
+    return { restored };
+  });
+
   const bringUp = Effect.fnUntraced(function*(name: string, manifest: () => Sandbox): Effect.fn.Return<BaymaEndpoint, SandboxError> {
     const desired = manifest();
     let sandbox = yield* readOrCreate(name, desired);
     yield* ensureToken(sandbox);
-    if (sandbox.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] !== desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION]) {
-      sandbox = yield* moveOnto(sandbox, desired);
-    } else if (podEnded(sandbox)) {
-      sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`);
-    } else if (fault && sandbox.spec?.operatingMode !== "Suspended" && sandboxReady(sandbox)) {
-      // Only a pod that ran before: one just made, or about to be resumed, is new.
-      const found = yield* fault(name);
-      if (found !== null) sandbox = yield* restart(sandbox, found.why, found.beforeResume);
+    const current = (made: StoredSandbox) => made.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] === desired.metadata.annotations?.[POD_TEMPLATE_ANNOTATION];
+    // A suspended Sandbox's template is chosen as it resumes, below.
+    if (sandbox.spec?.operatingMode !== "Suspended") {
+      if (!current(sandbox) && !(keeps(sandbox) && !podEnded(sandbox))) {
+        sandbox = yield* moveOnto(sandbox, desired);
+      } else if (podEnded(sandbox)) {
+        sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`);
+      } else if (fault && sandboxReady(sandbox)) {
+        // Only a pod that ran before: one just made, or about to be resumed, is new.
+        const found = yield* fault(name);
+        if (found !== null) sandbox = yield* restart(sandbox, found.why, found.beforeResume);
+      }
     }
     if (sandbox.spec?.operatingMode === "Suspended") {
-      sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
-      yield* Effect.logInfo(`resumed Sandbox ${namespace}/${name}`);
+      const plan = restore ? yield* restore(sandbox, desired) : null;
+      const outcome = plan ? yield* restoreFrom(sandbox, plan) : null;
+      if (outcome && "restored" in outcome) {
+        sandbox = outcome.restored;
+      } else {
+        if (outcome) sandbox = outcome.failed;
+        // One whose restore failed leaves the restore's template behind.
+        if (outcome || !current(sandbox)) sandbox = yield* moveOnto(sandbox, desired);
+        sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Running" } }));
+        yield* Effect.logInfo(`resumed Sandbox ${namespace}/${name}`);
+      }
     }
     // Readiness and bayma's answer share one deadline.
     const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(readyTimeout);
@@ -508,7 +624,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
             FiberMap.run(
               ensuring,
               name,
-              bringUp(name, manifest).pipe(
+              exclusively(name, bringUp(name, manifest)).pipe(
                 withAlasioSpan("alasio.sandbox.ensure", { attributes: { "alasio.sandbox.name": name, "k8s.namespace.name": namespace } }),
                 withLogScope("sandboxes"),
               ),
@@ -521,15 +637,32 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     exists: (name) => read(name).pipe(Effect.map((sandbox) => sandbox !== null)),
 
     suspend: (name) =>
-      Effect.gen(function*() {
-        const suspending = yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
-          Effect.map(stored),
-          Effect.catchIf(hasStatus(404), () => Effect.succeed(null)),
-        );
-        if (!suspending) return;
-        yield* awaitCondition(suspending, "Suspended");
-        yield* Effect.logInfo(`suspended Sandbox ${namespace}/${name}`);
-      }).pipe(withLogScope("sandboxes")),
+      exclusively(
+        name,
+        Effect.gen(function*() {
+          const suspending = yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }).pipe(
+            Effect.map(stored),
+            Effect.catchIf(hasStatus(404), () => Effect.succeed(null)),
+          );
+          if (!suspending) return;
+          yield* awaitCondition(suspending, "Suspended");
+          yield* Effect.logInfo(`suspended Sandbox ${namespace}/${name}`);
+        }),
+      ).pipe(withLogScope("sandboxes")),
+
+    release: (name, save) =>
+      exclusively(
+        name,
+        Effect.gen(function*() {
+          const sandbox = yield* read(name);
+          if (!sandbox || sandbox.spec?.operatingMode === "Suspended" || !sandboxReady(sandbox)) return false;
+          if ((yield* save(sandbox)) === "keep") return false;
+          const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
+          yield* awaitCondition(suspending, "Suspended");
+          yield* Effect.logInfo(`released Sandbox ${namespace}/${name}`);
+          return true;
+        }),
+      ).pipe(withLogScope("sandboxes")),
 
     remove: (name) =>
       Effect.sync(() => tokens.delete(name)).pipe(
