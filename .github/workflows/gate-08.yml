@@ -1,0 +1,47 @@
+name: gate-08
+
+# 08's gate (gate/08/run.sh), on its track's branch alone, whenever what it runs changes:
+# k3s on the runner, the bundled object store as alasio 5.1.0 deploys it, the box's
+# cut-over rehearsed onto the new layout at SeaweedFS 4.48, and the layout put through
+# what 08 needs of it.
+on:
+  push:
+    branches: [track/wave0-gates]
+    paths: [.github/workflows/gate-08.yml, gate/08/**, gate/*]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  object-store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: gate/k3s.sh
+      - run: gate/store.sh gate
+      - name: Rehearse the cut-over, then the new layout
+        run: |
+          FILER_PASSWORD=$(openssl rand -hex 24) gate/08/run.sh
+        env:
+          IMAGE: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+          VALKEY_IMAGE: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+          OUT: ${{ runner.temp }}/gate-08
+      - name: The cluster, when something failed
+        if: failure()
+        run: |
+          kubectl get pods,pvc -A -o wide
+          kubectl get pv
+          kubectl -n alasio describe pods
+          for pod in $(kubectl -n alasio get pods -o name); do kubectl -n alasio logs "$pod" --all-containers --tail=80 || true; done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-08
+          path: ${{ runner.temp }}/gate-08

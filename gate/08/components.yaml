@@ -1,0 +1,255 @@
+# The bundled object store as 08 shapes it, at SeaweedFS ${IMAGE}: a master, a volume
+# server, two filers on a Valkey `redis2` store of their own (an ACL user confined to the
+# filers' key prefix), and two S3 gateways, each on a filer of its own. The filers wait
+# for a registered volume server, and start one after the other (OrderedReady), so two
+# never race to make the store's signature. Pods run as alasio's data stack's (uid 1000),
+# the owner of the volumes the volume server takes over. gate/08/run.sh fills in the
+# variables (envsubst).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs-filer-store
+  namespace: alasio
+stringData:
+  valkey.conf: |
+    bind * -::*
+    port 6379
+    dir /data
+    appendonly yes
+    appendfsync everysec
+    aof-use-rdb-preamble yes
+    maxmemory 128mb
+    maxmemory-policy noeviction
+    user default off
+    user filer on >${FILER_PASSWORD} ~seaweedfs:* &* +@all
+    user probe on >${FILER_PASSWORD} +ping +info
+  filer.toml: |
+    [redis2]
+    enabled = true
+    address = "seaweedfs-filer-store:6379"
+    username = "filer"
+    password = "${FILER_PASSWORD}"
+    database = 0
+    keyPrefix = "seaweedfs:"
+    superLargeDirectories = []
+---
+apiVersion: v1
+kind: Service
+metadata: { name: seaweedfs-filer-store, namespace: alasio }
+spec:
+  selector: { app: seaweedfs-filer-store }
+  ports: [{ name: valkey, port: 6379 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: seaweedfs-filer-store, namespace: alasio }
+spec:
+  serviceName: seaweedfs-filer-store
+  replicas: 1
+  selector: { matchLabels: { app: seaweedfs-filer-store } }
+  template:
+    metadata: { labels: { app: seaweedfs-filer-store } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 999, runAsGroup: 999, fsGroup: 999, seccompProfile: { type: RuntimeDefault } }
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: valkey
+          image: ${VALKEY_IMAGE}
+          command: [valkey-server, /etc/valkey/valkey.conf]
+          env: [{ name: PASSWORD, value: "${FILER_PASSWORD}" }]
+          readinessProbe:
+            exec: { command: [sh, -c, 'valkey-cli --user probe --pass "$PASSWORD" --no-auth-warning ping | grep -q PONG'] }
+            periodSeconds: 2
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: conf, mountPath: /etc/valkey }
+      volumes:
+        - name: conf
+          secret: { secretName: seaweedfs-filer-store, items: [{ key: valkey.conf, path: valkey.conf }] }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: seaweedfs-master, namespace: alasio }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: seaweedfs-master }
+  ports: [{ name: http, port: 9333 }, { name: grpc, port: 19333 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: seaweedfs-master, namespace: alasio }
+spec:
+  serviceName: seaweedfs-master
+  replicas: 1
+  selector: { matchLabels: { app: seaweedfs-master } }
+  template:
+    metadata: { labels: { app: seaweedfs-master, "app.kubernetes.io/instance": alasio, "alasio.dev/stack": neon } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: master
+          image: ${IMAGE}
+          args:
+            - master
+            - -mdir=/data
+            - -ip=seaweedfs-master-0.seaweedfs-master.alasio.svc.cluster.local
+            - -ip.bind=0.0.0.0
+            - -volumeSizeLimitMB=1024
+            - -defaultReplication=000
+            - -garbageThreshold=0.1
+            - -telemetry=false
+          readinessProbe: { httpGet: { path: /cluster/status, port: 9333 }, periodSeconds: 2 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: seaweedfs-volume, namespace: alasio }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: seaweedfs-volume }
+  ports: [{ name: http, port: 8080 }, { name: grpc, port: 18080 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: seaweedfs-volume, namespace: alasio }
+spec:
+  serviceName: seaweedfs-volume
+  replicas: 1
+  selector: { matchLabels: { app: seaweedfs-volume } }
+  template:
+    metadata: { labels: { app: seaweedfs-volume, "app.kubernetes.io/instance": alasio, "alasio.dev/stack": neon } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: volume
+          image: ${IMAGE}
+          args:
+            - volume
+            - -dir=/data
+            - -max=100
+            - -minFreeSpace=5GiB
+            - -mserver=seaweedfs-master-0.seaweedfs-master.alasio.svc.cluster.local:9333
+            - -ip=$(POD_NAME).seaweedfs-volume.alasio.svc.cluster.local
+            - -ip.bind=0.0.0.0
+            - -dataCenter=dc1
+            - -rack=rack1
+          env: [{ name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }]
+          readinessProbe: { httpGet: { path: /status, port: 8080 }, periodSeconds: 2 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 100Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: seaweedfs-filer, namespace: alasio }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: seaweedfs-filer }
+  ports: [{ name: http, port: 8888 }, { name: grpc, port: 18888 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: seaweedfs-filer, namespace: alasio }
+spec:
+  serviceName: seaweedfs-filer
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector: { matchLabels: { app: seaweedfs-filer } }
+  template:
+    metadata: { labels: { app: seaweedfs-filer, "app.kubernetes.io/instance": alasio, "alasio.dev/stack": neon } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      initContainers:
+        # Until the master has a volume server registered: a filer writing before would
+        # have a fresh master make volume ids the volumes already hold (08, Corrections 4).
+        - name: wait-for-volume-server
+          image: ${IMAGE}
+          command:
+            - sh
+            - -c
+            - until wget -q -O - http://seaweedfs-master-0.seaweedfs-master.alasio.svc.cluster.local:9333/dir/status | grep -q '"DataNodes":\[{'; do sleep 2; done
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+      containers:
+        - name: filer
+          image: ${IMAGE}
+          args:
+            - filer
+            - -master=seaweedfs-master-0.seaweedfs-master.alasio.svc.cluster.local:9333
+            - -ip=$(POD_NAME).seaweedfs-filer.alasio.svc.cluster.local
+            - -ip.bind=0.0.0.0
+            - -defaultStoreDir=/tmp
+          env: [{ name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8888 }, periodSeconds: 2 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: toml, mountPath: /etc/seaweedfs }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: toml
+          secret: { secretName: seaweedfs-filer-store, items: [{ key: filer.toml, path: filer.toml }] }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: s3-a, namespace: alasio }
+spec:
+  selector: { app: s3-a }
+  ports: [{ name: s3, port: 8333 }, { name: grpc, port: 18333 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: s3-b, namespace: alasio }
+spec:
+  selector: { app: s3-b }
+  ports: [{ name: s3, port: 8333 }, { name: grpc, port: 18333 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: s3-a, namespace: alasio }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: s3-a } }
+  template:
+    metadata: { labels: { app: s3-a, "app.kubernetes.io/instance": alasio, "alasio.dev/stack": neon } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: s3
+          image: ${IMAGE}
+          args: [s3, -filer=seaweedfs-filer-0.seaweedfs-filer.alasio.svc.cluster.local:8888, -config=/etc/seaweedfs/s3.json, -allowDeleteBucketNotEmpty=false, -metricsPort=9327]
+          readinessProbe: { httpGet: { path: /healthz, port: 8333 }, periodSeconds: 2 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: identities, mountPath: /etc/seaweedfs, readOnly: true }]
+      volumes: [{ name: identities, secret: { secretName: alasio-neon-seaweedfs } }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: s3-b, namespace: alasio }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: s3-b } }
+  template:
+    metadata: { labels: { app: s3-b, "app.kubernetes.io/instance": alasio, "alasio.dev/stack": neon } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: s3
+          image: ${IMAGE}
+          args: [s3, -filer=seaweedfs-filer-1.seaweedfs-filer.alasio.svc.cluster.local:8888, -config=/etc/seaweedfs/s3.json, -allowDeleteBucketNotEmpty=false, -metricsPort=9327]
+          readinessProbe: { httpGet: { path: /healthz, port: 8333 }, periodSeconds: 2 }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: identities, mountPath: /etc/seaweedfs, readOnly: true }]
+      volumes: [{ name: identities, secret: { secretName: alasio-neon-seaweedfs } }]
