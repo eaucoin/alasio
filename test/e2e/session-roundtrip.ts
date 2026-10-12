@@ -34,7 +34,11 @@ export interface BaymaSessionCreated {
 
 /** What bayma's exec answers, as far as the end-to-end scripts read it. */
 export interface BaymaExecResult {
+  readonly stdout_text?: string;
   readonly result_text?: string;
+  readonly error_text?: string;
+  /** What bayma tells the first exec a session runs after it came back, of how it did. */
+  readonly notice?: string;
 }
 
 /** What the round trip saw, as its last line prints it; what it could not read is left out. */

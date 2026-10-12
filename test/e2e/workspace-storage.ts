@@ -166,7 +166,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  * Asks `check` every two seconds until it answers something, for up to `timeoutMs`: what
  * it answered. Should it not, `explain` says what there was instead.
  */
-async function until<T>(what: string, check: () => Promise<T | undefined>, timeoutMs = 300_000, explain = async () => ""): Promise<T> {
+export async function until<T>(what: string, check: () => Promise<T | undefined>, timeoutMs = 300_000, explain = async () => ""): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const answer = await check();

@@ -129,11 +129,11 @@ jobs:
   # alasio install, on one: behind ufw for one shard, as a server often is, and without a
   # firewall for the others. The shards need nothing of each other's: alasio on
   # Kubernetes, workspaces on JuiceFS, Neon, alasio's telemetry, branch environments, and
-  # how alasio is scaled, sized and drained, and, on the host target alone, as the box's,
-  # alasio upgraded from the release before (test/e2e/harness.ts). All of them, or those
-  # the run's shards input names, each word of it a shard on every cluster, target/shard
-  # on its target's, or target/agents/shard on one; a word that names none fails the run
-  # before any starts.
+  # how alasio is scaled, sized and drained, sessions' whole-sandbox snapshots, and, on the
+  # host target alone, as the box's, alasio upgraded from the release before
+  # (test/e2e/harness.ts). All of them, or those the run's shards input names, each word of
+  # it a shard on every cluster, target/shard on its target's, or target/agents/shard on
+  # one; a word that names none fails the run before any starts.
   shards:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -152,7 +152,7 @@ jobs:
               else [.target, (.agents | tostring), .shard] end;
             def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
             [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "upgrade") as $shard
+              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade") as $shard
               | $cluster + {shard: $shard}
               | select(.shard != "upgrade" or .target == "host")
               | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]

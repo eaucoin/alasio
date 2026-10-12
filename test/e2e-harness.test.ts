@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
-import { runsShard, shardOf, targetOf } from "./e2e/harness.ts";
+import { runsShard, shardOf, SHARDS, targetOf } from "./e2e/harness.ts";
 import { overlaid } from "./e2e/release-config.ts";
 import { createTelegramStub } from "./e2e/telegram-stub.ts";
 
@@ -19,21 +19,21 @@ test("ALASIO_E2E_SHARD names a shard of the suites, and every suite unset or emp
   assert.equal(shardOf("telemetry"), "telemetry");
   assert.equal(shardOf("branches"), "branches");
   assert.equal(shardOf("scaling"), "scaling");
+  assert.equal(shardOf("snapshots"), "snapshots");
   assert.equal(shardOf("upgrade"), "upgrade");
   assert.equal(shardOf(undefined), undefined);
   assert.equal(shardOf(""), undefined);
 });
 
-test("a shard there is not is refused, with those there are", () => {
-  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling, upgrade" });
+test("a run of a shard runs its suites alone, and a run of none every suite but the snapshots and upgrade shards'", () => {
+  assert.deepEqual(SHARDS.filter((shard) => runsShard("neon", shard)), ["neon"]);
+  assert.deepEqual(SHARDS.filter((shard) => runsShard("snapshots", shard)), ["snapshots"]);
+  assert.deepEqual(SHARDS.filter((shard) => runsShard("upgrade", shard)), ["upgrade"]);
+  assert.deepEqual(SHARDS.filter((shard) => runsShard(undefined, shard)), ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling"]);
 });
 
-test("a run of every suite runs every shard's but the upgrade's, which starts from an installation of its own; a run of a shard runs its own alone", () => {
-  assert.equal(runsShard(undefined, "sessions"), true);
-  assert.equal(runsShard(undefined, "upgrade"), false);
-  assert.equal(runsShard("upgrade", "upgrade"), true);
-  assert.equal(runsShard("upgrade", "sessions"), false);
-  assert.equal(runsShard("sessions", "sessions"), true);
+test("a shard there is not is refused, with those there are", () => {
+  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling, snapshots, upgrade" });
 });
 
 test("the upgrade shard's install configuration is laid over the one alasio init wrote, keeping what only that has", () => {

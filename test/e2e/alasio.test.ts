@@ -4,8 +4,9 @@
  * operator drives it, its sessions' confinement checked from inside them, its own code
  * paths run in its pod with its ServiceAccount, its telemetry looked for in its lake and
  * where the installation's goes, its workspaces' JuiceFS put through file operations, crashes and a
- * restore (./workspace-storage.ts), its Neon through crashes and losses (neon/test/stack.ts),
- * an installation of the release before upgraded to it with what it holds, by the cut-over the
+ * restore (./workspace-storage.ts), its sessions released idle into whole-sandbox snapshots and
+ * restored from them, its Neon through crashes and losses (neon/test/stack.ts), an
+ * installation of the release before upgraded to it with what it holds, by the cut-over the
  * box runs (upgrades/), and removed, with all it keeps, by its command line at the end.
  *
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
@@ -18,7 +19,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1PersistentVolume, V1Pod, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -26,6 +27,8 @@ import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
+import type { Manifest } from "../../src/node-agent/agent.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -43,16 +46,19 @@ import {
   HOST_USER,
   inAlasio,
   inAlasioContainer,
+  inNodeAgent,
   inSession,
   inShard,
   KEEP,
   kube,
   lakeQuery,
+  nodeAgents,
   onNode,
   OTHER_OPERATOR,
   paths,
   PREVIOUS,
   ref,
+  RELEASE_AFTER_SECONDS,
   SESSIONS,
   setUp,
   tcp,
@@ -60,7 +66,9 @@ import {
   tearDown,
 } from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
+import type { ReplSeen, ReplSet } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
+import type { Corrupted } from "./snapshot-bucket.ts";
 import { OTLP, STAND_INS, type StandIn, TELEGRAM, TELEGRAM_BRANCH, urlOf } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
 import { workspaceStorage } from "./workspace-storage.ts";
@@ -208,6 +216,8 @@ if (inShard("upgrade")) {
     let held: string[];
     /** A prompt held across the upgrade. */
     const HELD_PROMPT = "held across the upgrade";
+    /** The session's pod as 6.0.0 ran it. */
+    let ranBefore: string | undefined;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -282,6 +292,34 @@ if (inShard("upgrade")) {
           assert.ok(run && "callback_data" in run, "the question has a Run it button");
           await tg.press(run.callback_data);
           await tg.waitFor((call) => answered(call));
+        },
+      },
+      {
+        seeds: "the session workspace's pod, under 6.0.0's gVisor",
+        seed: async () => {
+          const pod = await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS));
+          assert.equal(pod?.spec?.runtimeClassName, "gvisor");
+          ranBefore = pod?.metadata?.uid;
+        },
+        keeps: "nothing runs under 6.0.0's gVisor, which is gone, and the session, its pod made anew, is released into a snapshot and restored from it whole",
+        check: async () => {
+          assert.equal(await onNode("", `k3s crictl pods --state ready -o json | jq '[.items[] | select(.runtimeHandler == "runsc")] | length'`), "0\n");
+          assert.equal(await onNode("", "for name in runsc containerd-shim-runsc-v1 gvisor-bin; do [ ! -e /usr/local/bin/$name ] || echo $name; done"), "");
+          await tg.say("hello again");
+          await tg.waitFor((call) => answered(call));
+          assert.notEqual((await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.metadata?.uid, ranBefore);
+          const value = `held by ${volumeId}, upgraded`;
+          const { sessionId } = await repl.set(volumeId, value);
+          await untilReleased(volumeId, Date.now());
+          const saved = await snapshotOf(volumeId);
+          assert.ok(saved, `the session ${volumeId} was released with no snapshot`);
+          await tg.say("restored");
+          await tg.waitFor((call) => answered(call));
+          assert.equal((await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.spec?.runtimeClassName, gvisorRuntimeClass(saved.release));
+          const seen = await repl.read(volumeId, sessionId);
+          assert.deepEqual([seen.live, seen.checkpointed], [value, value]);
+          assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
         },
       },
     ];
@@ -379,6 +417,13 @@ async function newSession(net: NetMode) {
 
 const probe = (target: string) => `fetch(${JSON.stringify(target)},{signal:AbortSignal.timeout(5000)}).then(r=>console.log("open"),e=>console.log("blocked"))`;
 
+/** That the session, which has no internet, reaches neither the internet, nor the cluster's API server, nor a resolver. */
+async function assertNoInternet(volumeId: string): Promise<void> {
+  assert.equal((await inSession(volumeId, probe("http://1.1.1.1"))).trim(), "blocked");
+  assert.equal((await inSession(volumeId, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
+  assert.match(await inSession(volumeId, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
+}
+
 const roundtrip = (volumeId: string) => inAlasio<RoundtripSeen>("./session-roundtrip.ts", volumeId);
 
 if (inShard("sessions")) {
@@ -400,9 +445,7 @@ if (inShard("sessions")) {
       none = await newSession("none");
       const pod = await kube.get<V1Pod>(ref("Pod", none, SESSIONS));
       if (pod?.spec?.runtimeClassName === "gvisor") assert.match(await inSession(none, 'console.log(require("fs").readFileSync("/proc/version","utf8"))'), /gvisor/u);
-      assert.equal((await inSession(none, probe("http://1.1.1.1"))).trim(), "blocked");
-      assert.equal((await inSession(none, tcp("process.env.KUBERNETES_SERVICE_HOST", 443))).trim(), "blocked");
-      assert.match(await inSession(none, 'require("dns").promises.lookup("example.com").then(()=>console.log("resolved"),()=>console.log("no dns"))'), /no dns/u);
+      await assertNoInternet(none);
       assert.match(await inSession(none, 'console.log(require("fs").existsSync("/var/run/secrets/kubernetes.io/serviceaccount"))'), /false/u);
       const gate = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.status?.initContainerStatuses?.find(({ name }) => name === "egress-gate");
       assert.equal(gate?.state?.terminated?.exitCode, 0);
@@ -523,6 +566,194 @@ if (inShard("sessions")) {
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+  });
+}
+
+/** A REPL of a session's bayma, reached as alasio reaches it (./session-repl.ts): a new one holding `value`, and what one holds. */
+const repl = {
+  set: (volumeId: string, value: string) => inAlasio<ReplSet>("./session-repl.ts", "set", volumeId, value),
+  read: (volumeId: string, sessionId: string) => inAlasio<ReplSeen>("./session-repl.ts", "read", volumeId, sessionId),
+};
+
+/** What bayma tells the first exec of a session that came back whole with its sandbox, and of one that came back from its checkpoint. */
+const CAME_BACK_WHOLE = /^bayma: this session came back whole with bayma's sandbox, restored from a snapshot taken at /u;
+const CAME_BACK_FROM_CHECKPOINT = /^bayma: this session came back from its checkpoint /u;
+
+/**
+ * Waits until alasio has released the session, last used at `since`: its Sandbox suspended,
+ * and its pod gone. How long after `since` it was.
+ */
+async function untilReleased(volumeId: string, since: number): Promise<number> {
+  // releaseAfter, and a look at the sessions every 15 seconds, then the save.
+  const within = (RELEASE_AFTER_SECONDS + 15) * 1000 + 180_000;
+  await until(`the release of the session ${volumeId}`, async () => {
+    const sandbox = await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS));
+    return sandbox?.spec.operatingMode === "Suspended" && (await kube.get(ref("Pod", volumeId, SESSIONS))) === null ? true : undefined;
+  }, within);
+  return Date.now() - since;
+}
+
+/** The session's current snapshot, as a node agent's API gives it to alasio, from the bucket; null when it has none. */
+async function snapshotOf(volumeId: string): Promise<Manifest | null> {
+  const [pod] = (await nodeAgents()).values();
+  assert.ok(pod, "no node agent runs ready");
+  const answered = await kube.execOk(NAMESPACE, pod, [
+    "sh",
+    "-c",
+    `curl -sS -w '\\n%{http_code}' -H "authorization: Bearer $${NODE_AGENT_TOKEN_VARIABLE}" "http://127.0.0.1:$0/snapshots/$1/$2"`,
+    String(NODE_AGENT_PORT),
+    SESSIONS,
+    volumeId,
+  ], { container: "node-agent" });
+  const status = answered.trimEnd().split("\n").at(-1);
+  if (status === "404") return null;
+  assert.equal(status, "200", answered);
+  // The agent answers a manifest, as alasio reads it (src/sandbox/node-agents.ts).
+  return JSON.parse(answered.trimEnd().split("\n").slice(0, -1).join("\n")) as Manifest;
+}
+
+/** That each container of the pod holds no capability: all dropped, none added, unprivileged, and none to gain. */
+function assertNoCapability(pod: V1Pod | null): void {
+  const containers = [...(pod?.spec?.initContainers ?? []), ...(pod?.spec?.containers ?? [])];
+  assert.ok(containers.length > 0, `there is no pod ${pod?.metadata?.name}`);
+  for (const { name, securityContext } of containers) {
+    const { capabilities, privileged = false, allowPrivilegeEscalation } = securityContext ?? {};
+    assert.deepEqual(
+      { drop: capabilities?.drop, add: capabilities?.add ?? [], privileged, allowPrivilegeEscalation },
+      { drop: ["ALL"], add: [], privileged: false, allowPrivilegeEscalation: false },
+      `the container ${name} of the pod ${pod?.metadata?.name}`,
+    );
+  }
+}
+
+if (inShard("snapshots")) {
+  describe("sessions released into whole-sandbox snapshots, and restored from them", () => {
+    /** The session released and restored, its REPL, the pod it ran in before, and its snapshot. */
+    let session: string;
+    let sessionId: string;
+    let ran: V1Pod | null;
+    let saved: Manifest;
+
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    /** Says `text` to the conversation's session as a turn: how long its answer took to come. */
+    async function turn(text: string): Promise<number> {
+      await tg.calls();
+      const asked = Date.now();
+      await tg.say(text);
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      return Date.now() - asked;
+    }
+
+    test("a session that runs no exec and no turn for releaseAfter is released: its Sandbox suspended, holding no pod, its snapshot in the bucket", async (t) => {
+      session = await newSession("none");
+      ({ sessionId } = await repl.set(session, `held by ${session}`));
+      const since = Date.now();
+      ran = await kube.get<V1Pod>(ref("Pod", session, SESSIONS));
+      const waited = await untilReleased(session, since);
+      assert.ok(waited >= (RELEASE_AFTER_SECONDS - 10) * 1000, `the session was released ${waited} ms after its last exec`);
+      const snapshot = await snapshotOf(session);
+      assert.ok(snapshot, `the session ${session} was released with no snapshot`);
+      assert.deepEqual([snapshot.environment, snapshot.workspace], [SESSIONS, session]);
+      saved = snapshot;
+      t.diagnostic(`released ${(waited / 1000).toFixed(1)}s after its last exec: ${saved.bytes} bytes, its sandbox paused ${saved.pauseMs} ms, uploaded in ${saved.uploadMs} ms`);
+    });
+
+    test("the session's next turn restores it from its snapshot, which is spent, and its REPL is whole, as bayma tells the next exec", async (t) => {
+      const answered = await turn("hello again");
+      const pod = await kube.get<V1Pod>(ref("Pod", session, SESSIONS));
+      assert.equal(pod?.spec?.runtimeClassName, gvisorRuntimeClass(saved.release));
+      const seen = await repl.read(session, sessionId);
+      assert.deepEqual([seen.live, seen.checkpointed], [`held by ${session}`, `held by ${session}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      assert.equal(await snapshotOf(session), null);
+      t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${pod?.spec?.nodeName}`);
+    });
+
+    test("the session's pods hold no capability, before its release and after its restore, and the restored one reaches nothing without internet", async () => {
+      assertNoCapability(ran);
+      assertNoCapability(await kube.get<V1Pod>(ref("Pod", session, SESSIONS)));
+      // Those of a process in the restored sandbox, as gVisor gives them: each set empty.
+      const held = await inSession(session, 'process.stdout.write(require("fs").readFileSync("/proc/self/status","utf8"))');
+      const capabilities = held.split("\n").filter((line) => line.startsWith("Cap"));
+      assert.ok(["CapPrm:", "CapEff:", "CapBnd:"].every((set) => capabilities.some((line) => line.startsWith(set))), held);
+      assert.deepEqual(capabilities.filter((line) => !/^Cap\w+:\s+0+$/u.test(line)), [], held);
+      await assertNoInternet(session);
+    });
+
+    test("a session saved on one node is restored on another, from the bucket, its REPL whole", { skip: AGENTS < 2 && "one node" }, async (t) => {
+      ({ sessionId } = await repl.set(session, `moved by ${session}`));
+      const since = Date.now();
+      const node = (await kube.get<V1Pod>(ref("Pod", session, SESSIONS)))?.spec?.nodeName;
+      assert.ok(node, `the session ${session} runs on no node`);
+      await untilReleased(session, since);
+      // Its node takes no pod of the session's, and has no agent to prepare its snapshot,
+      // which another node's agent then reads from the bucket.
+      const taints = (await kube.get<V1Node>(ref("Node", node)))?.spec?.taints ?? [];
+      await kube.patch(ref("Node", node), { spec: { taints: [...taints, { key: "alasio.dev/e2e-away", effect: "NoSchedule" }] } });
+      try {
+        const agent = (await nodeAgents()).get(node);
+        assert.ok(agent, `no node agent runs on ${node}`);
+        await kube.remove(ref("Pod", agent, NAMESPACE));
+        await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 300_000);
+        const answered = await turn("hello from elsewhere");
+        const restoredOn = (await kube.get<V1Pod>(ref("Pod", session, SESSIONS)))?.spec?.nodeName;
+        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, where it was saved`);
+        const seen = await repl.read(session, sessionId);
+        assert.deepEqual([seen.live, seen.checkpointed], [`moved by ${session}`, `moved by ${session}`]);
+        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+        t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${restoredOn}, saved on ${node}`);
+      } finally {
+        await kube.patch(ref("Node", node), { spec: { taints } });
+        await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
+      }
+    });
+
+    test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as alasio logs and bayma tells the next exec", async () => {
+      const corrupt = await newSession("none");
+      const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
+      await untilReleased(corrupt, Date.now());
+      // Read again from the bucket wherever it is restored, where a file of it is not what its manifest says.
+      const agents = await nodeAgents();
+      for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${corrupt}`], { container: "node-agent" });
+      const [node = ""] = agents.keys();
+      const corrupted = await inNodeAgent<Corrupted>(node, "./snapshot-bucket.ts", "corrupt", SESSIONS, corrupt);
+      await turn("hello after the rot");
+      const logged = (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
+        .split("\n")
+        .find((line) => line.includes(`session ${corrupt} is resumed from bayma's checkpoints, not from its snapshot: `));
+      assert.ok(logged?.includes(`its file ${corrupted.path} is ${corrupted.bytes} bytes of SHA-256 `), `alasio logged no fallback for its corrupted file ${corrupted.path}: ${logged}`);
+      const seen = await repl.read(corrupt, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(corrupt), null);
+    });
+
+    test("a fork of a released session restores its source's REPL", async () => {
+      const source = await newSession("none");
+      const { sessionId: forked } = await repl.set(source, `forked from ${source}`);
+      await untilReleased(source, Date.now());
+      await tg.calls();
+      await tg.say("/workspace");
+      await tg.choose(/^Fork this workspace$/u);
+      const panel = await tg.waitFor((call) => call.method === "editMessageText" && /^Forked session workspace /mu.test(call.payload.text ?? ""));
+      const fork = new RegExp(`^Forked session workspace ${source} into session workspace (fs-[0-9a-f]+) and switched to it`, "mu").exec(panel.payload.text ?? "")?.[1];
+      assert.ok(fork, panel.payload.text);
+      await turn("hello from the fork");
+      const seen = await repl.read(fork, forked);
+      assert.deepEqual([seen.live, seen.checkpointed], [`forked from ${source}`, `forked from ${source}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
   });
 }

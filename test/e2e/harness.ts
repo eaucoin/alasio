@@ -103,10 +103,10 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "upgrade"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "snapshots", "upgrade"] as const;
 export type Shard = (typeof SHARDS)[number];
 
-/** The shard `value` names, or none, every suite, when it is unset or empty. */
+/** The shard `value` names, or none, when it is unset or empty. */
 export function shardOf(value: string | undefined): Shard | undefined {
   if (!value) return undefined;
   const shard = SHARDS.find((name) => name === value);
@@ -119,21 +119,26 @@ export function shardOf(value: string | undefined): Shard | undefined {
  * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
  * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own;
  * `branches`, branch environments; `scaling`, how alasio is scaled, sized and drained,
- * with Grafana highly available; or `upgrade`, what alasio keeps upgraded from the release
- * before; every suite but the upgrade's unless set, as an upgrade starts from a release's
- * installation of its own. Each shard runs the command line's suite, and uninstall's, as
- * well.
+ * with Grafana highly available; `snapshots`, sessions released into whole-sandbox
+ * snapshots and restored from them, on an installation that releases them within
+ * RELEASE_AFTER_SECONDS; or `upgrade`, what alasio keeps upgraded from the release before;
+ * every suite but those two shards' unless set, as each needs an installation of its own.
+ * Each shard runs the command line's suite, and uninstall's, as well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
-/** Whether a run of the shard `selected`, or of every suite if none, runs the suites of `shard`. */
-export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => (selected === undefined ? shard !== "upgrade" : selected === shard);
+/** Whether a run of the shard `selected`, or of none, runs the suites of `shard`: the snapshots and upgrade shards' only when selected. */
+export const runsShard = (selected: Shard | undefined, shard: Shard): boolean =>
+  selected === shard || (selected === undefined && shard !== "snapshots" && shard !== "upgrade");
 
 /** Whether the run runs the suites of `shard`. */
 export const inShard = (shard: Shard): boolean => runsShard(SHARD, shard);
 
 /** The release the upgrade shard upgrades from, as `<major>.<minor>.<patch>`. */
 export const PREVIOUS = process.env["ALASIO_E2E_PREVIOUS"] || undefined;
+
+/** How long a session of the snapshots and upgrade shards runs no exec, and no turn, before alasio releases it. */
+export const RELEASE_AFTER_SECONDS = 60;
 
 /**
  * The images built here: their names, and what they are built from. alasio's runs in
@@ -417,18 +422,38 @@ export const inAlasioContainer = async (command: readonly string[], stdin?: stri
   kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), command, { container: "alasio", ...(stdin === undefined ? {} : { stdin }) });
 
 /**
- * Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount: its
- * last line, parsed, which the script prints in the shape `Seen` names.
+ * Runs one of test/e2e's scripts by node in the container of the pod, which runs alasio's
+ * image: its last line, parsed, which the script prints in the shape `Seen` names.
  */
-export async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
+async function scriptIn<Seen>(namespace: string, pod: string, container: string, script: string, args: readonly string[]): Promise<Seen> {
   // The scripts import alasio's modules by their paths in the repository, for the type
   // checker; in alasio's image those are under /opt/alasio, and a script read from stdin
   // resolves its imports from its working directory, not from where it was read. So they
   // are rewritten to the image's paths as the script is piped in.
   const source = readFileSync(new URL(script, import.meta.url), "utf8").replaceAll('from "../../src/', 'from "/opt/alasio/src/');
-  const stdout = await inAlasioContainer(["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args], source);
+  const stdout = await kube.execOk(namespace, pod, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", ...args], { container, stdin: source });
   // split always returns at least one part.
   return JSON.parse(stdout.trim().split("\n").at(-1)!);
+}
+
+/** Runs one of test/e2e's scripts in alasio's pod, with alasio's code and ServiceAccount, as scriptIn says. */
+export async function inAlasio<Seen>(script: string, ...args: string[]): Promise<Seen> {
+  return scriptIn(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio", script, args);
+}
+
+/** The pods of the node agents that run ready, by the names of their nodes. */
+export async function nodeAgents(): Promise<ReadonlyMap<string, string>> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
+  return new Map(pods.flatMap((pod) =>
+    pod.spec?.nodeName && pod.metadata?.name && !pod.metadata.deletionTimestamp && podProblems(pod).length === 0 ? [[pod.spec.nodeName, pod.metadata.name] as const] : []
+  ));
+}
+
+/** Runs one of test/e2e's scripts in the pod of the node agent on `node`, with its bucket and token in its environment, as scriptIn says. */
+export async function inNodeAgent<Seen>(node: string, script: string, ...args: string[]): Promise<Seen> {
+  const pod = (await nodeAgents()).get(node);
+  if (!pod) throw new Error(`no node agent runs ready on ${node}`);
+  return scriptIn(NAMESPACE, pod, "node-agent", script, args);
 }
 
 /**
@@ -499,11 +524,12 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     sessions: {
       storage: { size: "1Gi" },
       resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: "1Gi" } },
-      // Never released within the run: its suites reach sessions by exec in their pods, which is
-      // no exec of bayma's, and a release would end their pods under them. 6.0.0 releases none,
-      // and has no such setting.
-      ...(of === "release" ? { snapshots: { releaseAfter: "24h" } } : {}),
-      ...on("agent-0"),
+      // Never released within the run but in the snapshots and upgrade shards: the other suites
+      // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
+      // their pods under them. 6.0.0 releases none, and has no such setting.
+      ...(of === "release" ? { snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" ? `${RELEASE_AFTER_SECONDS}s` : "24h" } } : {}),
+      // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
+      ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },
     neon: {
       safekeepers: { storage: { size: "2Gi" }, resources: { requests: { cpu: "20m", memory: "64Mi" } } },
