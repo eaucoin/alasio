@@ -1,9 +1,10 @@
 /**
  * The node agent (src/node-agent/): its checkpoints, committed to a stand-in bucket and
- * forgotten when they fail, its prepared snapshots, and its cache, with runsc a stand-in
- * of its own (./support/fake-runsc.ts).
+ * forgotten when they fail, its prepared snapshots, its cache, its API and its process,
+ * with runsc a stand-in of its own (./support/fake-runsc.ts).
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +17,8 @@ import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent } 
 import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
+import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
+import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 
@@ -361,5 +364,123 @@ test("the node's cache keeps within its budget, evicting the least recently used
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent });
+      const call = (method: string, path: string, body?: unknown, token = "the token") =>
+        Effect.promise(async () => {
+          const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+            method,
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }),
+          });
+          const text = await response.text();
+          return { status: response.status, body: text ? (JSON.parse(text) as unknown) : null };
+        });
+      const error = (status: number, message: string | RegExp) => (answered: { readonly status: number; readonly body: unknown }) => {
+        assert.equal(answered.status, status);
+        const said = (answered.body as { readonly error: string }).error;
+        if (typeof message === "string") assert.equal(said, message);
+        else assert.match(said, message);
+      };
+
+      const health = yield* Effect.promise(() => fetch(`http://127.0.0.1:${port}/healthz`));
+      assert.equal(health.status, 200);
+      error(401, "the request bears no token of alasio's")(yield* call("GET", "/holdings", undefined, "another"));
+      error(401, "the request bears no token of alasio's")(yield* Effect.promise(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/holdings`);
+        return { status: response.status, body: await response.json() };
+      }));
+
+      error(400, /hook/u)(yield* call("POST", "/checkpoints", { ...request("fs-abc"), hook: ["bayma sandbox-hook"] }));
+      error(400, /containerId/u)(yield* call("POST", "/checkpoints", { ...request("fs-abc"), containerId: "short" }));
+      error(400, "the body is not JSON")(yield* call("POST", "/checkpoints", "{"));
+      const taken = yield* call("POST", "/checkpoints", request("fs-abc"));
+      assert.equal(taken.status, 200);
+      const manifest = taken.body as Manifest;
+      assert.equal(manifest.workspace, "fs-abc");
+
+      assert.deepEqual(yield* call("GET", "/snapshots/main/fs-abc"), { status: 200, body: manifest });
+      error(404, "the workspace has no snapshot")(yield* call("GET", "/snapshots/main/fs-none"));
+      error(400, /environment/u)(yield* call("GET", "/snapshots/Main/fs-abc"));
+
+      assert.deepEqual(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }), {
+        status: 200,
+        body: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot) },
+      });
+      error(404, "main/fs-none has no snapshot")(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-none" }));
+
+      const holdings = yield* call("GET", "/holdings");
+      assert.equal(holdings.status, 200);
+      const { cached, ...held } = holdings.body as { readonly cached: readonly { readonly usedAt: string }[] };
+      assert.deepEqual(held, { node: "node-1", releases: [{ release: RELEASE, cpuFeatures: ["sse", "avx", "avx2"] }] });
+      assert.deepEqual(cached.map(({ usedAt, ...rest }) => (assert.ok(Date.parse(usedAt) <= Date.now()), rest)), [
+        { environment: "main", workspace: "fs-abc", snapshot: manifest.snapshot, bytes: manifest.bytes + JSON.stringify(manifest).length },
+      ]);
+
+      // Snapshots it cannot restore, or that are not what they say, and a bucket that fails.
+      s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify({ ...manifest, release: "release-20260801.0-eaucoin.1" })));
+      error(409, /its gVisor release-20260801\.0-eaucoin\.1 is not installed here/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      s3.objects.set("main/fs-abc/current.json", Buffer.from("{}"));
+      error(422, /^the snapshot of main\/fs-abc is corrupt: its current\.json is not a manifest/u)(yield* call("GET", "/snapshots/main/fs-abc"));
+      s3.refuse = () => 503;
+      error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      s3.refuse = () => null;
+
+      assert.deepEqual(yield* call("DELETE", "/snapshots/main/fs-abc"), { status: 204, body: null });
+      assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
+      assert.deepEqual(cachedOf(here, "fs-abc"), []);
+
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
+      error(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* call("POST", "/checkpoints", request("fs-abc")));
+      error(404, "there is no GET /snapshots")(yield* call("GET", "/snapshots"));
+    })
+  ));
+
+test("the agent runs as its own process from its environment, and stops when told", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const env = {
+    PATH: process.env["PATH"],
+    NODE_NAME: "node-1",
+    ALASIO_NODE_AGENT_TOKEN: "the token",
+    S3_ENDPOINT: s3.endpoint,
+    S3_REGION: "us-east-1",
+    S3_BUCKET: "snapshots",
+    AWS_ACCESS_KEY_ID: CREDENTIALS.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: CREDENTIALS.secretAccessKey,
+  };
+  const start = (environment: NodeJS.ProcessEnv) => {
+    const agent = spawn(process.execPath, [join(import.meta.dirname, "../src/node-agent/main.ts")], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    agent.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    agent.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
+    const exited = new Promise<number | null>((resolve) => agent.once("exit", resolve));
+    return { agent, exited, output: () => output };
+  };
+  try {
+    const { NODE_NAME: _node, ...unnamed } = env;
+    const refused = start(unnamed);
+    assert.equal(await refused.exited, 1);
+    assert.match(refused.output(), /NODE_NAME/u);
+
+    const running = start(env);
+    const holdings = await (async () => {
+      for (;;) {
+        const response = await fetch(`http://127.0.0.1:${NODE_AGENT_PORT}/holdings`, { headers: { authorization: "Bearer the token" } }).catch(() => null);
+        if (response) return response.json();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })();
+    assert.deepEqual(holdings, { node: "node-1", releases: [], cached: [] });
+    running.agent.kill("SIGTERM");
+    assert.equal(await running.exited, 0);
+    assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, its cache within 5368709120 bytes/u);
+  } finally {
+    await s3.close();
   }
 });
