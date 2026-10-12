@@ -22,13 +22,19 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const MAX_BUFFER = 16 * 1024 * 1024;
 
 /**
- * What the package must hold: its command, and what is data, not code: the CRD it applies,
+ * What the package must hold: its command, and what is data, not code: the CRDs it applies,
  * and the node's pins and containerd template, cluster/node's, which the host target
  * installs from.
  */
 export const REQUIRED = [
   "dist/cli/src/main.js",
   "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json",
+  "dist/cli/src/manifests/scaledobjects.keda.sh.json",
+  "dist/cli/src/manifests/scaledjobs.keda.sh.json",
+  "dist/cli/src/manifests/triggerauthentications.keda.sh.json",
+  "dist/cli/src/manifests/clustertriggerauthentications.keda.sh.json",
+  "dist/cli/src/manifests/cloudeventsources.eventing.keda.sh.json",
+  "dist/cli/src/manifests/clustercloudeventsources.eventing.keda.sh.json",
   "dist/cluster/node/pins.json",
   "dist/cluster/node/config-v3.toml.tmpl",
 ] as const;

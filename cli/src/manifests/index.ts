@@ -10,6 +10,7 @@ import { alasioObjects } from "./alasio.ts";
 import { collectorObjects } from "./collector.ts";
 import type { InstallConfig } from "./config.ts";
 import { grafanaObjects } from "./grafana.ts";
+import { kedaObjects } from "./keda.ts";
 import { lakeObjects } from "./lake.ts";
 import { neonObjects } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
@@ -22,13 +23,14 @@ export { NAMESPACE } from "./common.ts";
 
 /**
  * The objects of the installation `config` describes: the PriorityClasses its pods run
- * under, agent-sandbox's, alasio's, Neon's, the object store's, the lake's, Grafana's,
- * the telemetry collector's, workspace storage's, and the NetworkPolicies.
+ * under, agent-sandbox's, KEDA's, alasio's, Neon's, the object store's, the lake's,
+ * Grafana's, the telemetry collector's, workspace storage's, and the NetworkPolicies.
  */
 export function manifests(config: InstallConfig): readonly KubernetesObject[] {
   return [
     ...priorityClassObjects(),
     ...agentSandboxObjects(config),
+    ...kedaObjects(config),
     ...alasioObjects(config),
     ...neonObjects(config),
     ...objectStoreObjects(config),

@@ -48,6 +48,9 @@ TkSTLQIn6KoYEux2yKdaN5mfHmoLRMPnci6D99PDS1kWI7FWqIMLSwAf
 /** The bearer token the fake takes, and refuses requests without. */
 export const TOKEN = "fake-kube-token";
 
+/** How long a controller takes to let go of what it finalizes once it is deleted. */
+const FINALIZE_MS = 50;
+
 export type KubeObject = Record<string, unknown> & {
   apiVersion: string;
   kind: string;
@@ -101,6 +104,13 @@ export interface FakeKube {
   readonly failing: Set<string>;
   /** What a pod logs, by its name, or a container of it, by `<pod>/<container>`. */
   readonly logs: Map<string, string>;
+  /**
+   * The controllers that let go of what they finalize, by their finalizer: the path of the
+   * workload that does, which lets go of an object it finalizes a moment (FINALIZE_MS)
+   * after it is asked to delete it, if the workload is there then. An object with another
+   * finalizer, or whose controller is gone by then, stays, being deleted.
+   */
+  readonly finalizers: Map<string, string>;
   readonly execs: KubeExec[];
   /** How the test answers a command run in a container; exit 0, saying nothing, unless it says. */
   onExec: (exec: KubeExec) => KubeExecResult;
@@ -222,6 +232,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const stuck = new Set<string>();
   const failing = new Set<string>();
   const logs = new Map<string, string>();
+  const finalizers = new Map<string, string>();
   const execs: KubeExec[] = [];
   const forwards: KubeForward[] = [];
   const forwarded = new Map<string, number>();
@@ -332,6 +343,15 @@ export async function serveFakeKube(): Promise<FakeKube> {
     for (const each of gone) if (each.kind === "PersistentVolumeClaim") reclaim(each);
   };
 
+  /** Deletes what has been deleted for a moment that its controllers, which are there, let go of. */
+  const finalize = (): void => {
+    for (const [path, object] of [...objects]) {
+      const since = object.metadata["deletionTimestamp"] as string | undefined;
+      const held = (object.metadata["finalizers"] as string[] | undefined) ?? [];
+      if (since && Date.now() - Date.parse(since) >= FINALIZE_MS && held.every((finalizer) => objects.has(finalizers.get(finalizer) ?? ""))) remove(path, object);
+    }
+  };
+
   const handle = (request: IncomingMessage, body: Buffer, response: ServerResponse): void => {
     if (request.headers.authorization !== `Bearer ${TOKEN}`) return refuse(response, 401, "Unauthorized");
     const url = new URL(request.url ?? "/", "https://fake");
@@ -361,7 +381,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     if (method === "DELETE") {
       changes.push({ method, path, query: url.searchParams });
       if (!existing) return refuse(response, 404, `${target.plural} "${target.name}" not found`);
-      remove(path, existing);
+      if (((existing.metadata["finalizers"] as string[] | undefined) ?? []).length > 0) existing.metadata["deletionTimestamp"] ??= new Date().toISOString();
+      else remove(path, existing);
       return json(response, 200, { kind: "Status", apiVersion: "v1", status: "Success" });
     }
     if (method === "PATCH") {
@@ -382,7 +403,10 @@ export async function serveFakeKube(): Promise<FakeKube> {
   };
 
   const server = createServer({ cert: CERTIFICATE, key: KEY }, (request, response) => {
-    buffer(request).then((body) => handle(request, body, response), (error: unknown) => response.destroy(error as Error));
+    buffer(request).then((body) => {
+      finalize();
+      handle(request, body, response);
+    }, (error: unknown) => response.destroy(error as Error));
   });
   /**
    * A port-forward, upgraded to a websocket: what comes on its data channel is sent to the
@@ -459,6 +483,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     stuck,
     failing,
     logs,
+    finalizers,
     execs,
     onExec: () => ({ exitCode: 0 }),
     forwards,

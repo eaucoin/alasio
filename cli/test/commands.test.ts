@@ -425,7 +425,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const lake = await alasio(["logs", "lake"]);
   succeeded(lake);
   assert.deepEqual(lake.stdout.split("\n").filter(Boolean).sort(), ["[lake] loaded", "[query] taking queries"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, grafana, lake, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {

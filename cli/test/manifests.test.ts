@@ -34,6 +34,7 @@ import { Result } from "effect";
 
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
+import { memoryBytes } from "../src/branches.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
@@ -1427,6 +1428,46 @@ describe("scaling", () => {
     // A branch's alasio runs turns; its lake serves no alert, and its compute sleeps.
     const branch = new Map(podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName]));
     assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
+  });
+
+  test("installs KEDA as its release does, in alasio's namespace under alasio's names, restricted, pinned and small, on the floor; none where the cluster has its own", () => {
+    const objects = install();
+    assert.deepEqual(
+      all(objects, "CustomResourceDefinition").map(({ metadata }) => metadata?.name).filter((name) => name?.endsWith("keda.sh")).sort(),
+      ["cloudeventsources.eventing.keda.sh", "clustercloudeventsources.eventing.keda.sh", "clustertriggerauthentications.keda.sh", "scaledjobs.keda.sh", "scaledobjects.keda.sh", "triggerauthentications.keda.sh"],
+    );
+    for (const name of ["alasio-keda-operator", "alasio-keda-metrics-apiserver", "alasio-keda-admission-webhooks"]) {
+      const deployment = one<V1Deployment>(objects, "Deployment", name);
+      const pod = deployment.spec?.template.spec;
+      assert.equal(deployment.metadata?.namespace, "alasio");
+      assert.equal(pod?.priorityClassName, "alasio-floor");
+      assert.deepEqual(pod?.securityContext, { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: { type: "RuntimeDefault" } });
+      assert.deepEqual(container(deployment).securityContext, { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true });
+      assert.match(container(deployment).image ?? "", /^ghcr\.io\/kedacore\/keda[-a-z]*:2\.21\.0@sha256:[0-9a-f]{64}$/u, name);
+      assert.ok(memoryBytes(container(deployment).resources?.requests?.["memory"] ?? "") <= 64 * 2 ** 20, name);
+    }
+    const operator = container(one<V1Deployment>(objects, "Deployment", "alasio-keda-operator"));
+    for (const arg of ["--cert-secret-name=alasio-keda-certs", "--operator-service-name=alasio-keda-operator", "--metrics-server-service-name=alasio-keda-metrics-apiserver", "--webhooks-service-name=alasio-keda-admission-webhooks", "--validating-webhook-name=alasio-keda-admission"]) {
+      assert.ok(operator.args?.includes(arg), arg);
+    }
+    assert.ok(container(one<V1Deployment>(objects, "Deployment", "alasio-keda-metrics-apiserver")).args?.includes("--metrics-service-address=alasio-keda-operator.alasio.svc.cluster.local:9666"));
+    const apiService = one<KubernetesObject & { spec: { service: object } }>(objects, "APIService", "v1beta1.external.metrics.k8s.io");
+    assert.deepEqual(apiService.spec.service, { name: "alasio-keda-metrics-apiserver", namespace: "alasio" });
+    // It reads Secrets in its own namespace alone, and of those writes its certificate's alone.
+    const clusterRole = one<V1ClusterRole>(objects, "ClusterRole", "alasio-keda-operator");
+    assert.ok(!(clusterRole.rules ?? []).some(({ resources }) => resources?.includes("secrets") || resources?.includes("*")));
+    // It writes no Job, and of the cluster's webhooks and APIServices its own alone.
+    const writes = (resource: string) =>
+      (clusterRole.rules ?? []).filter(({ resources, verbs }) => resources?.includes(resource) && verbs.some((verb) => ["create", "update", "patch", "delete"].includes(verb))).map(({ resourceNames }) => resourceNames);
+    assert.deepEqual([writes("jobs"), writes("validatingwebhookconfigurations"), writes("apiservices")], [[], [["alasio-keda-admission"]], [["v1beta1.external.metrics.k8s.io"]]]);
+    assert.ok(operator.env?.some(({ name, value }) => name === "KEDA_RESTRICT_SECRET_ACCESS" && value === "true"));
+    const role = one<V1Role>(objects, "Role", "alasio-keda-operator");
+    for (const { resources, verbs, resourceNames } of role.rules ?? []) {
+      if (resources?.includes("secrets") && verbs.some((verb) => ["update", "patch", "delete"].includes(verb))) assert.deepEqual(resourceNames, ["alasio-keda-certs"]);
+    }
+
+    const without = install({ autoscaling: { keda: { enabled: false } } });
+    assert.deepEqual(without.filter(({ metadata }) => /keda/u.test(metadata?.name ?? "") || metadata?.name === "v1beta1.external.metrics.k8s.io").map(({ metadata }) => metadata?.name), []);
   });
 });
 

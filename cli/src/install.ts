@@ -1,8 +1,8 @@
 /**
  * Installing alasio from the operator's config: its install configuration, with the
  * Secrets alasio names as the cluster has them, made into its objects (its namespace,
- * which its Secrets are in before anything else of it is, and its manifests), applied,
- * and waited for.
+ * which its Secrets are in before anything else of it is, and its manifests), checked
+ * against the cluster's autoscalers, applied, and waited for.
  */
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
@@ -10,6 +10,7 @@ import { Effect, Result, Schema } from "effect";
 import { installConfigOf, type OperatorConfig, OperatorConfigError } from "./config.ts";
 import { KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
+import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
 import { labels, NAMESPACE } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
@@ -54,10 +55,12 @@ export interface Installed {
 export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
-): Effect.fn.Return<Installed, ApplyError | BotNotSet | OperatorConfigError, KubeApi> {
+): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | BotNotSet | OperatorConfigError, KubeApi> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
-  yield* applyInstallation(installationObjects(settings), options);
+  const objects = installationObjects(settings);
+  yield* checkAutoscalers(objects, settings.autoscaling.keda.enabled);
+  yield* applyInstallation(objects, options);
   return { bot, claude: settings.alasio.claude.existingSecret !== "" };
 });

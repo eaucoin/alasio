@@ -1,7 +1,7 @@
 /**
  * What alasio's npm package may hold (tooling/cli-package.ts): the built command line,
- * with the CRD it applies and the node's pins and containerd template, and nothing else; CI's package job checks the package npm
- * packs against it.
+ * with the CRDs it applies and the node's pins and containerd template, and nothing else;
+ * CI's package job checks the package npm packs against it.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -18,6 +18,12 @@ test("sources, tests and what is not built are refused, and what it needs is req
     "dist/cli/src/config.d.ts is not of the built command line",
     "dist/cli/test/commands.test.js is a test's",
     "dist/cli/src/manifests/sandboxes.agents.x-k8s.io.json is missing",
+    "dist/cli/src/manifests/scaledobjects.keda.sh.json is missing",
+    "dist/cli/src/manifests/scaledjobs.keda.sh.json is missing",
+    "dist/cli/src/manifests/triggerauthentications.keda.sh.json is missing",
+    "dist/cli/src/manifests/clustertriggerauthentications.keda.sh.json is missing",
+    "dist/cli/src/manifests/cloudeventsources.eventing.keda.sh.json is missing",
+    "dist/cli/src/manifests/clustercloudeventsources.eventing.keda.sh.json is missing",
     "dist/cluster/node/pins.json is missing",
     "dist/cluster/node/config-v3.toml.tmpl is missing",
   ]);

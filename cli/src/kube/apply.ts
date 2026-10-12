@@ -2,13 +2,17 @@
  * Applying an installation of alasio: its objects, every one labelled as the
  * installation's, server-side applied as alasio in the order what runs needs them: CRDs,
  * waited for until established; namespaces, and the cluster's classes of pods and
- * volumes and its CSI drivers; what pods run as and with; Jobs, each run to completion
- * afresh (the Neon setup, which makes the Secrets the stack mounts); then the workloads.
- * What the installation had and no longer has is deleted, but for what holds data and
- * what serves volumes that remain, and its workloads are waited for until they run.
+ * volumes and its CSI drivers; what pods run as and with, and where the API server
+ * reaches its extensions (APIServices, webhooks); Jobs, each run to completion afresh
+ * (the Neon setup, which makes the Secrets the stack mounts); the workloads; then what
+ * scales and sizes them, for KEDA and VPA, whose CRDs are established by then. What the
+ * installation had and no longer has is deleted, but for what holds data and what serves
+ * volumes that remain, and its workloads are waited for until they run.
  *
  * Removing it deletes what it has, by its label, but for what holds data unless that
- * goes too, and what serves volumes that remain. A CSI driver deletes its volumes' data,
+ * goes too, and what serves volumes that remain. What a controller of the installation
+ * holds with a finalizer (KEDA's ScaledObjects) is deleted first, and waited for, while
+ * the controller runs to let go of it. A CSI driver deletes its volumes' data,
  * so the driver, what it needs to (VOLUME_DRIVER_LABEL), and the StorageClasses of its
  * volumes go only once those volumes have: removing the data lets go of them first.
  */
@@ -35,9 +39,26 @@ export const VOLUME_DRIVER_LABEL = "alasio.dev/volume-driver";
 const PHASES: readonly (readonly KindName[])[] = [
   ["CustomResourceDefinition"],
   ["Namespace", "PriorityClass", "StorageClass", "CSIDriver"],
-  ["ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding", "ConfigMap", "PersistentVolumeClaim", "Service", "NetworkPolicy", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"],
+  [
+    "ServiceAccount",
+    "ClusterRole",
+    "ClusterRoleBinding",
+    "Role",
+    "RoleBinding",
+    "ConfigMap",
+    "PersistentVolumeClaim",
+    "Service",
+    "NetworkPolicy",
+    "PodDisruptionBudget",
+    "APIService",
+    "MutatingWebhookConfiguration",
+    "ValidatingWebhookConfiguration",
+    "ValidatingAdmissionPolicy",
+    "ValidatingAdmissionPolicyBinding",
+  ],
   ["Job"],
   ["Deployment", "StatefulSet", "DaemonSet", "CronJob"],
+  ["ScaledObject", "VerticalPodAutoscaler"],
 ];
 
 /** The kinds alasio makes, in the order it applies them. */
@@ -48,13 +69,24 @@ export const WORKLOADS: readonly KindName[] = ["Deployment", "StatefulSet", "Dae
 
 /**
  * What holds data, which neither a prune nor a removal deletes unless asked to: volumes,
- * the namespaces sessions' volumes are in, and the CRD whose deletion would delete every
- * Sandbox, and with them their volumes.
+ * the namespaces sessions' volumes are in, and CRDs, whose deletion deletes every object
+ * of theirs: every Sandbox, and with them their volumes.
  */
 const HOLDS_DATA: ReadonlySet<string> = new Set(["PersistentVolumeClaim", "Namespace", "CustomResourceDefinition"]);
 
 /** Whether `ref` holds data (HOLDS_DATA). */
 const holdsData = (ref: ObjectRef): boolean => HOLDS_DATA.has(ref.kind);
+
+/** What a controller of the installation finalizes: KEDA lets go of a ScaledObject once it has stopped scaling it. */
+const FINALIZED: ReadonlySet<string> = new Set(["ScaledObject"]);
+
+/** Deletes those of `objects` a controller finalizes (FINALIZED), and waits until they are gone. */
+const removeFinalized = Effect.fnUntraced(function*(objects: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
+  const kube = yield* KubeApi;
+  const finalized = objects.filter((object) => FINALIZED.has(object.kind ?? "")).map(refOf);
+  yield* Effect.forEach(finalized, (ref) => kube.remove(ref), { concurrency: 8, discard: true });
+  yield* awaitGone(finalized, options);
+});
 
 const SANDBOX = kind("Sandbox");
 const PERSISTENT_VOLUME = kind("PersistentVolume");
@@ -73,6 +105,9 @@ function servedBy(object: KubernetesObject, volumes: readonly V1PersistentVolume
 /** `volumes` as people read them: their names. */
 const namesOf = (volumes: readonly V1PersistentVolume[]): string => volumes.map(({ metadata }) => metadata?.name ?? "").join(", ");
 
+/** Whether `object` is the installation's, by its label. */
+export const ofInstallation = (object: KubernetesObject): boolean => object.metadata?.labels?.[INSTALLATION_LABEL] === RELEASE;
+
 /** `object`, labelled as the installation's. */
 export function labelled(object: KubernetesObject): KubernetesObject {
   return { ...object, metadata: { ...object.metadata, labels: { ...object.metadata?.labels, [INSTALLATION_LABEL]: RELEASE } } };
@@ -83,10 +118,10 @@ const key = (ref: ObjectRef): string => `${ref.apiVersion}/${ref.kind}/${ref.nam
 /** How applying an installation fails. */
 export type ApplyError = KubeApiError | NotReadyInTime | RolloutFailed;
 
-/** The installation's objects of `kinds`, as it has them now. */
+/** The installation's objects of `kinds`, as it has them now: none of a kind whose CRD the cluster lacks. */
 const installed = (kinds: readonly Kind[]): Effect.Effect<KubernetesObject[], KubeApiError, KubeApi> =>
   Effect.flatMap(KubeApi, (kube) =>
-    Effect.forEach(kinds, (each) => kube.list(each, { labelSelector: INSTALLATION_SELECTOR }), { concurrency: 4 }).pipe(
+    Effect.forEach(kinds, (each) => kube.list(each, { labelSelector: INSTALLATION_SELECTOR }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([]))), { concurrency: 4 }).pipe(
       Effect.map((lists) => lists.flat()),
     ));
 
@@ -108,14 +143,18 @@ const runJob = Effect.fnUntraced(function*(job: KubernetesObject, options: WaitO
   yield* kube.remove(ref);
 });
 
-/** Deletes the installation's objects that are not `desired`, keeping what holds data and what serves volumes that remain. */
-const prune = Effect.fnUntraced(function*(desired: readonly KubernetesObject[]): Effect.fn.Return<void, KubeApiError, KubeApi> {
+/**
+ * Deletes the installation's objects that are not `desired`, keeping what holds data and
+ * what serves volumes that remain; what a controller finalizes first, until it is gone.
+ */
+const prune = Effect.fnUntraced(function*(desired: readonly KubernetesObject[], options: WaitOptions): Effect.fn.Return<void, ApplyError, KubeApi> {
   const kube = yield* KubeApi;
   const wanted = new Set(desired.map((object) => key(refOf(object))));
   // Workloads first, what they need after.
   const stale = (yield* installed(MADE_KINDS.toReversed())).filter((object) => !wanted.has(key(refOf(object))));
+  yield* removeFinalized(stale, options);
   const volumes = stale.length > 0 ? yield* persistentVolumes : [];
-  for (const object of stale) {
+  for (const object of stale.filter(({ kind }) => !FINALIZED.has(kind ?? ""))) {
     const ref = refOf(object);
     const served = servedBy(object, volumes);
     if (holdsData(ref)) {
@@ -157,7 +196,7 @@ export const applyInstallation = Effect.fnUntraced(function*(
 ): Effect.fn.Return<void, ApplyError, KubeApi> {
   const desired = objects.map(labelled);
   yield* applyPhases(desired, options);
-  yield* prune(desired);
+  yield* prune(desired, options);
   yield* awaitReady(workloadsOf(desired), options);
 });
 
@@ -208,6 +247,7 @@ export const removeInstallation = Effect.fnUntraced(function*(
   options: WaitOptions,
 ): Effect.fn.Return<readonly ObjectRef[], KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> {
   const kube = yield* KubeApi;
+  yield* removeFinalized(yield* installed(MADE_KINDS.filter(({ kind }) => FINALIZED.has(kind))), options);
   const found = yield* installed(MADE_KINDS.toReversed());
   if (purge) yield* releaseVolumes(found, options);
   const volumes = yield* persistentVolumes;

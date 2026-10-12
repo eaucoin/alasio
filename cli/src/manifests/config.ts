@@ -460,6 +460,44 @@ const AgentSandbox = Schema.Struct({
   affinity: Affinity,
 });
 
+/** A container of a controller alasio installs: its pinned image and its resources. */
+const ControllerContainer = (image: Parameters<typeof Image>[0], resources: Parameters<typeof Resources>[0]) =>
+  defaulted(Schema.Struct({ image: Image(image), resources: Resources(resources) }), {});
+
+/**
+ * How alasio's components scale: KEDA, which moves a component's replicas between its
+ * scale's min and max on what its ScaledObject names; VPA, which sizes every workload's
+ * requests from what it uses; each installed once per cluster, and off where the cluster
+ * has its own already, which alasio then uses; and headroom.
+ */
+const Autoscaling = Schema.Struct({
+  /**
+   * KEDA (kedacore/keda v2.21.0), as its release's manifest installs it, but that it reads
+   * Secrets in its own namespace alone, and of what ScaledObjects scale, Deployments and
+   * StatefulSets, and runs no ScaledJob's Jobs (./keda.ts): a cluster whose ScaledObjects
+   * scale custom resources, or authenticate through TriggerAuthentications in their own
+   * namespaces, or whose ScaledJobs run, brings a KEDA of its own, which enabled false uses.
+   */
+  keda: defaulted(
+    Schema.Struct({
+      enabled: defaulted(Schema.Boolean, true),
+      operator: ControllerContainer(
+        { repository: "ghcr.io/kedacore/keda", tag: "2.21.0", digest: "sha256:81fe6547ce8d1cc29273f887b76507e9b853e5bc1f875ec23fe60061a38ed809" },
+        { requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+      ),
+      metricsApiServer: ControllerContainer(
+        { repository: "ghcr.io/kedacore/keda-metrics-apiserver", tag: "2.21.0", digest: "sha256:255375037fe592732eeb554743aae360c2da88cf0b9b1258d0a987ef885f0881" },
+        { requests: { cpu: "10m", memory: "48Mi" }, limits: { memory: "256Mi" } },
+      ),
+      admissionWebhooks: ControllerContainer(
+        { repository: "ghcr.io/kedacore/keda-admission-webhooks", tag: "2.21.0", digest: "sha256:e1969628cca6123e32eea13c47c75817091af2657fa68d9d0d58a8620d1b75b1" },
+        { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
+      ),
+    }),
+    {},
+  ),
+});
+
 /** What a configuration must also hold, given what it turns off: the issue of the first it lacks. */
 function completeness(config: typeof InstallStruct.Type): { readonly path: ReadonlyArray<string>; readonly issue: string } | undefined {
   if (!config.neon.enabled && !config.neon.external.existingSecret) {
@@ -516,6 +554,7 @@ const InstallStruct = Schema.Struct({
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */
   networkPolicies: defaulted(Schema.Struct({ enabled: defaulted(Schema.Boolean, true) }), {}),
   agentSandbox: defaulted(AgentSandbox, {}),
+  autoscaling: defaulted(Autoscaling, {}),
 });
 
 /** The install configuration: what the config file holds, every key left out its default. */
