@@ -1,0 +1,50 @@
+name: gate-06
+
+# 06's gate (gate/06/proxy.test.ts), on its track's branch alone, whenever what it runs
+# changes: alasio installed in Docker on the runner, its images built here, as the
+# end-to-end run without a registry does.
+on:
+  push:
+    branches: [track/wave0-gates]
+    paths: [.github/workflows/gate-06.yml, gate/06/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      # As ci.yml's end-to-end jobs: the cluster's images need the disk the runner's
+      # preinstalled software holds.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix neon/lake
+      # libpq's clients at the compute's major, for pg_dump.
+      - name: PostgreSQL 17's clients
+        run: |
+          sudo apt-get install --yes postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install --yes postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >>"$GITHUB_PATH"
+      - run: node --test --test-timeout=7200000 gate/06/proxy.test.ts
+        env:
+          ALASIO_E2E_TARGET: docker
+          ALASIO_E2E_AGENTS: 0
+          GATE_OUT: ${{ runner.temp }}/gate-06
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-06
+          path: ${{ runner.temp }}/gate-06
