@@ -1,0 +1,125 @@
+name: gate-11
+
+# 11's gate (gate/11/restore.test.ts), on its track's branch alone, whenever what it runs
+# changes: alasio up on k3s on the runner, the host target, from the images this run
+# builds, and a real session pod saved by runsc beside gVisor's shim and restored into a
+# new pod of its Sandbox through the fork's restore annotation.
+on:
+  push:
+    branches: [track/snapshots-gate]
+    paths: [.github/workflows/gate-11.yml, gate/11/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # As ci.yml's: the run's images, which its last job deletes.
+  REGISTRY: ghcr.io/eaucoin/alasio-ci
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      registry: ${{ steps.push.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # As ci.yml's images job builds and pushes them.
+      - id: push
+        name: Build and push the images
+        shell: bash
+        env:
+          PUSH_TO: ${{ env.REGISTRY }}/run-${{ github.run_id }}-${{ github.run_attempt }}
+          SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          declare -A pids
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
+            name=${image%%:*}
+            args=()
+            [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
+            {
+              docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
+                docker push "$PUSH_TO/$name:e2e" &&
+                if [ "$name" = alasio ]; then
+                  docker build --file test/e2e/codex-stand-in.Dockerfile --build-arg "ALASIO=$PUSH_TO/alasio:e2e" \
+                    --tag "$PUSH_TO/alasio-codex-stand-in:e2e" --label "org.opencontainers.image.source=$SOURCE" test &&
+                    docker push "$PUSH_TO/alasio-codex-stand-in:e2e"
+                fi
+            } 2>&1 | sed -u "s/^/$name: /" &
+            pids[$name]=$!
+          done
+          failed=0
+          for name in "${!pids[@]}"; do
+            wait "${pids[$name]}" || { echo "::error::$name was not built and pushed"; failed=1; }
+          done
+          echo "registry=$PUSH_TO" >>"$GITHUB_OUTPUT"
+          exit "$failed"
+
+  restore:
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      # As ci.yml's end-to-end jobs free it: the cluster holds far more than a runner
+      # starts with free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az
+          docker system prune --all --force
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: node --test --test-timeout=10800000 gate/11/restore.test.ts
+        env:
+          ALASIO_E2E_TARGET: host
+          ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+          OUT: ${{ runner.temp }}/gate-11
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-11
+          path: ${{ runner.temp }}/gate-11
+
+  delete-images:
+    needs: [images, restore]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the run's images
+        shell: bash
+        run: |
+          failed=0
+          for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node alasio-codex-stand-in; do
+              package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
+              if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
+                echo "deleted $REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
+              elif [[ $said != *"HTTP 404"* ]]; then
+                echo "::error::$package was not deleted: $said"
+                failed=1
+              fi
+            done
+          done
+          exit "$failed"
