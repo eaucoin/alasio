@@ -59,6 +59,13 @@ export type KubeObject = Record<string, unknown> & {
   status?: Record<string, unknown>;
 };
 
+/** What a manager owns of an object, as its managedFields say it, under spec alone. */
+interface ManagedFields {
+  readonly manager: string;
+  readonly operation: string;
+  readonly fieldsV1: { readonly "f:spec"?: Readonly<Record<string, object>> };
+}
+
 /** A change the fake was asked for: its method, its path, and the content type and query of a patch. */
 export interface KubeChange {
   readonly method: string;
@@ -392,7 +399,22 @@ export async function serveFakeKube(): Promise<FakeKube> {
       if (contentType === "application/merge-patch+json" && !existing) return refuse(response, 404, `${target.plural} "${target.name}" not found`);
       version += 1;
       const base: KubeObject = existing ?? { ...patch, metadata: { ...patch.metadata, uid: `uid-${version}`, generation: 0, creationTimestamp: new Date().toISOString() } };
-      const next = (contentType === "application/apply-patch+yaml" ? { ...base, ...patch, metadata: { ...base.metadata, ...patch.metadata } } : merged(base, patch)) as KubeObject;
+      const applied = contentType === "application/apply-patch+yaml";
+      const next = (applied ? { ...base, ...patch, spec: { ...base.spec, ...patch.spec }, metadata: { ...base.metadata, ...patch.metadata } } : merged(base, patch)) as KubeObject;
+      if (applied) {
+        // Server-side apply's ownership, of what is under spec: each applying manager owns
+        // the fields it gave last, and one it no longer gives, which no other manager owns,
+        // is deleted.
+        const manager = url.searchParams.get("fieldManager") ?? "";
+        const fields = (object: KubeObject) => Object.keys(object.spec ?? {}).map((key) => `f:${key}`);
+        const owners = ((base.metadata["managedFields"] as ManagedFields[] | undefined) ?? []).filter((entry) => entry.manager !== manager);
+        const given = fields(patch);
+        const before = ((base.metadata["managedFields"] as ManagedFields[] | undefined) ?? []).find((entry) => entry.manager === manager);
+        for (const field of Object.keys(before?.fieldsV1["f:spec"] ?? {})) {
+          if (!given.includes(field) && !owners.some((entry) => field in (entry.fieldsV1["f:spec"] ?? {}))) delete (next.spec as Record<string, unknown>)[field.slice(2)];
+        }
+        next.metadata["managedFields"] = [...owners, { manager, operation: "Apply", fieldsV1: { "f:spec": Object.fromEntries(given.map((field) => [field, {}])) } }];
+      }
       const specChanged = JSON.stringify(next.spec) !== JSON.stringify(existing?.spec);
       next.metadata = { ...next.metadata, resourceVersion: String(version), generation: (base.metadata.generation ?? 0) + (specChanged || !existing ? 1 : 0) };
       settle(next);

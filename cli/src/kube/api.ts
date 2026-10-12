@@ -184,14 +184,14 @@ export interface ExecStreams {
 }
 
 /** The manager alasio applies its objects as, which owns every field it sets. */
-const FIELD_MANAGER = "alasio";
+export const FIELD_MANAGER = "alasio";
 
 /** The Kubernetes API a kubeconfig reaches, as alasio's command line calls it. */
 export class KubeApi extends Context.Service<KubeApi, {
   /** The API server's URL. */
   readonly server: string;
-  /** Server-side applies `object` as FIELD_MANAGER, taking over fields other managers set: the object as applied. */
-  readonly apply: (object: KubernetesObject) => Effect.Effect<KubernetesObject, KubeApiError>;
+  /** Server-side applies `object` as `fieldManager` (FIELD_MANAGER unless given), taking over fields other managers set: the object as applied. */
+  readonly apply: (object: KubernetesObject, fieldManager?: string) => Effect.Effect<KubernetesObject, KubeApiError>;
   /** The object, or null when there is none. */
   readonly get: <T extends KubernetesObject = KubernetesObject>(ref: ObjectRef) => Effect.Effect<T | null, KubeApiError>;
   readonly list: <T extends KubernetesObject = KubernetesObject>(kind: Kind, options?: ListOptions) => Effect.Effect<readonly T[], KubeApiError>;
@@ -373,11 +373,11 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
 
   return KubeApi.of({
     server: server.href.replace(/\/$/u, ""),
-    apply: (object) =>
+    apply: (object, fieldManager = FIELD_MANAGER) =>
       json({
         method: "PATCH",
         path: objectPath(refOf(object)),
-        query: { fieldManager: FIELD_MANAGER, force: "true" },
+        query: { fieldManager, force: "true" },
         // JSON is YAML, which an apply patch is sent as.
         body: { contentType: "application/apply-patch+yaml", content: object },
       }),

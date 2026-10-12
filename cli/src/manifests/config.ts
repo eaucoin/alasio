@@ -571,9 +571,17 @@ const InstallStruct = Schema.Struct({
     }),
     {},
   ),
-  /** Grafana, with the lake: dashboards and alerts on it, alerting through the Telegram bot; alasio grafana reaches it. */
+  /**
+   * Grafana, with the lake: dashboards and alerts on it, alerting through the Telegram bot;
+   * alasio grafana reaches it. Two replicas or more are its high availability, which sends
+   * each alert once; min and max apart scale it on its CPU.
+   */
   grafana: defaulted(
-    Schema.Struct({ enabled: defaulted(Schema.Boolean, true), resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "768Mi" } }) }),
+    Schema.Struct({
+      enabled: defaulted(Schema.Boolean, true),
+      scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
+      resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "768Mi" } }),
+    }),
     {},
   ),
   /** NetworkPolicies confining sessions, folder workspaces' bayma and Neon. */

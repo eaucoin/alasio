@@ -47,6 +47,7 @@ import {
   waitForObjectStore,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { replicaBudget, spread } from "./disruption.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -281,17 +282,12 @@ function storageController(config: InstallConfig): KubernetesObject[] {
 /**
  * The safekeepers: a timeline's WAL, each on its own volume, at stable names neon-control
  * registers them by, which resolve before they are ready, as the controller needs. They
- * spread across nodes and zones where the cluster has them, so a quorum survives one.
+ * spread across nodes and zones where the cluster has them, so a quorum survives one, and
+ * a drain stops one of them at a time.
  */
 function safekeepers(config: InstallConfig): KubernetesObject[] {
   const name = neonName("safekeeper");
   const component = "neon-safekeeper";
-  const spread = (topologyKey: string) => ({
-    maxSkew: 1,
-    topologyKey,
-    whenUnsatisfiable: "ScheduleAnyway",
-    labelSelector: { matchLabels: selectorLabels(component) },
-  });
   const headless: V1Service = {
     apiVersion: "v1",
     kind: "Service",
@@ -314,7 +310,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           ...given("initContainers", waitForObjectStore(config)),
-          topologySpreadConstraints: [spread("kubernetes.io/hostname"), spread("topology.kubernetes.io/zone")],
+          ...spread(component, config.neon.safekeepers.scaling),
           containers: [{
             name: "safekeeper",
             image: imageReference(config.neon.image),
@@ -370,7 +366,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(config.neon.safekeepers.storage) }],
     },
   };
-  return [headless, statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
+  return [headless, statefulSet, ...replicaBudget(component, NAMESPACE, config.neon.safekeepers.scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /**

@@ -36,6 +36,7 @@ import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/branches.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
+import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
@@ -553,7 +554,8 @@ describe("Grafana", () => {
 
   test("runs one Grafana, from its image, on its database in the compute, alerting through the bot, keeping nothing", () => {
     const grafana = one<V1Deployment>(install({ images: { grafana: { tag: "1.2.3" } } }), "Deployment", "alasio-grafana");
-    assert.deepEqual([grafana.spec?.replicas, grafana.spec?.strategy?.type], [1, "Recreate"]);
+    // Of one replica, stopped before its successor starts, so no two send an alert.
+    assert.deepEqual([grafana.spec?.replicas, grafana.spec?.strategy], [1, { type: "Recreate" }]);
     const pod = grafana.spec?.template.spec;
     assert.deepEqual([pod?.automountServiceAccountToken, pod?.securityContext?.runAsUser], [false, 472]);
     assert.equal(container(grafana).image, "ghcr.io/eaucoin/alasio-grafana:1.2.3");
@@ -567,6 +569,50 @@ describe("Grafana", () => {
     assert.deepEqual(container(grafana).envFrom, [{ secretRef: { name: "alasio-grafana" } }]);
     assert.equal(container(grafana).securityContext?.readOnlyRootFilesystem, true);
     assert.ok(pod?.volumes?.every(({ emptyDir }) => emptyDir), "no volume but emptyDirs");
+  });
+
+  test("runs Grafana highly available when asked: its replicas gossip, admitted to each other alone, one evaluating, spread, one evicted at a time", () => {
+    const objects = install({ grafana: { scaling: { min: 2, max: 2 } } });
+    const grafana = one<V1Deployment>(objects, "Deployment", "alasio-grafana");
+    assert.equal(grafana.spec?.replicas, 2);
+    // Rolled out a pod at a time, the new one ready before the old stops.
+    assert.deepEqual(grafana.spec?.strategy, { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } });
+    const env = Object.fromEntries((container(grafana).env ?? []).map(({ name, value }) => [name, value]));
+    assert.deepEqual(
+      [env["GF_UNIFIED_ALERTING_HA_PEERS"], env["GF_UNIFIED_ALERTING_HA_ADVERTISE_ADDRESS"], env["GF_UNIFIED_ALERTING_HA_SINGLE_NODE_EVALUATION"]],
+      ["alasio-grafana-peers.alasio.svc.cluster.local:9094", "$(POD_IP):9094", "true"],
+    );
+    const peers = one<V1Service>(objects, "Service", "alasio-grafana-peers");
+    assert.deepEqual([peers.spec?.clusterIP, peers.spec?.publishNotReadyAddresses, peers.spec?.ports?.map(({ protocol }) => protocol)], ["None", true, ["TCP", "UDP"]]);
+    assert.deepEqual(grafana.spec?.template.spec?.topologySpreadConstraints?.map(({ topologyKey }) => topologyKey), ["kubernetes.io/hostname", "topology.kubernetes.io/zone"]);
+    assert.deepEqual(one<KubernetesObject & { spec: object }>(objects, "PodDisruptionBudget", "alasio-grafana").spec, {
+      maxUnavailable: 1,
+      selector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "grafana" } },
+    });
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    const pod = { namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: grafana.spec?.template.metadata?.labels ?? {} };
+    const alasio = { ...pod, labels: one<V1Deployment>(objects, "Deployment", "alasio").spec?.template.metadata?.labels ?? {} };
+    assert.deepEqual([admits(policies, pod, pod, 9094), admits(policies, alasio, pod, 9094), admits(policies, pod, pod, 3000)], [true, false, false]);
+    // Of one replica, none of that.
+    const single = install();
+    assert.deepEqual(all(single, "PodDisruptionBudget").map(({ metadata }) => metadata?.name), ["alasio-neon-safekeeper"]);
+    assert.equal(all(single, "Service").find(({ metadata }) => metadata?.name === "alasio-grafana-peers"), undefined);
+    assert.equal(container(one<V1Deployment>(single, "Deployment", "alasio-grafana")).env?.find(({ name }) => name.startsWith("GF_UNIFIED_ALERTING_HA")), undefined);
+  });
+
+  test("scales Grafana on its CPU between min and max, by KEDA, which owns its replicas", () => {
+    const objects = install({ grafana: { scaling: { min: 1, max: 3 } } });
+    const grafana = one<V1Deployment>(objects, "Deployment", "alasio-grafana");
+    assert.equal(grafana.spec?.replicas, undefined);
+    assert.deepEqual(one<ScaledObject>(objects, "ScaledObject", "alasio-grafana").spec, {
+      scaleTargetRef: { apiVersion: "apps/v1", kind: "Deployment", name: "alasio-grafana" },
+      minReplicaCount: 1,
+      maxReplicaCount: 3,
+      triggers: [{ type: "cpu", metricType: "Utilization", metadata: { value: "80" } }],
+    });
+    // VPA sizes its memory alone, as its CPU is what it scales on.
+    assert.deepEqual(one<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler", "alasio-grafana").spec.resourcePolicy.containerPolicies.map((policy) => (policy as { controlledResources?: string[] }).controlledResources), [["memory"]]);
+    assert.deepEqual(all(install(), "ScaledObject"), []);
   });
 
   test("starts Grafana once it can log in to its database, which alasio lets it once the database is made", () => {

@@ -44,8 +44,12 @@ export interface VerticalPodAutoscaler extends KubernetesObject {
   readonly status?: { readonly recommendation?: { readonly containerRecommendations?: readonly { readonly containerName: string; readonly target?: Readonly<Record<string, string>> }[] } };
 }
 
-/** The VerticalPodAutoscaler of `workload`, sized as `sizing` says. */
-export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V1DaemonSet, sizing: Sizing): VerticalPodAutoscaler {
+/**
+ * The VerticalPodAutoscaler of `workload`, sized as `sizing` says, of its `controlled`
+ * resources: of memory alone where what scales it scales on its CPU, as the two would
+ * chase each other.
+ */
+export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V1DaemonSet, sizing: Sizing, controlled: readonly ("cpu" | "memory")[] = ["cpu", "memory"]): VerticalPodAutoscaler {
   const containers: readonly V1Container[] = workload.spec?.template.spec?.containers ?? [];
   return {
     apiVersion: "autoscaling.k8s.io/v1",
@@ -58,7 +62,13 @@ export function verticalPodAutoscaler(workload: V1Deployment | V1StatefulSet | V
       resourcePolicy: {
         containerPolicies: containers.map(({ name, resources }) => {
           const memory = resources?.limits?.["memory"];
-          return { containerName: name, minAllowed: MIN_ALLOWED, ...(memory ? { maxAllowed: { memory } } : {}), controlledValues: "RequestsOnly" };
+          return {
+            containerName: name,
+            ...(controlled.length < 2 ? { controlledResources: controlled } : {}),
+            minAllowed: MIN_ALLOWED,
+            ...(memory ? { maxAllowed: { memory } } : {}),
+            controlledValues: "RequestsOnly",
+          };
         }),
       },
     },

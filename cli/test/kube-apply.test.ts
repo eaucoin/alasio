@@ -256,6 +256,48 @@ test("what scales a workload is applied after the workloads, and a ScaledObject,
   assert.ok(deleted.lastIndexOf(path) < deleted.lastIndexOf(operator));
 });
 
+test("a workload whose scale becomes a range keeps the replicas it runs as its scaler takes them over, rather than dropping to one", async (t) => {
+  const { kube, run } = await rig(t);
+  const grafana = "/apis/apps/v1/namespaces/alasio/deployments/alasio-grafana";
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 2, max: 2 } } }), WAIT));
+  const before = kube.changes.length;
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 2, max: 4 } } }), WAIT));
+  assert.equal(kube.get(grafana)?.spec?.["replicas"], 2);
+  const handedOver = kube.changes.slice(before).filter(({ path, query }) => path === grafana && query.get("fieldManager") === "alasio-handover");
+  assert.equal(handedOver.length, 1);
+  // Once handed over, applying again hands nothing over.
+  const again = kube.changes.length;
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 2, max: 4 } } }), WAIT));
+  assert.deepEqual(kube.changes.slice(again).filter(({ query }) => query.get("fieldManager") === "alasio-handover"), []);
+});
+
+test("a scaler no longer wanted is gone before the workloads it scaled are applied, so it sets none of their replicas back", async (t) => {
+  const { kube, run } = await rig(t);
+  const scaledObject = "/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio-grafana";
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 1, max: 3 } } }), WAIT));
+  assert.ok(kube.get(scaledObject));
+  const before = kube.changes.length;
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 2, max: 2 } } }), WAIT));
+  const changes = kube.changes.slice(before).map(({ method, path }) => `${method} ${path}`);
+  assert.ok(changes.indexOf(`DELETE ${scaledObject}`) >= 0 && changes.indexOf(`DELETE ${scaledObject}`) < changes.findIndex((change) => change.startsWith("PATCH /apis/apps/v1/")));
+  assert.equal(kube.get(scaledObject), undefined);
+  assert.equal(kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-grafana")?.spec?.["replicas"], 2);
+});
+
+test("a ScaledObject whose controller does not run to let go of it is let go of, saying so, rather than waited for until the timeout", async (t) => {
+  const { kube, progress, run } = await rig(t);
+  // KEDA's finalizer, of an operator that is not there.
+  kube.finalizers.set("finalizer.keda.sh", "/apis/apps/v1/namespaces/elsewhere/deployments/keda-operator");
+  const path = "/apis/keda.sh/v1alpha1/namespaces/alasio/scaledobjects/alasio-grafana";
+  await run(applyInstallation(objectsOf({ grafana: { scaling: { min: 1, max: 3 } } }), WAIT));
+  const applied = kube.get(path);
+  assert.ok(applied);
+  applied.metadata["finalizers"] = ["finalizer.keda.sh"];
+  await run(applyInstallation(objectsOf(), WAIT));
+  assert.equal(kube.get(path), undefined);
+  assert.ok(progress.includes("letting go of ScaledObject alasio/alasio-grafana, as its controller has not within 2s"));
+});
+
 test("classes and CSI drivers are applied with the namespaces, before what uses them; DaemonSets with the workloads, waited for", async (t) => {
   const { kube, run } = await rig(t);
   const objects = [...objectsOf(), ...driverObjects()];

@@ -23,6 +23,8 @@ import {
   selectorLabels,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { replicated } from "./disruption.ts";
+import { GOSSIP_PORT } from "./grafana.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
@@ -184,14 +186,16 @@ function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
 }
 
 /**
- * Grafana takes no connection: `alasio grafana` reaches it through the API server's
- * port-forward, which no NetworkPolicy sees. It reaches the cluster's DNS, its database
- * on the compute and the lake's query endpoint, each of which admits it, and Telegram's
- * Bot API, as alasio does, on the internet's HTTPS port; nothing else, and no other
- * address of the cluster or its network.
+ * Grafana takes no connection but its replicas' gossip, where it may run several:
+ * `alasio grafana` reaches it through the API server's port-forward, which no
+ * NetworkPolicy sees. It reaches the cluster's DNS, its database on the compute and the
+ * lake's query endpoint, each of which admits it, its replicas, and Telegram's Bot API, as
+ * alasio does, on the internet's HTTPS port; nothing else, and no other address of the
+ * cluster or its network.
  */
-function grafanaPolicies({ sessions }: InstallConfig): NetworkPolicy[] {
+function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): NetworkPolicy[] {
   const grafana = { podSelector: { matchLabels: selectorLabels("grafana") } };
+  const gossip = replicated(scaling) ? [{ protocol: "TCP", port: GOSSIP_PORT }, { protocol: "UDP", port: GOSSIP_PORT }] : [];
   const admitted = (component: string, port: number): NetworkPolicy =>
     policy(componentName(`${component}-from-grafana`), NAMESPACE, component, {
       podSelector: { matchLabels: selectorLabels(component) },
@@ -202,7 +206,9 @@ function grafanaPolicies({ sessions }: InstallConfig): NetworkPolicy[] {
     policy(componentName("grafana"), NAMESPACE, "grafana", {
       ...grafana,
       policyTypes: ["Ingress", "Egress"],
+      ...(gossip.length > 0 ? { ingress: [{ from: [grafana], ports: gossip }] } : {}),
       egress: [
+        ...(gossip.length > 0 ? [{ to: [grafana], ports: gossip }] : []),
         {
           to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
           ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
