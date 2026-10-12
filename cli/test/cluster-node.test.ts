@@ -47,7 +47,9 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
     "service-cidr": "10.43.0.0/16",
     "default-local-storage-path": "/home/op/.local/share/alasio/storage",
     "kubelet-arg": [
-      "eviction-hard=imagefs.available<5%,nodefs.available<5%",
+      "kube-reserved=cpu=250m,memory=1Gi",
+      "system-reserved=cpu=250m,memory=512Mi",
+      "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<500Mi",
       "eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
       "image-gc-high-threshold=98",
       "image-gc-low-threshold=95",

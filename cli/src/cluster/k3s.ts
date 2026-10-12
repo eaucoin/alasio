@@ -36,12 +36,20 @@ export interface Registries {
 }
 
 /**
- * kubelet's settings, as its arguments say them, for a machine whose disk the cluster
- * shares with everything else on it: it evicts only when the disk is nearly full, and
- * collects unused images only then, so images in use are not evicted.
+ * kubelet's settings, as its arguments say them, for a machine the cluster shares with
+ * everything else on it:
+ *
+ * - its disk: kubelet evicts only when the disk is nearly full, and collects unused images
+ *   only then, so images in use are not evicted;
+ * - its memory: what k3s itself takes (its server, containerd and the containers' shims,
+ *   about 1.3 GB) and the system beside it are reserved, so pods are scheduled against
+ *   what is left rather than the whole machine; and kubelet evicts pods, lowest priority
+ *   first, while 500 MiB is still free, before the kernel kills a process of its choosing.
  */
 export const KUBELET_ARGS: readonly string[] = [
-  "eviction-hard=imagefs.available<5%,nodefs.available<5%",
+  "kube-reserved=cpu=250m,memory=1Gi",
+  "system-reserved=cpu=250m,memory=512Mi",
+  "eviction-hard=imagefs.available<5%,nodefs.available<5%,memory.available<500Mi",
   "eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
   "image-gc-high-threshold=98",
   "image-gc-low-threshold=95",
