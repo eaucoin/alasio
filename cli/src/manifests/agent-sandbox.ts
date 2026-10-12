@@ -18,6 +18,7 @@ import type {
 import { given, NAMESPACE, ONE, RELEASE, replicasOf } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 import sandboxes from "./sandboxes.agents.x-k8s.io.json" with { type: "json" };
 
 /**
@@ -104,7 +105,7 @@ function controller(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [serviceAccount, clusterRole, clusterRoleBinding, role, roleBinding, deployment];
+  return [serviceAccount, clusterRole, clusterRoleBinding, role, roleBinding, deployment, verticalPodAutoscaler(deployment, "InPlace")];
 }
 
 /** agent-sandbox's objects, unless the cluster already has it. */

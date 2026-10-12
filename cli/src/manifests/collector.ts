@@ -35,6 +35,7 @@ import {
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
 import { LAKE_INTAKE_PORT } from "./lake.ts";
 import { VALKEY, VALKEY_PORT } from "./valkey.ts";
@@ -217,7 +218,8 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  if (!workspaceStorage.enabled) return [configMap, service, deployment];
+  const sized = [deployment, verticalPodAutoscaler(deployment, "InPlace")];
+  if (!workspaceStorage.enabled) return [configMap, service, ...sized];
   // Who the collector is, and that it may find JuiceFS's pods in the driver's namespace.
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
   const driverMetadata = { ...metadata, namespace: workspaceStorage.csi.namespace };
@@ -234,5 +236,5 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
     subjects: [{ kind: "ServiceAccount", name: COLLECTOR, namespace: NAMESPACE }],
     roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: COLLECTOR },
   };
-  return [serviceAccount, role, binding, configMap, service, deployment];
+  return [serviceAccount, role, binding, configMap, service, ...sized];
 }

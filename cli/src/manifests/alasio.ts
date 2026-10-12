@@ -50,6 +50,7 @@ import {
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 import { cloneJob } from "./workspace-storage.ts";
 
 /** The port every workspace's bayma serves MCP on. */
@@ -526,11 +527,14 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
 /** The objects of the alasio of `environment`, main's unless a branch environment's. */
 export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
   const templates = sandboxTemplates(config, environment);
+  const alasio = deployment(config, templates.checksum, environment);
   return [
     ...namespaces(config, environment),
     ...identity(config, environment),
     templates.configMap,
-    deployment(config, templates.checksum, environment),
+    alasio,
+    // It runs turns, in its harnesses, which a recreation would end.
+    verticalPodAutoscaler(alasio, "Recommended"),
     telemetryService(config, environment),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
     // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.

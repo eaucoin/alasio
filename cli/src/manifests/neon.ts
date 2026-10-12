@@ -49,6 +49,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 import { VALKEY_ADDRESS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** A Service of the stack's: its name and component, selecting the component's pods, on `ports`, main's unless of `environment`. */
@@ -185,7 +186,7 @@ function controllerDb(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(config.neon.controllerDb.storage) }],
     },
   };
-  return [service(name, component, [{ name: "postgres", port: 5432 }]), statefulSet];
+  return [service(name, component, [{ name: "postgres", port: 5432 }]), statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /** The storage broker, through which safekeepers and the pageserver learn of each other's progress. */
@@ -218,7 +219,7 @@ function storageBroker(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service(name, component, [{ name: "grpc", port: 50051 }]), deployment];
+  return [service(name, component, [{ name: "grpc", port: 50051 }]), deployment, verticalPodAutoscaler(deployment, "InPlace")];
 }
 
 /** The storage controller: one at a time, as it leads the storage it controls; strict, every timeline on every safekeeper. */
@@ -274,7 +275,7 @@ function storageController(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service(name, component, [{ name: "http", port: 1234 }]), deployment];
+  return [service(name, component, [{ name: "http", port: 1234 }]), deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }
 
 /**
@@ -369,7 +370,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(config.neon.safekeepers.storage) }],
     },
   };
-  return [headless, statefulSet];
+  return [headless, statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /**
@@ -432,7 +433,7 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(config.neon.pageserver.storage) }],
     },
   };
-  return [service(name, component, [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }]), statefulSet];
+  return [service(name, component, [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }]), statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /**
@@ -505,7 +506,7 @@ function control(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service(name, component, [{ name: "http", port: 8080 }]), claim, deployment];
+  return [service(name, component, [{ name: "http", port: 8080 }]), claim, deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }
 
 /**
@@ -573,7 +574,7 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
       },
     },
   };
-  return [service(name, component, [{ name: "postgres", port: 55433 }, { name: "http", port: 3080 }], environment), deployment];
+  return [service(name, component, [{ name: "postgres", port: 55433 }, { name: "http", port: 3080 }], environment), deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }
 
 /**

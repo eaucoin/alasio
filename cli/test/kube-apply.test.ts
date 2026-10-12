@@ -369,7 +369,7 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const crd = (name: string) => kube.put("customresourcedefinitions", { apiVersion: "apiextensions.k8s.io/v1", kind: "CustomResourceDefinition", metadata: { name } });
   assert.equal(await check({}), "fits");
   assert.equal(await check(without("keda"), [scaledObject]), "this cluster has no KEDA, which scales alasio-grafana: install.autoscaling.keda.enabled true installs alasio's");
-  assert.equal(await check(without("vpa"), [verticalPodAutoscaler]), "this cluster has no VPA, which sizes alasio-lake: install.autoscaling.vpa.enabled true installs alasio's");
+  assert.match(await check(without("vpa")), /^this cluster has no VPA, which sizes alasio-agent-sandbox-controller, .*alasio-lake.*: install\.autoscaling\.vpa\.enabled true installs alasio's$/u);
   assert.equal(await check(without("keda")), "fits");
 
   // alasio's own, installed, are no other's, and not the cluster's once alasio is told to use the cluster's.

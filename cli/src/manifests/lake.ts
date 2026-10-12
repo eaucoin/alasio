@@ -28,6 +28,7 @@ import {
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** The port its telemetry intake takes OTLP over HTTP on. */
 export const LAKE_INTAKE_PORT = 4318;
@@ -130,5 +131,5 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
       },
     },
   };
-  return [service, deployment];
+  return [service, deployment, verticalPodAutoscaler(deployment, "InPlace")];
 }

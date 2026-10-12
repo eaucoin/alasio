@@ -36,6 +36,7 @@ import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/branches.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
+import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
@@ -765,7 +766,7 @@ describe("telemetry", () => {
       assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), undefined, job);
     }
     assert.equal(one<V1Deployment>(off, "Deployment", "alasio-collector").spec?.template.spec?.serviceAccountName, undefined);
-    assert.deepEqual(off.filter(({ kind, metadata }) => !["ConfigMap", "Service", "Deployment", "NetworkPolicy"].includes(kind ?? "") && metadata?.name === "alasio-collector"), []);
+    assert.deepEqual(off.filter(({ kind, metadata }) => !["ConfigMap", "Service", "Deployment", "VerticalPodAutoscaler", "NetworkPolicy"].includes(kind ?? "") && metadata?.name === "alasio-collector"), []);
   });
 
   test("scrapes nothing without Neon, only taking OTLP and sending it on", () => {
@@ -1102,7 +1103,9 @@ describe("workspace storage", () => {
     const needed = objects.filter(
       ({ metadata }) => metadata?.labels?.["app.kubernetes.io/name"] === "juicefs-csi-driver" || metadata?.labels?.["app.kubernetes.io/component"] === "valkey",
     );
-    assert.deepEqual(needed.filter(({ kind }) => kind !== "NetworkPolicy").map(({ kind, metadata }) => `${kind} ${metadata?.name}`), [
+    // What confines and sizes them is not needed for that.
+    const kept = needed.filter(({ kind }) => kind !== "NetworkPolicy" && kind !== "VerticalPodAutoscaler");
+    assert.deepEqual(kept.map(({ kind, metadata }) => `${kind} ${metadata?.name}`), [
       "ConfigMap alasio-valkey",
       "Service alasio-valkey",
       "StatefulSet alasio-valkey",
@@ -1118,8 +1121,8 @@ describe("workspace storage", () => {
       "StatefulSet juicefs-csi-controller",
       "DaemonSet juicefs-csi-node",
     ]);
-    for (const object of needed.filter(({ kind }) => kind !== "NetworkPolicy")) {
-      assert.equal(object.metadata?.labels?.["alasio.dev/volume-driver"], "csi.juicefs.com", `${object.kind} ${object.metadata?.name}`);
+    for (const object of needed) {
+      assert.equal(object.metadata?.labels?.["alasio.dev/volume-driver"], kept.includes(object) ? "csi.juicefs.com" : undefined, `${object.kind} ${object.metadata?.name}`);
     }
     // The Secrets the setup makes: Valkey's password and the file system's credentials.
     assert.deepEqual(JSON.parse(setupVariable(objects, "WORKSPACES_SECRET_LABELS") ?? ""), { "alasio.dev/volume-driver": "csi.juicefs.com" });
@@ -1428,6 +1431,42 @@ describe("scaling", () => {
     // A branch's alasio runs turns; its lake serves no alert, and its compute sleeps.
     const branch = new Map(podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName]));
     assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
+  });
+
+  test("sizes every workload by a VerticalPodAutoscaler beside it: in place what keeps no state and runs no turn, the rest recommended alone, from a small floor to its memory limit", () => {
+    const objects = [...install({ host: { enabled: true } }), ...branchObjects(configOf(), "try")];
+    const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet"), ...all<V1DaemonSet>(objects, "DaemonSet")];
+    const sized = all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler");
+    const key = ({ metadata }: KubernetesObject) => `${metadata?.namespace}/${metadata?.name}`;
+    assert.deepEqual(sized.map(key).sort(), workloads.map(key).sort());
+    const modes = new Map(sized.map((vpa) => [key(vpa), vpa.spec.updatePolicy.updateMode]));
+    const recommended = [
+      "alasio",
+      "alasio-neon-compute",
+      "alasio-neon-storage-controller",
+      "alasio-neon-safekeeper",
+      "alasio-neon-pageserver",
+      "alasio-neon-controller-db",
+      "alasio-neon-control",
+      "alasio-seaweedfs",
+      "alasio-valkey",
+      "juicefs-csi-controller",
+      "juicefs-csi-node",
+    ];
+    for (const [name, mode] of modes) assert.equal(mode, recommended.includes(name.split("/")[1] ?? "") ? "Off" : "InPlace", name);
+    // A branch's alasio runs turns as main's does.
+    assert.equal(modes.get("alasio-branch-try/alasio"), "Off");
+    for (const vpa of sized) {
+      const workload = workloads.find((each) => key(each) === key(vpa));
+      assert.deepEqual(vpa.spec.targetRef, { apiVersion: workload?.apiVersion, kind: workload?.kind, name: workload?.metadata?.name });
+      assert.equal(vpa.spec.updatePolicy.minReplicas, vpa.spec.updatePolicy.updateMode === "Off" ? undefined : 1);
+      assert.deepEqual(vpa.spec.resourcePolicy.containerPolicies, (workload?.spec?.template.spec?.containers ?? []).map(({ name, resources }) => ({
+        containerName: name,
+        minAllowed: { cpu: "5m", memory: "16Mi" },
+        ...(resources?.limits?.["memory"] ? { maxAllowed: { memory: resources.limits["memory"] } } : {}),
+        controlledValues: "RequestsOnly",
+      })));
+    }
   });
 
   test("installs KEDA as its release does, in alasio's namespace under alasio's names, restricted, pinned and small, on the floor; none where the cluster has its own", () => {

@@ -41,7 +41,7 @@ import type {
 import { imageReference } from "../images.ts";
 import { componentName, helperResources, imagePullSecrets, labels, NAMESPACE, restrictedContainer, restrictedPod, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { controllerDeployment, rule } from "./controllers.ts";
+import { rule, sizedController } from "./controllers.ts";
 import { priority } from "./priorities.ts";
 import checkpoints from "./verticalpodautoscalercheckpoints.autoscaling.k8s.io.json" with { type: "json" };
 import verticalPodAutoscalers from "./verticalpodautoscalers.autoscaling.k8s.io.json" with { type: "json" };
@@ -119,7 +119,7 @@ function recommender(config: InstallConfig): KubernetesObject[] {
       rule(["autoscaling.k8s.io"], ["verticalpodautoscalers/status"], ["get", "patch"]),
       rule(["autoscaling.k8s.io"], ["verticalpodautoscalercheckpoints"], ["get", "list", "watch", "create", "patch", "delete"]),
     ]),
-    controllerDeployment(config, "vpa-recommender", RECOMMENDER, {
+    ...sizedController(config, "vpa-recommender", RECOMMENDER, {
       name: "recommender",
       image: imageReference(recommender.image),
       args: ["--memory-saver", "--pod-recommendation-min-cpu-millicores=10", "--pod-recommendation-min-memory-mb=16"],
@@ -144,7 +144,7 @@ function updater(config: InstallConfig): KubernetesObject[] {
       rule([""], ["pods/resize", "pods"], ["patch"]),
     ]),
     ...namespaced(UPDATER, "vpa-updater", [rule(["coordination.k8s.io"], ["leases"], ["get", "list", "watch"])]),
-    controllerDeployment(config, "vpa-updater", UPDATER, {
+    ...sizedController(config, "vpa-updater", UPDATER, {
       name: "updater",
       image: imageReference(updater.image),
       args: ["--min-replicas=1", IN_PLACE],
@@ -204,7 +204,7 @@ function admissionController(config: InstallConfig): KubernetesObject[] {
     ]),
     service,
     webhook,
-    controllerDeployment(
+    ...sizedController(
       config,
       "vpa-admission-controller",
       ADMISSION_CONTROLLER,

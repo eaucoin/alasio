@@ -21,6 +21,7 @@ import { claimSpec, componentName, imagePullSecrets, labels, NAMESPACE, ONE, rep
 import type { InstallConfig } from "./config.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** Valkey's name: its Service's, its StatefulSet's, and its password's Secret's. */
 export const VALKEY = componentName("valkey");
@@ -116,5 +117,5 @@ export function valkeyObjects(config: InstallConfig, sidecars: readonly V1Contai
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(valkey.storage) }],
     },
   };
-  return [configMap, service, statefulSet];
+  return [configMap, service, statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }

@@ -11,6 +11,7 @@ import { imageReference } from "../images.ts";
 import { claimSpec, componentName, NAMESPACE, neonName, ONE, replicasOf, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** Every port its servers advertise themselves on by the Service's name, gRPC's each the HTTP port plus 10000. */
 const PORTS = [
@@ -222,7 +223,7 @@ function server(config: InstallConfig): KubernetesObject[] {
       volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(bundled.storage) }],
     },
   };
-  return [service, peersService, statefulSet];
+  return [service, peersService, statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /**

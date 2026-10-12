@@ -33,6 +33,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
 import { priority } from "./priorities.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** Grafana's name, its Secret's, and its pods' component. */
 export const GRAFANA = componentName("grafana");
@@ -110,5 +111,5 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service, deployment];
+  return [service, deployment, verticalPodAutoscaler(deployment, "InPlace")];
 }

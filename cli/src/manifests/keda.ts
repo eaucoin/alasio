@@ -23,7 +23,6 @@ import type {
   KubernetesObject,
   V1ClusterRole,
   V1ClusterRoleBinding,
-  V1Deployment,
   V1Role,
   V1RoleBinding,
   V1Service,
@@ -40,7 +39,7 @@ import clusterCloudEventSources from "./clustercloudeventsources.eventing.keda.s
 import clusterTriggerAuthentications from "./clustertriggerauthentications.keda.sh.json" with { type: "json" };
 import { componentName, labels, NAMESPACE, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
-import { controllerDeployment, rule } from "./controllers.ts";
+import { rule, sizedController } from "./controllers.ts";
 import scaledJobs from "./scaledjobs.keda.sh.json" with { type: "json" };
 import scaledObjects from "./scaledobjects.keda.sh.json" with { type: "json" };
 import triggerAuthentications from "./triggerauthentications.keda.sh.json" with { type: "json" };
@@ -85,10 +84,10 @@ const HEALTH_PROBES = {
 };
 
 /** The operator, which scales what ScaledObjects name, and makes the three's certificate. */
-function operator(config: InstallConfig): V1Deployment {
+function operator(config: InstallConfig): KubernetesObject[] {
   const { operator } = config.autoscaling.keda;
   const certs = certificates(true);
-  return controllerDeployment(config, "keda-operator", ACCOUNT, {
+  return sizedController(config, "keda-operator", ACCOUNT, {
     name: "keda-operator",
     image: imageReference(operator.image),
     command: ["/keda"],
@@ -121,10 +120,10 @@ function operator(config: InstallConfig): V1Deployment {
 }
 
 /** The metrics API server, which serves the API server the metrics of ScaledObjects' triggers, from the operator. */
-function metricsApiServer(config: InstallConfig): V1Deployment {
+function metricsApiServer(config: InstallConfig): KubernetesObject[] {
   const { metricsApiServer } = config.autoscaling.keda;
   const certs = certificates(false);
-  return controllerDeployment(config, "keda-metrics-apiserver", ACCOUNT, {
+  return sizedController(config, "keda-metrics-apiserver", ACCOUNT, {
     name: "keda-metrics-apiserver",
     image: imageReference(metricsApiServer.image),
     command: ["/keda-adapter"],
@@ -147,10 +146,10 @@ function metricsApiServer(config: InstallConfig): V1Deployment {
 }
 
 /** The admission webhooks, which refuse a ScaledObject that cannot work, such as two on one workload. */
-function admissionWebhooks(config: InstallConfig): V1Deployment {
+function admissionWebhooks(config: InstallConfig): KubernetesObject[] {
   const { admissionWebhooks } = config.autoscaling.keda;
   const certs = certificates(false);
-  return controllerDeployment(config, "keda-admission-webhooks", ACCOUNT, {
+  return sizedController(config, "keda-admission-webhooks", ACCOUNT, {
     name: "keda-admission-webhooks",
     image: imageReference(admissionWebhooks.image),
     command: ["/keda-admission-webhooks"],
@@ -320,8 +319,8 @@ export function kedaObjects(config: InstallConfig): KubernetesObject[] {
     service(METRICS_API_SERVER, "keda-metrics-apiserver", [{ name: "https", port: 443, targetPort: 6443 }, { name: "metrics", port: 8080, targetPort: 8080 }]),
     service(WEBHOOKS, "keda-admission-webhooks", [{ name: "https", port: 443, targetPort: 9443 }, { name: "metrics", port: 8080, targetPort: 8080 }]),
     ...registrations(),
-    operator(config),
-    metricsApiServer(config),
-    admissionWebhooks(config),
+    ...operator(config),
+    ...metricsApiServer(config),
+    ...admissionWebhooks(config),
   ];
 }

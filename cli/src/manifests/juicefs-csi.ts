@@ -46,6 +46,7 @@ import { imageReference } from "../images.ts";
 import { VOLUME_DRIVER_LABEL } from "../kube/apply.ts";
 import { goJson, type Labels, ONE, replicasOf } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { verticalPodAutoscaler } from "./sizing.ts";
 
 /** The driver's name, which StorageClasses name as their provisioner. */
 export const CSI_DRIVER = "csi.juicefs.com";
@@ -370,5 +371,7 @@ export function juicefsCsiObjects(config: InstallConfig): KubernetesObject[] {
     metadata: { name: CONFIG, namespace: csi.namespace, labels: LABELS },
     data: { "config.yaml": goJson(driverConfig(config), "  ") },
   };
-  return [csiDriver, priorityClass, ...identities(config), configMap, controller(config), nodeService(config)];
+  // Each serves workspaces' mounts, which its recreation would interrupt.
+  const workloads = [controller(config), nodeService(config)];
+  return [csiDriver, priorityClass, ...identities(config), configMap, ...workloads.flatMap((workload) => [workload, verticalPodAutoscaler(workload, "Recommended")])];
 }
