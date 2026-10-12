@@ -102,6 +102,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read 
           : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status: 409, reason: refused }));
       }),
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
+    copy: () => Effect.die("nothing is copied"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
     holdings: (node) => Effect.succeed(holdings.find((held) => held.node === node) as Holdings),
   };

@@ -1,7 +1,8 @@
 /**
  * The node agent (src/node-agent/): its checkpoints, committed to a stand-in bucket and
- * forgotten when they fail, its prepared snapshots, its cache, its API and its process,
- * with runsc a stand-in of its own (./support/fake-runsc.ts).
+ * forgotten when they fail, its copies, its prepared snapshots, its cache, its API, as
+ * alasio's client (src/sandbox/node-agents.ts) calls it too, and its process, with runsc a
+ * stand-in of its own (./support/fake-runsc.ts).
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -11,14 +12,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { Effect, Exit, Fiber, type Scope } from "effect";
+import type { V1Pod } from "@kubernetes/client-node";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, type Scope } from "effect";
 
+import { KubeClient } from "../src/kube/client.ts";
 import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent } from "../src/node-agent/agent.ts";
 import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
+import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 
@@ -310,6 +314,97 @@ test("a snapshot is prepared from the node's cache, or from the bucket, checked 
     })
   ));
 
+test("a copy gives a workspace another's snapshot, its files copied in the bucket, then its manifest, then its commit, and lets the one it had go", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const from = { environment: "main", workspace: "fs-abc" };
+      const fork = { environment: "br-1", workspace: "fs-fork" };
+      assert.equal(failure(yield* Effect.exit(here.agent.copy(from, fork))), "main/fs-abc has no snapshot");
+      assert.deepEqual(keysOf(s3, "br-1/"), []);
+
+      const source = yield* here.agent.checkpoint(request("fs-abc"));
+      const asked = s3.requests.length;
+      const copied = yield* here.agent.copy(from, fork);
+      assert.deepEqual(copied, { ...source, environment: "br-1", workspace: "fs-fork" });
+      const prefix = `br-1/fs-fork/${source.snapshot}`;
+      assert.deepEqual(s3.requests.slice(asked).filter((request) => request.startsWith("PUT")), [
+        ...source.files.map(({ path }) => `PUT ${prefix}/${path} from main/fs-abc/${source.snapshot}/${path}`),
+        `PUT ${prefix}/manifest.json`,
+        "PUT br-1/fs-fork/current.json",
+      ]);
+      assert.deepEqual(JSON.parse(s3.objects.get(`${prefix}/manifest.json`)?.toString() ?? ""), copied);
+      assert.deepEqual(yield* here.agent.current(fork), copied);
+      assert.deepEqual(yield* here.agent.current(from), source);
+      // Another node prepares it from the bucket, each file what the source's is.
+      const other = yield* node("node-2");
+      assert.deepEqual(yield* other.agent.prepare(fork), { manifest: copied, imagePath: join(other.cacheDir, "br-1", "fs-fork", source.snapshot) });
+
+      // A workspace's own snapshot is replaced, in the bucket and in this node's cache.
+      const own = { environment: "main", workspace: "fs-own" };
+      yield* here.agent.checkpoint(request("fs-own"));
+      const newer = yield* here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
+      assert.equal((yield* here.agent.copy(from, own)).snapshot, newer.snapshot);
+      assert.deepEqual(keysOf(s3, "main/fs-own/"), [
+        ...["checkpoint.img", "layers/pages.img", "manifest.json", "pages_meta.img"].map((file) => `main/fs-own/${newer.snapshot}/${file}`),
+        "main/fs-own/current.json",
+      ]);
+      assert.deepEqual(cachedOf(here, "fs-own"), []);
+
+      // A workspace's snapshot is its own already.
+      assert.deepEqual(yield* here.agent.copy(from, from), newer);
+      assert.equal(keysOf(s3, "main/fs-abc/").length, 5);
+
+      // Copies each way between two workspaces, both waiting as a checkpoint of one runs,
+      // hold them in turn, never one each.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "hang-checkpoint"), "");
+      const runs = here.releases.calls(RELEASE).length;
+      const checkpointing = yield* Effect.forkChild(here.agent.checkpoint(request("fs-abc")));
+      while (here.releases.calls(RELEASE).length === runs) yield* Effect.sleep("20 millis");
+      const there = yield* Effect.forkChild(Effect.exit(here.agent.copy(from, own)));
+      const back = yield* Effect.forkChild(here.agent.copy(own, from));
+      yield* Effect.sleep("100 millis");
+      yield* Fiber.interrupt(checkpointing);
+      rmSync(join(here.releases.dirOf(RELEASE), "hang-checkpoint"));
+      // The checkpoint stopped forgot the snapshot of fs-abc, which fs-own's then replaced.
+      assert.equal(failure(yield* Fiber.join(there).pipe(Effect.timeout("5 seconds"))), "main/fs-abc has no snapshot");
+      assert.deepEqual(yield* Fiber.join(back).pipe(Effect.timeout("5 seconds")), newer);
+    })
+  ));
+
+test("a copy that fails as it writes leaves the workspace without a snapshot, rather than part of one or the one it had", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const from = { environment: "main", workspace: "fs-abc" };
+      const own = { environment: "main", workspace: "fs-own" };
+      const source = yield* here.agent.checkpoint(request("fs-abc"));
+
+      // The commit fails, after the files went up.
+      yield* here.agent.checkpoint(request("fs-own"));
+      s3.refuse = (method, key) => (method === "PUT" && key === "main/fs-own/current.json" ? 500 : null);
+      assert.match(failure(yield* Effect.exit(here.agent.copy(from, own))), /^the bucket's upload of main\/fs-own\/current\.json failed: 500 InternalError/u);
+      assert.deepEqual(keysOf(s3, "main/fs-own/"), []);
+      assert.deepEqual(cachedOf(here, "fs-own"), []);
+      assert.equal(yield* here.agent.current(own), null);
+
+      // A file's copy fails.
+      s3.refuse = (method, key) => (method === "PUT" && key.endsWith("/pages_meta.img") ? 500 : null);
+      assert.match(
+        failure(yield* Effect.exit(here.agent.copy(from, own))),
+        new RegExp(`^the bucket's copy of main/fs-abc/${source.snapshot}/pages_meta\\.img to main/fs-own/${source.snapshot}/pages_meta\\.img failed: 500`, "u"),
+      );
+      assert.deepEqual(keysOf(s3, "main/fs-own/"), []);
+
+      // Forgetting fails too: the copy's failure is said, and the forgetting's logged.
+      s3.refuse = (method, key) => (key.startsWith("main/fs-own/") && method !== "GET" ? 503 : null);
+      assert.match(failure(yield* Effect.exit(here.agent.copy(from, own))), /^the bucket's copy of .* failed: 503/u);
+      s3.refuse = () => null;
+      // The source keeps its snapshot throughout.
+      assert.deepEqual(yield* here.agent.current(from), source);
+    })
+  ));
+
 test("checkpoints and prepares keep the node's cache within its budget, the least recently used snapshot evicted", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
@@ -409,6 +504,15 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       error(404, "the workspace has no snapshot")(yield* call("GET", "/snapshots/main/fs-none"));
       error(400, /environment/u)(yield* call("GET", "/snapshots/Main/fs-abc"));
 
+      const fork = { environment: "main", workspace: "fs-fork" };
+      assert.deepEqual(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: fork }), {
+        status: 200,
+        body: { ...manifest, workspace: "fs-fork" },
+      });
+      error(404, "main/fs-none has no snapshot")(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-none" }, to: fork }));
+      error(400, /to/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: { environment: "main" } }));
+      error(400, /workspace/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "../fs-abc" }, to: fork }));
+
       assert.deepEqual(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }), {
         status: 200,
         body: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot) },
@@ -430,6 +534,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       error(422, /^the snapshot of main\/fs-abc is corrupt: its current\.json is not a manifest/u)(yield* call("GET", "/snapshots/main/fs-abc"));
       s3.refuse = () => 503;
       error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: fork }));
       s3.refuse = () => null;
 
       assert.deepEqual(yield* call("DELETE", "/snapshots/main/fs-abc"), { status: 204, body: null });
@@ -439,6 +544,32 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
       error(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* call("POST", "/checkpoints", request("fs-abc")));
       error(404, "there is no GET /snapshots")(yield* call("GET", "/snapshots"));
+    })
+  ));
+
+test("alasio has a snapshot copied by any ready agent, and is answered its manifest, or why not", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent });
+      const pod: V1Pod = {
+        metadata: { name: "node-agent-1", namespace: "alasio" },
+        spec: { nodeName: "node-1", containers: [] },
+        status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
+      };
+      const unreachable = () => Effect.die("only pods are listed");
+      const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, remove: unreachable, exec: unreachable });
+      const agents = yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
+        Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
+      );
+      const from = { environment: "main", workspace: "fs-abc" };
+      const fork = { environment: "main", workspace: "fs-fork" };
+
+      const refused = yield* Effect.flip(agents.copy(from, fork));
+      assert.equal(refused.message, "the node agent of node-1 could not copy main/fs-abc's snapshot to main/fs-fork: main/fs-abc has no snapshot");
+      assert.equal(refused._tag === "NodeAgentError" && refused.status, 404);
+      const source = yield* here.agent.checkpoint(request("fs-abc"));
+      assert.deepEqual(yield* agents.copy(from, fork), { ...source, workspace: "fs-fork" });
     })
   ));
 

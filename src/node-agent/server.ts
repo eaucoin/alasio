@@ -16,6 +16,10 @@
  *   has none; 409 when this node cannot restore it (its release is not installed here, or
  *   this node's CPU lacks a feature it was saved with); 422 when its image is not what its
  *   manifest says; 502 when the bucket failed.
+ * - `POST /copies`, `{ from: { environment, workspace }, to: { environment, workspace } }`:
+ *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
+ *   session forked from another restores what the other was: `to`'s manifest (200). 404
+ *   when `from` has none; 502 when the bucket failed, which leaves `to` without a snapshot.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
  * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshot, in the bucket and
@@ -35,7 +39,7 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
-import { CheckpointRequest, makeNodeAgent, type NodeAgent, WorkspaceRef } from "./agent.ts";
+import { CheckpointRequest, CopyRequest, makeNodeAgent, type NodeAgent, WorkspaceRef } from "./agent.ts";
 import { type CacheError, makeSnapshotCache } from "./cache.ts";
 import {
   CONTAINERD,
@@ -98,6 +102,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       return body(CheckpointRequest).pipe(Effect.flatMap(agent.checkpoint), Effect.map((manifest) => answer(200, manifest)));
     }
     if (method === "POST" && url === "/prepare") return body(WorkspaceRef).pipe(Effect.flatMap(agent.prepare), Effect.map((prepared) => answer(200, prepared)));
+    if (method === "POST" && url === "/copies") {
+      return body(CopyRequest).pipe(Effect.flatMap(({ from, to }) => agent.copy(from, to)), Effect.map((manifest) => answer(200, manifest)));
+    }
     if (method === "GET" && snapshot) {
       return workspaceOf(snapshot).pipe(
         Effect.flatMap(agent.current),

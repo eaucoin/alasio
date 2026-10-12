@@ -55,13 +55,15 @@ export interface NodeAgents {
   readonly prepare: (node: string, workspace: WorkspaceRef) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
   /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
+  /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. An agent refuses one of `from` without a snapshot with 404. */
+  readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
   /** Forgets the workspace's current snapshot. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** What `node` holds. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
 }
 
-/** How long a checkpoint or a prepare may take: a sandbox's memory, through the store, both ways. */
+/** How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store, both ways, or within it. */
 const LONG_CALL: Duration.Input = "15 minutes";
 /** How long any other call may take. */
 const SHORT_CALL: Duration.Input = "30 seconds";
@@ -129,7 +131,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   /** The path of a workspace's snapshot. */
   const snapshotPath = ({ environment, workspace }: WorkspaceRef) => `/snapshots/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}`;
 
-  /** Any node with a ready agent: each reads and forgets in the bucket as well as another. */
+  /** Any node with a ready agent: each reads, copies and forgets in the bucket as well as another. */
   const anyNode: Effect.Effect<string, NodeAgentError | KubeApiError> = Effect.flatMap(addresses, (known) => {
     const [first] = known.keys();
     return first === undefined ? Effect.fail(new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" })) : Effect.succeed(first);
@@ -151,6 +153,14 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
           Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
         );
       }),
+    copy: (from, to) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(
+          node,
+          `copy ${from.environment}/${from.workspace}'s snapshot to ${to.environment}/${to.workspace}`,
+          { method: "POST", path: "/copies", body: { from, to }, timeout: LONG_CALL },
+          Manifest,
+        )),
     forget: (workspace) =>
       Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
         Effect.asVoid,

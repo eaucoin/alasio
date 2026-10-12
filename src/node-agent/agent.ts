@@ -12,7 +12,10 @@
  * A checkpoint ends the sandbox it saves. Once it has begun, the workspace's current
  * snapshot no longer holds what the workspace is, whose files and processes have moved
  * on since it was taken, so a checkpoint that fails forgets it rather than leave it to be
- * restored. One operation runs on a workspace at a time.
+ * restored. A copy gives a workspace another's current snapshot, as a session forked
+ * from another restores what the other was: its files copied in the bucket under the
+ * same snapshot id, then its manifest, then its commit, as a checkpoint writes them. One
+ * operation runs on a workspace at a time.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -62,6 +65,10 @@ export type Manifest = typeof Manifest.Type;
 /** A workspace, as each request names it. */
 export const WorkspaceRef = Schema.Struct({ environment: Name, workspace: Name });
 export type WorkspaceRef = typeof WorkspaceRef.Type;
+
+/** A request to copy a workspace's current snapshot to another. */
+export const CopyRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef });
+export type CopyRequest = typeof CopyRequest.Type;
 
 /** A request to checkpoint a workspace's sandbox. */
 export const CheckpointRequest = Schema.Struct({
@@ -145,6 +152,8 @@ export interface NodeAgent {
   readonly prepare: (workspace: WorkspaceRef) => Effect.Effect<Prepared, PrepareError>;
   /** The manifest of the workspace's current snapshot, or null. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt>;
+  /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. One that fails as it writes leaves `to` without a snapshot. */
+  readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError>;
   /** Forgets the workspace's snapshot, in the bucket and in the cache. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error | CacheError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
@@ -181,6 +190,10 @@ const sizes = meter.createHistogram("alasio.node_agent.snapshot.size", {
   description: "The size of a checkpoint's image",
   unit: "By",
 });
+const copies = meter.createCounter("alasio.node_agent.copies", {
+  description: "Snapshots copied from one workspace to another by the node agent, by outcome",
+  unit: "{copy}",
+});
 const prepares = meter.createCounter("alasio.node_agent.prepares", {
   description: "Snapshots prepared for a restore by the node agent, by where their image came from, or why not",
   unit: "{prepare}",
@@ -216,11 +229,16 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
 export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
 
-  /** `effect` once no other operation runs on the workspace. */
-  const exclusive = <A, E>({ environment, workspace }: WorkspaceRef, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
-    Effect.scoped(RcMap.get(locks, `${environment}/${workspace}`).pipe(Effect.flatMap((lock) => effect.pipe(Semaphore.withPermit(lock)))));
-
   const prefixOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;
+
+  /** `effect` once no other operation runs on the workspaces, each held in the order of its name, so that two operations never wait on each other. */
+  const exclusive = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.scoped(
+      [...new Set(workspaces.map(prefixOf))].sort().reduceRight<Effect.Effect<A, E, Scope.Scope>>(
+        (held, name) => RcMap.get(locks, name).pipe(Effect.flatMap((lock) => held.pipe(Semaphore.withPermit(lock)))),
+        effect,
+      ),
+    );
 
   /** How long `effect` took, in milliseconds. */
   const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =>
@@ -288,17 +306,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
 
   /**
    * After a snapshot is committed: every other object of the workspace's deleted (its
-   * previous snapshot's, and any a checkpoint that failed left), and its image made the
-   * one the cache holds of the workspace. What fails here leaves the snapshot committed.
+   * previous snapshot's, and any an operation that failed left), then `cached`, which
+   * makes the cache hold what it should of the workspace. What fails here leaves the
+   * snapshot committed.
    */
-  const settle = (manifest: Manifest): Effect.Effect<void> =>
+  const settle = (manifest: Manifest, cached: Effect.Effect<void, CacheError>): Effect.Effect<void> =>
     Effect.gen(function*() {
       const prefix = prefixOf(manifest);
       const stale = (yield* bucket.list(`${prefix}/`)).filter((key) => key !== `${prefix}/${CURRENT_FILE}` && !key.startsWith(`${prefix}/${manifest.snapshot}/`));
       yield* Effect.forEach(stale, bucket.remove, { discard: true });
-      yield* cache.commit(manifest.environment, manifest.workspace, manifest.snapshot);
-      yield* cache.clear(manifest.environment, manifest.workspace, manifest.snapshot);
-      yield* evict;
+      yield* cached;
     }).pipe(Effect.catch((error) => Effect.logWarning(`the snapshot ${manifest.snapshot} of ${prefixOf(manifest)} is committed, but ${error.message}`)));
 
   const evict: Effect.Effect<void, CacheError> = cache.evict.pipe(
@@ -312,7 +329,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     const failed = (reason: string) => new CheckpointFailed({ environment: request.environment, workspace: request.workspace, reason });
     const moved = "as the workspace has moved on since it was taken";
     return exclusive(
-      request,
+      [request],
       take(request).pipe(
         Effect.catch((error) =>
           forgetNow(request).pipe(
@@ -323,7 +340,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
           )
         ),
         Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
-        Effect.tap(settle),
+        // Its image is the one the cache holds of the workspace.
+        Effect.tap((manifest) =>
+          settle(
+            manifest,
+            cache.commit(manifest.environment, manifest.workspace, manifest.snapshot).pipe(
+              Effect.andThen(cache.clear(manifest.environment, manifest.workspace, manifest.snapshot)),
+              Effect.andThen(evict),
+            ),
+          )
+        ),
       ),
     ).pipe(
       Effect.tap((manifest) =>
@@ -341,6 +367,47 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       withAlasioSpan("alasio.node_agent.checkpoint", { attributes: spanAttributes(request) }),
     );
   };
+
+  /**
+   * Copies the current snapshot of `from` to `to` and commits it, as the module says:
+   * `to`'s manifest. Once it has begun writing, one that fails forgets `to`'s snapshot,
+   * rather than leave part of one, or one `to` was to move on from.
+   */
+  const copyNow = (from: WorkspaceRef, to: WorkspaceRef): Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError> =>
+    Effect.gen(function*() {
+      const source = yield* current(from);
+      if (source === null) return yield* new NoSnapshot(from);
+      // A workspace's snapshot is its own already.
+      if (prefixOf(from) === prefixOf(to)) return source;
+      const { snapshot } = source;
+      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
+      const manifest: Manifest = { ...source, environment: to.environment, workspace: to.workspace };
+      yield* Effect.gen(function*() {
+        yield* Effect.forEach(source.files, ({ path }) => bucket.copy(`${prefixOf(from)}/${snapshot}/${path}`, `${prefixOf(to)}/${snapshot}/${path}`), { discard: true });
+        yield* bucket.putJson(`${prefixOf(to)}/${snapshot}/${MANIFEST_FILE}`, manifest);
+        yield* bucket.putJson(`${prefixOf(to)}/${CURRENT_FILE}`, manifest);
+      }).pipe(
+        Effect.onError(() =>
+          forgetNow(to).pipe(Effect.catch((error) => Effect.logWarning(`copying a snapshot to ${prefixOf(to)} failed, and forgetting what it wrote failed too: ${error.message}`)))
+        ),
+      );
+      // This node's cache holds nothing of `to` until it is prepared here.
+      yield* settle(manifest, cache.clear(to.environment, to.workspace, null));
+      return manifest;
+    });
+
+  const copy = (from: WorkspaceRef, to: WorkspaceRef): Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError> =>
+    exclusive([from, to], copyNow(from, to)).pipe(
+      Effect.tap((manifest) =>
+        Effect.sync(() => copies.add(1, { outcome: "copied" })).pipe(
+          Effect.andThen(Effect.logInfo(`copied the snapshot ${manifest.snapshot} of ${prefixOf(from)} to ${prefixOf(to)}`)),
+        )
+      ),
+      Effect.tapError((error) => Effect.sync(() => copies.add(1, { outcome: error._tag }))),
+      withAlasioSpan("alasio.node_agent.copy", {
+        attributes: { ...spanAttributes(to), "alasio.source.environment": from.environment, "alasio.source.workspace": from.workspace },
+      }),
+    );
 
   /** The snapshot's image, from the bucket into the cache, each file checked against its manifest. */
   const download = (manifest: Manifest): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
@@ -377,7 +444,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
 
   const prepare = (ref: WorkspaceRef): Effect.Effect<Prepared, PrepareError> =>
     exclusive(
-      ref,
+      [ref],
       Effect.gen(function*() {
         const manifest = yield* current(ref);
         if (manifest === null) return yield* new NoSnapshot(ref);
@@ -410,8 +477,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     checkpoint: (request) => checkpoint(request).pipe(withLogScope("node-agent")),
     prepare: (ref) => prepare(ref).pipe(withLogScope("node-agent")),
     current,
+    copy: (from, to) => copy(from, to).pipe(withLogScope("node-agent")),
     forget: (ref) =>
-      exclusive(ref, forgetNow(ref)).pipe(
+      exclusive([ref], forgetNow(ref)).pipe(
         Effect.tap(() => Effect.logInfo(`forgot the snapshot of ${prefixOf(ref)}`)),
         withAlasioSpan("alasio.node_agent.forget", { attributes: spanAttributes(ref) }),
         withLogScope("node-agent"),
