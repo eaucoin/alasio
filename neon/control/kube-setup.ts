@@ -13,7 +13,8 @@
  * storage on, WORKSPACES_NAME (its JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
  * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
  * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
- * alasio keeps them while its volumes remain).
+ * alasio keeps them while its volumes remain). With session sandboxes snapshotted,
+ * SNAPSHOTS_BUCKET (the bucket their snapshots are kept in).
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
@@ -59,6 +60,7 @@ export interface SecretNames {
   branches: string;
   valkey: string;
   workspaces: string;
+  snapshots: string;
 }
 
 /** Workspace storage, as the setup makes its Secrets. */
@@ -92,6 +94,8 @@ interface SetupConfigBase {
   lakeBucket: string;
   /** Null when workspace storage is off. */
   workspaces: WorkspacesConfig | null;
+  /** Null when session sandboxes are not snapshotted. */
+  snapshotsBucket: string | null;
 }
 
 /** What renderSecrets renders from. */
@@ -153,6 +157,7 @@ export function secretNames(prefix: string): SecretNames {
     branches: `${prefix}-branches`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
+    snapshots: `${prefix}-snapshots`,
   };
 }
 
@@ -258,8 +263,19 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       "format-options": `trash-days=${workspaces.trashDays}`,
     };
   }
+  const { snapshotsBucket } = config;
+  if (snapshotsBucket) {
+    // The node agents': where they keep session sandboxes' snapshots, and as whom, which
+    // they take whole as their environment.
+    rendered[names.snapshots] = {
+      S3_ENDPOINT: config.s3Endpoint,
+      S3_REGION: config.s3Region,
+      S3_BUCKET: snapshotsBucket,
+      ...aws("snapshots"),
+    };
+  }
   if (!config.external) {
-    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null };
+    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
     // The filers' store's users', which its Valkey requires: the filers', each filer is
     // given, the collector's, which reads its metrics, and the backups'.
@@ -300,6 +316,7 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
         secretLabels: JSON.parse(required("WORKSPACES_SECRET_LABELS")),
       }
       : null,
+    snapshotsBucket: env["SNAPSHOTS_BUCKET"]?.trim() || null,
   };
   return external
     ? { ...base, external, accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") }

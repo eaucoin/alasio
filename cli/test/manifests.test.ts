@@ -246,6 +246,7 @@ describe("configuration", () => {
     assert.equal(workspaceStorage.valkey.maxmemory, "384mb");
     assert.equal(workspaceStorage.csi.shareMountPod, false);
     assert.equal(objectStore.buckets.workspaces, "workspaces");
+    assert.equal(objectStore.buckets.snapshots, "snapshots");
     const refused = (given: Record<string, unknown>) => {
       const result = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, workspaceStorage: given });
       return Result.isFailure(result) ? result.failure.message : "";
@@ -515,11 +516,33 @@ describe("neon", () => {
     }]);
   });
 
+  test("makes the snapshots bucket, its uploads left incomplete aborted after a day, and has the setup make its Secret, where sessions run under gVisor", () => {
+    const snapshots = (objects: readonly KubernetesObject[]) => {
+      const containers = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers ?? [];
+      const script = (name: string) => containers.find((container) => container.name === name)?.command?.[2] ?? "";
+      return {
+        buckets: /^for bucket in (.*); do$/mu.exec(script("buckets"))?.[1],
+        rules: /--bucket snapshots --lifecycle-configuration '([^']+)'/u.exec(script("lifecycle"))?.[1],
+        setup: one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env?.find(({ name }) => name === "SNAPSHOTS_BUCKET")?.value,
+      };
+    };
+    const made = snapshots(install());
+    assert.equal(made.buckets, "neon lake backups workspaces snapshots");
+    assert.deepEqual(JSON.parse(made.rules ?? ""), {
+      Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
+    });
+    assert.equal(made.setup, "snapshots");
+    assert.deepEqual(snapshots(install({ sessions: { runtimeClassName: "" } })), { buckets: "neon lake backups workspaces", rules: undefined, setup: undefined });
+    assert.deepEqual(snapshots(install({ sessions: { enabled: false }, workspaceStorage: { enabled: false } })), { buckets: "neon lake backups", rules: undefined, setup: undefined });
+  });
+
   test("uses the operator's object store and makes no SeaweedFS when told", () => {
     const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3" } } });
     assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("alasio-seaweedfs")), []);
     const env = one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env;
     assert.deepEqual(env?.find(({ name }) => name === "S3_EXTERNAL"), { name: "S3_EXTERNAL", value: "1" });
+    // Its operator makes the snapshots bucket, which the setup still gives the node agents.
+    assert.deepEqual(env?.find(({ name }) => name === "SNAPSHOTS_BUCKET"), { name: "SNAPSHOTS_BUCKET", value: "snapshots" });
   });
 
   test("runs no Neon when the database is the operator's", () => {
@@ -737,12 +760,12 @@ describe("object store", () => {
     assert.deepEqual(all(install(), "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs"), []);
   });
 
-  test("makes the buckets and Neon's rules in each gateway as it starts, ready only once they are", () => {
+  test("makes the buckets and their lifecycle rules in each gateway as it starts, ready only once they are", () => {
     const gateway = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs");
     assert.deepEqual(gateway.spec?.template.spec?.containers.map(({ name }) => name), ["s3", "buckets", "lifecycle"]);
     const buckets = gateway.spec?.template.spec?.containers[1]?.command?.[2] ?? "";
     assert.match(buckets, /weed shell -master=alasio-seaweedfs-master-0\.alasio-seaweedfs-master\.alasio\.svc\.cluster\.local:9333 -filer=alasio-seaweedfs-filer:8888/u);
-    assert.match(buckets, /for bucket in neon lake backups workspaces; do/u);
+    assert.match(buckets, /for bucket in neon lake backups workspaces snapshots; do/u);
   });
 
   test("makes no bucket anew, empty, whose objects the volumes hold while the filers know no such bucket, and its gateway is not ready", () => {
@@ -775,7 +798,7 @@ describe("object store", () => {
       }
     };
     // A fresh store: every bucket made.
-    assert.deepEqual(run("none", "elsewhere"), { status: 0, made: ["neon", "lake", "backups", "workspaces"], said: "" });
+    assert.deepEqual(run("none", "elsewhere"), { status: 0, made: ["neon", "lake", "backups", "workspaces", "snapshots"], said: "" });
     // A store that lost its filers' metadata, its volumes holding the lake's objects: no lake made anew, and the gateway never ready.
     const lost = run("neon", "lake");
     assert.equal(lost.status, 1);
@@ -1611,7 +1634,7 @@ describe("workspace storage", () => {
   test("makes its bucket and its identity, and gives the setup what its Secrets are made from", () => {
     const objects = install();
     const buckets = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
-    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups workspaces; do$/mu);
+    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups workspaces snapshots; do$/mu);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), "workspaces");
     assert.equal(setupVariable(objects, "WORKSPACES_BUCKET"), "workspaces");
     assert.equal(setupVariable(objects, "WORKSPACES_BUCKET_URL"), "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces");
@@ -1672,7 +1695,7 @@ describe("workspace storage", () => {
     assert.deepEqual(objects.filter(({ metadata }) => /valkey|juicefs|workspaces/u.test(metadata?.name ?? "")), []);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), undefined);
     const buckets = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
-    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups; do$/mu);
+    assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups snapshots; do$/mu);
   });
 });
 

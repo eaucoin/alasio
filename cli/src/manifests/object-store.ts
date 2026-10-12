@@ -15,9 +15,10 @@
  *   makes no volume's id again;
  * - S3 gateways, on the filers, the store's endpoint, under the name the stack reaches it
  *   by (alasio-seaweedfs:8333), scaled on their CPU where their scale is a range. Each makes
- *   the buckets, idempotently, as it starts: Neon's, the lake's, backups' and, when it is
- *   on, workspace storage's; and gives Neon's its lifecycle rules. It is ready, and the
- *   stack's writers start, only once they are.
+ *   the buckets, idempotently, as it starts: Neon's, the lake's, backups', workspace
+ *   storage's when it is on, and session sandboxes' snapshots' when they are taken; and
+ *   gives each bucket with lifecycle rules its rules (Neon's, and the snapshots'). It is
+ *   ready, and the stack's writers start, only once they are.
  *
  * And the periodic pass that applies the lifecycle rules, and copies again what has fewer
  * copies than it should; and the filer store's backups. The identities the gateways take
@@ -42,7 +43,7 @@ import type {
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, sandboxSnapshots, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -128,7 +129,7 @@ const WAL_SEGMENT_BYTES = 16 * 1024 * 1024;
  * An operator's store (objectStore.external) is given none of this: its operator gives
  * Neon's bucket these rules.
  */
-const LIFECYCLE = {
+const NEON_LIFECYCLE = {
   Rules: [
     {
       ID: "expire-noncurrent",
@@ -151,6 +152,15 @@ const LIFECYCLE = {
       Expiration: { Days: RESTORABLE_DAYS + 1 },
     },
   ],
+};
+
+/**
+ * The lifecycle rule of the snapshots bucket: a node agent ended mid-upload leaves the
+ * parts it had sent, which are aborted after a day, the least S3 allows. An operator's
+ * store is given none of it either: its operator gives the bucket this rule.
+ */
+const SNAPSHOTS_LIFECYCLE = {
+  Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
 };
 
 /** The address of the pod `ordinal` of the StatefulSet `name`, by its headless Service `service`, at `port`. */
@@ -390,13 +400,15 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
 }
 
 /**
- * The S3 gateways, on the filers, each making the buckets and Neon's lifecycle rules as
+ * The S3 gateways, on the filers, each making the buckets and their lifecycle rules as
  * it starts, in sidecars, and ready only once they are made.
  */
 function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
-  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : [])];
+  const snapshots = sandboxSnapshots(config);
+  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), ...(snapshots ? [buckets.snapshots] : [])];
+  const lifecycles = [{ bucket: buckets.neon, rules: NEON_LIFECYCLE }, ...(snapshots ? [{ bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE }] : [])];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {
@@ -481,7 +493,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
               resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
               volumeMounts: [{ name: "shell-tmp", mountPath: "/tmp" }],
             },
-            // Gives Neon's bucket its lifecycle rules once it exists.
+            // Gives each bucket with lifecycle rules its rules once it exists.
             {
               name: "lifecycle",
               image: imageReference(config.neon.image),
@@ -491,8 +503,10 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 "-c",
                 script(
                   "set -e",
-                  `until aws s3api --endpoint-url http://127.0.0.1:8333 head-bucket --bucket ${buckets.neon} 2>/dev/null; do sleep 2; done`,
-                  `aws s3api --endpoint-url http://127.0.0.1:8333 put-bucket-lifecycle-configuration --bucket ${buckets.neon} --lifecycle-configuration '${JSON.stringify(LIFECYCLE)}'`,
+                  ...lifecycles.flatMap(({ bucket, rules }) => [
+                    `until aws s3api --endpoint-url http://127.0.0.1:8333 head-bucket --bucket ${bucket} 2>/dev/null; do sleep 2; done`,
+                    `aws s3api --endpoint-url http://127.0.0.1:8333 put-bucket-lifecycle-configuration --bucket ${bucket} --lifecycle-configuration '${JSON.stringify(rules)}'`,
+                  ]),
                   "touch /tmp/ready",
                   "exec sleep infinity",
                 ),

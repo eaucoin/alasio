@@ -24,8 +24,11 @@ export const MONITOR_ROLE = "neon_control";
 export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE] as const;
 export type ClientRole = (typeof CLIENT_ROLES)[number];
 
-/** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader, and workspace storage's JuiceFS. */
-export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces";
+/**
+ * Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader,
+ * workspace storage's JuiceFS, and the node agents, which keep session sandboxes' snapshots.
+ */
+export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces" | "snapshots";
 
 export interface S3Credentials {
   accessKey: string;
@@ -84,11 +87,12 @@ export interface RemoteStorageLocation {
   region?: string;
 }
 
-/** The buckets of the bundled SeaweedFS, by who uses each; workspace storage's null when it is off. */
+/** The buckets of the bundled SeaweedFS, by who uses each; workspace storage's null when it is off, and the snapshots' when sandboxes are not snapshotted. */
 export interface Buckets {
   neon: string;
   lake: string;
   workspaces: string | null;
+  snapshots: string | null;
 }
 
 /** SeaweedFS's S3 configuration (its s3.json). */
@@ -154,6 +158,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       lake: kept(s3.lake, () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() })),
       lakeReader: kept(s3.lakeReader, () => ({ accessKey: `lakereader${hexId().slice(0, 12)}`, secretKey: secret() })),
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
+      snapshots: kept(s3.snapshots, () => ({ accessKey: `snapshots${hexId().slice(0, 12)}`, secretKey: secret() })),
     },
     controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
     alasioPassword: passwords.alasioPassword,
@@ -192,9 +197,10 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
 }
 
 /**
- * SeaweedFS's S3 identities: Neon, the lake and, when it is on, workspace storage, each
- * on their own bucket of `buckets`; the lake's reader, which may only read the lake's;
- * and an admin, which makes the buckets and keeps the backups.
+ * SeaweedFS's S3 identities: Neon, the lake, workspace storage when it is on and the
+ * snapshots' when sandboxes are snapshotted, each on their own bucket of `buckets`; the
+ * lake's reader, which may only read the lake's; and an admin, which makes the buckets
+ * and keeps the backups.
  */
 export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
   const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
@@ -208,6 +214,7 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),
+      ...(buckets.snapshots === null ? [] : [{ name: "snapshots" as const, credentials: [secrets.s3.snapshots], actions: on(buckets.snapshots) }]),
     ],
   };
 }

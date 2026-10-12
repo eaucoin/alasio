@@ -41,6 +41,7 @@ import {
   replicasOf,
   restrictedContainer,
   s3Endpoint,
+  sandboxSnapshots,
   script,
   selectorLabels,
   stackLabels,
@@ -72,7 +73,8 @@ function secretVariable(secret: string, key: string): V1EnvVar {
 
 /**
  * The stack's secrets, made once and kept, and each service's rendered from them, workspace
- * storage's among them when it is on, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
+ * storage's among them when it is on and the snapshots bucket's when sandboxes are
+ * snapshotted, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
  * anything else of alasio starts (../kube/apply.ts).
  */
 function setup(config: InstallConfig): KubernetesObject[] {
@@ -134,6 +136,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
                   { name: "WORKSPACES_SECRET_LABELS", value: JSON.stringify(VOLUME_DRIVER) },
                 ]
                 : []),
+              ...(sandboxSnapshots(config) ? [{ name: "SNAPSHOTS_BUCKET", value: objectStore.buckets.snapshots }] : []),
               ...(objectStore.bundled.enabled ? [] : [
                 { name: "S3_EXTERNAL", value: "1" },
                 { name: "S3_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "accessKey" } } },

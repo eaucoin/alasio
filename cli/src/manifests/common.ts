@@ -144,6 +144,15 @@ export function collectorRuns(config: InstallConfig): boolean {
   return lakeRuns(config) || Boolean(config.telemetry.otlpEndpoint);
 }
 
+/**
+ * Whether session sandboxes are snapshotted whole, into the object store's snapshots
+ * bucket: when sessions run under a RuntimeClass, gVisor's, whose checkpoints the
+ * snapshots are, and not under the cluster's default runtime.
+ */
+export function sandboxSnapshots(config: InstallConfig): boolean {
+  return config.sessions.enabled && config.sessions.runtimeClassName !== "";
+}
+
 /** The port the collector takes OTLP over HTTP on. */
 export const COLLECTOR_PORT = 4318;
 

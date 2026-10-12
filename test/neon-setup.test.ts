@@ -29,6 +29,7 @@ const ENV = {
   WORKSPACES_TRASH_DAYS: "1",
   VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
   WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
+  SNAPSHOTS_BUCKET: "snapshots",
 };
 
 /** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
@@ -90,6 +91,8 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.workspaces?.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
   assert.equal(setupConfig({ ...ENV, WORKSPACES_NAME: "" }).workspaces, null);
   assert.throws(() => setupConfig({ ...ENV, WORKSPACES_BUCKET_URL: "" }), /WORKSPACES_BUCKET_URL must be set/);
+  assert.equal(config.snapshotsBucket, "snapshots");
+  assert.equal(setupConfig({ ...ENV, SNAPSHOTS_BUCKET: "" }).snapshotsBucket, null);
 });
 
 test("the stack's secrets are made once, and every service's rendered from them on each run", async () => {
@@ -122,7 +125,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces", "snapshots"]);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -170,6 +173,21 @@ test("the stack's secrets are made once, and every service's rendered from them 
     "Write:workspaces",
   ]);
 
+  // The node agents keep session sandboxes' snapshots in their bucket alone, which they find, with their keys, in their Secret.
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "snapshots")?.actions, [
+    "Read:snapshots",
+    "List:snapshots",
+    "Tagging:snapshots",
+    "Write:snapshots",
+  ]);
+  assert.deepEqual(Object.fromEntries(Object.keys(kube.secrets.get(names.snapshots)?.data ?? {}).map((key) => [key, value(kube, names.snapshots, key)])), {
+    S3_ENDPOINT: "http://q-seaweedfs:8333",
+    S3_REGION: "us-east-1",
+    S3_BUCKET: "snapshots",
+    AWS_ACCESS_KEY_ID: root.s3.snapshots.accessKey,
+    AWS_SECRET_ACCESS_KEY: root.s3.snapshots.secretKey,
+  });
+
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
   assert.deepEqual(JSON.parse(value(kube, names.root, "secrets.json")), root);
@@ -197,12 +215,31 @@ test("a root predating a secret gains it without losing the rest", async () => {
   assert.ok(verifies(completed.verifiers.lake, root.lakePassword));
 });
 
+test("a root predating an S3 identity gains its credentials, and the store the identity, every other secret kept", async () => {
+  const kube = fakeKube();
+  const config = setupConfig(ENV);
+  await setupKube({ kube, config, log: () => {} });
+  const names = secretNames("q");
+  const root: StoredSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
+  delete root.s3?.snapshots;
+  const current = kube.secrets.get(names.root);
+  assert.ok(current?.data);
+  current.data["secrets.json"] = Buffer.from(JSON.stringify(root)).toString("base64");
+  await setupKube({ kube, config, log: () => {} });
+  const completed: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
+  const { snapshots, ...kept } = completed.s3;
+  assert.deepEqual({ ...completed, s3: kept }, root);
+  assert.match(snapshots.accessKey, /^snapshots[0-9a-f]{12}$/u);
+  const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "snapshots")?.credentials, [snapshots]);
+});
+
 /** Secrets as the root holds them, every S3 identity's credentials `s3`. */
 function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecrets {
   return {
     tenantId: "tenant",
     timelineId: "timeline",
-    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3 },
+    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3, snapshots: s3 },
     controllerDbPassword: "c",
     alasioPassword: "q",
     lakePassword: "l",
@@ -250,6 +287,13 @@ test("with an external object store, every service uses its credentials and no S
   assert.equal(rendered[names.workspaces]?.["bucket"], "https://s3.example.com/my-workspaces");
   assert.equal(rendered[names.workspaces]?.["access-key"], "AK");
   assert.equal(rendered[names.workspaces]?.["secret-key"], "SK");
+  assert.deepEqual(rendered[names.snapshots], {
+    S3_ENDPOINT: "http://q-seaweedfs:8333",
+    S3_REGION: "eu-west-1",
+    S3_BUCKET: "snapshots",
+    AWS_ACCESS_KEY_ID: "AK",
+    AWS_SECRET_ACCESS_KEY: "SK",
+  });
 });
 
 test("without workspace storage, neither its Secrets nor its identity are made", () => {
@@ -263,5 +307,18 @@ test("without workspace storage, neither its Secrets nor its identity are made",
   assert.equal(rendered[names.valkey], undefined);
   assert.equal(rendered[names.workspaces], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "snapshots"]);
+});
+
+test("without session sandboxes snapshotted, neither the snapshots' Secret nor their identity are made", () => {
+  const rendered = renderSecrets({
+    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
+    privateKeyPem: generateKeyPair().privateKeyPem,
+    publicKeyPem: "pk",
+    config: setupConfig({ ...ENV, SNAPSHOTS_BUCKET: "" }),
+  });
+  const names = secretNames("q");
+  assert.equal(rendered[names.snapshots], undefined);
+  const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
 });

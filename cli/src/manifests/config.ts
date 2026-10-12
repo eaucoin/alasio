@@ -475,6 +475,8 @@ const ObjectStore = Schema.Struct({
       backups: defaulted(Bucket, "backups"),
       /** Workspace storage's data; an external store must have it already, as it must the others. */
       workspaces: defaulted(Bucket, "workspaces"),
+      /** Session sandboxes' snapshots, when sessions run under gVisor (sessions.runtimeClassName); an external store must have it then, as it must the others. */
+      snapshots: defaulted(Bucket, "snapshots"),
     }),
     {},
   ),
