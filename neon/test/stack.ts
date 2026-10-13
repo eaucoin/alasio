@@ -2,8 +2,8 @@
  * alasio's Neon as alasio installs it: its components killed, the whole stack stopped at
  * once, a safekeeper's volume lost, with nothing committed lost; a day of its history
  * kept, its garbage collected, its dumps restorable, its past readable, its branches
- * made, run and deleted, and its lake loading; and an upgrade that changes nothing
- * restarting none of it.
+ * made, run and deleted, its compute reached through Neon's proxy alone, and its lake
+ * loading; and an upgrade that changes nothing restarting none of it.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
@@ -22,7 +22,7 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, kube, lakeQuery, ref, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
-import { type Branch, type BranchView, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
+import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
@@ -285,7 +285,8 @@ export function neonStack(): void {
       privateKey = await kube.secret(NAMESPACE, neonName("root"), "auth_private_key.pem");
       const secrets: StackSecrets = JSON.parse(await kube.secret(NAMESPACE, neonName("root"), "secrets.json"));
       tenantId = secrets.tenantId;
-      forward = await kube.forward(NAMESPACE, neonName("compute"), 55433);
+      // Through Neon's proxy, as every client of the compute connects.
+      forward = await kube.forward(NAMESPACE, neonName("proxy"), 5432);
       const url = new URL((await kube.secret(NAMESPACE, `${RELEASE}-database`, "url")).trim());
       url.hostname = "127.0.0.1";
       url.port = String(forward.port);
@@ -665,9 +666,9 @@ export function neonStack(): void {
               name: "compute",
               image: image(await kube.get<V1Deployment>(ref("Deployment", neonName("compute"), NAMESPACE))),
               command: ["/bin/sh", "-c", [
-                "/usr/local/bin/compute_ctl --pgdata /var/db/postgres/compute --connstr postgresql://cloud_admin@localhost:55433/postgres",
+                `/usr/local/bin/compute_ctl --pgdata /var/db/postgres/compute --connstr postgresql://cloud_admin@localhost:${COMPUTE_PORT}/postgres`,
                 "--pgbin /usr/local/bin/postgres --compute-id static --config /config/config.json >/tmp/compute.log 2>&1 &",
-                "for i in $(seq 120); do psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -Atc 'select count(*) from history' 2>/dev/null && exit 0; sleep 2; done; tail -40 /tmp/compute.log; exit 1",
+                `for i in $(seq 120); do psql -h 127.0.0.1 -p ${COMPUTE_PORT} -U cloud_admin -d alasio -Atc 'select count(*) from history' 2>/dev/null && exit 0; sleep 2; done; tail -40 /tmp/compute.log; exit 1`,
               ].join(" ")],
               env: [{ name: "OTEL_SDK_DISABLED", value: "true" }],
               securityContext: restricted,
@@ -746,7 +747,7 @@ export function neonStack(): void {
       const listed = async () => (await api<{ branches: Listed[] }>("GET", "/branches")).body.branches;
 
       /** Runs `sql` on the branch's compute, from its pod: what psql printed. */
-      const onBranch = async (sql: string) => (await kube.execOk(NAMESPACE, COMPUTE, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "alasio", "-Atc", sql])).trim();
+      const onBranch = async (sql: string) => (await kube.execOk(NAMESPACE, COMPUTE, ["psql", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "alasio", "-Atc", sql])).trim();
 
       before(async () => {
         control = await kube.forward(NAMESPACE, neonName("control"), 8080);
@@ -826,7 +827,7 @@ export function neonStack(): void {
           "sh",
           "-c",
           // By the pod's address, as alasio connects, not the loopback compute_ctl trusts.
-          'PGPASSWORD="$1" psql -h "$(hostname -i | cut -d" " -f1)" -p 55433 -U alasio -d alasio -Atc "select current_user" 2>/dev/null || echo refused',
+          `PGPASSWORD="$1" psql -h "$(hostname -i | cut -d" " -f1)" -p ${COMPUTE_PORT} -U alasio -d alasio -Atc "select current_user" 2>/dev/null || echo refused`,
           "sh",
           password,
         ])).trim();

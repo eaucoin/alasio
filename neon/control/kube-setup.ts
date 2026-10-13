@@ -6,7 +6,7 @@
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
- * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
+ * NEON_PROXY_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities, and its filers' store's users' passwords, are made here otherwise. With workspace
@@ -17,7 +17,7 @@
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
-import { BRANCHES_SCOPE, PROXY_SCOPE } from "./branches.ts";
+import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
@@ -83,7 +83,8 @@ interface SetupConfigBase {
   brokerUrl: string;
   controllerUrl: string;
   pageserverHost: string;
-  computeHost: string;
+  /** Where every client reaches Neon's proxy, from any namespace. */
+  proxyHost: string;
   controllerDbHost: string;
   s3Endpoint: string;
   s3Region: string;
@@ -116,6 +117,19 @@ export interface SetupKubeOptions {
   kube: SetupKubeClient;
   config: SetupConfig;
   log?: (message: string) => void;
+}
+
+/**
+ * The URL alasio reaches its database at, as its role with `password`, through Neon's proxy
+ * at `host`, on the compute `endpoint`: named by the libpq option the proxy reads, as no
+ * TLS carries a name in the cluster.
+ */
+export function databaseUrl(host: string, password: string, endpoint: string): string {
+  const url = new URL(`postgresql://${host}:5432/${DATABASE}`);
+  url.username = ROLE;
+  url.password = password;
+  url.searchParams.set("options", `endpoint=${endpoint}`);
+  return url.toString();
 }
 
 /** Every Secret's name, by what it is for. */
@@ -195,7 +209,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     [names.compute]: { NEON_CONTROL_PLANE_TOKEN: secrets.computeControlToken },
     [names.proxy]: { NEON_PROXY_TO_CONTROLPLANE_TOKEN: token(PROXY_SCOPE) },
     [names.database]: {
-      url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${config.computeHost}:55433/${DATABASE}`,
+      // Main's compute, through the proxy, which names it by the option.
+      url: databaseUrl(config.proxyHost, secrets.alasioPassword, computeId(MAIN)),
       password: secrets.alasioPassword,
       // What alasio sets the roles it makes to: the verifiers neon-control answers for them.
       "lake-verifier": secrets.verifiers[LAKE_ROLE],
@@ -269,7 +284,7 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     brokerUrl: required("NEON_BROKER_URL"),
     controllerUrl: required("NEON_CONTROLLER_URL"),
     pageserverHost: required("NEON_PAGESERVER_HOST"),
-    computeHost: required("NEON_COMPUTE_HOST"),
+    proxyHost: required("NEON_PROXY_HOST"),
     controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
     s3Endpoint: required("S3_ENDPOINT"),
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",

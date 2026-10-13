@@ -299,7 +299,7 @@ const Neon = Schema.Struct({
     }),
     {},
   ),
-  /** Neon's proxy, which a client of a compute connects through, and which wakes it: a count. */
+  /** Neon's proxy, which every client of the computes connects through, and which wakes them: a count. */
   proxy: defaulted(
     Schema.Struct({
       scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),

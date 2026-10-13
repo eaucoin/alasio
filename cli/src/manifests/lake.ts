@@ -10,6 +10,7 @@
  */
 import type { KubernetesObject, V1Container, V1Deployment, V1EnvVar, V1Service } from "@kubernetes/client-node";
 
+import { computeId, MAIN } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   componentName,
@@ -27,6 +28,7 @@ import {
   stackPodSpec,
 } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
+import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
 import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
@@ -57,8 +59,10 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
   };
   // Where the lake is, which both containers open it at.
   const lakeEnv: V1EnvVar[] = [
-    { name: "LAKE_DATABASE_HOST", value: neonName("compute") },
-    { name: "LAKE_DATABASE_PORT", value: "55433" },
+    // Its environment's compute, through Neon's proxy, which wakes it if it sleeps.
+    { name: "LAKE_DATABASE_HOST", value: PROXY_HOST },
+    { name: "LAKE_DATABASE_PORT", value: String(PROXY_PORT) },
+    { name: "LAKE_DATABASE_ENDPOINT", value: computeId(environment.branch ?? MAIN) },
     { name: "LAKE_DATA_PATH", value: `s3://${config.objectStore.buckets.lake}/` },
     { name: "LAKE_S3_ENDPOINT", value: s3Endpoint(config) },
     { name: "HOME", value: "/tmp" },

@@ -1,9 +1,9 @@
 /**
  * Neon, alasio's database: Postgres whose storage is safekeepers and a pageserver on
  * object storage, with a storage controller and its own Postgres, a storage broker, the
- * compute, Neon's proxy, which a client connects to the compute through, waking it when
- * it sleeps, neon-control (alasio's stand-in for Neon's control plane, neon/control/),
- * the setup that makes the stack's secrets, and a daily backup.
+ * compute, Neon's proxy, which every client connects to the compute through, waking it
+ * when it sleeps, neon-control (alasio's stand-in for Neon's control plane,
+ * neon/control/), the setup that makes the stack's secrets, and a daily backup.
  */
 import type {
   KubernetesObject,
@@ -21,6 +21,7 @@ import type {
 } from "@kubernetes/client-node";
 
 import { COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
+import { DATABASE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
 import {
   claimSpec,
@@ -116,7 +117,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
               { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
               { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
               { name: "NEON_PAGESERVER_HOST", value: neonName("pageserver") },
-              { name: "NEON_COMPUTE_HOST", value: neonName("compute") },
+              { name: "NEON_PROXY_HOST", value: PROXY_HOST },
               { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
               { name: "S3_ENDPOINT", value: s3Endpoint(config) },
               { name: "S3_REGION", value: objectStore.external.region },
@@ -432,7 +433,9 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
   return [service(name, component, [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }]), statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
-/** The port Neon's proxy takes clients on, Postgres's own. */
+/** Where every client reaches Neon's proxy, from main's namespace or a branch environment's. */
+export const PROXY_HOST = `${neonName("proxy")}.${NAMESPACE}.svc`;
+/** The port the proxy takes clients on, Postgres's own. */
 export const PROXY_PORT = 5432;
 
 /**
@@ -541,7 +544,7 @@ function control(config: InstallConfig): KubernetesObject[] {
 }
 
 /**
- * Neon's proxy, from Neon's image: a client of a compute, main's or a branch
+ * Neon's proxy, from Neon's image: every client of a compute, main's or a branch
  * environment's, connects to it, naming the compute by `options=endpoint=<id>` (the
  * compute's id, as its spec is served under), without TLS, which would turn that option
  * off. It asks neon-control, its control plane, for the role's verifier, authenticates the
@@ -697,12 +700,17 @@ function backup(config: InstallConfig): V1CronJob {
     command: [
       "/bin/sh",
       "-c",
-      // A new pod's NetworkPolicy may apply a moment after it starts, so the compute is
+      // A new pod's NetworkPolicy may apply a moment after it starts, so the proxy is
       // waited for rather than given up on at the first refusal.
-      'until pg_isready --quiet --host="$0" --port=55433; do sleep 2; done && pg_dump --host="$0" --port=55433 --username=alasio --dbname=alasio --format=custom --file=/backup/alasio.dump',
-      neonName("compute"),
+      `until pg_isready --quiet; do sleep 2; done && pg_dump --username=${ROLE} --dbname=${DATABASE} --format=custom --file=/backup/alasio.dump`,
     ],
-    env: [{ name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: databaseSecret(config), key: "password" } } }],
+    env: [
+      { name: "PGHOST", value: PROXY_HOST },
+      { name: "PGPORT", value: String(PROXY_PORT) },
+      // Main's compute, through the proxy, which wakes it if it sleeps.
+      { name: "PGOPTIONS", value: `endpoint=${computeId(MAIN)}` },
+      { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: databaseSecret(config), key: "password" } } },
+    ],
     securityContext: restrictedContainer(),
     resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { memory: "1Gi" } },
     volumeMounts: [{ name: "backup", mountPath: "/backup" }],

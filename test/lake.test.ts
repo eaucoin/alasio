@@ -23,7 +23,7 @@ import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } 
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
 import { startIntake } from "../neon/lake/src/intake.ts";
-import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
+import { conninfo, LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
@@ -1337,6 +1337,12 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadConfig({ ...local, LAKE_MAINTENANCE_HOURS: "-1" }), /LAKE_MAINTENANCE_HOURS must be a positive number/);
   assert.throws(() => loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches" }), /LAKE_BRANCHES_TOKEN is not set/);
   assert.deepEqual(loadConfig({ ...local, LAKE_BRANCHES_URL: "http://control:8080/branches", LAKE_BRANCHES_TOKEN: "t" }).branches, { url: "http://control:8080/branches", token: "t" });
+  // Through Neon's proxy, every connection names its compute; straight to a Postgres, none.
+  assert.equal(loadConfig(local).catalog.options, "");
+  assert.equal(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");
+  assert.equal(loadEndpointConfig({ ...reader, LAKE_QUERY_TOKEN: "t", LAKE_DATABASE_ENDPOINT: "alasio" }).catalog.options, "endpoint=alasio");
+  assert.equal(conninfo("lake"), "dbname='lake'");
+  assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' options='endpoint=alasio'");
 });
 
 test("the lake learns Neon's branches but main from neon-control, with its token, and fails on what is not a list of them", async () => {

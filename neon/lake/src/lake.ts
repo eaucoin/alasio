@@ -50,12 +50,14 @@ export function literal(value: string): string {
 }
 
 /**
- * A libpq connection string naming `database` alone: the server, the role and its
- * password come from the DuckDB's Postgres secret (openLake), so nothing DuckDB says of a
- * connection, which quotes this, carries the password into a log.
+ * A libpq connection string naming `database`, and the `options` sent with it, when any:
+ * the server, the role and its password come from the DuckDB's Postgres secret
+ * (openLake), so nothing DuckDB says of a connection, which quotes this, carries the
+ * password into a log.
  */
-export function conninfo(database: string): string {
-  return `dbname='${database.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
+export function conninfo(database: string, options = ""): string {
+  const quoted = (value: string) => `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
+  return `dbname=${quoted(database)}${options ? ` options=${quoted(options)}` : ""}`;
 }
 
 /**
@@ -101,12 +103,12 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
     await db.run(`create temporary secret (
       type postgres, host ${literal(host)}, port ${port}, user ${literal(user)}, password ${literal(password)})`);
     if (source) {
-      await db.run(`attach ${literal(conninfo(source))} as ${SOURCE} (type postgres, read_only)`);
+      await db.run(`attach ${literal(conninfo(source, config.catalog.options))} as ${SOURCE} (type postgres, read_only)`);
     }
     // Serially, as the lake's first attach writes its catalog.
     await serially(() =>
       db.run(
-        `attach ${literal(`ducklake:postgres:${conninfo(config.catalog.database)}`)} as ${LAKE}
+        `attach ${literal(`ducklake:postgres:${conninfo(config.catalog.database, config.catalog.options)}`)} as ${LAKE}
           (data_path ${literal(config.dataPath)}, metadata_schema 'ducklake'${readOnly ? ", read_only" : ""})`,
       )
     );

@@ -11,7 +11,8 @@
  * Claude Code's token when main has one; the pull Secrets of its images; and its token to
  * ask main to fork with. Its lake has main's object store identity, as it reads main's
  * files where they are (one data path: DuckLake keeps every file's path relative to it),
- * and SeaweedFS's Write, which writing needs, deletes too. neon-control is called
+ * and SeaweedFS's Write, which writing needs, deletes too. Its clients reach its compute
+ * as main's do theirs, through Neon's proxy, by its compute's id. neon-control is called
  * in its own pod, as the API server's service proxy drops the Authorization header it
  * authenticates its callers by, which neon-control would read a token from.
  *
@@ -25,7 +26,7 @@ import { randomBytes } from "node:crypto";
 import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1PersistentVolume, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "effect";
 
-import { type BranchView, COMPUTE_PORT, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
+import { type BranchView, COMPUTE_PORT, computeId, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
@@ -243,8 +244,10 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const credentials = { alasio: own(), lake: own(), compute: own() };
   // Their verifiers, each made once and given to whatever sets the role or answers for it.
   const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake) };
+  // Main's URL, through the proxy, with the branch's password, on the branch's compute.
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
+  url.searchParams.set("options", `endpoint=${computeId(name)}`);
   const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
   const secrets = [
     branchSecret(name, componentName("database"), { url: url.toString(), "lake-verifier": verifiers[LAKE_ROLE] }),

@@ -444,6 +444,13 @@ describe("neon", () => {
     ]);
   });
 
+  test("dumps the database through the proxy, which wakes main's compute", () => {
+    const dump = one<V1CronJob>(install(), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.initContainers?.[0];
+    const env = Object.fromEntries((dump?.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
+    assert.deepEqual([env["PGHOST"], env["PGPORT"], env["PGOPTIONS"]], ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio"]);
+    assert.equal(dump?.command?.[2], "until pg_isready --quiet; do sleep 2; done && pg_dump --username=alasio --dbname=alasio --format=custom --file=/backup/alasio.dump");
+  });
+
   test("pins every third-party image by digest", () => {
     const statefulSets = all<V1StatefulSet>(install({ workspaceStorage: { enabled: false } }), "StatefulSet");
     assert.equal(statefulSets.length, 7);
@@ -791,11 +798,11 @@ describe("object store", () => {
     // The filer store takes its filers, the collector and its backups; the Valkey that serves a backup as it is restored, the Job that restores it alone.
     assert.deepEqual(admitted("alasio-seaweedfs-filer-store"), [[["seaweedfs-filer", "collector", "seaweedfs-filer-store-backup"], [6379]]]);
     assert.deepEqual(admitted("alasio-seaweedfs-filer-store-restore-source"), [[["seaweedfs-filer-store-restore"], [6379]]]);
-    // The data stack's pods reach none of the parts but as these say.
+    // The data stack's pods reach none of the parts but as these say, nor the compute but as its own policy says.
     const stack = one<KubernetesObject & { spec: { podSelector: object } }>(objects, "NetworkPolicy", "alasio-neon").spec.podSelector;
     assert.deepEqual(stack, {
       matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" },
-      matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["seaweedfs", "seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"] }],
+      matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["seaweedfs", "seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "neon-compute"] }],
     });
     // The lifecycle pass and the backups are admitted by the components their pods carry.
     const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.metadata?.labels;
@@ -945,7 +952,7 @@ describe("Grafana", () => {
     }
   });
 
-  test("runs one Grafana, from its image, on its database in the compute, alerting through the bot, keeping nothing", () => {
+  test("runs one Grafana, from its image, on its database on main's compute, alerting through the bot, keeping nothing", () => {
     const grafana = one<V1Deployment>(install({ images: { grafana: { tag: "1.2.3" } } }), "Deployment", "alasio-grafana");
     // Of one replica, stopped before its successor starts, so no two send an alert.
     assert.deepEqual([grafana.spec?.replicas, grafana.spec?.strategy], [1, { type: "Recreate" }]);
@@ -953,8 +960,12 @@ describe("Grafana", () => {
     assert.deepEqual([pod?.automountServiceAccountToken, pod?.securityContext?.runAsUser], [false, 472]);
     assert.equal(container(grafana).image, "ghcr.io/eaucoin/alasio-grafana:1.2.3");
     assert.deepEqual(container(grafana).env, [
-      // Directly, not through a pooler: its migrations hold a session's advisory lock.
-      { name: "GF_DATABASE_HOST", value: "alasio-neon-compute:55433" },
+      // Through Neon's proxy, which passes a session through whole, as its migrations' advisory lock needs, naming main's compute;
+      // its password the Secret's, which envFrom gives it before.
+      {
+        name: "GF_DATABASE_URL",
+        value: "postgres://grafana:$(GF_DATABASE_PASSWORD)@alasio-neon-proxy.alasio.svc:5432/grafana?options=endpoint%3Dalasio&sslmode=disable",
+      },
       { name: "LAKE_QUERY_URL", value: "http://alasio-lake:8090" },
       { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: "telegram", key: "token" } } },
       { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: "telegram", key: "allowedUserIds" } } },
@@ -1012,7 +1023,10 @@ describe("Grafana", () => {
     const wait = one<V1Deployment>(install(), "Deployment", "alasio-grafana").spec?.template.spec?.initContainers?.[0];
     assert.ok(wait);
     const env = Object.fromEntries((wait.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
-    assert.deepEqual([env["PGHOST"], env["PGPORT"], env["PGDATABASE"], env["PGUSER"]], ["alasio-neon-compute", "55433", "grafana", "grafana"]);
+    assert.deepEqual(
+      [env["PGHOST"], env["PGPORT"], env["PGOPTIONS"], env["PGDATABASE"], env["PGUSER"], env["PGCONNECT_TIMEOUT"]],
+      ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio", "grafana", "grafana", "5"],
+    );
     assert.deepEqual(wait.env?.find(({ name }) => name === "PGPASSWORD")?.valueFrom, { secretKeyRef: { name: "alasio-grafana", key: "GF_DATABASE_PASSWORD" } });
     // A login refused twice, then let in.
     const psql = 'n=$(cat "$ROOT/tries" 2>/dev/null || echo 0); echo $((n + 1)) >"$ROOT/tries"; [ "$n" -ge 2 ] && echo "$PGUSER@$PGDATABASE" >"$ROOT/in"';
@@ -1030,11 +1044,11 @@ describe("Grafana", () => {
     const own = one<Policy>(objects, "NetworkPolicy", "alasio-grafana").spec;
     assert.deepEqual([own.podSelector, own.policyTypes, own.ingress], [{ matchLabels: GRAFANA }, ["Ingress", "Egress"], undefined]);
     const egress = own.egress as { to: Record<string, unknown>[]; ports: { protocol: string; port: number }[] }[];
-    assert.deepEqual(egress.map(({ ports }) => ports.map(({ protocol, port }) => `${protocol}/${port}`).join(",")), ["UDP/53,TCP/53", "TCP/55433", "TCP/8090", "TCP/443"]);
+    assert.deepEqual(egress.map(({ ports }) => ports.map(({ protocol, port }) => `${protocol}/${port}`).join(",")), ["UDP/53,TCP/53", "TCP/5432", "TCP/8090", "TCP/443"]);
     assert.deepEqual(egress[3]?.to, [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }]);
-    // Neither the compute nor the lake admits it as a pod of the stack: each does so on its port alone.
+    // Neither Neon's proxy nor the lake admits it as a pod of the stack: each does so on its port alone.
     assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-grafana").spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined);
-    for (const [component, port] of [["neon-compute", 55433], ["lake", 8090]] as const) {
+    for (const [component, port] of [["neon-proxy", 5432], ["lake", 8090]] as const) {
       assert.deepEqual(one<Policy>(objects, "NetworkPolicy", `alasio-${component}-from-grafana`).spec.ingress, [{ from: [{ podSelector: { matchLabels: GRAFANA } }], ports: [{ protocol: "TCP", port }] }]);
     }
   });
@@ -1795,7 +1809,8 @@ describe("branch environments", () => {
     assert.deepEqual(lake.spec?.template.spec?.containers.map(({ name }) => name), ["lake"]);
     assert.deepEqual(of<V1Service>("Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["metrics", "otlp-http"]);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("grafana")), []);
-    assert.equal(variable(lake, "LAKE_DATABASE_HOST"), "alasio-neon-compute");
+    // Its compute, through main's Neon proxy.
+    assert.deepEqual([variable(lake, "LAKE_DATABASE_HOST"), variable(lake, "LAKE_DATABASE_PORT"), variable(lake, "LAKE_DATABASE_ENDPOINT")], ["alasio-neon-proxy.alasio.svc", "5432", "branch-try"]);
     assert.deepEqual(of<V1Role>("Role", "alasio-neon-control").rules, [
       { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
@@ -1807,7 +1822,7 @@ describe("branch environments", () => {
     assert.equal(variable(one<V1Deployment>(main, "Deployment", "alasio-neon-control"), "NEON_PAGESERVER_HOST"), "alasio-neon-pageserver.alasio.svc");
   });
 
-  test("confine the branch's sessions to its alasio, and its compute to its alasio and lake", () => {
+  test("confine the branch's sessions to its alasio, and have a policy of its compute's", () => {
     const policy = (name: string, namespace: string) => of<KubernetesObject & { spec: Record<string, unknown> }>("NetworkPolicy", name, namespace).spec;
     const alasio = { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-branch-try" } }, podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
     assert.deepEqual(policy("bayma-from-alasio", "alasio-branch-try-sessions")["ingress"], [{ from: [alasio], ports: [{ protocol: "TCP", port: 7290 }] }]);
@@ -1846,7 +1861,7 @@ describe("branch environments", () => {
     assert.deepEqual(reached, ["alasio → main's alasio on 4319"]);
   });
 
-  test("are reached by main's Neon proxy and neon-control, each compute", () => {
+  test("reach every compute through main's Neon proxy alone, which with main's neon-control alone reaches one, and main's collector main's metrics alone", () => {
     const main = install({ grafana: { enabled: true } });
     const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
     const namespaces = new Map(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name ?? "", metadata?.labels ?? {}]));
@@ -1856,13 +1871,29 @@ describe("branch environments", () => {
       assert.ok(deployment, `${namespace}/${name}`);
       return podIn(namespace, deployment.spec?.template.metadata?.labels);
     };
+    const clients: [string, Pod][] = [
+      ["main's alasio", podOf(main, "alasio", "alasio")],
+      ["main's lake", podOf(main, "alasio-lake", "alasio")],
+      ["main's Grafana", podOf(main, "alasio-grafana", "alasio")],
+      ["main's backup", podIn("alasio", one<V1CronJob>(main, "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.metadata?.labels)],
+      ["the branch's alasio", podOf(branch, "alasio", "alasio-branch-try")],
+      ["the branch's lake", podOf(branch, "alasio-lake", "alasio-branch-try")],
+    ];
     const proxy = podOf(main, "alasio-neon-proxy", "alasio");
     const control = podOf(main, "alasio-neon-control", "alasio");
     const computes: [string, Pod][] = [["main's compute", podOf(main, "alasio-neon-compute", "alasio")], ["the branch's compute", podOf(branch, "alasio-neon-compute", "alasio-branch-try")]];
+    for (const [client, pod] of clients) {
+      assert.ok(admits(policies, pod, proxy, 5432), `${client} → the proxy`);
+      for (const [name, compute] of computes) assert.ok(!admits(policies, pod, compute, 55433), `${client} → ${name}`);
+    }
     for (const [name, compute] of computes) {
       assert.ok(admits(policies, proxy, compute, 55433), `the proxy → ${name}`);
       assert.ok(admits(policies, control, compute, 55433), `neon-control → ${name}`);
     }
+    const collector = podOf(main, "alasio-collector", "alasio");
+    assert.deepEqual(computes.filter(([, compute]) => admits(policies, collector, compute, 3080)).map(([name]) => name), ["main's compute"]);
+    // Sessions reach no database at all.
+    assert.ok(!admits(policies, podIn("alasio-branch-try-sessions", { "alasio.dev/workload": "session" }), proxy, 5432));
   });
 
   test("are admitted by main to what they share of its storage alone, and to its fork of their sessions, which only main forks", () => {
@@ -1872,12 +1903,12 @@ describe("branch environments", () => {
     assert.deepEqual(policy("alasio-neon-branches"), {
       podSelector: {
         matchLabels: { "app.kubernetes.io/instance": "alasio" },
-        matchExpressions: [{ key: "app.kubernetes.io/component", operator: "In", values: ["neon-pageserver", "neon-safekeeper", "neon-control", "seaweedfs"] }],
+        matchExpressions: [{ key: "app.kubernetes.io/component", operator: "In", values: ["neon-pageserver", "neon-safekeeper", "neon-control", "neon-proxy", "seaweedfs"] }],
       },
       policyTypes: ["Ingress"],
       ingress: [{
         from: [{ namespaceSelector: branches, podSelector: { matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" } } }],
-        ports: [6400, 5454, 8080, 8333].map((port) => ({ protocol: "TCP", port })),
+        ports: [6400, 5454, 8080, 5432, 8333].map((port) => ({ protocol: "TCP", port })),
       }],
     });
     assert.deepEqual((policy("alasio-alasio")["ingress"] as unknown[]).at(-1), {

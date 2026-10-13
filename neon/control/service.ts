@@ -12,7 +12,7 @@
  * timelines of main or of each other (./branches.ts), serves each branch's
  * compute its spec, answers the storage controller's compute hooks, and reports
  * healthy once main's compute can start. It is the control plane of Neon's proxy
- * (./endpoints.ts), which a client connects through: it answers the proxy for
+ * (./endpoints.ts), which every client connects through: it answers the proxy for
  * roles' secrets, main's from the stack's secrets alone and a branch's from the record,
  * or as last read while the record cannot be, and wakes a compute that sleeps; it serves
  * a compute its spec, likewise, as last read. The replica that leads (./record.ts)

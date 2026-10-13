@@ -41,6 +41,7 @@ import {
   RESTORE_SOURCE,
   VOLUME_SERVER,
 } from "./object-store.ts";
+import { PROXY_PORT } from "./neon.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
@@ -110,16 +111,17 @@ const PARTS = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, C
 const ofMain = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(component) } });
 
 /**
- * Neon's services, the lake and their jobs reach each other; alasio reaches the compute,
- * its database, and main's Neon proxy and neon-control reach every compute, the proxy for
- * its clients and neon-control as it wakes it. In a branch environment, its compute and
- * its lake reach each other, and its alasio its compute, as main's do. The object store's
- * parts, of the stack too, are reached as partPolicies and gatewayPolicy say alone.
+ * Neon's services, the lake and their jobs reach each other, but the compute, which
+ * takes its clients' sessions from main's Neon proxy alone, which every client connects
+ * through, neon-control's, which wakes it, and the collector's scrapes of compute_ctl's
+ * metrics. In a branch environment, its lake and compute likewise, but for the scrapes,
+ * as the collector scrapes main's compute alone. The object store's parts, of the stack
+ * too, are reached as partPolicies and gatewayPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
     policy(componentName("neon"), namespace, "neon", {
-      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: PARTS }] },
+      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: [...PARTS, "neon-compute"] }] },
       policyTypes: ["Ingress"],
       ingress: [{ from: [{ podSelector: { matchLabels: STACK } }] }],
     }),
@@ -127,27 +129,47 @@ function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
       podSelector: { matchLabels: selectorLabels("neon-compute") },
       policyTypes: ["Ingress"],
       ingress: [
-        { from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
         { from: [ofMain("neon-proxy"), ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
+        // The collector scrapes main's compute_ctl alone (collector.ts).
+        ...(namespace === NAMESPACE ? [{ from: [ofMain("collector")], ports: [{ protocol: "TCP", port: 3080 }] }] : []),
       ],
     }),
   ];
 }
 
 /**
+ * Neon's proxy takes the sessions of every client of a compute: the stack's own pods of
+ * main's (neonPolicies), alasio, and branch environments' alasio (their lakes reach it as
+ * what branches share, branchStoragePolicy; Grafana as grafanaPolicies admit it).
+ */
+function proxyPolicy(): NetworkPolicy {
+  return policy(componentName("neon-proxy"), NAMESPACE, "neon", {
+    podSelector: { matchLabels: selectorLabels("neon-proxy") },
+    policyTypes: ["Ingress"],
+    ingress: [{
+      from: [
+        { podSelector: { matchLabels: selectorLabels("alasio") } },
+        { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+      ],
+      ports: [{ protocol: "TCP", port: PROXY_PORT }],
+    }],
+  });
+}
+
+/**
  * Branch environments' computes and lakes reach main's storage, which they share: the
  * pageserver and safekeepers their timelines are on, neon-control their specs are
- * served by, and the object store the lake's files are in; nothing else of main's, nor
- * its compute, which is main's database.
+ * served by, the proxy their lakes reach their computes through, and the object store the
+ * lake's files are in; nothing else of main's, nor its compute, which is main's database.
  */
 function branchStoragePolicy(config: InstallConfig): NetworkPolicy {
-  const shared = ["neon-pageserver", "neon-safekeeper", "neon-control", ...(config.objectStore.bundled.enabled ? ["seaweedfs"] : [])];
+  const shared = ["neon-pageserver", "neon-safekeeper", "neon-control", "neon-proxy", ...(config.objectStore.bundled.enabled ? ["seaweedfs"] : [])];
   return policy(componentName("neon-branches"), NAMESPACE, "neon", {
     podSelector: { matchLabels: { "app.kubernetes.io/instance": RELEASE }, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "In", values: shared }] },
     policyTypes: ["Ingress"],
     ingress: [{
       from: [{ namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } }],
-      ports: [6400, 5454, 8080, 8333].map((port) => ({ protocol: "TCP", port })),
+      ports: [6400, 5454, 8080, PROXY_PORT, 8333].map((port) => ({ protocol: "TCP", port })),
     }],
   });
 }
@@ -288,10 +310,10 @@ function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
 /**
  * Grafana takes no connection but its replicas' gossip, where it may run several:
  * `alasio grafana` reaches it through the API server's port-forward, which no
- * NetworkPolicy sees. It reaches the cluster's DNS, its database on the compute and the
- * lake's query endpoint, each of which admits it, its replicas, and Telegram's Bot API, as
- * alasio does, on the internet's HTTPS port; nothing else, and no other address of the
- * cluster or its network.
+ * NetworkPolicy sees. It reaches the cluster's DNS, its database through Neon's proxy and
+ * the lake's query endpoint, each of which admits it, its replicas, and Telegram's Bot
+ * API, as alasio does, on the internet's HTTPS port; nothing else, and no other address
+ * of the cluster or its network.
  */
 function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): NetworkPolicy[] {
   const grafana = { podSelector: { matchLabels: selectorLabels("grafana") } };
@@ -313,13 +335,13 @@ function grafanaPolicies({ sessions, grafana: { scaling } }: InstallConfig): Net
           to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
           ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
         },
-        { to: [{ podSelector: { matchLabels: selectorLabels("neon-compute") } }], ports: [{ protocol: "TCP", port: 55433 }] },
+        { to: [{ podSelector: { matchLabels: selectorLabels("neon-proxy") } }], ports: [{ protocol: "TCP", port: PROXY_PORT }] },
         { to: [{ podSelector: { matchLabels: selectorLabels("lake") } }], ports: [{ protocol: "TCP", port: LAKE_QUERY_PORT }] },
         // The addresses sessions with internet may not reach, the cluster's and its network's, are Grafana's too.
         { to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...sessions.blockedCidrs] } }], ports: [{ protocol: "TCP", port: 443 }] },
       ],
     }),
-    admitted("neon-compute", 55433),
+    admitted("neon-proxy", PROXY_PORT),
     admitted("lake", LAKE_QUERY_PORT),
   ];
 }
@@ -370,7 +392,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       })]
       : []),
     alasioPolicy(config, environment),
-    ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
+    ...(config.neon.enabled ? [...neonPolicies(environment), proxyPolicy(), branchStoragePolicy(config)] : []),
     ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),

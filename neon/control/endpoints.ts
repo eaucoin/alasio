@@ -1,7 +1,7 @@
 /**
  * neon-control as the control plane of Neon's proxy (its `cplane-v1` backend:
  * proxy/src/control_plane/client/cplane_proxy_v1.rs and messages.rs at Neon's
- * release-9129), what is decided without I/O. A client of alasio's Neon connects to
+ * release-9129), what is decided without I/O. Every client of alasio's Neon connects to
  * the proxy, naming the compute it wants by `options=endpoint=<id>` (the compute's id,
  * ./branches.ts's computeId), and the proxy asks:
  *

@@ -20,7 +20,7 @@ const ENV = {
   NEON_BROKER_URL: "http://q-neon-storage-broker:50051",
   NEON_CONTROLLER_URL: "http://q-neon-storage-controller:1234",
   NEON_PAGESERVER_HOST: "q-neon-pageserver",
-  NEON_COMPUTE_HOST: "q-neon-compute",
+  NEON_PROXY_HOST: "q-neon-proxy.alasio.svc",
   NEON_CONTROLLER_DB_HOST: "q-neon-controller-db",
   S3_ENDPOINT: "http://q-seaweedfs:8333",
   WORKSPACES_NAME: "workspaces",
@@ -82,7 +82,7 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.s3Region, "us-east-1");
   assert.equal(config.neonBucket, "neon");
   assert.equal(config.external, false);
-  assert.throws(() => setupConfig({ ...ENV, NEON_COMPUTE_HOST: "" }), /NEON_COMPUTE_HOST must be set/);
+  assert.throws(() => setupConfig({ ...ENV, NEON_PROXY_HOST: "" }), /NEON_PROXY_HOST must be set/);
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
   const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" });
   assert.ok(external.external);
@@ -105,8 +105,8 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.deepEqual(verifyToken(publicKey, value(kube, names.storageController, "CONTROL_PLANE_JWT_TOKEN")), { scope: "admin" });
   assert.deepEqual(verifyToken(publicKey, value(kube, names.safekeeper, "safekeeper_peer_token")), { scope: "safekeeperdata" });
   assert.equal(value(kube, names.compute, "NEON_CONTROL_PLANE_TOKEN"), root.computeControlToken);
-  assert.equal(value(kube, names.database, "url"), `postgresql://alasio:${encodeURIComponent(root.alasioPassword)}@q-neon-compute:55433/alasio`);
-  // Neon's proxy, with a token that does nothing else.
+  // Main's compute, through Neon's proxy, which names it by the option; the proxy with a token that does nothing else.
+  assert.equal(value(kube, names.database, "url"), `postgresql://alasio:${encodeURIComponent(root.alasioPassword)}@q-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio`);
   assert.deepEqual(verifyToken(publicKey, value(kube, names.proxy, "NEON_PROXY_TO_CONTROLPLANE_TOKEN")), { scope: "proxy" });
   assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
   assert.deepEqual(verifyToken(publicKey, value(kube, names.lake, "LAKE_BRANCHES_TOKEN")), { scope: "branches" });

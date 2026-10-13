@@ -1033,7 +1033,7 @@ function verifies(verifier: string | undefined, password: string): boolean {
 async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNeon }> {
   const setup = await installed(t);
   stackSecret(setup.kube, "alasio-database", {
-    url: "postgresql://alasio:p@alasio-neon-compute:55433/alasio",
+    url: "postgresql://alasio:p@alasio-neon-proxy.alasio.svc:5432/alasio?options=endpoint%3Dalasio",
     password: "p",
     "lake-verifier": "SCRAM-SHA-256$l",
     "lake-reader-verifier": "SCRAM-SHA-256$r",
@@ -1123,9 +1123,9 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   // Its own bot, for main's users; its own token to ask main to fork with.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "token"), "456:branch");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "allowedUserIds"), "42");
-  // Its own password of alasio's role, whose verifier alone neon-control is given, for its compute's spec and Neon's proxy.
+  // Its own password of alasio's role, whose verifier alone neon-control is given, for its compute's spec and Neon's proxy; its compute named to the proxy.
   const url = new URL(secretIn(kube, "alasio-branch-try", "alasio-database", "url") ?? "");
-  assert.deepEqual([url.username, url.host, url.pathname], ["alasio", "alasio-neon-compute:55433", "/alasio"]);
+  assert.deepEqual([url.username, url.host, url.pathname, url.searchParams.get("options")], ["alasio", "alasio-neon-proxy.alasio.svc:5432", "/alasio", "endpoint=branch-try"]);
   assert.notEqual(url.password, "p");
   assert.ok(verifies(compute?.verifiers["alasio"], decodeURIComponent(url.password)));
   // Its compute's own token, whose hash alone neon-control is given; its lake's role's own password.

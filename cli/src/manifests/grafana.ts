@@ -8,7 +8,8 @@
  * Of one replica, rolled out by stopping it before its successor starts, so no two, not
  * of one cluster, both send an alert; of more, a pod at a time, the new ready before the
  * old stops. Replicas starting together take turns at its migrations, which hold a
- * session's advisory lock, which is why it connects to the compute directly. Of more
+ * session's advisory lock, which Neon's proxy, which it connects to main's compute
+ * through, keeps, as it passes the session through whole. Of more
  * than one replica (grafana.scaling),
  * unified alerting is highly available: they find each other through a headless Service
  * and gossip on GOSSIP_PORT, one of them evaluates the rules and shares what it finds, and
@@ -22,6 +23,8 @@
  */
 import type { KubernetesObject, V1Deployment, V1EnvVar, V1Service } from "@kubernetes/client-node";
 
+import { computeId, MAIN } from "../../../neon/control/branches.ts";
+import { GRAFANA_ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
 import {
   componentName,
@@ -30,7 +33,6 @@ import {
   imagePullSecrets,
   labels,
   NAMESPACE,
-  neonName,
   replicasOf,
   restrictedContainer,
   restrictedPod,
@@ -41,6 +43,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { replicaBudget, replicated, spread } from "./disruption.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
+import { PROXY_HOST, PROXY_PORT } from "./neon.ts";
 import { priority } from "./priorities.ts";
 import { cpuUtilization, scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -51,6 +54,12 @@ export const GRAFANA = componentName("grafana");
 export const GRAFANA_PORT = 3000;
 /** The user its image runs as. */
 const GRAFANA_USER = 472;
+
+/**
+ * What its database's URL asks of the connection, beside the server: main's compute, named
+ * to Neon's proxy; and no TLS, which the proxy is not given.
+ */
+const DATABASE_QUERY = new URLSearchParams({ options: `endpoint=${computeId(MAIN)}`, sslmode: "disable" }).toString();
 /** The port its replicas gossip on, over TCP and UDP, as unified alerting's peers. */
 export const GOSSIP_PORT = 9094;
 
@@ -114,10 +123,11 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
             imagePullPolicy: "IfNotPresent",
             command: ["/bin/sh", "-c", script('until psql --no-psqlrc --quiet --command="select 1" >/dev/null 2>&1; do sleep 2; done')],
             env: [
-              { name: "PGHOST", value: neonName("compute") },
-              { name: "PGPORT", value: "55433" },
+              { name: "PGHOST", value: PROXY_HOST },
+              { name: "PGPORT", value: String(PROXY_PORT) },
+              { name: "PGOPTIONS", value: `endpoint=${computeId(MAIN)}` },
               { name: "PGDATABASE", value: "grafana" },
-              { name: "PGUSER", value: "grafana" },
+              { name: "PGUSER", value: GRAFANA_ROLE },
               { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: GRAFANA, key: "GF_DATABASE_PASSWORD" } } },
               { name: "PGCONNECT_TIMEOUT", value: "5" },
             ],
@@ -129,7 +139,9 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
             image: imageReference(config.images.grafana),
             imagePullPolicy: config.images.pullPolicy,
             env: [
-              { name: "GF_DATABASE_HOST", value: `${neonName("compute")}:55433` },
+              // Its database, on main's compute through Neon's proxy, its password the Secret's
+              // (envFrom, which this may name), which the stack's setup makes URL-safe.
+              { name: "GF_DATABASE_URL", value: `postgres://${GRAFANA_ROLE}:$(GF_DATABASE_PASSWORD)@${PROXY_HOST}:${PROXY_PORT}/grafana?${DATABASE_QUERY}` },
               { name: "LAKE_QUERY_URL", value: `http://${componentName("lake")}:${LAKE_QUERY_PORT}` },
               { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: telegram, key: "token" } } },
               { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: telegram, key: "allowedUserIds" } } },

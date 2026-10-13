@@ -6,7 +6,10 @@
  *
  * The lake service (./service.ts), which writes the lake:
  *
- *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT  the compute, as the stack's network reaches it
+ *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT  Neon's proxy, as the stack's network reaches it
+ *   LAKE_DATABASE_ENDPOINT                  the compute it connects to through the proxy,
+ *                                           which it names by `options=endpoint=`; none
+ *                                           when unset, as straight to a Postgres
  *   LAKE_DATABASE_PASSWORD                  role `lake`'s: read-only on alasio's sources,
  *                                           owner of the `lake` database, the catalog
  *   LAKE_SOURCE_DATABASE                    alasio's database (default alasio)
@@ -29,8 +32,9 @@
  *
  * The lake's query endpoint (./endpoint.ts), which only reads it, as its reader:
  *
- *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT, LAKE_CATALOG_DATABASE, LAKE_DATA_PATH,
- *   LAKE_S3_ENDPOINT, LAKE_EXTENSION_DIRECTORY   as above
+ *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT, LAKE_DATABASE_ENDPOINT,
+ *   LAKE_CATALOG_DATABASE, LAKE_DATA_PATH, LAKE_S3_ENDPOINT,
+ *   LAKE_EXTENSION_DIRECTORY                     as above
  *   LAKE_READER_PASSWORD                    role `lake_reader`'s, which may only read the catalog
  *   LAKE_READER_S3_KEY, LAKE_READER_S3_SECRET  the object store's read-only identity's
  *   LAKE_QUERY_TOKEN                        the bearer token a query must carry
@@ -47,6 +51,8 @@ export interface DatabaseConfig {
   user: string;
   password: string;
   database: string;
+  /** The options each connection sends, as libpq's `options`: `endpoint=<id>` for Neon's proxy, or none (empty). */
+  options: string;
 }
 
 /** The object store an s3:// data path is in. */
@@ -133,6 +139,7 @@ function access(
       user,
       password: required(env, secrets.password),
       database: optional(env, "LAKE_CATALOG_DATABASE", "lake"),
+      options: env["LAKE_DATABASE_ENDPOINT"]?.trim() ? `endpoint=${env["LAKE_DATABASE_ENDPOINT"].trim()}` : "",
     },
     dataPath,
     s3: dataPath.startsWith("s3://")
