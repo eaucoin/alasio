@@ -1,7 +1,7 @@
 {
   "uid": "alasio-stack-health",
   "title": "Stack health",
-  "description": "Whether the stack's services answer, whether telemetry reaches the lake, what the stack logs as going wrong, and what its storage holds: from what the stack's collector scrapes and receives.",
+  "description": "Whether the stack's services answer, whether telemetry reaches the lake, what the stack logs as going wrong, what its storage holds, and how its computes sleep and wake: from what the stack's collector scrapes and receives.",
   "tags": [
     "alasio"
   ],
@@ -1158,6 +1158,199 @@
       "options": {
         "showHeader": true,
         "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Neon's computes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Wakes",
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 12,
+        "h": 8
+      },
+      "description": "How long a wake of a compute took on average, from its asking to the compute taking connections: warm, the compute running, or cold, woken from sleep. neon-control's replicas', each scraped.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with points as (\nselect TimeUnix, ResourceAttributes['service.instance.id'] as replica, Attributes['start'] as start, Sum, Count from otel.metrics_histogram\nwhere MetricName = 'neon_control_wake_duration_seconds' and TimeUnix >= epoch_ms(${__from}) - interval 10 minute and TimeUnix < epoch_ms(${__to})\n), wakes as (\nselect TimeUnix, start, greatest(Sum - lag(Sum) over replicas, 0) as seconds, greatest(Count - lag(Count) over replicas, 0) as wakes\nfrom points window replicas as (partition by replica, start order by TimeUnix)\n)\nselect time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, start, sum(seconds) / sum(wakes) as seconds\nfrom wakes where wakes > 0 and TimeUnix >= epoch_ms(${__from})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "start",
+              "text": "start",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.start}",
+          "custom": {
+            "drawStyle": "points",
+            "fillOpacity": 0,
+            "lineWidth": 1,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "state-timeline",
+      "title": "Computes awake",
+      "gridPos": {
+        "x": 12,
+        "y": 53,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Each environment's compute, main's (alasio) and each branch's: awake, at one replica, or asleep, at none, as neon-control's replica that leads reads them every half minute.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['compute'] as compute, max(Value) as replicas\nfrom otel.metrics_gauge where MetricName = 'neon_control_compute_replicas' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "compute",
+              "text": "compute",
+              "type": "string"
+            },
+            {
+              "selector": "replicas",
+              "text": "replicas",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "asleep",
+                  "color": "blue"
+                },
+                "1": {
+                  "text": "awake",
+                  "color": "green"
+                }
+              }
+            }
+          ],
+          "displayName": "${__field.labels.compute}",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "legend": {
+          "showLegend": false
+        }
       }
     }
   ]

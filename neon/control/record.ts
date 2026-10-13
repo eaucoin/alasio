@@ -44,10 +44,16 @@ const CONNECTION = {
   options: "-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3",
 } satisfies pg.ClientConfig;
 
+/** Which lock: of changes to the branches, or of a compute. */
+export type RecordLock = "changes" | "compute";
+
 /** A lock another replica held for longer than the record's patience: what waited for it may be asked again. */
 export class RecordBusy extends Error {
-  constructor(what: string) {
+  readonly lock: RecordLock;
+
+  constructor(lock: RecordLock, what: string) {
     super(`${what} is held by another replica of neon-control; ask again`);
+    this.lock = lock;
   }
 }
 
@@ -74,13 +80,15 @@ export interface ComputeTimes {
 export class BranchRecord {
   readonly #url: string;
   readonly #pool: pg.Pool;
+  readonly #busy: (lock: RecordLock) => void;
   readonly #patienceMs: number;
   /** The connection holding the leader's lock, while this replica leads. */
   #leading: pg.Client | null = null;
 
-  /** A lock is given up (RecordBusy) after `patienceMs`. */
-  constructor(url: string, { patienceMs = 60_000 }: { patienceMs?: number } = {}) {
+  /** `busy` hears of each lock given up (RecordBusy), after `patienceMs`. */
+  constructor(url: string, { busy = () => {}, patienceMs = 60_000 }: { busy?: (lock: RecordLock) => void; patienceMs?: number } = {}) {
     this.#url = url;
+    this.#busy = busy;
     this.#patienceMs = patienceMs;
     this.#pool = new pg.Pool({ connectionString: url, max: 4, ...CONNECTION });
     // An idle connection lost is replaced on the next checkout.
@@ -89,7 +97,7 @@ export class BranchRecord {
 
   /** Makes the schema and its tables, idempotently, under the lock, so two replicas starting at once do not race. */
   ensureSchema(): Promise<void> {
-    return this.#holding(CHANGE_LOCK, "the lock of changes", async (client) => {
+    return this.#holding(CHANGE_LOCK, "changes", "the lock of changes", async (client) => {
       await client.query("create schema if not exists neon_control");
       await client.query("create table if not exists neon_control.branches (name text primary key, branch jsonb not null)");
       await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz, suspended_at timestamptz)");
@@ -103,7 +111,7 @@ export class BranchRecord {
 
   /** Runs `work` holding the lock of changes, with the branches as recorded once it holds it. */
   changing<T>(work: (changing: Changing) => Promise<T>): Promise<T> {
-    return this.#holding(CHANGE_LOCK, "the lock of changes", (client) => this.#change(client, work));
+    return this.#holding(CHANGE_LOCK, "changes", "the lock of changes", (client) => this.#change(client, work));
   }
 
   /** Runs `work` as `changing` does, if no other holds the lock now; null, without running it, if one does. */
@@ -113,7 +121,7 @@ export class BranchRecord {
 
   /** Runs `work` holding the lock of the compute `id`, waiting for it as long as `patienceMs`, the record's patience unless given. */
   computeLocked<T>(id: string, work: () => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
-    return this.#holding([COMPUTE_LOCKS, id], `the lock of ${id}`, () => work(), patienceMs);
+    return this.#holding([COMPUTE_LOCKS, id], "compute", `the lock of ${id}`, () => work(), patienceMs);
   }
 
   /** Runs `work` as `computeLocked` does, if no other holds the compute's lock now; null, without running it, if one does. */
@@ -200,7 +208,7 @@ export class BranchRecord {
    * two: a class and a name hashed), waited for as long as the record's patience
    * (RecordBusy after that). The lock ends with the connection.
    */
-  async #holding<T>(key: bigint | readonly [number, string], what: string, work: (client: pg.Client) => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
+  async #holding<T>(key: bigint | readonly [number, string], lock: RecordLock, what: string, work: (client: pg.Client) => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
     const client = this.#client();
     await client.connect();
     try {
@@ -208,7 +216,9 @@ export class BranchRecord {
       await client.query(`set lock_timeout = ${Math.max(1, Math.round(patienceMs))}`);
       await client.query(lockQuery("pg_advisory_lock", key), lockParameters(key)).catch((error: unknown) => {
         // Postgres's lock_not_available: lock_timeout ran out.
-        throw (error as { code?: string }).code === "55P03" ? new RecordBusy(what) : error;
+        if ((error as { code?: string }).code !== "55P03") throw error;
+        this.#busy(lock);
+        throw new RecordBusy(lock, what);
       });
       return await work(client);
     } finally {

@@ -10,10 +10,11 @@
  * or an endpoint is set; with neither, nothing exports anything.
  *
  * It batches and retries in memory, so a restart of it may lose a few seconds of
- * telemetry. JuiceFS's metrics are its driver's and mount pods', found among the pods of
- * the driver's namespace, and SeaweedFS's its parts' pods', found among its own, which the
- * collector may list; each Valkey's are read with its password. Its pod carries its
- * configuration's checksum, so it is replaced when that changes.
+ * telemetry. neon-control's metrics are each of its replicas', and SeaweedFS's its parts'
+ * pods', found among the pods of its own namespace, and JuiceFS's its driver's and mount
+ * pods', among the driver's namespace's, which the collector may list; each Valkey's are
+ * read with its password. Its pod carries its configuration's checksum, so it is replaced
+ * when that changes.
  */
 import type { KubernetesObject, V1ConfigMap, V1Deployment, V1Role, V1RoleBinding, V1Service, V1ServiceAccount } from "@kubernetes/client-node";
 
@@ -95,7 +96,7 @@ function valkeys(config: InstallConfig): ReadValkey[] {
   ];
 }
 
-/** What it scrapes: each job's targets, by job, the object store's parts, and with workspace storage JuiceFS's pods. */
+/** What it scrapes: each job's targets, by job, each of neon-control's replicas, the object store's parts, and with workspace storage JuiceFS's pods. */
 function scrapes(config: InstallConfig): object[] {
   const { neon, workspaceStorage } = config;
   if (!neon.enabled) return [];
@@ -109,16 +110,16 @@ function scrapes(config: InstallConfig): object[] {
     safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
-  // JuiceFS's pods of the name `name` in the driver's namespace: each running one at its
-  // address, on the port `port` they serve their metrics on, named by its pod. The
-  // collector reads `$` as the start of a variable, and `$$` as a `$`.
-  const juicefsJob = (job: string, name: string, port: number) => ({
+  // The pods of `namespace` the label `label` selects: each running one at its address, on
+  // the port `port` they serve their metrics on, named by its pod. The collector reads `$`
+  // as the start of a variable, and `$$` as a `$`.
+  const podsJob = (job: string, namespace: string, label: string, port: number) => ({
     job_name: job,
     scrape_interval: SCRAPE_INTERVAL,
     kubernetes_sd_configs: [{
       role: "pod",
-      namespaces: { names: [workspaceStorage.csi.namespace] },
-      selectors: [{ role: "pod", label: `app.kubernetes.io/name=${name}` }],
+      namespaces: { names: [namespace] },
+      selectors: [{ role: "pod", label }],
     }],
     relabel_configs: [
       { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
@@ -143,8 +144,15 @@ function scrapes(config: InstallConfig): object[] {
   return [
     ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: SCRAPE_INTERVAL, static_configs: [{ targets: targets[job] }] })),
     ...(seaweedfsRuns(config) ? [seaweedfsJob] : []),
+    // Each replica's own wakes and sleeps, as any of them wakes a compute.
+    podsJob("neon-control", NAMESPACE, "app.kubernetes.io/component=neon-control", 8080),
     // The mount pods, the clients, and the controller's and node service's, the driver.
-    ...(workspaceStorage.enabled ? [juicefsJob("juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob("juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)] : []),
+    ...(workspaceStorage.enabled
+      ? [
+        podsJob("juicefs", workspaceStorage.csi.namespace, `app.kubernetes.io/name=${MOUNT_POD_NAME}`, JUICEFS_METRICS_PORT),
+        podsJob("juicefs-csi", workspaceStorage.csi.namespace, `app.kubernetes.io/name=${DRIVER_POD_NAME}`, DRIVER_METRICS_PORT),
+      ]
+      : []),
   ];
 }
 
@@ -215,8 +223,8 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
   if (!collectorRuns(config)) return [];
   const { telemetry, workspaceStorage } = config;
   const configuration = collectorConfig(config);
-  // The namespaces it finds pods to scrape in: the driver's, JuiceFS's, and its own, the object store's parts.
-  const listed = [...(workspaceStorage.enabled ? [workspaceStorage.csi.namespace] : []), ...(seaweedfsRuns(config) ? [NAMESPACE] : [])];
+  // The namespaces it finds pods to scrape in: the driver's, JuiceFS's, and its own, neon-control's and the object store's parts'.
+  const listed = [...(workspaceStorage.enabled ? [workspaceStorage.csi.namespace] : []), ...(config.neon.enabled ? [NAMESPACE] : [])];
   const metadata = { name: COLLECTOR, namespace: NAMESPACE, labels: stackLabels(COMPONENT) };
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata, data: { "config.yaml": goJson(configuration, "  ") } };
   const service: V1Service = {

@@ -134,13 +134,15 @@ test("each lock is held on a connection of its own, so reads go on however many 
     assert.deepEqual(await two.tryChanging(async () => "changed"), { value: "changed" });
 
     // Given up after its patience, of a lock never released.
-    const patient = new BranchRecord(database.url, { patienceMs: 1000 });
+    let busy: string | null = null;
+    const patient = new BranchRecord(database.url, { busy: (lock) => (busy = lock), patienceMs: 1000 });
     const forever = new Promise<void>(() => {});
     void one.computeLocked("alasio", () => forever);
     await sleep(200);
     const started = Date.now();
-    await assert.rejects(patient.computeLocked("alasio", async () => "woken"), RecordBusy);
+    await assert.rejects(patient.computeLocked("alasio", async () => "woken"), (error: unknown) => error instanceof RecordBusy && error.lock === "compute");
     assert.ok(Date.now() - started >= 900);
+    assert.equal(busy, "compute");
     assert.equal(await patient.tryComputeLocked("alasio", async () => "woken"), null);
     assert.deepEqual(await patient.tryComputeLocked("branch-dev", async () => "woken"), { value: "woken" }, "each compute's lock is its own");
     await patient.end();

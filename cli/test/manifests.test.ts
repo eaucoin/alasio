@@ -1182,6 +1182,10 @@ describe("telemetry", () => {
     }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "lake").static_configs, [{ targets: ["alasio-lake:9464"] }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "proxy").static_configs, [{ targets: ["alasio-neon-proxy:7001"] }]);
+    // Each of neon-control's replicas, found among main's pods, as any of them wakes a compute.
+    const control = jobs.find(({ job_name }: { job_name: string }) => job_name === "neon-control");
+    assert.deepEqual(control.kubernetes_sd_configs, [{ role: "pod", namespaces: { names: ["alasio"] }, selectors: [{ role: "pod", label: "app.kubernetes.io/component=neon-control" }] }]);
+    assert.equal(control.relabel_configs[1].replacement, "$$1:8080");
     for (const job of jobs) assert.equal(job.scrape_interval, "60s", job.job_name);
     assert.equal(config.receivers.redis.collection_interval, "60s");
   });
@@ -1220,7 +1224,7 @@ describe("telemetry", () => {
       { name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-valkey", key: "password" } } },
       { name: "FILER_STORE_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-collector", key: "password" } } },
     ]);
-    // It finds JuiceFS's pods in the driver's namespace, and the object store's parts in its own.
+    // It finds JuiceFS's pods in the driver's namespace, and neon-control's and the object store's parts in its own.
     const roles = all<V1Role>(objects, "Role").filter(({ metadata }) => metadata?.name === "alasio-collector");
     assert.deepEqual(roles.map(({ metadata }) => metadata?.namespace), ["kube-system", "alasio"]);
     for (const role of roles) assert.deepEqual(role.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
@@ -1264,8 +1268,11 @@ describe("telemetry", () => {
     });
   });
 
-  test("scrapes nothing without Neon, only taking OTLP and sending it on", () => {
-    const config = collectorConfig(install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } }));
+  test("scrapes nothing without Neon, only taking OTLP and sending it on, and lists no pods", () => {
+    const objects = install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } });
+    const config = collectorConfig(objects);
+    assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-collector").spec?.template.spec?.serviceAccountName, undefined);
+    assert.deepEqual(objects.filter(({ kind, metadata }) => !["ConfigMap", "Service", "Deployment", "VerticalPodAutoscaler", "NetworkPolicy"].includes(kind ?? "") && metadata?.name === "alasio-collector"), []);
     assert.equal(config.receivers.prometheus, undefined);
     assert.equal(config.service.pipelines["metrics/stack"], undefined);
     assert.equal(config.processors["resource/stack"], undefined);

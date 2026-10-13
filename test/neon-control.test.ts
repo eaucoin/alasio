@@ -26,6 +26,7 @@ import {
   withNotifiedPlacement,
 } from "../neon/control/branches.ts";
 import { bearsScope, generateKeyPair, signToken } from "../neon/control/jwt.ts";
+import { createControlMetrics } from "../neon/control/metrics.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 
 const MAIN_TIMELINE = "11111111111111111111111111111111";
@@ -309,4 +310,40 @@ test("the proxy's token of the proxy scope asks for roles' secrets and wakes com
     assert.ok(!proxy(method, url), `${method} ${url}`);
   }
   assert.ok(admin("POST", "/computes/alasio/wake"));
+});
+
+test("neon-control's metrics count its wakes, by how they started and in buckets of how long they took, its failures, sleeps and lock timeouts, and the replicas of each compute while it leads", () => {
+  const metrics = createControlMetrics();
+  const rendered = () => metrics.render().split("\n");
+  // Every counter, at 0, before anything has happened: what an increase is reckoned from.
+  for (const line of ['neon_control_wakes_total{start="cold"} 0', "neon_control_wake_failures_total 0", "neon_control_suspends_total 0", 'neon_control_lock_timeouts_total{lock="changes"} 0']) {
+    assert.ok(rendered().includes(line), line);
+  }
+  metrics.woke("cold", 6.5);
+  metrics.woke("warm", 0.1);
+  metrics.wakeFailed();
+  metrics.suspended();
+  metrics.lockTimedOut("compute");
+  metrics.replicas(new Map([["alasio", 1], ["branch-dev", 0]]));
+  const lines = rendered();
+  for (const line of [
+    'neon_control_wakes_total{start="cold"} 1',
+    'neon_control_wakes_total{start="warm"} 1',
+    'neon_control_wake_duration_seconds_bucket{start="cold",le="5"} 0',
+    'neon_control_wake_duration_seconds_bucket{start="cold",le="10"} 1',
+    'neon_control_wake_duration_seconds_bucket{start="cold",le="+Inf"} 1',
+    'neon_control_wake_duration_seconds_sum{start="cold"} 6.5',
+    'neon_control_wake_duration_seconds_bucket{start="warm",le="0.25"} 1',
+    "neon_control_wake_failures_total 1",
+    "neon_control_suspends_total 1",
+    'neon_control_lock_timeouts_total{lock="compute"} 1',
+    'neon_control_compute_replicas{compute="alasio"} 1',
+    'neon_control_compute_replicas{compute="branch-dev"} 0',
+    "# TYPE neon_control_wake_duration_seconds histogram",
+  ]) {
+    assert.ok(lines.includes(line), line);
+  }
+  // A replica that no longer leads says nothing of the computes.
+  metrics.replicas(new Map());
+  assert.ok(!metrics.render().includes("neon_control_compute_replicas{"));
 });

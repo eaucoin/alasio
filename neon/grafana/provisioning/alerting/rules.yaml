@@ -260,3 +260,44 @@ groups:
               type: threshold
               expression: volumes
               conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      - uid: alasio-wakes-failing
+        title: Computes are not waking
+        condition: failing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $values.failed }} wakes of Neon's computes failed in the last ten minutes: connections to them are refused."
+        data:
+          - refId: failed
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: failed
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(failed), 0)::int as failed from (
+                    select greatest(Value - lag(Value) over (partition by ResourceAttributes['service.instance.id'] order by TimeUnix), 0) as failed
+                    from otel.metrics_sum
+                    where MetricName = 'neon_control_wake_failures_total' and TimeUnix > now()::timestamp - interval 10 minute
+                  )
+              root_selector: ""
+              columns:
+                - {selector: failed, text: failed, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: failed
+              conditions: [{evaluator: {type: gt, params: [0]}}]

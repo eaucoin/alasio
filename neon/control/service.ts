@@ -58,7 +58,8 @@
  *   asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
  *
  * 503, `{ error }`, too, for a lock of the record another replica held for longer than its
- * patience (./record.ts), when it may be asked again.
+ * patience (./record.ts), when it may be asked again. `GET /metrics` takes no token: its
+ * metrics (./metrics.ts), for the stack's collector.
  *
  * A branch answered is `{ name, parent, timelineId, lsn, createdAt, state,
  * safekeepers?, computeId }`, its state `creating`, `ready` or `deleting`.
@@ -109,6 +110,7 @@ import {
 import { type ComputeDeployment, computePods, type ComputeRef, computeActivity, computeDeployment, scaleCompute } from "./computes.ts";
 import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
 import { bearsScope, publicJwks, signToken } from "./jwt.ts";
+import { createControlMetrics } from "./metrics.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { scramVerifier } from "./scram.ts";
 import { MONITOR_ROLE, type StackSecrets } from "./secrets.ts";
@@ -194,8 +196,11 @@ const stack: ComputeStack = {
   jwks: publicJwks(publicKeyPem),
 };
 
+const metrics = createControlMetrics();
+
 const record = new BranchRecord(
   `postgresql://storage_controller:${encodeURIComponent(secrets.controllerDbPassword)}@${CONTROLLER_DB_HOST}:5432/storage_controller`,
+  { busy: (lock) => metrics.lockTimedOut(lock) },
 );
 
 let ready = false;
@@ -493,8 +498,14 @@ function wake(name: string): Promise<boolean> {
       }),
     pause: () => sleep(POLL_MS),
   }).then((slept) => {
-    if (slept) log("compute woken", { compute: id, ms: Date.now() - started });
+    const seconds = (Date.now() - started) / 1000;
+    metrics.woke(slept ? "cold" : "warm", seconds);
+    if (slept) log("compute woken", { compute: id, ms: Math.round(seconds * 1000) });
     return slept;
+  }, (error: unknown) => {
+    // A compute not deployed is no failure of the wake's, nor a lock given up, which the record counts.
+    if (!(error instanceof BranchError) && !(error instanceof RecordBusy)) metrics.wakeFailed();
+    throw error;
   }).finally(() => waking.delete(id));
   waking.set(id, woke);
   return woke;
@@ -515,9 +526,10 @@ async function useOf(name: string): Promise<Use> {
  * wake, for as long as its Deployment says: under the compute's lock, counted again
  * first, so a session opened since is not cut, nor a wake asked for since undone, and
  * waiting until its pod is gone, so a wake after finds it gone. One whose lock a wake
- * holds is left until the next round.
+ * holds is left until the next round. Says how many replicas each compute runs.
  */
 async function suspendIdle(names: readonly string[]): Promise<void> {
+  const replicas = new Map<string, number>();
   // A compute deleted since is counted no more.
   const ids = new Set(names.map(computeId));
   for (const id of idle.keys()) if (!ids.has(id)) idle.delete(id);
@@ -526,6 +538,7 @@ async function suspendIdle(names: readonly string[]): Promise<void> {
     try {
       const ref = computeOf(name);
       const deployment = await computeDeployment(ref);
+      if (deployment) replicas.set(id, deployment.replicas);
       if (!deployment || deployment.suspendAfterMs === null || deployment.replicas === 0 || deployment.ready === 0) {
         idle.delete(id);
         continue;
@@ -547,11 +560,14 @@ async function suspendIdle(names: readonly string[]): Promise<void> {
         return true;
       });
       if (!slept?.value) continue;
+      replicas.set(id, 0);
+      metrics.suspended();
       log("compute suspended", { compute: id, idleMs: Date.now() - (counted.since ?? Date.now()), suspendAfterMs });
     } catch (error) {
       log("compute not checked for idleness", { compute: id, error: errorText(error) });
     }
   }
+  metrics.replicas(replicas);
 }
 
 /** Whether this replica led at its last round, which it says when that changes. */
@@ -570,7 +586,10 @@ async function lead(): Promise<void> {
     const leads = await record.leads();
     if (leads !== led) log(leads ? "leading" : "no longer leading");
     led = leads;
-    if (!leads) return;
+    if (!leads) {
+      metrics.replicas(new Map());
+      return;
+    }
     const branches = await record.branches();
     await repairEverySafekeeper(branches);
     await suspendIdle(branches.filter(({ state }) => state === "ready").map(({ name }) => name));
@@ -694,6 +713,10 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const { method, url = "" } = request;
   if (method === "GET" && url === "/healthz") {
     response.writeHead(ready ? 200 : 503).end(ready ? "ready\n" : "bootstrapping\n");
+    return;
+  }
+  if (method === "GET" && url === "/metrics") {
+    response.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(metrics.render());
     return;
   }
   const spec = method === "GET" ? SPEC.exec(url) : null;
