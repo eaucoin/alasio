@@ -3,13 +3,17 @@
  * once, a safekeeper's volume lost, with nothing committed lost; a day of its history
  * kept, its garbage collected, its dumps restorable, its past readable, its branches
  * made, run and deleted, its compute reached through Neon's proxy alone and woken by
- * it, and its lake loading; and an upgrade that changes nothing restarting none of it.
+ * it, and its lake loading through main's read replica; on a cluster of three nodes, its
+ * tenant split across two pageservers, drained and filled under a running compute, which
+ * one starting on shards placed before is restarted from; and an upgrade that changes
+ * nothing restarting none of it.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 
 import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
@@ -20,13 +24,14 @@ import type { ObjectRef } from "../../cli/src/kube/api.ts";
 import { dataNodes } from "../../cli/src/kube/object-store-scale.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
+import { pageserverName, REPLICA_NAME } from "../../cli/src/manifests/neon.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { AGENTS, alasioOk, type Forward, kube, lakeQuery, ref, tcp } from "../../test/e2e/harness.ts";
+import { AGENTS, alasioOk, type Forward, kube, lakeQuery, paths, ref, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
-import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
+import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, replicaId, tokenSha256 } from "../control/branches.ts";
 import { SUSPEND_AFTER } from "../control/endpoints.ts";
-import { signToken } from "../control/jwt.ts";
+import { computeCtlToken, signToken } from "../control/jwt.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
 
@@ -150,8 +155,47 @@ async function inside(pod: string, method: string, url: string, scope: string, b
   return await kube.execOk(NAMESPACE, pod, [...args, url]);
 }
 
+/** An HTTP call from inside a pod of the stack, as `inside` makes it, with `bearer`: its status, and what it answered. */
+async function answeredInside(pod: string, method: string, url: string, bearer: string, body?: unknown): Promise<{ status: number; text: string }> {
+  const args = ["curl", "-sS", "-w", "\n%{http_code}", "-X", method, "-H", `authorization: Bearer ${bearer}`];
+  if (body !== undefined) args.push("-H", "content-type: application/json", "-d", JSON.stringify(body));
+  const said = await kube.execOk(NAMESPACE, pod, [...args, url]);
+  const end = said.lastIndexOf("\n");
+  return { status: Number(said.slice(end + 1)), text: said.slice(0, end) };
+}
+
 /** Runs `command` in neon-control's pod: what it printed. */
 const inControl = async (command: readonly string[]) => kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, neonName("control")), command);
+
+/** The spec neon-control's replica `pod` serves main's compute now, fetched with main's compute's token, as compute_ctl fetches it. */
+async function servedSpec(pod: string): Promise<ServedComputeConfig> {
+  const computeToken = await kube.secret(NAMESPACE, neonName("compute"), "NEON_CONTROL_PLANE_TOKEN");
+  return JSON.parse(await kube.execOk(NAMESPACE, pod, [
+    "node",
+    "-e",
+    'fetch("http://127.0.0.1:8080/compute/api/v2/computes/alasio/spec", { headers: { authorization: "Bearer " + process.argv[1] } }).then((r) => r.text()).then((t) => process.stdout.write(t))',
+    // The token is random, and one starting with "-" would be read as an option of node's.
+    "--",
+    computeToken,
+  ]));
+}
+
+/**
+ * Asks the API server to merge-patch the object at `path` with `patch`, as neon-control's
+ * ServiceAccount, from its pod, as a dry run, which admission sees whole and which changes
+ * nothing: its status, and what it answered.
+ */
+async function patchedAsNeonControl(path: string, patch: unknown): Promise<{ status: number; text: string }> {
+  const said = await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, neonName("control")), [
+    "sh",
+    "-c",
+    'cd /var/run/secrets/kubernetes.io/serviceaccount && curl -sS -w "\n%{http_code}" --cacert ca.crt -H "Authorization: Bearer $(cat token)" ' +
+    '-H "Content-Type: application/merge-patch+json" -X PATCH --data-binary @- "https://kubernetes.default.svc$0?dryRun=All"',
+    path,
+  ], { stdin: JSON.stringify(patch) });
+  const end = said.lastIndexOf("\n");
+  return { status: Number(said.slice(end + 1)), text: said.slice(0, end) };
+}
 
 /** The tenant of alasio's timelines; set by the suite's first hook. */
 let tenantId: string;
@@ -170,8 +214,34 @@ async function record(): Promise<{ tenantId: string; timelineId: string; safekee
   return { tenantId, timelineId: main.timelineId, safekeepers: main.safekeepers };
 }
 
-async function pageserverMetric(name: string) {
-  const metrics = await inside(`${neonName("pageserver")}-0`, "GET", "http://127.0.0.1:9898/metrics", "pageserverapi");
+/** A shard of the tenant: its id, as its pageserver names it, the tenant's own while it is of one shard, and the pod of the pageserver it is attached to. */
+interface Shard {
+  readonly id: string;
+  readonly node: number;
+  readonly pod: string;
+}
+
+/** An answer of the storage controller's API to `method` of `path`, asked from its pod with a token of the admin scope. */
+async function controller<Body>(method: string, path: string, body?: unknown): Promise<Body> {
+  const said = await inside(await podOf("neon-storage-controller"), method, `http://127.0.0.1:1234${path}`, "admin", body);
+  return (said ? JSON.parse(said) : null) as Body;
+}
+
+/** The tenant's shards, as the storage controller locates them, in shard order: shard zero first, which answers for the tenant's timelines. */
+async function shards(): Promise<Shard[]> {
+  const located = await controller<{ shards: { shard_id: string; node_id: number }[] }>("GET", `/debug/v1/tenant/${tenantId}/locate`);
+  return located.shards.map(({ shard_id, node_id }) => ({ id: shard_id, node: node_id, pod: `${neonName("pageserver")}-${node_id - 1}` }));
+}
+
+/** Shard zero of the tenant. */
+async function shardZero(): Promise<Shard> {
+  const [zero] = await shards();
+  assert.ok(zero, "the tenant has no shard");
+  return zero;
+}
+
+async function pageserverMetric(name: string, pod: string) {
+  const metrics = await inside(pod, "GET", "http://127.0.0.1:9898/metrics", "pageserverapi");
   const line = metrics.split("\n").find((l) => l.startsWith(`${name} `));
   return Number(line?.split(" ")[1] ?? NaN);
 }
@@ -318,6 +388,29 @@ interface VolumeStatus {
 /** A branch as neon-control's API answers it. */
 type Listed = BranchView;
 
+/**
+ * A test that, when it fails, says at once what neon-control, the storage controller and
+ * main's compute last logged, as the tests after it may take long to fail in turn.
+ */
+function explainedTest(name: string, body: () => Promise<void>): void {
+  test(name, async () => {
+    try {
+      await body();
+    } catch (error) {
+      const logged = async (component: string, container: string) => {
+        const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": component }) });
+        return Promise.all(pods.map(async ({ metadata }) => {
+          const lines = (await kube.logs(NAMESPACE, metadata?.name ?? "", container).catch(String)).trimEnd().split("\n").slice(-60);
+          return `--- ${metadata?.name} ${container}:\n${lines.join("\n")}`;
+        }));
+      };
+      const said = await Promise.all([logged("neon-control", "neon-control"), logged("neon-storage-controller", "storage-controller"), logged("neon-compute", "compute")]);
+      console.error(`# ${name} failed: ${error instanceof Error ? error.message : String(error)}\n${said.flat().join("\n")}`);
+      throw error;
+    }
+  });
+}
+
 /** Registers the suite, which runs once the end-to-end run has installed alasio. */
 export function neonStack(): void {
   describe("alasio's Neon, as alasio installs it", () => {
@@ -350,6 +443,264 @@ export function neonStack(): void {
       return store;
     });
 
+    // Before the database's tests, which then run on the tenant split.
+    describe("its storage, scaled out", { skip: AGENTS < 2 && "one pageserver, where the cluster is of one node" }, () => {
+      /** A pageserver as the storage controller describes it. */
+      interface Node {
+        readonly id: number;
+        readonly availability: string;
+        readonly scheduling: string;
+        readonly listen_pg_addr: string;
+      }
+
+      /** Runs `sql` on main's compute as its superuser, from its pod: what psql printed. */
+      const onCompute = async (sql: string) =>
+        (await kube.execOk(NAMESPACE, await kube.runningPod(NAMESPACE, neonName("compute")), ["psql", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "postgres", "-Atc", sql], { container: "compute" })).trim();
+
+      /** The Services of the pageservers main's compute reads from now, one a shard, in shard order. */
+      const computeReads = async () => (await onCompute("show neon.pageserver_connstring")).split(",").map((connstring) => new URL(connstring).hostname.split(".")[0]);
+
+      /** The Services of the pageservers the shards are attached to, in shard order. */
+      const attachedTo = async () => (await shards()).map(({ node }) => pageserverName(node - 1));
+
+      /** Main's compute's pod, and how often its containers restarted, which a new layout must not change. */
+      const computePod = async () => {
+        const pod = await kube.get<V1Pod>(ref("Pod", await kube.runningPod(NAMESPACE, neonName("compute")), NAMESPACE));
+        return { uid: pod?.metadata?.uid, restarts: pod?.status?.containerStatuses?.map(({ restartCount }) => restartCount) };
+      };
+
+      /** Waits until `check` holds, every two seconds for `timeoutMs`, three minutes unless given, saying `what` did not. */
+      async function until(what: string, check: () => Promise<boolean>, timeoutMs = 180_000) {
+        const deadline = Date.now() + timeoutMs;
+        while (!(await check())) {
+          assert.ok(Date.now() < deadline, what);
+          await sleep(2000);
+        }
+      }
+
+      /**
+       * Waits until the secondary of each of `moving` on pageserver `node` is warm, having its
+       * shard's heatmap and every layer in it: a drain or a fill moves a shard only to a
+       * secondary whose lag it knows, and leaves the others where they are.
+       */
+      async function warmed(moving: readonly Shard[], node: number) {
+        await until(`the secondaries on pageserver ${node} did not warm`, async () => {
+          await controller("POST", `/v1/tenant/${tenantId}/secondary/download?wait_ms=10000`);
+          const statuses = await Promise.all(moving.map(async ({ id }) =>
+            JSON.parse(await inside(`${neonName("pageserver")}-${node - 1}`, "GET", `http://127.0.0.1:9898/v1/tenant/${id}/secondary/status`, "pageserverapi")) as {
+              heatmap_mtime?: unknown;
+              bytes_total?: unknown;
+              bytes_downloaded?: unknown;
+            }
+          ));
+          return statuses.every(({ heatmap_mtime, bytes_total, bytes_downloaded }) => Boolean(heatmap_mtime) && typeof bytes_total === "number" && bytes_downloaded === bytes_total);
+        }, 300_000);
+      }
+
+      /** Brings alasio up with `neon.shards` `shards`, and `controls` replicas of neon-control. */
+      async function upWith(shards: number, controls: number) {
+        const { configFile } = paths();
+        const config = JSON.parse(readFileSync(configFile, "utf8"));
+        config.install.neon.shards = shards;
+        config.install.neon.control = { ...config.install.neon.control, scaling: { min: controls, max: controls } };
+        writeFileSync(configFile, JSON.stringify(config));
+        return await alasioOk("up", "--timeout", "20m");
+      }
+
+      /** neon-control's replicas, by their pods' names. */
+      const controls = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-control" }), fieldSelector: "status.phase=Running" }))
+          .filter((pod) => pod.metadata?.deletionTimestamp === undefined)
+          .map((pod) => pod.metadata?.name ?? "");
+
+      /** The pageservers' Services in the pageserver connstring of `config`, one a shard, in shard order. */
+      const readsOf = (config: ServedComputeConfig) => String(config.spec["pageserver_connstring"]).split(",").map((connstring) => new URL(connstring).hostname.split(".")[0]);
+
+      // As the database's tests after expect it: one replica of neon-control, on the split tenant.
+      after(async () => {
+        await upWith(2, 1);
+      });
+
+      explainedTest("registers each pageserver as its ordinal plus one, at its own Service's name", async () => {
+        const nodes = await controller<Node[]>("GET", "/control/v1/node");
+        assert.deepEqual(
+          nodes.map(({ id, availability, listen_pg_addr }) => ({ id, availability, listen_pg_addr })).sort((a, b) => a.id - b.id),
+          [{ id: 1, availability: "Active", listen_pg_addr: pageserverName(0) }, { id: 2, availability: "Active", listen_pg_addr: pageserverName(1) }],
+        );
+      });
+
+      explainedTest("splits main's tenant as neon.shards is raised, under a client's writes, losing nothing, its compute reading the shards where they are without a restart, and every replica of neon-control serving them", async () => {
+        assert.equal((await shards()).length, 1);
+        const before = await computePod();
+        await query("create table split (id int primary key)");
+        const rows = writer("split");
+        try {
+          await upWith(2, 2);
+          // By the replica of neon-control that leads, at its next round.
+          await until("the tenant was not split", async () => (await shards()).length === 2);
+        } finally {
+          await rows.stop();
+        }
+        assert.deepEqual((await shards()).map(({ id }) => id), [`${tenantId}-0002`, `${tenantId}-0102`]);
+        // The split's shards start where the tenant was; neon-control has one moved to the
+        // other pageserver, once its secondary there is warm, each keeping a secondary on the other.
+        await until("the shards were not placed across both pageservers, each with a secondary on the other", async () => {
+          const described = await controller<{ shards: { node_attached: number | null; node_secondary: number[] }[] }>("GET", `/control/v1/tenant/${tenantId}`);
+          return new Set(described.shards.map(({ node_attached }) => node_attached)).size === 2 &&
+            described.shards.every(({ node_attached, node_secondary }) => node_secondary.length === 1 && node_secondary[0] !== node_attached);
+        }, 600_000);
+        // neon-control gave the running compute the new layout, and every replica of it, whichever
+        // the storage controller notified, serves a compute starting now the same.
+        await until("the compute does not read the shards where they are", async () => (await computeReads()).join() === (await attachedTo()).join());
+        const replicas = await controls();
+        assert.equal(replicas.length, 2);
+        for (const pod of replicas) assert.deepEqual(readsOf(await servedSpec(pod)), await attachedTo(), pod);
+        // In pages, as the storage controller split it.
+        const { shard_params } = await controller<{ shard_params: { stripe_size: number } }>("GET", `/debug/v1/tenant/${tenantId}/locate`);
+        assert.equal(await onCompute("select setting from pg_settings where name = 'neon.stripe_size'"), String(shard_params.stripe_size));
+        assert.deepEqual(await computePod(), before);
+        const present = new Set((await query<{ id: number }>("select id from split")).map(({ id }) => id));
+        assert.ok(rows.committed.length > 0);
+        assert.deepEqual(rows.committed.filter((id) => !present.has(id)), []);
+      });
+
+      explainedTest("refuses fewer shards than the tenant has, as Neon merges none, saying so", async () => {
+        await assert.rejects(upWith(1, 2), /neon\.shards is 1, but alasio's Neon has 2 shards already, and Neon merges no shards: set it to 2 or more/u);
+        await upWith(2, 2);
+      });
+
+      explainedTest("moves a drained pageserver's shards to the other, the compute following them with its session held, and back once filled", async () => {
+        const before = await computePod();
+        const held = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 60_000 });
+        held.on("error", () => {});
+        await held.connect();
+        try {
+          await held.query("create table drained (id int primary key)");
+          await held.query("insert into drained select g from generate_series(1, 10000) g");
+          // The drained shards' secondaries on the other pageserver warm first.
+          await warmed((await shards()).filter(({ node }) => node === 2), 1);
+          await controller("PUT", "/control/v1/node/2/drain");
+          await until("node 2 was not drained", async () => (await controller<Node>("GET", "/control/v1/node/2")).scheduling === "PauseForRestart");
+          assert.deepEqual((await shards()).map(({ node }) => node), [1, 1]);
+          await until("the compute does not follow the drained shards", async () => (await computeReads()).join() === [pageserverName(0), pageserverName(0)].join());
+          await held.query("insert into drained select g from generate_series(10001, 20000) g");
+          assert.deepEqual((await held.query("select count(*)::int as n from drained")).rows, [{ n: 20000 }]);
+
+          await controller("PUT", "/control/v1/node/2/config", { node_id: 2, scheduling: "Active" });
+          await warmed(await shards(), 2);
+          await controller("PUT", "/control/v1/node/2/fill");
+          await until("node 2 was not filled", async () => new Set((await shards()).map(({ node }) => node)).size === 2);
+          await until("the compute does not follow the filled shards", async () => (await computeReads()).join() === (await attachedTo()).join());
+          assert.deepEqual((await held.query("select count(*)::int as n from drained")).rows, [{ n: 20000 }]);
+        } finally {
+          await held.end().catch(() => {});
+        }
+        assert.deepEqual(await computePod(), before);
+      });
+
+      explainedTest("fails a lost pageserver's shards over to their secondaries once the storage controller finds it offline, neon-control naming where they are, the compute following them without a restart, losing nothing committed", async () => {
+        const set = ref("StatefulSet", neonName("pageserver"), NAMESPACE);
+        /** Where neon-control's record has the tenant's shards: their pageservers' Services, in shard order. */
+        const recorded = async () => {
+          const layout = (await kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", `select layout from neon_control.layout where tenant_id = '${tenantId}'`], { container: "postgres" })).trim();
+          return (JSON.parse(layout) as { pageservers: string[] }).pageservers.map((address) => address.split(".")[0]);
+        };
+        const before = await computePod();
+        await query("create table failed_over (id int primary key)");
+        await query("insert into failed_over select g from generate_series(1, 10000) g");
+        assert.equal(new Set((await shards()).map(({ node }) => node)).size, 2);
+        // A failover makes a secondary attached, which serves at once once warm.
+        await warmed((await shards()).filter(({ node }) => node === 2), 1);
+        // Pageserver 2 lost, as its node would be: its pod gone, and none made again.
+        await kube.patch(set, { spec: { replicas: 1 } });
+        try {
+          await until("node 2 did not go offline", async () => (await controller<Node>("GET", "/control/v1/node/2")).availability === "Offline", 300_000);
+          await until("node 2's shards were not failed over to their secondaries on node 1", async () => (await shards()).every(({ node }) => node === 1), 300_000);
+          await until("neon-control's record does not name pageserver 1 for every shard", async () => (await recorded()).join() === [pageserverName(0), pageserverName(0)].join());
+          await until("the compute does not follow the shards failed over", async () => (await computeReads()).join() === [pageserverName(0), pageserverName(0)].join());
+          await query("insert into failed_over select g from generate_series(10001, 20000) g");
+          assert.deepEqual(await query("select count(*)::int as n from failed_over"), [{ n: 20000 }]);
+          assert.deepEqual(await computePod(), before);
+        } finally {
+          await kube.patch(set, { spec: { replicas: 2 } });
+          await until("node 2 did not come back", async () => (await controller<Node>("GET", "/control/v1/node/2")).availability === "Active", 600_000);
+          // As the tests after expect them: one shard on each, as neon-control's round spreads them again.
+          await until("the shards were not spread again", async () => new Set((await shards()).map(({ node }) => node)).size === 2, 600_000);
+        }
+      });
+
+      explainedTest("restarts a compute that started on shards placed before, which never comes to run, once the storage controller notifies where they are, and gives a running one its spec live", async () => {
+        const COMPUTE = ref("Deployment", neonName("compute"), NAMESPACE);
+        /** Runs `sql` on neon-control's record, in the storage controller's Postgres. */
+        const onRecord = (sql: string) => kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" });
+        // What the storage controller notifies of where the shards are.
+        const located = await controller<{ shards: { node_id: number }[]; shard_params: { stripe_size: number } }>("GET", `/debug/v1/tenant/${tenantId}/locate`);
+        const notification = { tenant_id: tenantId, stripe_size: located.shard_params.stripe_size, shards: located.shards.map(({ node_id }, shard_number) => ({ node_id, shard_number })) };
+        /** Notifies `pod` of neon-control, as the storage controller does, until it answers 200: the statuses it answered. */
+        const notified = async (pod: string) => {
+          const answered: number[] = [];
+          while (answered.at(-1) !== 200) {
+            assert.ok(answered.length < 60, `neon-control answered ${answered.join(", ")}`);
+            if (answered.length > 0) await sleep(5000);
+            answered.push((await answeredInside(pod, "PUT", "http://127.0.0.1:8080/notify-attach", token("admin"), notification)).status);
+          }
+          return answered;
+        };
+        const [control] = await controls();
+        assert.ok(control);
+
+        // A running compute last given another layout is given its spec anew, live.
+        const running = await computePod();
+        await onRecord("update neon_control.compute_layouts set layout = '{\"pageservers\": [], \"stripeSize\": null}' where id = 'alasio'");
+        assert.deepEqual(await notified(control), [200]);
+        assert.deepEqual(await computePod(), running);
+        assert.deepEqual(JSON.parse(await onRecord("select layout from neon_control.compute_layouts where id = 'alasio'")).pageservers, (await attachedTo()).map((name) => `${name}.${NAMESPACE}.svc.cluster.local:6400`));
+
+        // One starting on a layout whose shard 1 is where shard 0 is, as one did in CI after
+        // the whole stack restarted, never comes to run: compute_ctl stays in init. Notified,
+        // or at the next round of the replica that leads, which sets the layout right on its
+        // own, neon-control restarts it, as a 412 from a compute in init is answered.
+        const restartedAt = async () => (await kube.get<V1Deployment>(COMPUTE))?.spec?.template.metadata?.annotations?.["kubectl.kubernetes.io/restartedAt"];
+        const restartedBefore = await restartedAt();
+        const recordedLayout = async () => JSON.parse(await onRecord(`select layout from neon_control.layout where tenant_id = '${tenantId}'`)) as { pageservers: string[] };
+        const givenLayout = async () => (JSON.parse((await onRecord("select layout from neon_control.compute_layouts where id = 'alasio'")) || "null") as { pageservers: string[] } | null);
+        try {
+          const computePods = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-compute" }) });
+          /** How compute_ctl says the compute is; null while it does not answer, as before it starts. */
+          const statusOf = async () => {
+            const answered = await answeredInside(control, "GET", `http://${neonName("compute")}.${NAMESPACE}.svc.cluster.local:3080/status`, computeCtlToken(privateKey, computeId(MAIN))).catch(() => null);
+            return answered?.status === 200 ? (JSON.parse(answered.text) as { status: string }).status : null;
+          };
+          let stuck: string | undefined;
+          for (let attempt = 1; stuck === undefined; attempt++) {
+            assert.ok(attempt <= 3, "the leader's round set the layout right before the compute fetched its spec, three times");
+            const old = (await computePods()).map(({ metadata }) => metadata?.uid);
+            await kube.patch(COMPUTE, { spec: { replicas: 0 } });
+            await until("the compute did not stop", async () => !(await computePods()).some(({ metadata }) => old.includes(metadata?.uid)));
+            // Main's clients wake it at once: the stale layout is recorded before it may start.
+            await onRecord(`update neon_control.layout set layout = jsonb_set(layout, '{pageservers,1}', layout->'pageservers'->0) where tenant_id = '${tenantId}'`);
+            await onRecord("delete from neon_control.compute_layouts where id = 'alasio'");
+            const stale = (await recordedLayout()).pageservers;
+            await kube.patch(COMPUTE, { spec: { replicas: 1 } });
+            // It fetches its spec with the stale layout, unless the leader's round set the record right first.
+            await until("the compute did not fetch its spec", async () => (await givenLayout()) !== null || (await recordedLayout()).pageservers.join() !== stale.join());
+            if ((await givenLayout())?.pageservers.join() !== stale.join()) continue;
+            stuck = (await computePods()).find(({ metadata }) => metadata?.deletionTimestamp === undefined)?.metadata?.uid;
+          }
+          // Notified, neon-control restarts it, and it starts on the shards where they are.
+          await notified(control);
+          assert.notEqual(await restartedAt(), restartedBefore, "neon-control did not restart the compute");
+          await until("the compute did not come to run", async () => (await statusOf()) === "running", 300_000);
+          assert.notEqual((await computePod()).uid, stuck);
+          assert.deepEqual(await computeReads(), await attachedTo());
+          await query("select 1");
+        } finally {
+          // The layout recorded as it is, for the tests after, whatever failed.
+          await notified(control);
+        }
+      });
+    });
+
     describe("the database", () => {
       test("bootstraps its tenant and a timeline on three safekeepers", async () => {
         const { safekeepers } = await record();
@@ -361,8 +712,26 @@ export function neonStack(): void {
       });
 
       test("keeps a day of history, as its tenant is configured", async () => {
-        const config: TenantConfigAnswered = JSON.parse(await inside(`${neonName("pageserver")}-0`, "GET", `http://127.0.0.1:9898/v1/tenant/${tenantId}/config`, "pageserverapi"));
+        const zero = await shardZero();
+        const config: TenantConfigAnswered = JSON.parse(await inside(zero.pod, "GET", `http://127.0.0.1:9898/v1/tenant/${zero.id}/config`, "pageserverapi"));
         assert.equal(config.effective_config.pitr_interval, "1day");
+      });
+
+      test("lets neon-control change no more of a compute's Deployment than the annotation that restarts it", async () => {
+        const path = `/apis/apps/v1/namespaces/${NAMESPACE}/deployments/${neonName("compute")}`;
+        const annotated = (annotations: Record<string, string>) => ({ spec: { template: { metadata: { annotations } } } });
+        assert.equal((await patchedAsNeonControl(path, annotated({ "kubectl.kubernetes.io/restartedAt": new Date().toISOString() }))).status, 200);
+        const refused = [
+          annotated({ "e2e.alasio.dev/other": "x" }),
+          { spec: { template: { metadata: { generateName: "other-" } } } },
+          { spec: { template: { spec: { containers: [{ name: "compute", image: "registry.k8s.io/pause:3.10.1" }] } } } },
+          { spec: { minReadySeconds: 5 } },
+          { metadata: { labels: { "e2e.alasio.dev/other": "x" } } },
+        ];
+        for (const patch of refused) {
+          const { status, text } = await patchedAsNeonControl(path, patch);
+          assert.ok(status === 422 && text.includes("ValidatingAdmissionPolicy 'alasio-compute-restarts'"), `${JSON.stringify(patch)}: ${status} ${text}`);
+        }
       });
 
       test("an upgrade that changes nothing restarts nothing of the stack", async () => {
@@ -373,7 +742,7 @@ export function neonStack(): void {
         assert.deepEqual(await pods(), before);
       });
 
-      test("keeps every row through the whole stack stopping at once", async () => {
+      explainedTest("keeps every row through the whole stack stopping at once", async () => {
         await query("create table kept (id int primary key)");
         await query("insert into kept select g from generate_series(1, 50000) g");
         const stopped = await runningPods();
@@ -491,25 +860,62 @@ export function neonStack(): void {
       });
 
       test("garbage the pageserver collects is deleted from the object store, validated by the storage controller", async () => {
-        const { tenantId, timelineId } = await record();
+        const { timelineId } = await record();
         await query("create table churn (id int primary key, payload text)");
         for (let pass = 0; pass < 3; pass++) {
           await query("truncate churn");
           await query("insert into churn select g, repeat(md5(random()::text), 30) from generate_series(1, 60000) g");
         }
-        const before = await pageserverMetric("pageserver_deletion_queue_executed_total");
-        const timeline = `http://127.0.0.1:9898/v1/tenant/${tenantId}/timeline/${timelineId}`;
-        await inside(`${neonName("pageserver")}-0`, "PUT", `${timeline}/compact?force_l0_compaction=true&force_repartition=true&force_image_layer_creation=true&wait_until_uploaded=true`, "pageserverapi");
-        const deadline = Date.now() + 180_000;
+        // Shard zero's, on its pageserver, as each shard is collected alike.
+        const zero = await shardZero();
+        const before = await pageserverMetric("pageserver_deletion_queue_executed_total", zero.pod);
+        const timeline = `http://127.0.0.1:9898/v1/tenant/${zero.id}/timeline/${timelineId}`;
+        // The churn is in the shard's open in-memory layer, which the pageserver writes out as
+        // an L0 layer only past checkpoint_distance (256 MiB) or checkpoint_timeout (10 min):
+        // until then compaction finds nothing of it to compact, and nothing to delete. A
+        // shorter timeout, for this test alone, writes it out within seconds.
+        /** The tenant's configuration patched with `patch`, by the storage controller. */
+        const patched = async (patch: object) => {
+          const answered = await answeredInside(await podOf("neon-storage-controller"), "PATCH", "http://127.0.0.1:1234/v1/tenant/config", token("admin"), { tenant_id: tenantId, ...patch });
+          assert.equal(answered.status, 200, answered.text);
+        };
+        await patched({ checkpoint_timeout: "5s" });
+        // Compacted until it schedules a deletion, and no more: the deletion queue writes its
+        // list out only once ten seconds pass with no deletion more (FRONTEND_DEFAULT_TIMEOUT
+        // in pageserver/src/deletion_queue/list_writer.rs at release-9129), which compacting
+        // every few seconds never lets happen.
+        const submittedBefore = await pageserverMetric("pageserver_deletion_queue_submitted_total", zero.pod);
         let executed = before;
+        try {
+          const scheduling = Date.now() + 120_000;
+          while ((await pageserverMetric("pageserver_deletion_queue_submitted_total", zero.pod)) <= submittedBefore) {
+            assert.ok(Date.now() < scheduling, "compaction scheduled no deletion");
+            const compacted = await answeredInside(zero.pod, "PUT", `${timeline}/compact?force_l0_compaction=true&force_repartition=true&force_image_layer_creation=true&wait_until_uploaded=true`, token("pageserverapi"));
+            assert.equal(compacted.status, 200, compacted.text);
+            await sleep(5000);
+          }
+        } finally {
+          await patched({ checkpoint_timeout: null });
+        }
+        const deadline = Date.now() + 180_000;
         while (Date.now() < deadline && !(executed > before)) {
           await sleep(5000);
-          executed = await pageserverMetric("pageserver_deletion_queue_executed_total");
+          executed = await pageserverMetric("pageserver_deletion_queue_executed_total", zero.pod);
         }
-        assert.ok(executed > before, `deletions executed: ${before} -> ${executed}`);
+        if (!(executed > before)) {
+          // What the pageserver's deletion queue and layers were, to say why.
+          const metrics = (await inside(zero.pod, "GET", "http://127.0.0.1:9898/metrics", "pageserverapi")).split("\n").filter((line) => line.startsWith("pageserver_deletion_queue"));
+          const layers = JSON.parse(await inside(zero.pod, "GET", `${timeline}/layer`, "pageserverapi")) as { historic_layers?: { kind: string; layer_file_name: string }[] };
+          const deltas = (layers.historic_layers ?? []).filter(({ kind }) => kind === "Delta").map(({ layer_file_name }) => layer_file_name);
+          const logged = async (pod: string, container: string, pattern: RegExp) =>
+            (await kube.logs(NAMESPACE, pod, container).catch(String)).split("\n").filter((line) => pattern.test(line)).slice(-15).join("\n");
+          const pageserver = await logged(zero.pod, "pageserver", /deletion|validat|upcall|generation/iu);
+          const storageController = await logged(await podOf("neon-storage-controller"), "storage-controller", /validat|upcall/iu);
+          assert.fail(`deletions executed: ${before} -> ${executed}; ${metrics.join("; ")}; ${deltas.length} delta layers: ${deltas.slice(0, 10).join(", ")}\n--- ${zero.pod}:\n${pageserver}\n--- storage controller:\n${storageController}`);
+        }
         assert.equal(
-          await pageserverMetric("pageserver_deletion_queue_validated_total"),
-          await pageserverMetric("pageserver_deletion_queue_executed_total"),
+          await pageserverMetric("pageserver_deletion_queue_validated_total", zero.pod),
+          await pageserverMetric("pageserver_deletion_queue_executed_total", zero.pod),
         );
       });
 
@@ -751,26 +1157,19 @@ export function neonStack(): void {
         await sleep(2000);
         await query("insert into history select g from generate_series(101, 200) g");
 
-        const { tenantId, timelineId } = await record();
+        const { timelineId } = await record();
+        const zero = await shardZero();
         const found: LsnAtTimestamp = JSON.parse(await inside(
-          `${neonName("pageserver")}-0`,
+          zero.pod,
           "GET",
-          `http://127.0.0.1:9898/v1/tenant/${tenantId}/timeline/${timelineId}/get_lsn_by_timestamp?timestamp=${encodeURIComponent(moment)}`,
+          `http://127.0.0.1:9898/v1/tenant/${zero.id}/timeline/${timelineId}/get_lsn_by_timestamp?timestamp=${encodeURIComponent(moment)}`,
           "pageserverapi",
         ));
         assert.equal(found.kind, "present");
 
         // A read-only compute pinned to that moment's LSN, given as a file the spec
         // neon-control serves the compute.
-        const computeToken = await kube.secret(NAMESPACE, neonName("compute"), "NEON_CONTROL_PLANE_TOKEN");
-        const config: ServedComputeConfig = JSON.parse(await inControl([
-          "node",
-          "-e",
-          'fetch("http://127.0.0.1:8080/compute/api/v2/computes/alasio/spec", { headers: { authorization: "Bearer " + process.argv[1] } }).then((r) => r.text()).then((t) => process.stdout.write(t))',
-          // The token is random, and one starting with "-" would be read as an option of node's.
-          "--",
-          computeToken,
-        ]));
+        const config = await servedSpec(await kube.runningPod(NAMESPACE, neonName("control")));
         delete config.status;
         config.spec.mode = { Static: found.lsn };
         config.spec.safekeeper_connstrings = [];
@@ -1291,6 +1690,71 @@ export function neonStack(): void {
           const { n, seqs } = await lakeCounts();
           return Number(n) === expected && Number(seqs) === expected;
         }, `held each of ${expected} entries exactly once`);
+      });
+
+      test("keeps every entry exactly once through a pageserver killed mid-load", async () => {
+        await new NeonSessionStore(pool).append(KEY, Array.from({ length: 20_000 }, (_, n) => entry(30_000 + n)));
+        await restartLake();
+        await sleep(1500);
+        await kube.kill(NAMESPACE, await podOf("neon-pageserver"));
+        await kube.awaitReady([ref("StatefulSet", neonName("pageserver"), NAMESPACE)], "5 minutes");
+        const expected = await sourceCount();
+        await untilLoaded(async () => {
+          const { n, seqs } = await lakeCounts();
+          return Number(n) === expected && Number(seqs) === expected;
+        }, `held each of ${expected} entries exactly once`);
+      });
+
+      test("loads through main's read replica, which replays main's writes and takes none", async () => {
+        const url = new URL(databaseUrl);
+        url.searchParams.set("options", `endpoint=${replicaId(MAIN)}`);
+        const replica = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 60_000 });
+        replica.on("error", () => {});
+        await replica.connect();
+        try {
+          assert.deepEqual((await replica.query("select pg_is_in_recovery() as recovering")).rows, [{ recovering: true }]);
+          await query("create table replayed (id int primary key)");
+          await query("insert into replayed values (1)");
+          const deadline = Date.now() + 60_000;
+          while (!(await replica.query("select count(*)::int as n from replayed").then(({ rows }) => rows[0]?.n === 1, () => false))) {
+            assert.ok(Date.now() < deadline, "the replica did not replay main's write");
+            await sleep(1000);
+          }
+          await assert.rejects(replica.query("insert into replayed values (2)"), /read-only transaction/u);
+        } finally {
+          await replica.end().catch(() => {});
+        }
+        // The lake's loader reads it: put to sleep, it is woken by the loader's next load, which loads all.
+        const deployment = ref("Deployment", REPLICA_NAME, NAMESPACE);
+        await kube.patch(deployment, { spec: { replicas: 0 } });
+        const labels = (await kube.get<V1Deployment>(deployment))?.spec?.selector.matchLabels ?? {};
+        const stopping = Date.now() + 120_000;
+        while ((await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).length > 0) {
+          assert.ok(Date.now() < stopping, "the replica did not stop");
+          await sleep(1000);
+        }
+        await new NeonSessionStore(pool).append(KEY, [entry(60_000)]);
+        await restartLake();
+        const expected = await sourceCount();
+        await untilLoaded(async () => Number((await lakeCounts())["n"]) === expected, `held all ${expected} entries, read on the replica woken`);
+        assert.equal((await kube.get<V1Deployment>(deployment))?.spec?.replicas, 1);
+        // neon-control measures how far behind main it is, while both are awake: as it answers
+        // alasio status, and as the replica that leads serves it at its next round.
+        const control = await kube.runningPod(NAMESPACE, neonName("control"));
+        const measuring = Date.now() + 120_000;
+        for (;;) {
+          const answered = await inside(control, "GET", "http://127.0.0.1:8080/computes", "admin");
+          const lag = (JSON.parse(answered) as { computes: { id: string; lagBytes?: number | null }[] }).computes.find(({ id }) => id === replicaId(MAIN))?.lagBytes;
+          const metrics = await inside(control, "GET", "http://127.0.0.1:8080/metrics", "admin");
+          const served = metrics.split("\n").find((line) => line.startsWith(`neon_control_replica_lag_bytes{compute="${replicaId(MAIN)}"} `));
+          if (typeof lag === "number" && served) {
+            // A real distance, in bytes of WAL, far under what the alert fires at.
+            for (const bytes of [lag, Number(served.split(" ")[1])]) assert.ok(Number.isInteger(bytes) && bytes >= 0 && bytes < 256 * 1024 * 1024, `${answered}\n${served}`);
+            break;
+          }
+          assert.ok(Date.now() < measuring, `neon-control did not measure the replica's lag: ${answered}\n${served}`);
+          await sleep(5000);
+        }
       });
 
       test("answers queries read-only", async () => {

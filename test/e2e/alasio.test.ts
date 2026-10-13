@@ -1258,7 +1258,32 @@ if (inShard("telemetry")) {
   });
 }
 
-if (inShard("neon")) neonStack();
+if (inShard("neon")) {
+  neonStack();
+
+  // On the database as the suite leaves it: on the cluster of three nodes, its tenant split
+  // across two pageservers, which every turn reads and writes through main's compute.
+  describe("alasio's turns, on its Neon as the neon suite leaves it", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    test("a message runs a turn on Codex in a session, whose answer reaches the operator, and its rollout, mirrored to Neon, is loaded into the lake", async () => {
+      await newSession("none");
+      await tg.say("/service codex");
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+      await untilInLake("Codex's turn, mirrored to Neon", "select count(*) as n from codex.turns where completed_at is not null", 600_000);
+    });
+  });
+}
 
 /** The namespace of the scaling suite's own workloads. */
 const SCALING = "alasio-e2e-scaling";

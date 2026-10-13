@@ -534,7 +534,13 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     },
     neon: {
       safekeepers: { storage: { size: "2Gi" }, resources: { requests: { cpu: "20m", memory: "64Mi" } } },
-      pageserver: { storage: { size: "5Gi" }, resources: { requests: { cpu: "50m", memory: "128Mi" } } },
+      // Two, where the run proves Neon's storage scaled out: its tenant split across them.
+      pageserver: {
+        ...(AGENTS >= 2 && inShard("neon") ? { scaling: { min: 2, max: 2 } } : {}),
+        storage: { size: "5Gi" },
+        resources: { requests: { cpu: "50m", memory: "128Mi" } },
+      },
+      ...(of === "release" ? { readReplica: { resources: { requests: { cpu: "20m", memory: "128Mi" } } } } : {}),
       storageController: { resources: { requests: { cpu: "10m", memory: "64Mi" } } },
       storageBroker: { resources: { requests: { cpu: "10m", memory: "32Mi" } } },
       controllerDb: { resources: { requests: { cpu: "10m", memory: "64Mi" } } },
