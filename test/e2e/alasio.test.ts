@@ -46,6 +46,7 @@ import {
   CLUSTER,
   cutOver,
   dumpClusterState,
+  ESTARGZ,
   type Forward,
   HOST_PROFILE,
   HOST_USER,
@@ -358,6 +359,23 @@ if (inShard("sessions")) {
       assert.equal(gate?.state?.terminated?.exitCode, 0);
     });
 
+    test("runs each of alasio's images on remote snapshots, the first session's pulled lazily in seconds", { skip: !ESTARGZ && "the run's own images are built whole" }, async () => {
+      const pods: [string, string][] = [
+        [NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake"))],
+        [NAMESPACE, await kube.runningPod(NAMESPACE, componentName("grafana"))],
+        [SESSIONS, none],
+      ];
+      for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
+      // The agent's image was on no node before the first session: kubelet says how long it took.
+      const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: `involvedObject.name=${none},reason=Pulled` });
+      const pulled = events.map(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1]).find((took) => took !== undefined);
+      assert.ok(pulled, `kubelet said nothing of pulling the agent's image: ${events.map(({ message }) => message).join("; ")}`);
+      console.error(`# the agent's image, on no node before, pulled lazily in ${goSeconds(pulled)} s`);
+      // Whole, it took 44 to 58 s on a runner; lazily, 2 to 4 s.
+      assert.ok(goSeconds(pulled) < 30, `the agent's image took ${pulled} to pull`);
+    });
+
     test("a new workspace with internet reaches the internet and nothing private", async () => {
       full = await newSession("full");
       assert.equal((await inSession(full, probe("https://example.com"))).trim(), "open");
@@ -473,6 +491,21 @@ if (inShard("sessions")) {
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+
+    // Last, as a restart of k3s ends the port forwards the tests before it reach the stand-ins through.
+    test("keeps pods pulled lazily running through a restart of k3s, and of stargz-snapshotter's daemon with it", { skip: (TARGET !== "host" || !ESTARGZ) && "k3s is restarted on its own where it is a service of the machine's, and its pods pulled lazily" }, async () => {
+      const session = await newSession("none");
+      const watched: [string, string][] = [[NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)], [SESSIONS, session]];
+      const restarts = () => Promise.all(watched.map(async ([namespace, name]) => (await kube.get<V1Pod>(ref("Pod", name, namespace)))?.status?.containerStatuses?.map(({ restartCount }) => restartCount)));
+      const before = await restarts();
+      // The daemon's service is part of k3s's, so it restarts with it; its FUSE manager keeps the mounts.
+      await onNode("", "systemctl restart k3s");
+      // The session's bayma runs a program from its image, once kubelet takes an exec again.
+      const ran = () => inSession(session, 'console.log(require("node:fs").readdirSync("/usr/lib").length > 0)').then((said) => said.trim(), () => undefined);
+      assert.equal(await until("the session's bayma reached again", async () => await ran(), 300_000), "true");
+      assert.deepEqual(await restarts(), before);
+      assert.ok(await onRemoteSnapshot(SESSIONS, session));
     });
   });
 
@@ -1801,6 +1834,34 @@ async function asAlasio(method: string, path: string, contentType: string, body:
     contentType,
   ], JSON.stringify(body));
   return Number(said);
+}
+
+/**
+ * Whether the container of the pod `name` in `namespace` runs on remote snapshots: a lower
+ * directory of its rootfs's overlay, on its node, is one of stargz-snapshotter's FUSE
+ * mounts, which reads its layer from the registry as it is read.
+ */
+async function onRemoteSnapshot(namespace: string, name: string): Promise<boolean> {
+  const pod = await kube.get<V1Pod>(ref("Pod", name, namespace));
+  const id = pod?.status?.containerStatuses?.[0]?.containerID?.replace(/^containerd:\/\//u, "");
+  assert.ok(pod?.spec?.nodeName && id, `${namespace}/${name} runs no container`);
+  // Each line: its id, its parent's, its device, its root, where it is mounted, its options, "-", its type, its source, its own options.
+  const mounts = (await onNode(pod.spec.nodeName, "cat /proc/self/mountinfo")).split("\n").map((line) => {
+    const [before = "", after = ""] = line.split(" - ");
+    const [type = "", , options = ""] = after.split(" ");
+    return { at: before.split(" ")[4] ?? "", type, options };
+  });
+  const remote = new Set(mounts.filter(({ type }) => type.startsWith("fuse.")).map(({ at }) => at));
+  const rootfs = mounts.find(({ at, type }) => type === "overlay" && at.endsWith(`/${id}/rootfs`));
+  assert.ok(rootfs, `${namespace}/${name}'s rootfs is no overlay on its node`);
+  const lower = /(?:^|,)lowerdir=([^,]+)/u.exec(rootfs.options)?.[1] ?? "";
+  return lower.split(":").some((directory) => remote.has(directory));
+}
+
+/** A duration as Go prints it, as kubelet's events do, `1m2.5s` or `850ms`, in seconds. */
+function goSeconds(text: string): number {
+  const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, "µs": 1e-6, us: 1e-6, ns: 1e-9 };
+  return [...text.matchAll(/([\d.]+)(h|ms|m|s|µs|us|ns)/gu)].reduce((sum, [, value, unit]) => sum + Number(value) * (units[unit ?? ""] ?? 0), 0);
 }
 
 /** Whether the pod's label says it runs a turn. */
