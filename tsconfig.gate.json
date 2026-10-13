@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","include":["gate","test/e2e/stand-ins.ts","test/e2e/telegram-stub.ts"]}

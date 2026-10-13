@@ -1,0 +1,93 @@
+name: gate-08-cutover
+
+# 08's cut-over of the box's object store (gate/08/cutover.sh) and its rollback
+# (gate/08/rollback.sh), rehearsed as C1 meets the box (gate/08/rehearse.ts): alasio 5.1.0
+# installed by its package on k3s on the runner, the host target, in use, its session, its
+# branch, its rows and versions, a folder workspace; then the cut-over failing after each step
+# and run again, its upgrade failing and run again, rolled forward; and, in two jobs, rolled back
+# from a failure after each of its steps before the upgrade, each run again first. On its
+# branch alone, whenever what it runs changes.
+on:
+  push:
+    branches: [track/object-store-gate]
+    paths: [.github/workflows/gate-08-cutover.yml, gate/**, cli/src/**, src/**, neon/grafana/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8"]
+    steps:
+      # alasio's images and its cluster's take more disk than a runner starts with free, so
+      # the software it comes with that this job does not use goes first, in the background,
+      # as the e2e jobs do (ci.yml).
+      - name: Free disk space, in the background
+        shell: bash
+        run: |
+          dirs=(/usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell
+            /usr/local/share/chromium /usr/local/lib/heroku /opt/microsoft /opt/google /opt/az)
+          for dir in "${dirs[@]}"; do
+            [ ! -e "$dir" ] || sudo mv "$dir" "$dir.deleted"
+          done
+          (
+            pids=()
+            for dir in "${dirs[@]}"; do
+              sudo rm -rf "$dir.deleted" &
+              pids+=($!)
+            done
+            status=0
+            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+            echo "$status" >"$RUNNER_TEMP/disk-freed.part" && mv "$RUNNER_TEMP/disk-freed.part" "$RUNNER_TEMP/disk-freed"
+          ) >"$RUNNER_TEMP/disk-freed.log" 2>&1 &
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - name: Wait for the disk space
+        run: |
+          until [ -f "$RUNNER_TEMP/disk-freed" ]; do sleep 1; done
+          cat "$RUNNER_TEMP/disk-freed.log"
+          df -h /
+          exit "$(cat "$RUNNER_TEMP/disk-freed")"
+      # 08 changes alasio's image and Grafana's alone: the release runs these, and the 5.1.0
+      # agent and lake images, which it pins as 5.1.0 does.
+      - name: The release's images, alasio's and Grafana's
+        run: |
+          docker build --quiet --tag gate.local/alasio:c1 .
+          docker build --quiet --tag gate.local/alasio-grafana:c1 neon/grafana
+      - name: Rehearse (${{ matrix.rehearsal }})
+        run: node gate/08/rehearse.ts ${{ matrix.rehearsal }}
+        env:
+          WORK: ${{ runner.temp }}/gate-08
+          IMAGES: gate.local/alasio:c1,gate.local/alasio-grafana:c1
+      - name: The cluster, when something failed
+        if: failure()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/gate-08/config/alasio/kubeconfig
+        run: |
+          kubectl get pods,pvc -A -o wide || true
+          kubectl get pv || true
+          kubectl get networkpolicy -n alasio -o yaml || true
+          kubectl -n alasio describe pods || true
+          for pod in $(kubectl -n alasio get pods -o name); do kubectl -n alasio logs "$pod" --all-containers --tail=80 || true; done
+      # What each cut-over recorded, its events and its checks; not the rehearsal's configuration.
+      - if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/recorded"
+          for out in "$RUNNER_TEMP"/gate-08/cutover*; do [ ! -d "$out" ] || sudo cp -r "$out" "$RUNNER_TEMP/recorded/"; done
+          sudo chown -R "$(id -u)" "$RUNNER_TEMP/recorded"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-08-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/recorded
