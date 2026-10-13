@@ -631,7 +631,10 @@ describe("alasio's command line, on the alasio it installed", () => {
   test("status says the cluster's nodes run, and each of alasio's workloads is ready", async () => {
     const said = await alasioOk("status");
     if (TARGET === "host") {
-      assert.match(said, /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?:\n {2}service k3s: active, enabled\n {2}node \S+: ready\n/u);
+      assert.match(
+        said,
+        /^k3s v\S+ on this machine, with gVisor \S+( and \S+)?, stargz-snapshotter v\S+:\n {2}service k3s: active, enabled\n {2}service stargz-snapshotter, which k3s pulls images through: active\n {2}node \S+: ready\n/u,
+      );
     } else {
       assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));
       const nodes = [`${CLUSTER}-server-0`, ...Array.from({ length: AGENTS }, (_, index) => `${CLUSTER}-agent-${index}`)];

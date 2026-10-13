@@ -1364,7 +1364,7 @@ test("upgrade installs this version's k3s, its gVisor release beside the one bef
   assert.equal(machine.read("/usr/local/bin/stargz-fuse-manager"), "stargz-fuse-manager v10.0.0\n");
   assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: newer })), []);
-  assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0:");
+  assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0, stargz-snapshotter v10.0.0:");
 
   const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"], stargz: "v10.0.0" });
   // A snapshot the gateway says names the release before: kept, though no longer pinned.
@@ -1471,7 +1471,12 @@ test("status of k3s here says its versions, its service and node, and that up st
   const { alasio, machine } = await onHost(t);
   const healthy = await alasio(["status"]);
   succeeded(healthy);
-  assert.deepEqual(healthy.printed.slice(0, 3), ["k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0:", "  service k3s: active, enabled", "  node machine: ready"]);
+  assert.deepEqual(healthy.printed.slice(0, 4), [
+    "k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0, stargz-snapshotter v9.9.0:",
+    "  service k3s: active, enabled",
+    "  service stargz-snapshotter, which k3s pulls images through: active",
+    "  node machine: ready",
+  ]);
   assert.ok(healthy.printed.includes("  Deployment alasio/alasio: ready"));
 
   const down = await alasio(["down"]);
@@ -1482,7 +1487,11 @@ test("status of k3s here says its versions, its service and node, and that up st
   assert.deepEqual(machine.killed.at(-1), [`${installed}/runsc`, `${installed}/containerd-shim-runsc-v1`, `${installed}/gvisor-bin/gvisor_sentry`]);
   const stopped = await alasio(["status"]);
   assert.equal(failure(stopped), "k3s on this machine is stopped: alasio up starts it");
-  assert.deepEqual(stopped.printed, ["k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0:", "  service k3s: inactive, disabled"]);
+  assert.deepEqual(stopped.printed, [
+    "k3s v1.99.0+k3s1 on this machine, with gVisor 20990101.0, stargz-snapshotter v9.9.0:",
+    "  service k3s: inactive, disabled",
+    "  service stargz-snapshotter, which k3s pulls images through: inactive",
+  ]);
   assert.equal(failure(await alasio(["logs"])), "k3s on this machine is stopped: alasio up starts it");
 
   const up = await alasio(["up"]);

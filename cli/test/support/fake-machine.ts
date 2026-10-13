@@ -3,7 +3,8 @@
  * test's, which stands for its root, its inotify limits there as high as a cluster here
  * needs unless the test lowers them; the commands alasio runs on it as root and the
  * processes it kills, recorded; systemd, with k3s as its install script makes it a
- * service; and a firewall, ufw or firewalld, when the test enables one. The commands
+ * service, and stargz-snapshotter's daemon's, which runs as k3s's does once its unit is
+ * written; and a firewall, ufw or firewalld, when the test enables one. The commands
  * alasio runs do to k3s and the firewall what they would: starting k3s writes its
  * kubeconfig and its node's password, uninstalling it removes what its uninstall script
  * does, and the firewall's rules are added, removed and said; unless the test says what a
@@ -150,7 +151,17 @@ export class FakeMachine {
   }
 
   get systemd(): Layer.Layer<Systemd> {
-    return Layer.succeed(Systemd, Systemd.of({ unit: (name) => Effect.sync(() => (name === "firewalld" ? this.firewalld : this.unit)) }));
+    return Layer.succeed(Systemd, Systemd.of({
+      unit: (name) =>
+        Effect.sync((): UnitState => {
+          if (name === "firewalld") return this.firewalld;
+          if (name === "stargz-snapshotter") {
+            const loaded = this.has("/etc/systemd/system/stargz-snapshotter.service");
+            return { loaded, active: loaded ? this.unit.active : "inactive", enabled: false };
+          }
+          return this.unit;
+        }),
+    }));
   }
 
   get layer(): Layer.Layer<RootSystem> {
