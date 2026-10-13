@@ -18,6 +18,8 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { ConfigProvider, Effect, Exit, Fiber, Layer, type Scope } from "effect";
 import { TestClock } from "effect/testing";
 
+// First: alasio's modules create their metrics as they load.
+import { added, collected } from "./support/metrics.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent, PoliciesNotInForce, type ResumeRequest } from "../src/node-agent/agent.ts";
 import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
@@ -461,6 +463,33 @@ test("a copy that fails as it writes leaves the workspace without a snapshot, ra
       s3.refuse = () => null;
       // The source keeps its snapshot throughout.
       assert.deepEqual(yield* here.agent.current(from), source);
+    })
+  ));
+
+test("the agent counts what it does, and tells, as metrics are exported, the releases it keeps and the snapshots its cache holds of each", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const older = "release-20260801.0-eaucoin.1";
+      const here = yield* node("node-1", { releases: [RELEASE, older] });
+      const counted = (name: string, effect: Effect.Effect<unknown, unknown>) => Effect.promise(() => added(name, () => Effect.runPromise(effect)));
+      const both = Effect.all([here.agent.checkpoint(request("fs-abc")), here.agent.checkpoint(request("fs-other"))]);
+      assert.deepEqual(yield* counted("alasio.node_agent.checkpoints", both), { "alasio.node_agent.checkpoint.outcome=taken": 2 });
+      assert.deepEqual(yield* counted("alasio.node_agent.prepares", here.agent.prepare({ environment: "main", workspace: "fs-abc" })), {
+        "alasio.node_agent.prepare.outcome=prepared,alasio.node_agent.prepare.source=cache": 1,
+      });
+      assert.deepEqual(yield* counted("alasio.node_agent.prepares", Effect.exit(here.agent.prepare({ environment: "main", workspace: "fs-none" }))), {
+        "alasio.node_agent.prepare.outcome=NoSnapshot": 1,
+      });
+      const releases = yield* Effect.promise(() => collected("alasio.node_agent.releases"));
+      assert.deepEqual(releases, [{ attributes: "", value: 2 }]);
+      const cached = yield* Effect.promise(() => collected("alasio.node_agent.cache.snapshots"));
+      assert.deepEqual(cached.toSorted((a, b) => a.attributes.localeCompare(b.attributes)), [
+        { attributes: `alasio.gvisor.release=${older}`, value: 0 },
+        { attributes: `alasio.gvisor.release=${RELEASE}`, value: 2 },
+      ]);
+      // A checkpoint that fails is counted by what failed.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
+      assert.deepEqual(yield* counted("alasio.node_agent.checkpoints", Effect.exit(here.agent.checkpoint(request("fs-abc")))), { "alasio.node_agent.checkpoint.outcome=RunscError": 1 });
     })
   ));
 

@@ -75,6 +75,10 @@ const releases = meter.createCounter("alasio.sandbox.releases", {
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
 });
+const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration", {
+  description: "How long a session restored from its snapshot took to come back, which the prompt bringing it up waits: from its snapshot looked up to its pod ready",
+  unit: "s",
+});
 
 /** Why a session with a snapshot was resumed without it. */
 export type Fallback = "release" | "template" | "node" | "prepare" | "restore" | "unreadable";
@@ -265,6 +269,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const restore = (sandbox: StoredSandbox, desired: Sandbox): Effect.Effect<SandboxRestore | null> => {
     const name = sandbox.metadata.name;
     return Effect.gen(function*() {
+      const started = yield* Clock.currentTimeMillis;
       const read = yield* agents.current(ref(name)).pipe(Effect.result);
       if (read._tag === "Failure") return yield* fallBack(name, "unreadable", read.failure.message);
       const manifest = read.success;
@@ -314,7 +319,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           kept: base,
           resume: resumeRestored(name, node, kept.release),
           // The session moves on from it.
-          restored: Effect.sync(() => restores.add(1, { "alasio.sandbox.restore.outcome": "restored" })).pipe(Effect.andThen(forget(name, "the session restored from it runs on"))),
+          restored: Clock.currentTimeMillis.pipe(
+            Effect.map((now) => {
+              restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
+              restoreDuration.record((now - started) / 1000);
+            }),
+            Effect.andThen(forget(name, "the session restored from it runs on")),
+          ),
           failed: (failure: string) => fallBack(name, "restore", failure).pipe(Effect.asVoid),
         };
       }

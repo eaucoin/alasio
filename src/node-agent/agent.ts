@@ -26,11 +26,12 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
+import type { BatchObservableResult } from "@opentelemetry/api";
 import { Clock, Effect, RcMap, Schema, type Scope, Semaphore } from "effect";
 
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
@@ -236,7 +237,7 @@ const HOOK_TIMEOUT = "30s";
 const POLICY_POLL = "250 millis";
 
 const checkpoints = meter.createCounter("alasio.node_agent.checkpoints", {
-  description: "Whole-sandbox checkpoints taken by the node agent, by outcome",
+  description: "Whole-sandbox checkpoints taken by the node agent, by outcome: taken, or what failed",
   unit: "{checkpoint}",
 });
 const pauses = meter.createHistogram("alasio.node_agent.checkpoint.pause", {
@@ -263,6 +264,17 @@ const resumes = meter.createCounter("alasio.node_agent.resumes", {
   description: "Restored sandboxes resumed by the node agent once their pods' network policies were in force, by outcome",
   unit: "{resume}",
 });
+const keptReleases = meter.createObservableGauge("alasio.node_agent.releases", {
+  description: "The gVisor releases kept on the node, each of which restores the snapshots it took",
+  unit: "{release}",
+});
+const cachedSnapshots = meter.createObservableGauge("alasio.node_agent.cache.snapshots", {
+  description: "The snapshots the node's cache holds, by the gVisor release that took them, none for a release kept on the node that took none",
+  unit: "{snapshot}",
+});
+
+/** The release a cached snapshot's manifest names, of all it says. */
+const CachedRelease = Schema.fromJsonString(Schema.Struct({ release: Schema.String }));
 
 /** A snapshot's id: when it was taken, sortable, and a random part. */
 function snapshotId(takenAt: number): string {
@@ -293,6 +305,37 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
 export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
+
+  /** How many snapshots the cache holds of each release, as their manifests beside their images say. */
+  const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
+    const held = new Map<string, number>();
+    for (const { environment, workspace, snapshot } of yield* cache.list) {
+      const text = yield* onDisk(() => readFile(join(cache.path(environment, workspace, snapshot), MANIFEST_FILE), "utf8"));
+      const { release } = yield* Schema.decodeUnknownEffect(CachedRelease)(text);
+      held.set(release, (held.get(release) ?? 0) + 1);
+    }
+    return held;
+  });
+
+  // The gauges are read as metrics are exported, outside every fiber of the agent's.
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
+  const gauges = [keptReleases, cachedSnapshots];
+  yield* Effect.acquireRelease(
+    Effect.sync(() => {
+      const observe = (result: BatchObservableResult) =>
+        runPromise(Effect.gen(function*() {
+          const installed = yield* runsc.releases;
+          const held = yield* cachedByRelease;
+          result.observe(keptReleases, installed.length);
+          for (const release of new Set([...installed, ...held.keys()])) {
+            result.observe(cachedSnapshots, held.get(release) ?? 0, { "alasio.gvisor.release": release });
+          }
+        }).pipe(Effect.catch((error) => Effect.logWarning(`could not count the snapshots the node's cache holds: ${error.message}`))));
+      meter.addBatchObservableCallback(observe, gauges);
+      return observe;
+    }),
+    (observe) => Effect.sync(() => meter.removeBatchObservableCallback(observe, gauges)),
+  );
 
   const prefixOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;
 
@@ -396,6 +439,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     return exclusive(
       [request],
       take(request).pipe(
+        Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))),
         Effect.catch((error) =>
           forgetNow(request).pipe(
             Effect.matchEffect({
@@ -422,13 +466,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
           pauses.record(manifest.pauseMs / 1000);
           uploads.record(manifest.uploadMs / 1000);
           sizes.record(manifest.bytes);
-          checkpoints.add(1, { outcome: "taken" });
+          checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": "taken" });
         }).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.pause_ms": manifest.pauseMs, "alasio.snapshot.upload_ms": manifest.uploadMs })),
           Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
         )
       ),
-      Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { outcome: "failed" })).pipe(Effect.andThen(Effect.logWarning(error.message)))),
+      Effect.tapError((error) => Effect.logWarning(error.message)),
       withAlasioSpan("alasio.node_agent.checkpoint", { attributes: spanAttributes(request) }),
     );
   };
@@ -464,11 +508,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   const copy = (from: WorkspaceRef, to: WorkspaceRef): Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError> =>
     exclusive([from, to], copyNow(from, to)).pipe(
       Effect.tap((manifest) =>
-        Effect.sync(() => copies.add(1, { outcome: "copied" })).pipe(
+        Effect.sync(() => copies.add(1, { "alasio.node_agent.copy.outcome": "copied" })).pipe(
           Effect.andThen(Effect.logInfo(`copied the snapshot ${manifest.snapshot} of ${prefixOf(from)} to ${prefixOf(to)}`)),
         )
       ),
-      Effect.tapError((error) => Effect.sync(() => copies.add(1, { outcome: error._tag }))),
+      Effect.tapError((error) => Effect.sync(() => copies.add(1, { "alasio.node_agent.copy.outcome": error._tag }))),
       withAlasioSpan("alasio.node_agent.copy", {
         attributes: { ...spanAttributes(to), "alasio.source.environment": from.environment, "alasio.source.workspace": from.workspace },
       }),
@@ -523,12 +567,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         yield* cache.clear(environment, workspace, snapshot);
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
         const source = cached ? "cache" : "bucket";
-        yield* Effect.sync(() => prepares.add(1, { outcome: "prepared", source }));
+        yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes });
         return { manifest, imagePath: cache.path(environment, workspace, snapshot) };
       }),
     ).pipe(
-      Effect.tapError((error) => Effect.sync(() => prepares.add(1, { outcome: error._tag }))),
+      Effect.tapError((error) => Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": error._tag }))),
       withAlasioSpan("alasio.node_agent.prepare", { attributes: spanAttributes(ref) }),
     );
 
@@ -573,11 +617,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       return waited;
     }).pipe(
       Effect.tap((waited) =>
-        Effect.sync(() => resumes.add(1, { outcome: "resumed" })).pipe(
+        Effect.sync(() => resumes.add(1, { "alasio.node_agent.resume.outcome": "resumed" })).pipe(
           Effect.andThen(Effect.logInfo(`resumed the sandbox of ${prefixOf(request)} in ${request.namespace}/${request.pod}, its network policies in force after ${waited} ms`)),
         )
       ),
-      Effect.tapError((error) => Effect.sync(() => resumes.add(1, { outcome: error._tag })).pipe(Effect.andThen(Effect.logWarning(error.message)))),
+      Effect.tapError((error) => Effect.sync(() => resumes.add(1, { "alasio.node_agent.resume.outcome": error._tag })).pipe(Effect.andThen(Effect.logWarning(error.message)))),
       Effect.asVoid,
       withAlasioSpan("alasio.node_agent.resume", {
         attributes: { ...spanAttributes(request), "k8s.namespace.name": request.namespace, "k8s.pod.name": request.pod },

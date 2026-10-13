@@ -6,6 +6,8 @@ import { Effect, Fiber, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
+// First: alasio's modules create their metrics as they load.
+import { added } from "./support/metrics.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import type { SessionsProfile } from "../src/kube/config.ts";
 import type { Sandbox, Sandboxes, StoredSandbox } from "../src/kube/sandboxes.ts";
@@ -230,8 +232,11 @@ test("a session with a snapshot on the current template is restored on a node th
     nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-c"] }] }],
   });
   assert.deepEqual(plan.podTemplate.spec?.containers, desired.spec.podTemplate.spec?.containers);
-  // Restored, the session moves on from it.
-  await Effect.runPromise(plan.restored);
+  // Restored, the session moves on from it, counted, with how long it took to come back.
+  const timed = await added("alasio.sandbox.restore.duration", async () => {
+    assert.deepEqual(await added("alasio.sandbox.restores", () => Effect.runPromise(plan.restored)), { "alasio.sandbox.restore.outcome=restored": 1 });
+  });
+  assert.deepEqual(timed, { "": 1 });
   assert.deepEqual(asked.slice(2), ["forget alasio-sessions/fs-abc123"]);
 });
 
@@ -331,10 +336,16 @@ test("a session without a snapshot is resumed as it is, and one whose snapshot c
     // Not read.
     fakeAgents({ read: new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" }) }),
   ];
-  for (const { agents, asked } of cases) {
-    assert.equal(await restore(agents), null);
-    assert.equal(asked.at(-1), "forget alasio-sessions/fs-abc123");
-  }
+  const fallbacks = await added("alasio.sandbox.restores", async () => {
+    for (const { agents, asked } of cases) {
+      assert.equal(await restore(agents), null);
+      assert.equal(asked.at(-1), "forget alasio-sessions/fs-abc123");
+    }
+  });
+  assert.deepEqual(
+    fallbacks,
+    Object.fromEntries(["release", "template", "node", "prepare", "unreadable"].map((why) => [`alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=${why}`, 1])),
+  );
 });
 
 test("an idle session is released, its sandbox snapshotted by its node's agent, addressed to bayma's container, with bayma's hook and its template", async () => {
@@ -371,8 +382,9 @@ test("an idle session is released, its sandbox snapshotted by its node's agent, 
   await look(null, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() });
   assert.deepEqual(saved, []);
   // Idle for five minutes, with no turn since.
-  await look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 });
+  const released = await added("alasio.sandbox.releases", () => look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 }));
   assert.deepEqual(saved, ["fs-abc123: suspend"]);
+  assert.deepEqual(released, { "alasio.sandbox.release.outcome=snapshotted": 1 });
   assert.deepEqual(checkpoints, [["node-a", {
     environment: "alasio-sessions",
     workspace: "fs-abc123",
