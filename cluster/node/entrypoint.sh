@@ -44,14 +44,27 @@ mount --make-rshared /
 
 # stargz-snapshotter's daemon, with its configuration as the node was made with it
 # (ALASIO_STARGZ_CONFIG), which containerd pulls images through once its socket is there:
-# it lives as long as the container, which k3s does too.
-mkdir -p /etc/containerd-stargz-grpc
+# started again whenever it exits, as the host target's systemd does, its FUSE manager
+# keeping the mounts meanwhile, for as long as the container lives, which k3s does too.
+# Its pid is in daemon.pid, which alasio status reads.
+mkdir -p /etc/containerd-stargz-grpc /run/containerd-stargz-grpc
 printf '%s\n' "$ALASIO_STARGZ_CONFIG" >/etc/containerd-stargz-grpc/config.toml
-/usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
-  --config=/etc/containerd-stargz-grpc/config.toml --root=/var/lib/containerd-stargz-grpc &
-daemon=$!
+# A socket left from the container's last start is no daemon listening.
+rm -f /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+(
+  while :; do
+    /usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
+      --config=/etc/containerd-stargz-grpc/config.toml --root=/var/lib/containerd-stargz-grpc &
+    echo $! >/run/containerd-stargz-grpc/daemon.pid
+    wait $! && exited=0 || exited=$?
+    echo "stargz-snapshotter's daemon exited with $exited; starting it again" >&2
+    sleep 1
+  done
+) &
+waited=0
 until [ -S /run/containerd-stargz-grpc/containerd-stargz-grpc.sock ]; do
-  kill -0 "$daemon" 2>/dev/null || { echo "stargz-snapshotter's daemon exited" >&2; exit 1; }
+  [ "$waited" -lt 600 ] || { echo "stargz-snapshotter's daemon did not start within a minute" >&2; exit 1; }
+  waited=$((waited + 1))
   sleep 0.1
 done
 

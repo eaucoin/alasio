@@ -1,8 +1,9 @@
 /**
  * k3s in the nodes of a fake Docker (./fake-docker.ts): kubectl in the server node, over
  * an API server in memory (nodes, CoreDNS's ConfigMap, RuntimeClasses, and what is
- * applied), find and the abort of FUSE's connections in every node, and the files k3s
- * writes in the server node, its kubeconfig and token.
+ * applied), find, the abort of FUSE's connections and the check of stargz-snapshotter's
+ * daemon in every node, and the files k3s writes in the server node, its kubeconfig and
+ * token.
  */
 import { type FakeContainer, type FakeDocker, type FakeDockerOptions, type FakeExecResult, serveFakeDocker } from "./fake-docker.ts";
 
@@ -30,6 +31,8 @@ export class FakeK3s {
   findFailures = 0;
   /** The nodes FUSE's connections were aborted in. */
   readonly aborted: string[] = [];
+  /** The nodes whose stargz-snapshotter daemon does not run. */
+  readonly stargzStopped = new Set<string>();
   containers: ReadonlyMap<string, FakeContainer> = new Map();
 
   readonly exec = (container: string, command: readonly string[], stdin: Buffer): FakeExecResult => {
@@ -42,6 +45,9 @@ export class FakeK3s {
     if (tool === "sh" && args[1]?.includes("/sys/fs/fuse/connections")) {
       this.aborted.push(container);
       return { exitCode: 0 };
+    }
+    if (tool === "sh" && args[1]?.includes("/run/containerd-stargz-grpc/daemon.pid")) {
+      return this.stargzStopped.has(container) ? { exitCode: 1, stderr: "sh: can't kill pid 41: No such process" } : { exitCode: 0 };
     }
     if (!this.apiReady) return { exitCode: 1, stderr: "The connection to the server 127.0.0.1:6443 was refused" };
     const verb = args.find((arg) => !arg.startsWith("--"));

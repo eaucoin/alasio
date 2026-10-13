@@ -272,7 +272,9 @@ export const status = Command.make("status", {}, () =>
     if (target._tag === "Docker") {
       const { docker, nodes } = yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.status), dockerCluster(target.cluster));
       yield* Console.log(`cluster ${target.cluster.name}, in Docker ${docker}:`);
-      yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state }) => `  ${name}: ${state}`).join("\n") : "  not made");
+      yield* Console.log(nodes.length > 0 ? nodes.map(({ name, state, snapshotter }) =>
+        `  ${name}: ${state}${snapshotter === null ? "" : `\n    stargz-snapshotter's daemon, which k3s pulls images through: ${snapshotter ? "running" : "not running"}`}`
+      ).join("\n") : "  not made");
       yield* sayShortfalls;
       const server = nodes.find(({ role }) => role === "server");
       if (server?.state !== "running") return yield* notRunning(target, server !== undefined);
@@ -364,7 +366,8 @@ export const status = Command.make("status", {}, () =>
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, with the stargz-snapshotter release " +
-        "k3s pulls images through and whether its daemon's service runs, as no image is pulled while it does not; or its nodes in Docker; and this " +
+        "k3s pulls images through and whether its daemon's service runs, as no image is pulled while it does not; or its nodes in Docker, " +
+        "each with whether that daemon runs in it; and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
         "awake, or asleep with nothing left to load until alasio writes again), waking (a compute or the loader whose pod starts, within " +

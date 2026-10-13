@@ -93,10 +93,15 @@ export interface NodeStatus {
   readonly state: string;
 }
 
+/** A node's container, and, while it runs, whether stargz-snapshotter's daemon, which its k3s pulls images through, runs in it. */
+export interface NodeHealth extends NodeStatus {
+  readonly snapshotter: boolean | null;
+}
+
 /** The Docker the cluster runs on, by its version, and the cluster's nodes, the server first; none when there is no cluster. */
 export interface ClusterStatus {
   readonly docker: string;
-  readonly nodes: readonly NodeStatus[];
+  readonly nodes: readonly NodeHealth[];
 }
 
 /** The cluster cannot be made as asked: something of its name is not its own, or its settings cannot hold. */
@@ -179,6 +184,8 @@ const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
 const REGISTRIES_ENV = "ALASIO_REGISTRIES";
 /** The variable the node image's entrypoint writes stargz-snapshotter's daemon's configuration from, before it starts it. */
 const STARGZ_CONFIG_ENV = "ALASIO_STARGZ_CONFIG";
+/** Where the node image's entrypoint writes the pid of stargz-snapshotter's daemon, at each of the daemon's starts. */
+const STARGZ_PID = "/run/containerd-stargz-grpc/daemon.pid";
 
 /** The `index`th address of the IPv4 subnet `cidr` (a.b.c.d/n), its network address the 0th; null when it has no such host address. */
 export function subnetAddress(cidr: string, index: number): string | null {
@@ -518,7 +525,16 @@ const makeDockerCluster = Effect.fnUntraced(function*({
 
     status: Effect.all({
       docker: Effect.map(docker.version, ({ Version }) => Version),
-      nodes: existingNodes,
+      // The daemon's pid, as the node's entrypoint writes it at each of its starts.
+      nodes: Effect.flatMap(existingNodes, (found) =>
+        Effect.forEach(found, (node): Effect.Effect<NodeHealth, DockerError> =>
+          node.state !== "running"
+            ? Effect.succeed({ ...node, snapshotter: null })
+            : inNode(node.name, ["sh", "-c", `kill -0 "$(cat ${STARGZ_PID})"`]).pipe(
+              Effect.as(true),
+              Effect.catchTag("NodeCommandFailed", () => Effect.succeed(false)),
+              Effect.map((snapshotter) => ({ ...node, snapshotter })),
+            ))),
     }),
   });
 });
