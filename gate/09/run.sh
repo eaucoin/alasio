@@ -12,9 +12,10 @@
 #   fork's restore annotations, onto a rootfs pulled lazily anew.
 # - G5: the daemon's caches against the content store, and its and containerd's memory.
 #
-# Needs root through sudo, Docker and buildx. Measurements go to $OUT.
+# Needs root through sudo, Docker and buildx. Measurements go to $OUT. STARGZ_OPTIONS,
+# when set, are top-level lines of the daemon's configuration besides, as G5 compares.
 #
-#   OUT=/tmp/gate-09 gate/09/run.sh
+#   OUT=/tmp/gate-09 STARGZ_OPTIONS='no_background_fetch = true' gate/09/run.sh
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -39,6 +40,8 @@ sudo mkdir -p /etc/containerd-stargz-grpc
 sudo tee /etc/containerd-stargz-grpc/config.toml >/dev/null <<EOF
 # The daemon's FUSE mounts held by its FUSE manager, so they outlive the daemon's own
 # restarts; the run's registry over HTTP.
+${STARGZ_OPTIONS:-}
+
 [fuse_manager]
 enable = true
 address = "/run/containerd-stargz-grpc/fuse-manager.sock"
@@ -294,7 +297,7 @@ log "  at the checkpoint: $checkpointed; restored: $after, then $later"
 kubectl -n gate exec restored -- md5sum /blob >/dev/null || fail "the restored pod cannot read its lazily pulled image"
 log "  the restored pod counts on from its checkpoint and reads its image"
 
-log "G5: caches and memory, once the sandbox image's background fetch had time"
+log "G5: caches and memory, once the sandbox image's background fetch had time (options: ${STARGZ_OPTIONS:-none})"
 sleep 120
 # On their own file systems only (-x): the snapshots' FUSE mounts, read, would fetch.
 sudo sh -c "du -shx $STARGZ_ROOT/* $STARGZ_ROOT/stargz/* /var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.overlayfs; true" | tee "$OUT/disk.txt"

@@ -1,10 +1,11 @@
 name: gate-09
 
-# 09's gate (gate/09/run.sh), on its track's branch alone, whenever what it runs changes:
-# k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon.
+# 09's gate (gate/09/run.sh), on its tracks' branches alone, whenever what it runs changes:
+# k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon; with
+# its background fetch on, as by default, and off, which G5's disk compares.
 on:
   push:
-    branches: [track/wave0-gates]
+    branches: [track/wave0-gates, track/lazy-pulling-gate]
     paths: [.github/workflows/gate-09.yml, gate/09/**, gate/k3s.sh]
   workflow_dispatch:
 
@@ -15,6 +16,10 @@ jobs:
   lazy-pulling:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        fetch: [background, on-demand]
     steps:
       # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
       - name: Free disk space
@@ -26,6 +31,7 @@ jobs:
       - run: gate/09/run.sh
         env:
           OUT: ${{ runner.temp }}/gate-09
+          STARGZ_OPTIONS: ${{ matrix.fetch == 'on-demand' && 'no_background_fetch = true' || '' }}
       - name: The node, when something failed
         if: failure()
         run: |
@@ -36,5 +42,5 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-09
+          name: gate-09-${{ matrix.fetch }}
           path: ${{ runner.temp }}/gate-09
