@@ -1058,11 +1058,13 @@ describe("workspace storage", () => {
     assert.deepEqual(cloner.securityContext, { privileged: true });
     assert.deepEqual(cloner.env, [{ name: "META_URL", valueFrom: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } } }]);
     // The destination's directory has no quota at first, then the driver's. The mount, run
-    // in the background, takes a while to answer, as on the box; it is up once it has.
+    // in the background, takes a while to answer, as on the box; it is up once it has, and
+    // its client runs until it is unmounted.
     const juicefs = [
       '[ "$1" = mount ] && /bin/sleep 0.3',
       'echo "$@" >> "$ROOT/calls"',
       '[ "$1" = mount ] && : > "$ROOT/mounted"',
+      '[ "$1" = mount ] && until [ -e "$ROOT/unmounted" ]; do /bin/sleep 0.05; done',
       'if [ "$1 $2" = "quota get" ]; then [ -e "$ROOT/quota" ] && echo "| /alasio-sessions-data-fs-def456 | 1.0 GiB |"; : > "$ROOT/quota"; fi',
       "true",
     ].join("\n");
@@ -1076,7 +1078,7 @@ describe("workspace storage", () => {
       DESTINATION_NAMESPACE: "alasio-sessions",
       DESTINATION_CLAIM: "data-fs-def456",
     };
-    const commands = { juicefs, mkdir: recorded("mkdir"), stat: stat, sleep: recorded("sleep"), umount: recorded("umount"), chown: recorded("chown"), chmod: recorded("chmod") };
+    const commands = { juicefs, mkdir: recorded("mkdir"), stat: stat, sleep: recorded("sleep"), umount: `${recorded("umount")}; : > "$ROOT/unmounted"`, chown: recorded("chown"), chmod: recorded("chmod") };
     const { root, run, remove } = runScript(cloner, env, commands);
     try {
       run();
