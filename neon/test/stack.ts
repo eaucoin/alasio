@@ -15,11 +15,12 @@ import { after, before, describe, test } from "node:test";
 import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
+import { dataNodes } from "../../cli/src/kube/object-store-scale.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
 import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
-import { alasioOk, type Forward, kube, lakeQuery, ref } from "../../test/e2e/harness.ts";
+import { AGENTS, alasioOk, type Forward, kube, lakeQuery, ref, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type BranchesFile, type BranchView, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
@@ -58,6 +59,12 @@ async function query<Row extends QueryResultRow = Record<string, unknown>>(
       await client.end().catch(() => {});
     }
   }
+}
+
+/** The object store's gateways' pods that run now. */
+async function gateways(): Promise<string[]> {
+  const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "seaweedfs" }) });
+  return pods.filter((pod) => pod.status?.phase === "Running" && !pod.metadata?.deletionTimestamp).map((pod) => pod.metadata?.name ?? "");
 }
 
 /** Waits until every workload of the stack is rolled out and ready, and the database answers. */
@@ -326,7 +333,7 @@ export function neonStack(): void {
         assert.deepEqual(await query("select count(*)::int as n from kept"), [{ n: 50000 }]);
       });
 
-      for (const component of ["neon-pageserver", "neon-safekeeper", "neon-compute", "neon-storage-controller", "seaweedfs"]) {
+      for (const component of ["neon-pageserver", "neon-safekeeper", "neon-compute", "neon-storage-controller", "seaweedfs", "seaweedfs-filer", "seaweedfs-volume"]) {
         test(`loses nothing committed when ${component} is killed mid-write`, async () => {
           const table = `crash_${component.replaceAll("-", "_")}`;
           await query(`create table ${table} (id int primary key)`);
@@ -424,11 +431,119 @@ export function neonStack(): void {
         assert.ok(rule("expire-noncurrent"));
       });
 
+      /** Runs `script` in the gateway `pod`'s lifecycle container, with the stack's S3 admin, its `s3api` at `endpoint` (its own, unless another's). */
+      const onGateway = (pod: string, script: string) =>
+        kube.execOk(NAMESPACE, pod, ["/bin/sh", "-c", `set -e; s3api() { endpoint=$1; shift; aws s3api --endpoint-url "http://$endpoint" "$@"; }; ${script}`], { container: "lifecycle" });
+
+      /** The masters' pods that run now. */
+      const masters = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "seaweedfs-master" }) }))
+          .filter(({ status, metadata }) => status?.phase === "Running" && !metadata?.deletionTimestamp).map(({ metadata }) => metadata?.name ?? "");
+      /** What a running master answers at `path` of its HTTP port, which it asks its leader where it is not one. */
+      const onMaster = async (path: string, master?: string) =>
+        kube.execOk(NAMESPACE, master ?? (await masters())[0] ?? assert.fail("no master runs"), ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
+      /** The pod of a part's address, as SeaweedFS names a server: its name in its headless Service, and a port. */
+      const podOfAddress = (address: string) => address.split(".")[0] ?? "";
+
+      test("the object store, its objects kept twice, serves every one while a volume server holding them is away, and takes new ones", { skip: AGENTS < 2 && "three volume servers, on three nodes" }, async () => {
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        const bucket = `replicated-${Date.now()}`;
+        await onGateway(gateway, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; for n in $(seq 1 20); do head -c 65536 /dev/urandom > /tmp/$n; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key $n --body /tmp/$n >/dev/null; done`);
+        // A volume server holding the bucket's volumes, as the masters say.
+        const status: VolumeStatus = JSON.parse(await onMaster("/vol/status"));
+        const holders = Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.entries(nodes))
+          .filter(([, volumes]) => volumes.some(({ Collection }) => Collection === bucket)).map(([address]) => address);
+        assert.equal(holders.length, 2, `the bucket's volumes are on ${holders.join(", ")}`);
+        const away = podOfAddress(holders[0] ?? "");
+        const node = (await kube.get<V1Pod>(ref("Pod", away, NAMESPACE)))?.spec?.nodeName ?? assert.fail(`${away} runs on no node`);
+        const registered = async () => dataNodes(JSON.parse(await onMaster("/dir/status"))).map(({ Url }) => podOfAddress(Url));
+        // Its node takes no pod, and its pod, made anew, is placed nowhere else, beside another volume server.
+        await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
+        try {
+          await kube.kill(NAMESPACE, away);
+          for (const deadline = Date.now() + 120_000; (await registered()).includes(away); await sleep(2000)) {
+            if (Date.now() > deadline) assert.fail(`the masters still count ${away}`);
+          }
+          // While it is away: every object read back as written, and a new one taken.
+          const read = await onGateway(gateway, `missing=0; for n in $(seq 1 20); do s3api 127.0.0.1:8333 get-object --bucket ${bucket} --key $n /tmp/back >/dev/null 2>&1 && cmp -s /tmp/$n /tmp/back || missing=$((missing + 1)); done; echo "missing $missing"; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key new --body /tmp/1 >/dev/null && echo taken`);
+          assert.match(read, /^missing 0$/mu);
+          assert.match(read, /^taken$/mu);
+          // And it was away throughout: unready, unplaced, and not among the masters' volume servers.
+          const pod = await kube.get<V1Pod>(ref("Pod", away, NAMESPACE));
+          assert.deepEqual([pod?.spec?.nodeName, pod?.status?.conditions?.find(({ type }) => type === "Ready")?.status ?? "False"], [undefined, "False"]);
+          assert.ok(!(await registered()).includes(away), `the masters count ${away} again`);
+        } finally {
+          await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
+          await onGateway(gateway, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+          await kube.awaitReady([ref("StatefulSet", componentName("seaweedfs-volume"), NAMESPACE)], "10 minutes");
+        }
+      });
+
+      test("the object store's three masters elect another leader when theirs is killed, and the store takes and serves objects through it", { skip: AGENTS < 2 && "three masters, on three nodes" }, async () => {
+        const running = await masters();
+        assert.equal(running.length, 3);
+        const leaderAsSaidBy = async (master: string) => podOfAddress((JSON.parse(await onMaster("/cluster/status", master)) as { Leader?: string }).Leader ?? "");
+        const leader = await leaderAsSaidBy(running[0] ?? "");
+        assert.ok(running.includes(leader), `the masters' leader is ${leader}`);
+        const other = running.find((master) => master !== leader) ?? "";
+        // A leader is a pod's instance: the killed one's pod is made anew, which may be elected.
+        const instance = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.metadata?.uid ?? "";
+        const killed = await instance(leader);
+        await kube.kill(NAMESPACE, leader);
+        for (const deadline = Date.now() + 120_000;; await sleep(2000)) {
+          const elected = await leaderAsSaidBy(other).catch(() => "");
+          if (elected !== "" && (elected !== leader || (await instance(elected)) !== killed)) break;
+          if (Date.now() > deadline) assert.fail(`the masters elected no leader but the one killed, ${leader}: ${elected || "none"} as ${other} says`);
+        }
+        const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+        const bucket = `leader-${Date.now()}`;
+        try {
+          const said = await onGateway(gateway, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; head -c 65536 /dev/urandom > /tmp/led; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key led --body /tmp/led >/dev/null; s3api 127.0.0.1:8333 get-object --bucket ${bucket} --key led /tmp/back >/dev/null; cmp -s /tmp/led /tmp/back && echo same`);
+          assert.match(said, /^same$/mu);
+        } finally {
+          await onGateway(gateway, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+          await kube.awaitReady([ref("StatefulSet", componentName("seaweedfs-master"), NAMESPACE)], "10 minutes");
+        }
+      });
+
+      test("the object store's parts refuse the stack's other pods: the lake reaches a gateway's S3 port, and neither its gRPC and metrics ports, nor any master, volume server or filer", async () => {
+        const lake = await kube.runningPod(NAMESPACE, componentName("lake"));
+        const addressOf = async (pod: string) => (await kube.get<V1Pod>(ref("Pod", pod, NAMESPACE)))?.status?.podIP ?? assert.fail(`${pod} has no address`);
+        const reached = async (pod: string, port: number) => (await kube.execOk(NAMESPACE, lake, ["node", "-e", tcp(JSON.stringify(await addressOf(pod)), port)], { container: "lake" })).trim();
+        const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
+        assert.equal(await reached(gateway, 8333), "open");
+        for (const port of [18333, 9327]) assert.equal(await reached(gateway, port), "blocked", `seaweedfs:${port}`);
+        for (const [part, port] of [["seaweedfs-master", 9333], ["seaweedfs-master", 19333], ["seaweedfs-volume", 8080], ["seaweedfs-filer", 8888], ["seaweedfs-filer", 18888]] as const) {
+          assert.equal(await reached(`${componentName(part)}-0`, port), "blocked", `${part}:${port}`);
+        }
+      });
+
+      test("an object written through one gateway is read through another at once, every time, its filers on one store", { skip: AGENTS < 2 && "two gateways and two filers, on three nodes" }, async () => {
+        const [one, other] = await gateways();
+        if (!one || !other) return assert.fail("two gateways run");
+        const otherAddress = (await kube.get<V1Pod>(ref("Pod", other, NAMESPACE)))?.status?.podIP;
+        const bucket = `read-after-write-${Date.now()}`;
+        await onGateway(one, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null`);
+        try {
+          const said = await onGateway(one, [
+            "missing=0; echo body > /tmp/body",
+            "for n in $(seq 1 100); do",
+            `  s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key $n --body /tmp/body >/dev/null`,
+            `  s3api ${otherAddress}:8333 head-object --bucket ${bucket} --key $n >/dev/null 2>&1 || missing=$((missing + 1))`,
+            "done",
+            'echo "missing $missing"',
+          ].join("\n"));
+          assert.match(said, /^missing 0$/mu);
+        } finally {
+          await onGateway(one, `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+        }
+      });
+
       test("the object store compacts a volume once a tenth of it is deleted", async () => {
         const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
         const bucket = `vacuum-${Date.now()}`;
         const s3 = (script: string) => kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", `set -e; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
-        const master = (path: string) => kube.execOk(NAMESPACE, `${componentName("seaweedfs-master")}-0`, ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
+        const master = (path: string) => onMaster(path);
         const volumes = async () => {
           const status: VolumeStatus = JSON.parse(await master("/vol/status"));
           return Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.values(nodes)).flat()
@@ -557,6 +672,42 @@ export function neonStack(): void {
           assert.equal(Number(count.trim().split("\n").at(-1)), 100);
         } finally {
           await kube.remove(ref("ConfigMap", name, NAMESPACE)).catch(() => {});
+        }
+      });
+
+      test("alasio restore-filer-store puts the filer store back from its backup: what was there then is, what was written since is not, and the stack runs on it again", async () => {
+        const bucket = `restore-${Date.now()}`;
+        const gateway = async () => (await gateways())[0] ?? assert.fail("no gateway runs");
+        const held = async (key: string) =>
+          (await onGateway(await gateway(), `s3api 127.0.0.1:8333 head-object --bucket ${bucket} --key ${key} >/dev/null 2>&1 && echo held || echo missing`)).trim();
+        await onGateway(await gateway(), `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; echo before > /tmp/body; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key before --body /tmp/body >/dev/null`);
+        await query("create table if not exists restored (said text)");
+        await query("insert into restored values ('before')");
+        try {
+          // A backup, as the CronJob takes one hourly.
+          const name = `filer-store-backup-${Date.now()}`;
+          const template = (await kube.get<V1CronJob>(ref("CronJob", componentName("seaweedfs-filer-store-backup"), NAMESPACE)))?.spec?.jobTemplate;
+          assert.ok(template?.spec);
+          const job: V1Job = { apiVersion: "batch/v1", kind: "Job", metadata: { name, namespace: NAMESPACE, labels: template.metadata?.labels ?? {} }, spec: template.spec };
+          await kube.apply(job);
+          try {
+            await kube.awaitReady([ref("Job", name, NAMESPACE)], "10 minutes");
+          } finally {
+            await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});
+          }
+          await onGateway(await gateway(), `echo after > /tmp/body; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key after --body /tmp/body >/dev/null`);
+          assert.deepEqual([await held("before"), await held("after")], ["held", "held"]);
+
+          const listed = await alasioOk("restore-filer-store");
+          const stamp = /^ {2}(\d{8}T\d{6}Z) /mu.exec(listed)?.[1] ?? assert.fail(`no backup is listed:\n${listed}`);
+          const restored = await alasioOk("restore-filer-store", stamp, "--yes", "--timeout", "30m");
+          assert.match(restored, /^The filer store is as it was at .+, with its \d+ keys, and alasio runs on it again\.$/mu);
+          await up();
+          assert.deepEqual([await held("before"), await held("after")], ["held", "missing"]);
+          assert.deepEqual(await query("select said from restored"), [{ said: "before" }]);
+        } finally {
+          await onGateway(await gateway(), `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
+          await query("drop table if exists restored").catch(() => {});
         }
       });
     });

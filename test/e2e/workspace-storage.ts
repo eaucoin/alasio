@@ -32,7 +32,7 @@ import type {
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName } from "../../cli/src/manifests/common.ts";
 import { CSI_DRIVER, JUICEFS_PODS_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "../../cli/src/manifests/juicefs-csi.ts";
-import { FILER, FILER_STORE, GATEWAY, VOLUME_SERVER } from "../../cli/src/manifests/object-store.ts";
+import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER } from "../../cli/src/manifests/object-store.ts";
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
@@ -47,16 +47,26 @@ const DRIVER_NAMESPACE = "kube-system";
  * object store's parts its data does, each a StatefulSet's but its gateways, a
  * Deployment's; and the port each takes them on.
  */
-const STORES = [
+const STORES: readonly Store[] = [
   { name: VALKEY, kind: "StatefulSet", port: 6379 },
   { name: GATEWAY, kind: "Deployment", port: 8333 },
   { name: FILER, kind: "StatefulSet", port: 8888 },
   { name: VOLUME_SERVER, kind: "StatefulSet", port: 8080 },
   { name: FILER_STORE, kind: "StatefulSet", port: 6379 },
-] as const;
+];
+
+/** A workload of the stack's a workspace's data goes through, or might: its name, its kind, and a port it takes connections on. */
+interface Store {
+  readonly name: string;
+  readonly kind: "StatefulSet" | "Deployment";
+  readonly port: number;
+}
+
+/** What a session must not reach: every store, and the object store's masters, which its writes go through to none of. */
+const UNREACHED: readonly Store[] = [...STORES, { name: MASTER, kind: "StatefulSet", port: 9333 }];
 
 /** A pod of the store `store`'s that runs now. */
-const podOfStore = async ({ name, kind }: (typeof STORES)[number]) => (kind === "Deployment" ? kube.runningPod(NAMESPACE, name) : `${name}-0`);
+const podOfStore = async ({ name, kind }: Store) => (kind === "Deployment" ? kube.runningPod(NAMESPACE, name) : `${name}-0`);
 
 /** Where the suite works in a session's workspace, and the files it writes first and expects everywhere after. */
 const WORKDIR = "/workspace/juicefs-e2e";
@@ -397,7 +407,7 @@ export function workspaceStorage(): void {
 
     test("a session reaches neither Valkey nor any part of the object store, and holds none of their credentials", async () => {
       const addresses: (readonly [string, number])[] = [];
-      for (const store of STORES) {
+      for (const store of UNREACHED) {
         const service = await kube.get<V1Service>(ref("Service", store.name, NAMESPACE));
         const pod = await kube.get<V1Pod>(ref("Pod", await podOfStore(store), NAMESPACE));
         assert.ok(pod?.status?.podIP, `${store.name} has no address`);
@@ -406,6 +416,8 @@ export function workspaceStorage(): void {
       }
       const secrets = await Promise.all([
         kube.secret(NAMESPACE, VALKEY, "password"),
+        kube.secret(NAMESPACE, FILER_STORE_USERS.filer.secret, "password"),
+        kube.secret(NAMESPACE, FILER_STORE_USERS.collector.secret, "password"),
         kube.secret(NAMESPACE, WORKSPACES_CREDENTIALS, "metaurl"),
         kube.secret(NAMESPACE, WORKSPACES_CREDENTIALS, "access-key"),
         kube.secret(NAMESPACE, WORKSPACES_CREDENTIALS, "secret-key"),
@@ -506,10 +518,11 @@ export function workspaceStorage(): void {
         const name = await podOfStore(store);
         const killed = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
         await kube.kill(NAMESPACE, name);
-        // A StatefulSet's under its name, a Deployment's under another.
-        await until(`${name} made anew`, async () => {
-          const now = await kube.get<V1Pod>(ref("Pod", store.kind === "Deployment" ? await podOfStore(store).catch(() => name) : name, NAMESPACE));
-          return now && now.metadata?.uid !== killed?.metadata?.uid ? true : undefined;
+        // The killed pod is gone: a StatefulSet's made anew under its name, a Deployment's for another, of a name of its own.
+        await until(`${name} gone`, async () => {
+          const now = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
+          const replaced = store.kind === "Deployment" ? now === null : now !== null && now.metadata?.uid !== killed?.metadata?.uid;
+          return replaced ? true : undefined;
         });
         await kube.awaitReady([ref(store.kind, store.name, NAMESPACE)], "10 minutes");
         const written = (await writing).trim().split("\n").filter(Boolean);
