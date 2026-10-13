@@ -188,21 +188,21 @@ export function claimSpec(storage: InstallConfig["neon"]["pageserver"]["storage"
   };
 }
 
-/** The Secret alasio reads its database URL and the lake role's password from. */
+/** The Secret alasio reads its database URL and the lake role's verifier from. */
 export function databaseSecret(config: InstallConfig): string {
   return config.neon.enabled ? `${RELEASE}-database` : config.neon.external.existingSecret;
 }
 
 /**
- * The passwords of the roles alasio makes in its Neon for what reads it beside alasio,
- * given while that runs: the lake's query endpoint's, and Grafana's. Each by its key in
- * the database Secret, which the stack's setup writes it in, and the variable that names
- * its file to alasio (src/neon/connect.ts).
+ * The verifiers of the passwords of the roles alasio makes in its Neon for what reads it
+ * beside alasio, given while that runs: the lake's query endpoint's, and Grafana's. Each
+ * by its key in the database Secret, which the stack's setup writes it in, and the
+ * variable that names its file to alasio (src/neon/connect.ts).
  */
-export function rolePasswords(config: InstallConfig): { readonly key: string; readonly variable: string }[] {
+export function roleVerifiers(config: InstallConfig): { readonly key: string; readonly variable: string }[] {
   return [
-    ...(lakeRuns(config) ? [{ key: "lake-reader-password", variable: "ALASIO_LAKE_READER_PASSWORD_FILE" }] : []),
-    ...(grafanaRuns(config) ? [{ key: "grafana-password", variable: "ALASIO_GRAFANA_PASSWORD_FILE" }] : []),
+    ...(lakeRuns(config) ? [{ key: "lake-reader-verifier", variable: "ALASIO_LAKE_READER_VERIFIER_FILE" }] : []),
+    ...(grafanaRuns(config) ? [{ key: "grafana-verifier", variable: "ALASIO_GRAFANA_VERIFIER_FILE" }] : []),
   ];
 }
 

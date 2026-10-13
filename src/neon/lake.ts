@@ -4,14 +4,14 @@
  *
  * The role is made here, by alasio, rather than in the compute's spec: Neon makes every
  * role in the spec a member of neon_superuser, which may read and write every table,
- * where the lake's should read what it loads and nothing else. The role, its password,
+ * where the lake's should read what it loads and nothing else. The role, its verifier,
  * and its database exist whether or not the lake runs, so turning the lake on or off
  * restarts nothing but the lake; it may read alasio's data only while it runs.
  */
 import { Config } from "effect";
-import type { Pool } from "pg";
+import { escapeLiteral, type Pool } from "pg";
 
-import { scramVerifier } from "../../neon/control/scram.ts";
+import { LAKE_READER_ROLE, LAKE_ROLE } from "../../neon/control/secrets.ts";
 
 /** Whether the lake runs: `ALASIO_LAKE_ENABLED=1`. Off unless set. */
 export const lakeEnabled: Config.Config<boolean> = Config.String("ALASIO_LAKE_ENABLED").pipe(
@@ -19,11 +19,8 @@ export const lakeEnabled: Config.Config<boolean> = Config.String("ALASIO_LAKE_EN
   Config.withDefault(false),
 );
 
-/** The role the lake connects as, and the database its catalog is kept in. */
-export const LAKE_ROLE = "lake";
+/** The database the lake's catalog is kept in. */
 const LAKE_DATABASE = "lake";
-/** The role the lake's query endpoint reads it as (neon/lake/src/reader.ts). */
-export const LAKE_READER_ROLE = "lake_reader";
 
 /** What the lake reads: the schemas and tables it loads from, as alasio's stores make them. */
 const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
@@ -33,15 +30,15 @@ const LAKE_SOURCES: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
- * Makes the lake's role, a login that is a member of no other role, with `password`
- * (stored as a SCRAM verifier, never in the clear), and its catalog's database, which
- * only the lake may connect to, make its catalog's schema in, and stage DuckLake's
- * updates in temporary tables in. Idempotent.
+ * Makes the lake's role, a login that is a member of no other role, its password stored
+ * as `verifier`, the one the deployment gives (neon/control/scram.ts), and its catalog's
+ * database, which only the lake may connect to, make its catalog's schema in, and stage
+ * DuckLake's updates in temporary tables in. Idempotent.
  */
-export async function ensureLakeRole(pool: Pool, password: string): Promise<void> {
+export async function ensureLakeRole(pool: Pool, verifier: string): Promise<void> {
   const role = await pool.query("select 1 from pg_roles where rolname = $1", [LAKE_ROLE]);
   if (role.rows.length === 0) await pool.query(`create role ${LAKE_ROLE} login`);
-  await pool.query(`alter role ${LAKE_ROLE} with login password '${scramVerifier(password)}'`);
+  await pool.query(`alter role ${LAKE_ROLE} with login password ${escapeLiteral(verifier)}`);
   const database = await pool.query("select 1 from pg_database where datname = $1", [LAKE_DATABASE]);
   if (database.rows.length === 0) await pool.query(`create database ${LAKE_DATABASE}`);
   await pool.query(`revoke all on database ${LAKE_DATABASE} from public`);
@@ -49,15 +46,15 @@ export async function ensureLakeRole(pool: Pool, password: string): Promise<void
 }
 
 /**
- * Makes the lake's reader's role, a login that is a member of no other role, with
- * `password`, which may connect to the catalog's database and nothing more: the lake's
- * role, which owns the catalog, lets it read that (neon/lake/src/reader.ts's
+ * Makes the lake's reader's role, a login that is a member of no other role, its password
+ * stored as `verifier`, which may connect to the catalog's database and nothing more:
+ * the lake's role, which owns the catalog, lets it read that (neon/lake/src/reader.ts's
  * grantReads). Idempotent; after ensureLakeRole, which makes the database.
  */
-export async function ensureLakeReaderRole(pool: Pool, password: string): Promise<void> {
+export async function ensureLakeReaderRole(pool: Pool, verifier: string): Promise<void> {
   const role = await pool.query("select 1 from pg_roles where rolname = $1", [LAKE_READER_ROLE]);
   if (role.rows.length === 0) await pool.query(`create role ${LAKE_READER_ROLE} login`);
-  await pool.query(`alter role ${LAKE_READER_ROLE} with login password '${scramVerifier(password)}'`);
+  await pool.query(`alter role ${LAKE_READER_ROLE} with login password ${escapeLiteral(verifier)}`);
   await pool.query(`grant connect on database ${LAKE_DATABASE} to ${LAKE_READER_ROLE}`);
 }
 

@@ -44,7 +44,7 @@ import {
   replicasOf,
   restrictedContainer,
   restrictedPod,
-  rolePasswords,
+  roleVerifiers,
   selectorLabels,
   sha256,
 } from "./common.ts";
@@ -252,11 +252,11 @@ export function forksForBranches(config: InstallConfig): boolean {
 
 /**
  * The roles main's alasio makes for what reads its Neon beside it (common.ts
- * rolePasswords); a branch environment's makes none, as it has none of them, and is given
- * none of their passwords.
+ * roleVerifiers); a branch environment's makes none, as it has none of them, and is given
+ * none of their verifiers.
  */
-function readerRoles(config: InstallConfig, { branch }: Environment): ReturnType<typeof rolePasswords> {
-  return branch === null ? rolePasswords(config) : [];
+function readerRoles(config: InstallConfig, { branch }: Environment): ReturnType<typeof roleVerifiers> {
+  return branch === null ? roleVerifiers(config) : [];
 }
 
 /** alasio's environment: where its templates, state, database and receiver are, and what the configuration adds. */
@@ -274,7 +274,7 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "token" } } },
     { name: "TELEGRAM_ALLOWED_USER_IDS", valueFrom: { secretKeyRef: { name: alasio.telegram.existingSecret, key: "allowedUserIds" } } },
     { name: "ALASIO_DATABASE_URL_FILE", value: "/run/alasio/database/url" },
-    { name: "ALASIO_LAKE_PASSWORD_FILE", value: "/run/alasio/database/lake-password" },
+    { name: "ALASIO_LAKE_VERIFIER_FILE", value: "/run/alasio/database/lake-verifier" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
     { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
@@ -356,7 +356,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
               name: "database",
               secret: {
                 secretName: databaseSecret(config),
-                items: ["url", "lake-password", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
+                items: ["url", "lake-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
             ...branchSecret,

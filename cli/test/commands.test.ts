@@ -1019,6 +1019,12 @@ function stackSecret(kube: FakeKube, name: string, data: Record<string, string>)
   kube.put("secrets", { apiVersion: "v1", kind: "Secret", metadata: { name, namespace: "alasio" }, data: Object.fromEntries(Object.entries(data).map(([key, value]) => [key, Buffer.from(value).toString("base64")])) });
 }
 
+/** Whether `verifier` is a SCRAM verifier of `password`, made with its own salt. */
+function verifies(verifier: string | undefined, password: string): boolean {
+  const salt = /^SCRAM-SHA-256\$4096:([^$]+)\$/u.exec(verifier ?? "")?.[1];
+  return salt !== undefined && scramVerifier(password, Buffer.from(salt, "base64")) === verifier;
+}
+
 /**
  * alasio installed, with the Secrets its stack's setup makes, and neon-control and the
  * computes answering in their pods as they do: neon-control's API through curl, the
@@ -1029,9 +1035,9 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
   stackSecret(setup.kube, "alasio-database", {
     url: "postgresql://alasio:p@alasio-neon-compute:55433/alasio",
     password: "p",
-    "lake-password": "l",
-    "lake-reader-password": "r",
-    "grafana-password": "g",
+    "lake-verifier": "SCRAM-SHA-256$l",
+    "lake-reader-verifier": "SCRAM-SHA-256$r",
+    "grafana-verifier": "SCRAM-SHA-256$g",
   });
   stackSecret(setup.kube, "alasio-lake", {
     LAKE_DATABASE_PASSWORD: "l",
@@ -1121,20 +1127,19 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   const url = new URL(secretIn(kube, "alasio-branch-try", "alasio-database", "url") ?? "");
   assert.deepEqual([url.username, url.host, url.pathname], ["alasio", "alasio-neon-compute:55433", "/alasio"]);
   assert.notEqual(url.password, "p");
-  const [, iterations, salt] = /^SCRAM-SHA-256\$(\d+):([^$]+)\$/u.exec(compute?.passwordVerifier ?? "") ?? [];
-  assert.equal(iterations, "4096");
-  assert.equal(compute?.passwordVerifier, scramVerifier(decodeURIComponent(url.password), Buffer.from(salt ?? "", "base64")));
+  assert.ok(verifies(compute?.passwordVerifier, decodeURIComponent(url.password)));
   // Its compute's own token, whose hash alone neon-control is given; its lake's role's own password.
   const computeToken = secretIn(kube, "alasio-branch-try", "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN") ?? "";
   assert.notEqual(computeToken, "c");
   assert.equal(compute?.tokenSha256, tokenSha256(computeToken));
   const lakePassword = secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_DATABASE_PASSWORD");
   assert.notEqual(lakePassword, "l");
-  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-password"), lakePassword);
+  // Its lake's role's verifier, which its alasio sets the role to.
+  assert.ok(verifies(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-verifier"), lakePassword ?? ""));
   // Of main's, only the lake's object store identity, which reads main's files where they are.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
   const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();
-  assert.deepEqual(keys("alasio-database"), ["lake-password", "url"]);
+  assert.deepEqual(keys("alasio-database"), ["lake-verifier", "url"]);
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));

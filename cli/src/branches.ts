@@ -27,6 +27,7 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 
 import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
+import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
@@ -240,11 +241,13 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
   const credentials = { alasio: own(), lake: own(), compute: own() };
+  // Their verifiers, each made once and given to whatever sets the role.
+  const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake) };
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
   const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
   const secrets = [
-    branchSecret(name, componentName("database"), { url: url.toString(), "lake-password": credentials.lake }),
+    branchSecret(name, componentName("database"), { url: url.toString(), "lake-verifier": verifiers[LAKE_ROLE] }),
     branchSecret(name, neonName("compute"), { NEON_CONTROL_PLANE_TOKEN: credentials.compute }),
     // The lake service's: main's object store identity, the one thing of main's a branch is given (see the module), and its role's password.
     ...(lake ? [{ ...lake, data: { ...lake.data, LAKE_DATABASE_PASSWORD: Buffer.from(credentials.lake, "utf8").toString("base64") } }] : []),
@@ -260,7 +263,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const made = yield* neonControl<BranchView>("POST", "/branches", {
     name,
     lsn,
-    compute: { passwordVerifier: scramVerifier(credentials.alasio), tokenSha256: tokenSha256(credentials.compute) },
+    compute: { passwordVerifier: verifiers[ROLE], tokenSha256: tokenSha256(credentials.compute) },
   });
   if (made.status !== 201 && made.status !== 200) return yield* new BranchRefused({ message: `neon-control did not make the branch ${name}: ${refusalOf(made)}` });
 

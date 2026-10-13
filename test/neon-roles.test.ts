@@ -11,6 +11,7 @@ import { ConfigProvider, Effect } from "effect";
 import pg from "pg";
 
 import { Neon } from "../src/neon/connect.ts";
+import { isScramVerifier, scramVerifier } from "../neon/control/scram.ts";
 import { ensureGrafanaRole } from "../src/neon/grafana.ts";
 import { startPostgres } from "./support/postgres.ts";
 
@@ -27,7 +28,21 @@ async function run(url: string, ...statements: string[]): Promise<Record<string,
   }
 }
 
-test("alasio makes the lake reader's role and Grafana's, with Grafana's database, when given their passwords, and each may do what it is for alone", async () => {
+/** Each role's verifier, as the deployment gives it: made once, its salt at random. */
+const verifiers = { grafana: scramVerifier("grafana-password"), lake: scramVerifier("lake-password"), lake_reader: scramVerifier("reader-password") };
+
+test("a role's verifier is salted at random, so two of one password differ", () => {
+  assert.notEqual(scramVerifier("p"), scramVerifier("p"));
+  assert.match(scramVerifier("p"), /^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]{24}\$[A-Za-z0-9+/=]{44}:[A-Za-z0-9+/=]{44}$/u);
+});
+
+test("a verifier is one whole, and nothing more: its prefix alone, or one with more after it, is none", () => {
+  const verifier = scramVerifier("p");
+  assert.ok(isScramVerifier(verifier));
+  for (const text of ["SCRAM-SHA-256$p", `${verifier}'`, `${verifier}\n`, verifier.replace(":", "x"), "md5" + "0".repeat(32)]) assert.ok(!isScramVerifier(text), text);
+});
+
+test("alasio makes the lake reader's role and Grafana's, with Grafana's database, when given their verifiers, and each may do what it is for alone", async () => {
   const database = await startPostgres();
   /** `database`'s server, as `user`, in the database `name`. */
   const as = (user: string, password: string, name: string) => {
@@ -39,16 +54,16 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     await run(database.url, "create role alasio login password 'alasio-password' createrole createdb", "create database alasio owner alasio");
     const env = {
       ALASIO_DATABASE_URL: as("alasio", "alasio-password", "alasio"),
-      ALASIO_LAKE_PASSWORD: "lake-password",
-      ALASIO_LAKE_READER_PASSWORD: "reader-password",
-      ALASIO_GRAFANA_PASSWORD: "grafana-password",
+      ALASIO_LAKE_VERIFIER: verifiers.lake,
+      ALASIO_LAKE_READER_VERIFIER: verifiers.lake_reader,
+      ALASIO_GRAFANA_VERIFIER: verifiers.grafana,
     };
     // Grafana may not log in until all it needs is made: here its schema cannot be granted, the database's server not reached.
     const alasio = new pg.Pool({ connectionString: env.ALASIO_DATABASE_URL });
     try {
       const unreached = new URL(env.ALASIO_DATABASE_URL);
       unreached.port = "1";
-      await assert.rejects(ensureGrafanaRole(alasio, unreached.toString(), "grafana-password"), /ECONNREFUSED/u);
+      await assert.rejects(ensureGrafanaRole(alasio, unreached.toString(), verifiers.grafana), /ECONNREFUSED/u);
     } finally {
       await alasio.end();
     }
@@ -69,6 +84,13 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     );
     assert.deepEqual(roles, [], "neither is a member of another role");
     assert.deepEqual(privileges, [{ public_connects: false, reader_connects: false, reader_reads_lake: true }]);
+    // Each stored as the verifier given, to the byte.
+    const [stored] = await run(database.url, "select rolname, rolpassword from pg_authid where rolname in ('lake', 'lake_reader', 'grafana') order by rolname");
+    assert.deepEqual(stored, [
+      { rolname: "grafana", rolpassword: verifiers.grafana },
+      { rolname: "lake", rolpassword: verifiers.lake },
+      { rolname: "lake_reader", rolpassword: verifiers.lake_reader },
+    ]);
   } finally {
     await database.stop();
   }

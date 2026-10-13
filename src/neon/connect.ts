@@ -5,14 +5,16 @@
  * It makes the analytics lake's role and catalog database either way (./lake.ts), and
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it
  * revokes them. It makes the lake reader's role (./lake.ts) and Grafana's role and
- * database (./grafana.ts) when the deployment gives their passwords, as it does while
- * they run.
+ * database (./grafana.ts) when the deployment gives their verifiers, as it does while
+ * they run. It sets each role's password to the SCRAM verifier the deployment gives, made
+ * once where the password is, and never sees a password.
  */
 import { readFileSync } from "node:fs";
 
 import { Config, Context, Effect, FiberSet, Option, Redacted, Schedule, Schema, type Scope } from "effect";
 import pg, { type Pool } from "pg";
 
+import { isScramVerifier } from "../../neon/control/scram.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../codex/rollouts/store.ts";
 import { NeonSessionStore } from "../harness/claude/session-store.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -40,15 +42,15 @@ export class NeonSettingError extends Schema.TaggedError<NeonSettingError>()("Ne
   }
 }
 
-/** How to reach a deployment's Neon, whether the lake runs, and the passwords of the roles alasio makes there. */
+/** How to reach a deployment's Neon, whether the lake runs, and the verifiers of the passwords of the roles alasio makes there. */
 interface NeonAccess {
   readonly databaseUrl: Redacted.Redacted;
-  readonly lakePassword: Redacted.Redacted;
+  readonly lakeVerifier: Redacted.Redacted;
   readonly lake: boolean;
   /** The lake's reader's, given while the lake runs. */
-  readonly lakeReaderPassword: Option.Option<Redacted.Redacted>;
+  readonly lakeReaderVerifier: Option.Option<Redacted.Redacted>;
   /** Grafana's, given while Grafana runs. */
-  readonly grafanaPassword: Option.Option<Redacted.Redacted>;
+  readonly grafanaVerifier: Option.Option<Redacted.Redacted>;
 }
 
 /** alasio's stores in an open Neon, on the pool they share. */
@@ -96,6 +98,15 @@ const givenSecret = Effect.fnUntraced(function*(key: string): Effect.fn.Return<O
 const deploymentSecret = (key: string): Effect.Effect<Redacted.Redacted, NeonSettingError | Config.ConfigError> =>
   Effect.flatMap(givenSecret(key), Option.match({ onNone: () => Effect.fail(new NeonSettingError({ key })), onSome: Effect.succeed }));
 
+/** `secret`, given as `key`, if it is a role's SCRAM verifier, as alasio sets a role's password to; a NeonSettingError if it is not. */
+const verifier = (key: string) => (secret: Redacted.Redacted): Effect.Effect<Redacted.Redacted, NeonSettingError> =>
+  isScramVerifier(Redacted.value(secret))
+    ? Effect.succeed(secret)
+    : Effect.fail(new NeonSettingError({ key, cause: new Error(`${key} must be a SCRAM-SHA-256 verifier, as Postgres stores one, not a password`) }));
+
+/** A role's verifier the deployment gives, if it gives one, as givenSecret reads it, checked to be one. */
+const givenVerifier = (key: string) => Effect.flatMap(givenSecret(key), Option.match({ onNone: () => Effect.succeedNone, onSome: (secret) => Effect.asSome(verifier(key)(secret)) }));
+
 /** A promise on Neon, its rejection a NeonUnavailable. */
 const onNeon = <A>(query: () => Promise<A>): Effect.Effect<A, NeonUnavailable> =>
   Effect.tryPromise({ try: query, catch: (cause) => new NeonUnavailable({ cause }) });
@@ -106,12 +117,12 @@ const endPool = (pool: Pool): Effect.Effect<void> => onNeon(() => pool.end()).pi
 /**
  * Connects to a Neon that is already up and makes what alasio keeps in it: the session
  * and rollout stores' schemas, the lake's role and reads, and the lake reader's and
- * Grafana's roles when their passwords are given. A pool that cannot is ended: before
+ * Grafana's roles when their verifiers are given. A pool that cannot is ended: before
  * the next attempt when this one fails, and in the background when a stop ends the
  * wait, which does not wait for it.
  */
 const openNeon = Effect.fnUntraced(function*(
-  { databaseUrl, lakePassword, lake, lakeReaderPassword, grafanaPassword }: NeonAccess,
+  { databaseUrl, lakeVerifier, lake, lakeReaderVerifier, grafanaVerifier }: NeonAccess,
   onIdleError: (error: Error) => void,
 ): Effect.fn.Return<OpenNeon, NeonUnavailable> {
   const pool = new pg.Pool({
@@ -128,10 +139,10 @@ const openNeon = Effect.fnUntraced(function*(
   yield* onNeon(async () => {
     await sessionStore.ensureSchema();
     await rollouts.ensureSchema();
-    await ensureLakeRole(pool, Redacted.value(lakePassword));
+    await ensureLakeRole(pool, Redacted.value(lakeVerifier));
     await syncLakeReads(pool, lake);
-    if (Option.isSome(lakeReaderPassword)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderPassword.value));
-    if (Option.isSome(grafanaPassword)) await ensureGrafanaRole(pool, Redacted.value(databaseUrl), Redacted.value(grafanaPassword.value));
+    if (Option.isSome(lakeReaderVerifier)) await ensureLakeReaderRole(pool, Redacted.value(lakeReaderVerifier.value));
+    if (Option.isSome(grafanaVerifier)) await ensureGrafanaRole(pool, Redacted.value(databaseUrl), Redacted.value(grafanaVerifier.value));
   }).pipe(
     Effect.tapError(() => endPool(pool)),
     Effect.onInterrupt(() => Effect.forkDetach(endPool(pool))),
@@ -152,23 +163,23 @@ const whileNeonStarts = Schedule.max([Schedule.spaced(CONNECT_RETRY), Schedule.d
 
 /**
  * Connects to the Neon the deployment provides, from `ALASIO_DATABASE_URL` and
- * `ALASIO_LAKE_PASSWORD`, and `ALASIO_LAKE_READER_PASSWORD` and `ALASIO_GRAFANA_PASSWORD`
+ * `ALASIO_LAKE_VERIFIER`, and `ALASIO_LAKE_READER_VERIFIER` and `ALASIO_GRAFANA_VERIFIER`
  * if given, or their `_FILE` forms, until the scope closes. The stack starts
  * beside alasio, so it is waited for, up to ten minutes, retrying while it does not
  * answer; a stop meanwhile stops the wait.
  */
 const connectNeon: Effect.Effect<ConnectedNeon, NeonError, Scope.Scope> = Effect.gen(function*() {
   const databaseUrl = yield* deploymentSecret("ALASIO_DATABASE_URL");
-  const lakePassword = yield* deploymentSecret("ALASIO_LAKE_PASSWORD");
+  const lakeVerifier = yield* Effect.flatMap(deploymentSecret("ALASIO_LAKE_VERIFIER"), verifier("ALASIO_LAKE_VERIFIER"));
   const lake = yield* lakeEnabled;
-  const lakeReaderPassword = yield* givenSecret("ALASIO_LAKE_READER_PASSWORD");
-  const grafanaPassword = yield* givenSecret("ALASIO_GRAFANA_PASSWORD");
+  const lakeReaderVerifier = yield* givenVerifier("ALASIO_LAKE_READER_VERIFIER");
+  const grafanaVerifier = yield* givenVerifier("ALASIO_GRAFANA_VERIFIER");
   const runFork = yield* FiberSet.makeRuntime();
   const onIdleError = (error: Error): void => {
     runFork(Effect.logWarning(`idle database connection lost: ${error.message}`));
   };
   const { pool, sessionStore, rollouts } = yield* Effect.acquireRelease(
-    openNeon({ databaseUrl, lakePassword, lake, lakeReaderPassword, grafanaPassword }, onIdleError).pipe(
+    openNeon({ databaseUrl, lakeVerifier, lake, lakeReaderVerifier, grafanaVerifier }, onIdleError).pipe(
       Effect.retry(whileNeonStarts),
       withAlasioSpan("alasio.neon.connect", { attributes: { "alasio.neon.lake": lake } }),
       Effect.interruptible,

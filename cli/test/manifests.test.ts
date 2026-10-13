@@ -514,8 +514,8 @@ describe("neon", () => {
   });
 });
 
-/** The variables that name the files of the passwords alasio is given, and the files. */
-const passwordFiles = (workload: V1Deployment) => container(workload).env?.filter(({ name }) => name.endsWith("_PASSWORD_FILE")).map(({ name, value }) => [name, value]);
+/** The variables that name the files of the verifiers alasio is given, and the files. */
+const verifierFiles = (workload: V1Deployment) => container(workload).env?.filter(({ name }) => name.endsWith("_VERIFIER_FILE")).map(({ name, value }) => [name, value]);
 
 describe("the lake's query endpoint", () => {
   test("reads the lake through its query endpoint, a container of the lake's pod with the reader's credentials alone", () => {
@@ -531,13 +531,13 @@ describe("the lake's query endpoint", () => {
 
   test("has alasio make the lake reader's role while the lake runs", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
-    assert.deepEqual(passwordFiles(alasio({}))?.slice(0, 2), [
-      ["ALASIO_LAKE_PASSWORD_FILE", "/run/alasio/database/lake-password"],
-      ["ALASIO_LAKE_READER_PASSWORD_FILE", "/run/alasio/database/lake-reader-password"],
+    assert.deepEqual(verifierFiles(alasio({}))?.slice(0, 2), [
+      ["ALASIO_LAKE_VERIFIER_FILE", "/run/alasio/database/lake-verifier"],
+      ["ALASIO_LAKE_READER_VERIFIER_FILE", "/run/alasio/database/lake-reader-verifier"],
     ]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-password", "lake-reader-password"]);
-    assert.deepEqual(passwordFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_PASSWORD_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-verifier", "lake-reader-verifier"]);
+    assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE"]);
   });
 });
 
@@ -1000,10 +1000,10 @@ describe("Grafana", () => {
 
   test("has alasio make Grafana's role while Grafana runs", () => {
     const alasio = (file: Record<string, unknown>) => one<V1Deployment>(install(file), "Deployment", "alasio");
-    assert.deepEqual(passwordFiles(alasio({}))?.at(-1), ["ALASIO_GRAFANA_PASSWORD_FILE", "/run/alasio/database/grafana-password"]);
+    assert.deepEqual(verifierFiles(alasio({}))?.at(-1), ["ALASIO_GRAFANA_VERIFIER_FILE", "/run/alasio/database/grafana-verifier"]);
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
-    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-password", "lake-reader-password", "grafana-password"]);
-    assert.deepEqual(passwordFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_PASSWORD_FILE", "ALASIO_LAKE_READER_PASSWORD_FILE"]);
+    assert.deepEqual(database?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier", "lake-reader-verifier", "grafana-verifier"]);
+    assert.deepEqual(verifierFiles(alasio({ grafana: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE", "ALASIO_LAKE_READER_VERIFIER_FILE"]);
   });
 });
 
@@ -1705,9 +1705,9 @@ describe("branch environments", () => {
     assert.equal(variable(alasio, "ALASIO_TELEMETRY_RECEIVER_SERVICE"), "alasio-telemetry.alasio-branch-try.svc");
     assert.equal(variable(alasio, "ALASIO_BRANCH_FORK_KEY_FILE"), undefined);
     // It makes no role for what reads main's Neon beside it, which a branch has none of.
-    assert.equal(variable(alasio, "ALASIO_LAKE_READER_PASSWORD_FILE"), undefined);
-    assert.equal(variable(alasio, "ALASIO_GRAFANA_PASSWORD_FILE"), undefined);
-    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-password"]);
+    assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
+    assert.equal(variable(alasio, "ALASIO_GRAFANA_VERIFIER_FILE"), undefined);
+    assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier"]);
     for (const workload of all<V1Deployment>(branch, "Deployment")) {
       assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);
     }

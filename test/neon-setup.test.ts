@@ -5,7 +5,14 @@ import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
 
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
+import { scramVerifier } from "../neon/control/scram.ts";
 import type { SeaweedS3Config, StackSecrets, StoredSecrets } from "../neon/control/secrets.ts";
+
+/** Whether `verifier` is a SCRAM verifier of `password`, made with its own salt. */
+function verifies(verifier: string | undefined, password: string | undefined): boolean {
+  const salt = /^SCRAM-SHA-256\$4096:([^$]+)\$/u.exec(verifier ?? "")?.[1];
+  return salt !== undefined && password !== undefined && scramVerifier(password, Buffer.from(salt, "base64")) === verifier;
+}
 
 const ENV = {
   NAMESPACE: "alasio",
@@ -122,10 +129,19 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
   assert.equal(value(kube, names.lake, "LAKE_READER_S3_KEY"), root.s3.lakeReader.accessKey);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "lakeReader")?.actions, ["Read:lake", "List:lake"]);
-  assert.equal(value(kube, names.database, "lake-reader-password"), root.lakeReaderPassword);
+  // alasio sets each role it makes to the verifier made once with its password.
+  for (const [key, role, password] of [["lake-verifier", "lake", root.lakePassword], ["lake-reader-verifier", "lake_reader", root.lakeReaderPassword], ["grafana-verifier", "grafana", root.grafanaPassword]] as const) {
+    const verifier = value(kube, names.database, key);
+    assert.equal(verifier, root.verifiers?.[role], key);
+    assert.ok(verifies(verifier, password), key);
+  }
+  assert.ok(verifies(root.verifiers?.alasio, root.alasioPassword));
+  // Each salted at random.
+  assert.equal(new Set(Object.values(root.verifiers ?? {}).map((verifier) => verifier.split("$")[1])).size, 4);
   assert.equal(value(kube, names.grafana, "LAKE_QUERY_TOKEN"), value(kube, names.lake, "LAKE_QUERY_TOKEN"));
-  // alasio makes Grafana's role with the password Grafana connects with.
-  assert.equal(value(kube, names.grafana, "GF_DATABASE_PASSWORD"), value(kube, names.database, "grafana-password"));
+  // Grafana's password, which its database's URL takes as it is.
+  assert.equal(value(kube, names.grafana, "GF_DATABASE_PASSWORD"), root.grafanaPassword);
+  assert.match(value(kube, names.grafana, "GF_DATABASE_PASSWORD"), /^[\w-]{32}$/u);
   assert.match(value(kube, names.grafana, "GF_SECURITY_ADMIN_PASSWORD"), /^[\w-]{32}$/u);
   assert.equal(value(kube, names.grafana, "GF_SECURITY_SECRET_KEY"), root.grafanaSecretKey);
 
@@ -163,6 +179,7 @@ test("a root predating a secret gains it without losing the rest", async () => {
   const names = secretNames("q");
   const root: StoredSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   delete root.computeControlToken;
+  delete root.verifiers?.lake;
   const current = kube.secrets.get(names.root);
   assert.ok(current?.data);
   current.data["secrets.json"] = Buffer.from(JSON.stringify(root)).toString("base64");
@@ -170,6 +187,9 @@ test("a root predating a secret gains it without losing the rest", async () => {
   const completed: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   assert.equal(completed.alasioPassword, root.alasioPassword);
   assert.match(completed.computeControlToken, /^[\w-]{32}$/u);
+  // A verifier missing is made of the password kept; those there are kept.
+  assert.equal(completed.verifiers.alasio, root.verifiers?.alasio);
+  assert.ok(verifies(completed.verifiers.lake, root.lakePassword));
 });
 
 /** Secrets as the root holds them, every S3 identity's credentials `s3`. */
@@ -192,6 +212,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreFilerPassword: "p",
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
+    verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
   };
 }
 

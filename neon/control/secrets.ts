@@ -5,9 +5,22 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 
+import { scramVerifier } from "./scram.ts";
+
 export const PAGESERVER_ID = 1;
 export const DATABASE = "alasio";
+/** The roles of alasio's database: alasio's own, the one its spec gives every compute. */
 export const ROLE = "alasio";
+/** The analytics lake's (src/neon/lake.ts), which alasio makes. */
+export const LAKE_ROLE = "lake";
+/** The one the lake's query endpoint reads it as (src/neon/lake.ts), which alasio makes. */
+export const LAKE_READER_ROLE = "lake_reader";
+/** Grafana's (src/neon/grafana.ts), which alasio makes. */
+export const GRAFANA_ROLE = "grafana";
+
+/** The roles main's clients connect as, whose verifiers the stack keeps. */
+export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE] as const;
+export type ClientRole = (typeof CLIENT_ROLES)[number];
 
 /** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader, and workspace storage's JuiceFS. */
 export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces";
@@ -41,10 +54,18 @@ export interface StackSecrets {
   grafanaSecretKey: string;
   /** What alasio signs each branch environment's token to fork its sessions with (src/branch/names.ts). */
   branchForkKey: string;
+  /**
+   * The SCRAM verifier (./scram.ts) of each of CLIENT_ROLES' passwords above, made once:
+   * the one main's compute stores, alasio's by its spec, the others' by alasio.
+   */
+  verifiers: Record<ClientRole, string>;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
-export type StoredSecrets = Partial<Omit<StackSecrets, "s3">> & { s3?: Partial<Record<S3Identity, S3Credentials>> };
+export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "verifiers">> & {
+  s3?: Partial<Record<S3Identity, S3Credentials>>;
+  verifiers?: Partial<Record<ClientRole, string>>;
+};
 
 /** Where Neon keeps its files: an S3 bucket at an endpoint. */
 export interface RemoteStorageLocation {
@@ -105,6 +126,13 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
   };
   // A secret already held keeps its place; one made is added after them, in this order.
   const s3: Partial<Record<S3Identity, S3Credentials>> = kept(stored.s3, () => ({}));
+  const verifiers: Partial<Record<ClientRole, string>> = kept(stored.verifiers, () => ({}));
+  const passwords = {
+    alasioPassword: kept(stored.alasioPassword, () => secret()),
+    lakePassword: kept(stored.lakePassword, () => secret()),
+    lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
+    grafanaPassword: kept(stored.grafanaPassword, () => secret()),
+  };
   const secrets: StackSecrets = {
     ...stored,
     tenantId: kept(stored.tenantId, () => hexId()),
@@ -118,19 +146,27 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
     },
     controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
-    alasioPassword: kept(stored.alasioPassword, () => secret()),
-    lakePassword: kept(stored.lakePassword, () => secret()),
+    alasioPassword: passwords.alasioPassword,
+    lakePassword: passwords.lakePassword,
     computeControlToken: kept(stored.computeControlToken, () => secret()),
     valkeyPassword: kept(stored.valkeyPassword, () => secret()),
-    lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
+    lakeReaderPassword: passwords.lakeReaderPassword,
     lakeQueryToken: kept(stored.lakeQueryToken, () => secret()),
-    grafanaPassword: kept(stored.grafanaPassword, () => secret()),
+    grafanaPassword: passwords.grafanaPassword,
     grafanaAdminPassword: kept(stored.grafanaAdminPassword, () => secret()),
     grafanaSecretKey: kept(stored.grafanaSecretKey, () => secret()),
     branchForkKey: kept(stored.branchForkKey, () => secret()),
     filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
     filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
     filerStoreBackupPassword: kept(stored.filerStoreBackupPassword, () => secret()),
+    // Each of its password above, whether that was kept or made now.
+    verifiers: {
+      ...verifiers,
+      [ROLE]: kept(verifiers[ROLE], () => scramVerifier(passwords.alasioPassword)),
+      [LAKE_ROLE]: kept(verifiers[LAKE_ROLE], () => scramVerifier(passwords.lakePassword)),
+      [LAKE_READER_ROLE]: kept(verifiers[LAKE_READER_ROLE], () => scramVerifier(passwords.lakeReaderPassword)),
+      [GRAFANA_ROLE]: kept(verifiers[GRAFANA_ROLE], () => scramVerifier(passwords.grafanaPassword)),
+    },
   };
   return { secrets, changed };
 }

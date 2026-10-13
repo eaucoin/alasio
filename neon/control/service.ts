@@ -84,8 +84,7 @@ import {
   withoutBranch,
 } from "./branches.ts";
 import { bearsScope, publicJwks, signToken } from "./jwt.ts";
-import { scramVerifier } from "./scram.ts";
-import type { StackSecrets } from "./secrets.ts";
+import { ROLE, type StackSecrets } from "./secrets.ts";
 
 /** A call to the storage controller. */
 interface ControllerRequest {
@@ -141,7 +140,7 @@ const stack: ComputeStack = {
   tenantId: secrets.tenantId,
   pageserverHost: PAGESERVER_HOST,
   safekeepers: SAFEKEEPERS,
-  passwordVerifier: scramVerifier(secrets.alasioPassword),
+  passwordVerifier: secrets.verifiers[ROLE],
   storageAuthToken: signToken(privateKeyPem, "tenant", secrets.tenantId),
   jwks: publicJwks(publicKeyPem),
 };

@@ -15,6 +15,7 @@ import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "
 import { ConfigProvider, Effect } from "effect";
 import pg from "pg";
 
+import { LAKE_READER_ROLE, LAKE_ROLE } from "../neon/control/secrets.ts";
 import { branchesBesideMain } from "../neon/lake/src/branches.ts";
 import { syncClaude } from "../neon/lake/src/claude.ts";
 import { syncCodex } from "../neon/lake/src/codex.ts";
@@ -33,7 +34,7 @@ import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
 import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
-import { ensureLakeReaderRole, ensureLakeRole, LAKE_READER_ROLE, LAKE_ROLE, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
+import { ensureLakeReaderRole, ensureLakeRole, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
 import { startPostgres, type TestPostgres } from "./support/postgres.ts";
 
 // The lake loads alasio's Neon into DuckLake. Here its source is a throwaway Postgres

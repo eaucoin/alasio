@@ -22,6 +22,9 @@ import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
   DATABASE,
+  GRAFANA_ROLE,
+  LAKE_READER_ROLE,
+  LAKE_ROLE,
   pageserverMetadata,
   pageserverToml,
   PAGESERVER_ID,
@@ -191,9 +194,10 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     [names.database]: {
       url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${config.computeHost}:55433/${DATABASE}`,
       password: secrets.alasioPassword,
-      "lake-password": secrets.lakePassword,
-      "lake-reader-password": secrets.lakeReaderPassword,
-      "grafana-password": secrets.grafanaPassword,
+      // What alasio sets the roles it makes to: their verifiers, made once.
+      "lake-verifier": secrets.verifiers[LAKE_ROLE],
+      "lake-reader-verifier": secrets.verifiers[LAKE_READER_ROLE],
+      "grafana-verifier": secrets.verifiers[GRAFANA_ROLE],
     },
     // The lake service's, and its query endpoint's, which each read their own.
     [names.lake]: {
