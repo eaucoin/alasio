@@ -476,8 +476,10 @@ if (inShard("telemetry")) {
         // Started once its database was ready for it, on a fresh install: never restarted for want of it.
         const pod = await kube.get<V1Pod>(ref("Pod", await kube.runningPod(NAMESPACE, "alasio-grafana"), NAMESPACE));
         assert.deepEqual(pod?.status?.containerStatuses?.map(({ name, restartCount }) => [name, restartCount]), [["grafana", 0]]);
-        const backOffs = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE })).filter(({ involvedObject, reason }) => involvedObject.name?.startsWith("alasio-grafana-") && reason === "BackOff");
-        assert.deepEqual(backOffs.map(({ message }) => message), []);
+        // A restart's back-off, that is: an image's pull's is the registry's, which a pod's first pull can meet.
+        const restarts = (await kube.list<CoreV1Event>("Event", { namespace: NAMESPACE }))
+          .filter(({ involvedObject, reason, message }) => involvedObject.name?.startsWith("alasio-grafana-") && reason === "BackOff" && message?.startsWith("Back-off restarting"));
+        assert.deepEqual(restarts.map(({ message }) => message), []);
         // What Grafana and the lake's query endpoint hold, as their cgroups count it.
         const memory = async (pod: string, container: string) =>
           (await kube.execOk(NAMESPACE, pod, ["cat", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.peak"], { container })).trim().split("\n").map((bytes) => `${Math.round(Number(bytes) / 1048576)} MiB`).join(", peak ");
