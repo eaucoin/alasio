@@ -30,7 +30,9 @@ import type {
   V1CronJob,
   V1Deployment,
   V1EnvVar,
+  V1Job,
   V1PersistentVolumeClaim,
+  V1PodSpec,
   V1Service,
   V1ServicePort,
   V1StatefulSet,
@@ -442,7 +444,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
             // time-travel recovery needs that), writes fsynced. One a gateway beside it has
             // made at once is found made. A bucket whose objects the volumes hold, by its
             // collection, while the filers know no such bucket, is not made anew, empty: the
-            // filer store has lost what it kept, which is restored from its backups instead,
+            // filer store has lost what it kept, which `alasio restore-filer-store` puts back instead,
             // and the gateway is not ready until it is.
             {
               name: "buckets",
@@ -461,7 +463,7 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                   `for bucket in ${made.join(" ")}; do`,
                   "  if ! listed \"$bucket\"; then",
                   "    if shell 'volume.list' | grep -q \"Collection:$bucket,\"; then",
-                  "      echo \"the store's volumes hold objects of the bucket $bucket, which its filers do not know: their store has lost what it kept; restore it from its backups rather than make $bucket anew, empty\" >&2",
+                  "      echo \"the store's volumes hold objects of the bucket $bucket, which its filers do not know: their store has lost what it kept; alasio restore-filer-store puts it back from its backups, rather than make $bucket anew, empty\" >&2",
                   "      exit 1",
                   "    fi",
                   "    shell \"s3.bucket.create -name $bucket\"",
@@ -598,7 +600,8 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
  * predecessors, of which the last `keep` are kept. On a volume of their own, outside the
  * store they copy, made, where the cluster has several nodes and another can take it, on
  * another node than the filer store's (the volume is placed by the pod that first mounts
- * it, and keeps its pods on its node from then on).
+ * it, and keeps its pods on its node from then on). `alasio restore-filer-store` puts one
+ * back (filerStoreRestore).
  */
 function filerStoreBackup(config: InstallConfig): KubernetesObject[] {
   const { filerStore } = config.objectStore.bundled;
@@ -671,6 +674,143 @@ const awayFrom = (component: string): V1WeightedPodAffinityTerm => ({
   weight: 100,
   podAffinityTerm: { labelSelector: { matchLabels: selectorLabels(component) }, topologyKey: "kubernetes.io/hostname" },
 });
+
+/** The components of filerStoreRestore's pods: the one that serves the backup, and the one that loads it. */
+export const RESTORE_COMPONENTS = { source: "seaweedfs-filer-store-restore-source", restore: "seaweedfs-filer-store-restore" };
+
+/** The Jobs, and the source's Service, of filerStoreRestore, by their names. */
+export const RESTORE_SOURCE = componentName(RESTORE_COMPONENTS.source);
+export const RESTORE = componentName(RESTORE_COMPONENTS.restore);
+export const BACKUPS_LISTING = componentName("seaweedfs-filer-store-backups-listing");
+
+/** The filer store's volume, its StatefulSet's one pod's. */
+export const FILER_STORE_CLAIM = `data-${FILER_STORE}-0`;
+
+/** What filerStoreRestore's Job prints as its last line once it has loaded the backup: `restored <keys> keys`. */
+export const RESTORED = /^restored (\d+) keys$/mu;
+
+/**
+ * A Job that lists the filer store's backups, on their volume: what it prints, each
+ * backup's file's name, one a line.
+ */
+export function backupsListing(config: InstallConfig): V1Job {
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name: BACKUPS_LISTING, namespace: NAMESPACE, labels: labels(BACKUP_COMPONENT) },
+    spec: {
+      backoffLimit: 0,
+      activeDeadlineSeconds: 600,
+      ttlSecondsAfterFinished: 3600,
+      template: {
+        metadata: { labels: labels(BACKUP_COMPONENT) },
+        spec: {
+          restartPolicy: "Never",
+          ...priority("component"),
+          ...valkeyPod(config),
+          containers: [{
+            name: "list",
+            image: imageReference(config.objectStore.bundled.filerStore.image),
+            imagePullPolicy: "IfNotPresent",
+            command: ["/bin/sh", "-c", "ls /backups | grep '^filer-store-.*\\.rdb$' || true"],
+            securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+            resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "64Mi" } },
+            volumeMounts: [{ name: "backups", mountPath: "/backups", readOnly: true }],
+          }],
+          volumes: [{ name: "backups", persistentVolumeClaim: { claimName: BACKUPS, readOnly: true } }],
+        },
+      },
+    },
+  };
+}
+
+/**
+ * The filer store put back from its backup `file`, which `alasio restore-filer-store` runs
+ * with the filer store stopped, as two Jobs, since the backups' volume and the filer
+ * store's may be on different nodes: on the backups' node, a Valkey that loads the backup
+ * and serves it, behind a Service, to the other alone (./network-policies.ts), with the
+ * backup user's password; and on the filer store's, one that takes a snapshot of it, as the
+ * backups do, onto the filer store's volume beside what is there, loads it in a Valkey of
+ * its own, checks it holds as many keys as the backup, and only then deletes what was
+ * there and writes the append-only file the filer store loads as it starts, then prints
+ * how many keys it restored (RESTORED).
+ */
+export function filerStoreRestore(config: InstallConfig, file: string): KubernetesObject[] {
+  const { filerStore } = config.objectStore.bundled;
+  const image = imageReference(filerStore.image);
+  const auth = { name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.backup.secret) };
+  const container = { image, imagePullPolicy: "IfNotPresent", securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true }, env: [auth] };
+  const job = (name: string, component: string, spec: V1PodSpec): V1Job => ({
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name, namespace: NAMESPACE, labels: labels(component) },
+    spec: {
+      backoffLimit: 0,
+      activeDeadlineSeconds: 3600,
+      template: { metadata: { labels: labels(component) }, spec: { restartPolicy: "Never", ...priority("component"), ...valkeyPod(config), ...spec } },
+    },
+  });
+  const service: V1Service = {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: RESTORE_SOURCE, namespace: NAMESPACE, labels: labels(RESTORE_COMPONENTS.source) },
+    spec: { selector: selectorLabels(RESTORE_COMPONENTS.source), ports: [{ name: "valkey", port: VALKEY_PORT }] },
+  };
+  const source = job(RESTORE_SOURCE, RESTORE_COMPONENTS.source, {
+    containers: [{
+      ...container,
+      name: "serve",
+      // Writes nothing: it neither snapshots nor appends.
+      command: ["valkey-server", "--port", String(VALKEY_PORT), "--dir", "/backups", "--dbfilename", file, "--appendonly", "no", "--save", "", "--requirepass", "$(VALKEYCLI_AUTH)"],
+      ports: [{ name: "valkey", containerPort: VALKEY_PORT }],
+      readinessProbe: { exec: { command: ["/bin/sh", "-c", "valkey-cli ping | grep -q PONG"] }, periodSeconds: 2 },
+      resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: filerStore.resources.limits["memory"] ?? "512Mi" } },
+      volumeMounts: [{ name: "backups", mountPath: "/backups", readOnly: true }],
+    }],
+    volumes: [{ name: "backups", persistentVolumeClaim: { claimName: BACKUPS, readOnly: true } }],
+  });
+  const local = `valkey-cli -p ${VALKEY_PORT + 1}`;
+  const restore = job(RESTORE, RESTORE_COMPONENTS.restore, {
+    containers: [{
+      ...container,
+      name: "restore",
+      command: [
+        "/bin/sh",
+        "-c",
+        script(
+          "set -eu",
+          `backup() { valkey-cli -h ${RESTORE_SOURCE} "$@"; }`,
+          // Waits for the backup to be loaded and served, and for its NetworkPolicy to apply, as a new pod.
+          "until backup ping 2>/dev/null | grep -q PONG; do sleep 2; done",
+          "expected=$(backup dbsize)",
+          // The backup fetched and checked beside what the volume holds, which goes only once it is.
+          "rm -f /data/restore.rdb",
+          "backup --rdb /data/restore.rdb",
+          "test -s /data/restore.rdb",
+          `valkey-server --port ${VALKEY_PORT + 1} --bind 127.0.0.1 --dir /data --dbfilename restore.rdb --appendonly no --save "" --requirepass "$VALKEYCLI_AUTH" &`,
+          "server=$!",
+          // Each wait ends with the server, should it stop.
+          `until ${local} ping 2>/dev/null | grep -q PONG; do kill -0 "$server"; sleep 1; done`,
+          `loaded=$(${local} dbsize)`,
+          '[ "$loaded" = "$expected" ] || { echo "loaded $loaded keys, and the backup has $expected" >&2; exit 1; }',
+          "rm -rf /data/appendonlydir /data/dump.rdb",
+          `${local} config set appendonly yes >/dev/null`,
+          // The rewrite that writes the append-only file from what is loaded, done, and well.
+          `until persistence=$(${local} info persistence) && echo "$persistence" | grep -q '^aof_enabled:1' && echo "$persistence" | grep -q '^aof_rewrite_in_progress:0'; do kill -0 "$server"; sleep 1; done`,
+          `${local} info persistence | grep -q '^aof_last_bgrewrite_status:ok' && [ -n "$(ls /data/appendonlydir)" ] || { echo "the append-only file could not be written" >&2; exit 1; }`,
+          `${local} shutdown`,
+          "wait",
+          "rm /data/restore.rdb",
+          'echo "restored $loaded keys"',
+        ),
+      ],
+      resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: filerStore.resources.limits["memory"] ?? "512Mi" } },
+      volumeMounts: [{ name: "data", mountPath: "/data" }],
+    }],
+    volumes: [{ name: "data", persistentVolumeClaim: { claimName: FILER_STORE_CLAIM } }],
+  });
+  return [service, source, restore];
+}
 
 /** The bundled object store's objects, when it runs, which is beside Neon. */
 export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {

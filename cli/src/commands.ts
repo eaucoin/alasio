@@ -10,6 +10,7 @@ import { lake } from "./commands/lake.ts";
 import { login } from "./commands/login.ts";
 import { logs } from "./commands/logs.ts";
 import { restart } from "./commands/restart.ts";
+import { restoreFilerStore } from "./commands/restore-filer-store.ts";
 import { status } from "./commands/status.ts";
 import { uninstall } from "./commands/uninstall.ts";
 import { up } from "./commands/up.ts";
@@ -21,6 +22,6 @@ export const alasio = Command.make("alasio").pipe(
     "Coding agents you talk to from Telegram: Claude Code and Codex, each conversation with a workspace of its own. " +
       "alasio init sets it up, alasio up starts it, in a cluster alasio makes on this machine or one a kubeconfig reaches.",
   ),
-  Command.withSubcommands([init, up, status, logs, restart, upgrade, login, lake, grafana, branch, down, uninstall, asRoot]),
+  Command.withSubcommands([init, up, status, logs, restart, upgrade, login, lake, grafana, branch, restoreFilerStore, down, uninstall, asRoot]),
   Command.withGlobalFlags([ConfigFlag]),
 );

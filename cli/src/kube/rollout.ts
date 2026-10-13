@@ -250,6 +250,10 @@ export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Eff
     options,
   );
 
+/** Waits until every Job ref has ended, complete or failed, or is gone. */
+export const awaitEnded = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
+  awaitAll(refs, (ref) => Effect.map(current(ref), (job) => (job === null || readiness(job)._tag !== "Waiting" ? READY : waiting("running"))), diagnose, options);
+
 /** Waits until every volume ref, its claim deleted, is let go of (reclamation). */
 export const awaitReclaimed = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
   awaitAll(

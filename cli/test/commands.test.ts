@@ -514,6 +514,100 @@ test("up changes no count of the object store's masters, nor lowers its volume s
   assert.equal(statefulSet("alasio-seaweedfs-volume")?.spec?.["replicas"], 1);
 });
 
+test("restore-filer-store lists the filer store's backups, and puts one back with what writes to the store stopped, alasio and Neon first, and started again as it was", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const at = (path: string) => kube.get(`/apis/${path}`);
+  const listing = "filer-store-20261013T082300Z.rdb\nfiler-store-20261013T092300Z.rdb\n";
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", listing);
+  const listed = await alasio(["restore-filer-store"]);
+  succeeded(listed);
+  assert.deepEqual(listed.printed.join("\n").split("\n"), [
+    "The filer store's backups, the newest first:",
+    "  20261013T092300Z  2026-10-13 09:23:00 UTC",
+    "  20261013T082300Z  2026-10-13 08:23:00 UTC",
+    "",
+    "alasio restore-filer-store <backup> puts one back.",
+  ]);
+  // One it does not have is refused before anything is stopped.
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", listing);
+  const before = kube.changes.length;
+  assert.equal(
+    failure(await alasio(["restore-filer-store", "20261012T092300Z", "--yes"])),
+    "the filer store has no backup 20261012T092300Z; it has 20261013T092300Z, 20261013T082300Z",
+  );
+  assert.deepEqual(kube.changes.slice(before).filter(({ path }) => !path.includes("filer-store-backups-listing")), []);
+
+  // A branch environment's alasio; the gateways scaled by KEDA, and the lake's ScaledObject paused before; the lifecycle pass suspended before; a backup of Neon's running.
+  const labels = (component: string) => ({ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component });
+  kube.put("deployments", { apiVersion: "apps/v1", kind: "Deployment", metadata: { name: "alasio", namespace: "alasio-branch-feature", labels: labels("alasio") }, spec: { replicas: 1, selector: { matchLabels: labels("alasio") } } });
+  kube.put("pods", { apiVersion: "v1", kind: "Pod", metadata: { name: "alasio-0", namespace: "alasio-branch-feature", labels: labels("alasio") }, status: { phase: "Running" } });
+  const scaler = (name: string, annotations: Record<string, string>) =>
+    kube.put("scaledobjects", { apiVersion: "keda.sh/v1alpha1", kind: "ScaledObject", metadata: { name, namespace: "alasio", labels: labels(name), annotations }, spec: { scaleTargetRef: { name } } });
+  scaler("alasio-seaweedfs", {});
+  scaler("alasio-lake", { "autoscaling.keda.sh/paused-replicas": "1" });
+  const lifecycle = at("batch/v1/namespaces/alasio/cronjobs/alasio-seaweedfs-lifecycle");
+  assert.ok(lifecycle?.spec);
+  lifecycle.spec["suspend"] = true;
+  kube.put("jobs", { apiVersion: "batch/v1", kind: "Job", metadata: { name: "alasio-neon-backup-1", namespace: "alasio", labels: labels("neon-backup") }, spec: {}, status: { active: 1 } });
+  setTimeout(() => {
+    const job = at("batch/v1/namespaces/alasio/jobs/alasio-neon-backup-1");
+    if (job) job.status = { conditions: [{ type: "Complete", status: "True" }] };
+  }, 500);
+  kube.logs.set("alasio-seaweedfs-filer-store-restore-0/restore", "restored 1234 keys\n");
+  kube.onExec = ({ pod, container }) =>
+    pod === "alasio-seaweedfs-filer-store-0" && container === "valkey"
+      ? { exitCode: 0, stdout: "# Keyspace\ndb0:keys=1234,expires=0,avg_ttl=0\n# Persistence\nloading:0\naof_enabled:1\naof_last_bgrewrite_status:ok\n" }
+      : { exitCode: 0 };
+  const start = kube.changes.length;
+  const restored = await alasio(["restore-filer-store", "20261013T092300Z", "--yes"]);
+  succeeded(restored);
+  assert.deepEqual(restored.printed, ["The filer store is as it was at 2026-10-13 09:23:00 UTC, with its 1234 keys, and alasio runs on it again."]);
+  // Stopped in order: the CronJobs, alasio, Neon and the lake, then the gateways, then the filer store, before the backup is put back.
+  const changed = kube.changes.slice(start);
+  const first = (path: string) => changed.findIndex((change) => change.path.endsWith(path));
+  const order = [
+    "/cronjobs/alasio-neon-backup",
+    "/apps/v1/namespaces/alasio-branch-feature/deployments/alasio",
+    "/statefulsets/alasio-neon-pageserver",
+    "/deployments/alasio-seaweedfs",
+    "/statefulsets/alasio-seaweedfs-filer-store",
+    "/jobs/alasio-seaweedfs-filer-store-restore",
+  ].map(first);
+  assert.ok(order.every((index, position) => index >= 0 && (position === 0 || index > (order[position - 1] ?? 0))), JSON.stringify(order));
+  // Started again as each was: the replicas, the gateways' ScaledObject unpaused, the lake's paused as before, the lifecycle pass still suspended.
+  for (const path of ["apps/v1/namespaces/alasio/deployments/alasio-seaweedfs", "apps/v1/namespaces/alasio-branch-feature/deployments/alasio", "apps/v1/namespaces/alasio/statefulsets/alasio-seaweedfs-filer-store"]) {
+    const workload = at(path);
+    assert.equal(workload?.spec?.["replicas"], 1, path);
+    assert.equal((workload?.metadata["annotations"] as Record<string, string> | undefined)?.["alasio.dev/restore-filer-store"], undefined, path);
+  }
+  const annotations = (name: string) => at(`keda.sh/v1alpha1/namespaces/alasio/scaledobjects/${name}`)?.metadata["annotations"];
+  assert.deepEqual([annotations("alasio-seaweedfs"), annotations("alasio-lake")], [{}, { "autoscaling.keda.sh/paused-replicas": "1" }]);
+  assert.deepEqual(
+    ["alasio-seaweedfs-lifecycle", "alasio-seaweedfs-filer-store-backup"].map((name) => at(`batch/v1/namespaces/alasio/cronjobs/${name}`)?.spec?.["suspend"]),
+    [true, false],
+  );
+  // Nothing of the restore is left but its NetworkPolicy, of the installation.
+  assert.deepEqual([...kube.objects.keys()].filter((path) => path.includes("filer-store-restore") && !path.includes("/networkpolicies/")), []);
+
+  // A filer store that holds other than what was restored is said, and what is stopped stays so, until the next run.
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", listing);
+  kube.logs.set("alasio-seaweedfs-filer-store-restore-0/restore", "restored 1235 keys\n");
+  assert.equal(
+    failure(await alasio(["restore-filer-store", "20261013T092300Z", "--yes"])),
+    "the filer store holds 1234 keys of the 1235 restored: everything else stays stopped; alasio restore-filer-store 20261013T092300Z again puts the backup back anew",
+  );
+  assert.equal(at("apps/v1/namespaces/alasio/deployments/alasio-seaweedfs")?.spec?.["replicas"], 0);
+  assert.deepEqual(annotations("alasio-lake"), {
+    "autoscaling.keda.sh/paused-replicas": "0",
+    "alasio.dev/restore-filer-store": '{"autoscaling.keda.sh/paused-replicas":"1","autoscaling.keda.sh/paused":null}',
+  });
+  kube.logs.set("alasio-seaweedfs-filer-store-backups-listing-0/list", listing);
+  kube.logs.set("alasio-seaweedfs-filer-store-restore-0/restore", "restored 1234 keys\n");
+  succeeded(await alasio(["restore-filer-store", "20261013T092300Z", "--yes"]));
+  assert.equal(at("apps/v1/namespaces/alasio/deployments/alasio-seaweedfs")?.spec?.["replicas"], 1);
+  assert.deepEqual(annotations("alasio-lake"), { "autoscaling.keda.sh/paused-replicas": "1" });
+});
+
 test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
   const { alasio, configure, home, kube, machine } = await rig(t);
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });

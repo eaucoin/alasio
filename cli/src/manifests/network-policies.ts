@@ -36,6 +36,8 @@ import {
   LIFECYCLE_COMPONENT,
   MASTER,
   METRICS_PORT,
+  RESTORE_COMPONENTS,
+  RESTORE_SOURCE,
   VOLUME_SERVER,
 } from "./object-store.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
@@ -236,18 +238,21 @@ function gatewayPolicy(): NetworkPolicy {
 /**
  * The bundled object store's filer store takes no connection but its filers', the
  * collector's, which reads its metrics, and its backups': it is not of the data stack,
- * whose pods reach each other.
+ * whose pods reach each other. As `alasio restore-filer-store` puts a backup back, the
+ * Valkey that serves it is reached by the Job that loads it alone.
  */
-function filerStorePolicy(): NetworkPolicy {
+function filerStorePolicies(): NetworkPolicy[] {
   const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
-  return policy(FILER_STORE, NAMESPACE, COMPONENTS.filerStore, {
-    podSelector: { matchLabels: selectorLabels(COMPONENTS.filerStore) },
-    policyTypes: ["Ingress"],
-    ingress: [{
-      from: [of(COMPONENTS.filer), of("collector"), of(BACKUP_COMPONENT)],
-      ports: [{ protocol: "TCP", port: VALKEY_PORT }],
-    }],
-  });
+  const valkey = (name: string, component: string, from: readonly string[]) =>
+    policy(name, NAMESPACE, component, {
+      podSelector: { matchLabels: selectorLabels(component) },
+      policyTypes: ["Ingress"],
+      ingress: [{ from: from.map(of), ports: [{ protocol: "TCP", port: VALKEY_PORT }] }],
+    });
+  return [
+    valkey(FILER_STORE, COMPONENTS.filerStore, [COMPONENTS.filer, "collector", BACKUP_COMPONENT]),
+    valkey(RESTORE_SOURCE, RESTORE_COMPONENTS.source, [RESTORE_COMPONENTS.restore]),
+  ];
 }
 
 /**
@@ -358,7 +363,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       : []),
     alasioPolicy(config, environment),
     ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
-    ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), filerStorePolicy()] : []),
+    ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

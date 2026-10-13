@@ -10,7 +10,7 @@
  *
  * Its controllers are make-believe: what is applied is at once as the cluster would make
  * it once it runs (a CRD established, a Job complete, a workload rolled out with a ready
- * pod, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
+ * pod, or none once scaled to none, a deleted claim's volume reclaimed), unless the test says an object is stuck (its
  * pods wait on an image pull the cluster warns about, or its data is never deleted) or,
  * for a Job, fails.
  */
@@ -258,7 +258,28 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const { name, namespace, generation = 1 } = object.metadata;
     const condition = (type: string, reason = type) => ({ type, status: "True", reason, message: "" });
     if (object.kind === "CustomResourceDefinition") object.status = { conditions: [condition("Established")] };
-    if (object.kind === "Job") object.status = { conditions: [failing.has(name) ? { ...condition("Failed", "BackoffLimitExceeded"), message: "Job has reached the specified backoff limit" } : condition("Complete")] };
+    if (object.kind === "Job") {
+      const failed = failing.has(name);
+      object.status = { conditions: [failed ? { ...condition("Failed", "BackoffLimitExceeded"), message: "Job has reached the specified backoff limit" } : condition("Complete")] };
+      // Its pod, which ran, as its Job's: what it logged is the test's to say.
+      const template = object.spec?.["template"] as { metadata?: { labels?: Record<string, string> }; spec?: { containers?: { name: string; image: string }[] } } | undefined;
+      put("pods", {
+        apiVersion: "v1",
+        kind: "Pod",
+        metadata: { name: `${name}-0`, ...(namespace ? { namespace } : {}), labels: { ...template?.metadata?.labels, "batch.kubernetes.io/job-name": name }, creationTimestamp: new Date().toISOString() },
+        status: {
+          phase: failed ? "Failed" : "Succeeded",
+          containerStatuses: (template?.spec?.containers ?? []).map(({ name: container, image }) => ({
+            name: container,
+            ready: false,
+            restartCount: 0,
+            image,
+            imageID: "",
+            state: { terminated: { exitCode: failed ? 1 : 0, reason: failed ? "Error" : "Completed" } },
+          })),
+        },
+      });
+    }
     if (object.kind !== "Deployment" && object.kind !== "StatefulSet" && object.kind !== "DaemonSet") return;
     const replicas = (object.spec?.["replicas"] as number | undefined) ?? 1;
     const blocked = stuck.has(name);
@@ -275,6 +296,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const template = object.spec?.["template"] as { metadata?: { labels?: Record<string, string> }; spec?: { containers?: { name: string; image: string }[] } } | undefined;
     const container = template?.spec?.containers?.[0];
     const pod = `${name}-0`;
+    // Of no replicas, it has no pod.
+    if (replicas === 0 && object.kind !== "DaemonSet") return void objects.delete(pathOf("/api/v1", "pods", namespace, pod));
     put("pods", {
       apiVersion: "v1",
       kind: "Pod",

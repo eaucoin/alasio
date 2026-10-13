@@ -41,6 +41,7 @@ import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
+import { filerStoreRestore } from "../src/manifests/object-store.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -702,7 +703,7 @@ describe("object store", () => {
     const lost = run("neon", "lake");
     assert.equal(lost.status, 1);
     assert.deepEqual(lost.made, []);
-    assert.match(lost.said, /the store's volumes hold objects of the bucket lake, which its filers do not know: their store has lost what it kept; restore it from its backups rather than make lake anew, empty/u);
+    assert.match(lost.said, /the store's volumes hold objects of the bucket lake, which its filers do not know: their store has lost what it kept; alasio restore-filer-store puts it back from its backups, rather than make lake anew, empty/u);
     // A bucket is known by its name exactly: another named after it is not it.
     assert.equal(run("lake-archive\tsize:0\tlogical:0\tchunk:0", "lake").status, 1);
   });
@@ -746,8 +747,9 @@ describe("object store", () => {
       [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-lifecycle" }], [18333]],
       [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" }], [9327]],
     ]);
-    // The filer store takes its filers, the collector and its backups.
+    // The filer store takes its filers, the collector and its backups; the Valkey that serves a backup as it is restored, the Job that restores it alone.
     assert.deepEqual(admitted("alasio-seaweedfs-filer-store"), [[["seaweedfs-filer", "collector", "seaweedfs-filer-store-backup"], [6379]]]);
+    assert.deepEqual(admitted("alasio-seaweedfs-filer-store-restore-source"), [[["seaweedfs-filer-store-restore"], [6379]]]);
     // The data stack's pods reach none of the parts but as these say.
     const stack = one<KubernetesObject & { spec: { podSelector: object } }>(objects, "NetworkPolicy", "alasio-neon").spec.podSelector;
     assert.deepEqual(stack, {
@@ -759,8 +761,11 @@ describe("object store", () => {
     assert.equal(pass?.["app.kubernetes.io/component"], "seaweedfs-lifecycle");
     const backup = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-filer-store-backup").spec?.jobTemplate.spec?.template.metadata?.labels;
     assert.equal(backup?.["app.kubernetes.io/component"], "seaweedfs-filer-store-backup");
-    // Of the data stack they are not, as they reach nothing of it.
+    // Of the data stack neither they nor a restore's pods are, which reach nothing of it.
     assert.equal(backup?.["alasio.dev/stack"], undefined);
+    for (const job of filerStoreRestore(configOf(), "filer-store-20261013T092300Z.rdb").filter(({ kind }) => kind === "Job") as V1Job[]) {
+      assert.equal(job.spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined, job.metadata?.name);
+    }
   });
 
   test("logs in to the filer store as users of its own, each with its own Secret, its default user off: the filers to their keys alone, the collector to INFO, the backups to a snapshot", () => {
@@ -858,6 +863,33 @@ describe("object store", () => {
     // None where they are off.
     const off = install({ objectStore: { bundled: { filerStore: { backups: { enabled: false } } } } });
     assert.deepEqual([...all(off, "CronJob"), ...all(off, "PersistentVolumeClaim")].filter(({ metadata }) => metadata?.name?.includes("filer-store-backup")), []);
+  });
+
+  test("restores the filer store from a backup a Valkey on the backups' volume serves, onto the filer store's volume, as the filer store then loads it", () => {
+    const [service, source, restore] = filerStoreRestore(configOf(), "filer-store-20261013T092300Z.rdb") as [V1Service, V1Job, V1Job];
+    assert.deepEqual(service.spec?.selector, { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-filer-store-restore-source" });
+    const serving = source.spec?.template.spec;
+    assert.deepEqual(serving?.volumes, [{ name: "backups", persistentVolumeClaim: { claimName: "alasio-seaweedfs-filer-store-backups", readOnly: true } }]);
+    assert.deepEqual(serving?.containers[0]?.command, [
+      "valkey-server", "--port", "6379", "--dir", "/backups", "--dbfilename", "filer-store-20261013T092300Z.rdb", "--appendonly", "no", "--save", "", "--requirepass", "$(VALKEYCLI_AUTH)",
+    ]);
+    const loading = restore.spec?.template.spec;
+    assert.deepEqual(loading?.volumes, [{ name: "data", persistentVolumeClaim: { claimName: "data-alasio-seaweedfs-filer-store-0" } }]);
+    // As the filer store's Valkey runs, so the files it writes are its own.
+    assert.deepEqual(loading?.securityContext, one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs-filer-store").spec?.template.spec?.securityContext);
+    const script = loading?.containers[0]?.command?.[2] ?? "";
+    for (
+      const step of [
+        "backup --rdb /data/restore.rdb",
+        '[ "$loaded" = "$expected" ] || { echo "loaded $loaded keys, and the backup has $expected" >&2; exit 1; }',
+        "valkey-cli -p 6380 config set appendonly yes >/dev/null",
+        "grep -q '^aof_last_bgrewrite_status:ok'",
+        'echo "restored $loaded keys"',
+      ]
+    ) assert.ok(script.includes(step), step);
+    // What the volume held goes only once the backup is fetched and holds as many keys.
+    assert.ok(script.indexOf("rm -rf /data/appendonlydir /data/dump.rdb") > script.indexOf('[ "$loaded" = "$expected" ]'));
+    assert.ok(!script.slice(0, script.indexOf('[ "$loaded" = "$expected" ]')).includes("appendonlydir"));
   });
 });
 
