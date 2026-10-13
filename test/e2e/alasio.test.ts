@@ -228,7 +228,7 @@ if (inShard("sessions")) {
       assert.equal(fromStub, "blocked");
     });
 
-    test("alasio reads a session's files as its agent, a suspended session resumes with them, and one of another pod template moves onto it with them", async () => {
+    test("alasio reads a session's files as its agent, a suspended session resumes with them, and one recorded of another pod template is moved onto the current one with them", async () => {
       const seen = await roundtrip(none);
       assert.equal(seen.exec, '"written"');
       assert.match(seen.read ?? "", /^hello from /u);
@@ -238,7 +238,6 @@ if (inShard("sessions")) {
       assert.equal(seen.afterResume, seen.read);
       assert.equal(seen.execAfterResume, JSON.stringify(seen.read));
       assert.equal(seen.podReplaced, true);
-      assert.equal(seen.movedPodLabel, "yes");
       assert.equal(seen.execAfterMove, JSON.stringify(seen.read));
     });
 

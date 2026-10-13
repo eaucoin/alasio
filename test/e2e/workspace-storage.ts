@@ -179,7 +179,7 @@ async function checkMount(volumeId: string): Promise<Ran> {
 const fixtureDigest = async (volumeId: string) => (await inWorkspaceOk(volumeId, `cd ${FIXTURE} && timeout -k 5 120 sh -c '${DIGEST}'`)).trim();
 
 /** Brings the session up as a turn does (./session-bring-up.ts): the pod it runs in then. */
-const bringUp = (volumeId: string, ...where: string[]) => inAlasio<BroughtUp>("./session-bring-up.ts", volumeId, ...where);
+const bringUp = (volumeId: string) => inAlasio<BroughtUp>("./session-bring-up.ts", volumeId);
 
 const isReady = (pod: V1Pod | null | undefined) => pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false;
 
@@ -583,12 +583,19 @@ export function workspaceStorage(): void {
       const full = sessions.full;
       const written = (await inWorkspaceOk(full, `mkdir -p ${WORKDIR} && head -c 1048576 /dev/urandom > ${WORKDIR}/moving && sha256sum < ${WORKDIR}/moving`)).trim();
       const node = (await podOf(full)).spec?.nodeName ?? "";
+      const sandbox = ref("Sandbox", full, SESSIONS);
+      const nodeSelector = (await kube.get<Sandbox>(sandbox))?.spec.podTemplate.spec?.nodeSelector ?? null;
       await kube.patch(ref("Node", node), { spec: { unschedulable: true } });
       try {
-        const moved = await bringUp(full, "anywhere");
+        // Free to run on any node, and made anew: as the cluster's admin, as alasio makes no
+        // Sandbox but from its template, which places sessions on one node in this run.
+        await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector: null } } } });
+        await kube.remove(ref("Pod", full, SESSIONS));
+        const moved = await bringUp(full);
         assert.ok(moved.node && moved.node !== node, `the session stayed on ${node}`);
         assert.equal((await inWorkspaceOk(full, `sha256sum < ${WORKDIR}/moving`)).trim(), written);
       } finally {
+        await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector } } } });
         await kube.patch(ref("Node", node), { spec: { unschedulable: null } });
       }
     });

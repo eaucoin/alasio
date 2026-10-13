@@ -917,11 +917,14 @@ test("branch list says each branch, what it is a branch of, its age, its alasio,
   assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, its alasio ready, 1.6 GiB requested, 0 MiB used"]);
 });
 
-test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces", async (t) => {
+test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
   const { alasio, home, kube, neon, telegram } = await branchable(t);
   telegram.bots.set("456:branch", "branch_bot");
   writeFileSync(join(home, "branch"), "456:branch");
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  const policy = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/alasio-branch-try-sandboxes";
+  const binding = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/alasio-branch-try-sandboxes";
+  assert.ok(kube.get(policy) && kube.get(binding));
   neon.turns = "1";
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "its alasio has 1 turn running; --force deletes it all the same");
   assert.ok(kube.get(BRANCH_DEPLOYMENT));
@@ -936,6 +939,7 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);
+  assert.deepEqual([kube.get(policy), kube.get(binding)], [undefined, undefined]);
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "there is no branch try");
 });
 

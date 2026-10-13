@@ -32,7 +32,8 @@ import type {
 } from "@kubernetes/client-node";
 import { Result } from "effect";
 
-import type { SessionsProfile } from "../../src/kube/config.ts";
+import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
+import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
 
@@ -1251,7 +1252,11 @@ describe("branch environments", () => {
     ]);
     assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.labels?.["alasio.dev/branch"] !== "try"), []);
-    assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")), []);
+    // But its Sandboxes' admission policy, which is the cluster's.
+    assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")).map(({ kind, metadata }) => [kind, metadata?.name]), [
+      ["ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes"],
+      ["ValidatingAdmissionPolicyBinding", "alasio-branch-try-sandboxes"],
+    ]);
     assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake", "alasio-neon-compute"]);
     // Named as main's are, as each namespace is the branch's own.
     assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-lake", "alasio-neon-compute", "alasio-telemetry"]);
@@ -1427,10 +1432,10 @@ describe("scaling", () => {
 
 describe("admission", () => {
   type Policy = KubernetesObject & { spec: { matchConstraints: { resourceRules: object[] }; matchConditions: { expression: string }[]; validations: { expression: string }[] } };
-  /** The keys the pin of `field` in `expression` allows. */
-  const keysOf = (expression: string, field: string) => {
+  /** The keys the pin of `field` in `expression` allows, of its last pin where `last`. */
+  const keysOf = (expression: string, field: string, last = false) => {
     const pin = `${field}.all(key, key in [`;
-    const at = expression.indexOf(pin);
+    const at = last ? expression.lastIndexOf(pin) : expression.indexOf(pin);
     return at < 0 ? null : JSON.parse(expression.slice(at + pin.length - 1, expression.indexOf("]", at + pin.length) + 1));
   };
   const binding = (objects: readonly KubernetesObject[], name: string) => one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", name).spec;
@@ -1451,5 +1456,47 @@ describe("admission", () => {
     assert.deepEqual(binding(objects, "alasio-clone-job"), { policyName: "alasio-clone-job", validationActions: ["Deny"] });
     // None where alasio forks no session, which runs no Job.
     assert.ok(!all(install({ workspaceStorage: { enabled: false } }), "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === "alasio-clone-job"));
+  });
+
+  test("lets alasio make no Sandbox but from its namespace's template, its own as a branch's, and no Secret but a Sandbox's token", () => {
+    const objects = install({ host: { enabled: true } });
+    const sandboxes = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-sandboxes");
+    assert.deepEqual(sandboxes.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
+    const sandbox = sandboxes.spec.validations[0]?.expression ?? "";
+    // A Sandbox not moved onto another template is left be; one made, or moved, is its namespace's template's.
+    assert.ok(sandbox.startsWith('request.operation == "UPDATE" && object.spec.podTemplate == oldObject.spec.podTemplate'));
+    assert.ok(sandbox.includes('(request.namespace == "alasio-host" ? '));
+    // A session's pod is as no one, under the sessions' runtime; a folder's bayma's as its own account alone.
+    const sessionKeys = keysOf(sandbox, 'object.spec["podTemplate"]["spec"]', true);
+    for (const key of ["serviceAccountName", "hostNetwork", "hostPID", "nodeName", "ephemeralContainers"]) assert.ok(!sessionKeys.includes(key), key);
+    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["runtimeClassName"] == "gvisor"'));
+    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["automountServiceAccountToken"] == false'));
+    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["serviceAccountName"] == "alasio-host-agent"'));
+    assert.deepEqual(binding(objects, "alasio-sandboxes"), { policyName: "alasio-sandboxes", validationActions: ["Deny"] });
+    // A branch's is its own, of its own templates, by its own ServiceAccount.
+    const branch = one<Policy>(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes");
+    assert.deepEqual(branch.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio-branch-try:alasio"']);
+
+    const secrets = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-secrets");
+    assert.ok(secrets.spec.matchConditions[0]?.expression.includes("^system:serviceaccount:(alasio|alasio-branch-[a-z0-9-]+):alasio$"));
+    assert.deepEqual(secrets.spec.validations.map(({ expression }) => expression), [
+      'object.?type.orValue("Opaque") == "Opaque" && object.metadata.name.endsWith("-bayma-token") && object.?data.orValue({}).all(key, key == "token")',
+    ]);
+    assert.deepEqual(binding(objects, "alasio-secrets"), { policyName: "alasio-secrets", validationActions: ["Deny"] });
+  });
+
+  test("holds a folder's bayma's state directory under its template's state root as alasio joins it, however the root is written", () => {
+    for (const stateRoot of ["/home/op/state", "/home/op//state/", "/"]) {
+      const sandbox = one<Policy>(install({ host: { enabled: true, stateRoot } }), "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[0]?.expression ?? "";
+      // The patterns of path segments: the state directory's.
+      const patterns = [...sandbox.matchAll(/\.matches\(("(?:[^"\\]|\\.)*")\)/gu)]
+        .map(([, quoted = '""']) => JSON.parse(quoted) as string)
+        .filter((pattern) => pattern.includes("[A-Za-z0-9_][A-Za-z0-9_.-]*/"))
+        .map((pattern) => new RegExp(pattern, "u"));
+      assert.equal(patterns.length, 1, stateRoot);
+      const profile = { stateRoot } as HostProfile;
+      assert.match(hostBaymaStateDir(profile, "claude", "telegram:1"), patterns[0] ?? /^$/u, stateRoot);
+      assert.doesNotMatch("/elsewhere/claude/telegram-1", patterns[0] ?? /^$/u, stateRoot);
+    }
   });
 });

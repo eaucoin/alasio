@@ -21,6 +21,7 @@ import { TestClock } from "effect/testing";
 
 import { type ExecResult, exitCodeOf, KubeApiError, KubeClient, KubeExecError, mergePatch, patchBody } from "../src/kube/client.ts";
 import { decodeKubeTemplates, type KubeTemplates, loadKubeTemplates, type SessionsProfile } from "../src/kube/config.ts";
+import { EGRESS_GATE_SCRIPT } from "../src/kube/sandbox-shape.ts";
 import {
   makeSandboxes,
   newToken,
@@ -35,7 +36,7 @@ import {
   sandboxReady,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
-import { cloneJobManifest, EGRESS_GATE_SCRIPT, type NetMode, SessionInheritError, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
+import { cloneJobManifest, type NetMode, SessionInheritError, SessionSandboxes, sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { SessionToken } from "../src/sandbox/names.ts";
 import { makeRateLimiter, serveTelemetryReceiver } from "../src/sandbox/telemetry-receiver.ts";
 import type { Signal } from "../src/telemetry/config.ts";

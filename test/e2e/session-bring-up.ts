@@ -2,9 +2,8 @@
  * Run inside alasio's pod, by node there, with a session's volume id (inAlasio in
  * harness.ts): brings the session up as a turn does, through alasio's own session
  * filesystems and its ServiceAccount's permissions, resuming it when it is suspended and
- * restarting it when its workspace's mount is broken. Given `anywhere`, the sessions
- * template's node selector is left out, so the session's pod may run on any node that
- * takes it. Prints one JSON line of the pod it runs in afterwards.
+ * restarting it when its workspace's mount is broken. Prints one JSON line of the pod it
+ * runs in afterwards.
  *
  * Its Sandbox is made from what this script, without alasio's telemetry settings, makes
  * of the template: the first bring-up here moves a session alasio made onto that, and
@@ -17,7 +16,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect } from "effect";
 
 import { KubeClient } from "../../src/kube/client.ts";
-import { loadKubeTemplates, type SessionsProfile } from "../../src/kube/config.ts";
+import { loadKubeTemplates } from "../../src/kube/config.ts";
 import { SessionSandboxes } from "../../src/sandbox/index.ts";
 
 /** The pod the session runs in once it is up. */
@@ -26,21 +25,13 @@ export interface BroughtUp {
   readonly node: string | undefined;
 }
 
-const [volumeId, where] = process.argv.slice(2);
-if (!volumeId || (where !== undefined && where !== "anywhere")) throw new Error("usage: session-bring-up.ts <volumeId> [anywhere]");
-
-/** `profile` without its node selector, when the session may run anywhere. */
-function placed(profile: SessionsProfile): SessionsProfile {
-  if (where !== "anywhere") return profile;
-  const podTemplate = structuredClone(profile.podTemplate ?? {});
-  delete podTemplate.spec?.nodeSelector;
-  return { ...profile, podTemplate };
-}
+const volumeId = process.argv[2];
+if (!volumeId) throw new Error("usage: session-bring-up.ts <volumeId>");
 
 const seen = await Effect.runPromise(Effect.gen(function*() {
   const { sessions } = yield* loadKubeTemplates;
   if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
-  const profile = placed(sessions);
+  const profile = sessions;
   return yield* Effect.gen(function*() {
     yield* (yield* SessionSandboxes).ensureSession(volumeId);
     // A core Pod, as the API server returns one.

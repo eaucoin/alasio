@@ -21,7 +21,7 @@ import type {
 import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
 import { imageReference } from "../images.ts";
-import { cloneJobPolicy } from "./admission.ts";
+import { alasioAccount, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -533,7 +533,13 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     deployment(config, templates.checksum, environment),
     telemetryService(config, environment),
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
-    // What alasio may do beyond what RBAC can say; the cluster's, made with main's.
+    // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.
+    ...(environment.branch === null ? secretPolicy() : []),
     ...(environment.branch === null && sessionsForked(config) ? cloneJobPolicy(cloneJob(config)) : []),
+    ...sandboxPolicy(
+      sandboxPolicyName(environment.namespace),
+      alasioAccount(environment.namespace),
+      { sessions: config.sessions.enabled ? sessionsProfile(config, environment) : null, host: config.host.enabled ? hostProfile(config) : null },
+    ),
   ];
 }

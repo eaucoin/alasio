@@ -43,6 +43,15 @@ import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/clien
 import { CLONE_VARIABLES, type SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
+  DEFAULT_FULL_MODE_NAMESERVERS,
+  EGRESS_GATE,
+  EGRESS_GATE_SCRIPT,
+  NET_MODE_LABEL,
+  TOKEN_ENV,
+  tokenSecretName,
+  WORKLOAD_LABEL,
+} from "../kube/sandbox-shape.ts";
+import {
   type BaymaEndpoint,
   claimName,
   makeSandboxes,
@@ -54,7 +63,6 @@ import {
   type SandboxOperatingMode,
   sameToken,
   sandboxManifest,
-  tokenSecretName,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
 import { overLimitNote } from "../telegram/rich-media.ts";
@@ -202,36 +210,13 @@ const targetsOf = (mountPod: V1Pod): string[] =>
 /** Whether a target path is one of `pod`'s volumes, under kubelet's directory of the pod. */
 const ofPod = (pod: V1Pod) => (target: string): boolean => target.includes(`/pods/${pod.metadata?.uid}/volumes/`);
 
-const NET_MODE_LABEL = "alasio.dev/net-mode";
-const WORKLOAD_LABEL = "alasio.dev/workload";
 /** The annotation of a fork's Sandbox that names the session it was forked from. */
 const FORKED_FROM_ANNOTATION = "alasio.dev/forked-from";
-const DEFAULT_FULL_MODE_NAMESERVERS = ["1.1.1.1", "8.8.8.8"];
-// The token's environment variable in bayma's container, which the OTLP headers expand.
-const TOKEN_ENV = "ALASIO_SANDBOX_TOKEN";
 
 /** Where sessions' telemetry is received: the receiver's Service, when sessions export any, and its port. */
 const ReceiverService = Config.String("ALASIO_TELEMETRY_RECEIVER_SERVICE").pipe(Config.map((service) => service.trim()), Config.withDefault(""));
 const ReceiverPort = Config.Port("ALASIO_TELEMETRY_RECEIVER_PORT").pipe(Config.withDefault(4318));
 
-/**
- * The egress gate's program: exits once three connections in a row to the API server
- * fail, and fails the pod if they still succeed after two minutes. Runs on the agent
- * image's Node.
- */
-export const EGRESS_GATE_SCRIPT = [
-  "const net = require('node:net');",
-  "const host = process.env.KUBERNETES_SERVICE_HOST, port = Number(process.env.KUBERNETES_SERVICE_PORT);",
-  "const deadline = Date.now() + 120000; let refused = 0;",
-  "(function probe() {",
-  "  const socket = net.connect({ host, port, timeout: 1000 });",
-  "  const next = (blocked) => { socket.destroy(); refused = blocked ? refused + 1 : 0;",
-  "    if (refused >= 3) process.exit(0);",
-  "    if (Date.now() > deadline) { console.error('egress is not confined: is NetworkPolicy enforced in this cluster?'); process.exit(1); }",
-  "    setTimeout(probe, 250); };",
-  "  socket.once('connect', () => next(false)); socket.once('timeout', () => next(true)); socket.once('error', () => next(true));",
-  "})();",
-].join("\n");
 
 /**
  * The Sandbox for a session on `volumeId` with internet mode `netMode`, from the
@@ -273,11 +258,11 @@ export function sessionSandboxManifest({
         dnsConfig: { nameservers: full ? [...(profile.fullModeNameservers ?? DEFAULT_FULL_MODE_NAMESERVERS)] : ["127.0.0.1"] },
         initContainers: [
           ...(profile.egressGate === false ? [] : [{
-            name: "egress-gate",
+            name: EGRESS_GATE.name,
             ...(bayma.image === undefined ? {} : { image: bayma.image }),
             command: ["node", "-e", EGRESS_GATE_SCRIPT],
             ...(bayma.securityContext === undefined ? {} : { securityContext: bayma.securityContext }),
-            resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "64Mi" } },
+            resources: structuredClone(EGRESS_GATE.resources),
           }]),
           ...(spec.initContainers ?? []),
         ],

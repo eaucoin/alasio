@@ -21,7 +21,6 @@ import {
   type BaymaEndpoint,
   makeSandboxes,
   POD_TEMPLATE_ANNOTATION,
-  podTemplateHash,
   SANDBOX_API_VERSION,
   SANDBOX_KIND,
   type Sandbox,
@@ -50,12 +49,8 @@ export interface RoundtripSeen {
   afterResume?: string | undefined;
   execAfterResume?: string | undefined;
   podReplaced: boolean;
-  movedPodLabel?: string | undefined;
   execAfterMove?: string | undefined;
 }
-
-/** The pod label the round trip's other pod template adds. */
-const MOVED_LABEL = "alasio.dev/e2e-moved";
 
 const volumeId = process.argv[2];
 if (!volumeId) throw new Error("usage: session-roundtrip.ts <volumeId>");
@@ -117,17 +112,14 @@ const roundtrip = (profile: SessionsProfile) => Effect.gen(function*() {
   const again = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
   seen.execAfterResume = again.result_text;
 
-  // Brought up with another pod template, as after an upgrade: its pod is one of that
-  // template, and its files are kept.
+  // Recorded as of another pod template, as after an upgrade, which alasio moves onto
+  // the current one as it brings it up: its pod is made anew, and its files are kept.
   const currentPod = kube.read("v1", "Pod", profile.namespace, volumeId);
   const podBefore = yield* currentPod;
-  const moved = structuredClone(made);
-  moved.spec.podTemplate.metadata = { ...moved.spec.podTemplate.metadata, labels: { ...moved.spec.podTemplate.metadata?.labels, [MOVED_LABEL]: "yes" } };
-  moved.metadata.annotations = { ...moved.metadata.annotations, [POD_TEMPLATE_ANNOTATION]: podTemplateHash(moved.spec.podTemplate) };
-  bayma = yield* sandboxes.ensure(volumeId, () => moved);
+  yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, volumeId, { metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: "another" } } });
+  bayma = yield* sandboxes.ensure(volumeId, () => made);
   const podAfter = yield* currentPod;
   seen.podReplaced = !!podBefore?.metadata?.uid && !!podAfter?.metadata?.uid && podBefore.metadata.uid !== podAfter.metadata.uid;
-  seen.movedPodLabel = podAfter?.metadata?.labels?.[MOVED_LABEL];
   const afterMove = yield* Effect.promise(() => exec(bayma, 'require("fs").readFileSync("/workspace/out/hello.txt", "utf8")'));
   seen.execAfterMove = afterMove.result_text;
   return seen;

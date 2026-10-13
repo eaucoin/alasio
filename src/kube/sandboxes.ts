@@ -34,6 +34,7 @@ import { FetchHttpClient } from "effect/http";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { hasStatus, type KubeApiError, KubeClient, mergePatch } from "./client.ts";
+import { BAYMA_CONTAINER, MANAGED_BY, SANDBOX_LABEL, TOKEN_DIR, TOKEN_FILE_ARGS, TOKEN_KEY, TOKEN_MODE, TOKEN_VOLUME, tokenSecretName } from "./sandbox-shape.ts";
 
 export const SANDBOX_API_VERSION = "agents.x-k8s.io/v1beta1";
 export const SANDBOX_KIND = "Sandbox";
@@ -197,16 +198,6 @@ export interface SandboxesOptions {
   readonly fault?: (name: string) => Effect.Effect<SandboxFault | null>;
 }
 
-/** The container in every Sandbox's pod that runs bayma. */
-export const BAYMA_CONTAINER = "bayma";
-/** Where a Sandbox's token Secret is mounted in its bayma container. */
-const TOKEN_DIR = "/run/alasio/bayma";
-const TOKEN_KEY = "token";
-const TOKEN_VOLUME = "alasio-bayma-token";
-
-/** The label every object alasio makes carries, and the one that names its Sandbox. */
-const MANAGED_BY = { "app.kubernetes.io/managed-by": "alasio" };
-const SANDBOX_LABEL = "alasio.dev/sandbox";
 /** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
 export const POD_TEMPLATE_ANNOTATION = "alasio.dev/pod-template";
 
@@ -219,11 +210,6 @@ const ANSWER_TIMEOUT_MS = 5000;
 /** The claim agent-sandbox makes for the Sandbox `sandbox` of its volume claim template `template`. */
 export function claimName(template: string, sandbox: string): string {
   return `${template}-${sandbox}`;
-}
-
-/** The name of a Sandbox's token Secret. */
-export function tokenSecretName(name: string): string {
-  return `${name}-bayma-token`;
 }
 
 /**
@@ -274,12 +260,11 @@ export function sandboxManifest({
   const containers = spec.containers ?? [];
   const bayma = containers.find((container) => container.name === BAYMA_CONTAINER);
   if (!bayma) throw new Error(`the Sandbox template for ${namespace} has no container named ${JSON.stringify(BAYMA_CONTAINER)}`);
-  bayma.args = [...(bayma.args ?? []), "--token-file", `${TOKEN_DIR}/${TOKEN_KEY}`];
+  bayma.args = [...(bayma.args ?? []), ...TOKEN_FILE_ARGS];
   bayma.volumeMounts = [...(bayma.volumeMounts ?? []), { name: TOKEN_VOLUME, mountPath: TOKEN_DIR, readOnly: true }];
   spec.volumes = [
     ...(spec.volumes ?? []),
-    // Readable by the pod's group, which is how a non-root bayma reads it.
-    { name: TOKEN_VOLUME, secret: { secretName: tokenSecretName(name), defaultMode: 0o440 } },
+    { name: TOKEN_VOLUME, secret: { secretName: tokenSecretName(name), defaultMode: TOKEN_MODE } },
   ];
   const allLabels = { ...MANAGED_BY, [SANDBOX_LABEL]: name, ...labels };
   podTemplate.metadata = {

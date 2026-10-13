@@ -33,6 +33,7 @@ import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts"
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
+import { sandboxPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
@@ -391,5 +392,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     );
   }
   yield* removed([namespace, sessions].map((each) => ({ ...NAMESPACE_KIND, name: each })), options);
+  // What of its is the cluster's: its Sandboxes' admission policy.
+  yield* removed([kind("ValidatingAdmissionPolicyBinding"), kind("ValidatingAdmissionPolicy")].map((each) => ({ ...each, name: sandboxPolicyName(namespace) })), options);
 });
 

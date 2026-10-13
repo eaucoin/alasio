@@ -18,6 +18,7 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 
 import type { KubeClient } from "../kube/client.ts";
 import type { HostProfile } from "../kube/config.ts";
+import { HARNESS_LABEL, sanitizePathToken, STATE_DIR_ARG, WORKLOAD_LABEL } from "../kube/sandbox-shape.ts";
 import { type BaymaEndpoint, makeSandboxes, type Sandbox, type SandboxError, sandboxManifest } from "../kube/sandboxes.ts";
 import { conversationTelemetryEnv } from "../telemetry/index.ts";
 
@@ -46,14 +47,7 @@ export interface HostBaymaManifestOptions extends HostBaymaScope {
  */
 export const BAYMA_STARTUP_TIMEOUT_MS = 60_000;
 
-const WORKLOAD_LABEL = "alasio.dev/workload";
-const HARNESS_LABEL = "alasio.dev/harness";
 const CONVERSATION_ANNOTATION = "alasio.dev/conversation";
-
-/** A path segment from `value`. */
-function sanitizePathToken(value: string): string {
-  return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
-}
 
 /** The Sandbox serving bayma to one conversation under one harness. */
 export function hostBaymaName(harness: string, threadKey: string): string {
@@ -83,7 +77,7 @@ export function hostBaymaManifest({ harness, threadKey, profile, env = process.e
     annotations: { [CONVERSATION_ANNOTATION]: threadKey },
     configure(spec, bayma) {
       // sandboxManifest has given bayma its arguments by now.
-      bayma.args = [...(bayma.args ?? []), "--state-dir", hostBaymaStateDir(profile, harness, threadKey)];
+      bayma.args = [...(bayma.args ?? []), STATE_DIR_ARG, hostBaymaStateDir(profile, harness, threadKey)];
       bayma.env = [...(bayma.env ?? []), ...Object.entries(telemetry).map(([name, value]) => ({ name, value }))];
       return spec;
     },
