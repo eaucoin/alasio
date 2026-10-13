@@ -1341,8 +1341,8 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.equal(loadConfig(local).catalog.options, "");
   assert.equal(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");
   assert.equal(loadEndpointConfig({ ...reader, LAKE_QUERY_TOKEN: "t", LAKE_DATABASE_ENDPOINT: "alasio" }).catalog.options, "endpoint=alasio");
-  assert.equal(conninfo("lake"), "dbname='lake'");
-  assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' options='endpoint=alasio'");
+  assert.equal(conninfo("lake"), "dbname='lake' connect_timeout=60");
+  assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' connect_timeout=60 options='endpoint=alasio'");
 });
 
 test("the lake learns Neon's branches but main from neon-control, with its token, and fails on what is not a list of them", async () => {

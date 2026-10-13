@@ -30,7 +30,8 @@ export async function ensureGrafanaRole(pool: Pool, databaseUrl: string, verifie
   await pool.query(`grant connect on database ${GRAFANA_DATABASE} to ${GRAFANA_ROLE}`);
   const url = new URL(databaseUrl);
   url.pathname = `/${GRAFANA_DATABASE}`;
-  const client = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 30_000 });
+  // As patient as the pool's own connections.
+  const client = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: pool.options.connectionTimeoutMillis });
   try {
     await client.connect();
     await client.query(`grant usage, create on schema public to ${GRAFANA_ROLE}`);

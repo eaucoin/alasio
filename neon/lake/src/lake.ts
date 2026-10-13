@@ -50,14 +50,14 @@ export function literal(value: string): string {
 }
 
 /**
- * A libpq connection string naming `database`, and the `options` sent with it, when any:
- * the server, the role and its password come from the DuckDB's Postgres secret
- * (openLake), so nothing DuckDB says of a connection, which quotes this, carries the
- * password into a log.
+ * A libpq connection string naming `database`, and the `options` sent with it, when any,
+ * patient for as long as Neon's proxy may take to wake a compute that sleeps: the server,
+ * the role and its password come from the DuckDB's Postgres secret (openLake), so nothing
+ * DuckDB says of a connection, which quotes this, carries the password into a log.
  */
 export function conninfo(database: string, options = ""): string {
   const quoted = (value: string) => `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
-  return `dbname=${quoted(database)}${options ? ` options=${quoted(options)}` : ""}`;
+  return `dbname=${quoted(database)} connect_timeout=60${options ? ` options=${quoted(options)}` : ""}`;
 }
 
 /**

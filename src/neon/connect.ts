@@ -71,6 +71,13 @@ export interface ConnectedNeon extends OpenNeon {
 /** What connecting to Neon fails with: a setting missing, or Neon not answering in time. */
 export type NeonError = NeonUnavailable | NeonSettingError | Config.ConfigError;
 
+/**
+ * How long a connection may take: Neon's proxy holds a connection to a compute that sleeps
+ * until neon-control has woken it, which on a cold storage path (the pageserver just
+ * restarted, catching up on WAL) has taken half a minute.
+ */
+const CONNECT_TIMEOUT_MS = 60_000;
+
 /** How long alasio waits for a deployment's Neon to answer as it starts, and how often it asks. */
 const CONNECT_PATIENCE = "10 minutes";
 const CONNECT_RETRY = "5 seconds";
@@ -129,7 +136,7 @@ const openNeon = Effect.fnUntraced(function*(
     connectionString: Redacted.value(databaseUrl),
     max: 8,
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 30_000,
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
   });
   // An idle connection dies with the compute when it restarts; the pool
   // replaces it on the next checkout.

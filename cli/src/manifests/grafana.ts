@@ -57,9 +57,9 @@ const GRAFANA_USER = 472;
 
 /**
  * What its database's URL asks of the connection, beside the server: main's compute, named
- * to Neon's proxy; and no TLS, which the proxy is not given.
+ * to Neon's proxy; no TLS, which the proxy is not given; and the patience a wake takes.
  */
-const DATABASE_QUERY = new URLSearchParams({ options: `endpoint=${computeId(MAIN)}`, sslmode: "disable" }).toString();
+const DATABASE_QUERY = new URLSearchParams({ options: `endpoint=${computeId(MAIN)}`, sslmode: "disable", connect_timeout: "60" }).toString();
 /** The port its replicas gossip on, over TCP and UDP, as unified alerting's peers. */
 export const GOSSIP_PORT = 9094;
 
@@ -129,7 +129,8 @@ export function grafanaObjects(config: InstallConfig): KubernetesObject[] {
               { name: "PGDATABASE", value: "grafana" },
               { name: "PGUSER", value: GRAFANA_ROLE },
               { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: GRAFANA, key: "GF_DATABASE_PASSWORD" } } },
-              { name: "PGCONNECT_TIMEOUT", value: "5" },
+              // Long enough for the proxy to wake the compute.
+              { name: "PGCONNECT_TIMEOUT", value: "60" },
             ],
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             ...helperResources(),

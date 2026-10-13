@@ -709,6 +709,7 @@ function backup(config: InstallConfig): V1CronJob {
       { name: "PGPORT", value: String(PROXY_PORT) },
       // Main's compute, through the proxy, which wakes it if it sleeps.
       { name: "PGOPTIONS", value: `endpoint=${computeId(MAIN)}` },
+      { name: "PGCONNECT_TIMEOUT", value: "60" },
       { name: "PGPASSWORD", valueFrom: { secretKeyRef: { name: databaseSecret(config), key: "password" } } },
     ],
     securityContext: restrictedContainer(),

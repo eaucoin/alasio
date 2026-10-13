@@ -35,6 +35,8 @@ const LOCK = "alasio.lake.loader";
 const LOCK_RETRY_MS = 10_000;
 /** The intake's DuckDB's memory limit: a request's rows, staged, are all it holds. */
 const INTAKE_MEMORY_LIMIT = "256MB";
+/** How long a connection may take: Neon's proxy holds it while it wakes a compute that sleeps, which has taken half a minute. */
+const CONNECT_TIMEOUT_MS = 60_000;
 
 /** The loader's lock: the connection holding it, and whether that has since been lost. */
 interface LoaderLock {
@@ -55,7 +57,7 @@ function log(message: string, fields: Record<string, unknown> = {}): void {
  * whether that connection, and so the lock, has since been lost.
  */
 async function takeLock(catalog: DatabaseConfig, signal: AbortSignal): Promise<LoaderLock> {
-  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: 30_000 });
+  const client = new pg.Client({ ...catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
   let lost = false;
   client.on("error", (error) => {
     lost = true;
@@ -115,7 +117,7 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
  */
 async function openForIntake(): Promise<IntakeLake> {
   const lake = await openLake(config, { memoryLimit: INTAKE_MEMORY_LIMIT });
-  const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: 30_000 });
+  const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
   try {
     await ensureOtel(lake.db);
     await catalog.connect();

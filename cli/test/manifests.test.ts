@@ -447,7 +447,7 @@ describe("neon", () => {
   test("dumps the database through the proxy, which wakes main's compute", () => {
     const dump = one<V1CronJob>(install(), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.initContainers?.[0];
     const env = Object.fromEntries((dump?.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
-    assert.deepEqual([env["PGHOST"], env["PGPORT"], env["PGOPTIONS"]], ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio"]);
+    assert.deepEqual([env["PGHOST"], env["PGPORT"], env["PGOPTIONS"], env["PGCONNECT_TIMEOUT"]], ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio", "60"]);
     assert.equal(dump?.command?.[2], "until pg_isready --quiet; do sleep 2; done && pg_dump --username=alasio --dbname=alasio --format=custom --file=/backup/alasio.dump");
   });
 
@@ -964,7 +964,7 @@ describe("Grafana", () => {
       // its password the Secret's, which envFrom gives it before.
       {
         name: "GF_DATABASE_URL",
-        value: "postgres://grafana:$(GF_DATABASE_PASSWORD)@alasio-neon-proxy.alasio.svc:5432/grafana?options=endpoint%3Dalasio&sslmode=disable",
+        value: "postgres://grafana:$(GF_DATABASE_PASSWORD)@alasio-neon-proxy.alasio.svc:5432/grafana?options=endpoint%3Dalasio&sslmode=disable&connect_timeout=60",
       },
       { name: "LAKE_QUERY_URL", value: "http://alasio-lake:8090" },
       { name: "TELEGRAM_BOT_TOKEN", valueFrom: { secretKeyRef: { name: "telegram", key: "token" } } },
@@ -1025,7 +1025,7 @@ describe("Grafana", () => {
     const env = Object.fromEntries((wait.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
     assert.deepEqual(
       [env["PGHOST"], env["PGPORT"], env["PGOPTIONS"], env["PGDATABASE"], env["PGUSER"], env["PGCONNECT_TIMEOUT"]],
-      ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio", "grafana", "grafana", "5"],
+      ["alasio-neon-proxy.alasio.svc", "5432", "endpoint=alasio", "grafana", "grafana", "60"],
     );
     assert.deepEqual(wait.env?.find(({ name }) => name === "PGPASSWORD")?.valueFrom, { secretKeyRef: { name: "alasio-grafana", key: "GF_DATABASE_PASSWORD" } });
     // A login refused twice, then let in.
