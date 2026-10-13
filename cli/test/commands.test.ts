@@ -304,7 +304,7 @@ test("init asks where alasio runs on a first run, and runs it in the cluster a k
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-claude"), undefined);
 });
 
-test("init installs k3s and gVisor here unless told otherwise, as root at once, after saying what, its volumes under XDG_DATA_HOME", async (t) => {
+test("init installs k3s, gVisor and stargz-snapshotter here unless told otherwise, as root at once, after saying what, its volumes under XDG_DATA_HOME", async (t) => {
   const { alasio, config, configFile, env, kube, machine } = await rig(t);
   const run = await alasio(["init", "--no-up"], [[ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], replaced(PUBLIC_ADDRESS)]);
   succeeded(run);
@@ -312,15 +312,18 @@ test("init installs k3s and gVisor here unless told otherwise, as root at once, 
   assert.deepEqual(config(), { target: { host: { storagePath } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS } } });
   assert.ok(run.progress.includes([
     "alasio changes this machine as root:",
-    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "  install gVisor 20990101.0 in /usr/local/lib/alasio/gvisor/20990101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "  install stargz-snapshotter v9.9.0 in /usr/local/bin: containerd-stargz-grpc, stargz-fuse-manager",
     "  install k3s v1.99.0+k3s1 in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "  read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ].join("\n")), run.progress.join("\n"));
   assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/gvisor-bin/gvisor_sentry"), "gvisor_sentry 20990101.0\n");
-  assert.equal(machine.ran.length, 1);
-  assert.deepEqual(machine.ran[0]?.env, {
+  assert.equal(machine.read("/usr/local/bin/containerd-stargz-grpc"), "containerd-stargz-grpc v9.9.0\n");
+  // systemd reads the daemon's service and k3s's drop-in, which k3s's install script then starts with it.
+  assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["systemctl daemon-reload", "sh install.sh"]);
+  assert.deepEqual(machine.ran[1]?.env, {
     INSTALL_K3S_SKIP_DOWNLOAD: "true",
     INSTALL_K3S_SKIP_SELINUX_RPM: "true",
     INSTALL_K3S_SELINUX_WARN: "true",
@@ -1263,7 +1266,7 @@ async function upOnHost({ alasio, home }: Rig): Promise<CliRun> {
   return run;
 }
 
-/** alasio initialized and up in k3s on this machine, k3s and gVisor installed from `releases`. */
+/** alasio initialized and up in k3s on this machine, k3s, gVisor and stargz-snapshotter installed from `releases`. */
 async function onHost(t: TestContext): Promise<Rig> {
   const setup = await rig(t);
   await upOnHost(setup);
@@ -1294,12 +1297,12 @@ test("up on k3s here asks root for nothing once all is as it should, gives CoreD
   const mirrored = await alasio(["up"]);
   succeeded(mirrored);
   assert.deepEqual(rootSteps(mirrored), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "restart the service k3s, with its new configuration",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
   assert.match(machine.read("/etc/rancher/k3s/registries.yaml") ?? "", /"mirrors":\{"docker\.io":\{"endpoint":\["https:\/\/mirror\.lan"\]\}\}/u);
-  assert.deepEqual(machine.commands().slice(ran), ["systemctl restart k3s"]);
+  assert.deepEqual(machine.commands().slice(ran), ["systemctl daemon-reload", "systemctl restart k3s"]);
 });
 
 /** Where a forward of the sandbox gateway's pod's port leads. */
@@ -1340,28 +1343,30 @@ async function gatewayReleases(t: TestContext, kube: FakeKube, answer: () => unk
     environment === "main" && method === "GET" && path === "/snapshots/releases" ? { status: 200, json: answer() } : { status: 403 });
 }
 
-test("upgrade installs this version's k3s and gVisor release beside the one before, then removes that once it is no longer pinned, as no snapshot the gateway says names it, and up after each nothing", async (t) => {
+test("upgrade installs this version's k3s, its gVisor release beside the one before and its stargz-snapshotter in place of the one installed, then removes that gVisor release once it is no longer pinned, as no snapshot the gateway says names it, and up after each nothing", async (t) => {
   const setup = await onHost(t);
   const { env, kube, machine } = setup;
   const handlers = () =>
     [...kube.objects].filter(([path]) => path.startsWith("/apis/node.k8s.io/v1/runtimeclasses/")).map(([, { metadata, handler }]) => `${metadata.name} ${String(handler)}`).sort();
-  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"] });
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0", "20990101.0"], stargz: "v10.0.0" });
   const upgraded = await runAlasio(["upgrade"], { env, machine, releases: newer });
   succeeded(upgraded);
   assert.deepEqual(rootSteps(upgraded), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtimes runsc-21000101-0 and runsc-20990101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "install gVisor 21000101.0 in /usr/local/lib/alasio/gvisor/21000101.0: runsc, containerd-shim-runsc-v1, gvisor-bin",
+    "install stargz-snapshotter v10.0.0, in place of v9.9.0, in /usr/local/bin: containerd-stargz-grpc, stargz-fuse-manager",
     "install k3s v1.100.0+k3s1, in place of v1.99.0+k3s1, in /usr/local/bin, with its own install script, as the systemd service k3s, enabled and started anew",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
   ]);
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/21000101.0/runsc"), "runsc 21000101.0\n");
   assert.equal(machine.read("/usr/local/lib/alasio/gvisor/20990101.0/runsc"), "runsc 20990101.0\n");
   assert.equal(machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
+  assert.equal(machine.read("/usr/local/bin/stargz-fuse-manager"), "stargz-fuse-manager v10.0.0\n");
   assert.deepEqual(handlers(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env, machine, releases: newer })), []);
   assert.equal((await runAlasio(["status"], { env, machine, releases: newer })).printed[0], "k3s v1.100.0+k3s1 on this machine, with gVisor 20990101.0 and 21000101.0:");
 
-  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"] });
+  const latest = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: ["21000101.0"], stargz: "v10.0.0" });
   // A snapshot the gateway says names the release before: kept, though no longer pinned.
   const named: { releases: Record<string, string[]> } = { releases: { "20990101.0": ["alasio-sessions/fs-abc123/s-1"] } };
   await gatewayReleases(t, kube, () => named);
@@ -1383,7 +1388,7 @@ test("upgrade installs this version's k3s and gVisor release beside the one befo
   const pruned = await runAlasio(["upgrade"], { env, machine, releases: latest });
   succeeded(pruned);
   assert.deepEqual(rootSteps(pruned), [
-    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-21000101-0, in /var/lib/rancher/k3s/agent/etc/containerd",
+    "write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc-21000101-0, in /var/lib/rancher/k3s/agent/etc/containerd, and stargz-snapshotter's daemon's, as the service stargz-snapshotter, which k3s's starts",
     "stop the sandboxes of gVisor 20990101.0, which alasio no longer keeps, and remove /usr/local/lib/alasio/gvisor/20990101.0",
     "restart the service k3s, with its new configuration",
     "read its kubeconfig, /etc/rancher/k3s/k3s.yaml, for alasio to reach it",
@@ -1506,32 +1511,54 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
   machine.write(
     "/proc/self/mounts",
-    "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/alasio/workspaces fuse.juicefs rw 0 0\nJuiceFS:workspaces /var/lib/alasio/attach/pod\\040one fuse.juicefs rw 0 0\n",
+    "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/alasio/workspaces fuse.juicefs rw 0 0\nJuiceFS:workspaces /var/lib/alasio/attach/pod\\040one fuse.juicefs rw 0 0\nstargz /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs fuse.rawBridge rw 0 0\n",
   );
   machine.write("/var/lib/alasio/workspaces/main/one/files/file", "data");
   machine.write("/var/lib/alasio/attach/pod one/file", "data");
+  machine.write("/var/lib/containerd-stargz-grpc/stargz/httpcache/layer", "cached");
+  machine.write("/run/containerd-stargz-grpc/fuse-manager.sock", "");
   const storagePath = join(env.XDG_DATA_HOME, "alasio", "storage");
   const run = await alasio(["uninstall", "--purge"], [pressed("y")]);
   succeeded(run);
-  assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s and gVisor themselves\? This cannot be undone/u);
+  assert.match(run.prompts, /Remove alasio and all its data from k3s on this machine, and k3s, gVisor and stargz-snapshotter themselves\? This cannot be undone/u);
   assert.deepEqual(rootSteps(run), [
-    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, and alasio's mounts and directory, /var/lib/alasio",
+    "stop the cluster's gVisor pods, uninstall k3s with k3s-uninstall.sh, which removes its service, /etc/rancher/k3s and its data, and remove what it leaves, its node's password in /etc/rancher/node, gVisor's releases in /usr/local/lib/alasio/gvisor, stargz-snapshotter from /usr/local/bin, " +
+      "stargz-snapshotter's service, its mounts and its images in /var/lib/containerd-stargz-grpc and its sockets in /run/containerd-stargz-grpc, and alasio's mounts and directory, /var/lib/alasio",
     `remove ${storagePath}, the cluster's volumes`,
     `remove ${SYSCTL_FILE}, which raises the inotify limits at every boot`,
   ]);
-  assert.deepEqual(machine.commands().slice(-4), [
+  assert.deepEqual(machine.commands().slice(-6), [
     "systemctl stop k3s",
     "/usr/local/bin/k3s-uninstall.sh",
+    "umount --lazy /var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs",
     "umount --lazy /var/lib/alasio/workspaces",
     "umount --lazy /var/lib/alasio/attach/pod one",
+    "systemctl daemon-reload",
   ]);
-  for (const path of ["/usr/local/bin/k3s", "/usr/local/lib/alasio", "/etc/rancher", "/var/lib/rancher", "/var/lib/alasio", SYSCTL_FILE]) {
+  // The daemon stopped with k3s; its FUSE manager, which outlives it, is stopped by alasio.
+  assert.deepEqual(machine.killed.at(-1), ["/usr/local/bin/stargz-fuse-manager"]);
+  const removed = [
+    "/usr/local/bin/k3s",
+    "/usr/local/lib/alasio",
+    "/usr/local/bin/containerd-stargz-grpc",
+    "/usr/local/bin/stargz-fuse-manager",
+    "/etc/systemd/system/stargz-snapshotter.service",
+    "/etc/systemd/system/k3s.service.d",
+    "/etc/containerd-stargz-grpc",
+    "/var/lib/containerd-stargz-grpc",
+    "/run/containerd-stargz-grpc",
+    "/etc/rancher",
+    "/var/lib/rancher",
+    "/var/lib/alasio",
+    SYSCTL_FILE,
+  ];
+  for (const path of removed) {
     assert.ok(!machine.has(path), `${path} is left`);
   }
   assert.ok(!existsSync(storagePath));
   assert.ok(!existsSync(join(configFile, "..", "kubeconfig")));
   assert.ok(existsSync(configFile));
-  assert.equal(run.printed.at(-1), `alasio and k3s on this machine are removed, with gVisor and all their data; the config at ${configFile} is kept.`);
+  assert.equal(run.printed.at(-1), `alasio and k3s on this machine are removed, with gVisor, stargz-snapshotter and all their data; the config at ${configFile} is kept.`);
   const status = await alasio(["status"]);
   assert.equal(failure(status), "there is no k3s on this machine yet: alasio up installs it");
   assert.deepEqual(status.printed, ["k3s on this machine:", "  not installed"]);

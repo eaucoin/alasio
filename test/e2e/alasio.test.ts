@@ -3062,7 +3062,13 @@ const INSTALLED_HERE = [
   "/usr/local/bin/k3s",
   "/usr/local/bin/k3s-uninstall.sh",
   "/usr/local/lib/alasio",
+  "/usr/local/bin/containerd-stargz-grpc",
+  "/usr/local/bin/stargz-fuse-manager",
   "/etc/systemd/system/k3s.service",
+  "/etc/systemd/system/k3s.service.d",
+  "/etc/systemd/system/stargz-snapshotter.service",
+  "/etc/containerd-stargz-grpc",
+  "/var/lib/containerd-stargz-grpc",
   "/etc/rancher",
   "/var/lib/rancher",
   "/var/lib/kubelet",
@@ -3076,7 +3082,7 @@ describe("alasio uninstall --purge", { skip: KEEP && "the run keeps the cluster"
     assert.equal(
       await alasioOk("uninstall", "--purge", "--yes"),
       TARGET === "host"
-        ? `alasio and k3s on this machine are removed, with gVisor and all their data; the config at ${configFile} is kept.\n`
+        ? `alasio and k3s on this machine are removed, with gVisor, stargz-snapshotter and all their data; the config at ${configFile} is kept.\n`
         : `alasio and the cluster ${CLUSTER} are removed, with all their data; the config at ${configFile} is kept.\n`,
     );
     assert.ok(!existsSync(storage), `${storage} is left`);

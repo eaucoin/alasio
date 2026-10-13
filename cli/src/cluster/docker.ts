@@ -36,8 +36,8 @@ import {
   awaitReady as waitFor,
   clusterKubeconfig,
   type ClusterNotReady,
+  containerdFiles,
   gvisorRuntimeClasses,
-  gvisorRuntimeFiles,
   type HostAlias,
   KUBELET_ARGS,
   nodeHostsWith,
@@ -50,6 +50,7 @@ import {
   writeKubeconfig,
 } from "./k3s.ts";
 import { gvisorReleases, NODE_PINS } from "./node.ts";
+import { STARGZ_ROOT, stargzConfig } from "./stargz.ts";
 import { tarArchive, type TarEntry } from "./tar.ts";
 
 /** A path of this machine mounted in every node, at `target`. */
@@ -165,6 +166,7 @@ const NODE_VOLUMES = [
   ["log", "/var/log"],
   // The snapshots of sandboxes gVisor saves whole, which the node restores them from.
   ["snapshots", SNAPSHOT_CACHE_DIR],
+  ["stargz", STARGZ_ROOT],
 ] as const;
 
 /** The API server's port in the server node. */
@@ -175,6 +177,8 @@ const K3S_KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
 const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
 /** The variable the node image's entrypoint writes k3s's registries.yaml from, before k3s starts. */
 const REGISTRIES_ENV = "ALASIO_REGISTRIES";
+/** The variable the node image's entrypoint writes stargz-snapshotter's daemon's configuration from, before it starts it. */
+const STARGZ_CONFIG_ENV = "ALASIO_STARGZ_CONFIG";
 
 /** The `index`th address of the IPv4 subnet `cidr` (a.b.c.d/n), its network address the 0th; null when it has no such host address. */
 export function subnetAddress(cidr: string, index: number): string | null {
@@ -232,8 +236,11 @@ const ABORT_FUSE = [
   "done",
 ].join("\n");
 
-/** kubelet's settings, as k3s's flags give them. */
-const kubeletArgs = KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`);
+/**
+ * What every node's k3s is given: kubelet's settings, and no snapshotter, as containerd's
+ * files in its container say stargz-snapshotter's daemon's (./stargz.ts).
+ */
+const nodeArgs = [...KUBELET_ARGS.map((arg) => `--kubelet-arg=${arg}`), "--snapshotter="];
 
 /** A digest of `spec` and the `files` put into its container that two share only when they are the same. */
 const specHash = (spec: ContainerCreate, files: ReadonlyMap<string, string>): string => createHash("sha256").update(JSON.stringify([spec, [...files]])).digest("hex");
@@ -275,18 +282,19 @@ const makeDockerCluster = Effect.fnUntraced(function*({
 
   const unusable = (reason: string) => new ClusterUnusable({ cluster, reason });
 
-  /** The files that make each gVisor release the node image holds a runtime of containerd's, in every node. */
-  const files = gvisorRuntimeFiles(gvisor, { systemd: false });
+  /** containerd's files, which pull through stargz-snapshotter's daemon and make each gVisor release the node image holds a runtime, in every node. */
+  const files = containerdFiles(gvisor, { systemd: false });
 
   /**
    * The container of `node`, with what every node has: privileged, as k3s in Docker needs,
-   * its volumes, the storage directory and the host mounts, and the registries.
+   * its volumes, the storage directory and the host mounts, the registries, and
+   * stargz-snapshotter's daemon's configuration.
    */
   const nodeContainer = (node: string, role: NodeRole, address: string, command: readonly string[], env: readonly string[]): ContainerCreate => ({
     Image: image,
     Hostname: node,
     Cmd: command,
-    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : [])],
+    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : []), `${STARGZ_CONFIG_ENV}=${stargzConfig(registries)}`],
     Labels: { ...labels, [ROLE_LABEL]: role },
     ...(role === "server" ? { ExposedPorts: { [API_PORT]: {} } } : {}),
     HostConfig: {
@@ -439,7 +447,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
         // Where the kubeconfig reaches it.
         "--tls-san=127.0.0.1",
         `--default-local-storage-path=${storagePath}`,
-        ...kubeletArgs,
+        ...nodeArgs,
       ], []),
     );
     yield* awaitReady("its API server", kubectl(["get", "--raw=/readyz"]));
@@ -448,7 +456,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
       for (const [index, agent] of nodes.slice(1).entries()) {
         yield* ensureNode(
           agent,
-          nodeContainer(agent, "agent", yield* nodeAddress(networkSubnet, 1 + index), ["agent", ...kubeletArgs], [
+          nodeContainer(agent, "agent", yield* nodeAddress(networkSubnet, 1 + index), ["agent", ...nodeArgs], [
             `K3S_URL=https://${server}:${K3S_PORT}`,
             `K3S_TOKEN=${token}`,
           ]),

@@ -10,8 +10,9 @@ import { Effect, Layer, Logger } from "effect";
 
 import { DockerEngine } from "../src/cluster/docker-engine.ts";
 import { DockerCluster, type DockerClusterOptions, freeSubnet, subnetAddress } from "../src/cluster/docker.ts";
-import { gvisorRuntimeClasses, gvisorRuntimeFiles } from "../src/cluster/k3s.ts";
+import { containerdFiles, gvisorRuntimeClasses } from "../src/cluster/k3s.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
+import { stargzConfig } from "../src/cluster/stargz.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { type FakeK3s, K3S_TOKEN, serveK3sInDocker } from "./support/fake-k3s.ts";
 
@@ -99,6 +100,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
     "POST /volumes/create",
     "POST /volumes/create",
     "POST /volumes/create",
+    "POST /volumes/create",
     "POST /containers/create",
     "PUT /containers/dev-server-0/archive",
     "POST /containers/dev-server-0/start",
@@ -110,7 +112,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
     IPAM: { Config: [{ Subnet: "172.30.9.0/24" }] },
     Labels: { "alasio.cluster": "dev" },
   });
-  assert.deepEqual([...fake.volumes.keys()], ["dev-server-0-k3s", "dev-server-0-kubelet", "dev-server-0-cni", "dev-server-0-log", "dev-server-0-snapshots"]);
+  assert.deepEqual([...fake.volumes.keys()], ["dev-server-0-k3s", "dev-server-0-kubelet", "dev-server-0-cni", "dev-server-0-log", "dev-server-0-snapshots", "dev-server-0-stargz"]);
 
   const { Labels, ...server } = sent(fake, "POST", "/containers/create") as { Labels: Record<string, string> };
   assert.equal(Labels["alasio.cluster"], "dev");
@@ -130,8 +132,10 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       "--kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%",
       "--kubelet-arg=image-gc-high-threshold=98",
       "--kubelet-arg=image-gc-low-threshold=95",
+      // No snapshotter of k3s's: the node image's template says stargz-snapshotter's daemon's.
+      "--snapshotter=",
     ],
-    Env: [],
+    Env: [`ALASIO_STARGZ_CONFIG=${stargzConfig()}`],
     ExposedPorts: { "6443/tcp": {} },
     HostConfig: {
       Privileged: true,
@@ -146,6 +150,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
         { Type: "volume", Source: "dev-server-0-cni", Target: "/var/lib/cni" },
         { Type: "volume", Source: "dev-server-0-log", Target: "/var/log" },
         { Type: "volume", Source: "dev-server-0-snapshots", Target: "/var/lib/alasio/snapshots" },
+        { Type: "volume", Source: "dev-server-0-stargz", Target: "/var/lib/containerd-stargz-grpc" },
         { Type: "bind", Source: options.storagePath, Target: options.storagePath },
       ],
       ExtraHosts: ["otelcol.observability:172.30.9.250"],
@@ -157,7 +162,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
 
   assert.equal(k3s.nodeHosts, "172.30.9.2 dev-server-0\n172.30.9.250 otelcol.observability");
   assert.deepEqual(k3s.patches, [{ metadata: { resourceVersion: "1" }, data: { NodeHosts: k3s.nodeHosts } }]);
-  assert.deepEqual(fake.containers.get("dev-server-0")?.files, new Map([...gvisorRuntimeFiles(gvisorReleases(NODE_PINS), { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+  assert.deepEqual(fake.containers.get("dev-server-0")?.files, new Map([...containerdFiles(gvisorReleases(NODE_PINS), { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
   assert.deepEqual(k3s.applied, [{ apiVersion: "v1", kind: "List", items: gvisorRuntimeClasses(gvisorReleases(NODE_PINS)) }]);
 
   assert.equal(statSync(kubeconfig).mode & 0o777, 0o600);
@@ -203,13 +208,14 @@ test("up makes a node made from other settings anew, keeping its volumes", async
     "POST /volumes/create",
     "POST /volumes/create",
     "POST /volumes/create",
+    "POST /volumes/create",
     "POST /containers/create",
     "PUT /containers/dev-server-0/archive",
     "POST /containers/dev-server-0/start",
   ]);
   const { HostConfig } = sent(fake, "POST", "/containers/create") as { HostConfig: { Mounts: unknown[] } };
   assert.deepEqual(HostConfig.Mounts.at(-1), { Type: "bind", Source: "/home", Target: "/home", ReadOnly: false });
-  assert.equal(fake.volumes.size, 5);
+  assert.equal(fake.volumes.size, 6);
 });
 
 test("up makes the nodes anew when the gVisor releases change, with their files put in before they start, and replaces their RuntimeClasses", async (t) => {
@@ -234,7 +240,7 @@ test("up makes the nodes anew when the gVisor releases change, with their files 
     "POST /containers/dev-agent-0/start",
   ]);
   for (const node of ["dev-server-0", "dev-agent-0"]) {
-    assert.deepEqual(fake.containers.get(node)?.files, new Map([...gvisorRuntimeFiles(releases, { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
+    assert.deepEqual(fake.containers.get(node)?.files, new Map([...containerdFiles(releases, { systemd: false })].map(([path, content]) => [path, Buffer.from(content)])));
   }
   assert.deepEqual(runtimeClasses(), ["gvisor runsc-21000101-0", "gvisor-20990101-0 runsc-20990101-0", "gvisor-21000101-0 runsc-21000101-0"]);
 
@@ -256,7 +262,7 @@ test("agents join the server with the token it made, at the addresses after it, 
     NetworkingConfig: unknown;
   };
   assert.equal(agent.Cmd[0], "agent");
-  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`]);
+  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`, `ALASIO_STARGZ_CONFIG=${stargzConfig()}`]);
   assert.equal(agent.Labels["alasio.role"], "agent");
   assert.equal(agent.ExposedPorts, undefined);
   assert.equal(agent.HostConfig.PortBindings, undefined);
@@ -350,7 +356,7 @@ test("remove aborts the FUSE connections of each running node's mounts, deletes 
   assert.deepEqual(k3s.aborted, ["dev-server-0"]);
   assert.equal(fake.containers.size, 0);
   assert.equal(fake.networks.size, 0);
-  assert.equal(fake.volumes.size, 11);
+  assert.equal(fake.volumes.size, 13);
   await run((cluster) => cluster.remove({ volumes: true }));
   assert.deepEqual([...fake.volumes.keys()], ["unrelated"]);
 });
@@ -401,6 +407,9 @@ test("every node is made with the registries, as k3s's registries.yaml, and made
     ["dev-server-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
     ["dev-agent-0", [`ALASIO_REGISTRIES={"mirrors":{"registry.example:5000":{"endpoint":["http://registry.example:5000"]}},"configs":{}}`]],
   ]);
+  // stargz-snapshotter's daemon reads layers through the mirror too.
+  const created = fake.requests.find(({ path }) => path === "/containers/create")?.body as { Env: string[] };
+  assert.ok(created.Env.includes(`ALASIO_STARGZ_CONFIG=${stargzConfig(registries)}`));
 
   const changes = fake.changes().length;
   await run((cluster) => cluster.up(kubeconfig), { agents: 1, registries: { ...registries, configs: { "registry.example:5000": { tls: { insecureSkipVerify: true } } } } });
