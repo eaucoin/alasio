@@ -22,7 +22,7 @@ import { NeonRolloutStore } from "../../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, kube, lakeQuery, ref, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
-import { type BranchesFile, type BranchView, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
+import { type Branch, type BranchView, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
 import { signToken } from "../control/jwt.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
@@ -123,10 +123,16 @@ const inControl = async (command: readonly string[]) => kube.execOk(NAMESPACE, a
 /** The tenant of alasio's timelines; set by the suite's first hook. */
 let tenantId: string;
 
+/** The branches as neon-control recorded them, in the storage controller's Postgres, read there. */
+async function recorded(): Promise<Branch[]> {
+  const pod = `${neonName("controller-db")}-0`;
+  const rows = await kube.execOk(NAMESPACE, pod, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", "select branch from neon_control.branches"], { container: "postgres" });
+  return rows.trim().split("\n").filter(Boolean).map((row) => JSON.parse(row) as Branch);
+}
+
 /** Main's timeline, as neon-control recorded it once the stack was up, and where it is placed. */
 async function record(): Promise<{ tenantId: string; timelineId: string; safekeepers: ReadyBranch["safekeepers"] }> {
-  const { branches }: BranchesFile = JSON.parse(await inControl(["cat", "/state/branches.json"]));
-  const main = branches.find((branch): branch is ReadyBranch => branch.name === MAIN && branch.state === "ready");
+  const main = (await recorded()).find((branch): branch is ReadyBranch => branch.name === MAIN && branch.state === "ready");
   assert.ok(main, "neon-control has recorded main");
   return { tenantId, timelineId: main.timelineId, safekeepers: main.safekeepers };
 }

@@ -1,6 +1,8 @@
 /**
  * neon-control: alasio's small stand-in for Neon's control plane, the one part
- * of Neon that is not open source. Runs as a service of the stack.
+ * of Neon that is not open source. Runs as a service of the stack, as many replicas as
+ * its scale says, which share its record of the branches in the storage controller's
+ * Postgres (./record.ts).
  *
  * On start it bootstraps what the storage services need and cannot do
  * themselves, idempotently: registers the safekeepers with the storage
@@ -8,8 +10,9 @@
  * and its timeline, the branch `main`, once, and configures the tenant to keep
  * a day of history (HISTORY_DAYS). It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
- * compute its spec, answers the storage controller's compute hooks, repairs
- * every branch's safekeepers, and reports healthy once main's compute can start.
+ * compute its spec, from the record, or as last read while the record cannot be, answers
+ * the storage controller's compute hooks, and reports healthy once main's compute can
+ * start. The replica that leads (./record.ts) repairs every branch's safekeepers.
  *
  * A compute fetches its spec as Neon's compute_ctl does from a control plane
  * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with its
@@ -43,16 +46,19 @@
  *   one with branches of its own; 409 while the storage controller is still
  *   deleting it, and 503 when it did not, when it is asked again.
  *
+ * 503, `{ error }`, too, for a lock of the record another replica held for longer than its
+ * patience (./record.ts), when it may be asked again.
+ *
  * A branch answered is `{ name, parent, timelineId, lsn, createdAt, state,
  * safekeepers?, computeId }`, its state `creating`, `ready` or `deleting`.
  *
  * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
- * the order of their ids, comma-separated; and NEON_PAGESERVER_HOST. Mounts:
- * /secrets (secrets.json, the signing key), /keys (the public key), /state (its
- * record of the branches, branches.json).
+ * the order of their ids, comma-separated; NEON_PAGESERVER_HOST; and NEON_CONTROLLER_DB_HOST,
+ * the storage controller's Postgres, which its record is in. Mounts: /secrets
+ * (secrets.json, the signing key), /keys (the public key).
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import {
@@ -63,7 +69,6 @@ import {
   branchPoint,
   branchRequest,
   type BranchRequest,
-  type BranchesFile,
   branchView,
   callScopes,
   type ComputeStack,
@@ -84,6 +89,7 @@ import {
   withoutBranch,
 } from "./branches.ts";
 import { bearsScope, publicJwks, signToken } from "./jwt.ts";
+import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { ROLE, type StackSecrets } from "./secrets.ts";
 
 /** A call to the storage controller. */
@@ -116,15 +122,19 @@ interface TimelineStatus {
   mconf: unknown;
 }
 
-const CONTROLLER_URL = process.env["CONTROLLER_URL"];
-const PG_VERSION = 17;
-const SAFEKEEPER_HOSTS = (process.env["NEON_SAFEKEEPER_HOSTS"] ?? "").split(",").map((host) => host.trim()).filter(Boolean);
-const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
-const PAGESERVER_HOST = process.env["NEON_PAGESERVER_HOST"];
-const STATE = "/state/branches.json";
-if (!CONTROLLER_URL || SAFEKEEPER_HOSTS.length === 0 || !PAGESERVER_HOST) {
-  throw new Error("CONTROLLER_URL, NEON_SAFEKEEPER_HOSTS and NEON_PAGESERVER_HOST must be set");
+/** The environment variable `name`, which must be set. */
+function setting(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} must be set`);
+  return value;
 }
+
+const CONTROLLER_URL = setting("CONTROLLER_URL");
+const PG_VERSION = 17;
+const SAFEKEEPER_HOSTS = setting("NEON_SAFEKEEPER_HOSTS").split(",").map((host) => host.trim()).filter(Boolean);
+const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
+const PAGESERVER_HOST = setting("NEON_PAGESERVER_HOST");
+const CONTROLLER_DB_HOST = setting("NEON_CONTROLLER_DB_HOST");
 
 // Written by the setup job (./kube-setup.ts).
 const secrets: StackSecrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
@@ -133,7 +143,12 @@ const publicKeyPem = readFileSync("/keys/auth_public_key.pem", "utf8");
 // The storage controller's /control and /debug APIs take the admin scope.
 const adminToken = signToken(privateKeyPem, "admin");
 const safekeeperToken = signToken(privateKeyPem, "safekeeperdata");
-const REPAIR_INTERVAL_MS = 30_000;
+/** How often the replica that leads repairs safekeepers. */
+const LEAD_INTERVAL_MS = 30_000;
+/** How long a call of the storage controller may take: longer than its own waits for the pageserver. */
+const CONTROLLER_PATIENCE_MS = 120_000;
+/** How long a call of a safekeeper may take. */
+const SAFEKEEPER_PATIENCE_MS = 30_000;
 
 /** What every branch's compute spec shares. */
 const stack: ComputeStack = {
@@ -144,6 +159,10 @@ const stack: ComputeStack = {
   storageAuthToken: signToken(privateKeyPem, "tenant", secrets.tenantId),
   jwks: publicJwks(publicKeyPem),
 };
+
+const record = new BranchRecord(
+  `postgresql://storage_controller:${encodeURIComponent(secrets.controllerDbPassword)}@${CONTROLLER_DB_HOST}:5432/storage_controller`,
+);
 
 let ready = false;
 
@@ -168,6 +187,7 @@ async function controller<Body = unknown>(
       ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(CONTROLLER_PATIENCE_MS),
   });
   const text = await response.text();
   if (!response.ok && !allow.includes(response.status)) {
@@ -188,33 +208,6 @@ async function until<T>(what: string, check: () => Promise<T>, { attempts = 300,
     if (attempt === attempts) throw new Error(`gave up waiting for ${what}`);
     await sleep(delayMs);
   }
-}
-
-function writeAtomically(path: string, value: unknown): void {
-  writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
-}
-
-/** The branches, as recorded: this service's own record (save), or none yet. */
-let branches: Branch[] = existsSync(STATE) ? (JSON.parse(readFileSync(STATE, "utf8")) as BranchesFile).branches : [];
-
-/** Records `next` as the branches. */
-function save(next: Branch[]): void {
-  const file: BranchesFile = { branches: next };
-  writeAtomically(STATE, file);
-  branches = next;
-}
-
-let queue: Promise<unknown> = Promise.resolve();
-
-/**
- * Runs `work` once all work queued before it has run: what changes branches, and the
- * repairs, which must not pull back a timeline whose deletion has begun.
- */
-function serially<T>(work: () => Promise<T>): Promise<T> {
-  const done = queue.then(work);
-  queue = done.catch(() => {});
-  return done;
 }
 
 async function registerSafekeepers(): Promise<void> {
@@ -256,7 +249,7 @@ async function ensureTenant(): Promise<void> {
 }
 
 /** Creates main's timeline once, bootstrapped, recording the safekeepers it was placed on. */
-async function ensureMain(): Promise<void> {
+async function ensureMain({ branches, save }: Changing): Promise<void> {
   if (branchNamed(branches, MAIN)?.state === "ready") return;
   const created = await controller<TimelineCreated>("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
     body: { new_timeline_id: secrets.timelineId, pg_version: PG_VERSION },
@@ -264,7 +257,7 @@ async function ensureMain(): Promise<void> {
   const main = { name: MAIN, parent: null, timelineId: secrets.timelineId, lsn: null, createdAt: new Date().toISOString(), compute: null };
   // A timeline created is answered with its description.
   const safekeepers = placementOf(main, null, created.body!);
-  save(withBranch(branches, { ...main, state: "ready", safekeepers }));
+  await save(withBranch(branches, { ...main, state: "ready", safekeepers }));
   log("timeline created", { branch: MAIN, timelineId: secrets.timelineId, safekeepers });
 }
 
@@ -280,11 +273,11 @@ async function endOf(parent: Branch): Promise<string> {
  * not yet created is recorded first, with its timeline id and branch point, so that
  * asking again asks the storage controller for the same timeline, which it creates once.
  */
-async function createBranch(request: BranchRequest): Promise<{ status: number; branch: Branch }> {
-  const existing = existingBranch(branches, request);
+async function createBranch(changing: Changing, request: BranchRequest): Promise<{ status: number; branch: Branch }> {
+  const existing = existingBranch(changing.branches, request);
   if (existing?.state === "ready") return { status: 200, branch: existing };
   // Checked by existingBranch: a branch's parent is there, and a new one's ready.
-  const parent = branchNamed(branches, request.parent)!;
+  const parent = branchNamed(changing.branches, request.parent)!;
   let branch = existing;
   if (!branch) {
     const lsn = request.lsn ?? (await endOf(parent).catch((error: unknown) => {
@@ -299,7 +292,7 @@ async function createBranch(request: BranchRequest): Promise<{ status: number; b
       compute: request.compute,
       state: "creating",
     };
-    save(withBranch(branches, branch));
+    await changing.save(withBranch(changing.branches, branch));
   }
   const created = await controller<TimelineCreated>("POST", `/v1/tenant/${secrets.tenantId}/timeline`, {
     body: { new_timeline_id: branch.timelineId, ancestor_timeline_id: parent.timelineId, ancestor_start_lsn: branch.lsn },
@@ -310,26 +303,26 @@ async function createBranch(request: BranchRequest): Promise<{ status: number; b
   if (created.status === 406 || created.status === 409) {
     const refusal = creationRefused(branch, created.status, JSON.stringify(created.body));
     // Refused for its branch point, nothing was created, and asking again would be refused again.
-    if (refusal.status === 406) save(withoutBranch(branches, branch.name));
+    if (refusal.status === 406) await changing.save(withoutBranch(changing.branches, branch.name));
     throw refusal;
   }
   const placed: ReadyBranch = { ...branch, state: "ready", safekeepers: placementOf(branch, parent.timelineId, created.body!) };
-  save(withBranch(branches, placed));
+  await changing.save(withBranch(changing.branches, placed));
   log("branch created", { branch: placed.name, parent: placed.parent, timelineId: placed.timelineId, lsn: placed.lsn, safekeepers: placed.safekeepers });
   return { status: 201, branch: placed };
 }
 
 /** Deletes the branch `name`'s timeline, and then its record. */
-async function deleteBranch(name: string): Promise<void> {
-  save(deleting(branches, name));
+async function deleteBranch(changing: Changing, name: string): Promise<void> {
+  await changing.save(deleting(changing.branches, name));
   // Checked by deleting: the branch is there.
-  const { timelineId } = branchNamed(branches, name)!;
+  const { timelineId } = branchNamed(changing.branches, name)!;
   const deleted = await controller("DELETE", `/v1/tenant/${secrets.tenantId}/timeline/${timelineId}`, { allow: [409] }).catch((error: unknown) => {
     throw new BranchError(503, `the storage controller did not delete ${name}, which may be deleted again: ${errorText(error)}`);
   });
   // The storage controller waits a while for the pageserver, and answers 409 if it is not done by then.
   if (deleted.status === 409) throw new BranchError(409, `the storage controller is still deleting ${name}, which may be deleted again`);
-  save(withoutBranch(branches, name));
+  await changing.save(withoutBranch(changing.branches, name));
   log("branch deleted", { branch: name, timelineId });
 }
 
@@ -342,6 +335,7 @@ async function safekeeper<Body = unknown>(sk: Safekeeper, method: string, path: 
       ...(body === undefined ? {} : { "content-type": "application/json" }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(SAFEKEEPER_PATIENCE_MS),
   });
   const text = await response.text();
   const parsed: Body | null = text ? JSON.parse(text) : null;
@@ -363,7 +357,10 @@ interface HealthySafekeeper {
 /**
  * A safekeeper that lost its disk comes back without the branch's timeline, and
  * in membership mode does not recreate it: it pulls it from the peers that have
- * it, joining the timeline's current membership.
+ * it, joining the timeline's current membership. Each pull is made holding the lock of
+ * changes, the branch found ready under it, so none pulls back a timeline whose deletion
+ * has begun; while another holds the lock, the pull waits for the next round. What only
+ * asks the safekeepers takes no lock.
  */
 async function repairSafekeepers(branch: ReadyBranch): Promise<void> {
   const placed = SAFEKEEPERS.filter((sk) => branch.safekeepers.ids.includes(sk.id));
@@ -374,13 +371,21 @@ async function repairSafekeepers(branch: ReadyBranch): Promise<void> {
   const healthy = states.filter((entry): entry is HealthySafekeeper => entry.state?.status === 200);
   for (const { sk, state } of states) {
     if (state?.status !== 404 || healthy.length === 0) continue;
-    const pulled = await safekeeper(sk, "POST", "/v1/pull_timeline", {
-      tenant_id: secrets.tenantId,
-      timeline_id: branch.timelineId,
-      http_hosts: healthy.map(({ sk: peer }) => `http://${peer.host}:${peer.httpPort}`),
-      // Not empty: checked above.
-      mconf: healthy[0]!.state.body.mconf,
+    const held = await record.tryChanging(({ branches }) => {
+      if (branchNamed(branches, branch.name)?.state !== "ready") return Promise.resolve(null);
+      return safekeeper(sk, "POST", "/v1/pull_timeline", {
+        tenant_id: secrets.tenantId,
+        timeline_id: branch.timelineId,
+        http_hosts: healthy.map(({ sk: peer }) => `http://${peer.host}:${peer.httpPort}`),
+        // Not empty: checked above.
+        mconf: healthy[0]!.state.body.mconf,
+      });
     });
+    const pulled = held?.value;
+    if (!pulled) {
+      log("safekeeper repair put off", { branch: branch.name, safekeeper: sk.id, why: held ? "the branch is no longer ready" : "the lock of changes is held" });
+      continue;
+    }
     log(pulled.status === 200 ? "safekeeper repaired from its peers" : "safekeeper repair failed", {
       branch: branch.name,
       safekeeper: sk.id,
@@ -390,16 +395,61 @@ async function repairSafekeepers(branch: ReadyBranch): Promise<void> {
   }
 }
 
-/** Repairs the safekeepers of every ready branch, each where its timeline is placed. */
-async function repairEverySafekeeper(): Promise<void> {
+/** Repairs the safekeepers of every ready branch of `branches`, each where its timeline is placed. */
+async function repairEverySafekeeper(branches: readonly Branch[]): Promise<void> {
   for (const branch of branches) {
     if (branch.state !== "ready") continue;
     await repairSafekeepers(branch).catch((error: unknown) => log("safekeeper check failed", { branch: branch.name, error: errorText(error) }));
   }
 }
 
+/** Whether this replica led at its last round, which it says when that changes. */
+let led = false;
+/** Whether a round of leading is under way: one never starts beside another. */
+let leading = false;
+
+/** What the replica that leads does, now and then: each branch's safekeepers repaired. */
+async function lead(): Promise<void> {
+  if (leading) return;
+  leading = true;
+  try {
+    const leads = await record.leads();
+    if (leads !== led) log(leads ? "leading" : "no longer leading");
+    led = leads;
+    if (!leads) return;
+    await repairEverySafekeeper(await record.branches());
+  } finally {
+    leading = false;
+  }
+}
+
+/** The branches as last read: what serves the computes their specs while the record cannot be read. */
+let lastRead: Branch[] | null = null;
+/** Until when the record is not asked again, having failed to be read: each lookup meanwhile answers at once. */
+let unreadUntil = 0;
+/** How long the record is let be once it could not be read. */
+const UNREAD_PAUSE_MS = 30_000;
+
+/**
+ * The branches, as recorded now, or, while the record cannot be read, as last read: once a
+ * read fails, the record is not asked again for UNREAD_PAUSE_MS, so no lookup meanwhile
+ * waits for a connection that fails.
+ */
+async function knownBranches(): Promise<Branch[]> {
+  if (lastRead !== null && Date.now() < unreadUntil) return lastRead;
+  try {
+    lastRead = await record.branches();
+  } catch (error) {
+    if (lastRead === null) throw error;
+    unreadUntil = Date.now() + UNREAD_PAUSE_MS;
+    log("the record was not read; answering from the last read", { error: errorText(error) });
+  }
+  return lastRead;
+}
+
 async function bootstrap(): Promise<void> {
   await until("the storage controller", async () => (await controller("GET", "/status")).status === 200);
+  await record.ensureSchema();
   await registerSafekeepers();
   await until("the pageserver to register", async () => {
     // The controller answers with its nodes; a failure here is retried.
@@ -407,19 +457,18 @@ async function bootstrap(): Promise<void> {
     return nodes.some((node) => node.id === 1 && node.availability === "Active");
   });
   await ensureTenant();
-  await serially(async () => {
-    await ensureMain();
-    await repairEverySafekeeper();
-  });
+  await record.changing(ensureMain);
+  lastRead = await record.branches();
   ready = true;
   log("ready");
-  setInterval(() => void serially(repairEverySafekeeper), REPAIR_INTERVAL_MS).unref();
+  const round = () => lead().catch((error: unknown) => log("leading failed", { error: errorText(error) }));
+  void round();
+  setInterval(() => void round(), LEAD_INTERVAL_MS).unref();
 }
 
 /** Whether the request bears a token of a scope its call is taken with (callScopes). */
 const authorized = (request: IncomingMessage): boolean =>
   bearsScope(publicKeyPem, request.headers.authorization, ...callScopes(request.method ?? "", request.url ?? ""));
-
 
 /** The request's body, parsed as JSON. */
 async function jsonBody(request: IncomingMessage): Promise<unknown> {
@@ -451,13 +500,14 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   const spec = method === "GET" ? SPEC.exec(url) : null;
   if (spec) {
+    // Until bootstrapped there is no spec yet, nor perhaps a record; compute_ctl retries,
+    // and then its container is restarted.
+    if (!ready) return answer(response, 503);
     // A compute's token is its own: main's the stack's, a branch's the one it was created with.
     const id = decodeURIComponent(spec[1] ?? "");
+    const branches = await knownBranches();
     const holder = computeOfToken(branches, request.headers.authorization, secrets.computeControlToken);
     if (holder === null) return answer(response, 401);
-    // Until bootstrapped there is no spec yet; compute_ctl retries, and then
-    // its container is restarted.
-    if (!ready) return answer(response, 503);
     if (holder !== id) return answer(response, 403, { error: `the token is not the compute ${id}'s` });
     const branch = branchOfCompute(branches, id);
     if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
@@ -479,25 +529,26 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     // A timeline's safekeepers migrated, which alasio never starts itself: the branch's
     // spec and repairs follow them from now on, and its compute at its next start.
     const notified = safekeepersNotified(await jsonBody(request));
-    await serially(async () => {
+    await record.changing(async ({ branches, save }) => {
       const next = withNotifiedPlacement(branches, notified);
-      if (next) save(next);
+      if (next) await save(next);
       log("compute hook /notify-safekeepers", { timelineId: notified.timelineId, placement: notified.placement, recorded: next !== null });
     });
     return answer(response, 200);
   }
-  if (method === "GET") return answer(response, 200, { branches: branches.map(branchView) });
+  if (method === "GET") return answer(response, 200, { branches: (await record.branches()).map(branchView) });
   if (method === "POST") {
     const asked = branchRequest(await jsonBody(request));
-    const { status, branch: created } = await serially(() => createBranch(asked));
+    const { status, branch: created } = await record.changing((changing) => createBranch(changing, asked));
     return answer(response, status, branchView(created));
   }
-  await serially(() => deleteBranch(decodeURIComponent(branch?.[1] ?? "")));
+  await record.changing((changing) => deleteBranch(changing, decodeURIComponent(branch?.[1] ?? "")));
   return answer(response, 204);
 }
 
 const server = createServer((request, response) => {
   route(request, response).catch((error: unknown) => {
+    if (error instanceof RecordBusy) return answer(response, 503, { error: errorText(error) });
     if (!(error instanceof BranchError)) log("request failed", { method: request.method, url: request.url, error: errorText(error) });
     answer(response, error instanceof BranchError ? error.status : 500, { error: errorText(error) });
   });
@@ -505,7 +556,7 @@ const server = createServer((request, response) => {
 server.listen(8080, "0.0.0.0", () => log("listening", { port: 8080 }));
 
 // As PID 1 in its container, Node would otherwise ignore the SIGTERM that stops it.
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
+process.on("SIGTERM", () => server.close(() => void record.end().finally(() => process.exit(0))));
 
 bootstrap().catch((error: unknown) => {
   log("bootstrap failed", { error: errorText(error) });

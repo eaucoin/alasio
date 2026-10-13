@@ -76,11 +76,6 @@ export type Branch = BranchFields & ({ state: "creating" | "deleting" } | { stat
 /** A branch whose timeline is placed, which its compute can run on. */
 export type ReadyBranch = Extract<Branch, { state: "ready" }>;
 
-/** What neon-control keeps in its state file. */
-export interface BranchesFile {
-  branches: Branch[];
-}
-
 /** A branch asked for: its name, its parent, its branch point (the parent's end if not given), and its compute's credentials. */
 export interface BranchRequest {
   name: string;

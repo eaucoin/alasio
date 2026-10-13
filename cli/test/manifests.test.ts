@@ -289,8 +289,8 @@ describe("alasio", () => {
       { name: "alasio-home", mountPath: "/var/lib/alasio/home" },
     ]);
     assert.deepEqual(spec?.volumes?.filter(({ name }) => name === "state" || name === "alasio-home"), [{ name: "state", emptyDir: {} }, { name: "alasio-home", emptyDir: {} }]);
-    // Of the stack's alone: neon-control's, and the volume the filer store's backups are kept on.
-    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-neon-control", "alasio-seaweedfs-filer-store-backups"]);
+    // Of the stack's alone: the volume the filer store's backups are kept on.
+    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-seaweedfs-filer-store-backups"]);
     assert.equal(spec?.securityContext?.runAsNonRoot, true);
   });
 
@@ -401,6 +401,16 @@ describe("neon", () => {
     // Main's, whose spec neon-control serves under the id it has always had.
     const args = container(compute).args ?? [];
     assert.equal(args[args.indexOf("--compute-id") + 1], "alasio");
+  });
+
+  test("runs neon-control with no volume, its record in the storage controller's Postgres, at the count its scale fixes", () => {
+    const control = one<V1Deployment>(install(), "Deployment", "alasio-neon-control");
+    assert.deepEqual(control.spec?.template.spec?.volumes?.map(({ name }) => name), ["root", "keys"]);
+    assert.equal(control.spec?.strategy, undefined, "rolled out a replica at a time, as any of them serves");
+    assert.equal(container(control).env?.find(({ name }) => name === "NEON_CONTROLLER_DB_HOST")?.value, "alasio-neon-controller-db");
+    const two = install({ neon: { control: { scaling: { min: 2, max: 2 } } } });
+    assert.equal(one<V1Deployment>(two, "Deployment", "alasio-neon-control").spec?.replicas, 2);
+    assert.ok(one(two, "PodDisruptionBudget", "alasio-neon-control"));
   });
 
   test("pins every third-party image by digest", () => {

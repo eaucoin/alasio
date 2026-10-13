@@ -152,7 +152,15 @@ test("applying again deletes what the installation no longer has, but for what h
   kube.put("deployments", { apiVersion: "apps/v1", kind: "Deployment", metadata: { name: "mine", namespace: "alasio" } });
   const before = kube.changes.length;
 
-  await run(applyInstallation(objectsOf({ sessions: { enabled: false }, neon: { enabled: false, external: { existingSecret: "database" } }, workspaceStorage: { enabled: false } }), WAIT));
+  await run(applyInstallation(
+    objectsOf({
+      sessions: { enabled: false },
+      neon: { enabled: false, external: { existingSecret: "database" } },
+      objectStore: { bundled: { filerStore: { backups: { enabled: false } } } },
+      workspaceStorage: { enabled: false },
+    }),
+    WAIT,
+  ));
 
   const deleted = kube.changes.slice(before).filter(({ method }) => method === "DELETE").map(({ path }) => path);
   assert.ok(deleted.includes("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute"));
@@ -160,11 +168,12 @@ test("applying again deletes what the installation no longer has, but for what h
   assert.ok(deleted.includes("/apis/networking.k8s.io/v1/namespaces/alasio-sessions/networkpolicies/default-deny"));
   assert.ok(deleted.includes("/apis/rbac.authorization.k8s.io/v1/namespaces/alasio-sessions/roles/alasio"));
   assert.ok(!deleted.includes("/api/v1/namespaces/alasio-sessions"));
-  assert.ok(!deleted.includes("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-neon-control"));
+  assert.ok(!deleted.includes("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-seaweedfs-filer-store-backups"));
   assert.ok(kube.get("/api/v1/namespaces/alasio-sessions"));
-  assert.ok(kube.get("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-neon-control"));
+  assert.ok(kube.get("/api/v1/namespaces/alasio/persistentvolumeclaims/alasio-seaweedfs-filer-store-backups"));
   assert.ok(kube.get("/apis/apps/v1/namespaces/alasio/deployments/mine"));
   assert.ok(progress.includes("kept Namespace alasio-sessions, no longer part of alasio, as it holds data; alasio uninstall --purge deletes it"));
+  assert.ok(progress.includes("kept PersistentVolumeClaim alasio/alasio-seaweedfs-filer-store-backups, no longer part of alasio, as it holds data; alasio uninstall --purge deletes it"), progress.join("\n"));
   assert.ok(progress.includes("deleted Deployment alasio/alasio-neon-compute, no longer part of alasio"));
 });
 
@@ -220,7 +229,6 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "CustomResourceDefinition verticalpodautoscalers.autoscaling.k8s.io",
     "Namespace alasio",
     "Namespace alasio-sessions",
-    "PersistentVolumeClaim alasio-neon-control",
     "PersistentVolumeClaim alasio-seaweedfs-filer-store-backups",
   ]);
   await run(removeInstallation({ purge: true }, WAIT));

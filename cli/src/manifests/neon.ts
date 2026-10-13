@@ -11,7 +11,6 @@ import type {
   V1Deployment,
   V1EnvVar,
   V1Job,
-  V1PersistentVolumeClaim,
   V1Role,
   V1RoleBinding,
   V1Service,
@@ -435,36 +434,31 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
 /**
  * neon-control: it bootstraps the tenant and main's timeline, makes and deletes branches,
  * serves each branch's compute its spec, answers the storage controller's hooks, and
- * repairs a safekeeper that lost its disk. Its record of the branches is on a volume of
- * its own.
+ * repairs a safekeeper that lost its disk. Its record of the branches is in the storage
+ * controller's Postgres, so any of its replicas serves.
  */
 function control(config: InstallConfig): KubernetesObject[] {
   const name = neonName("control");
   const component = "neon-control";
+  const { scaling, resources } = config.neon.control;
   const safekeeper = neonName("safekeeper");
   const safekeeperHosts = Array.from(
     { length: config.neon.safekeepers.scaling.min },
     (_, index) => `${safekeeper}-${index}.${safekeeper}.${NAMESPACE}.svc.cluster.local`,
   );
-  const claim: V1PersistentVolumeClaim = {
-    apiVersion: "v1",
-    kind: "PersistentVolumeClaim",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
-    spec: claimSpec(config.neon.control.storage),
-  };
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      ...replicasOf(ONE),
-      strategy: { type: "Recreate" },
+      ...replicasOf(scaling),
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
           ...priority("floor"),
           ...stackPodSpec(config),
+          ...spread(component, scaling),
           containers: [{
             name: "neon-control",
             image: imageReference(config.images.alasio),
@@ -475,19 +469,18 @@ function control(config: InstallConfig): KubernetesObject[] {
               { name: "NEON_SAFEKEEPER_HOSTS", value: safekeeperHosts.join(",") },
               // As every compute reaches it, a branch environment's in its own namespace too.
               { name: "NEON_PAGESERVER_HOST", value: `${neonName("pageserver")}.${NAMESPACE}.svc` },
+              { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
             ],
             ports: [{ name: "http", containerPort: 8080 }],
             readinessProbe: { httpGet: { path: "/healthz", port: "http" }, periodSeconds: 3 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
-            resources: config.neon.control.resources,
+            resources,
             volumeMounts: [
-              { name: "state", mountPath: "/state" },
               { name: "root", mountPath: "/secrets", readOnly: true },
               { name: "keys", mountPath: "/keys", readOnly: true },
             ],
           }],
           volumes: [
-            { name: "state", persistentVolumeClaim: { claimName: name } },
             {
               name: "root",
               secret: {
@@ -502,7 +495,12 @@ function control(config: InstallConfig): KubernetesObject[] {
       },
     },
   };
-  return [service(name, component, [{ name: "http", port: 8080 }]), claim, deployment, verticalPodAutoscaler(deployment, "Recommended")];
+  return [
+    service(name, component, [{ name: "http", port: 8080 }]),
+    deployment,
+    ...replicaBudget(component, NAMESPACE, scaling),
+    verticalPodAutoscaler(deployment, "Recommended"),
+  ];
 }
 
 /**

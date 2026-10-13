@@ -291,7 +291,14 @@ const Neon = Schema.Struct({
   storageController: NeonService({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
   storageBroker: NeonService({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
   controllerDb: NeonStored("2Gi", { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
-  control: NeonStored("100Mi", { requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }),
+  /** neon-control, alasio's stand-in for Neon's control plane: a count, its replicas sharing its record of the branches. */
+  control: defaulted(
+    Schema.Struct({
+      scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+      resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "256Mi" } }),
+    }),
+    {},
+  ),
   compute: NeonService({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of
