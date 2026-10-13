@@ -49,14 +49,20 @@ export function busyBudget(namespace: string): V1PodDisruptionBudget {
   };
 }
 
-/** Where `component`'s replicas go, of `scale`: spread across nodes, where the cluster has them, and zones; nothing to say of one replica. */
-export function spread(component: string, scale: Scale): { topologySpreadConstraints?: V1TopologySpreadConstraint[] } {
+/**
+ * Where `component`'s replicas go, of `scale`: spread across nodes, where the cluster has
+ * them, and zones; nothing to say of one replica. `strictly`, a replica is left unplaced
+ * rather than put beside another on a node while one has fewer: of what keeps copies of
+ * the same data, so the copies are on different nodes as long as there are as many.
+ */
+export function spread(component: string, scale: Scale, strictly = false): { topologySpreadConstraints?: V1TopologySpreadConstraint[] } {
   if (!replicated(scale)) return {};
-  const across = (topologyKey: string): V1TopologySpreadConstraint => ({
+  const across = (topologyKey: string, hard: boolean): V1TopologySpreadConstraint => ({
     maxSkew: 1,
     topologyKey,
-    whenUnsatisfiable: "ScheduleAnyway",
+    whenUnsatisfiable: hard ? "DoNotSchedule" : "ScheduleAnyway",
     labelSelector: { matchLabels: selectorLabels(component) },
   });
-  return { topologySpreadConstraints: [across("kubernetes.io/hostname"), across("topology.kubernetes.io/zone")] };
+  // Zones softly alone: a node without a zone's label would be no place for a pod spread strictly across them.
+  return { topologySpreadConstraints: [across("kubernetes.io/hostname", strictly), across("topology.kubernetes.io/zone", false)] };
 }

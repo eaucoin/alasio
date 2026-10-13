@@ -9,8 +9,8 @@
  * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
- * identities are made here otherwise. With workspace storage on, WORKSPACES_NAME (its
- * JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
+ * identities, and its filers' store's users' passwords, are made here otherwise. With workspace
+ * storage on, WORKSPACES_NAME (its JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
  * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
  * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
  * alasio keeps them while its volumes remain).
@@ -44,6 +44,9 @@ export interface SecretNames {
   storageController: string;
   controllerDb: string;
   seaweedfs: string;
+  filerStoreFiler: string;
+  filerStoreCollector: string;
+  filerStoreBackup: string;
   s3Admin: string;
   compute: string;
   database: string;
@@ -120,6 +123,9 @@ export function secretNames(prefix: string): SecretNames {
     storageController: `${prefix}-neon-storage-controller`,
     controllerDb: `${prefix}-neon-controller-db`,
     seaweedfs: `${prefix}-neon-seaweedfs`,
+    filerStoreFiler: `${prefix}-seaweedfs-filer-store-filer`,
+    filerStoreCollector: `${prefix}-seaweedfs-filer-store-collector`,
+    filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
     s3Admin: `${prefix}-neon-s3-admin`,
     compute: `${prefix}-neon-compute`,
     database: `${prefix}-database`,
@@ -233,6 +239,11 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
+    // The filers' store's users', which its Valkey requires: the filers', each filer is
+    // given, the collector's, which reads its metrics, and the backups'.
+    rendered[names.filerStoreFiler] = { password: secrets.filerStoreFilerPassword };
+    rendered[names.filerStoreCollector] = { password: secrets.filerStoreCollectorPassword };
+    rendered[names.filerStoreBackup] = { password: secrets.filerStoreBackupPassword };
   }
   return rendered;
 }

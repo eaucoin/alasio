@@ -1,8 +1,9 @@
 /**
  * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
- * telemetry collector, Grafana and workspace storage, which need a cluster that enforces
- * NetworkPolicy, as session filesystems do; and branch environments' (./branch.ts), whose
- * namespaces main's policies admit by the label each has, to what they share alone.
+ * object store's parts and its filer store, the telemetry collector, Grafana and workspace
+ * storage, which need a cluster that enforces NetworkPolicy, as session filesystems do; and
+ * branch environments' (./branch.ts), whose namespaces main's policies admit by the label
+ * each has, to what they share alone.
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
@@ -26,6 +27,17 @@ import type { InstallConfig } from "./config.ts";
 import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
 import { LAKE_QUERY_PORT } from "./lake.ts";
+import {
+  BACKUP_COMPONENT,
+  COMPONENTS,
+  FILER,
+  FILER_STORE,
+  GATEWAY,
+  LIFECYCLE_COMPONENT,
+  MASTER,
+  METRICS_PORT,
+  VOLUME_SERVER,
+} from "./object-store.ts";
 import { CONTROLLER_POD_LABELS, JOB_POD_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "./juicefs-csi.ts";
 import { VALKEY_PORT } from "./valkey.ts";
 import { JUICEFS_ADMIN } from "./workspace-storage.ts";
@@ -88,15 +100,19 @@ function sessionPolicies(config: InstallConfig, environment: Environment): Netwo
   ];
 }
 
+/** The object store's parts, of the stack, to each of which partPolicies and gatewayPolicy admit what talks to it alone. */
+const PARTS = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
+
 /**
- * Neon's services, the object store, the lake and their jobs reach each other; alasio
- * reaches the compute, its database. In a branch environment, its compute and its lake
- * reach each other, and its alasio its compute, as main's do.
+ * Neon's services, the lake and their jobs reach each other; alasio reaches the compute,
+ * its database. In a branch environment, its compute and its lake reach each other, and
+ * its alasio its compute, as main's do. The object store's parts, of the stack too, are
+ * reached as partPolicies and gatewayPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
     policy(componentName("neon"), namespace, "neon", {
-      podSelector: { matchLabels: STACK },
+      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: PARTS }] },
       policyTypes: ["Ingress"],
       ingress: [{ from: [{ podSelector: { matchLabels: STACK } }] }],
     }),
@@ -161,6 +177,77 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
       })]
       : []),
   ];
+}
+
+/**
+ * The bundled object store's parts behind its gateways, each reached by what talks to it
+ * alone, on its HTTP and gRPC ports (SeaweedFS's gRPC port is the HTTP port's plus 10000),
+ * and by the collector on its metrics port:
+ *
+ * - the masters, by each other, in Raft, and by every part that asks them where volumes
+ *   are, or registers: the volume servers, the filers, the gateways (whose sidecar makes
+ *   the buckets through `weed shell`), and the lifecycle pass;
+ * - the volume servers, by each other, which copy what they are written to the others,
+ *   the masters, which compact their volumes, the filers and gateways, which read and
+ *   write objects' chunks there, and the lifecycle pass, which copies volumes again;
+ * - the filers, by each other, which follow each other's changes, the gateways, and the
+ *   lifecycle pass, which replays their log.
+ *
+ * The stack's other pods, which reach the store through its gateways, reach none of them.
+ */
+function partPolicies(): NetworkPolicy[] {
+  const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
+  const ports = (http: number) => [http, http + 10_000].map((port) => ({ protocol: "TCP", port }));
+  const part = (name: string, component: string, http: number, from: readonly string[]) =>
+    policy(name, NAMESPACE, component, {
+      podSelector: { matchLabels: selectorLabels(component) },
+      policyTypes: ["Ingress"],
+      ingress: [
+        { from: from.map(of), ports: ports(http) },
+        { from: [of("collector")], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
+      ],
+    });
+  const { gateway, master, volumeServer, filer } = COMPONENTS;
+  return [
+    part(MASTER, master, 9333, [master, volumeServer, filer, gateway, LIFECYCLE_COMPONENT]),
+    part(VOLUME_SERVER, volumeServer, 8080, [volumeServer, master, filer, gateway, LIFECYCLE_COMPONENT]),
+    part(FILER, filer, 8888, [filer, gateway, LIFECYCLE_COMPONENT]),
+  ];
+}
+
+/**
+ * The bundled object store's gateways take the stack's pods on their S3 port, the
+ * store's endpoint (and branch environments' and workspace storage's, as their own
+ * policies say); the lifecycle pass alone on their gRPC port, through which it deletes;
+ * and the collector alone on their metrics port.
+ */
+function gatewayPolicy(): NetworkPolicy {
+  return policy(GATEWAY, NAMESPACE, COMPONENTS.gateway, {
+    podSelector: { matchLabels: selectorLabels(COMPONENTS.gateway) },
+    policyTypes: ["Ingress"],
+    ingress: [
+      { from: [{ podSelector: { matchLabels: STACK } }], ports: [{ protocol: "TCP", port: 8333 }] },
+      { from: [{ podSelector: { matchLabels: selectorLabels(LIFECYCLE_COMPONENT) } }], ports: [{ protocol: "TCP", port: 18_333 }] },
+      { from: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
+    ],
+  });
+}
+
+/**
+ * The bundled object store's filer store takes no connection but its filers', the
+ * collector's, which reads its metrics, and its backups': it is not of the data stack,
+ * whose pods reach each other.
+ */
+function filerStorePolicy(): NetworkPolicy {
+  const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
+  return policy(FILER_STORE, NAMESPACE, COMPONENTS.filerStore, {
+    podSelector: { matchLabels: selectorLabels(COMPONENTS.filerStore) },
+    policyTypes: ["Ingress"],
+    ingress: [{
+      from: [of(COMPONENTS.filer), of("collector"), of(BACKUP_COMPONENT)],
+      ports: [{ protocol: "TCP", port: VALKEY_PORT }],
+    }],
+  });
 }
 
 /**
@@ -271,6 +358,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       : []),
     alasioPolicy(config, environment),
     ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
+    ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), filerStorePolicy()] : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

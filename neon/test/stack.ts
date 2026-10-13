@@ -409,7 +409,7 @@ export function neonStack(): void {
       test("the object store holds Neon's bucket to its lifecycle rules, the safekeepers' full WAL segments expiring after three days", async () => {
         const answered: { Rules: { ID: string }[] } = JSON.parse(await kube.execOk(
           NAMESPACE,
-          `${componentName("seaweedfs")}-0`,
+          await kube.runningPod(NAMESPACE, componentName("seaweedfs")),
           ["aws", "s3api", "--endpoint-url", "http://127.0.0.1:8333", "get-bucket-lifecycle-configuration", "--bucket", "neon"],
           { container: "lifecycle" },
         ));
@@ -425,10 +425,10 @@ export function neonStack(): void {
       });
 
       test("the object store compacts a volume once a tenth of it is deleted", async () => {
-        const store = `${componentName("seaweedfs")}-0`;
+        const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
         const bucket = `vacuum-${Date.now()}`;
-        const s3 = (script: string) => kube.execOk(NAMESPACE, store, ["/bin/sh", "-c", `set -e; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
-        const master = (path: string) => kube.execOk(NAMESPACE, store, ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "seaweedfs" });
+        const s3 = (script: string) => kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", `set -e; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
+        const master = (path: string) => kube.execOk(NAMESPACE, `${componentName("seaweedfs-master")}-0`, ["wget", "-q", "-O", "-", `http://127.0.0.1:9333${path}`], { container: "master" });
         const volumes = async () => {
           const status: VolumeStatus = JSON.parse(await master("/vol/status"));
           return Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.values(nodes)).flat()
@@ -466,7 +466,8 @@ export function neonStack(): void {
         } catch (error) {
           const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "job-name": name }) });
           const logs = (await Promise.all(pods.map(logsOf))).join("");
-          const store = (await kube.logs(NAMESPACE, `${RELEASE}-seaweedfs-0`, "seaweedfs").catch(() => "")).trimEnd().split("\n").slice(-30).join("\n");
+          const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs")).catch(() => "");
+          const store = (await kube.logs(NAMESPACE, gateway, "s3").catch(() => "")).trimEnd().split("\n").slice(-30).join("\n");
           throw new Error(`${error instanceof Error ? error.message : String(error)}\n${logs}\nthe object store:\n${store}`);
         } finally {
           await kube.remove(ref("Job", name, NAMESPACE)).catch(() => {});

@@ -484,11 +484,22 @@ function installation(): Record<string, unknown> {
     telemetry: { collector: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } },
     objectStore: {
       bundled: {
-        storage: { size: "10Gi" },
-        volumes: 30,
-        // A runner's disk is mostly images; the store needs only a little of what is left.
-        minFreeSpace: "1GiB",
-        resources: { requests: { cpu: "20m", memory: "128Mi" } },
+        // On three nodes, three masters in Raft, each object kept twice on three volume
+        // servers, and two filers on their store with two gateways, so losing one of a part
+        // loses nothing.
+        ...(AGENTS >= 2 ? { replication: "001" } : {}),
+        masters: { ...(AGENTS >= 2 ? { scaling: { min: 3, max: 3 } } : {}), resources: { requests: { cpu: "10m", memory: "32Mi" } } },
+        volumeServers: {
+          ...(AGENTS >= 2 ? { scaling: { min: 3, max: 3 } } : {}),
+          storage: { size: "10Gi" },
+          volumes: 30,
+          // A runner's disk is mostly images; the store needs only a little of what is left.
+          minFreeSpace: "1GiB",
+          resources: { requests: { cpu: "10m", memory: "64Mi" } },
+        },
+        filers: { ...(AGENTS >= 2 ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "10m", memory: "64Mi" } } },
+        gateways: { ...(AGENTS >= 2 ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "10m", memory: "64Mi" } } },
+        filerStore: { resources: { requests: { cpu: "10m", memory: "16Mi" } } },
       },
     },
     lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } },

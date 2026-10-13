@@ -1,33 +1,100 @@
 /**
- * The bundled object store: SeaweedFS, one server with its S3 gateway, its identities
- * from the stack's setup, and a bucket each for Neon, the lake, backups and, when it is
- * on, workspace storage; and the
- * periodic pass that applies its lifecycle rules.
+ * The bundled object store: SeaweedFS as its parts, each at its scale
+ * (objectStore.bundled):
+ *
+ * - masters, which place objects on volume servers and keep where each is, in Raft when
+ *   there are three, each with a volume of its state;
+ * - volume servers, which keep the objects on volumes of their own, as many copies of each
+ *   as the replication says, each on another server, and then each server on a node of its
+ *   own while there are as many;
+ * - filers, which keep the store's namespace (buckets, keys, versions, tags, and the log of
+ *   changes lifecycle passes replay) in the filer store, a Valkey of their own (./valkey.ts),
+ *   so what one filer writes every other reads at once; started one after another, so no
+ *   two make the store's identity at once, each once a volume server has registered with
+ *   the masters, so no filer writes before the volumes there are known, and a fresh master
+ *   makes no volume's id again;
+ * - S3 gateways, on the filers, the store's endpoint, under the name the stack reaches it
+ *   by (alasio-seaweedfs:8333), scaled on their CPU where their scale is a range. Each makes
+ *   the buckets, idempotently, as it starts: Neon's, the lake's, backups' and, when it is
+ *   on, workspace storage's; and gives Neon's its lifecycle rules. It is ready, and the
+ *   stack's writers start, only once they are.
+ *
+ * And the periodic pass that applies the lifecycle rules, and copies again what has fewer
+ * copies than it should; and the filer store's backups. The identities the gateways take
+ * are the stack's setup's, as are the filer store's users' passwords.
  */
-import type { KubernetesObject, V1CronJob, V1Service, V1StatefulSet } from "@kubernetes/client-node";
+import type {
+  KubernetesObject,
+  V1ConfigMap,
+  V1Container,
+  V1CronJob,
+  V1Deployment,
+  V1EnvVar,
+  V1PersistentVolumeClaim,
+  V1Service,
+  V1ServicePort,
+  V1StatefulSet,
+  V1Volume,
+  V1WeightedPodAffinityTerm,
+} from "@kubernetes/client-node";
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, NAMESPACE, neonName, ONE, replicasOf, restrictedContainer, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
+import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
+import { cpuUtilization, scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
+import { VALKEY_PORT, valkeyObjects, valkeyPassword, valkeyPod, type ValkeyUser } from "./valkey.ts";
 
-/** Every port its servers advertise themselves on by the Service's name, gRPC's each the HTTP port plus 10000. */
-const PORTS = [
-  { name: "s3", port: 8333 },
-  { name: "s3-grpc", port: 18333 },
-  { name: "master", port: 9333 },
-  { name: "master-grpc", port: 19333 },
-  { name: "volume", port: 8080 },
-  { name: "volume-grpc", port: 18080 },
-  { name: "filer", port: 8888 },
-  { name: "filer-grpc", port: 18888 },
-  { name: "metrics", port: 9327 },
-];
+/** The gateways' name, their Service's, by which the stack reaches the store. */
+export const GATEWAY = componentName("seaweedfs");
+export const MASTER = componentName("seaweedfs-master");
+export const VOLUME_SERVER = componentName("seaweedfs-volume");
+/** The filers' StatefulSet's name, and their Service's, by which a client reaches any of them. */
+export const FILER = componentName("seaweedfs-filer");
+/** The filers' headless Service, which names each, as they reach each other and the gateways reach them. */
+export const FILER_PEERS = componentName("seaweedfs-filer-peers");
+/** The filer store's name: its Service's and its StatefulSet's. */
+export const FILER_STORE = componentName("seaweedfs-filer-store");
 
-/** The ports by which the server reaches itself: its master, volume and filer servers'. */
-const PEER_PORTS = PORTS.filter(({ name }) => /^(master|volume|filer)/u.test(name));
+/**
+ * The filer store's users, each with its password in a Secret of its own, its default user
+ * off: the filers', to the keys under their prefix alone, and of no command that could
+ * take down or reconfigure the store; the collector's, which reads INFO and PINGs, as its
+ * readiness probe does; and the backups', which take a snapshot of the store as a replica
+ * would, and nothing else.
+ */
+export const FILER_STORE_USERS = {
+  filer: { name: "filer", secret: `${FILER_STORE}-filer`, rules: ["~seaweedfs:*", "+@all", "-@dangerous"] },
+  collector: { name: "collector", secret: `${FILER_STORE}-collector`, rules: ["+info", "+ping"], probes: true },
+  backup: { name: "backup", secret: `${FILER_STORE}-backup`, rules: ["+replconf", "+sync", "+psync", "+ping"] },
+} as const satisfies Record<string, ValkeyUser>;
+
+/** The components of the store's parts, by which their pods are told. */
+export const COMPONENTS = { gateway: "seaweedfs", master: "seaweedfs-master", volumeServer: "seaweedfs-volume", filer: "seaweedfs-filer", filerStore: "seaweedfs-filer-store" };
+
+/** The component of the lifecycle pass's pods. */
+export const LIFECYCLE_COMPONENT = "seaweedfs-lifecycle";
+
+/** The component of the filer store's backups' pods, and the name of the volume they are kept on. */
+export const BACKUP_COMPONENT = "seaweedfs-filer-store-backup";
+export const BACKUPS = componentName("seaweedfs-filer-store-backups");
+
+/** The port each part serves its Prometheus metrics on. */
+export const METRICS_PORT = 9327;
+
+/** The key prefix of the filers' entries in their store. */
+const KEY_PREFIX = "seaweedfs:";
+
+/** Each part's ports: its HTTP port's, and its gRPC port's, the HTTP port plus 10000, as SeaweedFS reaches them. */
+const PORTS = {
+  master: [{ name: "http", port: 9333 }, { name: "grpc", port: 19333 }],
+  volumeServer: [{ name: "http", port: 8080 }, { name: "grpc", port: 18080 }],
+  filer: [{ name: "http", port: 8888 }, { name: "grpc", port: 18888 }],
+  gateway: [{ name: "s3", port: 8333 }, { name: "s3-grpc", port: 18333 }],
+};
 
 /**
  * The days back to which Neon's time-travel recovery can put the pageserver's objects:
@@ -84,85 +151,299 @@ const LIFECYCLE = {
   ],
 };
 
-/** The server, and the Services by which it is reached and reaches itself. */
-function server(config: InstallConfig): KubernetesObject[] {
-  const name = componentName("seaweedfs");
-  const peers = `${name}-peers`;
+/** The address of the pod `ordinal` of the StatefulSet `name`, by its headless Service `service`, at `port`. */
+const podAddress = (name: string, service: string, ordinal: number, port: number) => `${name}-${ordinal}.${service}.${NAMESPACE}.svc.cluster.local:${port}`;
+
+/** The addresses of the `count` pods of the StatefulSet `name`, by `service`, at `port`, as SeaweedFS takes a list of them. */
+const podAddresses = (name: string, service: string, count: number, port: number) =>
+  Array.from({ length: count }, (_, ordinal) => podAddress(name, service, ordinal, port)).join(",");
+
+/** The masters, as the other parts reach them. */
+const masters = ({ objectStore }: InstallConfig) => podAddresses(MASTER, MASTER, objectStore.bundled.masters.scaling.min, 9333);
+
+/** A pod's name and namespace, by which a part names itself to the others. */
+const POD_ENV: V1EnvVar[] = [
+  { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
+  { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
+];
+
+/** The address a pod of a StatefulSet names itself by, its own in its headless Service `service`. */
+const ownAddress = (service: string) => `-ip=$(POD_NAME).${service}.$(POD_NAMESPACE).svc.cluster.local`;
+
+/** The headless Service `name` of `component`'s pods, on `ports`, which names each pod, ready or not. */
+function headless(name: string, component: string, ports: readonly { readonly name: string; readonly port: number }[]): V1Service {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
+    spec: { clusterIP: "None", publishNotReadyAddresses: true, selector: selectorLabels(component), ports: [...ports, { name: "metrics", port: METRICS_PORT }] },
+  };
+}
+
+/** How a part's StatefulSet differs from the others': its headless Service, unless its own name; its pods started in order; spread across nodes strictly. */
+interface PartOptions {
+  readonly service?: string;
+  readonly ordered?: boolean;
+  readonly strictly?: boolean;
+}
+
+/** The StatefulSet `name` of `component`, of `scale`, running `containers`, as every part of the store's is: on the floor, as the data stack's user. */
+function partStatefulSet(
+  config: InstallConfig,
+  name: string,
+  component: string,
+  scale: Scale,
+  pod: { readonly containers: V1Container[]; readonly initContainers?: V1Container[]; readonly volumes?: V1Volume[] },
+  storage?: { readonly size: string; readonly storageClassName: string },
+  { service = name, ordered = false, strictly = false }: PartOptions = {},
+): V1StatefulSet {
+  return {
+    apiVersion: "apps/v1",
+    kind: "StatefulSet",
+    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
+    spec: {
+      serviceName: service,
+      ...replicasOf(scale),
+      podManagementPolicy: ordered ? "OrderedReady" : "Parallel",
+      selector: { matchLabels: selectorLabels(component) },
+      template: {
+        metadata: { labels: stackLabels(component) },
+        spec: {
+          ...priority("floor"),
+          ...stackPodSpec(config),
+          ...spread(component, scale, strictly),
+          terminationGracePeriodSeconds: 30,
+          ...(pod.initContainers ? { initContainers: pod.initContainers } : {}),
+          containers: pod.containers,
+          ...(pod.volumes ? { volumes: pod.volumes } : {}),
+        },
+      },
+      ...(storage ? { volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(storage) }] } : {}),
+    },
+  };
+}
+
+/** The container of a part, `name`, running `weed` with `args`, probed at `path` on its HTTP port. */
+function partContainer(config: InstallConfig, name: string, args: string[], path: string, port: number, resources: V1Container["resources"]): V1Container {
+  const probe = { httpGet: { path, port } };
+  return {
+    name,
+    image: imageReference(config.objectStore.bundled.image),
+    imagePullPolicy: "IfNotPresent",
+    args: [...args, `-metricsPort=${METRICS_PORT}`],
+    env: POD_ENV,
+    ports: [{ name: "http", containerPort: port }, { name: "grpc", containerPort: port + 10_000 }, { name: "metrics", containerPort: METRICS_PORT }],
+    readinessProbe: { ...probe, periodSeconds: 5 },
+    livenessProbe: { ...probe, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
+    securityContext: restrictedContainer(),
+    ...(resources ? { resources } : {}),
+  };
+}
+
+/** The masters: of their state, a volume each; of three, in Raft, each naming the others. */
+function masterObjects(config: InstallConfig): KubernetesObject[] {
+  const { bundled } = config.objectStore;
+  const { scaling } = bundled.masters;
+  const args = [
+    "master",
+    "-mdir=/data",
+    ownAddress(MASTER),
+    "-ip.bind=0.0.0.0",
+    // One alone needs no quorum: none, it is the leader as it starts.
+    `-peers=${scaling.min > 1 ? masters(config) : "none"}`,
+    "-volumeSizeLimitMB=1024",
+    `-defaultReplication=${bundled.replication}`,
+    // A volume is compacted once a tenth of it is deleted, not a third as by default:
+    // Neon's objects all expire within days, so every volume comes to hold deleted ones,
+    // and the store would keep up to a third of its disk dead. A compaction copies the
+    // volume's live rest, at about half a gigabyte a second.
+    "-garbageThreshold=0.1",
+    "-telemetry=false",
+  ];
+  const container = { ...partContainer(config, "master", args, "/cluster/status", 9333, bundled.masters.resources), volumeMounts: [{ name: "data", mountPath: "/data" }] };
+  const statefulSet = partStatefulSet(config, MASTER, COMPONENTS.master, scaling, { containers: [container] }, bundled.masters.storage);
+  return [headless(MASTER, COMPONENTS.master, PORTS.master), statefulSet, ...replicaBudget(COMPONENTS.master, NAMESPACE, scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
+}
+
+/**
+ * The volume servers, each keeping its volumes on a volume of its own, in one data center
+ * and rack, so a copy goes to another server; and, where copies are kept, each on a node
+ * of its own while there are as many, so a copy is on another node, a server left
+ * unplaced rather than put beside another.
+ */
+function volumeServerObjects(config: InstallConfig): KubernetesObject[] {
+  const { bundled } = config.objectStore;
+  const { volumeServers } = bundled;
+  const args = [
+    "volume",
+    "-dir=/data",
+    `-max=${volumeServers.volumes}`,
+    `-minFreeSpace=${volumeServers.minFreeSpace}`,
+    `-master=${masters(config)}`,
+    ownAddress(VOLUME_SERVER),
+    "-ip.bind=0.0.0.0",
+    "-dataCenter=dc1",
+    "-rack=rack1",
+  ];
+  const container = { ...partContainer(config, "volume", args, "/status", 8080, volumeServers.resources), volumeMounts: [{ name: "data", mountPath: "/data" }] };
+  const statefulSet = partStatefulSet(config, VOLUME_SERVER, COMPONENTS.volumeServer, volumeServers.scaling, { containers: [container] }, volumeServers.storage, {
+    strictly: bundled.replication !== "000",
+  });
+  return [
+    headless(VOLUME_SERVER, COMPONENTS.volumeServer, PORTS.volumeServer),
+    statefulSet,
+    ...replicaBudget(COMPONENTS.volumeServer, NAMESPACE, volumeServers.scaling),
+    verticalPodAutoscaler(statefulSet, "Recommended"),
+  ];
+}
+
+/** The filers' configuration: their store, the filer store, as its user `filer`, whose password each is given as WEED_REDIS2_PASSWORD. */
+export function filerToml(): string {
+  return [
+    "[redis2]",
+    "enabled = true",
+    `address = "${FILER_STORE}:${VALKEY_PORT}"`,
+    `username = "${FILER_STORE_USERS.filer.name}"`,
+    "database = 0",
+    `keyPrefix = "${KEY_PREFIX}"`,
+    "superLargeDirectories = []",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The filers, started one after another on the filer store, each once the store has
+ * loaded what it keeps and a volume server has registered with the masters.
+ */
+function filerObjects(config: InstallConfig): KubernetesObject[] {
+  const { bundled } = config.objectStore;
+  const { filers } = bundled;
+  const image = imageReference(bundled.image);
+  const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: FILER, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.filer) }, data: { "filer.toml": filerToml() } };
+  const waiting = (name: string, waitImage: string, line: string, env: V1EnvVar[] = []): V1Container => ({
+    name: `wait-for-${name}`,
+    image: waitImage,
+    imagePullPolicy: "IfNotPresent",
+    command: ["/bin/sh", "-c", line],
+    ...(env.length > 0 ? { env } : {}),
+    securityContext: restrictedContainer(),
+    resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "64Mi" } },
+  });
+  const initContainers = [
+    // Answers PONG once it has loaded its append-only file, LOADING before.
+    waiting(
+      "filer-store",
+      imageReference(bundled.filerStore.image),
+      `until valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.filer.name} ping 2>/dev/null | grep -q PONG; do sleep 2; done`,
+      [{ name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }],
+    ),
+    waiting("volume-server", image, `until wget -q -O - http://${MASTER}:9333/dir/status | grep -q '"DataNodes":\\[{'; do sleep 2; done`),
+  ];
+  const args = ["filer", `-master=${masters(config)}`, ownAddress(FILER_PEERS), "-ip.bind=0.0.0.0", "-defaultStoreDir=/tmp"];
+  const container: V1Container = {
+    ...partContainer(config, "filer", args, "/healthz", 8888, filers.resources),
+    env: [...POD_ENV, { name: "WEED_REDIS2_PASSWORD", valueFrom: valkeyPassword(FILER_STORE_USERS.filer.secret) }],
+    volumeMounts: [{ name: "config", mountPath: "/etc/seaweedfs", readOnly: true }, { name: "tmp", mountPath: "/tmp" }],
+  };
+  const statefulSet = partStatefulSet(
+    config,
+    FILER,
+    COMPONENTS.filer,
+    filers.scaling,
+    { initContainers, containers: [container], volumes: [{ name: "config", configMap: { name: FILER } }, { name: "tmp", emptyDir: {} }] },
+    undefined,
+    { service: FILER_PEERS, ordered: true },
+  );
+  // Any filer, for the shells that need one: the buckets' and the lifecycle pass's.
+  const service: V1Service = {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: FILER, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.filer) },
+    spec: { selector: selectorLabels(COMPONENTS.filer), ports: PORTS.filer },
+  };
+  return [
+    configMap,
+    headless(FILER_PEERS, COMPONENTS.filer, PORTS.filer),
+    service,
+    statefulSet,
+    ...replicaBudget(COMPONENTS.filer, NAMESPACE, filers.scaling),
+    verticalPodAutoscaler(statefulSet, "InPlace"),
+  ];
+}
+
+/** The filer store: a Valkey of the filers' own, its memory sized for its entries. */
+function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
+  const { filerStore } = config.objectStore.bundled;
+  const maxmemory = `${filerStoreMaxmemoryBytes(filerStore.entries) / 2 ** 20}mb`;
+  const { filer, collector, backup } = FILER_STORE_USERS;
+  return valkeyObjects(config, {
+    name: FILER_STORE,
+    component: COMPONENTS.filerStore,
+    image: filerStore.image,
+    storage: filerStore.storage,
+    resources: filerStore.resources,
+    maxmemory,
+    users: [filer, collector, backup],
+  });
+}
+
+/**
+ * The S3 gateways, on the filers, each making the buckets and Neon's lifecycle rules as
+ * it starts, in sidecars, and ready only once they are made.
+ */
+function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
+  const { scaling } = bundled.gateways;
   const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : [])];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {
     apiVersion: "v1",
     kind: "Service",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels("seaweedfs") },
-    spec: { selector: selectorLabels("seaweedfs"), ports: PORTS },
+    metadata: { name: GATEWAY, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.gateway) },
+    spec: { selector: selectorLabels(COMPONENTS.gateway), ports: [...PORTS.gateway, { name: "metrics", port: METRICS_PORT }] as V1ServicePort[] },
   };
-  // The server's own stable name, which it advertises and reaches itself by (its master
-  // elects itself leader through it) before it is ready, as the Service above admits
-  // clients only once its buckets exist.
-  const peersService: V1Service = {
-    apiVersion: "v1",
-    kind: "Service",
-    metadata: { name: peers, namespace: NAMESPACE, labels: stackLabels("seaweedfs") },
-    spec: { clusterIP: "None", publishNotReadyAddresses: true, selector: selectorLabels("seaweedfs"), ports: PEER_PORTS },
-  };
-  const statefulSet: V1StatefulSet = {
+  const deployment: V1Deployment = {
     apiVersion: "apps/v1",
-    kind: "StatefulSet",
-    metadata: { name, namespace: NAMESPACE, labels: stackLabels("seaweedfs") },
+    kind: "Deployment",
+    metadata: { name: GATEWAY, namespace: NAMESPACE, labels: stackLabels(COMPONENTS.gateway) },
     spec: {
-      serviceName: peers,
-      ...replicasOf(ONE),
-      selector: { matchLabels: selectorLabels("seaweedfs") },
+      ...replicasOf(scaling),
+      selector: { matchLabels: selectorLabels(COMPONENTS.gateway) },
       template: {
-        metadata: { labels: stackLabels("seaweedfs") },
+        metadata: { labels: stackLabels(COMPONENTS.gateway) },
         spec: {
           ...priority("floor"),
           ...stackPodSpec(config),
+          ...spread(COMPONENTS.gateway, scaling),
           terminationGracePeriodSeconds: 30,
           containers: [
             {
-              name: "seaweedfs",
+              name: "s3",
               image,
               imagePullPolicy: "IfNotPresent",
               args: [
-                "server",
-                `-ip=$(POD_NAME).${peers}.$(POD_NAMESPACE).svc.cluster.local`,
+                "s3",
+                `-filer=${podAddresses(FILER, FILER_PEERS, bundled.filers.scaling.min, 8888)}`,
                 "-ip.bind=0.0.0.0",
-                "-dir=/data",
-                `-volume.max=${bundled.volumes}`,
-                "-master.volumeSizeLimitMB=1024",
-                "-master.defaultReplication=000",
-                // Its master compacts a volume once a tenth of it is deleted, not a third
-                // as by default: Neon's objects all expire within days, so every volume
-                // comes to hold deleted ones, and the store would keep up to a third of
-                // its disk dead. A compaction copies the volume's live rest, at about half
-                // a gigabyte a second.
-                "-master.garbageThreshold=0.1",
-                "-master.telemetry=false",
-                `-volume.minFreeSpace=${bundled.minFreeSpace}`,
-                "-filer",
-                "-s3",
-                "-s3.config=/etc/seaweedfs/s3.json",
-                "-s3.allowDeleteBucketNotEmpty=false",
-                "-s3.autoCreateBucket=false",
-                "-metricsPort=9327",
+                "-config=/etc/seaweedfs/s3.json",
+                "-allowDeleteBucketNotEmpty=false",
+                "-autoCreateBucket=false",
+                `-metricsPort=${METRICS_PORT}`,
               ],
-              env: [
-                { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
-                { name: "POD_NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
-              ],
-              ports: PORTS.map(({ name, port }) => ({ name, containerPort: port })),
+              ports: [...PORTS.gateway.map(({ name, port }) => ({ name, containerPort: port })), { name: "metrics", containerPort: METRICS_PORT }],
               readinessProbe: { httpGet: { path: "/healthz", port: "s3" }, periodSeconds: 5 },
               livenessProbe: { httpGet: { path: "/healthz", port: "s3" }, initialDelaySeconds: 30, periodSeconds: 10, failureThreshold: 6 },
               securityContext: restrictedContainer(),
-              resources: bundled.resources,
-              volumeMounts: [{ name: "data", mountPath: "/data" }, { name: "identities", mountPath: "/etc/seaweedfs", readOnly: true }],
+              resources: bundled.gateways.resources,
+              volumeMounts: [{ name: "identities", mountPath: "/etc/seaweedfs", readOnly: true }],
             },
-            // Makes the buckets, idempotently, each time the server starts: Neon's versioned
-            // (its time-travel recovery needs that), writes fsynced. The pod is ready only
-            // once they exist, so nothing that stores in them starts before.
+            // Makes the buckets, idempotently, as the gateway starts: Neon's versioned (its
+            // time-travel recovery needs that), writes fsynced. One a gateway beside it has
+            // made at once is found made. A bucket whose objects the volumes hold, by its
+            // collection, while the filers know no such bucket, is not made anew, empty: the
+            // filer store has lost what it kept, which is restored from its backups instead,
+            // and the gateway is not ready until it is.
             {
               name: "buckets",
               image,
@@ -172,11 +453,20 @@ function server(config: InstallConfig): KubernetesObject[] {
                 "-c",
                 script(
                   "set -e",
-                  "shell() { printf '%s\\n' \"$1\" | weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888; }",
+                  `shell() { printf '%s\\n' "$1" | weed shell -master=${masters(config)} -filer=${FILER}:8888; }`,
+                  // A bucket, by its name exactly, as each line of the list starts with one.
+                  "listed() { shell 's3.bucket.list' | awk '{print $1}' | grep -qxF \"$1\"; }",
                   "until wget -q -O /dev/null http://127.0.0.1:8333/healthz; do sleep 2; done",
                   "shell 'fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1 -fsync -apply'",
                   `for bucket in ${made.join(" ")}; do`,
-                  "  shell 's3.bucket.list' | grep -qw \"$bucket\" || shell \"s3.bucket.create -name $bucket\"",
+                  "  if ! listed \"$bucket\"; then",
+                  "    if shell 'volume.list' | grep -q \"Collection:$bucket,\"; then",
+                  "      echo \"the store's volumes hold objects of the bucket $bucket, which its filers do not know: their store has lost what it kept; restore it from its backups rather than make $bucket anew, empty\" >&2",
+                  "      exit 1",
+                  "    fi",
+                  "    shell \"s3.bucket.create -name $bucket\"",
+                  "  fi",
+                  "  listed \"$bucket\"",
                   "done",
                   `shell 's3.bucket.versioning -name ${buckets.neon} -enable'`,
                   `shell 's3.bucket.versioning -name ${buckets.neon}' | grep -qi enabled`,
@@ -220,23 +510,42 @@ function server(config: InstallConfig): KubernetesObject[] {
           ],
         },
       },
-      volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(bundled.storage) }],
     },
   };
-  return [service, peersService, statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
+  return [
+    service,
+    deployment,
+    ...scaledObject(deployment, scaling, [cpuUtilization(80)]),
+    ...replicaBudget(COMPONENTS.gateway, NAMESPACE, scaling),
+    // Of memory alone where KEDA scales the gateways on their CPU, as the two would chase each other.
+    verticalPodAutoscaler(deployment, "InPlace", scaled(scaling) ? ["memory"] : undefined),
+  ];
 }
 
 /**
  * SeaweedFS applies lifecycle rules only when asked: a pass every hour, deleting through
- * the S3 server's gRPC port. A pass replays the filer's log of changes from where each
+ * the gateways' gRPC port. A pass replays the filers' log of changes from where each
  * shard's last stopped, which is the oldest change with an expiry not yet due; so it reads
  * to now (`-events 0`), not a count of changes, which would hold a short rule's expiries
  * behind a long one's until that one's came due. It stops at its runtime, well before the
  * next, and the one after it goes on from there.
+ *
+ * The pass then sets each volume's replication to the store's, which differs where the
+ * store's was changed since the volume was made, and, where copies are kept, copies again
+ * each volume with fewer than that, as a volume server lost, or come back empty, or a
+ * replication raised leaves it; holding the shell's lock while it does, which one shell
+ * holds at a time.
  */
 function lifecyclePass(config: InstallConfig): V1CronJob {
-  const name = componentName("seaweedfs");
-  const component = "seaweedfs-lifecycle";
+  const component = LIFECYCLE_COMPONENT;
+  const { replication } = config.objectStore.bundled;
+  const commands = [
+    `s3.lifecycle.run-shard -shards 0-15 -s3 ${GATEWAY}:18333 -events 0 -runtime 10m`,
+    "lock",
+    `volume.configure.replication -replication ${replication} -collectionPattern *`,
+    ...(replication === "000" ? [] : ["volume.fix.replication -apply"]),
+    "unlock",
+  ];
   return {
     apiVersion: "batch/v1",
     kind: "CronJob",
@@ -249,7 +558,8 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
       jobTemplate: {
         spec: {
           backoffLimit: 1,
-          activeDeadlineSeconds: 900,
+          // Its copies' too, which a lost volume server's many take.
+          activeDeadlineSeconds: 2700,
           template: {
             metadata: { labels: stackLabels(component) },
             spec: {
@@ -264,7 +574,8 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
                   "/bin/sh",
                   "-c",
                   // Waits out the moment before its NetworkPolicy applies, as a new pod.
-                  `until wget -q -O /dev/null http://${name}:9333/cluster/status; do sleep 2; done && printf 's3.lifecycle.run-shard -shards 0-15 -s3 ${name}:18333 -events 0 -runtime 10m\\n' | weed shell -master=${name}:9333 -filer=${name}:8888`,
+                  `until wget -q -O /dev/null http://${MASTER}:9333/cluster/status; do sleep 2; done && ` +
+                  `printf '${commands.map((command) => `${command}\\n`).join("")}' | weed shell -master=${masters(config)} -filer=${FILER}:8888`,
                 ],
                 securityContext: restrictedContainer(),
                 resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "256Mi" } },
@@ -279,7 +590,98 @@ function lifecyclePass(config: InstallConfig): V1CronJob {
   };
 }
 
+/**
+ * The filer store's backups: a snapshot of the whole store, every bucket, key, version and
+ * tag, and the log of changes lifecycle passes replay, as Valkey writes one for a replica,
+ * taken by the user that may do that alone, on the backups' schedule; written under a
+ * name of its own, then renamed, so a backup that fails leaves none behind but its
+ * predecessors, of which the last `keep` are kept. On a volume of their own, outside the
+ * store they copy, made, where the cluster has several nodes and another can take it, on
+ * another node than the filer store's (the volume is placed by the pod that first mounts
+ * it, and keeps its pods on its node from then on).
+ */
+function filerStoreBackup(config: InstallConfig): KubernetesObject[] {
+  const { filerStore } = config.objectStore.bundled;
+  if (!filerStore.backups.enabled) return [];
+  const claim: V1PersistentVolumeClaim = {
+    apiVersion: "v1",
+    kind: "PersistentVolumeClaim",
+    metadata: { name: BACKUPS, namespace: NAMESPACE, labels: labels(BACKUP_COMPONENT) },
+    spec: claimSpec(filerStore.backups.storage),
+  };
+  const save: V1Container = {
+    name: "save",
+    image: imageReference(filerStore.image),
+    imagePullPolicy: "IfNotPresent",
+    command: [
+      "/bin/sh",
+      "-c",
+      script(
+        "set -eu",
+        "stamp=$(date -u +%Y%m%dT%H%M%SZ)",
+        // What a backup that failed left behind, which no other is writing: they run one at a time.
+        "rm -f /backups/.filer-store-*.rdb",
+        // Waits out the moment before its NetworkPolicy applies, as a new pod.
+        `until valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.backup.name} ping 2>/dev/null | grep -q PONG; do sleep 2; done`,
+        `valkey-cli -h ${FILER_STORE} --user ${FILER_STORE_USERS.backup.name} --rdb "/backups/.filer-store-$stamp.rdb"`,
+        'test -s "/backups/.filer-store-$stamp.rdb"',
+        'mv "/backups/.filer-store-$stamp.rdb" "/backups/filer-store-$stamp.rdb"',
+        // All but the newest KEEP, which sort by when they were made.
+        "ls /backups | grep '^filer-store-.*\\.rdb$' | sort -r | tail -n +$((KEEP + 1)) | while read -r old; do rm \"/backups/$old\"; done",
+      ),
+    ],
+    env: [{ name: "KEEP", value: String(filerStore.backups.keep) }, { name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(FILER_STORE_USERS.backup.secret) }],
+    securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+    resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: "512Mi" } },
+    volumeMounts: [{ name: "backups", mountPath: "/backups" }],
+  };
+  const cronJob: V1CronJob = {
+    apiVersion: "batch/v1",
+    kind: "CronJob",
+    metadata: { name: componentName(BACKUP_COMPONENT), namespace: NAMESPACE, labels: labels(BACKUP_COMPONENT) },
+    spec: {
+      schedule: filerStore.backups.schedule,
+      concurrencyPolicy: "Forbid",
+      successfulJobsHistoryLimit: 1,
+      failedJobsHistoryLimit: 3,
+      jobTemplate: {
+        spec: {
+          backoffLimit: 2,
+          activeDeadlineSeconds: 1800,
+          template: {
+            metadata: { labels: labels(BACKUP_COMPONENT) },
+            spec: {
+              restartPolicy: "Never",
+              ...priority("component"),
+              ...valkeyPod(config),
+              affinity: { podAntiAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [awayFrom(COMPONENTS.filerStore)] } },
+              containers: [save],
+              volumes: [{ name: "backups", persistentVolumeClaim: { claimName: BACKUPS } }],
+            },
+          },
+        },
+      },
+    },
+  };
+  return [claim, cronJob];
+}
+
+/** A preference for another node than `component`'s pods'. */
+const awayFrom = (component: string): V1WeightedPodAffinityTerm => ({
+  weight: 100,
+  podAffinityTerm: { labelSelector: { matchLabels: selectorLabels(component) }, topologyKey: "kubernetes.io/hostname" },
+});
+
 /** The bundled object store's objects, when it runs, which is beside Neon. */
 export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {
-  return config.neon.enabled && config.objectStore.bundled.enabled ? [...server(config), lifecyclePass(config)] : [];
+  if (!config.neon.enabled || !config.objectStore.bundled.enabled) return [];
+  return [
+    ...masterObjects(config),
+    ...volumeServerObjects(config),
+    ...filerStoreObjects(config),
+    ...filerObjects(config),
+    ...gatewayObjects(config),
+    lifecyclePass(config),
+    ...filerStoreBackup(config),
+  ];
 }

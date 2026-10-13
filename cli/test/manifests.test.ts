@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -22,6 +22,7 @@ import type {
   V1Job,
   V1LabelSelector,
   V1Namespace,
+  V1PersistentVolumeClaim,
   V1PodSpec,
   V1PriorityClass,
   V1Role,
@@ -287,7 +288,8 @@ describe("alasio", () => {
       { name: "alasio-home", mountPath: "/var/lib/alasio/home" },
     ]);
     assert.deepEqual(spec?.volumes?.filter(({ name }) => name === "state" || name === "alasio-home"), [{ name: "state", emptyDir: {} }, { name: "alasio-home", emptyDir: {} }]);
-    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-neon-control"]);
+    // Of the stack's alone: neon-control's, and the volume the filer store's backups are kept on.
+    assert.deepEqual(all(objects, "PersistentVolumeClaim").map((claim) => claim.metadata?.name), ["alasio-neon-control", "alasio-seaweedfs-filer-store-backups"]);
     assert.equal(spec?.securityContext?.runAsNonRoot, true);
   });
 
@@ -402,42 +404,38 @@ describe("neon", () => {
 
   test("pins every third-party image by digest", () => {
     const statefulSets = all<V1StatefulSet>(install({ workspaceStorage: { enabled: false } }), "StatefulSet");
-    assert.equal(statefulSets.length, 4);
+    assert.equal(statefulSets.length, 7);
     for (const statefulSet of statefulSets) assert.match(container(statefulSet).image ?? "", /@sha256:[0-9a-f]{64}$/u, statefulSet.metadata?.name);
+    assert.match(container(one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs")).image ?? "", /^chrislusf\/seaweedfs:4\.48@sha256:[0-9a-f]{64}$/u);
   });
 
-  test("gives the object store a fixed count of volumes, not one made from the disk free", () => {
-    const seaweedfs = one<V1StatefulSet>(install({ objectStore: { bundled: { volumes: 40 } } }), "StatefulSet", "alasio-seaweedfs");
-    assert.ok(container(seaweedfs).args?.includes("-volume.max=40"));
-  });
-
-  test("reclaims a volume's deleted space once it is a tenth of the volume", () => {
-    assert.ok(container(one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs")).args?.includes("-master.garbageThreshold=0.1"));
-  });
-
-  test("applies the object store's lifecycle rules every hour, reading the filer's log to now, each pass done before the next", () => {
+  test("applies the object store's lifecycle rules every hour, reading the filers' log to now, through its parts, each pass done before the next", () => {
     const pass = one<V1CronJob>(install(), "CronJob", "alasio-seaweedfs-lifecycle").spec;
     assert.equal(pass?.schedule, "41 * * * *");
     assert.equal(pass?.concurrencyPolicy, "Forbid");
-    assert.match(pass?.jobTemplate.spec?.template.spec?.containers[0]?.command?.[2] ?? "", /s3\.lifecycle\.run-shard -shards 0-15 -s3 alasio-seaweedfs:18333 -events 0 -runtime 10m\\n/u);
-    assert.equal(pass?.jobTemplate.spec?.activeDeadlineSeconds, 900);
+    const command = pass?.jobTemplate.spec?.template.spec?.containers[0]?.command?.[2] ?? "";
+    assert.match(command, /s3\.lifecycle\.run-shard -shards 0-15 -s3 alasio-seaweedfs:18333 -events 0 -runtime 10m\\n/u);
+    assert.match(command, / -master=alasio-seaweedfs-master-0\.alasio-seaweedfs-master\.alasio\.svc\.cluster\.local:9333 -filer=alasio-seaweedfs-filer:8888$/u);
+    // Keeping one copy of each object, it copies none again.
+    assert.doesNotMatch(command, /volume\.fix\.replication/u);
+    assert.equal(pass?.jobTemplate.spec?.activeDeadlineSeconds, 2700);
   });
 
-  test("expires Neon's replaced objects a day past the history it keeps, and the safekeepers' re-uploads after a day", () => {
-    const lifecycle = one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+  /** The lifecycle rules each gateway gives Neon's bucket. */
+  const lifecycleRules = () => {
+    const lifecycle = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
     const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
     assert.ok(rules);
-    const expiries = (JSON.parse(rules) as { Rules: { Filter: { Prefix?: string }; NoncurrentVersionExpiration?: { NoncurrentDays: number } }[] }).Rules
-      .flatMap(({ Filter, NoncurrentVersionExpiration }) => (NoncurrentVersionExpiration ? [[Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]] : []));
+    return (JSON.parse(rules) as { Rules: { Filter: { Prefix?: string }; NoncurrentVersionExpiration?: { NoncurrentDays: number }; Expiration?: unknown }[] }).Rules;
+  };
+
+  test("expires Neon's replaced objects a day past the history it keeps, and the safekeepers' re-uploads after a day", () => {
+    const expiries = lifecycleRules().flatMap(({ Filter, NoncurrentVersionExpiration }) => (NoncurrentVersionExpiration ? [[Filter.Prefix, NoncurrentVersionExpiration.NoncurrentDays]] : []));
     assert.deepEqual(expiries, [["pageserver/", 2], ["safekeeper/", 1]]);
   });
 
   test("expires the safekeepers' full WAL segments a day after the pageserver's objects can no longer be put back, not the segments they write", () => {
-    const lifecycle = one<V1StatefulSet>(install(), "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
-    const rules = /--lifecycle-configuration '([^']+)'/u.exec(lifecycle?.command?.[2] ?? "")?.[1];
-    assert.ok(rules);
-    const expiring = (JSON.parse(rules) as { Rules: { Filter: unknown; Expiration?: unknown }[] }).Rules.filter(({ Expiration }) => Expiration);
-    assert.deepEqual(expiring, [{
+    assert.deepEqual(lifecycleRules().filter(({ Expiration }) => Expiration), [{
       ID: "expire-wal",
       Status: "Enabled",
       Filter: { And: { Prefix: "safekeeper/", ObjectSizeGreaterThan: 16 * 1024 * 1024 - 1 } },
@@ -539,6 +537,327 @@ describe("the lake's query endpoint", () => {
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
     assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-password", "lake-reader-password"]);
     assert.deepEqual(passwordFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_PASSWORD_FILE"]);
+  });
+});
+
+describe("object store", () => {
+  const MASTERS = "alasio-seaweedfs-master-0.alasio-seaweedfs-master.alasio.svc.cluster.local:9333";
+  const args = (objects: readonly KubernetesObject[], kind: "StatefulSet" | "Deployment", name: string) => container(one<V1StatefulSet>(objects, kind, name)).args ?? [];
+
+  test("runs SeaweedFS as its parts, each at one replica, under the names the stack reaches it by, on the floor", () => {
+    const objects = install();
+    const parts = [["StatefulSet", "alasio-seaweedfs-master"], ["StatefulSet", "alasio-seaweedfs-volume"], ["StatefulSet", "alasio-seaweedfs-filer"], ["StatefulSet", "alasio-seaweedfs-filer-store"], ["Deployment", "alasio-seaweedfs"]] as const;
+    for (const [kind, name] of parts) {
+      const workload = one<V1StatefulSet>(objects, kind, name);
+      assert.deepEqual([workload.spec?.replicas, workload.spec?.template.spec?.priorityClassName], [1, "alasio-floor"], name);
+    }
+    // No all-in-one server.
+    assert.deepEqual(args(objects, "StatefulSet", "alasio-seaweedfs-master").slice(0, 1), ["master"]);
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-seaweedfs").spec?.ports?.map(({ port }) => port), [8333, 18333, 9327]);
+    for (const name of ["alasio-seaweedfs-master", "alasio-seaweedfs-volume", "alasio-seaweedfs-filer-peers"]) {
+      assert.deepEqual([one<V1Service>(objects, "Service", name).spec?.clusterIP, one<V1Service>(objects, "Service", name).spec?.publishNotReadyAddresses], ["None", true], name);
+    }
+    // Any filer, for the shells, by a Service of its own; each by the headless one, its StatefulSet's.
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-seaweedfs-filer").spec?.ports?.map(({ port }) => port), [8888, 18888]);
+    assert.equal(one<V1Service>(objects, "Service", "alasio-seaweedfs-filer").spec?.clusterIP, undefined);
+    assert.equal(one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer").spec?.serviceName, "alasio-seaweedfs-filer-peers");
+    // One master needs no quorum; the parts reach it by its pod's name.
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes("-peers=none"));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes("-defaultReplication=000"));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes("-garbageThreshold=0.1"));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes("-telemetry=false"));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-volume").includes(`-master=${MASTERS}`));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-filer").includes(`-master=${MASTERS}`));
+    assert.ok(args(objects, "Deployment", "alasio-seaweedfs").includes("-filer=alasio-seaweedfs-filer-0.alasio-seaweedfs-filer-peers.alasio.svc.cluster.local:8888"));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-filer").includes("-ip=$(POD_NAME).alasio-seaweedfs-filer-peers.$(POD_NAMESPACE).svc.cluster.local"));
+    // Each serves its metrics where the collector scrapes them.
+    for (const [kind, name] of parts.filter(([, name]) => name !== "alasio-seaweedfs-filer-store")) assert.ok(args(objects, kind, name).includes("-metricsPort=9327"), name);
+    // What keeps state is recommended its requests; what keeps none resized in place.
+    const modes = Object.fromEntries(all<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler").filter(({ metadata }) => metadata?.name?.startsWith("alasio-seaweedfs")).map(({ metadata, spec }) => [metadata?.name, spec.updatePolicy.updateMode]));
+    assert.deepEqual(modes, { "alasio-seaweedfs-master": "Off", "alasio-seaweedfs-volume": "Off", "alasio-seaweedfs-filer-store": "Off", "alasio-seaweedfs-filer": "InPlace", "alasio-seaweedfs": "InPlace" });
+  });
+
+  test("keeps objects on the volume servers' volumes, a fixed count of volumes each, in one rack, so a copy goes to another server", () => {
+    const objects = install({ objectStore: { bundled: { volumeServers: { volumes: 40, storage: { size: "50Gi" } } } } });
+    const volume = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-volume");
+    for (const arg of ["-dir=/data", "-max=40", "-minFreeSpace=5GiB", "-dataCenter=dc1", "-rack=rack1"]) assert.ok(container(volume).args?.includes(arg), arg);
+    assert.equal(volume.spec?.volumeClaimTemplates?.[0]?.spec?.resources?.requests?.["storage"], "50Gi");
+    assert.equal(volume.spec?.podManagementPolicy, "Parallel");
+  });
+
+  test("starts the filers one after another, each once its store has loaded and a volume server has registered, on the filer store", () => {
+    const objects = install();
+    const filer = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer");
+    assert.equal(filer.spec?.podManagementPolicy, "OrderedReady");
+    const waits = filer.spec?.template.spec?.initContainers ?? [];
+    assert.deepEqual(waits.map(({ name }) => name), ["wait-for-filer-store", "wait-for-volume-server"]);
+    assert.match(waits[0]?.command?.[2] ?? "", /valkey-cli -h alasio-seaweedfs-filer-store --user filer ping/u);
+    assert.deepEqual(waits[0]?.env, [{ name: "VALKEYCLI_AUTH", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-filer", key: "password" } } }]);
+    assert.match(waits[1]?.command?.[2] ?? "", /http:\/\/alasio-seaweedfs-master:9333\/dir\/status \| grep -q '"DataNodes":\\\[\{'/u);
+    assert.deepEqual(container(filer).env?.find(({ name }) => name === "WEED_REDIS2_PASSWORD"), { name: "WEED_REDIS2_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-filer", key: "password" } } });
+    assert.equal(
+      one<V1ConfigMap>(objects, "ConfigMap", "alasio-seaweedfs-filer").data?.["filer.toml"],
+      '[redis2]\nenabled = true\naddress = "alasio-seaweedfs-filer-store:6379"\nusername = "filer"\ndatabase = 0\nkeyPrefix = "seaweedfs:"\nsuperLargeDirectories = []\n',
+    );
+  });
+
+  test("sizes the filer store's memory from the entries it holds, and refuses a limit that leaves no room for its snapshots", () => {
+    const conf = (objects: readonly KubernetesObject[]) => one<V1ConfigMap>(objects, "ConfigMap", "alasio-seaweedfs-filer-store").data?.["valkey.conf"] ?? "";
+    assert.match(conf(install()), /^maxmemory 256mb$/mu);
+    assert.match(conf(install()), /^maxmemory-policy noeviction$/mu);
+    assert.match(conf(install({ objectStore: { bundled: { filerStore: { entries: 400_000, resources: { limits: { memory: "2Gi" } } } } } })), /^maxmemory 704mb$/mu);
+    const refused = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, objectStore: { bundled: { filerStore: { entries: 400_000 } } } });
+    assert.ok(Result.isFailure(refused));
+    assert.equal(refused.failure.message, "objectStore.bundled.filerStore.resources.limits.memory must be at least 1.4 GiB, twice what its entries take, for the fork that writes its snapshots");
+  });
+
+  test("runs three masters in Raft when asked, each naming the others, and never two", () => {
+    const objects = install({ objectStore: { bundled: { masters: { scaling: { min: 3, max: 3 } } } } });
+    const peers = [0, 1, 2].map((ordinal) => `alasio-seaweedfs-master-${ordinal}.alasio-seaweedfs-master.alasio.svc.cluster.local:9333`).join(",");
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes(`-peers=${peers}`));
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-volume").includes(`-master=${peers}`));
+    assert.ok(one<KubernetesObject>(objects, "PodDisruptionBudget", "alasio-seaweedfs-master"));
+    const refused = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, objectStore: { bundled: { masters: { scaling: { min: 2, max: 2 } } } } });
+    assert.ok(Result.isFailure(refused) && refused.failure.message === "objectStore.bundled.masters.scaling must be 1 or 3: two masters elect no leader once one is gone");
+  });
+
+  test("keeps as many copies as the replication says, each on another volume server, which there must be enough of", () => {
+    const objects = install({ objectStore: { bundled: { replication: "001", volumeServers: { scaling: { min: 3, max: 3 } } } } });
+    assert.ok(args(objects, "StatefulSet", "alasio-seaweedfs-master").includes("-defaultReplication=001"));
+    const volume = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-volume");
+    assert.equal(volume.spec?.replicas, 3);
+    // Each on a node of its own while there are as many; zones as they come.
+    assert.deepEqual(volume.spec?.template.spec?.topologySpreadConstraints?.map(({ topologyKey, whenUnsatisfiable }) => [topologyKey, whenUnsatisfiable]), [
+      ["kubernetes.io/hostname", "DoNotSchedule"],
+      ["topology.kubernetes.io/zone", "ScheduleAnyway"],
+    ]);
+    // Each hour, under the shell's lock, every volume's replication is set to the store's, as one made before it changed differs, and what has fewer copies than that is copied again.
+    const pass = (objects: readonly KubernetesObject[]) => one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.spec?.containers[0]?.command?.[2] ?? "";
+    assert.match(pass(objects), /-runtime 10m\\nlock\\nvolume\.configure\.replication -replication 001 -collectionPattern \*\\nvolume\.fix\.replication -apply\\nunlock\\n' \| weed shell/u);
+    // Without copies, a spread as any other, and nothing to copy.
+    const singly = install({ objectStore: { bundled: { volumeServers: { scaling: { min: 3, max: 3 } } } } });
+    assert.match(pass(singly), /-runtime 10m\\nlock\\nvolume\.configure\.replication -replication 000 -collectionPattern \*\\nunlock\\n' \| weed shell/u);
+    const single = one<V1StatefulSet>(singly, "StatefulSet", "alasio-seaweedfs-volume");
+    assert.deepEqual(single.spec?.template.spec?.topologySpreadConstraints?.map(({ whenUnsatisfiable }) => whenUnsatisfiable), ["ScheduleAnyway", "ScheduleAnyway"]);
+    assert.ok(one<KubernetesObject>(objects, "PodDisruptionBudget", "alasio-seaweedfs-volume"));
+    const refused = (install: Record<string, unknown>) => {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, objectStore: { bundled: install } });
+      return Result.isFailure(decoded) ? decoded.failure.message : null;
+    };
+    assert.equal(refused({ replication: "001" }), "objectStore.bundled.volumeServers.scaling must be at least 2, one for each copy objectStore.bundled.replication keeps");
+    assert.equal(refused({ replication: "010", volumeServers: { scaling: { min: 2 } } }), "objectStore.bundled.replication must be 000, or 00N for N more copies, each on another volume server");
+  });
+
+  test("scales its gateways on their CPU where their scale is a range, KEDA owning their replicas", () => {
+    const objects = install({ objectStore: { bundled: { gateways: { scaling: { min: 2, max: 4 } } } } });
+    const gateway = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs");
+    assert.equal(gateway.spec?.replicas, undefined);
+    const scaled = one<ScaledObject>(objects, "ScaledObject", "alasio-seaweedfs");
+    assert.deepEqual([scaled.spec.minReplicaCount, scaled.spec.maxReplicaCount, scaled.spec.triggers], [2, 4, [{ type: "cpu", metricType: "Utilization", metadata: { value: "80" } }]]);
+    const sizing = one<VerticalPodAutoscaler>(objects, "VerticalPodAutoscaler", "alasio-seaweedfs");
+    assert.ok(sizing.spec.resourcePolicy.containerPolicies.every((policy) => JSON.stringify(policy).includes('"controlledResources":["memory"]')));
+    assert.deepEqual(all(install(), "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs"), []);
+  });
+
+  test("makes the buckets and Neon's rules in each gateway as it starts, ready only once they are", () => {
+    const gateway = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs");
+    assert.deepEqual(gateway.spec?.template.spec?.containers.map(({ name }) => name), ["s3", "buckets", "lifecycle"]);
+    const buckets = gateway.spec?.template.spec?.containers[1]?.command?.[2] ?? "";
+    assert.match(buckets, /weed shell -master=alasio-seaweedfs-master-0\.alasio-seaweedfs-master\.alasio\.svc\.cluster\.local:9333 -filer=alasio-seaweedfs-filer:8888/u);
+    assert.match(buckets, /for bucket in neon lake backups workspaces; do/u);
+  });
+
+  test("makes no bucket anew, empty, whose objects the volumes hold while the filers know no such bucket, and its gateway is not ready", () => {
+    const gateway = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs");
+    const buckets = gateway.spec?.template.spec?.containers.find(({ name }) => name === "buckets") ?? {};
+    // The shell as the filers and the volumes answer it: the buckets the filers know, and the collection a volume holds.
+    const run = (known: string, held: string) => {
+      const weed = [
+        "read -r command",
+        'case "$command" in',
+        `  "s3.bucket.list") cat "$ROOT/made" 2>/dev/null; echo "${known}" ;;`,
+        `  "volume.list") echo "  volume Id:7, Size:1, ReplicaPlacement:000, Collection:${held}, Version:3" ;;`,
+        '  "s3.bucket.create -name "*) echo "${command#s3.bucket.create -name }" >> "$ROOT/made" ;;',
+        "  *versioning*) echo Enabled ;;",
+        "esac",
+      ].join("\n");
+      const { root, run: ran, remove } = runScript(buckets, {}, { weed, wget: "true", touch: "true", sleep: "true" });
+      try {
+        let said = "";
+        let status = 0;
+        try {
+          ran();
+        } catch (error) {
+          ({ status, stderr: said } = error as { status: number; stderr: string });
+        }
+        const made = existsSync(join(root, "made")) ? readFileSync(join(root, "made"), "utf8").trim().split("\n") : [];
+        return { status, made, said };
+      } finally {
+        remove();
+      }
+    };
+    // A fresh store: every bucket made.
+    assert.deepEqual(run("none", "elsewhere"), { status: 0, made: ["neon", "lake", "backups", "workspaces"], said: "" });
+    // A store that lost its filers' metadata, its volumes holding the lake's objects: no lake made anew, and the gateway never ready.
+    const lost = run("neon", "lake");
+    assert.equal(lost.status, 1);
+    assert.deepEqual(lost.made, []);
+    assert.match(lost.said, /the store's volumes hold objects of the bucket lake, which its filers do not know: their store has lost what it kept; restore it from its backups rather than make lake anew, empty/u);
+    // A bucket is known by its name exactly: another named after it is not it.
+    assert.equal(run("lake-archive\tsize:0\tlogical:0\tchunk:0", "lake").status, 1);
+  });
+
+  test("admits the filers alone, the collector and the backups to the filer store, which is no part of the data stack", () => {
+    const objects = install();
+    const store = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer-store");
+    assert.equal(store.spec?.template.metadata?.labels?.["alasio.dev/stack"], undefined);
+    const policy = one<KubernetesObject & { spec: { ingress: unknown } }>(objects, "NetworkPolicy", "alasio-seaweedfs-filer-store");
+    assert.deepEqual(policy.spec.ingress, [{
+      from: [
+        { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-filer" } } },
+        { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" } } },
+        { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-filer-store-backup" } } },
+      ],
+      ports: [{ protocol: "TCP", port: 6379 }],
+    }]);
+  });
+
+  test("admits to each part behind the gateways what talks to it alone, and the collector, and leaves them out of the data stack's policy", () => {
+    const objects = install();
+    type Rule = { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] };
+    const admitted = (name: string) =>
+      one<KubernetesObject & { spec: { ingress: Rule[] } }>(objects, "NetworkPolicy", name).spec.ingress.map(({ from, ports }) => [
+        from.map(({ podSelector }) => podSelector.matchLabels["app.kubernetes.io/component"]),
+        ports.map(({ port }) => port),
+      ]);
+    assert.deepEqual(admitted("alasio-seaweedfs-master"), [
+      [["seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [9333, 19333]],
+      [["collector"], [9327]],
+    ]);
+    assert.deepEqual(admitted("alasio-seaweedfs-volume"), [
+      [["seaweedfs-volume", "seaweedfs-master", "seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8080, 18080]],
+      [["collector"], [9327]],
+    ]);
+    assert.deepEqual(admitted("alasio-seaweedfs-filer"), [[["seaweedfs-filer", "seaweedfs", "seaweedfs-lifecycle"], [8888, 18888]], [["collector"], [9327]]]);
+    // The gateways take the data stack's pods on their S3 port, the lifecycle pass alone on their gRPC port, and the collector alone on their metrics port.
+    const gateway = one<KubernetesObject & { spec: { ingress: { from: { podSelector: { matchLabels: Record<string, string> } }[]; ports: { port: number }[] }[] } }>(objects, "NetworkPolicy", "alasio-seaweedfs").spec.ingress;
+    assert.deepEqual(gateway.map(({ from, ports }) => [from.map(({ podSelector }) => podSelector.matchLabels), ports.map(({ port }) => port)]), [
+      [[{ "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" }], [8333]],
+      [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-lifecycle" }], [18333]],
+      [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" }], [9327]],
+    ]);
+    // The filer store takes its filers, the collector and its backups.
+    assert.deepEqual(admitted("alasio-seaweedfs-filer-store"), [[["seaweedfs-filer", "collector", "seaweedfs-filer-store-backup"], [6379]]]);
+    // The data stack's pods reach none of the parts but as these say.
+    const stack = one<KubernetesObject & { spec: { podSelector: object } }>(objects, "NetworkPolicy", "alasio-neon").spec.podSelector;
+    assert.deepEqual(stack, {
+      matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" },
+      matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["seaweedfs", "seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"] }],
+    });
+    // The lifecycle pass and the backups are admitted by the components their pods carry.
+    const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.metadata?.labels;
+    assert.equal(pass?.["app.kubernetes.io/component"], "seaweedfs-lifecycle");
+    const backup = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-filer-store-backup").spec?.jobTemplate.spec?.template.metadata?.labels;
+    assert.equal(backup?.["app.kubernetes.io/component"], "seaweedfs-filer-store-backup");
+    // Of the data stack they are not, as they reach nothing of it.
+    assert.equal(backup?.["alasio.dev/stack"], undefined);
+  });
+
+  test("logs in to the filer store as users of its own, each with its own Secret, its default user off: the filers to their keys alone, the collector to INFO, the backups to a snapshot", () => {
+    const objects = install();
+    const store = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs-filer-store"));
+    assert.deepEqual(store.command, [
+      "valkey-server",
+      "/etc/valkey/valkey.conf",
+      "--user",
+      "default",
+      "off",
+      "--user",
+      "filer",
+      "on",
+      ">$(VALKEY_FILER_PASSWORD)",
+      "~seaweedfs:*",
+      "+@all",
+      "-@dangerous",
+      "--user",
+      "collector",
+      "on",
+      ">$(VALKEY_COLLECTOR_PASSWORD)",
+      "+info",
+      "+ping",
+      "--user",
+      "backup",
+      "on",
+      ">$(VALKEY_BACKUP_PASSWORD)",
+      "+replconf",
+      "+sync",
+      "+psync",
+      "+ping",
+    ]);
+    const secret = (name: string) => ({ secretKeyRef: { name, key: "password" } });
+    assert.deepEqual(store.env, [
+      { name: "VALKEY_FILER_PASSWORD", valueFrom: secret("alasio-seaweedfs-filer-store-filer") },
+      { name: "VALKEY_COLLECTOR_PASSWORD", valueFrom: secret("alasio-seaweedfs-filer-store-collector") },
+      { name: "VALKEY_BACKUP_PASSWORD", valueFrom: secret("alasio-seaweedfs-filer-store-backup") },
+      { name: "VALKEYCLI_AUTH", valueFrom: secret("alasio-seaweedfs-filer-store-collector") },
+    ]);
+    // Its readiness probe logs in as the collector; workspace storage's Valkey, of no users of its own, as its default user.
+    assert.match(store.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli --user collector info persistence\)/u);
+    const valkey = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey"));
+    assert.deepEqual(valkey.command, ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
+    assert.match(valkey.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli info persistence\)/u);
+  });
+
+  test("backs the filer store up hourly, a snapshot of it as a replica takes one, onto a volume of its own on another node where one takes it, renamed once whole", () => {
+    const objects = install({ objectStore: { bundled: { filerStore: { backups: { keep: 2 } } } } });
+    const claim = one<V1PersistentVolumeClaim>(objects, "PersistentVolumeClaim", "alasio-seaweedfs-filer-store-backups");
+    assert.equal(claim.spec?.resources?.requests?.["storage"], "10Gi");
+    const backup = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-filer-store-backup").spec;
+    assert.deepEqual([backup?.schedule, backup?.concurrencyPolicy], ["23 * * * *", "Forbid"]);
+    const pod = backup?.jobTemplate.spec?.template.spec;
+    assert.deepEqual(pod?.volumes, [{ name: "backups", persistentVolumeClaim: { claimName: "alasio-seaweedfs-filer-store-backups" } }]);
+    // Its volume is made where its first pod runs: away from the filer store, where a node can take it.
+    assert.deepEqual(pod?.affinity?.podAntiAffinity?.preferredDuringSchedulingIgnoredDuringExecution, [{
+      weight: 100,
+      podAffinityTerm: { labelSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-filer-store" } }, topologyKey: "kubernetes.io/hostname" },
+    }]);
+    // The one container: no copy in the store it backs up.
+    assert.deepEqual(pod?.containers.map(({ name }) => name), ["save"]);
+    const save: V1Container | undefined = pod?.containers[0];
+    assert.deepEqual(save?.env, [{ name: "KEEP", value: "2" }, { name: "VALKEYCLI_AUTH", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-backup", key: "password" } } }]);
+    // Run with a valkey-cli that writes its snapshot where it is told, then succeeds or fails, in a directory of its own for /backups.
+    const take = (fails: boolean) => {
+      const valkey = ['case "$*" in', "  *ping*) echo PONG ;;", `  *--rdb*) for last; do :; done; echo snapshot > "$last"; exit ${fails ? 1 : 0} ;;`, "esac"].join("\n");
+      const text = (save?.command?.[2] ?? "").replaceAll("/backups", () => "$ROOT/backups");
+      return runScript({ command: ["/bin/sh", "-c", text] }, { KEEP: "2" }, { "valkey-cli": valkey });
+    };
+    const { root, run, remove } = take(false);
+    try {
+      mkdirSync(join(root, "backups"));
+      for (const stamp of ["20261013T062300Z", "20261013T072300Z"]) writeFileSync(join(root, "backups", `filer-store-${stamp}.rdb`), "older");
+      writeFileSync(join(root, "backups", ".filer-store-20261013T072300Z.rdb"), "half");
+      run();
+      const kept = readdirSync(join(root, "backups")).sort();
+      // The newest two, the one just taken among them, and nothing a backup that failed left behind.
+      assert.equal(kept.length, 2);
+      assert.equal(kept[0], "filer-store-20261013T072300Z.rdb");
+      assert.match(kept[1] ?? "", /^filer-store-\d{8}T\d{6}Z\.rdb$/u);
+      assert.equal(readFileSync(join(root, "backups", kept[1] ?? ""), "utf8").trim(), "snapshot");
+    } finally {
+      remove();
+    }
+    const failing = take(true);
+    try {
+      mkdirSync(join(failing.root, "backups"));
+      assert.throws(() => failing.run());
+      // A snapshot that failed is never a backup.
+      assert.deepEqual(readdirSync(join(failing.root, "backups")).filter((file) => file.startsWith("filer-store-")), []);
+    } finally {
+      failing.remove();
+    }
+    // None where they are off.
+    const off = install({ objectStore: { bundled: { filerStore: { backups: { enabled: false } } } } });
+    assert.deepEqual([...all(off, "CronJob"), ...all(off, "PersistentVolumeClaim")].filter(({ metadata }) => metadata?.name?.includes("filer-store-backup")), []);
   });
 });
 
@@ -677,7 +996,7 @@ describe("telemetry", () => {
       assert.deepEqual(config.service.pipelines[pipeline], { receivers: ["otlp"], processors: ["batch"], exporters: ["otlphttp/lake"] }, pipeline);
     }
     assert.deepEqual(config.service.pipelines.metrics, { receivers: ["otlp"], processors: ["batch/metrics"], exporters: ["otlphttp/lake"] });
-    assert.deepEqual(config.service.pipelines["metrics/stack"], { receivers: ["prometheus", "redis"], processors: ["resource/stack", "batch/metrics"], exporters: ["otlphttp/lake"] });
+    assert.deepEqual(config.service.pipelines["metrics/stack"], { receivers: ["prometheus", "redis", "redis/filer-store"], processors: ["resource/stack", "batch/metrics"], exporters: ["otlphttp/lake"] });
     // Spans and log records in batches no larger than an insert the lake inlines, at once;
     // metric points a minute's at a time, which the lake writes as files.
     assert.deepEqual(config.processors.batch, { send_batch_size: 1000, send_batch_max_size: 1000, timeout: "5s" });
@@ -793,27 +1112,54 @@ describe("telemetry", () => {
       collection_interval: "60s",
       metrics: { "redis.maxmemory": { enabled: true } },
     });
-    assert.deepEqual(config.service.pipelines["metrics/stack"].receivers, ["prometheus", "redis"]);
+    assert.deepEqual(config.service.pipelines["metrics/stack"].receivers, ["prometheus", "redis", "redis/filer-store"]);
     const collector = one<V1Deployment>(objects, "Deployment", "alasio-collector");
     assert.equal(collector.spec?.template.spec?.serviceAccountName, "alasio-collector");
-    assert.deepEqual(container(collector).env, [{ name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-valkey", key: "password" } } }]);
-    const role = one<V1Role>(objects, "Role", "alasio-collector");
-    assert.equal(role.metadata?.namespace, "kube-system");
-    assert.deepEqual(role.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
-    const binding = one<V1RoleBinding>(objects, "RoleBinding", "alasio-collector");
-    assert.equal(binding.metadata?.namespace, "kube-system");
-    assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio-collector", namespace: "alasio" }]);
+    assert.deepEqual(container(collector).env, [
+      { name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-valkey", key: "password" } } },
+      { name: "FILER_STORE_PASSWORD", valueFrom: { secretKeyRef: { name: "alasio-seaweedfs-filer-store-collector", key: "password" } } },
+    ]);
+    // It finds JuiceFS's pods in the driver's namespace, and the object store's parts in its own.
+    const roles = all<V1Role>(objects, "Role").filter(({ metadata }) => metadata?.name === "alasio-collector");
+    assert.deepEqual(roles.map(({ metadata }) => metadata?.namespace), ["kube-system", "alasio"]);
+    for (const role of roles) assert.deepEqual(role.rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }]);
+    const bindings = all<V1RoleBinding>(objects, "RoleBinding").filter(({ metadata }) => metadata?.name === "alasio-collector");
+    assert.deepEqual(bindings.map(({ metadata, subjects }) => [metadata?.namespace, subjects]), ["kube-system", "alasio"].map((namespace) => [namespace, [{ kind: "ServiceAccount", name: "alasio-collector", namespace: "alasio" }]]));
     assert.ok(one(objects, "ServiceAccount", "alasio-collector"));
 
     const off = install({ workspaceStorage: { enabled: false } });
     const offConfig = collectorConfig(off);
     assert.equal(offConfig.receivers.redis, undefined);
-    assert.deepEqual(offConfig.service.pipelines["metrics/stack"].receivers, ["prometheus"]);
+    assert.deepEqual(offConfig.service.pipelines["metrics/stack"].receivers, ["prometheus", "redis/filer-store"]);
     for (const job of ["juicefs", "juicefs-csi"]) {
       assert.equal(offConfig.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job), undefined, job);
     }
-    assert.equal(one<V1Deployment>(off, "Deployment", "alasio-collector").spec?.template.spec?.serviceAccountName, undefined);
-    assert.deepEqual(off.filter(({ kind, metadata }) => !["ConfigMap", "Service", "Deployment", "VerticalPodAutoscaler", "NetworkPolicy"].includes(kind ?? "") && metadata?.name === "alasio-collector"), []);
+    assert.deepEqual(all<V1Role>(off, "Role").filter(({ metadata }) => metadata?.name === "alasio-collector").map(({ metadata }) => metadata?.namespace), ["alasio"]);
+  });
+
+  test("scrapes each pod of each of the object store's parts, found in its own namespace, and reads the filer store, with its password", () => {
+    const config = collectorConfig(install());
+    const job = config.receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === "seaweedfs");
+    assert.deepEqual(job, {
+      job_name: "seaweedfs",
+      scrape_interval: "60s",
+      kubernetes_sd_configs: [{ role: "pod", namespaces: { names: ["alasio"] } }],
+      relabel_configs: [
+        { source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"], regex: "seaweedfs|seaweedfs-master|seaweedfs-volume|seaweedfs-filer", action: "keep" },
+        { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+        { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: "$$1:9327" },
+        { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+        { source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"], target_label: "component" },
+      ],
+    });
+    // As the filer store's user that may read its INFO alone.
+    assert.deepEqual(config.receivers["redis/filer-store"], {
+      endpoint: "alasio-seaweedfs-filer-store:6379",
+      username: "collector",
+      password: "${env:FILER_STORE_PASSWORD}",
+      collection_interval: "60s",
+      metrics: { "redis.maxmemory": { enabled: true } },
+    });
   });
 
   test("scrapes nothing without Neon, only taking OTLP and sending it on", () => {
@@ -1138,7 +1484,7 @@ describe("workspace storage", () => {
 
   test("makes its bucket and its identity, and gives the setup what its Secrets are made from", () => {
     const objects = install();
-    const buckets = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
+    const buckets = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
     assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups workspaces; do$/mu);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), "workspaces");
     assert.equal(setupVariable(objects, "WORKSPACES_BUCKET"), "workspaces");
@@ -1199,7 +1545,7 @@ describe("workspace storage", () => {
     assert.deepEqual(all(objects, "PriorityClass").filter(({ metadata }) => metadata?.name === "alasio-juicefs-mount"), []);
     assert.deepEqual(objects.filter(({ metadata }) => /valkey|juicefs|workspaces/u.test(metadata?.name ?? "")), []);
     assert.equal(setupVariable(objects, "WORKSPACES_NAME"), undefined);
-    const buckets = one<V1StatefulSet>(objects, "StatefulSet", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
+    const buckets = one<V1Deployment>(objects, "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "buckets");
     assert.match(buckets?.command?.[2] ?? "", /^for bucket in neon lake backups; do$/mu);
   });
 });
@@ -1523,7 +1869,9 @@ describe("scaling", () => {
       "alasio-neon-pageserver",
       "alasio-neon-controller-db",
       "alasio-neon-control",
-      "alasio-seaweedfs",
+      "alasio-seaweedfs-master",
+      "alasio-seaweedfs-volume",
+      "alasio-seaweedfs-filer-store",
       "alasio-valkey",
       "juicefs-csi-controller",
       "juicefs-csi-node",

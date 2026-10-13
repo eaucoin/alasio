@@ -221,6 +221,7 @@ test("removing an installation keeps what holds data, and with purge deletes it 
     "Namespace alasio",
     "Namespace alasio-sessions",
     "PersistentVolumeClaim alasio-neon-control",
+    "PersistentVolumeClaim alasio-seaweedfs-filer-store-backups",
   ]);
   await run(removeInstallation({ purge: true }, WAIT));
   assert.deepEqual([...kube.objects.keys()], []);

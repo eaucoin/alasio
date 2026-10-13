@@ -2,17 +2,18 @@
  * The stack's telemetry collector, the one hub of alasio's telemetry: alasio, its
  * harnesses, bayma (folder workspaces' directly, sessions' through alasio's receiver),
  * the lake and Neon's compute export to it over OTLP/HTTP (common.ts's otelEnv), and it
- * scrapes the rest: every Neon service's, SeaweedFS's and the lake's Prometheus metrics,
- * and with workspace storage JuiceFS's and Valkey's. All of it goes to the lake's
+ * scrapes the rest: every Neon service's, each of SeaweedFS's parts' and the lake's
+ * Prometheus metrics, and with workspace storage JuiceFS's; and it reads the Valkeys', the
+ * object store's filer store's and workspace storage's. All of it goes to the lake's
  * telemetry intake (neon/lake/src/intake.ts), and to telemetry.otlpEndpoint too when one
  * is set, which alone is sent the configured headers. It runs whenever the lake does,
  * or an endpoint is set; with neither, nothing exports anything.
  *
  * It batches and retries in memory, so a restart of it may lose a few seconds of
  * telemetry. JuiceFS's metrics are its driver's and mount pods', found among the pods of
- * the driver's namespace, which the collector may list; Valkey's are read with its
- * password. Its pod carries its configuration's checksum, so it is replaced when that
- * changes.
+ * the driver's namespace, and SeaweedFS's its parts' pods', found among its own, which the
+ * collector may list; each Valkey's are read with its password. Its pod carries its
+ * configuration's checksum, so it is replaced when that changes.
  */
 import type { KubernetesObject, V1ConfigMap, V1Deployment, V1Role, V1RoleBinding, V1Service, V1ServiceAccount } from "@kubernetes/client-node";
 
@@ -21,6 +22,7 @@ import {
   COLLECTOR_PORT,
   collectorRuns,
   componentName,
+  given,
   goJson,
   lakeRuns,
   NAMESPACE,
@@ -38,7 +40,9 @@ import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
 import { LAKE_INTAKE_PORT } from "./lake.ts";
-import { VALKEY, VALKEY_PORT } from "./valkey.ts";
+import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
+import { VALKEY_PORT, valkeyPassword } from "./valkey.ts";
+import { VALKEY } from "./workspace-storage.ts";
 
 /** The collector's name, its pods' component, and its Service's. */
 export const COLLECTOR = componentName("collector");
@@ -65,7 +69,33 @@ const BATCH = { send_batch_size: 1000, send_batch_max_size: 1000, timeout: "5s" 
  */
 const METRICS_BATCH = { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" };
 
-/** What it scrapes: each job's targets, by job, and with workspace storage JuiceFS's pods. */
+/** Whether the bundled object store runs, whose parts it scrapes and whose filer store it reads. */
+const seaweedfsRuns = ({ neon, objectStore }: InstallConfig): boolean => neon.enabled && objectStore.bundled.enabled;
+
+/** The object store's parts it scrapes, by their pods' component: all but the filer store, which it reads as a Valkey. */
+const SEAWEEDFS_SCRAPED = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
+
+/** A Valkey it reads: its receiver, its name, the user it logs in as, if not the default, the Secret of its password, and the variable it is given that in. */
+interface ReadValkey {
+  readonly receiver: string;
+  readonly name: string;
+  readonly username?: string;
+  readonly secret: string;
+  readonly variable: string;
+}
+
+/** The Valkeys it reads: workspace storage's, as its default user, and the filer store's, as the user that may read its INFO alone. */
+function valkeys(config: InstallConfig): ReadValkey[] {
+  const { collector } = FILER_STORE_USERS;
+  return [
+    ...(config.workspaceStorage.enabled ? [{ receiver: "redis", name: VALKEY, secret: VALKEY, variable: "VALKEY_PASSWORD" }] : []),
+    ...(seaweedfsRuns(config)
+      ? [{ receiver: "redis/filer-store", name: FILER_STORE, username: collector.name, secret: collector.secret, variable: "FILER_STORE_PASSWORD" }]
+      : []),
+  ];
+}
+
+/** What it scrapes: each job's targets, by job, the object store's parts, and with workspace storage JuiceFS's pods. */
 function scrapes(config: InstallConfig): object[] {
   const { neon, workspaceStorage } = config;
   if (!neon.enabled) return [];
@@ -76,7 +106,6 @@ function scrapes(config: InstallConfig): object[] {
     "storage-broker": [`${neonName("storage-broker")}:50051`],
     compute: [`${neonName("compute")}:3080`],
     safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
-    ...(config.objectStore.bundled.enabled ? { seaweedfs: [`${componentName("seaweedfs")}:9327`] } : {}),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
   // JuiceFS's pods of the name `name` in the driver's namespace: each running one at its
@@ -96,8 +125,23 @@ function scrapes(config: InstallConfig): object[] {
       { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
     ],
   });
+  // The object store's parts, each pod of each, which the collector may list in its own
+  // namespace, as their gateways' count moves; each labelled with its part.
+  const seaweedfsJob = {
+    job_name: "seaweedfs",
+    scrape_interval: SCRAPE_INTERVAL,
+    kubernetes_sd_configs: [{ role: "pod", namespaces: { names: [NAMESPACE] } }],
+    relabel_configs: [
+      { source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"], regex: SEAWEEDFS_SCRAPED.join("|"), action: "keep" },
+      { source_labels: ["__meta_kubernetes_pod_phase"], regex: "Running", action: "keep" },
+      { source_labels: ["__meta_kubernetes_pod_ip"], target_label: "__address__", replacement: `$$1:${SEAWEEDFS_METRICS_PORT}` },
+      { source_labels: ["__meta_kubernetes_pod_name"], target_label: "pod" },
+      { source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"], target_label: "component" },
+    ],
+  };
   return [
     ...Object.keys(targets).sort().map((job) => ({ job_name: job, scrape_interval: SCRAPE_INTERVAL, static_configs: [{ targets: targets[job] }] })),
+    ...(seaweedfsRuns(config) ? [seaweedfsJob] : []),
     // The mount pods, the clients, and the controller's and node service's, the driver.
     ...(workspaceStorage.enabled ? [juicefsJob("juicefs", MOUNT_POD_NAME, JUICEFS_METRICS_PORT), juicefsJob("juicefs-csi", DRIVER_POD_NAME, DRIVER_METRICS_PORT)] : []),
   ];
@@ -113,8 +157,9 @@ function externalExporter({ telemetry }: InstallConfig): Record<string, object> 
 
 /** The collector's configuration. */
 function collectorConfig(config: InstallConfig): object {
-  const { telemetry, workspaceStorage } = config;
+  const { telemetry } = config;
   const scraped = scrapes(config);
+  const read = valkeys(config);
   const exporters = {
     ...(lakeRuns(config) ? { "otlphttp/lake": { endpoint: `http://${componentName("lake")}:${LAKE_INTAKE_PORT}` } } : {}),
     ...(telemetry.otlpEndpoint ? externalExporter(config) : {}),
@@ -125,17 +170,14 @@ function collectorConfig(config: InstallConfig): object {
     receivers: {
       otlp: { protocols: { http: { endpoint: `0.0.0.0:${COLLECTOR_PORT}` } } },
       ...(scraped.length > 0 ? { prometheus: { config: { scrape_configs: scraped } } } : {}),
-      ...(workspaceStorage.enabled
-        ? {
-          redis: {
-            endpoint: `${VALKEY}:${VALKEY_PORT}`,
-            password: "${env:VALKEY_PASSWORD}",
-            collection_interval: SCRAPE_INTERVAL,
-            // How near it is to refusing writes: used memory against this.
-            metrics: { "redis.maxmemory": { enabled: true } },
-          },
-        }
-        : {}),
+      ...Object.fromEntries(read.map(({ receiver, name, username, variable }) => [receiver, {
+        endpoint: `${name}:${VALKEY_PORT}`,
+        ...(username ? { username } : {}),
+        password: `\${env:${variable}}`,
+        collection_interval: SCRAPE_INTERVAL,
+        // How near it is to refusing writes: used memory against this.
+        metrics: { "redis.maxmemory": { enabled: true } },
+      }])),
     },
     processors: {
       batch: BATCH,
@@ -154,7 +196,7 @@ function collectorConfig(config: InstallConfig): object {
         ...(scraped.length > 0
           ? {
             "metrics/stack": {
-              receivers: ["prometheus", ...(workspaceStorage.enabled ? ["redis"] : [])],
+              receivers: ["prometheus", ...read.map(({ receiver }) => receiver)],
               processors: ["resource/stack", "batch/metrics"],
               exporters: Object.keys(exporters),
             },
@@ -170,6 +212,8 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
   if (!collectorRuns(config)) return [];
   const { telemetry, workspaceStorage } = config;
   const configuration = collectorConfig(config);
+  // The namespaces it finds pods to scrape in: the driver's, JuiceFS's, and its own, the object store's parts.
+  const listed = [...(workspaceStorage.enabled ? [workspaceStorage.csi.namespace] : []), ...(seaweedfsRuns(config) ? [NAMESPACE] : [])];
   const metadata = { name: COLLECTOR, namespace: NAMESPACE, labels: stackLabels(COMPONENT) };
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata, data: { "config.yaml": goJson(configuration, "  ") } };
   const service: V1Service = {
@@ -188,7 +232,7 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(COMPONENT), annotations: { "checksum/config": sha256(goJson(configuration)) } },
         spec: {
-          ...(workspaceStorage.enabled ? { serviceAccountName: COLLECTOR } : {}),
+          ...(listed.length > 0 ? { serviceAccountName: COLLECTOR } : {}),
           ...priority("floor"),
           ...stackPodSpec(config),
           containers: [{
@@ -196,7 +240,7 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
             image: imageReference(telemetry.collector.image),
             imagePullPolicy: "IfNotPresent",
             args: ["--config=/etc/otelcol/config.yaml"],
-            ...(workspaceStorage.enabled ? { env: [{ name: "VALKEY_PASSWORD", valueFrom: { secretKeyRef: { name: VALKEY, key: "password" } } }] } : {}),
+            ...given("env", valkeys(config).map(({ secret, variable }) => ({ name: variable, valueFrom: valkeyPassword(secret) }))),
             ports: [{ name: "otlp-http", containerPort: COLLECTOR_PORT }, { name: "health", containerPort: 13133 }],
             readinessProbe: { httpGet: { path: "/", port: "health" }, periodSeconds: 5 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
@@ -219,22 +263,25 @@ export function collectorObjects(config: InstallConfig): KubernetesObject[] {
     },
   };
   const sized = [deployment, verticalPodAutoscaler(deployment, "InPlace")];
-  if (!workspaceStorage.enabled) return [configMap, service, ...sized];
-  // Who the collector is, and that it may find JuiceFS's pods in the driver's namespace.
+  if (listed.length === 0) return [configMap, service, ...sized];
+  // Who the collector is, and that it may find the pods it scrapes in the namespaces they are in.
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata };
-  const driverMetadata = { ...metadata, namespace: workspaceStorage.csi.namespace };
-  const role: V1Role = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "Role",
-    metadata: driverMetadata,
-    rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }],
+  const podLister = (namespace: string): KubernetesObject[] => {
+    const inNamespace = { ...metadata, namespace };
+    const role: V1Role = {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "Role",
+      metadata: inNamespace,
+      rules: [{ apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch"] }],
+    };
+    const binding: V1RoleBinding = {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "RoleBinding",
+      metadata: inNamespace,
+      subjects: [{ kind: "ServiceAccount", name: COLLECTOR, namespace: NAMESPACE }],
+      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: COLLECTOR },
+    };
+    return [role, binding];
   };
-  const binding: V1RoleBinding = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "RoleBinding",
-    metadata: driverMetadata,
-    subjects: [{ kind: "ServiceAccount", name: COLLECTOR, namespace: NAMESPACE }],
-    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: COLLECTOR },
-  };
-  return [serviceAccount, role, binding, configMap, service, ...sized];
+  return [serviceAccount, ...listed.flatMap(podLister), configMap, service, ...sized];
 }

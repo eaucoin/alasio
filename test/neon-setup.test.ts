@@ -111,6 +111,12 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
+  // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
+  assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
+  assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
+  assert.equal(value(kube, names.filerStoreBackup, "password"), root.filerStoreBackupPassword);
+  assert.equal(new Set([root.filerStoreFilerPassword, root.filerStoreCollectorPassword, root.filerStoreBackupPassword]).size, 3);
+  assert.deepEqual([names.filerStoreFiler, names.filerStoreCollector, names.filerStoreBackup], ["q-seaweedfs-filer-store-filer", "q-seaweedfs-filer-store-collector", "q-seaweedfs-filer-store-backup"]);
 
   // The lake's query endpoint reads as a reader, in the catalog and in the object store, and Grafana queries it with its token.
   assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
@@ -183,6 +189,9 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     grafanaAdminPassword: "a",
     grafanaSecretKey: "s",
     branchForkKey: "f",
+    filerStoreFilerPassword: "p",
+    filerStoreCollectorPassword: "c",
+    filerStoreBackupPassword: "b",
   };
 }
 
@@ -205,6 +214,9 @@ test("with an external object store, every service uses its credentials and no S
   });
   const names = secretNames("q");
   assert.equal(rendered[names.seaweedfs], undefined);
+  assert.equal(rendered[names.filerStoreFiler], undefined);
+  assert.equal(rendered[names.filerStoreCollector], undefined);
+  assert.equal(rendered[names.filerStoreBackup], undefined);
   assert.equal(rendered[names.safekeeper]?.["AWS_ACCESS_KEY_ID"], "AK");
   assert.equal(rendered[names.lake]?.["LAKE_S3_SECRET"], "SK");
   assert.match(rendered[names.safekeeper]?.["REMOTE_STORAGE"] ?? "",/bucket_name="my-neon", bucket_region="eu-west-1"/u);

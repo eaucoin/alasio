@@ -32,8 +32,8 @@ import type {
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName } from "../../cli/src/manifests/common.ts";
 import { CSI_DRIVER, JUICEFS_PODS_SELECTOR, MOUNT_POD_LABELS, NODE_POD_LABELS } from "../../cli/src/manifests/juicefs-csi.ts";
-import { VALKEY } from "../../cli/src/manifests/valkey.ts";
-import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
+import { FILER, FILER_STORE, GATEWAY, VOLUME_SERVER } from "../../cli/src/manifests/object-store.ts";
+import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
@@ -42,7 +42,21 @@ import type { Made } from "./session-volumes.ts";
 
 /** Where the installation's JuiceFS driver runs, and makes its mount pods: its default namespace. */
 const DRIVER_NAMESPACE = "kube-system";
-const SEAWEEDFS = componentName("seaweedfs");
+/**
+ * What a workspace's writes go through, of the stack's: its metadata's Valkey, and the
+ * object store's parts its data does, each a StatefulSet's but its gateways, a
+ * Deployment's; and the port each takes them on.
+ */
+const STORES = [
+  { name: VALKEY, kind: "StatefulSet", port: 6379 },
+  { name: GATEWAY, kind: "Deployment", port: 8333 },
+  { name: FILER, kind: "StatefulSet", port: 8888 },
+  { name: VOLUME_SERVER, kind: "StatefulSet", port: 8080 },
+  { name: FILER_STORE, kind: "StatefulSet", port: 6379 },
+] as const;
+
+/** A pod of the store `store`'s that runs now. */
+const podOfStore = async ({ name, kind }: (typeof STORES)[number]) => (kind === "Deployment" ? kube.runningPod(NAMESPACE, name) : `${name}-0`);
 
 /** Where the suite works in a session's workspace, and the files it writes first and expects everywhere after. */
 const WORKDIR = "/workspace/juicefs-e2e";
@@ -381,13 +395,14 @@ export function workspaceStorage(): void {
       assert.match(said, /^after$/mu);
     });
 
-    test("a session reaches neither Valkey nor the object store, and holds none of their credentials", async () => {
+    test("a session reaches neither Valkey nor any part of the object store, and holds none of their credentials", async () => {
       const addresses: (readonly [string, number])[] = [];
-      for (const [name, port] of [[VALKEY, 6379], [SEAWEEDFS, 8333]] as const) {
-        const service = await kube.get<V1Service>(ref("Service", name, NAMESPACE));
-        const pod = await kube.get<V1Pod>(ref("Pod", `${name}-0`, NAMESPACE));
-        assert.ok(service?.spec?.clusterIP && pod?.status?.podIP, `${name} has no address`);
-        addresses.push([service.spec.clusterIP, port], [pod.status.podIP, port]);
+      for (const store of STORES) {
+        const service = await kube.get<V1Service>(ref("Service", store.name, NAMESPACE));
+        const pod = await kube.get<V1Pod>(ref("Pod", await podOfStore(store), NAMESPACE));
+        assert.ok(pod?.status?.podIP, `${store.name} has no address`);
+        // A headless Service's name is its pods' addresses.
+        addresses.push(...(service?.spec?.clusterIP && service.spec.clusterIP !== "None" ? [[service.spec.clusterIP, store.port] as const] : []), [pod.status.podIP, store.port]);
       }
       const secrets = await Promise.all([
         kube.secret(NAMESPACE, VALKEY, "password"),
@@ -483,16 +498,20 @@ export function workspaceStorage(): void {
       await kube.remove(ref("Sandbox", again, SESSIONS));
     });
 
-    for (const component of [VALKEY, SEAWEEDFS]) {
-      test(`a workspace keeps every file written through ${component} being killed mid-write`, async () => {
-        const dir = `${WORKDIR}/through-${component}`;
+    for (const store of STORES) {
+      test(`a workspace keeps every file written through ${store.name} being killed mid-write`, async () => {
+        const dir = `${WORKDIR}/through-${store.name}`;
         const writing = kube.execOk(SESSIONS, none, ["node", "-e", WRITER, dir, "30000"], { container: "bayma" });
         await sleep(3000);
-        const name = `${component}-0`;
+        const name = await podOfStore(store);
         const killed = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
         await kube.kill(NAMESPACE, name);
-        await until(`${name} made anew`, async () => ((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.metadata?.uid === killed?.metadata?.uid ? undefined : true));
-        await kube.awaitReady([ref("StatefulSet", component, NAMESPACE)], "10 minutes");
+        // A StatefulSet's under its name, a Deployment's under another.
+        await until(`${name} made anew`, async () => {
+          const now = await kube.get<V1Pod>(ref("Pod", store.kind === "Deployment" ? await podOfStore(store).catch(() => name) : name, NAMESPACE));
+          return now && now.metadata?.uid !== killed?.metadata?.uid ? true : undefined;
+        });
+        await kube.awaitReady([ref(store.kind, store.name, NAMESPACE)], "10 minutes");
         const written = (await writing).trim().split("\n").filter(Boolean);
         assert.ok(written.length > 0, "nothing was written");
         const kept = new Set<string>(JSON.parse(await kube.execOk(SESSIONS, none, ["node", "-e", WRITTEN, dir], { container: "bayma" })));

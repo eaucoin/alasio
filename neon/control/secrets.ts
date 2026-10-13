@@ -28,6 +28,10 @@ export interface StackSecrets {
   computeControlToken: string;
   /** Workspace storage's Valkey's. */
   valkeyPassword: string;
+  /** The bundled object store's filer store's, its filers' Valkey: its users', the filers', the collector's and the backups'. */
+  filerStoreFilerPassword: string;
+  filerStoreCollectorPassword: string;
+  filerStoreBackupPassword: string;
   /** The lake's query endpoint's: its reader's role's, and the token its queries carry. */
   lakeReaderPassword: string;
   lakeQueryToken: string;
@@ -124,6 +128,9 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     grafanaAdminPassword: kept(stored.grafanaAdminPassword, () => secret()),
     grafanaSecretKey: kept(stored.grafanaSecretKey, () => secret()),
     branchForkKey: kept(stored.branchForkKey, () => secret()),
+    filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
+    filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
+    filerStoreBackupPassword: kept(stored.filerStoreBackupPassword, () => secret()),
   };
   return { secrets, changed };
 }

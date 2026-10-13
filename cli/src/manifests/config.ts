@@ -12,6 +12,7 @@ import { isIPv4 } from "node:net";
 import type { V1Affinity, V1EnvFromSource, V1Toleration } from "@kubernetes/client-node";
 import { Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
 
+import { memoryBytes, memoryText } from "../capacity.ts";
 import { IMAGES } from "../release.ts";
 
 /** The install configuration is not what alasio installs from; the message says which key and why. */
@@ -309,22 +310,121 @@ const Neon = Schema.Struct({
   tolerations: Tolerations,
 });
 
+/** The Valkey of workspace storage's metadata and of the object store's filers. */
+const VALKEY_IMAGE = { repository: "valkey/valkey", tag: "9.1.2-alpine", digest: "sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11" };
+
+/** What an entry of the filer store, an object or a directory, takes in its Valkey: 1,339 bytes as measured, rounded up. */
+const FILER_STORE_ENTRY_BYTES = 1400;
+
+/** The filer store's `maxmemory` for `entries`: what they take and a quarter more, in whole 64 MiB. */
+export function filerStoreMaxmemoryBytes(entries: number): number {
+  const unit = 64 * 2 ** 20;
+  return Math.ceil((entries * FILER_STORE_ENTRY_BYTES * 1.25) / unit) * unit;
+}
+
 const ObjectStore = Schema.Struct({
-  /** SeaweedFS, run beside Neon. */
+  /**
+   * SeaweedFS, run beside Neon, as its parts: masters, which place objects on volume
+   * servers, which keep them; filers, which keep the store's namespace in a Valkey of its
+   * own, the filer store, so every filer sees what any has written; and S3 gateways, on the
+   * filers. Each takes its scale; the gateways', apart, scale on their CPU.
+   */
   bundled: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       image: Image({
         repository: "chrislusf/seaweedfs",
-        tag: "4.47",
-        digest: "sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882",
+        tag: "4.48",
+        digest: "sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d",
       }),
-      storage: Storage("100Gi"),
-      /** The most volumes it keeps, each up to 1GiB. */
-      volumes: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(30, { message: "must be at least 30" })), 100),
-      /** The disk it leaves free. */
-      minFreeSpace: defaulted(matching(/^[0-9]+(KiB|MiB|GiB|TiB)$/u, "must be a size in KiB, MiB, GiB or TiB"), "5GiB"),
-      resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "2Gi" } }),
+      /**
+       * How many copies of each object are kept, as SeaweedFS's replication says it: 000,
+       * one; 00N, N more, each on another volume server, so N + 1 of them at least. A copy
+       * outlives a disk's loss only on another disk: volume servers whose volumes are on one
+       * disk, as local-path's are on one node's, lose every copy with it, and need room
+       * there for all of them. Where copies are kept, each volume server is on a node of
+       * its own while there are as many, one left unplaced rather than beside another, and
+       * what a lost server held is copied again, each hour, onto the others. Changed, it
+       * holds for what is written from then on at once, and for what was written before
+       * from the next hour's lifecycle pass, which sets each volume's own to it and copies
+       * each that lacks copies; until then, those are kept as they were.
+       */
+      replication: defaulted(matching(/^00[0-9]$/u, "must be 000, or 00N for N more copies, each on another volume server"), "000"),
+      /**
+       * The masters, 1, or 3 in Raft, each with a volume of its state; their count is set
+       * as the store is made, and never changed after: fewer would lose what their Raft
+       * keeps, and one master's state, made without peers, is no Raft's that more could join.
+       */
+      masters: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false, most: 3 }),
+          storage: Storage("1Gi"),
+          resources: Resources({ requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
+        }),
+        {},
+      ),
+      /**
+       * The volume servers, each keeping objects on a volume of its own. Their count is
+       * lowered only once those it would remove hold no volumes, moved to the others first.
+       */
+      volumeServers: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+          storage: Storage("100Gi"),
+          /** The most volumes each keeps, each up to 1GiB. */
+          volumes: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(30, { message: "must be at least 30" })), 100),
+          /** The disk each leaves free. */
+          minFreeSpace: defaulted(matching(/^[0-9]+(KiB|MiB|GiB|TiB)$/u, "must be a size in KiB, MiB, GiB or TiB"), "5GiB"),
+          resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "2Gi" } }),
+        }),
+        {},
+      ),
+      /** The filers, started one after another. */
+      filers: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+          resources: Resources({ requests: { cpu: "20m", memory: "128Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
+      /** The S3 gateways, the store's endpoint. */
+      gateways: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
+          resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
+      /**
+       * The filers' store: a Valkey of its own, its memory sized for `entries`, the store's
+       * objects and directories, as about 1.4 KB each, with a quarter more.
+       */
+      filerStore: defaulted(
+        Schema.Struct({
+          image: Image(VALKEY_IMAGE),
+          storage: Storage("2Gi"),
+          entries: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(10_000, { message: "must be at least 10000" })), 150_000),
+          resources: Resources({ requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "512Mi" } }),
+          /**
+           * A snapshot of the filer store on `schedule`, hourly, onto a volume of its own,
+           * the last `keep` kept. One put back rolls the store's namespace back to when it
+           * was taken, so what was written since is lost, as an hour's at most. On a
+           * cluster of several nodes the volume is made on another node than the filer
+           * store's where one can take it, so a node's loss takes one of the two alone; on
+           * a single node, its disk's loss takes both.
+           */
+          backups: defaulted(
+            Schema.Struct({
+              enabled: defaulted(Schema.Boolean, true),
+              schedule: defaulted(Schema.String.check(Schema.isMinLength(9, { message: "must be a cron schedule" })), "23 * * * *"),
+              keep: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 48),
+              storage: Storage("10Gi"),
+            }),
+            {},
+          ),
+        }),
+        {},
+      ),
     }),
     {},
   ),
@@ -404,11 +504,7 @@ const Csi = Schema.Struct({
 
 /** Valkey, the file system's metadata engine. */
 const Valkey = Schema.Struct({
-  image: Image({
-    repository: "valkey/valkey",
-    tag: "9.1.2-alpine",
-    digest: "sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
-  }),
+  image: Image(VALKEY_IMAGE),
   /** Its snapshots and append-only file. */
   storage: Storage("2Gi"),
   /** What it may hold, half its memory limit, leaving room for the fork that writes its snapshots; about a million files at 384mb. */
@@ -558,6 +654,18 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   }
   if (config.workspaceStorage.enabled && !config.neon.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
+  }
+  const { bundled } = config.objectStore;
+  if (bundled.masters.scaling.min === 2) return { path: ["objectStore", "bundled", "masters", "scaling"], issue: "must be 1 or 3: two masters elect no leader once one is gone" };
+  const copies = Number(bundled.replication.slice(2)) + 1;
+  if (bundled.volumeServers.scaling.min < copies) {
+    return { path: ["objectStore", "bundled", "volumeServers", "scaling"], issue: `must be at least ${copies}, one for each copy objectStore.bundled.replication keeps` };
+  }
+  if (memoryBytes(bundled.filerStore.resources.limits["memory"] ?? "0") < 2 * filerStoreMaxmemoryBytes(bundled.filerStore.entries)) {
+    return {
+      path: ["objectStore", "bundled", "filerStore", "resources", "limits", "memory"],
+      issue: `must be at least ${memoryText(2 * filerStoreMaxmemoryBytes(bundled.filerStore.entries))}, twice what its entries take, for the fork that writes its snapshots`,
+    };
   }
   if (config.autoscaling.headroom.scaling.min > 0 && !config.autoscaling.preemption) {
     return { path: ["autoscaling", "headroom", "scaling"], issue: "must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then" };

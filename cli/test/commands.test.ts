@@ -409,6 +409,66 @@ test("status with rights in alasio's namespace alone says what it sees there, an
   ]);
 });
 
+test("up and upgrade refuse to start the object store's parts while its data is still on the volume of the one pod it ran as", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-seaweedfs-0", namespace: "alasio" }, spec: {} });
+  const refusal = "the object store still keeps its data on the volume of its one pod, the claim data-alasio-seaweedfs-0, which this release's parts do not use: " +
+    "they would start the stack on an empty store, so alasio does not apply them; move the data onto them first with the release's cut-over, which deletes data-alasio-seaweedfs-0 once it has";
+  assert.equal(failure(await alasio(["up"])), refusal);
+  assert.equal(failure(await alasio(["upgrade"])), refusal);
+  kube.objects.delete("/api/v1/namespaces/alasio/persistentvolumeclaims/data-alasio-seaweedfs-0");
+  succeeded(await alasio(["up"]));
+});
+
+test("up changes no count of the object store's masters, nor lowers its volume servers' while one it would remove holds volumes", async (t) => {
+  const { alasio, config, configure, kube } = await installed(t);
+  const statefulSet = (name: string) => kube.get(`/apis/apps/v1/namespaces/alasio/statefulsets/${name}`);
+  const scale = (name: string, replicas: number) => {
+    const found = statefulSet(name);
+    assert.ok(found?.spec);
+    found.spec["replicas"] = replicas;
+  };
+  // Three masters run, which the configuration's one would lower.
+  scale("alasio-seaweedfs-master", 3);
+  assert.equal(
+    failure(await alasio(["up"])),
+    "the object store runs 3 masters, whose Raft keeps where every volume is: fewer would lose its quorum, and that with it, so alasio does not lower their count; objectStore.bundled.masters.scaling stays 3",
+  );
+  scale("alasio-seaweedfs-master", 1);
+  // One master runs, which the configuration's three would raise.
+  const before = config() as { install: object };
+  configure({ ...before, install: { ...before.install, objectStore: { bundled: { masters: { scaling: { min: 3, max: 3 } } } } } });
+  assert.equal(
+    failure(await alasio(["up"])),
+    "the object store runs 1 master, whose state, made without peers, is no Raft's that more masters could join, so alasio does not raise their count; " +
+      "objectStore.bundled.masters.scaling stays 1, as the count of masters is set as the store is made",
+  );
+  configure(before);
+  // Three volume servers run, of which the third holds volumes, as a running master says.
+  scale("alasio-seaweedfs-volume", 3);
+  kube.put("pods", {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "alasio-seaweedfs-master-0", namespace: "alasio", labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-master" } },
+    status: { phase: "Running" },
+  });
+  const server = (ordinal: number, volumes: number) => ({ Url: `alasio-seaweedfs-volume-${ordinal}.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080`, Volumes: volumes, EcShards: 0 });
+  let held = 4;
+  kube.onExec = ({ pod, container, command }) =>
+    pod === "alasio-seaweedfs-master-0" && container === "master" && command.at(-1) === "http://127.0.0.1:9333/dir/status"
+      ? { exitCode: 0, stdout: JSON.stringify({ Topology: { DataCenters: [{ Racks: [{ DataNodes: [server(0, 7), server(1, 0), server(2, held)] }] }] } }) }
+      : { exitCode: 0 };
+  assert.equal(
+    failure(await alasio(["up"])),
+    "objectStore.bundled.volumeServers.scaling would remove volume servers that still hold volumes, alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080: " +
+      "move them to the others first, in weed shell in a gateway's buckets container, with lock, then volume.server.evacuate -node alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080 -apply, then unlock; then lower their count",
+  );
+  // Once they hold none, their count is lowered.
+  held = 0;
+  succeeded(await alasio(["up"]));
+  assert.equal(statefulSet("alasio-seaweedfs-volume")?.spec?.["replicas"], 1);
+});
+
 test("init and up raise inotify limits too low for the cluster here as root, now and for every boot, and status says them too low", async (t) => {
   const { alasio, configure, home, kube, machine } = await rig(t);
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });

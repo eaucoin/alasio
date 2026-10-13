@@ -20,7 +20,7 @@ import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restri
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
-import { VALKEY, VALKEY_PASSWORD, VALKEY_PORT, valkeyObjects } from "./valkey.ts";
+import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
 
 /** The Secret of the file system's credentials. */
 export const WORKSPACES_CREDENTIALS = componentName("workspaces-juicefs");
@@ -43,6 +43,12 @@ const NOBODY = 65534;
  * the clone's script.
  */
 const volumeDirectory = (namespace: string, claim: string) => `${namespace}-${claim}`;
+
+/** The file system's Valkey's name: its Service's, its StatefulSet's, and its password's Secret's. */
+export const VALKEY = componentName("valkey");
+
+/** The file system's Valkey's password, as a variable's source. */
+export const VALKEY_PASSWORD = valkeyPassword(VALKEY);
 
 /** Valkey's address, as the driver's pods reach it from their own namespace. */
 export const VALKEY_ADDRESS = `${VALKEY}.${NAMESPACE}.svc.cluster.local:${VALKEY_PORT}`;
@@ -263,5 +269,8 @@ function formatter(config: InstallConfig): V1Container {
 /** Workspace storage's objects, when it is on: Valkey, the CSI driver, the StorageClass, the quota check and the collection. */
 export function workspaceStorageObjects(config: InstallConfig): KubernetesObject[] {
   if (!config.workspaceStorage.enabled) return [];
-  return [...valkeyObjects(config, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config)];
+  const { valkey } = config.workspaceStorage;
+  // JuiceFS's driver needs it to delete its volumes' data, so it is kept while they remain.
+  const instance = { name: VALKEY, component: "valkey", labels: VOLUME_DRIVER, ...valkey };
+  return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config)];
 }
