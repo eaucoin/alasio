@@ -424,6 +424,60 @@ describe("neon", () => {
     });
   });
 
+  test("runs as many pageservers as their scale fixes, started at once, each on a node of its own, registering itself as its ordinal plus one at a Service of its pod's name, all in one zone", () => {
+    const objects = install({ neon: { pageserver: { scaling: { min: 3, max: 3 } } } });
+    const statefulSet = one<V1StatefulSet>(objects, "StatefulSet", "alasio-neon-pageserver");
+    assert.equal(statefulSet.spec?.replicas, 3);
+    assert.equal(statefulSet.spec?.podManagementPolicy, "Parallel");
+    // Governed by a headless Service of their own, which alasio renders.
+    const governing = one<V1Service>(objects, "Service", statefulSet.spec?.serviceName ?? "");
+    assert.equal(governing.metadata?.name, "alasio-neon-pageservers");
+    assert.equal(governing.spec?.clusterIP, "None");
+    assert.deepEqual(governing.spec?.selector, statefulSet.spec?.selector.matchLabels);
+    assert.deepEqual(statefulSet.spec?.template.spec?.topologySpreadConstraints?.map(({ topologyKey, whenUnsatisfiable }) => [topologyKey, whenUnsatisfiable]), [
+      ["kubernetes.io/hostname", "DoNotSchedule"],
+      ["topology.kubernetes.io/zone", "ScheduleAnyway"],
+    ]);
+    for (const index of [0, 1, 2]) {
+      const service = one<V1Service>(objects, "Service", `alasio-neon-pageserver-${index}`);
+      assert.equal(service.spec?.selector?.["statefulset.kubernetes.io/pod-name"], `alasio-neon-pageserver-${index}`);
+      assert.equal(service.spec?.publishNotReadyAddresses, true);
+    }
+    const init = statefulSet.spec?.template.spec?.initContainers?.[0];
+    assert.ok(init?.command);
+    const [shell, flag, text = ""] = init.command;
+    const identities = [0, 2].map((index) => {
+      const { root, run, remove } = runScript({ command: [shell ?? "", flag ?? "", text.replaceAll("/data/.neon/", "$ROOT/")] }, { POD_NAME: `alasio-neon-pageserver-${index}` }, { cp: "true" });
+      try {
+        run();
+        return [readFileSync(join(root, "identity.toml"), "utf8"), JSON.parse(readFileSync(join(root, "metadata.json"), "utf8"))];
+      } finally {
+        remove();
+      }
+    });
+    assert.deepEqual(identities, [
+      ["id=1\n", { host: "alasio-neon-pageserver-0", port: 6400, http_host: "alasio-neon-pageserver-0", http_port: 9898, availability_zone_id: "az-pageserver" }],
+      ["id=3\n", { host: "alasio-neon-pageserver-2", port: 6400, http_host: "alasio-neon-pageserver-2", http_port: 9898, availability_zone_id: "az-pageserver" }],
+    ]);
+    assert.ok(one(objects, "PodDisruptionBudget", "alasio-neon-pageserver"));
+    // neon-control waits for each, and splits the tenant into as many shards as configured.
+    const env = container(one<V1Deployment>(install({ neon: { pageserver: { scaling: { min: 2, max: 2 } }, shards: 4 } }), "Deployment", "alasio-neon-control")).env ?? [];
+    assert.deepEqual(["NEON_PAGESERVERS", "NEON_SHARDS"].map((key) => env.find(({ name }) => name === key)?.value), ["2", "4"]);
+  });
+
+  test("takes the tenant's shards as a power of two from 1 to 16, one by default, and the pageservers' count fixed", () => {
+    assert.equal(configOf().neon.shards, 1);
+    assert.equal(configOf({ neon: { shards: 8 } }).neon.shards, 8);
+    for (const shards of [0, 3, 32]) {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, neon: { shards } });
+      assert.ok(Result.isFailure(decoded), String(shards));
+      assert.equal(decoded.failure.message, "neon.shards must be a power of two from 1 to 16");
+    }
+    const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, neon: { pageserver: { scaling: { min: 1, max: 2 } } } });
+    assert.ok(Result.isFailure(decoded));
+    assert.equal(decoded.failure.message, "neon.pageserver.scaling.max must equal min: nothing scales it between them");
+  });
+
   test("runs one compute at a time, its spec fetched from neon-control", () => {
     const compute = one<V1Deployment>(install(), "Deployment", "alasio-neon-compute");
     assert.equal(compute.spec?.strategy?.type, "Recreate");
@@ -1252,6 +1306,10 @@ describe("telemetry", () => {
     }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "lake").static_configs, [{ targets: ["alasio-lake:9464"] }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "proxy").static_configs, [{ targets: ["alasio-neon-proxy:7001"] }]);
+    // Each pageserver, at its own Service.
+    const scraped = (file: Record<string, unknown>, job: string) =>
+      collectorConfig(install(file)).receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job).static_configs[0].targets;
+    assert.deepEqual(scraped({ neon: { pageserver: { scaling: { min: 2, max: 2 } } } }, "pageserver"), ["alasio-neon-pageserver-0:9898", "alasio-neon-pageserver-1:9898"]);
     // Each of neon-control's replicas, found among main's pods, as any of them wakes a compute.
     const control = jobs.find(({ job_name }: { job_name: string }) => job_name === "neon-control");
     assert.deepEqual(control.kubernetes_sd_configs, [{ role: "pod", namespaces: { names: ["alasio"] }, selectors: [{ role: "pod", label: "app.kubernetes.io/component=neon-control" }] }]);
@@ -2090,6 +2148,8 @@ describe("branch environments", () => {
     assert.equal(variable(lake, "LAKE_S3_ENDPOINT"), "http://alasio-seaweedfs.alasio.svc:8333");
     const main = install();
     assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio-neon-compute")).args?.at(-3), "alasio");
+    const control = one<V1Deployment>(main, "Deployment", "alasio-neon-control");
+    assert.deepEqual([variable(control, "NEON_PAGESERVERS"), variable(control, "NEON_SHARDS")], ["1", "1"]);
   });
 
   test("confine the branch's sessions to its alasio, and have a policy of its compute's", () => {

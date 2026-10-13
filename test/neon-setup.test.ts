@@ -21,7 +21,6 @@ const ENV = {
   SECRET_PREFIX: "q",
   NEON_BROKER_URL: "http://q-neon-storage-broker:50051",
   NEON_CONTROLLER_URL: "http://q-neon-storage-controller:1234",
-  NEON_PAGESERVER_HOST: "q-neon-pageserver",
   NEON_PROXY_HOST: "q-neon-proxy.alasio.svc",
   NEON_CONTROLLER_DB_HOST: "q-neon-controller-db",
   S3_ENDPOINT: "http://q-seaweedfs:8333",
@@ -129,8 +128,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
   // It evicts layers only once the node's disk, which it shares, is nearly full: at 94 % used or under 8 GiB free.
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /^disk_usage_based_eviction=\{ max_usage_pct=94, min_avail_bytes=8589934592 \}$/mu);
-  const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
-  assert.equal(metadata.host, "q-neon-pageserver");
+  // Its identity is each pageserver's own, which it renders itself (cli/src/manifests/neon.ts), not the stack's.
+  const pageserverKeys = Object.keys(kube.secrets.get(names.pageserver)?.data ?? {});
+  assert.ok(!pageserverKeys.includes("identity.toml") && !pageserverKeys.includes("metadata.json"), pageserverKeys.join(", "));
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces", "snapshots"]);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.

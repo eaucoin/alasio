@@ -82,14 +82,16 @@ const succeeded = (what: string) => (ran: Ran): Effect.Effect<string, BranchRefu
 
 /**
  * Calls neon-control's API (neon/control/service.ts) in its pod, with the stack's admin
- * token (the `alasio-branches` Secret's), which goes on stdin, never on a command line.
+ * token (the `alasio-branches` Secret's), which goes on stdin, never on a command line. A
+ * neon-control that does not answer holds a command 4 minutes at most, longer than it
+ * waits for a compute to wake (3 minutes).
  */
 function neonControl<Body>(method: "GET" | "POST" | "DELETE", path: string, body?: object) {
   return Effect.gen(function*() {
     const token = yield* requiredSecret(componentName("branches"), "control-token");
     const pod = yield* runningPod("neon-control");
     const command = [
-      "curl", "-sS", "-X", method, "-H", "@-",
+      "curl", "-sS", "--max-time", "240", "-X", method, "-H", "@-",
       ...(body === undefined ? [] : ["-H", "content-type: application/json", "--data-binary", JSON.stringify(body)]),
       "-w", "\n%{http_code}", `http://127.0.0.1:8080${path}`,
     ];
@@ -114,6 +116,19 @@ export interface ComputeTimes {
 export const computeTimes = neonControl<{ readonly computes: readonly ComputeTimes[] }>("GET", "/computes").pipe(
   Effect.map((answer) => new Map(answer.status === 200 && answer.body ? answer.body.computes.map((compute) => [compute.namespace, compute] as const) : [])),
   Effect.orElseSucceed(() => new Map<string, ComputeTimes>()),
+);
+
+/** Neon's tenant as neon-control has it: its shards, their stripe, and each pageserver, with how many it holds. */
+export interface TenantView {
+  readonly shards: number;
+  readonly stripeSize: number;
+  readonly pageservers: readonly { readonly id: number; readonly address: string; readonly availability: string; readonly shards: number }[];
+}
+
+/** Neon's tenant, as neon-control has it; null where neon-control does not answer, as before alasio runs. */
+export const tenantView = neonControl<TenantView>("GET", "/tenant").pipe(
+  Effect.map((answer) => (answer.status === 200 ? answer.body : null)),
+  Effect.orElseSucceed(() => null),
 );
 
 /** What neon-control says of a refusal: its error, or its status. */

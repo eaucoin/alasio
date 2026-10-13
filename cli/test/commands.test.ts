@@ -17,6 +17,7 @@ import { Cause, Exit } from "effect";
 import { tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { forkToken } from "../../src/branch/names.ts";
+import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
@@ -39,6 +40,48 @@ const CPU_FEATURES = "alasio-node-agent/cpu-features";
 
 /** What a node agent's pod says of a node with `features`, under the current gVisor release. */
 const cpuReport = (features: readonly string[], release = currentGvisorRelease()): string => JSON.stringify({ release, cpuFeatures: features });
+
+/** Neon's tenant as neon-control has it after alasio's first start: one shard, on one pageserver. */
+const ONE_SHARD: TenantView = { shards: 1, stripeSize: 2048, pageservers: [{ id: 1, address: "alasio-neon-pageserver-0.alasio.svc.cluster.local:6400", availability: "Active", shards: 1 }] };
+
+/** Neon's storage as the storage controller holds it: the pageservers registered, and its tenant's shards, null before it is made; and whether it answers. */
+interface FakeStorage {
+  pageservers: number;
+  shards: number | null;
+  answering: boolean;
+  /** Whether its database answers, in its pod. */
+  databaseAnswering: boolean;
+}
+
+/**
+ * The storage controller's answer, in its pod, to curl asking its API for the path
+ * `command` ends with, as `storage` holds: its pageservers, or the tenant.
+ */
+function storageControllerAnswer(storage: FakeStorage, command: readonly string[]): { exitCode: number; stdout: string } {
+  const path = command.at(-1) ?? "";
+  const answer = (status: number, answered: unknown) => ({ exitCode: 0, stdout: `${JSON.stringify(answered)}\n${status}` });
+  if (!storage.answering) return answer(503, { msg: "Not ready: startup in progress" });
+  if (path === "/control/v1/node") {
+    return answer(200, Array.from({ length: storage.pageservers }, (_, index) => ({ id: index + 1, availability: "Active", scheduling: "Active", listen_pg_addr: `alasio-neon-pageserver-${index}`, listen_pg_port: 6400 })));
+  }
+  if (path.startsWith("/control/v1/tenant/") && storage.shards !== null) {
+    const count = storage.shards;
+    return answer(200, { shards: Array.from({ length: count }, (_, index) => ({ tenant_shard_id: `t-${index.toString(16).padStart(2, "0")}${count.toString(16).padStart(2, "0")}`, node_attached: 1, is_reconciling: false, is_splitting: false })) });
+  }
+  return answer(404, { msg: "NotFound" });
+}
+
+/**
+ * The storage controller's database's answer, in its pod, to psql asking it `command`'s SQL,
+ * as `storage` holds: its table of nodes made, and a node in it while it has a pageserver.
+ */
+function controllerDatabaseAnswer(storage: FakeStorage, command: readonly string[]): { exitCode: number; stdout: string; stderr?: string } {
+  const sql = command.at(-1) ?? "";
+  if (!storage.databaseAnswering) return { exitCode: 2, stdout: "", stderr: "psql: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL.5432\" failed: No such file or directory" };
+  if (sql.includes("to_regclass('nodes')")) return { exitCode: 0, stdout: "t\n" };
+  if (sql.includes("from nodes")) return { exitCode: 0, stdout: `${storage.pageservers > 0 ? "t" : "f"}\n` };
+  return { exitCode: 0, stdout: "" };
+}
 
 interface Rig {
   readonly kube: FakeKube;
@@ -65,6 +108,11 @@ async function rig(t: TestContext): Promise<Rig> {
   telegram.bots.set(BOT_TOKEN, BOT);
   // The server node of the cluster in Docker writes a kubeconfig that reaches the fake API, at the port the config gives it.
   const { fake: docker } = await serveK3sInDocker(kube.kubeconfig);
+  // The storage controller, once installed, says what Neon's storage holds, which alasio up
+  // checks the configuration against: one pageserver, before the tenant is made.
+  const storage: FakeStorage = { pageservers: 1, shards: null, answering: true, databaseAnswering: true };
+  kube.onExec = ({ container, command }) =>
+    container === "storage-controller" ? storageControllerAnswer(storage, command) : container === "postgres" ? controllerDatabaseAnswer(storage, command) : { exitCode: 0 };
   const home = mkdtempSync(join(tmpdir(), "alasio-commands-"));
   t.after(async () => {
     await Promise.all([kube.close(), telegram.close(), docker.close()]);
@@ -568,10 +616,12 @@ test("up changes no count of the object store's masters, nor lowers its volume s
   });
   const server = (ordinal: number, volumes: number) => ({ Url: `alasio-seaweedfs-volume-${ordinal}.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080`, Volumes: volumes, EcShards: 0 });
   let held = 4;
-  kube.onExec = ({ pod, container, command }) =>
-    pod === "alasio-seaweedfs-master-0" && container === "master" && command.at(-1) === "http://127.0.0.1:9333/dir/status"
+  // The storage controller still says what Neon's storage holds, as the rig has it.
+  const others = kube.onExec;
+  kube.onExec = (exec) =>
+    exec.pod === "alasio-seaweedfs-master-0" && exec.container === "master" && exec.command.at(-1) === "http://127.0.0.1:9333/dir/status"
       ? { exitCode: 0, stdout: JSON.stringify({ Topology: { DataCenters: [{ Racks: [{ DataNodes: [server(0, 7), server(1, 0), server(2, held)] }] }] } }) }
-      : { exitCode: 0 };
+      : others(exec);
   assert.equal(
     failure(await alasio(["up"])),
     "objectStore.bundled.volumeServers.scaling would remove volume servers that still hold volumes, alasio-seaweedfs-volume-2.alasio-seaweedfs-volume.alasio.svc.cluster.local:8080: " +
@@ -1162,6 +1212,10 @@ interface FakeNeon {
   turns: string;
   /** Each compute as neon-control lists it. */
   readonly computes: { id: string; namespace: string; wokenAt: string | null; suspendedAt: string | null }[];
+  /** Neon's tenant as neon-control has it; null while it cannot say (503). */
+  tenant: TenantView | null;
+  /** Neon's storage as the storage controller holds it. */
+  readonly storage: FakeStorage;
 }
 
 /** A Secret of main's, as the stack's setup makes it. */
@@ -1201,7 +1255,14 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
   });
   stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
   stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
-  const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [] };
+  const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [],
+    tenant: ONE_SHARD,
+    storage: { pageservers: 1, shards: 1, answering: true, databaseAnswering: true },
+  };
+  // The storage controller's database's claim, bound as its first start bound it.
+  setup.kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-neon-controller-db-0", namespace: "alasio" }, spec: {}, status: { phase: "Bound" } });
+  // The tenant, as the stack's setup names it.
+  stackSecret(setup.kube, "alasio-neon-root", { "secrets.json": JSON.stringify({ tenantId: "t" }) });
   setup.kube.onExec = ({ container, command }) => {
     if (container === "neon-control") {
       const method = command[command.indexOf("-X") + 1] ?? "";
@@ -1211,6 +1272,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
       neon.asked.push({ method, path, ...(body === undefined ? {} : { body }) });
       const answer = (status: number, answered?: unknown) => ({ exitCode: 0, stdout: `${answered === undefined ? "" : JSON.stringify(answered)}\n${status}` });
       if (method === "GET" && path === "/computes") return answer(200, { computes: neon.computes });
+      if (method === "GET" && path === "/tenant") return neon.tenant ? answer(200, neon.tenant) : answer(503, { error: "neon-control is bootstrapping" });
       if (method === "GET") return answer(200, { branches: neon.branches });
       if (method === "POST" && path.startsWith("/computes/")) return answer(200, { address: "woken" });
       if (method === "POST") {
@@ -1222,6 +1284,8 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
       neon.branches.splice(neon.branches.findIndex((branch) => branch.name === name), 1);
       return answer(204);
     }
+    if (container === "storage-controller") return storageControllerAnswer(neon.storage, command);
+    if (container === "postgres") return controllerDatabaseAnswer(neon.storage, command);
     if (container === "compute") {
       const sql = command.at(-1) ?? "";
       return { exitCode: 0, stdout: sql.includes("pg_current_wal_lsn") ? "0/1A2B3C8\n" : `${neon.turns}\n` };
@@ -1257,6 +1321,123 @@ test("status says of each compute whether it is awake or asleep, and when neon-c
   collector.spec["replicas"] = 0;
   run = await alasio(["status"]);
   assert.ok(run.printed.includes("  Deployment alasio/alasio-collector: ready"), run.printed.join("\n"));
+});
+
+test("status says Neon's shards, and each pageserver, with how many of them it holds", async (t) => {
+  const { alasio, neon } = await branchable(t);
+  neon.tenant = {
+    shards: 2,
+    stripeSize: 2048,
+    pageservers: [
+      { id: 1, address: "alasio-neon-pageserver-0.alasio.svc.cluster.local:6400", availability: "Active", shards: 1 },
+      { id: 2, address: "alasio-neon-pageserver-1.alasio.svc.cluster.local:6400", availability: "Offline", shards: 1 },
+    ],
+  };
+  const run = await alasio(["status"]);
+  succeeded(run);
+  const at = run.printed.indexOf("Neon: 2 shards on 2 pageservers");
+  assert.deepEqual(run.printed.slice(at, at + 3), [
+    "Neon: 2 shards on 2 pageservers",
+    "  pageserver 1 at alasio-neon-pageserver-0.alasio.svc.cluster.local:6400: Active, 1 shard",
+    "  pageserver 2 at alasio-neon-pageserver-1.alasio.svc.cluster.local:6400: Offline, 1 shard",
+  ]);
+});
+
+test("up refuses fewer of Neon's shards than its tenant has, as Neon merges none, before it applies anything", async (t) => {
+  const { alasio, config, configure, kube, neon } = await branchable(t);
+  neon.storage.shards = 4;
+  const written = config() as { install?: Record<string, unknown> };
+  configure({ ...written, install: { ...written.install, neon: { shards: 2 } } });
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["up"])),
+    "neon.shards is 2, but alasio's Neon has 4 shards already, and Neon merges no shards: set it to 4 or more",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  configure({ ...written, install: { ...written.install, neon: { shards: 4 } } });
+  succeeded(await alasio(["up"]));
+});
+
+test("up refuses to apply anything while the storage controller, which has registered a pageserver, cannot say what Neon's storage holds", async (t) => {
+  const { alasio, kube, neon } = await branchable(t);
+  neon.storage.answering = false;
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["up"])),
+    "alasio applies nothing it cannot check against Neon's storage, and its storage controller did not say what it holds (it answered its pageservers with 503): " +
+      "once it runs, as alasio status says it does not, run alasio up again",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  // One that has registered no pageserver, as its database says, as where alasio's first up stopped before it did, holds nothing to check against.
+  neon.storage.pageservers = 0;
+  succeeded(await alasio(["up"]));
+});
+
+test("up refuses to apply anything while the storage controller's database, its claim bound, does not answer, and checks nothing only where its claim never bound", async (t) => {
+  const { alasio, kube, neon } = await branchable(t);
+  neon.storage.databaseAnswering = false;
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["up"])),
+    "alasio applies nothing it cannot check against Neon's storage, and the storage controller's database, which holds what it registered, did not answer " +
+      "(psql exited with 2: psql: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL.5432\" failed: No such file or directory): " +
+      "once its pod runs (kubectl -n alasio describe pod alasio-neon-controller-db-0 says why it does not), run alasio up again",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  // Its claim never bound, as where alasio's first up stopped before the database first started: it holds nothing.
+  const claim = kube.get("/api/v1/namespaces/alasio/persistentvolumeclaims/data-alasio-neon-controller-db-0");
+  assert.ok(claim);
+  claim["status"] = { phase: "Pending" };
+  succeeded(await alasio(["up"]));
+});
+
+test("up refuses to apply anything while the Secret that names Neon's tenant cannot be read", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  stackSecret(kube, "alasio-neon-root", { "secrets.json": "{" });
+  kube.changes.length = 0;
+  assert.match(failure(await alasio(["up"])), /^alasio applies nothing it cannot check against Neon's storage, and its storage controller did not say what it holds \(the Secret alasio-neon-root's secrets\.json, which names Neon's tenant, is no JSON\)/u);
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+});
+
+test("up applies nothing where an object the cluster has cannot take this release's of it, as a dry run of each says, naming what makes it able", async (t) => {
+  const { alasio, kube } = await branchable(t);
+  // The pageservers' StatefulSet as 7.0.0 made it, its pods started in order.
+  const pageservers = kube.get("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-neon-pageserver");
+  assert.ok(pageservers?.spec);
+  pageservers.spec["podManagementPolicy"] = "OrderedReady";
+  kube.changes.length = 0;
+  for (const command of [["up"], ["upgrade", "--check"]]) {
+    assert.equal(
+      failure(await alasio(command)),
+      "the cluster's StatefulSet alasio/alasio-neon-pageserver cannot take this release's of it (StatefulSet.apps \"alasio-neon-pageserver\" is invalid: spec: Forbidden: " +
+        "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden), " +
+        "so alasio applies nothing: an installation of 7.0.0 is upgraded by upgrades/from-7.0.0.sh, which makes it anew, keeping its pod and claim",
+    );
+  }
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+});
+
+test("up checks Neon's storage by the storage controller, which every release runs, and asks neon-control nothing, whose release it may be upgrading", async (t) => {
+  const { alasio, neon } = await branchable(t);
+  // neon-control of a release before this one, which has no /tenant.
+  neon.tenant = null;
+  neon.asked.length = 0;
+  succeeded(await alasio(["up"]));
+  assert.deepEqual(neon.asked.filter(({ path }) => path === "/tenant"), []);
+});
+
+test("up refuses fewer of Neon's pageservers than the storage controller has registered, as alasio removes none, before it applies anything", async (t) => {
+  const { alasio, config, configure, kube, neon } = await branchable(t);
+  neon.storage.pageservers = 2;
+  const written = config() as { install?: Record<string, unknown> };
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["up"])),
+    "neon.pageserver.scaling is 1, but alasio's Neon has 2 pageservers registered, each holding shards or their secondaries, and alasio removes none: set it to 2 or more",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  configure({ ...written, install: { ...written.install, neon: { pageserver: { scaling: { min: 2, max: 2 } } } } });
+  succeeded(await alasio(["up"]));
 });
 
 test("branch create's help says how far back Neon keeps its history, and so a branch point", async (t) => {

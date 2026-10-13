@@ -7,7 +7,11 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import { scramVerifier } from "./scram.ts";
 
-export const PAGESERVER_ID = 1;
+/**
+ * The availability zone every pageserver is in: one, the tenant's home zone, as alasio's
+ * pageservers are no zones apart, so any of them may hold any shard attached.
+ */
+export const PAGESERVER_ZONE = "az-pageserver";
 export const DATABASE = "alasio";
 /** The roles of alasio's database: alasio's own, the one its spec gives every compute. */
 export const ROLE = "alasio";
@@ -258,7 +262,7 @@ export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath,
     `pg_distrib_dir=${toml("/usr/local/")}`,
     `listen_pg_addr=${toml("0.0.0.0:6400")}`,
     `listen_http_addr=${toml("0.0.0.0:9898")}`,
-    `availability_zone=${toml("az-pageserver")}`,
+    `availability_zone=${toml(PAGESERVER_ZONE)}`,
     `control_plane_api=${toml(`${controllerUrl}/upcall/v1/`)}`,
     `control_plane_api_token=${toml(token)}`,
     `http_auth_type='NeonJWT'`,
@@ -268,9 +272,4 @@ export function pageserverToml({ brokerUrl, controllerUrl, token, publicKeyPath,
     `disk_usage_based_eviction={ max_usage_pct=${LAYER_EVICTION.maxUsagePct}, min_avail_bytes=${LAYER_EVICTION.minAvailBytes} }`,
     "",
   ].join("\n");
-}
-
-/** How the storage controller and computes reach the pageserver at `host`; it registers itself with these. */
-export function pageserverMetadata(host: string): string {
-  return JSON.stringify({ host, port: 6400, http_host: host, http_port: 9898, availability_zone_id: "az-pageserver" }) + "\n";
 }

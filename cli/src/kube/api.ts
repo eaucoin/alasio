@@ -194,6 +194,8 @@ export class KubeApi extends Context.Service<KubeApi, {
   readonly server: string;
   /** Server-side applies `object` as `fieldManager` (FIELD_MANAGER unless given), taking over fields other managers set: the object as applied. */
   readonly apply: (object: KubernetesObject, fieldManager?: string) => Effect.Effect<KubernetesObject, KubeApiError>;
+  /** Server-side applies `object` as FIELD_MANAGER as a dry run, which changes nothing: the object as it would be, or why the API server refuses it. */
+  readonly dryApply: (object: KubernetesObject) => Effect.Effect<KubernetesObject, KubeApiError>;
   /** The object, or null when there is none. */
   readonly get: <T extends KubernetesObject = KubernetesObject>(ref: ObjectRef) => Effect.Effect<T | null, KubeApiError>;
   readonly list: <T extends KubernetesObject = KubernetesObject>(kind: Kind, options?: ListOptions) => Effect.Effect<readonly T[], KubeApiError>;
@@ -381,6 +383,13 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
         path: objectPath(refOf(object)),
         query: { fieldManager, force: "true" },
         // JSON is YAML, which an apply patch is sent as.
+        body: { contentType: "application/apply-patch+yaml", content: object },
+      }),
+    dryApply: (object) =>
+      json({
+        method: "PATCH",
+        path: objectPath(refOf(object)),
+        query: { fieldManager: FIELD_MANAGER, force: "true", dryRun: "All" },
         body: { contentType: "application/apply-patch+yaml", content: object },
       }),
     get: <T extends KubernetesObject>(ref: ObjectRef) =>

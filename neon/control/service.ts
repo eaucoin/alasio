@@ -6,9 +6,14 @@
  *
  * On start it bootstraps what the storage services need and cannot do
  * themselves, idempotently: registers the safekeepers with the storage
- * controller, waits for the pageserver to register, creates alasio's tenant
- * and its timeline, the branch `main`, once, and configures the tenant to keep
- * a day of history (HISTORY_DAYS). It then manages branches, child
+ * controller, creates alasio's tenant once a pageserver registers, and its timeline, the
+ * branch `main`, once, and configures the tenant to keep a day of history
+ * (HISTORY_DAYS), with a warm secondary location on another pageserver where there are
+ * several; it is ready then, whichever pageservers serve. While every pageserver serves,
+ * the replica that leads splits the tenant into as many shards as configured, once that
+ * is more than it has, and spreads its shards over the pageservers where all are on one:
+ * Neon merges no shards, so fewer are refused (by alasio up, which asks the storage
+ * controller first), and alasio removes no pageserver. It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
  * compute its spec, and reports healthy once main's compute can start. Each spec names
  * the pageserver of each of the tenant's shards (ShardLayout), as the storage controller
@@ -61,6 +66,8 @@
  *   (200, `{ address }`); 404 for a compute of no ready branch, or not deployed.
  * - `GET /computes`: every ready branch's compute, its namespace, and when it was last
  *   asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
+ * - `GET /tenant`: the tenant's shards, their stripe, and each pageserver, with how many of
+ *   them it holds (200, `{ shards, stripeSize, pageservers }`), for `alasio status`.
  *
  * 503, `{ error }`, too, for a lock of the record another replica held for longer than its
  * patience (./record.ts), when it may be asked again. `GET /metrics` takes no token: its
@@ -70,7 +77,8 @@
  * safekeepers?, computeId }`, its state `creating`, `ready` or `deleting`.
  *
  * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
- * the order of their ids, comma-separated; NEON_CONTROLLER_DB_HOST,
+ * the order of their ids, comma-separated; NEON_PAGESERVERS, how many pageservers run;
+ * NEON_SHARDS, how many shards the tenant is split into; NEON_CONTROLLER_DB_HOST,
  * the storage controller's Postgres, which its record is in; NAMESPACE, its own, main's
  * compute's; and NEON_COMPUTE_NAME, the name of every compute's Deployment and Service,
  * in main's namespace or a branch environment's. Mounts: /secrets (secrets.json, the
@@ -100,10 +108,12 @@ import {
   computeOfToken,
   creationRefused,
   deleting,
+  type DescribedShard,
   existingBranch,
   HISTORY_DAYS,
   layoutOf,
   MAIN,
+  pageserversServing,
   placementOf,
   PROXY_PATHS,
   type ReadyBranch,
@@ -111,6 +121,8 @@ import {
   safekeepersNotified,
   sameLayout,
   type ShardLayout,
+  shardMoves,
+  type StorageNode,
   type TimelineCreated,
   withBranch,
   withNotifiedPlacement,
@@ -131,7 +143,7 @@ import {
 import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
 import { bearsScope, computeCtlToken, publicJwks, signToken } from "./jwt.ts";
 import { createControlMetrics } from "./metrics.ts";
-import { reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
+import { reconcile, reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { scramVerifier } from "./scram.ts";
 import { MONITOR_ROLE, type StackSecrets } from "./secrets.ts";
@@ -148,15 +160,6 @@ interface ControllerRequest {
 interface JsonResponse<Body> {
   status: number;
   body: Body | null;
-}
-
-/** A pageserver as the storage controller lists it. */
-interface StorageNode {
-  id: number;
-  /** Active, WarmingUp or Offline. */
-  availability: string;
-  listen_pg_addr: string;
-  listen_pg_port: number;
 }
 
 /** Where the tenant's shards are, as the storage controller's locate answers. */
@@ -186,6 +189,8 @@ const CONTROLLER_URL = setting("CONTROLLER_URL");
 const PG_VERSION = 17;
 const SAFEKEEPER_HOSTS = setting("NEON_SAFEKEEPER_HOSTS").split(",").map((host) => host.trim()).filter(Boolean);
 const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
+const PAGESERVERS = Number(setting("NEON_PAGESERVERS"));
+const SHARDS = Number(setting("NEON_SHARDS"));
 const CONTROLLER_DB_HOST = setting("NEON_CONTROLLER_DB_HOST");
 const NAMESPACE = setting("NAMESPACE");
 const COMPUTE_NAME = setting("NEON_COMPUTE_NAME");
@@ -307,18 +312,97 @@ async function registerSafekeepers(): Promise<void> {
 }
 
 /**
- * Creates alasio's tenant once, and gives it its configuration, whole, each time: the
- * storage controller keeps it, and gives it the pageserver with the tenant.
+ * Creates alasio's tenant once, on a pageserver once one registers, and gives it its
+ * configuration, whole, each time: the storage controller keeps it, and gives it the
+ * pageservers with the tenant.
  */
 async function ensureTenant(): Promise<void> {
   const found = await controller("GET", `/control/v1/tenant/${secrets.tenantId}`, { allow: [404] });
   if (found.status === 404) {
+    await until("a pageserver to register", async () => {
+      // The controller answers with its nodes; a failure here is retried.
+      const nodes = (await controller<StorageNode[]>("GET", "/control/v1/node")).body!;
+      return nodes.some((node) => node.availability === "Active");
+    });
     await controller("POST", "/v1/tenant", {
       body: { new_tenant_id: secrets.tenantId, placement_policy: { Attached: 0 } },
     });
     log("tenant created", { tenantId: secrets.tenantId });
   }
   await controller("PUT", "/v1/tenant/config", { body: { tenant_id: secrets.tenantId, pitr_interval: `${HISTORY_DAYS}d` } });
+  // A warm secondary location of each shard on another pageserver, where there is one, so
+  // losing a pageserver fails its shards over without downloading their layers anew.
+  await controller("PUT", `/control/v1/tenant/${secrets.tenantId}/policy`, { body: { placement: { Attached: PAGESERVERS > 1 ? 1 : 0 } } });
+}
+
+/** The tenant's shard count: an unsharded tenant's, 0 to the storage controller, is 1. */
+const shardCount = ({ shard_params }: Located): number => Math.max(1, shard_params.count);
+
+/**
+ * Splits the tenant into SHARDS shards, where it has fewer, and waits for the split; one
+ * with more stays as it is, as Neon merges no shards (alasio up refuses fewer, saying so).
+ * A split the storage controller cannot make now (409, 503) is asked for again at the
+ * next round.
+ */
+async function ensureShards(): Promise<void> {
+  const count = shardCount(await located());
+  if (count > SHARDS) {
+    log("the tenant keeps more shards than configured, as Neon merges none", { shards: count, configured: SHARDS });
+    return;
+  }
+  if (count === SHARDS) return;
+  const split = await controller("PUT", `/control/v1/tenant/${secrets.tenantId}/shard_split`, { body: { new_shard_count: SHARDS }, allow: [409, 503] });
+  log(split.status === 200 ? "tenant split" : "tenant not split yet", { from: count, to: SHARDS, status: split.status });
+}
+
+/**
+ * Spreads the tenant's shards over the pageservers where they are all on one (shardMoves).
+ * The storage controller leaves a split's shards where the tenant was, and its optimizer
+ * is not relied on to move them: with every pageserver in one zone (PAGESERVER_ZONE) it
+ * moved neither of two shards in ten minutes, twice in CI. Each move is graceful, cut over
+ * once the shard's secondary there is warm; one the storage controller refuses, to a
+ * pageserver it scores worse (412), or cannot make now (409, 503), is left as it is, so
+ * neon-control never works against it.
+ */
+async function spreadShards(): Promise<void> {
+  const described = (await controller<{ shards: DescribedShard[] }>("GET", `/control/v1/tenant/${secrets.tenantId}`)).body!;
+  for (const move of shardMoves(described.shards, PAGESERVERS)) {
+    const moved = await controller("PUT", `/control/v1/tenant/${move.shardId}/migrate`, { body: { node_id: move.to, origin_node_id: move.from }, allow: [409, 412, 503] });
+    log(moved.status === 200 ? "shard moving" : "shard not moved", { ...move, status: moved.status });
+  }
+}
+
+/**
+ * The tenant split into as many shards as configured, and its shards spread over the
+ * pageservers, by the replica that leads, once every pageserver serves (pageserversServing):
+ * a split or a move needs each, and no other replica splits or moves beside it.
+ */
+async function balanceShards(): Promise<void> {
+  const nodes = (await controller<StorageNode[]>("GET", "/control/v1/node")).body ?? [];
+  if (!pageserversServing(nodes, PAGESERVERS)) return;
+  await ensureShards();
+  await spreadShards();
+}
+
+/**
+ * The layout recorded, and every running compute's, set right by the replica that leads,
+ * as ./reconfigure.ts's reconcile decides. Under the layout's lock, as a notification is,
+ * from reading where the shards are on: a notification meanwhile is answered 423 and sent
+ * again, so neither records a layout the other read before it.
+ */
+async function reconcileLayout(): Promise<void> {
+  const done = await record.tryLayoutLocked(() => reconcile({
+    shards: async () => (await controller<{ shards: DescribedShard[] }>("GET", `/control/v1/tenant/${secrets.tenantId}`)).body!.shards,
+    located: async () => layoutLocated(await located()),
+    recorded: () => record.layout(secrets.tenantId),
+    record: learnLayout,
+    configure: async (layout) => configureRunning(await record.branches(), layout),
+  }));
+  const reconciled = done?.value;
+  if (!reconciled) return;
+  const { layout, recorded, pending } = reconciled;
+  if (recorded) log("layout recorded as the storage controller locates the shards", { pageservers: layout.pageservers, stripeSize: layout.stripeSize });
+  if (pending > 0) log("computes not given the layout yet", { pending });
 }
 
 /** Creates main's timeline once, bootstrapped, recording the safekeepers it was placed on. */
@@ -612,8 +696,9 @@ let led = false;
 let leading = false;
 
 /**
- * What the replica that leads does, now and then: each branch's safekeepers repaired, and
- * each compute idle long enough put to sleep.
+ * What the replica that leads does, now and then: each branch's safekeepers repaired,
+ * each compute idle long enough put to sleep, the tenant's shards split and spread as
+ * configured (balanceShards), and the computes' layout set right (reconcileLayout).
  */
 async function lead(): Promise<void> {
   if (leading) return;
@@ -629,6 +714,8 @@ async function lead(): Promise<void> {
     const branches = await record.branches();
     await repairEverySafekeeper(branches);
     await suspendIdle(branches.filter(({ state }) => state === "ready").map(({ name }) => name));
+    await balanceShards();
+    await reconcileLayout();
   } finally {
     leading = false;
   }
@@ -703,11 +790,6 @@ async function bootstrap(): Promise<void> {
   await until("the storage controller", async () => (await controller("GET", "/status")).status === 200);
   await record.ensureSchema();
   await registerSafekeepers();
-  await until("the pageserver to register", async () => {
-    // The controller answers with its nodes; a failure here is retried.
-    const nodes = (await controller<StorageNode[]>("GET", "/control/v1/node")).body!;
-    return nodes.some((node) => node.id === 1 && node.availability === "Active");
-  });
   await ensureTenant();
   // Where the shards are, recorded once: from then on as notified, under the layout's lock.
   await record.seedLayout(secrets.tenantId, layoutLocated(await located()));
@@ -815,6 +897,21 @@ async function computesView(): Promise<object> {
   };
 }
 
+/** The tenant's shards and pageservers, as the storage controller has them now. */
+async function tenantView(): Promise<object> {
+  const [answered, nodes] = await Promise.all([located(), controller<StorageNode[]>("GET", "/control/v1/node")]);
+  return {
+    shards: shardCount(answered),
+    stripeSize: answered.shard_params.stripe_size,
+    pageservers: (nodes.body ?? []).map(({ id, availability, listen_pg_addr, listen_pg_port }) => ({
+      id,
+      address: pageserverAddress(listen_pg_addr, listen_pg_port),
+      availability,
+      shards: answered.shards.filter(({ node_id }) => node_id === id).length,
+    })),
+  };
+}
+
 const SPEC = /^\/compute\/api\/v2\/computes\/([^/]+)\/spec$/u;
 const WAKE = /^\/computes\/([^/]+)\/wake$/u;
 const BRANCH = /^\/branches\/([^/]+)$/u;
@@ -856,7 +953,11 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const wakeAsked = method === "POST" ? WAKE.exec(url) : null;
   const branch = BRANCH.exec(url);
   const hook = method === "PUT" && (url === "/notify-attach" || url === "/notify-safekeepers");
-  const api = url === "/branches" ? method === "GET" || method === "POST" : url === "/computes" ? method === "GET" : branch !== null && method === "DELETE";
+  const api = url === "/branches"
+    ? method === "GET" || method === "POST"
+    : url === "/computes" || url === "/tenant"
+    ? method === "GET"
+    : branch !== null && method === "DELETE";
   if (!proxied && !wakeAsked && !hook && !api) return answer(response, 404);
   if (!authorized(request)) return answer(response, 401);
   if (!ready) {
@@ -874,6 +975,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     return answer(response, 200, { address: computeAddress(COMPUTE_NAME, computeOf(compute.name).namespace) });
   }
   if (url === "/computes") return answer(response, 200, await computesView());
+  if (url === "/tenant") return answer(response, 200, await tenantView());
   if (url === "/notify-attach") {
     // The shards placed anew, after a split, a migration or a pageserver lost: every spec
     // names their pageservers from now on, and every running compute is given its own, by

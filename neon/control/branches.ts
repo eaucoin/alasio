@@ -363,6 +363,58 @@ export function layoutOf({ nodeIds, stripeSize }: AttachNotified, addresses: Rea
 export const sameLayout = (a: ShardLayout, b: ShardLayout): boolean =>
   a.stripeSize === b.stripeSize && a.pageservers.length === b.pageservers.length && a.pageservers.every((pageserver, index) => pageserver === b.pageservers[index]);
 
+/** A shard to move: its id, the pageserver it is attached to, and the one it belongs on. */
+export interface ShardMove {
+  shardId: string;
+  from: number;
+  to: number;
+}
+
+/** A shard as the storage controller describes it (GET /control/v1/tenant/:id): where it is attached, and whether it is being moved or split. */
+export interface DescribedShard {
+  tenant_shard_id: string;
+  node_attached: number | null;
+  is_reconciling: boolean;
+  is_splitting: boolean;
+}
+
+/**
+ * The moves that spread the tenant's `shards`, in shard order, over `pageservers`
+ * pageservers numbered from 1, shard n onto pageserver n mod `pageservers`, plus one:
+ * where every shard is attached to one pageserver, at rest, as a split leaves them, and
+ * as a failover does once every pageserver is back. None otherwise: any other placement
+ * is the storage controller's own, as its drain and fill make it, which neon-control
+ * never undoes.
+ */
+export function shardMoves(shards: readonly DescribedShard[], pageservers: number): ShardMove[] {
+  const attached = new Set(shards.map(({ node_attached }) => node_attached));
+  const [from] = attached;
+  if (shards.length < 2 || pageservers < 2 || !shardsAtRest(shards) || attached.size !== 1 || from === null || from === undefined) return [];
+  return shards.flatMap(({ tenant_shard_id }, index) => {
+    const to = (index % pageservers) + 1;
+    return from === to ? [] : [{ shardId: tenant_shard_id, from, to }];
+  });
+}
+
+/** Whether none of `shards` is being moved or split, so where they are attached is where they stay. */
+export const shardsAtRest = (shards: readonly DescribedShard[]): boolean => shards.every(({ is_reconciling, is_splitting }) => !is_reconciling && !is_splitting);
+
+/** A pageserver as the storage controller lists it (GET /control/v1/node), as far as neon-control reads it. */
+export interface StorageNode {
+  id: number;
+  /** Active, WarmingUp or Offline. */
+  availability: string;
+  /** Active, or paused, draining or filling. */
+  scheduling: string;
+  listen_pg_addr: string;
+  listen_pg_port: number;
+}
+
+/** Whether each of `pageservers` pageservers, numbered from 1, is registered, available and takes shards, among `nodes`. */
+export const pageserversServing = (nodes: readonly StorageNode[], pageservers: number): boolean =>
+  Array.from({ length: pageservers }, (_, index) => index + 1)
+    .every((id) => nodes.some((node) => node.id === id && node.availability === "Active" && node.scheduling === "Active"));
+
 /** A safekeeper of the stack, by its id. */
 export interface Safekeeper {
   id: number;

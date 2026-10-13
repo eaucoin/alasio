@@ -308,7 +308,18 @@ const Neon = Schema.Struct({
     }),
     {},
   ),
-  pageserver: NeonStored("50Gi", { requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "4Gi" } }),
+  pageserver: defaulted(
+    Schema.Struct({
+      /**
+       * How many pageservers serve the tenant's shards: a count, each registering itself
+       * with the storage controller, which keeps it; lowered, alasio up refuses, saying so.
+       */
+      scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+      storage: Storage("50Gi"),
+      resources: Resources({ requests: { cpu: "100m", memory: "256Mi" }, limits: { memory: "4Gi" } }),
+    }),
+    {},
+  ),
   storageController: NeonService({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
   storageBroker: NeonService({ requests: { cpu: "20m", memory: "32Mi" }, limits: { memory: "256Mi" } }),
   controllerDb: NeonStored("2Gi", { requests: { cpu: "50m", memory: "64Mi" }, limits: { memory: "512Mi" } }),
@@ -338,6 +349,15 @@ const Neon = Schema.Struct({
       resources: Resources({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
     }),
     {},
+  ),
+  /**
+   * How many shards the storage controller splits alasio's tenant into, across the
+   * pageservers: a power of two, at most 16. A split is one-way, as Neon merges no shards:
+   * raised, the tenant is split; lowered, alasio up refuses, saying so.
+   */
+  shards: defaulted(
+    Schema.Int.check(Schema.makeFilter((shards) => (shards >= 1 && shards <= 16 && (shards & (shards - 1)) === 0) || "must be a power of two from 1 to 16")),
+    1,
   ),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of

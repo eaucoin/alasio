@@ -22,7 +22,7 @@ import type {
 
 import { COMPUTE_CTL_PORT, COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
 import { SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
-import { DATABASE, ROLE } from "../../../neon/control/secrets.ts";
+import { DATABASE, PAGESERVER_ZONE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
 import { computeRestartPolicy } from "./admission.ts";
 import {
@@ -120,7 +120,6 @@ function setup(config: InstallConfig): KubernetesObject[] {
               { name: "SECRET_PREFIX", value: RELEASE },
               { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
               { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
-              { name: "NEON_PAGESERVER_HOST", value: neonName("pageserver") },
               { name: "NEON_PROXY_HOST", value: PROXY_HOST },
               { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
               { name: "S3_ENDPOINT", value: s3Endpoint(config) },
@@ -382,35 +381,82 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
   return [headless, statefulSet, ...replicaBudget(component, NAMESPACE, config.neon.safekeepers.scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
+/** The name of the pageserver of ordinal `index`, its Service's, which it registers itself at: its pod's. */
+export const pageserverName = (index: number): string => `${neonName("pageserver")}-${index}`;
+
+/** The pageservers' governing Service, headless, which their StatefulSet names: of no one pageserver, as pageserverName is. */
+export const PAGESERVERS_NAME = neonName("pageservers");
+
 /**
- * The pageserver: pages served from layers it keeps in the object store, its volume a
- * cache. It registers itself with the controller by the name in its metadata.
+ * The pageservers: pages served from layers each keeps in the object store, its volume a
+ * cache, as many as their scale fixes. Each registers itself with the storage controller
+ * as its ordinal plus one, at a Service of its own alone (pageserverName), which resolves
+ * before it is ready, as registration needs; the controller places the tenant's shards on
+ * them, and computes reach each shard's pageserver at that name (neon-control's specs),
+ * never through one address that would balance them. They start at once, none waiting for
+ * another to be ready, which waits for the storage controller: so a restore that starts what
+ * its volumes hold to a node before the rest (../commands/restore-filer-store.ts) finds
+ * every pageserver's pod made. Their StatefulSet's governing Service (PAGESERVERS_NAME) is
+ * headless, giving each pod its DNS identity, which no address uses: a pod's own Service
+ * keeps its address while it is not ready, as registration needs, and alone resolves to it.
  */
 function pageserver(config: InstallConfig): KubernetesObject[] {
   const name = neonName("pageserver");
   const component = "neon-pageserver";
   const image = imageReference(config.neon.image);
+  const { scaling, storage, resources } = config.neon.pageserver;
+  const services = Array.from({ length: scaling.min }, (_, index): V1Service => ({
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: pageserverName(index), namespace: NAMESPACE, labels: stackLabels(component) },
+    spec: {
+      selector: { ...selectorLabels(component), "statefulset.kubernetes.io/pod-name": `${name}-${index}` },
+      publishNotReadyAddresses: true,
+      ports: [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }],
+    },
+  }));
+  const governing: V1Service = {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name: PAGESERVERS_NAME, namespace: NAMESPACE, labels: stackLabels(component) },
+    spec: { clusterIP: "None", publishNotReadyAddresses: true, selector: selectorLabels(component), ports: [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }] },
+  };
   const statefulSet: V1StatefulSet = {
     apiVersion: "apps/v1",
     kind: "StatefulSet",
     metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
     spec: {
-      serviceName: name,
-      ...replicasOf(ONE),
+      serviceName: PAGESERVERS_NAME,
+      ...replicasOf(scaling),
+      podManagementPolicy: "Parallel",
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
           ...priority("bound"),
           ...stackPodSpec(config),
+          ...spread(component, scaling, true),
           terminationGracePeriodSeconds: 30,
           initContainers: [
             {
               name: "config",
               image,
               imagePullPolicy: "IfNotPresent",
-              // Its configuration, rendered by the stack's setup, into its working directory.
-              command: ["/bin/sh", "-c", "cp /config/pageserver.toml /config/identity.toml /config/metadata.json /config/auth_public_key.pem /data/.neon/"],
+              // Its configuration, the stack's setup's, into its working directory, and its
+              // identity, its own: its ordinal plus one, at its own Service's name, its pod's.
+              // The ordinal is its pod's name's last part, as the StatefulSet names its pods,
+              // on any Kubernetes (the pod-index label is 1.28's).
+              command: [
+                "/bin/sh",
+                "-c",
+                [
+                  'POD_INDEX="${POD_NAME##*-}" &&',
+                  "cp /config/pageserver.toml /config/auth_public_key.pem /data/.neon/ &&",
+                  'echo "id=$((POD_INDEX + 1))" > /data/.neon/identity.toml &&',
+                  `printf '{"host":"%s","port":6400,"http_host":"%s","http_port":9898,"availability_zone_id":"${PAGESERVER_ZONE}"}\\n' "$POD_NAME" "$POD_NAME" > /data/.neon/metadata.json`,
+                ].join(" "),
+              ],
+              env: [{ name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } }],
               securityContext: restrictedContainer(),
               ...helperResources(),
               volumeMounts: [{ name: "data", mountPath: "/data/.neon" }, { name: "config", mountPath: "/config", readOnly: true }],
@@ -427,22 +473,19 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
             ports: [{ name: "pg", containerPort: 6400 }, { name: "http", containerPort: 9898 }],
             readinessProbe: { httpGet: { path: "/v1/status", port: "http" }, periodSeconds: 5 },
             securityContext: restrictedContainer(),
-            resources: config.neon.pageserver.resources,
+            resources,
             volumeMounts: [{ name: "data", mountPath: "/data/.neon" }],
           }],
           volumes: [{
             name: "config",
-            secret: {
-              secretName: name,
-              items: ["pageserver.toml", "identity.toml", "metadata.json", "auth_public_key.pem"].map((key) => ({ key, path: key })),
-            },
+            secret: { secretName: name, items: ["pageserver.toml", "auth_public_key.pem"].map((key) => ({ key, path: key })) },
           }],
         },
       },
-      volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(config.neon.pageserver.storage) }],
+      volumeClaimTemplates: [{ metadata: { name: "data" }, spec: claimSpec(storage) }],
     },
   };
-  return [service(name, component, [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }]), statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
+  return [governing, ...services, statefulSet, ...replicaBudget(component, NAMESPACE, scaling), verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
 /** Where every client reaches Neon's proxy, from main's namespace or a branch environment's. */
@@ -521,6 +564,8 @@ function control(config: InstallConfig): KubernetesObject[] {
             env: [
               { name: "CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
               { name: "NEON_SAFEKEEPER_HOSTS", value: safekeeperHosts.join(",") },
+              { name: "NEON_PAGESERVERS", value: String(config.neon.pageserver.scaling.min) },
+              { name: "NEON_SHARDS", value: String(config.neon.shards) },
               { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
               { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
               { name: "NEON_COMPUTE_NAME", value: neonName("compute") },

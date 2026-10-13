@@ -17,22 +17,26 @@ import {
   computeOfToken,
   creationRefused,
   deleting,
+  type DescribedShard,
   existingBranch,
   layoutOf,
   nameProblem,
+  pageserversServing,
   placementOf,
   PROXY_SCOPE,
   type ReadyBranch,
   safekeepersNotified,
   sameLayout,
   type ShardLayout,
+  shardMoves,
+  type StorageNode,
   tokenSha256,
   withNotifiedPlacement,
 } from "../neon/control/branches.ts";
 import { bearsScope, computeCtlToken, generateKeyPair, signToken, verifyToken } from "../neon/control/jwt.ts";
 import { createControlMetrics } from "../neon/control/metrics.ts";
 import { containerRuns } from "../neon/control/computes.ts";
-import { type Reconfigured, reconfigure, type Reconfiguring, settledLayout, tookLayout } from "../neon/control/reconfigure.ts";
+import { reconcile, type Reconciling, type Reconfigured, reconfigure, type Reconfiguring, settledLayout, tookLayout } from "../neon/control/reconfigure.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 
 const MAIN_TIMELINE = "11111111111111111111111111111111";
@@ -287,6 +291,36 @@ test("a compute reads each shard from the pageserver the storage controller plac
   assert.equal(two.tenant_id, "t");
 });
 
+describe("the shards", () => {
+  /** Four shards at rest, attached to the pageservers `on` says, in shard order. */
+  const shards = (on: readonly (number | null)[]): DescribedShard[] =>
+    on.map((node, index) => ({ tenant_shard_id: `t-0${index}04`, node_attached: node, is_reconciling: false, is_splitting: false }));
+
+  test("all on one pageserver, as a split leaves them, are spread in shard order, one on each in turn", () => {
+    assert.deepEqual(shardMoves(shards([1, 1, 1, 1]), 2), [{ shardId: "t-0104", from: 1, to: 2 }, { shardId: "t-0304", from: 1, to: 2 }]);
+    assert.deepEqual(shardMoves(shards([2, 2, 2, 2]), 3), [{ shardId: "t-0004", from: 2, to: 1 }, { shardId: "t-0204", from: 2, to: 3 }, { shardId: "t-0304", from: 2, to: 1 }]);
+  });
+
+  test("are left where the storage controller placed them otherwise, while any moves or splits, and where there is nothing to spread", () => {
+    assert.deepEqual(shardMoves(shards([2, 1, 2, 1]), 2), [], "a drain and fill's own placement");
+    assert.deepEqual(shardMoves(shards([1, 1, 1, null]), 2), [], "one shard attached nowhere");
+    assert.deepEqual(shardMoves(shards([1, 1, 1, 1]).map((shard, index) => ({ ...shard, is_reconciling: index === 3 })), 2), []);
+    assert.deepEqual(shardMoves(shards([1, 1, 1, 1]).map((shard) => ({ ...shard, is_splitting: true })), 2), []);
+    assert.deepEqual(shardMoves(shards([1, 1, 1, 1]), 1), []);
+    assert.deepEqual(shardMoves(shards([1]), 2), []);
+  });
+
+  test("are split and spread while every pageserver is registered, available and takes shards", () => {
+    const node = (id: number, availability = "Active", scheduling = "Active"): StorageNode => ({ id, availability, scheduling, listen_pg_addr: `ps-${id}`, listen_pg_port: 6400 });
+    assert.equal(pageserversServing([node(1), node(2)], 2), true);
+    assert.equal(pageserversServing([node(1)], 2), false, "one not registered yet");
+    assert.equal(pageserversServing([node(1), node(2, "Offline")], 2), false);
+    assert.equal(pageserversServing([node(1), node(2, "WarmingUp")], 2), false);
+    assert.equal(pageserversServing([node(1, "Active", "PauseForRestart"), node(2)], 2), false, "one drained");
+    assert.equal(pageserversServing([node(1), node(2, "Active", "Filling")], 2), false);
+  });
+});
+
 describe("shards notified", () => {
   const body = { tenant_id: "t", preferred_az: "az-pageserver", stripe_size: 2048, shards: [{ node_id: 2, shard_number: 1 }, { node_id: 1, shard_number: 0 }] };
 
@@ -392,6 +426,46 @@ describe("a running compute given a new layout", () => {
       { outcome: "failed", error: "" },
     ];
     assert.deepEqual(outcomes.map(tookLayout), [true, true, true, false, false, false, false]);
+  });
+});
+
+describe("the leader's round", () => {
+  const one: ShardLayout = { pageservers: ["ps-0:6400"], stripeSize: null };
+  const two: ShardLayout = { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 };
+  /** Two shards, moving or not, located as `two`, the layout `recorded`, and each compute last given `given`; what was recorded and given, each in turn. */
+  const round = (recorded: ShardLayout | null, given: ShardLayout[], moving = false) => {
+    const done: { recorded: ShardLayout[]; given: ShardLayout[] } = { recorded: [], given: [] };
+    const through: Reconciling = {
+      shards: async () => [0, 1].map((index) => ({ tenant_shard_id: `t-0${index}02`, node_attached: index + 1, is_reconciling: moving && index === 1, is_splitting: false })),
+      located: async () => two,
+      recorded: async () => recorded,
+      record: async (layout) => void done.recorded.push(layout),
+      configure: async (layout) => {
+        const stale = given.filter((had) => !sameLayout(had, layout));
+        done.given.push(...stale.map(() => layout));
+        return 0;
+      },
+    };
+    return { done, through };
+  };
+
+  test("alone sets a stale recorded layout right, as the storage controller locates the shards, and gives every compute on another it", async () => {
+    const { done, through } = round(one, [one, two]);
+    assert.deepEqual(await reconcile(through), { layout: two, recorded: true, pending: 0 });
+    assert.deepEqual(done, { recorded: [two], given: [two] });
+  });
+
+  test("records a layout where none is, records none where the record is right, and still gives a compute left on another it", async () => {
+    assert.deepEqual(await reconcile(round(null, []).through), { layout: two, recorded: true, pending: 0 });
+    const { done, through } = round(two, [one]);
+    assert.deepEqual(await reconcile(through), { layout: two, recorded: false, pending: 0 });
+    assert.deepEqual(done, { recorded: [], given: [two] });
+  });
+
+  test("does nothing while a shard moves or splits, as a notification follows", async () => {
+    const { done, through } = round(one, [one], true);
+    assert.equal(await reconcile(through), null);
+    assert.deepEqual(done, { recorded: [], given: [] });
   });
 });
 

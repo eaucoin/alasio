@@ -434,12 +434,19 @@ export async function serveFakeKube(): Promise<FakeKube> {
     }
     if (method === "PATCH") {
       const contentType = request.headers["content-type"] ?? "";
-      changes.push({ method, path, contentType, query: url.searchParams });
+      // A dry run changes nothing, and is answered as the change would be.
+      const dryRun = url.searchParams.get("dryRun") === "All";
+      if (!dryRun) changes.push({ method, path, contentType, query: url.searchParams });
       const patch = JSON.parse(body.toString("utf8")) as KubeObject;
       if (contentType === "application/merge-patch+json" && !existing) return refuse(response, 404, `${target.plural} "${target.name}" not found`);
       // A RuntimeClass's handler cannot change, as the API server's validation has it.
       if (existing?.kind === "RuntimeClass" && patch["handler"] !== undefined && patch["handler"] !== existing["handler"]) {
         return refuse(response, 422, `RuntimeClass.node.k8s.io "${target.name}" is invalid: handler: Invalid value: ${JSON.stringify(patch["handler"])}: field is immutable`);
+      }
+      // Nor a StatefulSet's way of managing its pods.
+      const policy = (object: KubeObject) => (object.spec?.["podManagementPolicy"] as string | undefined) ?? "OrderedReady";
+      if (existing?.kind === "StatefulSet" && patch.spec?.["podManagementPolicy"] !== undefined && policy(patch) !== policy(existing)) {
+        return refuse(response, 422, `StatefulSet.apps "${target.name}" is invalid: spec: Forbidden: updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden`);
       }
       version += 1;
       const base: KubeObject = existing ?? { ...patch, metadata: { ...patch.metadata, uid: `uid-${version}`, generation: 0, creationTimestamp: new Date().toISOString() } };
@@ -461,6 +468,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
       }
       const specChanged = JSON.stringify(next.spec) !== JSON.stringify(existing?.spec);
       next.metadata = { ...next.metadata, resourceVersion: String(version), generation: (base.metadata.generation ?? 0) + (specChanged || !existing ? 1 : 0) };
+      if (dryRun) return json(response, existing ? 200 : 201, next);
       settle(next);
       objects.set(path, next);
       return json(response, existing ? 200 : 201, next);

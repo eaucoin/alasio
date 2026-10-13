@@ -20,7 +20,7 @@ import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.t
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
-import { type ComputeTimes, computeTimes } from "../branches.ts";
+import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { notRunning, runIn } from "./common.ts";
 
@@ -138,6 +138,14 @@ function describeCompute(workload: ScaledWorkload, computes: ReadonlyMap<string,
   return `${workload.spec?.replicas === 0 ? "asleep" : "awake"}${woken ? `, last woken ${woken}` : ""}`;
 }
 
+/** Neon's tenant: its shards, and each pageserver, with how many of them it holds. */
+function describeTenant({ shards, pageservers }: TenantView): string[] {
+  return [
+    `Neon: ${shards} shard${shards === 1 ? "" : "s"} on ${pageservers.length} pageserver${pageservers.length === 1 ? "" : "s"}`,
+    ...pageservers.map(({ id, address, availability, shards: held }) => `  pageserver ${id} at ${address}: ${availability}, ${held} shard${held === 1 ? "" : "s"}`),
+  ];
+}
+
 /** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
 const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
@@ -206,6 +214,8 @@ export const status = Command.make("status", {}, () =>
           const releases = describeKept(yield* clusterReleases(gvisorReleases(NODE_PINS)), yield* snapshotReleases);
           for (const line of releases) yield* Console.log(`  ${line}`);
         }
+        const tenant = yield* tenantView;
+        if (tenant) for (const line of describeTenant(tenant)) yield* Console.log(line);
         if (listed.some(({ whole }) => !whole)) {
           yield* Console.log(`  alasio's workloads outside its namespace, ${NAMESPACE}: not seen, as this kubeconfig may list them there alone`);
         }

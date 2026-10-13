@@ -2,8 +2,8 @@
  * Installing alasio from the operator's config: its install configuration, with the
  * Secrets alasio names as the cluster has them, made into its objects (its namespace,
  * which its Secrets are in before anything else of it is, and its manifests), checked
- * against the cluster's autoscalers and its object store's layout and scale, applied, and
- * waited for.
+ * against the cluster's autoscalers, its object store's layout and scale, Neon's storage
+ * (./neon-storage.ts), and the objects the cluster has, applied, and waited for.
  */
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
@@ -12,15 +12,16 @@ import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
 import { clusterReleases } from "./kept-releases.ts";
-import { KubeApi, type KubeApiError } from "./kube/api.ts";
+import { describeRef, hasStatus, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline } from "./manifests/alasio.ts";
-import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
+import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
+import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
 
 /** alasio's namespace. */
@@ -58,6 +59,41 @@ export interface Installed {
   readonly cpuBaseline: BaselineDecision | null;
 }
 
+/**
+ * The cluster has an object of the installation that cannot take this release's of it, as
+ * applying it as a dry run said: nothing is applied, as one refused midway would leave the
+ * installation half of one release, half of the other.
+ */
+export class ObjectRefused extends Schema.TaggedError<ObjectRefused>()("ObjectRefused", { object: Schema.String, reason: Schema.String, remedy: Schema.String }) {
+  override get message(): string {
+    return `the cluster's ${this.object} cannot take this release's of it (${this.reason}), so alasio applies nothing${this.remedy ? `: ${this.remedy}` : ""}`;
+  }
+}
+
+/**
+ * What makes an object the cluster has able to take this release's, by the object, where an
+ * upgrade to this release is to be made by hand: the pageservers' StatefulSet of 7.0.0,
+ * whose pods start in order, as this release's start at once, a field Kubernetes changes of
+ * no StatefulSet.
+ */
+const REMEDIES: ReadonlyMap<string, string> = new Map([
+  [`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`, "an installation of 7.0.0 is upgraded by upgrades/from-7.0.0.sh, which makes it anew, keeping its pod and claim"],
+]);
+
+/** Refuses `objects` where the cluster has one that cannot take this release's of it, each applied as a dry run. */
+const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<void, KubeApiError | ObjectRefused, KubeApi> =>
+  Effect.flatMap(KubeApi, (kube) =>
+    Effect.forEach(objects, (object) => {
+      const ref = refOf(object);
+      return Effect.flatMap(kube.get(ref), (live) =>
+        live
+          ? kube.dryApply(labelled(object)).pipe(
+            Effect.asVoid,
+            Effect.catchIf(hasStatus(422), (error) => Effect.fail(new ObjectRefused({ object: describeRef(ref), reason: error.reason, remedy: REMEDIES.get(describeRef(ref)) ?? "" }))),
+          )
+          : Effect.void);
+    }, { concurrency: 8, discard: true }));
+
 /** The installation `config` describes, as checkInstallation finds it, with what its objects carry forward. */
 interface Checked {
   readonly bot: TelegramBot;
@@ -72,12 +108,14 @@ interface Checked {
 
 /**
  * The installation `config` describes, with its bot, refused where applying it would not do:
- * with no bot set, against the cluster's own autoscalers, or its object store's layout and
- * scale. Its objects carry forward what the installation they replace recorded.
+ * with no bot set, against the cluster's own autoscalers, its object store's layout and
+ * scale, or Neon's storage (./neon-storage.ts), or where an object the cluster has cannot
+ * take this release's of it. Its objects carry forward what the installation they replace
+ * recorded.
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
-): Effect.fn.Return<Checked, KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
+): Effect.fn.Return<Checked, KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused, KubeApi> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
@@ -87,6 +125,8 @@ export const checkInstallation = Effect.fnUntraced(function*(
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
+  yield* checkNeonStorage(settings);
+  yield* checkApplicable(objects);
   return { bot, settings, objects, live, recorded, gvisorReleases };
 });
 
@@ -99,7 +139,7 @@ export const checkInstallation = Effect.fnUntraced(function*(
 export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
-): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
+): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused, KubeApi> {
   const { bot, settings, objects, live, recorded, gvisorReleases } = yield* checkInstallation(config);
   yield* applyInstallation(objects, options);
   const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };

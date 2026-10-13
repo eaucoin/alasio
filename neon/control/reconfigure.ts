@@ -12,8 +12,11 @@
  * sessions, and asked again with the next notification. One whose compute_ctl cannot be
  * reached, as no container of it runs (pulling its image, or crashing and started again),
  * fetches its spec, with the layout as recorded then, when its container next starts.
+ *
+ * The leader's round sets the layout right likewise (`reconcile`), through the storage
+ * controller and the record, so what it does is decided here too.
  */
-import { sameLayout, type ShardLayout } from "./branches.ts";
+import { type DescribedShard, sameLayout, type ShardLayout, shardsAtRest } from "./branches.ts";
 
 /** compute_ctl's statuses of a compute that never takes a spec given now (libs/compute_api/src/responses.rs at Neon's release-compute-9073). */
 const RESTARTED_IN = ["init", "failed"];
@@ -67,6 +70,37 @@ export async function reconfigure(layout: ShardLayout, through: Reconfiguring): 
   } catch (error) {
     return { outcome: "failed", error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** What the layout is set right through, in the leader's round: the storage controller, the record, and the computes. */
+export interface Reconciling {
+  /** The tenant's shards, as the storage controller describes them now. */
+  shards(): Promise<readonly DescribedShard[]>;
+  /** Their layout, as the storage controller locates them now. */
+  located(): Promise<ShardLayout>;
+  /** The layout recorded, or null where none is. */
+  recorded(): Promise<ShardLayout | null>;
+  /** Records `layout`. */
+  record(layout: ShardLayout): Promise<void>;
+  /** Gives every compute last given another layout than `layout` its spec anew, with it: how many have not taken it yet. */
+  configure(layout: ShardLayout): Promise<number>;
+}
+
+/**
+ * The layout set right, in the leader's round (./service.ts's reconcileLayout), while no
+ * shard moves or splits: recorded as the storage controller locates the shards, where the
+ * record differs, and given every compute on another, so a notification neon-control
+ * missed, or one not sent again yet after a 423, leaves none on a layout that is not so.
+ * What came of it: the layout, whether it was recorded anew, and how many computes have
+ * not taken it yet; null while a shard moves or splits, as a notification follows.
+ */
+export async function reconcile(through: Reconciling): Promise<{ readonly layout: ShardLayout; readonly recorded: boolean; readonly pending: number } | null> {
+  if (!shardsAtRest(await through.shards())) return null;
+  const layout = await through.located();
+  const recorded = await through.recorded();
+  const stale = recorded === null || !sameLayout(recorded, layout);
+  if (stale) await through.record(layout);
+  return { layout, recorded: stale, pending: await through.configure(layout) };
 }
 
 /**

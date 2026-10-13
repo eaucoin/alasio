@@ -5,8 +5,8 @@
  * Idempotent, and never rotating.
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
- * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
- * NEON_PROXY_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
+ * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PROXY_HOST,
+ * NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON, S3_BUCKET_LAKE and S3_BUCKET_BACKUPS (neon, lake and backups unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities, and its filers' store's users' passwords, are made here otherwise, and with
@@ -32,9 +32,7 @@ import {
   GRAFANA_ROLE,
   LAKE_READER_ROLE,
   LAKE_ROLE,
-  pageserverMetadata,
   pageserverToml,
-  PAGESERVER_ID,
   remoteStorage,
   ROLE,
   s3Identities,
@@ -92,7 +90,6 @@ interface SetupConfigBase {
   prefix: string;
   brokerUrl: string;
   controllerUrl: string;
-  pageserverHost: string;
   /** Where every client reaches Neon's proxy, from any namespace. */
   proxyHost: string;
   controllerDbHost: string;
@@ -208,8 +205,6 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       ...aws("neon"),
       // What it presents to the safekeepers it streams WAL from.
       NEON_AUTH_TOKEN: token("safekeeperdata"),
-      "identity.toml": `id=${PAGESERVER_ID}\n`,
-      "metadata.json": pageserverMetadata(config.pageserverHost),
       "pageserver.toml": pageserverToml({
         brokerUrl: config.brokerUrl,
         controllerUrl: config.controllerUrl,
@@ -320,7 +315,6 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     prefix: required("SECRET_PREFIX"),
     brokerUrl: required("NEON_BROKER_URL"),
     controllerUrl: required("NEON_CONTROLLER_URL"),
-    pageserverHost: required("NEON_PAGESERVER_HOST"),
     proxyHost: required("NEON_PROXY_HOST"),
     controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
     s3Endpoint: required("S3_ENDPOINT"),
