@@ -66,6 +66,7 @@ import {
   RemoveNode,
   RemoveStorage,
   SERVICE,
+  STARGZ_SERVICE,
   StartK3s,
   StopK3s,
 } from "./node.ts";
@@ -251,9 +252,10 @@ export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, fire
   };
 }
 
-/** k3s's service, and what alasio installed, when anything. */
+/** k3s's service, stargz-snapshotter's daemon's, which k3s's starts, and what alasio installed, when anything. */
 export interface HostClusterStatus {
   readonly unit: UnitState;
+  readonly snapshotter: UnitState;
   readonly installed: NodeStamp | null;
 }
 
@@ -445,6 +447,6 @@ const makeHostCluster = Effect.fnUntraced(function*({
         ]);
       }),
 
-    status: Effect.map(installed, ({ unit, stamp }) => ({ unit, installed: stamp })),
+    status: Effect.map(Effect.all([installed, systemd.unit(STARGZ_SERVICE)]), ([{ unit, stamp }, snapshotter]) => ({ unit, snapshotter, installed: stamp })),
   });
 });

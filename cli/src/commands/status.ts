@@ -7,7 +7,7 @@ import { DockerCluster } from "../cluster/docker.ts";
 import { HostCluster } from "../cluster/host.ts";
 import { readySince } from "../cluster/k3s.ts";
 import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
-import { gvisorReleases, NODE_PINS, SERVICE } from "../cluster/node.ts";
+import { gvisorReleases, NODE_PINS, SERVICE, STARGZ_SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
 import { describeBaseline, recordedBaseline, standingOf, surveyCpu } from "../cpu-baseline.ts";
 import { clusterReleases, describeKept, snapshotReleases } from "../kept-releases.ts";
@@ -278,9 +278,12 @@ export const status = Command.make("status", {}, () =>
       if (server?.state !== "running") return yield* notRunning(target, server !== undefined);
     }
     if (target._tag === "Host") {
-      const { unit, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
-      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${installed?.gvisor?.length ? `, with gVisor ${installed.gvisor.join(" and ")}` : ""}:`);
+      const { unit, snapshotter, installed } = yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.status), HostCluster.layer(target.cluster));
+      const beside = [...(installed?.gvisor?.length ? [`gVisor ${installed.gvisor.join(" and ")}`] : []), ...(installed?.stargz ? [`stargz-snapshotter ${installed.stargz}`] : [])];
+      yield* Console.log(`k3s${installed?.k3s ? ` ${installed.k3s}` : ""} on this machine${beside.length > 0 ? `, with ${beside.join(", ")}` : ""}:`);
       yield* Console.log(unit.loaded ? `  service ${SERVICE}: ${unit.active}, ${unit.enabled ? "enabled" : "disabled"}` : "  not installed");
+      // Started by k3s's service, and stopped with it: whether it runs, not whether it is enabled.
+      if (snapshotter.loaded) yield* Console.log(`  service ${STARGZ_SERVICE}, which k3s pulls images through: ${snapshotter.active}`);
       if (unit.active === "active") {
         const nodes = yield* Effect.provide(Effect.flatMap(KubeApi, (kube) => kube.list<V1Node>(kind("Node"))), kubeApi(target));
         for (const node of nodes) yield* Console.log(`  node ${node.metadata?.name}: ${readySince(node, 0) ? "ready" : "not ready"}`);
@@ -360,7 +363,8 @@ export const status = Command.make("status", {}, () =>
   })).pipe(
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
-      "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
+      "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, with the stargz-snapshotter release " +
+        "k3s pulls images through and whether its daemon's service runs, as no image is pulled while it does not; or its nodes in Docker; and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
         "awake, or asleep with nothing left to load until alasio writes again), waking (a compute or the loader whose pod starts, within " +
