@@ -326,6 +326,22 @@ test("a session without a snapshot is resumed as it is, and one whose snapshot c
   );
 });
 
+test("where one release is kept, a snapshot is restored under it alone, and one taken under the release before falls back", async () => {
+  const desired = sessionOf(profile());
+  const one = { ...snapshots, releases: [{ release: CURRENT, runtimeClassName: "gvisor-20260921-0-eaucoin-4" }] };
+  const restore = (agents: NodeAgents) =>
+    run(fakeKube(), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots: one, agents, templates: templates(profile()) });
+      return yield* snapshotted.restore(stored(desired), desired);
+    }));
+  const plan = await restore(fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])] }).agents);
+  assert.equal(plan?.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-4");
+  const before = fakeAgents({ current: manifestOf(desired.spec.podTemplate, PREVIOUS), holdings: [node("node-a", [CURRENT, PREVIOUS])] });
+  const fallbacks = await added("alasio.sandbox.restores", async () => assert.equal(await restore(before.agents), null));
+  assert.deepEqual(fallbacks, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=release": 1 });
+  assert.equal(before.asked.at(-1), "forget alasio-sessions/fs-abc123");
+});
+
 test("an idle session is released, its sandbox snapshotted by its node's agent, addressed to bayma's container, with bayma's hook and its template", async () => {
   const sandbox = stored(sessionOf(profile()), "Running");
   sandbox.status = { serviceFQDN: "fs-abc123.alasio-sessions.svc.cluster.local", conditions: [{ type: "Ready", status: "True", reason: "Ready", message: "", lastTransitionTime: new Date(0), observedGeneration: 0 }] };

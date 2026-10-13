@@ -80,6 +80,15 @@ test("each gVisor release kept is a runtime of containerd's, after k3s's own con
   assert.ok(options.endsWith(`\nbinary_name = "/usr/local/lib/alasio/gvisor/20260921.0-eaucoin.3/runsc"\nrestore_direct = true\n\n[runsc_config]\n  restore-validate-files = "all"\n`), options);
 });
 
+test("a single release kept is one runtime of containerd's, and nothing is rendered for a release before it", () => {
+  const files = gvisorRuntimeFiles(["21000101.0"], { systemd: false });
+  assert.deepEqual([...files.keys()], [`${CONTAINERD}/config-v3.toml.tmpl`, `${CONTAINERD}/runsc-21000101-0.toml`]);
+  assert.equal((files.get(`${CONTAINERD}/config-v3.toml.tmpl`) ?? "").match(/^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runsc-[^.\]]+\]$/gmu)?.length, 1);
+  assert.deepEqual(gvisorRuntimeClasses(["21000101.0"]).map(({ metadata, handler }) => [metadata?.name, handler]), [["gvisor", "runsc-21000101-0"], ["gvisor-21000101-0", "runsc-21000101-0"]]);
+  // The classes of the releases kept before it go.
+  assert.deepEqual(staleRuntimeClasses(gvisorRuntimeClasses(["20990101.0", "20980101.0"]), gvisorRuntimeClasses(["21000101.0"])), ["gvisor", "gvisor-20990101-0", "gvisor-20980101-0"]);
+});
+
 test("where systemd runs the machine, runsc places its sandboxes' cgroups through it, and only there", () => {
   const options = (systemd: boolean) => gvisorRuntimeFiles(["20990101.0"], { systemd }).get(`${CONTAINERD}/runsc-20990101-0.toml`) ?? "";
   assert.match(options(true), /\n {2}restore-validate-files = "all"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
