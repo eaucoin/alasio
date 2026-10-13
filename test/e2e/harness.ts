@@ -168,6 +168,12 @@ const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
 /** The registry the images were pushed to already, when the run builds none. */
 const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
 
+/**
+ * Whether alasio's own images are eStargz, which the nodes pull lazily: as CI pushes them
+ * (tooling/push-estargz.sh), not as the run builds them itself, whole.
+ */
+export const ESTARGZ = PUSHED !== undefined;
+
 /** The run's registry: a container on the cluster's network, with a volume of its own, both of this name. */
 const REGISTRY = `${CLUSTER}-registry`;
 /** Distribution's registry. */
