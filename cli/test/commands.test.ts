@@ -1071,6 +1071,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
       const answer = (status: number, answered?: unknown) => ({ exitCode: 0, stdout: `${answered === undefined ? "" : JSON.stringify(answered)}\n${status}` });
       if (method === "GET" && path === "/computes") return answer(200, { computes: neon.computes });
       if (method === "GET") return answer(200, { branches: neon.branches });
+      if (method === "POST" && path.startsWith("/computes/")) return answer(200, { address: "woken" });
       if (method === "POST") {
         const { name } = body as { name: string };
         neon.branches.push({ name, parent: "main", state: "ready", createdAt: new Date().toISOString() });
@@ -1142,8 +1143,9 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   succeeded(run);
   // Asked nothing before, as asserted: what it was asked since.
   const posted = (neon.asked as FakeNeon["asked"]).filter(({ method }) => method === "POST");
-  assert.deepEqual(posted.map(({ path }) => path), ["/branches"]);
-  const { compute, ...branched } = (posted[0]?.body ?? {}) as { readonly compute?: { readonly verifiers: Record<string, string>; readonly tokenSha256: string } };
+  // Main's compute woken first, as it may sleep, and its WAL position read in it.
+  assert.deepEqual(posted.map(({ path }) => path), ["/computes/alasio/wake", "/branches"]);
+  const { compute, ...branched } = (posted[1]?.body ?? {}) as { readonly compute?: { readonly verifiers: Record<string, string>; readonly tokenSha256: string } };
   assert.deepEqual(branched, { name: "try", lsn: "0/1A2B3C8" });
   const deployment = kube.get(BRANCH_DEPLOYMENT) as { metadata: { labels: Record<string, string> }; spec: { template: { spec: { containers: { image: string }[] } } } } | undefined;
   assert.equal(deployment?.spec.template.spec.containers[0]?.image, "registry.example:5000/alasio:next");
@@ -1222,7 +1224,10 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   const binding = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/alasio-branch-try-sandboxes";
   assert.ok(kube.get(policy) && kube.get(binding));
   neon.turns = "1";
+  neon.asked.length = 0;
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "its alasio has 1 turn running; --force deletes it all the same");
+  // Its compute, which may sleep, woken to be asked.
+  assert.deepEqual(neon.asked.filter(({ method }) => method === "POST").map(({ path }) => path), ["/computes/branch-try/wake"]);
   assert.ok(kube.get(BRANCH_DEPLOYMENT));
   kube.changes.length = 0;
   const run = await alasio(["branch", "delete", "try", "--force"]);

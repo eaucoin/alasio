@@ -14,7 +14,8 @@
  * and SeaweedFS's Write, which writing needs, deletes too. Its clients reach its compute
  * as main's do theirs, through Neon's proxy, by its compute's id. neon-control is called
  * in its own pod, as the API server's service proxy drops the Authorization header it
- * authenticates its callers by, which neon-control would read a token from.
+ * authenticates its callers by, which neon-control would read a token from; and a compute
+ * this works in, which may sleep, it wakes first.
  *
  * A branch is deleted in the order nothing of it outlives what it runs on: its alasio and
  * lake stopped, its Sandboxes and their claims deleted (JuiceFS keeps every chunk main
@@ -26,7 +27,7 @@ import { randomBytes } from "node:crypto";
 import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1PersistentVolume, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "effect";
 
-import { type BranchView, COMPUTE_PORT, computeId, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
+import { type BranchView, COMPUTE_PORT, computeId, MAIN, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
@@ -35,7 +36,7 @@ import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluste
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
-import { awaitGone, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
+import { awaitGone, awaitReady, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
 import { sandboxPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
@@ -125,6 +126,16 @@ const neonBranches = Effect.gen(function*() {
   if (answer.status !== 200 || !answer.body) return yield* new BranchRefused({ message: `neon-control did not list Neon's branches: ${refusalOf(answer)}` });
   return answer.body.branches.filter(({ parent }) => parent !== null);
 });
+
+/**
+ * Wakes the compute of the branch `name` (main's, or a branch environment's in
+ * `namespace`), which may sleep, by neon-control, and waits until its pod is ready.
+ */
+const awake = (name: string, namespace: string, options: WaitOptions) =>
+  neonControl("POST", `/computes/${computeId(name)}/wake`).pipe(
+    Effect.flatMap((answer) => answer.status === 200 ? Effect.void : Effect.fail(new BranchRefused({ message: `neon-control did not wake ${name}'s compute: ${refusalOf(answer)}` }))),
+    Effect.andThen(awaitReady([{ ...DEPLOYMENT, namespace, name: neonName("compute") }], options)),
+  );
 
 /** Runs `sql` as the compute's own superuser, in its pod: what psql printed of its one value. */
 const onCompute = (namespace: string, pod: string, sql: string) =>
@@ -275,6 +286,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   ];
 
   // At main's current WAL position, so the branch holds every commit main has made.
+  yield* awake(MAIN, NAMESPACE, options);
   const lsn = yield* onCompute(NAMESPACE, yield* runningPod("neon-compute"), "select pg_current_wal_lsn()");
   yield* Effect.logInfo(`branching Neon at ${lsn}`);
   const made = yield* neonControl<BranchView>("POST", "/branches", {
@@ -372,7 +384,8 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
   if (!branch && !made) return yield* new BranchRefused({ message: `there is no branch ${name}` });
 
   if (made && !force) {
-    const turns = yield* runningPodIn(namespace, "neon-compute").pipe(
+    const turns = yield* awake(name, namespace, options).pipe(
+      Effect.andThen(runningPodIn(namespace, "neon-compute")),
       Effect.flatMap((pod) => onCompute(namespace, pod, "select count(*) from state.turns where state = 'active'")),
       Effect.catch((error) => Effect.fail(new BranchRefused({ message: `whether its alasio has a turn running cannot be read: ${error.message}; --force deletes it all the same` }))),
     );
