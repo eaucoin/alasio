@@ -1,7 +1,7 @@
 {
   "uid": "alasio-stack-health",
   "title": "Stack health",
-  "description": "Whether the stack's services answer, whether telemetry reaches the lake, what the stack logs as going wrong, what its storage holds, and how its computes sleep and wake: from what the stack's collector scrapes and receives.",
+  "description": "Whether the stack's services answer, whether telemetry reaches the lake, what the stack logs as going wrong, what its storage holds, how its computes sleep and wake, and how sessions' sandboxes are released and restored: from what the stack's collector scrapes and receives.",
   "tags": [
     "alasio"
   ],
@@ -1350,6 +1350,496 @@
         "rowHeight": 0.8,
         "legend": {
           "showLegend": false
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "Sandboxes",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 61,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Releases",
+      "gridPos": {
+        "x": 0,
+        "y": 62,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Idle sessions released, every environment's, by outcome: snapshotted and suspended; kept running, as its pod runs no bayma under a gVisor release kept; or failed.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['alasio.sandbox.release.outcome'] as outcome, sum(added) as releases\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.sandbox.releases' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "outcome",
+              "text": "outcome",
+              "type": "string"
+            },
+            {
+              "selector": "releases",
+              "text": "releases",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.outcome}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Restores",
+      "gridPos": {
+        "x": 8,
+        "y": 62,
+        "w": 8,
+        "h": 8
+      },
+      "description": "Sessions brought up with a snapshot, every environment's, by outcome: restored from it, or fallen back to bayma's checkpoints, by why. `template` and `release`: what took it is no longer kept, as after an upgrade; `node`, `prepare`, `restore`, `unreadable`: a failure.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, if(Attributes['alasio.sandbox.restore.outcome'] = 'fallback', 'fell back: ' || Attributes['alasio.sandbox.restore.fallback'], Attributes['alasio.sandbox.restore.outcome']) as outcome, sum(added) as restores\nfrom (\nselect TimeUnix, Attributes, Value - coalesce(lag(Value) over series, 0) as added\nfrom otel.metrics_sum where MetricName = 'alasio.sandbox.restores' and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "outcome",
+              "text": "outcome",
+              "type": "string"
+            },
+            {
+              "selector": "restores",
+              "text": "restores",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.outcome}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Restore time",
+      "gridPos": {
+        "x": 16,
+        "y": 62,
+        "w": 8,
+        "h": 8
+      },
+      "description": "How long a session restored from its snapshot took to come back, which the prompt bringing it up waits: from its snapshot looked up to its pod ready. The mean of those in each interval.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'restore' as duration, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, MetricName, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.sandbox.restore.duration') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by MetricName, ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "duration",
+              "text": "duration",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.duration}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Checkpoint time",
+      "gridPos": {
+        "x": 0,
+        "y": 70,
+        "w": 8,
+        "h": 8
+      },
+      "description": "How long the node agents' checkpoints held their sandboxes paused, the hook's run included, and then took to upload their images to the snapshots bucket. The mean of those in each interval.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, if(MetricName = 'alasio.node_agent.checkpoint.pause', 'paused', 'uploading') as phase, sum(added_sum) / sum(added_count) as seconds\nfrom (\nselect TimeUnix, MetricName, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.node_agent.checkpoint.pause', 'alasio.node_agent.checkpoint.upload') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by MetricName, ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "phase",
+              "text": "phase",
+              "type": "string"
+            },
+            {
+              "selector": "seconds",
+              "text": "seconds",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "displayName": "${__field.labels.phase}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Snapshot images",
+      "gridPos": {
+        "x": 8,
+        "y": 70,
+        "w": 8,
+        "h": 8
+      },
+      "description": "The size of the node agents' checkpoints' images. The mean of those in each interval.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'image' as image, sum(added_sum) / sum(added_count) as bytes\nfrom (\nselect TimeUnix, MetricName, Sum - coalesce(lag(Sum) over series, 0) as added_sum, Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count\nfrom otel.metrics_histogram where MetricName in ('alasio.node_agent.snapshot.size') and TimeUnix >= epoch_ms(${__from}) - interval 1 hour and TimeUnix < epoch_ms(${__to})\nwindow series as (partition by MetricName, ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)\n) where TimeUnix >= epoch_ms(${__from}) and added_count > 0\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "image",
+              "text": "image",
+              "type": "string"
+            },
+            {
+              "selector": "bytes",
+              "text": "bytes",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "displayName": "${__field.labels.image}",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "showPoints": "always",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Releases and cached snapshots",
+      "gridPos": {
+        "x": 16,
+        "y": 70,
+        "w": 8,
+        "h": 8
+      },
+      "description": "The gVisor releases kept on the node that keeps the most, and the snapshots the nodes' caches hold together, by the release that took them, each kept release counted.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time, held, if(held = 'gVisor releases kept', max(value), sum(value)) as count\nfrom (\nselect time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, ResourceAttributes,\nif(MetricName = 'alasio.node_agent.releases', 'gVisor releases kept', 'snapshots cached of ' || Attributes['alasio.gvisor.release']) as held, arg_max(Value, TimeUnix) as value\nfrom otel.metrics_gauge where MetricName in ('alasio.node_agent.releases', 'alasio.node_agent.cache.snapshots') and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all\n) group by time, held order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "held",
+              "text": "held",
+              "type": "string"
+            },
+            {
+              "selector": "count",
+              "text": "count",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.held}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
         }
       }
     }

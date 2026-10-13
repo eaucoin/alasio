@@ -301,3 +301,59 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      # Of the sessions restored from their snapshots in the last hour, or meant to be, the
+      # share that fell back to bayma's checkpoints for a failure: no node to restore on, its
+      # image not prepared, its restore failing, or its snapshot unreadable. One whose
+      # template or gVisor release is no longer kept falls back as designed, after an
+      # upgrade, and counts neither way. A session is restored at most once each time it
+      # comes back from idle, so restores are few, and the window an hour: one failure among
+      # four or fewer pages, as each costs a session its REPLs.
+      # alasio's counts are running totals, since its process started, exported every
+      # minute: what a series added is each point less the one before it, its first counted
+      # from zero, the hour before the window giving each its point before.
+      - uid: alasio-restores-falling-back
+        title: Restores are falling back
+        condition: falling
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ humanizePercentage $values.failed.Value }} of the restores from snapshots in the last hour fell back to bayma's checkpoints for a failure."
+        data:
+          - refId: failed
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: failed
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(added) filter (where fallback in ('node', 'prepare', 'restore', 'unreadable')), 0) / sum(added) as failed
+                  from (
+                    select TimeUnix, Attributes['alasio.sandbox.restore.fallback'] as fallback,
+                      Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
+                    from otel.metrics_sum
+                    where MetricName = 'alasio.sandbox.restores' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                  )
+                  where TimeUnix > now()::timestamp - interval 1 hour and coalesce(fallback not in ('template', 'release'), true)
+                  having sum(added) > 0
+              root_selector: ""
+              columns:
+                - {selector: failed, text: failed, type: number}
+          - refId: falling
+            datasourceUid: __expr__
+            model:
+              refId: falling
+              type: threshold
+              expression: failed
+              conditions: [{evaluator: {type: gt, params: [0.2]}}]

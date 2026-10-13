@@ -1214,6 +1214,98 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the Sandboxes row counts what alasio's running totals added in each interval, and the fallback alert main's failures alone", async () => {
+    const minute = 60_000;
+    const now = Math.floor(Date.now() / minute) * minute;
+    const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    const resource = (instance: string, branch?: string) => ({ attributes: keyValues({ "service.name": "alasio", "service.instance.id": instance, ...(branch ? { "alasio.branch": branch } : {}) }) });
+    const nanos = (ms: number) => String(BigInt(ms) * 1_000_000n);
+    /**
+     * A point a minute of a series, as alasio's SDK exports one, from the minute after its
+     * first value, each `{ count, sum }` of the values `at` (minutes before now, each half a
+     * minute before the next point) by then.
+     */
+    const points = <Point extends object>(startedAgo: number, at: readonly (readonly [number, number])[], point: (seen: readonly number[]) => Point) =>
+      Array.from({ length: Math.max(...at.map(([ago]) => ago)) + 1 }, (_, index) => Math.max(...at.map(([ago]) => ago)) - index).map((ago) => ({
+        startTimeUnixNano: nanos(now - startedAgo * minute),
+        timeUnixNano: nanos(now - ago * minute),
+        ...point(at.filter(([happened]) => happened >= ago).map(([, value]) => value)),
+      }));
+    const counter = (name: string, startedAgo: number, attributes: Readonly<Record<string, string>>, at: readonly number[]) => ({
+      name,
+      sum: {
+        aggregationTemporality: 2,
+        isMonotonic: true,
+        dataPoints: points(startedAgo, at.map((ago) => [ago, 1]), (seen) => ({
+          asDouble: seen.length,
+          attributes: keyValues(attributes),
+        })),
+      },
+    });
+    const histogram = (name: string, startedAgo: number, at: readonly (readonly [number, number])[]) => ({
+      name,
+      histogram: {
+        aggregationTemporality: 2,
+        dataPoints: points(startedAgo, at, (seen) => ({ count: String(seen.length), sum: seen.reduce((total, value) => total + value, 0), bucketCounts: [String(seen.length)], explicitBounds: [] })),
+      },
+    });
+    const outcome = (restore: string, fallback?: string) => ({ "alasio.sandbox.restore.outcome": restore, ...(fallback ? { "alasio.sandbox.restore.fallback": fallback } : {}) });
+    const restores = "alasio.sandbox.restores";
+    // One alasio up for three hours, which counted before the last hour too; one started
+    // fifty minutes ago, counting from zero; a branch's, which pages no one.
+    const metrics: MetricsRequest = {
+      resourceMetrics: [
+        {
+          resource: resource("long"),
+          scopeMetrics: [{
+            metrics: [
+              counter(restores, 180, outcome("restored"), [150, 70, 40, 20, 19]),
+              counter(restores, 180, outcome("fallback", "prepare"), [170, 10]),
+              counter(restores, 180, outcome("fallback", "template"), [30, 29, 28]),
+              counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "snapshotted" }, [90, 50, 10]),
+              counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "failed" }, [30]),
+              histogram("alasio.sandbox.restore.duration", 180, [[100, 99], [20, 3], [5, 5]]),
+            ],
+          }],
+        },
+        { resource: resource("restarted"), scopeMetrics: [{ metrics: [counter(restores, 50, outcome("restored"), [45, 5]), counter(restores, 50, outcome("fallback", "restore"), [15])] }] },
+        { resource: resource("branch", "try"), scopeMetrics: [{ metrics: [counter(restores, 120, outcome("fallback", "node"), [25, 24, 23, 22])] }] },
+      ],
+    };
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", metrics));
+      await flushTelemetry(db);
+    });
+    const dashboard: { panels: { title: string; targets?: { url_options: { data: string } }[] }[] } =
+      JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
+    // A panel's query over the last hour, by the minute.
+    const panel = (title: string) => {
+      const sql = dashboard.panels.find((found) => found.title === title)?.targets?.[0]?.url_options.data;
+      assert.ok(sql, title);
+      return [["${__from}", String(now - 60 * minute)], ["${__to}", String(now + minute)], ["${__interval_ms}", String(minute)]]
+        .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
+    };
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf("title: Restores are falling back"))) ?? [];
+    const reader = await openReader(readerConfig);
+    try {
+      /** Each label's total over the panel's rows. */
+      const totals = async (title: string, label: string, value: string) => {
+        const summed: Record<string, number> = {};
+        for (const row of await answer(reader.db, panel(title))) summed[String(row[label])] = (summed[String(row[label])] ?? 0) + Number(row[value]);
+        return summed;
+      };
+      assert.deepEqual(await totals("Restores", "outcome", "restores"), { "restored": 5, "fell back: prepare": 1, "fell back: template": 3, "fell back: restore": 1, "fell back: node": 4 });
+      assert.deepEqual(await totals("Releases", "outcome", "releases"), { snapshotted: 2, failed: 1 });
+      assert.deepEqual((await answer(reader.db, panel("Restore time"))).map((row) => row["seconds"]), [3, 5]);
+      // Main's restores that failed, of those that could have restored.
+      assert.deepEqual(await answer(reader.db, block.replaceAll(`\n${indent}  `, "\n").trim()), [{ failed: 2 / 7 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, and which collection keeps too few copies", async () => {
     const now = String(BigInt(Date.now()) * 1_000_000n);
     const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
