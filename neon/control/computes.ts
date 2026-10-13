@@ -220,3 +220,21 @@ export async function computeCtlStatus(host: string, token: string): Promise<str
   const body: unknown = response?.ok ? await response.json().catch(() => null) : null;
   return typeof body === "object" && body !== null && "status" in body && typeof body.status === "string" ? body.status : null;
 }
+
+/**
+ * The LSN the compute at `host`:`port` has: a primary's flushed WAL's end, or a replica's
+ * replayed (`replica`), as neon-control's own role reads it, read-only.
+ */
+export async function computeLsn(host: string, port: number, role: string, password: string, replica: boolean): Promise<string> {
+  const client = new pg.Client({ host, port, user: role, password, database: "postgres", connectionTimeoutMillis: 5000, options: "-c default_transaction_read_only=on" });
+  client.on("error", () => {});
+  await client.connect();
+  try {
+    const { rows } = await client.query<{ lsn: string | null }>(`select ${replica ? "pg_last_wal_replay_lsn()" : "pg_current_wal_flush_lsn()"}::text as lsn`);
+    const lsn = rows[0]?.lsn;
+    if (!lsn) throw new Error(`${host} has no LSN to read`);
+    return lsn;
+  } finally {
+    await client.end().catch(() => {});
+  }
+}

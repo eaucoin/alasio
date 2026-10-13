@@ -3,7 +3,8 @@
  * collector to scrape from each of its replicas (cli/src/manifests/collector.ts): its
  * wakes of the computes, how long each took, warm or from sleep, and those that failed;
  * the computes it put to sleep; how many replicas each compute runs, as the replica that
- * leads last read; and the locks of its record it gave up waiting for (./record.ts).
+ * leads last read; how far each branch's read replica trails its primary, while both
+ * run; and the locks of its record it gave up waiting for (./record.ts).
  */
 
 /** The bounds, in seconds, of the wake durations' histogram's buckets: a warm wake's first, a cold one's after. */
@@ -16,6 +17,7 @@ const HELP = {
   neon_control_suspends_total: "Computes put to sleep, idle as long as their environment allows",
   neon_control_compute_replicas: "The replicas each compute's Deployment runs, 0 asleep, as the replica that leads last read them",
   neon_control_lock_timeouts_total: "Locks of the record waited for longer than their patience, by lock: changes to the branches, or a compute's",
+  neon_control_replica_lag_bytes: "The WAL a branch's read replica has yet to replay of what its primary has flushed, by the replica's compute, while both run, as the replica that leads last read it",
 } as const;
 
 /** How a wake started. */
@@ -28,6 +30,8 @@ export interface ControlMetrics {
   suspended(): void;
   /** The replicas of each compute, by its id, replacing what was set before; none for a replica that does not lead. */
   replicas(byCompute: ReadonlyMap<string, number>): void;
+  /** The lag of each read replica, by its compute's id, replacing what was set before; none for a replica that does not lead. */
+  replicaLag(byCompute: ReadonlyMap<string, number>): void;
   lockTimedOut(lock: "changes" | "compute"): void;
   /** The exposition text, every metric with its HELP and TYPE. */
   render(): string;
@@ -39,6 +43,7 @@ export function createControlMetrics(): ControlMetrics {
   let failures = 0;
   let suspends = 0;
   let replicas: ReadonlyMap<string, number> = new Map();
+  let lag: ReadonlyMap<string, number> = new Map();
   const lockTimeouts = { changes: 0, compute: 0 };
   const head = (name: keyof typeof HELP, type: string) => [`# HELP ${name} ${HELP[name]}`, `# TYPE ${name} ${type}`];
   return {
@@ -59,6 +64,9 @@ export function createControlMetrics(): ControlMetrics {
     },
     replicas(byCompute) {
       replicas = new Map(byCompute);
+    },
+    replicaLag(byCompute) {
+      lag = new Map(byCompute);
     },
     lockTimedOut(lock) {
       lockTimeouts[lock] += 1;
@@ -85,6 +93,8 @@ export function createControlMetrics(): ControlMetrics {
         ...[...replicas].map(([compute, count]) => `neon_control_compute_replicas{compute="${compute}"} ${count}`),
         ...head("neon_control_lock_timeouts_total", "counter"),
         ...(["changes", "compute"] as const).map((lock) => `neon_control_lock_timeouts_total{lock="${lock}"} ${lockTimeouts[lock]}`),
+        ...head("neon_control_replica_lag_bytes", "gauge"),
+        ...[...lag].map(([compute, bytes]) => `neon_control_replica_lag_bytes{compute="${compute}"} ${bytes}`),
       ];
       return `${lines.join("\n")}\n`;
     },

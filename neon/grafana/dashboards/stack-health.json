@@ -1180,7 +1180,7 @@
       "gridPos": {
         "x": 0,
         "y": 53,
-        "w": 12,
+        "w": 8,
         "h": 8
       },
       "description": "How long a wake of a compute took on average, from its asking to the compute taking connections: warm, the compute running, or cold, woken from sleep. neon-control's replicas', each scraped.",
@@ -1258,9 +1258,9 @@
       "type": "state-timeline",
       "title": "Computes awake",
       "gridPos": {
-        "x": 12,
+        "x": 8,
         "y": 53,
-        "w": 12,
+        "w": 8,
         "h": 8
       },
       "description": "Each environment's compute, main's (alasio) and each branch's: awake, at one replica, or asleep, at none, as neon-control's replica that leads reads them every half minute.",
@@ -1355,6 +1355,86 @@
     },
     {
       "id": 19,
+      "type": "timeseries",
+      "title": "Read replicas' lag",
+      "gridPos": {
+        "x": 16,
+        "y": 53,
+        "w": 8,
+        "h": 8
+      },
+      "description": "How much WAL each branch's read replica, which the lake loads from, has yet to replay of what its primary has flushed, while both run: the delay of the lake's loads behind alasio's writes.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['compute'] as compute, max(Value) as bytes\nfrom otel.metrics_gauge where MetricName = 'neon_control_replica_lag_bytes' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "compute",
+              "text": "compute",
+              "type": "string"
+            },
+            {
+              "selector": "bytes",
+              "text": "bytes",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "displayName": "${__field.labels.compute}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 20,
       "type": "row",
       "title": "Sandboxes",
       "collapsed": false,
@@ -1367,7 +1447,7 @@
       "panels": []
     },
     {
-      "id": 20,
+      "id": 21,
       "type": "timeseries",
       "title": "Releases",
       "gridPos": {
@@ -1447,7 +1527,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 22,
       "type": "timeseries",
       "title": "Restores",
       "gridPos": {
@@ -1527,7 +1607,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 23,
       "type": "timeseries",
       "title": "Restore time",
       "gridPos": {
@@ -1606,7 +1686,7 @@
       }
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "timeseries",
       "title": "Checkpoint time",
       "gridPos": {
@@ -1685,7 +1765,7 @@
       }
     },
     {
-      "id": 24,
+      "id": 25,
       "type": "timeseries",
       "title": "Snapshot images",
       "gridPos": {
@@ -1764,7 +1844,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 26,
       "type": "timeseries",
       "title": "Releases and cached snapshots",
       "gridPos": {

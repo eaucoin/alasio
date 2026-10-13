@@ -105,13 +105,18 @@ function neonControl<Body>(method: "GET" | "POST" | "DELETE", path: string, body
   });
 }
 
-/** A compute as neon-control lists it: its Deployment, and when it was last asked to wake and put to sleep, if ever. */
+/**
+ * A compute as neon-control lists it: its Deployment, when it was last asked to wake and
+ * put to sleep, if ever, and a read replica's lag behind its primary, in bytes of WAL, as
+ * last read (null while either sleeps).
+ */
 export interface ComputeTimes {
   readonly id: string;
   readonly namespace: string;
   readonly name: string;
   readonly wokenAt: string | null;
   readonly suspendedAt: string | null;
+  readonly lagBytes?: number | null;
 }
 
 /** Each compute neon-control knows of, by its Deployment, `<namespace>/<name>`; none where neon-control does not answer. */

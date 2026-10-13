@@ -65,8 +65,9 @@
  * - `POST /computes/<id>/wake`: wakes the compute `id` (`alasio`, or `branch-<name>`),
  *   as the proxy's `wake_compute` does, for alasio's command line, which works in it
  *   (200, `{ address }`); 404 for a compute of no ready branch, or not deployed.
- * - `GET /computes`: every ready branch's compute and read replica, its namespace, and when
- *   it was last asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
+ * - `GET /computes`: every ready branch's compute and read replica, its namespace, when it
+ *   was last asked to wake and put to sleep, and a replica's lag (200, `{ computes }`),
+ *   for `alasio status`.
  * - `GET /tenant`: the tenant's shards, their stripe, and each pageserver, with how many of
  *   them it holds (200, `{ shards, stripeSize, pageservers }`), for `alasio status`.
  *
@@ -136,6 +137,7 @@ import {
   type ComputeDeployment,
   computeActivity,
   computeDeployment,
+  computeLsn,
   computePods,
   type ComputeRef,
   computeCtlStatus,
@@ -144,7 +146,7 @@ import {
   restartCompute,
   scaleCompute,
 } from "./computes.ts";
-import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
+import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, lsnDistance, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
 import { bearsScope, computeCtlToken, publicJwks, signToken } from "./jwt.ts";
 import { createControlMetrics } from "./metrics.ts";
 import { reconcile, type Reconfigured, reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
@@ -720,6 +722,30 @@ async function suspendIdle(computes: readonly Compute[]): Promise<void> {
 const computesOf = (branches: readonly Branch[]): Compute[] =>
   branches.filter(({ state }) => state === "ready").flatMap(({ name }) => [{ name, replica: false }, { name, replica: true }]);
 
+/**
+ * How far each read replica trails its primary, by the replica's id, in bytes of WAL, where
+ * both run: the primary's flushed WAL's end against what the replica has replayed.
+ */
+async function replicaLag(branches: readonly Branch[]): Promise<Map<string, number>> {
+  // Every replica's at once, as each may wait on a compute that does not answer.
+  const read = await Promise.all(computesOf(branches).filter(({ replica }) => replica).map(async (compute): Promise<[string, number] | null> => {
+    const primary = { name: compute.name, replica: false };
+    try {
+      const [replicaDeployment, primaryDeployment] = await Promise.all([computeDeployment(computeOf(compute)), computeDeployment(computeOf(primary))]);
+      if (!replicaDeployment?.ready || !primaryDeployment?.ready) return null;
+      const password = monitorPassword(computeId(compute.name));
+      // The replica's first, so a lag is never under what it is.
+      const replayed = await computeLsn(hostOf(compute), COMPUTE_PORT, MONITOR_ROLE, password, true);
+      const flushed = await computeLsn(hostOf(primary), COMPUTE_PORT, MONITOR_ROLE, password, false);
+      return [idOf(compute), lsnDistance(replayed, flushed)];
+    } catch (error) {
+      log("replica lag not read", { compute: idOf(compute), error: errorText(error) });
+      return null;
+    }
+  }));
+  return new Map(read.filter((entry): entry is [string, number] => entry !== null));
+}
+
 /** Whether this replica led at its last round, which it says when that changes. */
 let led = false;
 /** Whether a round of leading is under way: one never starts beside another. */
@@ -727,8 +753,9 @@ let leading = false;
 
 /**
  * What the replica that leads does, now and then: each branch's safekeepers repaired,
- * each compute idle long enough put to sleep, the tenant's shards split and spread as
- * configured (balanceShards), and the computes' layout set right (reconcileLayout).
+ * each compute idle long enough put to sleep, each read replica's lag read, the tenant's
+ * shards split and spread as configured (balanceShards), and the computes' layout set
+ * right (reconcileLayout).
  */
 async function lead(): Promise<void> {
   if (leading) return;
@@ -739,11 +766,13 @@ async function lead(): Promise<void> {
     led = leads;
     if (!leads) {
       metrics.replicas(new Map());
+      metrics.replicaLag(new Map());
       return;
     }
     const branches = await record.branches();
     await repairEverySafekeeper(branches);
     await suspendIdle(computesOf(branches));
+    metrics.replicaLag(await replicaLag(branches));
     await balanceShards();
     await reconcileLayout();
   } finally {
@@ -928,11 +957,13 @@ async function answerProxy(request: IncomingMessage, response: ServerResponse, p
 }
 
 /**
- * Every ready branch's compute and read replica, where it runs, and when it was last asked
- * to wake and put to sleep (./record.ts), for alasio's command line.
+ * Every ready branch's compute and read replica, where it runs, when it was last asked to
+ * wake and put to sleep (./record.ts), and a replica's lag, read now, as any replica of
+ * neon-control answers, for alasio's command line.
  */
 async function computesView(): Promise<object> {
   const [branches, times] = await Promise.all([record.branches(), record.computes()]);
+  const lag = await replicaLag(branches);
   const at = (ms: number | null | undefined) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
   // A read replica where its environment runs one, as the lake runs there.
   const computes = computesOf(branches);
@@ -947,6 +978,7 @@ async function computesView(): Promise<object> {
         name: computeOf(compute).name,
         wokenAt: at(recorded?.wokenAt),
         suspendedAt: at(recorded?.suspendedAt),
+        ...(compute.replica ? { lagBytes: lag.get(id) ?? null } : {}),
       };
     }),
   };

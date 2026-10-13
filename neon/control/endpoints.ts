@@ -157,3 +157,13 @@ export async function wakeCompute<D extends { readonly replicas: number }>(steps
   }
   return slept;
 }
+
+/** The bytes from LSN `from` to LSN `to` (each `<high>/<low>` in hexadecimal, as Postgres writes one), 0 where `to` is not past `from`. */
+export function lsnDistance(from: string, to: string): number {
+  const bytes = (lsn: string) => {
+    const [high = "0", low = "0"] = lsn.split("/");
+    return (BigInt(`0x${high}`) << 32n) + BigInt(`0x${low}`);
+  };
+  const distance = bytes(to) - bytes(from);
+  return distance > 0n ? Number(distance) : 0;
+}

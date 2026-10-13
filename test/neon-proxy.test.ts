@@ -11,7 +11,7 @@ import pg from "pg";
 
 import type { ComputeCredentials } from "../neon/control/branches.ts";
 import { computeActivity, livePods } from "../neon/control/computes.ts";
-import { controlPlaneError, idleness, proxyQuery, roleSecret, suspendDue, wakeCompute } from "../neon/control/endpoints.ts";
+import { controlPlaneError, idleness, lsnDistance, proxyQuery, roleSecret, suspendDue, wakeCompute } from "../neon/control/endpoints.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { startPostgres } from "./support/postgres.ts";
 
@@ -174,4 +174,10 @@ describe("a compute", () => {
       await database.stop();
     }
   });
+});
+
+test("a read replica's lag is the WAL between what it replayed and what its primary flushed, never under none", () => {
+  assert.equal(lsnDistance("0/16B5A50", "0/16B5A58"), 8);
+  assert.equal(lsnDistance("0/FFFFFFF8", "1/8"), 16);
+  assert.equal(lsnDistance("1/8", "0/FFFFFFF8"), 0, "a replica ahead, read a moment after its primary");
 });

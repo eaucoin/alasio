@@ -577,7 +577,7 @@ test("the proxy's token of the proxy scope asks for roles' secrets and wakes com
   assert.ok(admin("POST", "/computes/alasio/wake"));
 });
 
-test("neon-control's metrics count its wakes, by how they started and in buckets of how long they took, its failures, sleeps and lock timeouts, and the replicas of each compute while it leads", () => {
+test("neon-control's metrics count its wakes, by how they started and in buckets of how long they took, its failures, sleeps and lock timeouts, and the replicas of each compute and each read replica's lag while it leads", () => {
   const metrics = createControlMetrics();
   const rendered = () => metrics.render().split("\n");
   // Every counter, at 0, before anything has happened: what an increase is reckoned from.
@@ -590,6 +590,7 @@ test("neon-control's metrics count its wakes, by how they started and in buckets
   metrics.suspended();
   metrics.lockTimedOut("compute");
   metrics.replicas(new Map([["alasio", 1], ["branch-dev", 0]]));
+  metrics.replicaLag(new Map([["alasio-ro", 4096]]));
   const lines = rendered();
   for (const line of [
     'neon_control_wakes_total{start="cold"} 1',
@@ -604,6 +605,7 @@ test("neon-control's metrics count its wakes, by how they started and in buckets
     'neon_control_lock_timeouts_total{lock="compute"} 1',
     'neon_control_compute_replicas{compute="alasio"} 1',
     'neon_control_compute_replicas{compute="branch-dev"} 0',
+    'neon_control_replica_lag_bytes{compute="alasio-ro"} 4096',
     "# TYPE neon_control_wake_duration_seconds histogram",
   ]) {
     assert.ok(lines.includes(line), line);

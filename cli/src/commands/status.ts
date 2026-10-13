@@ -11,7 +11,7 @@ import { gvisorReleases, NODE_PINS, SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
 import { describeBaseline, recordedBaseline, standingOf, surveyCpu } from "../cpu-baseline.ts";
 import { clusterReleases, describeKept, snapshotReleases } from "../kept-releases.ts";
-import { describeMemory, describeScale, describeSizing, memoryBytes, type ScaledWorkload } from "../capacity.ts";
+import { describeMemory, describeScale, describeSizing, memoryBytes, memoryText, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
@@ -132,11 +132,17 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
 /**
  * A compute that is ready, a primary or a read replica: asleep at no replica, as
  * neon-control puts one no client has used for a while, until the next connection wakes
- * it, or awake; and when it was last woken, as neon-control recorded it.
+ * it, or awake; when it was last woken, as neon-control recorded it; and a read
+ * replica's lag behind its primary, as neon-control last read it.
  */
 function describeCompute(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>): string {
-  const woken = computes.get(`${workload.metadata?.namespace ?? ""}/${workload.metadata?.name ?? ""}`)?.wokenAt;
-  return `${workload.spec?.replicas === 0 ? "asleep" : "awake"}${woken ? `, last woken ${woken}` : ""}`;
+  const compute = computes.get(`${workload.metadata?.namespace ?? ""}/${workload.metadata?.name ?? ""}`);
+  const lag = compute?.lagBytes;
+  return [
+    workload.spec?.replicas === 0 ? "asleep" : "awake",
+    ...(compute?.wokenAt ? [`last woken ${compute.wokenAt}`] : []),
+    ...(lag === undefined || lag === null ? [] : [`${memoryText(lag)} of WAL behind its primary`]),
+  ].join(", ");
 }
 
 /** Neon's tenant: its shards, and each pageserver, with how many of them it holds. */

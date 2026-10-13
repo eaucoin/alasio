@@ -1211,7 +1211,7 @@ interface FakeNeon {
   /** The active turns a branch's database has. */
   turns: string;
   /** Each compute as neon-control lists it. */
-  readonly computes: { id: string; namespace: string; name: string; wokenAt: string | null; suspendedAt: string | null }[];
+  readonly computes: { id: string; namespace: string; name: string; wokenAt: string | null; suspendedAt: string | null; lagBytes?: number | null }[];
   /** Neon's tenant as neon-control has it; null while it cannot say (503). */
   tenant: TenantView | null;
   /** Neon's storage as the storage controller holds it. */
@@ -1323,6 +1323,14 @@ test("status says of each compute whether it is awake or asleep, and when neon-c
   collector.spec["replicas"] = 0;
   run = await alasio(["status"]);
   assert.ok(run.printed.includes("  Deployment alasio/alasio-collector: ready"), run.printed.join("\n"));
+});
+
+test("status says how far each read replica is behind its primary", async (t) => {
+  const { alasio, neon } = await branchable(t);
+  neon.computes.push({ id: "alasio-ro", namespace: "alasio", name: "alasio-neon-compute-ro", wokenAt: null, suspendedAt: null, lagBytes: 3 * 1024 * 1024 });
+  const run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-neon-compute-ro: awake, 3 MiB of WAL behind its primary"), run.printed.join("\n"));
 });
 
 test("status says Neon's shards, and each pageserver, with how many of them it holds", async (t) => {

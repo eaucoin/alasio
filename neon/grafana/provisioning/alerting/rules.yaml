@@ -411,3 +411,44 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0.2]}}]
+
+      - uid: alasio-replica-lagging
+        title: A read replica trails its primary
+        condition: lagging
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.compute }} has had {{ $values.bytes }} bytes of WAL yet to replay for fifteen minutes: the lake's loads from it trail alasio's writes."
+        data:
+          - refId: bytes
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: bytes
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select Attributes['compute'] as compute, min(Value) as bytes
+                  from otel.metrics_gauge
+                  where MetricName = 'neon_control_replica_lag_bytes' and TimeUnix > now()::timestamp - interval 5 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: compute, text: compute, type: string}
+                - {selector: bytes, text: bytes, type: number}
+          - refId: lagging
+            datasourceUid: __expr__
+            model:
+              refId: lagging
+              type: threshold
+              expression: bytes
+              conditions: [{evaluator: {type: gt, params: [268435456]}}]
