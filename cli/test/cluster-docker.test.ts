@@ -386,14 +386,19 @@ test("remove with the storage empties it in the server node, as root, again whil
   assert.throws(() => statSync(options.storagePath), /ENOENT/u);
 });
 
-test("status is Docker's version and the cluster's nodes, the server first", async (t) => {
-  const { kubeconfig, run } = await rig(t);
+test("status is Docker's version and the cluster's nodes, the server first, and whether stargz-snapshotter's daemon runs in each running one", async (t) => {
+  const { k3s, kubeconfig, run } = await rig(t);
   assert.deepEqual(await run((cluster) => cluster.status), { docker: "29.0.0", nodes: [] });
   await run((cluster) => cluster.up(kubeconfig), { agents: 1 });
+  k3s.stargzStopped.add("dev-agent-0");
+  assert.deepEqual(await run((cluster) => cluster.status, { agents: 1 }), {
+    docker: "29.0.0",
+    nodes: [{ name: "dev-server-0", role: "server", state: "running", snapshotter: true }, { name: "dev-agent-0", role: "agent", state: "running", snapshotter: false }],
+  });
   await run((cluster) => cluster.down, { agents: 1 });
   assert.deepEqual(await run((cluster) => cluster.status), {
     docker: "29.0.0",
-    nodes: [{ name: "dev-server-0", role: "server", state: "exited" }, { name: "dev-agent-0", role: "agent", state: "exited" }],
+    nodes: [{ name: "dev-server-0", role: "server", state: "exited", snapshotter: null }, { name: "dev-agent-0", role: "agent", state: "exited", snapshotter: null }],
   });
 });
 

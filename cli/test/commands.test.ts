@@ -28,7 +28,7 @@ import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
 import { ROUTES_SECRET, TLS_SECRET, WEBHOOK, WEBHOOK_HEALTH_PORT } from "../src/manifests/webhook.ts";
 import { type CliRun, runAlasio } from "./support/cli.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
-import { serveK3sInDocker } from "./support/fake-k3s.ts";
+import { type FakeK3s, serveK3sInDocker } from "./support/fake-k3s.ts";
 import { type FakeKube, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
@@ -96,6 +96,8 @@ interface Rig {
   readonly kube: FakeKube;
   readonly telegram: FakeTelegram;
   readonly docker: FakeDocker;
+  /** k3s in the fake Docker's nodes. */
+  readonly k3s: FakeK3s;
   readonly machine: FakeMachine;
   readonly home: string;
   /** A kubeconfig that reaches the fake API. */
@@ -116,7 +118,7 @@ async function rig(t: TestContext): Promise<Rig> {
   const telegram = await serveFakeTelegram();
   telegram.bots.set(BOT_TOKEN, BOT);
   // The server node of the cluster in Docker writes a kubeconfig that reaches the fake API, at the port the config gives it.
-  const { fake: docker } = await serveK3sInDocker(kube.kubeconfig);
+  const { fake: docker, k3s } = await serveK3sInDocker(kube.kubeconfig);
   // The storage controller, once installed, says what Neon's storage holds, which alasio up
   // checks the configuration against: one pageserver, before the tenant is made.
   const storage: FakeStorage = { pageservers: 1, shards: null, answering: true, databaseAnswering: true };
@@ -152,6 +154,7 @@ async function rig(t: TestContext): Promise<Rig> {
     kube,
     telegram,
     docker,
+    k3s,
     machine,
     home,
     kubeconfig,
@@ -1006,7 +1009,11 @@ test("init and up raise inotify limits too low for the cluster here as root, now
   machine.sysctl("fs.inotify.max_user_instances", 128);
   const status = await alasio(["status"]);
   assert.equal(failure(status), ["this machine's inotify limits are too low for the cluster alasio makes on it:", `  ${shortfall}`, "alasio up raises them, as root."].join("\n"));
-  assert.deepEqual(status.printed.slice(0, 3), ["cluster dev, in Docker 29.0.0:", "  dev-server-0: running", `  this machine's ${shortfall}`]);
+  assert.deepEqual(status.printed.slice(0, 3), [
+    "cluster dev, in Docker 29.0.0:",
+    "  dev-server-0: running\n    stargz-snapshotter's daemon, which k3s pulls images through: running",
+    `  this machine's ${shortfall}`,
+  ]);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
 });
 
@@ -1023,6 +1030,18 @@ test("init, up and status refuse to make a cluster on a machine other than Linux
   const status = await runAlasio(["status"], { env: remote.env, machine: remote.machine, kind: mac });
   succeeded(status);
   assert.ok(status.printed.includes("  Deployment alasio/alasio: ready"));
+});
+
+test("status of the cluster in Docker says whether stargz-snapshotter's daemon runs in each running node, which k3s pulls images through", async (t) => {
+  const { alasio, configure, home, k3s, kube } = await rig(t);
+  configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath: join(home, "storage") } } });
+  const tokenFile = join(home, "bot-token");
+  writeFileSync(tokenFile, BOT_TOKEN);
+  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
+  k3s.stargzStopped.add("dev-server-0");
+  const status = await alasio(["status"]);
+  succeeded(status);
+  assert.equal(status.printed[1], "  dev-server-0: running\n    stargz-snapshotter's daemon, which k3s pulls images through: not running");
 });
 
 test("status of a stopped cluster here says that up starts it", async (t) => {

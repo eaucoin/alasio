@@ -639,7 +639,7 @@ describe("alasio's command line, on the alasio it installed", () => {
     } else {
       assert.match(said, new RegExp(`^cluster ${CLUSTER}, in Docker `, "u"));
       const nodes = [`${CLUSTER}-server-0`, ...Array.from({ length: AGENTS }, (_, index) => `${CLUSTER}-agent-${index}`)];
-      for (const node of nodes) assert.ok(said.includes(`\n  ${node}: running\n`), said);
+      for (const node of nodes) assert.ok(said.includes(`\n  ${node}: running\n    stargz-snapshotter's daemon, which k3s pulls images through: running\n`), said);
     }
     assert.ok(said.includes(`  Deployment ${NAMESPACE}/${RELEASE}: ready\n`), said);
     assert.ok(said.includes(`  StatefulSet ${NAMESPACE}/${RELEASE}-neon-pageserver: ready\n`), said);
