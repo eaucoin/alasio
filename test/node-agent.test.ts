@@ -34,7 +34,7 @@ import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
 
-const RELEASE = "release-20260921.0-eaucoin.3";
+const RELEASE = "20260921.0-eaucoin.3";
 const CONTAINER = "0123456789abcdef".repeat(4);
 const OTHER_CONTAINER = "fedcba9876543210".repeat(4);
 const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"];
@@ -361,7 +361,7 @@ test("a snapshot is prepared from the node's cache, or from the bucket, checked 
       assert.deepEqual(cachedOf(third, "fs-abc"), []);
 
       // A node without its release, or whose CPU lacks a feature it was saved with, cannot restore it.
-      const older = yield* node("node-4", { releases: ["release-20260801.0-eaucoin.1"] });
+      const older = yield* node("node-4", { releases: ["20260801.0-eaucoin.1"] });
       assert.equal(
         failure(yield* Effect.exit(older.agent.prepare(workspace))),
         `this node cannot restore the snapshot ${newer.snapshot} of main/fs-abc: its gVisor ${RELEASE} is not installed here`,
@@ -469,7 +469,7 @@ test("a copy that fails as it writes leaves the workspace without a snapshot, ra
 test("the agent counts what it does, and tells, as metrics are exported, the releases it keeps and the snapshots its cache holds of each", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
-      const older = "release-20260801.0-eaucoin.1";
+      const older = "20260801.0-eaucoin.1";
       const here = yield* node("node-1", { releases: [RELEASE, older] });
       const counted = (name: string, effect: Effect.Effect<unknown, unknown>) => Effect.promise(() => added(name, () => Effect.runPromise(effect)));
       const both = Effect.all([here.agent.checkpoint(request("fs-abc")), here.agent.checkpoint(request("fs-other"))]);
@@ -756,8 +756,8 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       ]);
 
       // Snapshots it cannot restore, or that are not what they say, and a bucket that fails.
-      s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify({ ...manifest, release: "release-20260801.0-eaucoin.1" })));
-      error(409, /its gVisor release-20260801\.0-eaucoin\.1 is not installed here/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify({ ...manifest, release: "20260801.0-eaucoin.1" })));
+      error(409, /its gVisor 20260801\.0-eaucoin\.1 is not installed here/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
       s3.objects.set("main/fs-abc/current.json", Buffer.from("{}"));
       error(422, /^the snapshot of main\/fs-abc is corrupt: its current\.json is not a manifest/u)(yield* call("GET", "/snapshots/main/fs-abc"));
       s3.refuse = () => 503;
