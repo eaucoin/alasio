@@ -791,6 +791,16 @@ export async function dumpClusterState(): Promise<void> {
         }
       }
     }
+    // Ready as they may be, alasio and the node agents log why a snapshot was not taken or
+    // a session not restored from one: alasio in its scope "snapshots", the agents in theirs.
+    for (const [component, scope] of [["alasio", "[snapshots]"], ["node-agent", "[node-agent]"]] as const) {
+      for (const pod of await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })) {
+        const name = pod.metadata?.name ?? "";
+        const logged = await kube.logs(NAMESPACE, name, component).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        say(`--- ${NAMESPACE}/${name}: its last lines of ${scope}`);
+        for (const line of logged.trimEnd().split("\n").filter((each) => each.startsWith(scope)).slice(-40)) say(`  ${line}`);
+      }
+    }
   } catch (error) {
     say(`the cluster's state could not be read: ${error instanceof Error ? error.message : String(error)}`);
   }
