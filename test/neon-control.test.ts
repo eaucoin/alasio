@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  attachNotified,
   type Branch,
   BranchError,
   BRANCHES_SCOPE,
@@ -17,16 +18,21 @@ import {
   creationRefused,
   deleting,
   existingBranch,
+  layoutOf,
   nameProblem,
   placementOf,
   PROXY_SCOPE,
   type ReadyBranch,
   safekeepersNotified,
+  sameLayout,
+  type ShardLayout,
   tokenSha256,
   withNotifiedPlacement,
 } from "../neon/control/branches.ts";
-import { bearsScope, generateKeyPair, signToken } from "../neon/control/jwt.ts";
+import { bearsScope, computeCtlToken, generateKeyPair, signToken, verifyToken } from "../neon/control/jwt.ts";
 import { createControlMetrics } from "../neon/control/metrics.ts";
+import { containerRuns } from "../neon/control/computes.ts";
+import { type Reconfigured, reconfigure, type Reconfiguring, settledLayout, tookLayout } from "../neon/control/reconfigure.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 
 const MAIN_TIMELINE = "11111111111111111111111111111111";
@@ -237,7 +243,6 @@ describe("safekeepers notified", () => {
 /** What every compute's spec shares in these tests. */
 const stack: ComputeStack = {
   tenantId: "t",
-  pageserverHost: "pageserver",
   safekeepers: [1, 2, 3].map((id) => ({ id, host: `sk-${id - 1}`, pgPort: 5454, httpPort: 7676 })),
   verifiers: { alasio: "SCRAM-SHA-256$verifier" },
   monitor: { role: "neon_control", verifier: (id) => `SCRAM-SHA-256$monitor-${id}` },
@@ -245,9 +250,12 @@ const stack: ComputeStack = {
   jwks: { keys: [] },
 };
 
+/** One shard, on one pageserver. */
+const ONE_SHARD: ShardLayout = { pageservers: ["alasio-neon-pageserver.alasio.svc.cluster.local:6400"], stripeSize: null };
+
 test("a branch's compute spec is main's but for its timeline, its safekeepers and its roles' passwords", () => {
-  const ofMain = computeConfig(main, stack);
-  const ofDev = computeConfig({ ...dev, safekeepers: { generation: 2, ids: [2, 3] } }, stack);
+  const ofMain = computeConfig(main, stack, ONE_SHARD);
+  const ofDev = computeConfig({ ...dev, safekeepers: { generation: 2, ids: [2, 3] } }, stack, ONE_SHARD);
   assert.equal(ofDev.spec.timeline_id, DEV_TIMELINE);
   assert.deepEqual(ofDev.spec.safekeeper_connstrings, ["sk-1:5454", "sk-2:5454"]);
   assert.equal(ofDev.spec.safekeepers_generation, 2);
@@ -268,9 +276,148 @@ test("a branch's compute spec is main's but for its timeline, its safekeepers an
   ]);
 });
 
+test("a compute reads each shard from the pageserver the storage controller placed it on, in shard order, by the stripe", () => {
+  const one = computeConfig(main, stack, ONE_SHARD).spec;
+  assert.equal(one.pageserver_connstring, "postgresql://no_user@alasio-neon-pageserver.alasio.svc.cluster.local:6400");
+  assert.equal(one.shard_stripe_size, undefined, "one shard has no stripe");
+  const two = computeConfig(main, stack, { pageservers: ["ps-1:6400", "ps-0:6400"], stripeSize: 2048 }).spec;
+  assert.equal(two.pageserver_connstring, "postgresql://no_user@ps-1:6400,postgresql://no_user@ps-0:6400");
+  assert.equal(two.shard_stripe_size, 2048);
+  // The tenant's own id, never a shard's.
+  assert.equal(two.tenant_id, "t");
+});
+
+describe("shards notified", () => {
+  const body = { tenant_id: "t", preferred_az: "az-pageserver", stripe_size: 2048, shards: [{ node_id: 2, shard_number: 1 }, { node_id: 1, shard_number: 0 }] };
+
+  test("place each shard, in shard order, on a pageserver whose address the storage controller lists", () => {
+    const notified = attachNotified(body, "t");
+    assert.deepEqual(notified, { nodeIds: [1, 2], stripeSize: 2048 });
+    assert.deepEqual(layoutOf(notified, new Map([[1, "ps-0:6400"], [2, "ps-1:6400"]])), { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 });
+    assert.equal(layoutOf(notified, new Map([[1, "ps-0:6400"]])), null, "a pageserver not yet listed");
+    // One shard has no stripe, which the storage controller gives as null.
+    assert.deepEqual(attachNotified({ ...body, stripe_size: null, shards: [{ node_id: 1, shard_number: 0 }] }, "t"), { nodeIds: [1], stripeSize: null });
+  });
+
+  test("are refused when the notification is not one, or of another tenant", () => {
+    for (const malformed of [null, { ...body, shards: [] }, { ...body, shards: [{ node_id: "1", shard_number: 0 }] }, { ...body, shards: [{ node_id: 1, shard_number: 1 }] }, { ...body, stripe_size: "2048" }]) {
+      assert.equal(refusal(() => attachNotified(malformed, "t")), 400, JSON.stringify(malformed));
+    }
+    assert.equal(refusal(() => attachNotified(body, "another")), 400);
+  });
+
+  test("tell a layout from another by where each shard is, and the stripe", () => {
+    const two = { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 };
+    assert.ok(sameLayout(two, { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 }));
+    assert.ok(!sameLayout(two, { pageservers: ["ps-1:6400", "ps-0:6400"], stripeSize: 2048 }));
+    assert.ok(!sameLayout(two, { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 4096 }));
+    assert.ok(!sameLayout(two, { pageservers: ["ps-0:6400"], stripeSize: null }));
+  });
+});
+
+describe("a running compute given a new layout", () => {
+  const layout: ShardLayout = { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 };
+  /** A compute compute_ctl says is `status` of, answering `configured` to a spec, as `awake` says; what was done with it. */
+  const compute = ({ awake = true, running = true, configured = 200, status = "running" as string | null, failing = "" } = {}) => {
+    const done: string[] = [];
+    const through: Reconfiguring = {
+      awake: async () => awake,
+      running: async () => running,
+      configure: async () => {
+        done.push("configure");
+        if (failing === "configure") throw new Error("connect ECONNREFUSED");
+        return configured;
+      },
+      status: async () => {
+        done.push("status");
+        return status;
+      },
+      restart: async () => {
+        done.push("restart");
+        if (failing === "restart") throw new Error("restarting alasio-branch-dev/alasio-neon-compute: 403");
+      },
+      gave: async (given) => {
+        assert.deepEqual(given, layout);
+        done.push("gave");
+      },
+    };
+    return { done, through };
+  };
+  const given = async (options: Parameters<typeof compute>[0]): Promise<[Reconfigured, string[]]> => {
+    const { done, through } = compute(options);
+    return [await reconfigure(layout, through), done];
+  };
+
+  test("takes it live, and is recorded given it", async () => {
+    assert.deepEqual(await given({}), [{ outcome: "given" }, ["configure", "gave"]]);
+  });
+
+  test("is left asleep, as it fetches the layout when woken", async () => {
+    assert.deepEqual(await given({ awake: false }), [{ outcome: "asleep" }, []]);
+  });
+
+  test("is restarted while it starts on the spec it fetched, or has failed, as it never takes one then", async () => {
+    assert.deepEqual(await given({ configured: 412, status: "init" }), [{ outcome: "restarted" }, ["configure", "status", "restart"]]);
+    assert.deepEqual(await given({ configured: 412, status: "failed" }), [{ outcome: "restarted" }, ["configure", "status", "restart"]]);
+  });
+
+  test("is left alone while it configures or stops, or compute_ctl says nothing, as it may hold its clients' sessions", async () => {
+    for (const status of ["configuration_pending", "configuration", "termination_pending_fast", "running", null]) {
+      assert.deepEqual(await given({ configured: 412, status }), [{ outcome: "waiting", status }, ["configure", "status"]]);
+    }
+  });
+
+  test("takes it at its next start where no container of it runs, pulling its image or crashing", async () => {
+    assert.deepEqual(await given({ configured: 0, running: false }), [{ outcome: "starting" }, ["configure"]]);
+  });
+
+  test("is asked again later where compute_ctl is not reached, or refuses otherwise, and never fails the others", async () => {
+    assert.deepEqual(await given({ configured: 0 }), [{ outcome: "unreached", answered: 0 }, ["configure"]]);
+    assert.deepEqual(await given({ configured: 401 }), [{ outcome: "unreached", answered: 401 }, ["configure"]]);
+    assert.deepEqual(await given({ failing: "configure" }), [{ outcome: "failed", error: "connect ECONNREFUSED" }, ["configure"]]);
+    assert.deepEqual(await given({ configured: 412, status: "init", failing: "restart" }), [
+      { outcome: "failed", error: "restarting alasio-branch-dev/alasio-neon-compute: 403" },
+      ["configure", "status", "restart"],
+    ]);
+  });
+
+  test("has the layout once given it, or asleep; the storage controller notifies again otherwise", () => {
+    const outcomes: Reconfigured[] = [
+      { outcome: "given" },
+      { outcome: "asleep" },
+      { outcome: "starting" },
+      { outcome: "restarted" },
+      { outcome: "waiting", status: "configuration" },
+      { outcome: "unreached", answered: 0 },
+      { outcome: "failed", error: "" },
+    ];
+    assert.deepEqual(outcomes.map(tookLayout), [true, true, true, false, false, false, false]);
+  });
+});
+
+test("a compute's spec gives it the layout recorded once it is recorded given it, read again until it stays", async () => {
+  const one: ShardLayout = { pageservers: ["ps-0:6400"], stripeSize: null };
+  const two: ShardLayout = { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 };
+  // A notification records two as the compute's row is written with one.
+  const recorded = [one, two, two];
+  const given: ShardLayout[] = [];
+  const read = async () => recorded.shift() ?? two;
+  assert.deepEqual(await settledLayout(read, async (layout) => void given.push(layout)), two);
+  assert.deepEqual(given, [one, two], "the last recorded given is the one it runs on");
+  assert.deepEqual(await settledLayout(async () => one, async () => {}), one);
+});
+
+test("a compute's pod runs it while its container runs, and not once it is being deleted", () => {
+  const pod = (state: object, deleting = false) => ({ metadata: deleting ? { deletionTimestamp: "2026-10-14T00:00:00Z" } : {}, status: { containerStatuses: [{ name: "compute", state }] } });
+  assert.equal(containerRuns([pod({ running: { startedAt: "x" } })], "compute"), true);
+  assert.equal(containerRuns([pod({ waiting: { reason: "ImagePullBackOff" } })], "compute"), false);
+  assert.equal(containerRuns([pod({ waiting: { reason: "CrashLoopBackOff" } }), pod({ running: {} }, true)], "compute"), false);
+  assert.equal(containerRuns([], "compute"), false);
+});
+
 test("every compute checkpoints hourly, unless an hour's WAL comes to a gigabyte first", () => {
   for (const branch of [main, dev]) {
-    const settings = new Map(computeConfig(branch, stack).spec.cluster.settings.map(({ name, value }) => [name, value]));
+    const settings = new Map(computeConfig(branch, stack, ONE_SHARD).spec.cluster.settings.map(({ name, value }) => [name, value]));
     assert.deepEqual([settings.get("checkpoint_timeout"), settings.get("max_wal_size")], ["1h", "2GB"], branch.name);
   }
 });
@@ -284,6 +431,13 @@ test("neon-control takes a token of the admin scope only, not the tenant's every
   assert.ok(!bearsScope(publicKeyPem, bearer(signToken(generateKeyPair().privateKeyPem, "admin")), "admin"));
   assert.ok(!bearsScope(publicKeyPem, signToken(privateKeyPem, "admin"), "admin"));
   assert.ok(!bearsScope(publicKeyPem, undefined, "admin"));
+});
+
+test("compute_ctl's token names its compute alone, of no scope, so nothing else of Neon's takes it, and ends in five minutes", () => {
+  const { privateKeyPem, publicKeyPem } = generateKeyPair();
+  const token = computeCtlToken(privateKeyPem, "branch-dev", Date.UTC(2026, 9, 13, 12));
+  assert.deepEqual(verifyToken(publicKeyPem, token), { compute_id: "branch-dev", exp: Date.UTC(2026, 9, 13, 12, 5) / 1000 });
+  for (const scope of ["admin", "tenant", "proxy", BRANCHES_SCOPE]) assert.ok(!bearsScope(publicKeyPem, `Bearer ${token}`, scope), scope);
 });
 
 test("the lake's token of the branches scope lists the branches, and calls nothing else", () => {

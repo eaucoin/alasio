@@ -1,18 +1,20 @@
 /**
  * neon-control's record, in the storage controller's Postgres, in a schema of its own
  * (`neon_control`), so that it outlives any replica of neon-control and is shared by all
- * of them: a row of each branch, its name and its record as ./branches.ts has it; and a
- * row of each compute woken or put to sleep, and when.
+ * of them: a row of each branch, its name and its record as ./branches.ts has it; a row
+ * of each compute woken or put to sleep, and when; where the tenant's shards are, as the
+ * storage controller last said, which every compute's spec names; and of each compute,
+ * where its spec last said they were.
  *
  * What changes branches runs under one lock, a session's advisory lock on the database,
  * so two replicas never change them at once, nor repair a timeline whose deletion one of
  * them has begun: `changing` holds it for the whole of its work, and each `save` within
  * it is written at once, so a creation asked again after a failure, or of another
  * replica, finds what the first recorded. A compute is woken or put to sleep under a lock
- * of its own (`computeLocked`), so a wake never finds the pod a sleep is stopping. One
- * replica leads, running what must run once (./service.ts's loops): the one holding
- * another advisory lock, on a connection of its own, for as long as that connection
- * lives.
+ * of its own (`computeLocked`), so a wake never finds the pod a sleep is stopping, and the
+ * computes are given a new layout under another (`tryLayoutLocked`). One replica leads,
+ * running what must run once (./service.ts's loops): the one holding another advisory
+ * lock, on a connection of its own, for as long as that connection lives.
  *
  * Each lock is held on a connection of its own, made for it, and what only reads takes
  * none, on a pool of its own: so however many wait for a lock, reads go on. A lock is
@@ -25,13 +27,16 @@
  */
 import pg from "pg";
 
-import type { Branch } from "./branches.ts";
+import type { Branch, ShardLayout } from "./branches.ts";
 
 /** The advisory lock key of changes to the branches: `neon_ctl`, its bytes read as a number. */
 const CHANGE_LOCK = 0x6e65_6f6e_5f63_746cn;
 
 /** The advisory lock key of the replica that leads (./service.ts): `neon_ldr`, likewise. */
 const LEADER_LOCK = 0x6e65_6f6e_5f6c_6472n;
+
+/** The advisory lock key of giving computes the shards' layout (./service.ts's /notify-attach): `neon_lay`, likewise. */
+const LAYOUT_LOCK = 0x6e65_6f6e_5f6c_6179n;
 
 /** The first of the two keys of each compute's advisory lock, the second its id's hash: `neon`, its bytes read as a number. */
 const COMPUTE_LOCKS = 0x6e65_6f6e;
@@ -101,6 +106,8 @@ export class BranchRecord {
       await client.query("create schema if not exists neon_control");
       await client.query("create table if not exists neon_control.branches (name text primary key, branch jsonb not null)");
       await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz, suspended_at timestamptz)");
+      await client.query("create table if not exists neon_control.layout (tenant_id text primary key, layout jsonb not null)");
+      await client.query("create table if not exists neon_control.compute_layouts (id text primary key, layout jsonb not null)");
     });
   }
 
@@ -129,6 +136,15 @@ export class BranchRecord {
     return this.#trying([COMPUTE_LOCKS, id], () => work());
   }
 
+  /**
+   * Runs `work` holding the lock of the layout, if no other holds it now; null, without
+   * running it, if one does: so one replica at a time records the layout notified and gives
+   * it to the computes, and a notification taken by another meanwhile is asked again.
+   */
+  tryLayoutLocked<T>(work: () => Promise<T>): Promise<{ value: T } | null> {
+    return this.#trying(LAYOUT_LOCK, () => work());
+  }
+
   /** Records the compute `id` woken, or asked to be, now. */
   async woke(id: string): Promise<void> {
     await this.#pool.query(
@@ -143,6 +159,42 @@ export class BranchRecord {
       "insert into neon_control.computes (id, suspended_at) values ($1, now()) on conflict (id) do update set suspended_at = excluded.suspended_at",
       [id],
     );
+  }
+
+  /** Where the shards of the tenant `tenantId` are, as recorded; null before the first record of it. */
+  async layout(tenantId: string): Promise<ShardLayout | null> {
+    const { rows } = await this.#pool.query<{ layout: ShardLayout }>("select layout from neon_control.layout where tenant_id = $1", [tenantId]);
+    return rows[0]?.layout ?? null;
+  }
+
+  /** Records the shards of the tenant `tenantId` placed as `layout` says. */
+  async saveLayout(tenantId: string, layout: ShardLayout): Promise<void> {
+    await this.#pool.query(
+      "insert into neon_control.layout (tenant_id, layout) values ($1, $2) on conflict (tenant_id) do update set layout = excluded.layout",
+      [tenantId, JSON.stringify(layout)],
+    );
+  }
+
+  /** Records the shards of the tenant `tenantId` placed as `layout` says, where nothing of it is recorded yet. */
+  async seedLayout(tenantId: string, layout: ShardLayout): Promise<void> {
+    await this.#pool.query(
+      "insert into neon_control.layout (tenant_id, layout) values ($1, $2) on conflict (tenant_id) do nothing",
+      [tenantId, JSON.stringify(layout)],
+    );
+  }
+
+  /** Where the compute `id`'s spec, fetched or given anew, last said the shards were. */
+  async gaveLayout(id: string, layout: ShardLayout): Promise<void> {
+    await this.#pool.query(
+      "insert into neon_control.compute_layouts (id, layout) values ($1, $2) on conflict (id) do update set layout = excluded.layout",
+      [id, JSON.stringify(layout)],
+    );
+  }
+
+  /** Each compute's last given layout (gaveLayout), by its id. */
+  async givenLayouts(): Promise<Map<string, ShardLayout>> {
+    const { rows } = await this.#pool.query<{ id: string; layout: ShardLayout }>("select id, layout from neon_control.compute_layouts");
+    return new Map(rows.map(({ id, layout }) => [id, layout]));
   }
 
   /** Every compute recorded woken or put to sleep. */

@@ -322,6 +322,47 @@ export function withNotifiedPlacement(branches: readonly Branch[], { timelineId,
   return withBranch(branches, { ...branch, safekeepers: placement });
 }
 
+/** The tenant's shards as the storage controller notifies them (/notify-attach): each one's pageserver, by its node id, in shard order, and their stripe. */
+export interface AttachNotified {
+  nodeIds: number[];
+  stripeSize: number | null;
+}
+
+/**
+ * The notification `body` is, of the tenant `tenantId`'s shards, checked: `{ tenant_id,
+ * stripe_size, shards: [{ node_id, shard_number }] }`, its shards in any order.
+ */
+export function attachNotified(body: unknown, tenantId: string): AttachNotified {
+  const record = (value: unknown) => (typeof value === "object" && value !== null ? value as Record<string, unknown> : {});
+  const { tenant_id, stripe_size, shards } = record(body);
+  const placed = Array.isArray(shards) ? shards.map((shard: unknown) => record(shard)) : [];
+  const numbers = placed.map(({ shard_number }) => shard_number);
+  if (
+    typeof tenant_id !== "string" || (stripe_size !== null && typeof stripe_size !== "number") || placed.length === 0 ||
+    !placed.every(({ node_id, shard_number }) => typeof node_id === "number" && typeof shard_number === "number") ||
+    [...numbers].sort((a, b) => Number(a) - Number(b)).some((number, index) => number !== index)
+  ) {
+    throw new BranchError(400, "shards are notified as { tenant_id, stripe_size, shards: [{ node_id, shard_number }] }, numbered from 0");
+  }
+  if (tenant_id !== tenantId) throw new BranchError(400, `the shards of the tenant ${tenant_id} were notified, which is not alasio's`);
+  const ordered = [...placed].sort((a, b) => Number(a["shard_number"]) - Number(b["shard_number"]));
+  return { nodeIds: ordered.map(({ node_id }) => node_id as number), stripeSize: placed.length > 1 ? (stripe_size as number | null) : null };
+}
+
+/**
+ * The layout `notified` places the shards in, each pageserver's address `addresses` has by
+ * its node id; null where it names a node `addresses` has not, which the storage
+ * controller notifies again.
+ */
+export function layoutOf({ nodeIds, stripeSize }: AttachNotified, addresses: ReadonlyMap<number, string>): ShardLayout | null {
+  const pageservers = nodeIds.map((id) => addresses.get(id));
+  return pageservers.every((address): address is string => address !== undefined) ? { pageservers, stripeSize } : null;
+}
+
+/** Whether the layouts `a` and `b` place the shards alike. */
+export const sameLayout = (a: ShardLayout, b: ShardLayout): boolean =>
+  a.stripeSize === b.stripeSize && a.pageservers.length === b.pageservers.length && a.pageservers.every((pageserver, index) => pageserver === b.pageservers[index]);
+
 /** A safekeeper of the stack, by its id. */
 export interface Safekeeper {
   id: number;
@@ -333,7 +374,6 @@ export interface Safekeeper {
 /** What every compute's spec shares: the stack, and the role and database on every timeline. */
 export interface ComputeStack {
   tenantId: string;
-  pageserverHost: string;
   safekeepers: readonly Safekeeper[];
   /** The verifiers of the passwords of the roles main's clients connect as, by role: alasio's, which main's spec gives it, among them. */
   verifiers: Readonly<Record<string, string>> & { readonly alasio: string };
@@ -370,6 +410,8 @@ export interface ComputeSpec {
   timeline_id: string;
   mode: "Primary";
   pageserver_connstring: string;
+  /** The pages of each stripe a key's shard is chosen by, where the tenant has several shards. */
+  shard_stripe_size?: number;
   safekeepers_generation: number;
   safekeeper_connstrings: string[];
   storage_auth_token: string;
@@ -384,20 +426,34 @@ export interface ComputeConfig {
 /** The port every compute serves Postgres on. */
 export const COMPUTE_PORT = 55433;
 
+/** The port of compute_ctl's API, and its metrics, on every compute. */
+export const COMPUTE_CTL_PORT = 3080;
+
+/**
+ * Where the tenant's shards are, as the storage controller placed them: each shard's
+ * pageserver, `<host>:<port>` as computes reach it, in shard order, and the pages of each
+ * stripe, where there are several shards (null for one).
+ */
+export interface ShardLayout {
+  pageservers: string[];
+  stripeSize: number | null;
+}
+
 function setting(name: string, value: string | number, vartype: SettingType): ComputeSetting {
   return { name, value: String(value), vartype };
 }
 
 /**
- * The spec of `branch`'s compute: a primary on its timeline, at its safekeepers. The role
- * and database are main's, which every branch inherits with its data; the role's password
- * is the branch's own.
+ * The spec of `branch`'s compute: a primary on its timeline, at its safekeepers, reading
+ * each shard's pages from the pageserver `layout` places it on. The role and database are
+ * main's, which every branch inherits with its data; the role's password is the branch's
+ * own.
  *
  * Its storage token is the tenant's, as the pageserver and safekeepers take no narrower
  * one: a timeline is not a scope of theirs. A branch's compute could read main's timeline
  * with it, which only Neon's storage services take, and only from the stack's pods.
  */
-export function computeConfig(branch: ReadyBranch, stack: ComputeStack): ComputeConfig {
+export function computeConfig(branch: ReadyBranch, stack: ComputeStack, layout: ShardLayout): ComputeConfig {
   // The timeline was placed on safekeepers of the stack, so each id is one of theirs.
   const safekeeper = (id: number) => stack.safekeepers.find((sk) => sk.id === id)!;
   return {
@@ -446,7 +502,8 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack): Compute
       tenant_id: stack.tenantId,
       timeline_id: branch.timelineId,
       mode: "Primary",
-      pageserver_connstring: `postgresql://no_user@${stack.pageserverHost}:6400`,
+      pageserver_connstring: layout.pageservers.map((pageserver) => `postgresql://no_user@${pageserver}`).join(","),
+      ...(layout.stripeSize === null ? {} : { shard_stripe_size: layout.stripeSize }),
       safekeepers_generation: branch.safekeepers.generation,
       safekeeper_connstrings: branch.safekeepers.ids.map((id) => `${safekeeper(id).host}:${safekeeper(id).pgPort}`),
       storage_auth_token: stack.storageAuthToken,

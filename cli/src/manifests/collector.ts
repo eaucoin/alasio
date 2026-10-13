@@ -18,6 +18,7 @@
  */
 import type { KubernetesObject, V1ConfigMap, V1Deployment, V1Role, V1RoleBinding, V1Service, V1ServiceAccount } from "@kubernetes/client-node";
 
+import { COMPUTE_CTL_PORT } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   COLLECTOR_PORT,
@@ -105,7 +106,7 @@ function scrapes(config: InstallConfig): object[] {
     pageserver: [`${neonName("pageserver")}:9898`],
     "storage-controller": [`${neonName("storage-controller")}:1234`],
     "storage-broker": [`${neonName("storage-broker")}:50051`],
-    compute: [`${neonName("compute")}:3080`],
+    compute: [`${neonName("compute")}:${COMPUTE_CTL_PORT}`],
     proxy: [`${neonName("proxy")}:7001`],
     safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),

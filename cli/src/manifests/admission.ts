@@ -15,7 +15,10 @@
  *   ServiceAccount's token among them;
  * - a pod alasio patches changes its busy label and annotations alone (src/kube/busy.ts),
  *   and in alasio's own namespace is alasio's own: RBAC lets it patch its namespaces'
- *   pods whole, their images among it.
+ *   pods whole, their images among it;
+ * - a compute's Deployment neon-control patches changes its pod template's restartedAt
+ *   annotation alone, which restarts it (neon/control/computes.ts): RBAC lets it patch the
+ *   Deployment whole, its image and command among it.
  *
  * Where a policy holds an object to a rendered one, `pinned` makes the CEL that says so:
  * the object's fields are the rendered ones', key for key and item for item, but for what
@@ -53,7 +56,7 @@ import {
   tokenSecretName,
   WORKLOAD_LABEL,
 } from "../../../src/kube/sandbox-shape.ts";
-import { componentName, labels, NAMESPACE, RELEASE } from "./common.ts";
+import { componentName, labels, NAMESPACE, neonName, RELEASE } from "./common.ts";
 
 /** A field's test, beyond its being a rendered value: given the field's CEL expression and how deep it is, the CEL that holds where it passes. */
 class Check {
@@ -171,15 +174,17 @@ function admissionPolicy(
   return [policy, binding];
 }
 
+/** CEL that holds where the maps `variables.old<field>` and `variables.new<field>` differ in `keys` alone. */
+const unchanged = (field: string, keys: readonly string[]) =>
+  `variables.new${field}.all(key, key in ${JSON.stringify(keys)} || (key in variables.old${field} && variables.old${field}[key] == variables.new${field}[key])) && ` +
+  `variables.old${field}.all(key, key in ${JSON.stringify(keys)} || key in variables.new${field})`;
+
 /**
  * What alasio may change of a pod: its busy label and the annotations that go with it
  * (src/kube/busy.ts), and nothing else; and in its own namespace, of its own pod alone,
  * not the floor's beside it. Main's alasio's and each branch environment's.
  */
 export function busyLabelPolicy(): KubernetesObject[] {
-  const unchanged = (field: string, keys: readonly string[]) =>
-    `variables.new${field}.all(key, key in ${JSON.stringify(keys)} || (key in variables.old${field} && variables.old${field}[key] == variables.new${field}[key])) && ` +
-    `variables.old${field}.all(key, key in ${JSON.stringify(keys)} || key in variables.new${field})`;
   const component = "app.kubernetes.io/component";
   return admissionPolicy(componentName("busy-label"), [{ apiGroups: [""], resources: ["pods"], operations: ["UPDATE"] }], BY_ANY_ALASIO, [
     { expression: "object.spec == oldObject.spec", message: "alasio changes no pod's spec" },
@@ -200,6 +205,44 @@ export function busyLabelPolicy(): KubernetesObject[] {
     { name: "newLabels", expression: "object.metadata.?labels.orValue({})" },
     { name: "oldAnnotations", expression: "oldObject.metadata.?annotations.orValue({})" },
     { name: "newAnnotations", expression: "object.metadata.?annotations.orValue({})" },
+  ]);
+}
+
+/** The annotation of a pod template whose change restarts its pods, as `kubectl rollout restart` sets it. */
+const RESTARTED_AT = "kubectl.kubernetes.io/restartedAt";
+
+/** The fields of a Deployment's spec but its pod template. */
+const DEPLOYMENT_FIELDS = ["replicas", "selector", "strategy", "minReadySeconds", "revisionHistoryLimit", "paused", "progressDeadlineSeconds"];
+
+/**
+ * What neon-control may change of a Deployment, which RBAC lets it patch whole, of the
+ * computes alone (./neon.ts's computeScaling): its pod template's RESTARTED_AT, which
+ * restarts it (neon/control/computes.ts), and nothing else. Its scale it changes through
+ * the scale subresource, which this does not match.
+ */
+export function computeRestartPolicy(): KubernetesObject[] {
+  const same = (field: string) => `has(object.spec.${field}) == has(oldObject.spec.${field}) && (!has(object.spec.${field}) || object.spec.${field} == oldObject.spec.${field})`;
+  const account = `system:serviceaccount:${NAMESPACE}:${neonName("control")}`;
+  return admissionPolicy(componentName("compute-restarts"), [{ apiGroups: ["apps"], resources: ["deployments"], operations: ["UPDATE"] }], `request.userInfo.username == "${account}"`, [
+    { expression: "object.spec.template.spec == oldObject.spec.template.spec", message: "neon-control changes no compute's pod spec" },
+    { expression: DEPLOYMENT_FIELDS.map(same).join(" && "), message: "neon-control changes nothing of a compute's Deployment's spec but its pod template's annotation" },
+    {
+      expression: "object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) && " +
+        "object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) && " +
+        "object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) && " +
+        "object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])",
+      message: "neon-control changes no compute Deployment's labels, annotations, finalizers or owners",
+    },
+    {
+      expression: Object.entries({ labels: "{}", finalizers: "[]", ownerReferences: "[]", name: '""', generateName: '""' })
+        .map(([field, none]) => `object.spec.template.metadata.?${field}.orValue(${none}) == oldObject.spec.template.metadata.?${field}.orValue(${none})`)
+        .join(" && "),
+      message: "neon-control changes no label, finalizer, owner or name of a compute's pod template",
+    },
+    { expression: unchanged("Annotations", [RESTARTED_AT]), message: `neon-control changes no annotation of a compute's pod template but ${RESTARTED_AT}` },
+  ], [
+    { name: "oldAnnotations", expression: "oldObject.spec.template.metadata.?annotations.orValue({})" },
+    { name: "newAnnotations", expression: "object.spec.template.metadata.?annotations.orValue({})" },
   ]);
 }
 

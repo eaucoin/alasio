@@ -1,8 +1,9 @@
 /**
  * The computes, as neon-control wakes them and puts them to sleep: each the Deployment of
  * one replica, or none, that a branch environment's objects (or main's) run it as, which
- * neon-control scales through its scale subresource with its ServiceAccount's token, and
- * reaches at its Service, which takes connections before its pod is ready.
+ * neon-control scales through its scale subresource, and restarts when it must start on
+ * another spec, with its ServiceAccount's token, and reaches at its Service, which takes
+ * connections before its pod is ready.
  *
  * It logs in to each compute as a role of its own, which every compute's spec gives a
  * password of that compute's own (./branches.ts): so it logs in once compute_ctl has
@@ -23,9 +24,12 @@ import { request } from "node:https";
 
 import pg from "pg";
 
+import { COMPUTE_CTL_PORT, type ComputeConfig } from "./branches.ts";
 import { type Activity, SUSPEND_AFTER } from "./endpoints.ts";
 
 const SERVICE_ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
+/** The container of a compute's pod that runs compute_ctl, and Postgres under it. */
+const COMPUTE_CONTAINER = "compute";
 /** How long a call of the API server may take. */
 const KUBE_PATIENCE_MS = 10_000;
 
@@ -114,6 +118,30 @@ export async function computePods({ namespace }: ComputeRef, { selector }: Compu
 export const livePods = (items: readonly { status?: { phase?: string } }[]): number =>
   items.filter(({ status }) => status?.phase !== "Failed" && status?.phase !== "Succeeded").length;
 
+/** A pod as the API lists it, as far as whether its container runs is read. */
+interface ListedPod {
+  metadata?: { deletionTimestamp?: string };
+  status?: { containerStatuses?: { name: string; state?: { running?: object } }[] };
+}
+
+/** Whether any of `items`, not being deleted, runs its container `container`. */
+export const containerRuns = (items: readonly ListedPod[], container: string): boolean =>
+  items.some(({ metadata, status }) => !metadata?.deletionTimestamp && (status?.containerStatuses ?? []).some(({ name, state }) => name === container && state?.running !== undefined));
+
+/** Whether a pod of the compute's Deployment runs its compute's container, compute_ctl in it (containerRuns). */
+export async function computeRuns({ namespace }: ComputeRef, { selector }: ComputeDeployment): Promise<boolean> {
+  const { status, json } = await kube("GET", `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods?labelSelector=${encodeURIComponent(selector)}`);
+  if (status !== 200) throw new Error(`listing the pods of ${namespace}'s compute: ${status} ${JSON.stringify(json)}`);
+  return containerRuns((json["items"] as ListedPod[] | undefined) ?? [], COMPUTE_CONTAINER);
+}
+
+/** Restarts the compute, as `kubectl rollout restart` does: its pod made anew, which fetches its spec as it is now. */
+export async function restartCompute(ref: ComputeRef): Promise<void> {
+  const restartedAt = new Date().toISOString();
+  const { status, json } = await kube("PATCH", deploymentPath(ref), { spec: { template: { metadata: { annotations: { "kubectl.kubernetes.io/restartedAt": restartedAt } } } } });
+  if (status !== 200) throw new Error(`restarting ${ref.namespace}/${ref.name}: ${status} ${JSON.stringify(json)}`);
+}
+
 /** Scales the compute to `replicas`, 1 to wake it or 0 to put it to sleep. */
 export async function scaleCompute(ref: ComputeRef, replicas: 0 | 1): Promise<void> {
   const { status, json } = await kube("PATCH", `${deploymentPath(ref)}/scale`, { spec: { replicas } });
@@ -149,4 +177,46 @@ export async function computeActivity(host: string, port: number, role: string, 
   } finally {
     await client.end().catch(() => {});
   }
+}
+
+/**
+ * How long compute_ctl may take to apply a spec: a reload of its settings, and its roles
+ * and databases checked, which took about 120 ms in CI; one that takes longer is asked
+ * again with the storage controller's next notification, which waits 10 s for an answer
+ * (./service.ts's NOTIFY_PATIENCE_MS).
+ */
+const CONFIGURE_PATIENCE_MS = 4_000;
+/** How long compute_ctl may take to say how its compute is. */
+const STATUS_PATIENCE_MS = 2_000;
+
+/**
+ * Gives the compute at `host` the spec of `config` through compute_ctl's /configure, with
+ * `token` (computeCtlToken), which applies it live, a changed pageserver connstring by a
+ * reload: the status it answered, 200 once it has, 412 while the compute is not running
+ * (computeCtlStatus says how it is), or 0 where compute_ctl was not reached.
+ */
+export async function configureCompute(host: string, token: string, config: ComputeConfig): Promise<number> {
+  const response = await fetch(`http://${host}:${COMPUTE_CTL_PORT}/configure`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(config),
+    signal: AbortSignal.timeout(CONFIGURE_PATIENCE_MS),
+  }).catch(() => null);
+  await response?.body?.cancel();
+  return response?.status ?? 0;
+}
+
+/**
+ * How compute_ctl says the compute at `host` is (its /status, with `token`): `init` while
+ * it starts, `running`, `configuration` while it applies a spec, `failed`, and others
+ * (libs/compute_api/src/responses.rs at Neon's release-compute-9073); null where it was not
+ * reached, or did not say.
+ */
+export async function computeCtlStatus(host: string, token: string): Promise<string | null> {
+  const response = await fetch(`http://${host}:${COMPUTE_CTL_PORT}/status`, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(STATUS_PATIENCE_MS),
+  }).catch(() => null);
+  const body: unknown = response?.ok ? await response.json().catch(() => null) : null;
+  return typeof body === "object" && body !== null && "status" in body && typeof body.status === "string" ? body.status : null;
 }

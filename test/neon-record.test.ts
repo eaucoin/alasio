@@ -152,6 +152,42 @@ test("each lock is held on a connection of its own, so reads go on however many 
   }
 });
 
+test("records where the tenant's shards are, as last learned, by tenant, and where each compute's spec last said, and holds a lock of giving them", async () => {
+  const database = await startPostgres();
+  const record = new BranchRecord(database.url);
+  try {
+    await record.ensureSchema();
+    assert.equal(await record.layout("t"), null);
+    await record.seedLayout("t", { pageservers: ["ps-0:6400"], stripeSize: null });
+    await record.seedLayout("t", { pageservers: ["ps-9:6400"], stripeSize: null });
+    assert.deepEqual(await record.layout("t"), { pageservers: ["ps-0:6400"], stripeSize: null }, "seeded once, where nothing was recorded");
+    await record.saveLayout("t", { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 });
+    assert.deepEqual(await record.layout("t"), { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 });
+    assert.equal(await record.layout("other"), null);
+    // Each compute's, as its spec last said.
+    assert.deepEqual(await record.givenLayouts(), new Map());
+    await record.gaveLayout("alasio", { pageservers: ["ps-0:6400"], stripeSize: null });
+    await record.gaveLayout("alasio", { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 });
+    await record.gaveLayout("branch-dev", { pageservers: ["ps-0:6400"], stripeSize: null });
+    assert.deepEqual(await record.givenLayouts(), new Map([["alasio", { pageservers: ["ps-0:6400", "ps-1:6400"], stripeSize: 2048 }], ["branch-dev", { pageservers: ["ps-0:6400"], stripeSize: null }]]));
+
+    // One replica at a time gives the computes a layout; another, meanwhile, does not wait.
+    const other = new BranchRecord(database.url);
+    let release = () => {};
+    const giving = record.tryLayoutLocked(() => new Promise<string>((resolve) => (release = () => resolve("given"))));
+    await sleep(200);
+    assert.equal(await other.tryLayoutLocked(async () => "given"), null);
+    assert.deepEqual(await other.tryChanging(async () => "changed"), { value: "changed" }, "the layout's lock is its own");
+    release();
+    assert.deepEqual(await giving, { value: "given" });
+    assert.deepEqual(await other.tryLayoutLocked(async () => "given"), { value: "given" });
+    await other.end();
+  } finally {
+    await record.end();
+    await database.stop();
+  }
+});
+
 test("records when each compute was asked to wake, and put to sleep", async () => {
   const database = await startPostgres();
   const record = new BranchRecord(database.url);

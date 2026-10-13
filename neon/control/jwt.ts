@@ -37,16 +37,33 @@ export function generateKeyPair(): KeyPair {
   return { privateKeyPem: privateKey, publicKeyPem: publicKey };
 }
 
+/** A token of `claims`, signed with `privateKeyPem`. */
+function signClaims(privateKeyPem: string, claims: object): string {
+  const unsigned = `${HEADER}.${base64url(JSON.stringify(claims))}`;
+  const signature = sign(null, Buffer.from(unsigned), createPrivateKey(privateKeyPem));
+  return `${unsigned}.${signature.toString("base64url")}`;
+}
+
 /**
  * A token for `scope` (tenant, pageserverapi, safekeeperdata,
  * generations_api, admin, infra, ...), limited to `tenantId` if given.
  */
 export function signToken(privateKeyPem: string, scope: string, tenantId: string | null = null): string {
   const claims: TokenClaims = tenantId ? { scope, tenant_id: tenantId } : { scope };
-  const unsigned = `${HEADER}.${base64url(JSON.stringify(claims))}`;
-  const signature = sign(null, Buffer.from(unsigned), createPrivateKey(privateKeyPem));
-  return `${unsigned}.${signature.toString("base64url")}`;
+  return signClaims(privateKeyPem, claims);
 }
+
+/** How long a token for compute_ctl's API lasts: the calls it is made for. */
+const COMPUTE_CTL_TOKEN_SECONDS = 300;
+
+/**
+ * A token for compute_ctl's API on the compute `computeId` alone, as its middleware takes
+ * one (compute_tools/src/http/middleware/authorize.rs at Neon's release-compute-9073):
+ * of no scope, naming the compute, verified with the key set its spec gave it, and good for
+ * the calls it is made for alone. No other service takes it, as it bears no scope.
+ */
+export const computeCtlToken = (privateKeyPem: string, computeId: string, now = Date.now()): string =>
+  signClaims(privateKeyPem, { compute_id: computeId, exp: Math.floor(now / 1000) + COMPUTE_CTL_TOKEN_SECONDS });
 
 /** The claims of `token` if `publicKeyPem` signed it, else null. */
 export function verifyToken(publicKeyPem: string, token: string): TokenClaims | null {

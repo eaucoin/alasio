@@ -10,8 +10,13 @@
  * and its timeline, the branch `main`, once, and configures the tenant to keep
  * a day of history (HISTORY_DAYS). It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
- * compute its spec, answers the storage controller's compute hooks, and reports
- * healthy once main's compute can start. It is the control plane of Neon's proxy
+ * compute its spec, and reports healthy once main's compute can start. Each spec names
+ * the pageserver of each of the tenant's shards (ShardLayout), as the storage controller
+ * last notified them, as recorded, which any replica may have recorded: on a notification
+ * (/notify-attach), after a split, a migration or a pageserver lost, one replica at a time
+ * gives every running compute its spec anew (./reconfigure.ts), through compute_ctl's
+ * /configure, which reloads it live, and answers 423 while any did not take it, which the
+ * storage controller notifies again. It is the control plane of Neon's proxy
  * (./endpoints.ts), which every client connects through: it answers the proxy for
  * roles' secrets, main's from the stack's secrets alone and a branch's from the record,
  * or as last read while the record cannot be, and wakes a compute that sleeps; it serves
@@ -65,7 +70,7 @@
  * safekeepers?, computeId }`, its state `creating`, `ready` or `deleting`.
  *
  * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
- * the order of their ids, comma-separated; NEON_PAGESERVER_HOST; NEON_CONTROLLER_DB_HOST,
+ * the order of their ids, comma-separated; NEON_CONTROLLER_DB_HOST,
  * the storage controller's Postgres, which its record is in; NAMESPACE, its own, main's
  * compute's; and NEON_COMPUTE_NAME, the name of every compute's Deployment and Service,
  * in main's namespace or a branch environment's. Mounts: /secrets (secrets.json, the
@@ -78,6 +83,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { branchNamespace } from "../../src/branch/names.ts";
 
 import {
+  attachNotified,
   type Branch,
   BranchError,
   branchNamed,
@@ -96,21 +102,36 @@ import {
   deleting,
   existingBranch,
   HISTORY_DAYS,
+  layoutOf,
   MAIN,
   placementOf,
   PROXY_PATHS,
   type ReadyBranch,
   type Safekeeper,
   safekeepersNotified,
+  sameLayout,
+  type ShardLayout,
   type TimelineCreated,
   withBranch,
   withNotifiedPlacement,
   withoutBranch,
 } from "./branches.ts";
-import { type ComputeDeployment, computePods, type ComputeRef, computeActivity, computeDeployment, scaleCompute } from "./computes.ts";
+import {
+  type ComputeDeployment,
+  computeActivity,
+  computeDeployment,
+  computePods,
+  type ComputeRef,
+  computeCtlStatus,
+  computeRuns,
+  configureCompute,
+  restartCompute,
+  scaleCompute,
+} from "./computes.ts";
 import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
-import { bearsScope, publicJwks, signToken } from "./jwt.ts";
+import { bearsScope, computeCtlToken, publicJwks, signToken } from "./jwt.ts";
 import { createControlMetrics } from "./metrics.ts";
+import { reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { scramVerifier } from "./scram.ts";
 import { MONITOR_ROLE, type StackSecrets } from "./secrets.ts";
@@ -132,7 +153,16 @@ interface JsonResponse<Body> {
 /** A pageserver as the storage controller lists it. */
 interface StorageNode {
   id: number;
-  availability: unknown;
+  /** Active, WarmingUp or Offline. */
+  availability: string;
+  listen_pg_addr: string;
+  listen_pg_port: number;
+}
+
+/** Where the tenant's shards are, as the storage controller's locate answers. */
+interface Located {
+  shards: { shard_id: string; node_id: number; listen_pg_addr: string; listen_pg_port: number }[];
+  shard_params: { count: number; stripe_size: number };
 }
 
 /** A timeline as the pageserver describes it, as far as neon-control reads it. */
@@ -156,7 +186,6 @@ const CONTROLLER_URL = setting("CONTROLLER_URL");
 const PG_VERSION = 17;
 const SAFEKEEPER_HOSTS = setting("NEON_SAFEKEEPER_HOSTS").split(",").map((host) => host.trim()).filter(Boolean);
 const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
-const PAGESERVER_HOST = setting("NEON_PAGESERVER_HOST");
 const CONTROLLER_DB_HOST = setting("NEON_CONTROLLER_DB_HOST");
 const NAMESPACE = setting("NAMESPACE");
 const COMPUTE_NAME = setting("NEON_COMPUTE_NAME");
@@ -178,6 +207,12 @@ const SUSPEND_PATIENCE_MS = 120_000;
 const POLL_MS = 250;
 /** How long a call of the storage controller may take: longer than its own waits for the pageserver. */
 const CONTROLLER_PATIENCE_MS = 120_000;
+/**
+ * How long a notification of the shards' layout is answered within: before the storage
+ * controller stops waiting for it, at 10 s (storage_controller/src/compute_hook.rs's
+ * NOTIFY_REQUEST_TIMEOUT at release-9129), with a 423 if the computes are not given it yet.
+ */
+const NOTIFY_PATIENCE_MS = 8_000;
 /** How long a call of a safekeeper may take. */
 const SAFEKEEPER_PATIENCE_MS = 30_000;
 
@@ -187,7 +222,6 @@ const monitorPassword = (id: string) => createHmac("sha256", secrets.monitorKey)
 /** What every branch's compute spec shares. */
 const stack: ComputeStack = {
   tenantId: secrets.tenantId,
-  pageserverHost: PAGESERVER_HOST,
   safekeepers: SAFEKEEPERS,
   // Main's clients' roles': the verifiers alasio sets them to (src/neon/), and main's spec alasio's.
   verifiers: secrets.verifiers,
@@ -445,10 +479,12 @@ async function repairEverySafekeeper(branches: readonly Branch[]): Promise<void>
 /** The compute of the branch `name`: main's in neon-control's namespace, any other's in its branch environment's. */
 const computeOf = (name: string): ComputeRef => ({ namespace: name === MAIN ? NAMESPACE : branchNamespace(name), name: COMPUTE_NAME });
 
+/** Where the branch `name`'s compute's Service is, from any namespace. */
+const hostOf = (name: string): string => `${COMPUTE_NAME}.${computeOf(name).namespace}.svc.cluster.local`;
+
 /** What the clients of the branch `name`'s compute are doing, counted as neon-control's own role there (./computes.ts); fails while it cannot log in. */
 function activityOn(name: string): Promise<Activity> {
-  const { namespace } = computeOf(name);
-  return computeActivity(`${COMPUTE_NAME}.${namespace}.svc.cluster.local`, COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
+  return computeActivity(hostOf(name), COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
 }
 
 /** Waits until the compute has no pod, one stopping included, by `deadline`. */
@@ -622,6 +658,47 @@ async function knownBranches(): Promise<Branch[]> {
   return lastRead;
 }
 
+/** A pageserver's address, as computes reach it from any namespace: its Service's name, qualified. */
+const pageserverAddress = (host: string, port: number): string => `${host.includes(".") ? host : `${host}.${NAMESPACE}.svc.cluster.local`}:${port}`;
+
+/** Where the tenant's shards are, as the storage controller locates them now. */
+async function located(): Promise<Located> {
+  return (await controller<Located>("GET", `/debug/v1/tenant/${secrets.tenantId}/locate`)).body!;
+}
+
+/** The layout of the shards as `answered` locates them. */
+function layoutLocated(answered: Located): ShardLayout {
+  const pageservers = answered.shards.map(({ listen_pg_addr, listen_pg_port }) => pageserverAddress(listen_pg_addr, listen_pg_port));
+  return { pageservers, stripeSize: pageservers.length > 1 ? answered.shard_params.stripe_size : null };
+}
+
+/** Where the tenant's shards are, as last read from the record, or recorded. */
+let lastLayout: ShardLayout | null = null;
+
+/**
+ * Where the tenant's shards are, as recorded now, which any replica may have recorded last
+ * (/notify-attach); while the record cannot be read, as last read, as knownBranches answers.
+ */
+async function currentLayout(): Promise<ShardLayout> {
+  if (lastLayout !== null && Date.now() < unreadUntil) return lastLayout;
+  try {
+    const recorded = await record.layout(secrets.tenantId);
+    if (recorded === null) throw new Error("the record has no layout of the tenant's shards");
+    lastLayout = recorded;
+  } catch (error) {
+    if (lastLayout === null) throw error;
+    unreadUntil = Date.now() + UNREAD_PAUSE_MS;
+    log("the record was not read; answering from the last read", { error: errorText(error) });
+  }
+  return lastLayout;
+}
+
+/** Records where the tenant's shards are now. */
+async function learnLayout(next: ShardLayout): Promise<void> {
+  await record.saveLayout(secrets.tenantId, next);
+  lastLayout = next;
+}
+
 async function bootstrap(): Promise<void> {
   await until("the storage controller", async () => (await controller("GET", "/status")).status === 200);
   await record.ensureSchema();
@@ -632,6 +709,8 @@ async function bootstrap(): Promise<void> {
     return nodes.some((node) => node.id === 1 && node.availability === "Active");
   });
   await ensureTenant();
+  // Where the shards are, recorded once: from then on as notified, under the layout's lock.
+  await record.seedLayout(secrets.tenantId, layoutLocated(await located()));
   await record.changing(ensureMain);
   lastRead = await record.branches();
   ready = true;
@@ -639,6 +718,37 @@ async function bootstrap(): Promise<void> {
   const round = () => lead().catch((error: unknown) => log("leading failed", { error: errorText(error) }));
   void round();
   setInterval(() => void round(), LEAD_INTERVAL_MS).unref();
+}
+
+/**
+ * Gives every compute last given another layout than `layout` its spec anew, with it, all
+ * at once, each as ./reconfigure.ts decides: how many have not taken it yet.
+ */
+async function configureRunning(branches: readonly Branch[], layout: ShardLayout): Promise<number> {
+  const given = await record.givenLayouts();
+  const stale = branches.filter((branch): branch is ReadyBranch => {
+    const had = given.get(computeId(branch.name));
+    return branch.state === "ready" && !(had && sameLayout(had, layout));
+  });
+  const outcomes = await Promise.all(stale.map(async (branch) => {
+    const id = computeId(branch.name);
+    const ref = computeOf(branch.name);
+    const token = computeCtlToken(privateKeyPem, id);
+    const reconfigured = await reconfigure(layout, {
+      awake: async () => (await computeDeployment(ref))?.replicas === 1,
+      running: async () => {
+        const deployment = await computeDeployment(ref);
+        return deployment !== null && await computeRuns(ref, deployment);
+      },
+      configure: (to) => configureCompute(hostOf(branch.name), token, computeConfig(branch, stack, to)),
+      status: () => computeCtlStatus(hostOf(branch.name), token),
+      restart: () => restartCompute(ref),
+      gave: (to) => record.gaveLayout(id, to),
+    });
+    if (!tookLayout(reconfigured)) log("compute not given the layout yet", { compute: id, ...reconfigured });
+    return reconfigured;
+  }));
+  return outcomes.filter((reconfigured) => !tookLayout(reconfigured)).length;
 }
 
 /** Whether the request bears a token of a scope its call is taken with (callScopes). */
@@ -732,7 +842,14 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     if (holder !== id) return answer(response, 403, { error: `the token is not the compute ${id}'s` });
     const branch = branchOfCompute(branches, id);
     if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
-    return answer(response, 200, { ...computeConfig(branch, stack), status: "attached" });
+    // Where its spec says the shards are, recorded for a new layout's (configureRunning) before
+    // it is answered, and read again after, so one notified meanwhile is in this spec or in
+    // the record of it; if the record can be written.
+    const layout = await settledLayout(currentLayout, (given) => record.gaveLayout(id, given)).catch(async (error: unknown) => {
+      log("layout given not recorded", { compute: id, error: errorText(error) });
+      return currentLayout();
+    });
+    return answer(response, 200, { ...computeConfig(branch, stack, layout), status: "attached" });
   }
   const path = new URL(url, "http://neon-control").pathname;
   const proxied = method === "GET" && PROXY_PATHS.includes(path);
@@ -758,10 +875,29 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   if (url === "/computes") return answer(response, 200, await computesView());
   if (url === "/notify-attach") {
-    // Every compute reaches the stack's one pageserver by its Service, whichever of
-    // its nodes the tenant is attached to: an attach changes no branch's spec.
-    log("compute hook /notify-attach", { body: JSON.stringify(await jsonBody(request)).slice(0, 2000) });
-    return answer(response, 200);
+    // The shards placed anew, after a split, a migration or a pageserver lost: every spec
+    // names their pageservers from now on, and every running compute is given its own, by
+    // one replica at a time, so two notifications never restart the same compute twice.
+    const notified = attachNotified(await jsonBody(request), secrets.tenantId);
+    const nodes = (await controller<StorageNode[]>("GET", "/control/v1/node")).body ?? [];
+    const next = layoutOf(notified, new Map(nodes.map(({ id, listen_pg_addr, listen_pg_port }) => [id, pageserverAddress(listen_pg_addr, listen_pg_port)])));
+    if (!next) return answer(response, 423, { error: "a shard is on a pageserver not yet listed; notify again" });
+    const giving = record.tryLayoutLocked(async () => {
+      await learnLayout(next);
+      return configureRunning(await record.branches(), next);
+    });
+    // Answered before the storage controller gives up waiting; the computes are given it all the same.
+    const given = await Promise.race([giving, sleep(NOTIFY_PATIENCE_MS).then(() => "late" as const)]);
+    if (given === "late") {
+      giving.then(
+        (done) => log("compute hook /notify-attach, answered before done", { pageservers: next.pageservers, pending: done?.value ?? null }),
+        (error: unknown) => log("compute hook /notify-attach failed, answered before done", { error: errorText(error) }),
+      );
+      return answer(response, 423, { error: "the computes are being given the new layout; notify again" });
+    }
+    if (given === null) return answer(response, 423, { error: "another replica of neon-control is giving the computes a layout; notify again" });
+    log("compute hook /notify-attach", { pageservers: next.pageservers, stripeSize: next.stripeSize, pending: given.value });
+    return given.value === 0 ? answer(response, 200) : answer(response, 423, { error: `${given.value} computes did not take the new layout yet; notify again` });
   }
   if (url === "/notify-safekeepers") {
     // A timeline's safekeepers migrated, which alasio never starts itself: the branch's

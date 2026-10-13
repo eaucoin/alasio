@@ -7,7 +7,7 @@
  */
 import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
-import { COMPUTE_PORT } from "../../../neon/control/branches.ts";
+import { COMPUTE_CTL_PORT, COMPUTE_PORT } from "../../../neon/control/branches.ts";
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
@@ -124,7 +124,8 @@ const ofMain = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector:
 /**
  * Neon's services, the lake and their jobs reach each other, but the compute, which
  * takes its clients' sessions from main's Neon proxy alone, which every client connects
- * through, neon-control's, which wakes it and counts its sessions, and the collector's
+ * through, and neon-control's, which wakes it and counts its sessions, and on
+ * compute_ctl's port neon-control's, which gives it its spec anew, and the collector's
  * scrapes of compute_ctl's metrics. In a branch environment, its lake and compute
  * likewise, but for the scrapes, as the collector scrapes main's compute alone. The object
  * store's parts, of the stack too, are reached as partPolicies and gatewayPolicy say alone.
@@ -141,8 +142,9 @@ function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
       policyTypes: ["Ingress"],
       ingress: [
         { from: [ofMain("neon-proxy"), ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
+        { from: [ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] },
         // The collector scrapes main's compute_ctl alone (collector.ts).
-        ...(namespace === NAMESPACE ? [{ from: [ofMain("collector")], ports: [{ protocol: "TCP", port: 3080 }] }] : []),
+        ...(namespace === NAMESPACE ? [{ from: [ofMain("collector")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] }] : []),
       ],
     }),
   ];

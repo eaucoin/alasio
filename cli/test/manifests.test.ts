@@ -479,7 +479,7 @@ describe("neon", () => {
     const env = Object.fromEntries((container(control).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual([env["NEON_CONTROLLER_DB_HOST"], env["NEON_COMPUTE_NAME"], env["NAMESPACE"]], ["alasio-neon-controller-db", "alasio-neon-compute", { fieldRef: { fieldPath: "metadata.namespace" } }]);
     assert.deepEqual(one<V1Role>(objects, "Role", "alasio-neon-control").rules, [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get", "patch"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
@@ -2082,7 +2082,7 @@ describe("branch environments", () => {
     assert.deepEqual([variable(lake, "LAKE_DATABASE_HOST"), variable(lake, "LAKE_DATABASE_PORT"), variable(lake, "LAKE_DATABASE_ENDPOINT")], ["alasio-neon-proxy.alasio.svc", "5432", "branch-try"]);
     assert.equal(compute.spec?.replicas, undefined);
     assert.deepEqual(of<V1Role>("Role", "alasio-neon-control").rules, [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get", "patch"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
@@ -2090,7 +2090,6 @@ describe("branch environments", () => {
     assert.equal(variable(lake, "LAKE_S3_ENDPOINT"), "http://alasio-seaweedfs.alasio.svc:8333");
     const main = install();
     assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio-neon-compute")).args?.at(-3), "alasio");
-    assert.equal(variable(one<V1Deployment>(main, "Deployment", "alasio-neon-control"), "NEON_PAGESERVER_HOST"), "alasio-neon-pageserver.alasio.svc");
   });
 
   test("confine the branch's sessions to its alasio, and have a policy of its compute's", () => {
@@ -2160,6 +2159,9 @@ describe("branch environments", () => {
     for (const [name, compute] of computes) {
       assert.ok(admits(policies, proxy, compute, 55433), `the proxy → ${name}`);
       assert.ok(admits(policies, control, compute, 55433), `neon-control → ${name}`);
+      // compute_ctl's port, where neon-control gives a running compute its spec anew.
+      assert.ok(admits(policies, control, compute, 3080), `neon-control → ${name}'s compute_ctl`);
+      assert.ok(!admits(policies, proxy, compute, 3080), `the proxy → ${name}'s compute_ctl`);
     }
     const collector = podOf(main, "alasio-collector", "alasio");
     assert.deepEqual(computes.filter(([, compute]) => admits(policies, collector, compute, 3080)).map(([name]) => name), ["main's compute"]);
@@ -2348,6 +2350,30 @@ describe("scaling", () => {
     assert.deepEqual(one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", "alasio-busy-label").spec, { policyName: "alasio-busy-label", validationActions: ["Deny"] });
     // The cluster's, made with main's alone; a branch makes its Sandboxes' alone.
     assert.deepEqual(all(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy").map(({ metadata }) => metadata?.name), ["alasio-branch-try-sandboxes"]);
+  });
+
+  test("lets neon-control change no more of a compute's Deployment than its pod template's restartedAt, which restarts it", () => {
+    type Policy = KubernetesObject & {
+      spec: { matchConstraints: { resourceRules: object[] }; matchConditions: { expression: string }[]; validations: { expression: string }[]; variables: { name: string; expression: string }[] };
+    };
+    const policy = one<Policy>(install(), "ValidatingAdmissionPolicy", "alasio-compute-restarts");
+    assert.deepEqual(policy.spec.matchConstraints.resourceRules, [{ apiGroups: ["apps"], resources: ["deployments"], operations: ["UPDATE"], apiVersions: ["*"] }]);
+    assert.deepEqual(policy.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio-neon-control"']);
+    const [pod, spec, metadata, labelled, annotated] = policy.spec.validations.map(({ expression }) => expression);
+    assert.equal(pod, "object.spec.template.spec == oldObject.spec.template.spec");
+    for (const field of ["replicas", "selector", "strategy", "minReadySeconds", "revisionHistoryLimit", "paused", "progressDeadlineSeconds"]) {
+      assert.ok(spec?.includes(`(!has(object.spec.${field}) || object.spec.${field} == oldObject.spec.${field})`), field);
+    }
+    assert.ok(metadata?.includes("object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({})"));
+    for (const [field, none] of [["labels", "{}"], ["finalizers", "[]"], ["ownerReferences", "[]"], ["name", '""'], ["generateName", '""']]) {
+      assert.ok(labelled?.includes(`object.spec.template.metadata.?${field}.orValue(${none}) == oldObject.spec.template.metadata.?${field}.orValue(${none})`), field);
+    }
+    assert.ok(annotated?.includes('key in ["kubectl.kubernetes.io/restartedAt"]'));
+    assert.deepEqual(policy.spec.variables.map(({ expression }) => expression), [
+      "oldObject.spec.template.metadata.?annotations.orValue({})",
+      "object.spec.template.metadata.?annotations.orValue({})",
+    ]);
+    assert.deepEqual(all(install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false } }), "ValidatingAdmissionPolicy").filter(({ metadata }) => metadata?.name === "alasio-compute-restarts"), []);
   });
 
   test("keeps room for a node autoscaler only when asked: placeholders at the lowest priority, which preempt nothing", () => {

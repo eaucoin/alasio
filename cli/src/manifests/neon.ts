@@ -20,10 +20,11 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
+import { COMPUTE_CTL_PORT, COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
 import { SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
 import { DATABASE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
+import { computeRestartPolicy } from "./admission.ts";
 import {
   claimSpec,
   collectorRuns,
@@ -451,9 +452,11 @@ export const PROXY_PORT = 5432;
 
 /**
  * What neon-control may do to the compute of `namespace`, main's or a branch
- * environment's: read its Deployment, and scale it, waking it and putting it to sleep, and
- * list its pods, to see one put to sleep gone before it wakes it; a Role there, bound to
- * neon-control's ServiceAccount in main's.
+ * environment's: read its Deployment, and restart it, to start on a spec anew, and scale
+ * it, waking it and putting it to sleep, and list its pods, to see one put to sleep gone
+ * before it wakes it; a Role there, bound to neon-control's ServiceAccount in main's. Of a
+ * Deployment it patches, it may change the restart's annotation alone (./admission.ts's
+ * computeRestartPolicy).
  */
 export function computeScaling(namespace: string): KubernetesObject[] {
   const name = neonName("control");
@@ -463,7 +466,7 @@ export function computeScaling(namespace: string): KubernetesObject[] {
     kind: "Role",
     metadata,
     rules: [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute")], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute")], verbs: ["get", "patch"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute")], verbs: ["patch"] },
       // A list is of a namespace's pods, as no name narrows it.
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
@@ -518,8 +521,6 @@ function control(config: InstallConfig): KubernetesObject[] {
             env: [
               { name: "CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
               { name: "NEON_SAFEKEEPER_HOSTS", value: safekeeperHosts.join(",") },
-              // As every compute reaches it, a branch environment's in its own namespace too.
-              { name: "NEON_PAGESERVER_HOST", value: `${neonName("pageserver")}.${NAMESPACE}.svc` },
               { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
               { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
               { name: "NEON_COMPUTE_NAME", value: neonName("compute") },
@@ -552,6 +553,7 @@ function control(config: InstallConfig): KubernetesObject[] {
     service(name, component, [{ name: "http", port: 8080 }]),
     serviceAccount,
     ...computeScaling(NAMESPACE),
+    ...computeRestartPolicy(),
     deployment,
     ...replicaBudget(component, NAMESPACE, scaling),
     verticalPodAutoscaler(deployment, "Recommended"),
@@ -685,7 +687,7 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
                 ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config, environment)]
                 : [{ name: "OTEL_SDK_DISABLED", value: "true" }]),
             ],
-            ports: [{ name: "postgres", containerPort: COMPUTE_PORT }, { name: "http", containerPort: 3080 }],
+            ports: [{ name: "postgres", containerPort: COMPUTE_PORT }, { name: "http", containerPort: COMPUTE_CTL_PORT }],
             readinessProbe: { exec: { command: ["pg_isready", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "postgres"] }, periodSeconds: 5 },
             securityContext: restrictedContainer(),
             resources,
@@ -700,7 +702,7 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
     apiVersion: "v1",
     kind: "Service",
     metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
-    spec: { selector: selectorLabels(component), publishNotReadyAddresses: true, ports: [{ name: "postgres", port: COMPUTE_PORT }, { name: "http", port: 3080 }] },
+    spec: { selector: selectorLabels(component), publishNotReadyAddresses: true, ports: [{ name: "postgres", port: COMPUTE_PORT }, { name: "http", port: COMPUTE_CTL_PORT }] },
   };
   return [service, deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }
