@@ -43,9 +43,9 @@ const BAYMA: BaymaEndpoint = { url: "http://fs-abc123.alasio-sessions.svc.cluste
 test("volume ids are DNS labels, as the names of their Sandboxes must be", () => {
   assert.equal(isValidVolumeId("fs-1a2b3c4d5e"), true);
   assert.equal(isValidVolumeId("abc"), true);
-  assert.equal(isValidVolumeId(`${"a".repeat(63)}`), true);
+  assert.equal(isValidVolumeId(`${"a".repeat(58)}`), true);
   assert.equal(isValidVolumeId("ab"), false); // too short
-  assert.equal(isValidVolumeId(`${"a".repeat(64)}`), false); // too long
+  assert.equal(isValidVolumeId(`${"a".repeat(59)}`), false); // too long for its claims' names
   assert.equal(isValidVolumeId("has_underscore"), false);
   assert.equal(isValidVolumeId("has.dot"), false);
   assert.equal(isValidVolumeId("fs-Foo1"), false); // no uppercase

@@ -276,7 +276,10 @@ test("the deployment's templates are checked as alasio starts", async () => {
   assert.equal(failure({ sessions: 5 }), "ALASIO_KUBE_TEMPLATES sessions must be an object");
   const clone = { claimTemplate: "data", job: { kind: "Job" } };
   assert.deepEqual(Result.getOrThrow(load({ sessions: { ...profile(), clone } })).sessions?.clone, clone);
-  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "" } } }), "ALASIO_KUBE_TEMPLATES sessions.clone.claimTemplate must be a claim template's name");
+  const shortName = "ALASIO_KUBE_TEMPLATES sessions.clone.claimTemplate must be a claim template's name, a DNS label of at most 4 characters";
+  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "" } } }), shortName);
+  // Its claims, `<template>-<volume id>`, would be longer than a DNS label.
+  assert.equal(failure({ sessions: { ...profile(), clone: { ...clone, claimTemplate: "volume" } } }), shortName);
   assert.equal(failure({ sessions: { ...profile(), clone: { claimTemplate: "data" } } }), "ALASIO_KUBE_TEMPLATES sessions.clone.job must be an object");
 
   const loading = (env: Record<string, string>) =>

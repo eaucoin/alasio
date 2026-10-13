@@ -7,12 +7,23 @@
 import { Schema } from "effect";
 
 /**
- * A volume id is a DNS label of 3–63 characters from `[a-z0-9-]` that starts and ends
- * with a letter or digit, as the names of the Sandbox, its Service and its pod must be.
- * alasio generates ids that already satisfy this, and this guards against any that would
- * not.
+ * The longest a volume id is: a DNS label's 63 characters, less a claim template's name
+ * of up to CLAIM_TEMPLATE_MAX and the hyphen after it, so its volume claims' names,
+ * `<template>-<id>` (../kube/sandboxes.ts claimName), are DNS labels too, as alasio's
+ * admission policy of its clones holds them to (cli/src/manifests/admission.ts).
  */
-const VOLUME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/;
+export const VOLUME_ID_MAX = 58;
+
+/** The longest a claim template's name is, of which a volume id's claims are named. */
+export const CLAIM_TEMPLATE_MAX = 63 - 1 - VOLUME_ID_MAX;
+
+/**
+ * A volume id is a DNS label of 3–58 characters from `[a-z0-9-]` that starts and ends
+ * with a letter or digit, as the names of the Sandbox, its Service and its pod must be,
+ * and short enough for its claims' (VOLUME_ID_MAX). alasio generates ids that already
+ * satisfy this, and this guards against any that would not.
+ */
+const VOLUME_ID_PATTERN = new RegExp(`^[a-z0-9][a-z0-9-]{1,${VOLUME_ID_MAX - 2}}[a-z0-9]$`, "u");
 
 /** A volume id, as what comes from outside alasio is decoded. */
 const VolumeId = Schema.String.check(Schema.isPattern(VOLUME_ID_PATTERN));
@@ -29,7 +40,7 @@ export function isValidVolumeId(volumeId: unknown): volumeId is string {
 
 export function assertValidVolumeId(volumeId: unknown): string {
   if (!isValidVolumeId(volumeId)) {
-    throw new Error(`invalid session volume id: ${JSON.stringify(volumeId)} (need 3–63 chars of [a-z0-9-], starting and ending with a letter or digit)`);
+    throw new Error(`invalid session volume id: ${JSON.stringify(volumeId)} (need 3–${VOLUME_ID_MAX} chars of [a-z0-9-], starting and ending with a letter or digit)`);
   }
   return volumeId;
 }

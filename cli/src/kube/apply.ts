@@ -35,7 +35,7 @@ export const VOLUME_DRIVER_LABEL = "alasio.dev/volume-driver";
 const PHASES: readonly (readonly KindName[])[] = [
   ["CustomResourceDefinition"],
   ["Namespace", "PriorityClass", "StorageClass", "CSIDriver"],
-  ["ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding", "ConfigMap", "PersistentVolumeClaim", "Service", "NetworkPolicy"],
+  ["ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding", "ConfigMap", "PersistentVolumeClaim", "Service", "NetworkPolicy", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"],
   ["Job"],
   ["Deployment", "StatefulSet", "DaemonSet", "CronJob"],
 ];

@@ -42,6 +42,8 @@ const KINDS = {
   RuntimeClass: { apiVersion: "node.k8s.io/v1", plural: "runtimeclasses", namespaced: false },
   StorageClass: { apiVersion: "storage.k8s.io/v1", plural: "storageclasses", namespaced: false },
   CSIDriver: { apiVersion: "storage.k8s.io/v1", plural: "csidrivers", namespaced: false },
+  ValidatingAdmissionPolicy: { apiVersion: "admissionregistration.k8s.io/v1", plural: "validatingadmissionpolicies", namespaced: false },
+  ValidatingAdmissionPolicyBinding: { apiVersion: "admissionregistration.k8s.io/v1", plural: "validatingadmissionpolicybindings", namespaced: false },
   ClusterRole: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterroles", namespaced: false },
   ClusterRoleBinding: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "clusterrolebindings", namespaced: false },
   Role: { apiVersion: "rbac.authorization.k8s.io/v1", plural: "roles", namespaced: true },

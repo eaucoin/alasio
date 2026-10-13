@@ -1424,3 +1424,32 @@ describe("scaling", () => {
     assert.deepEqual(["alasio", "alasio-lake", "alasio-neon-compute"].map((name) => branch.get(name)), ["alasio-turn", "alasio-component", "alasio-component"]);
   });
 });
+
+describe("admission", () => {
+  type Policy = KubernetesObject & { spec: { matchConstraints: { resourceRules: object[] }; matchConditions: { expression: string }[]; validations: { expression: string }[] } };
+  /** The keys the pin of `field` in `expression` allows. */
+  const keysOf = (expression: string, field: string) => {
+    const pin = `${field}.all(key, key in [`;
+    const at = expression.indexOf(pin);
+    return at < 0 ? null : JSON.parse(expression.slice(at + pin.length - 1, expression.indexOf("]", at + pin.length) + 1));
+  };
+  const binding = (objects: readonly KubernetesObject[], name: string) => one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", name).spec;
+
+  test("lets alasio run no Job but its clone's, as rendered but for the claims it is told, each a name, where it forks sessions", () => {
+    const objects = install();
+    const clone = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-clone-job");
+    assert.deepEqual(clone.spec.matchConstraints, { resourceRules: [{ apiGroups: ["batch"], resources: ["jobs"], operations: ["CREATE", "UPDATE"], apiVersions: ["*"] }] });
+    assert.deepEqual(clone.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
+    const job = clone.spec.validations[0]?.expression ?? "";
+    // The Job's keys, its template's and its pod's are the clone's and what the API server defaults: no ServiceAccount, volume or host namespace of another's.
+    assert.deepEqual(keysOf(job, "object.spec"), ["backoffLimit", "activeDeadlineSeconds", "ttlSecondsAfterFinished", "template", "completions", "parallelism", "completionMode", "suspend", "manualSelector", "podReplacementPolicy", "selector"]);
+    assert.deepEqual(keysOf(job, 'object.spec["template"]["spec"]'), ["restartPolicy", "priorityClassName", "containers", "dnsPolicy", "schedulerName", "terminationGracePeriodSeconds", "securityContext"]);
+    const rendered = (JSON.parse(one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-templates").data?.["templates.json"] ?? "{}") as { sessions: SessionsProfile }).sessions.clone?.job;
+    assert.ok(job.includes(`object.spec["template"]["spec"]["containers"][0]["image"] == ${JSON.stringify(rendered?.spec?.template.spec?.containers[0]?.image)}`));
+    for (const variable of ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"]) assert.ok(job.includes(JSON.stringify(variable)), variable);
+    assert.ok(job.includes('.matches("^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$")'), "each claim's a DNS label");
+    assert.deepEqual(binding(objects, "alasio-clone-job"), { policyName: "alasio-clone-job", validationActions: ["Deny"] });
+    // None where alasio forks no session, which runs no Job.
+    assert.ok(!all(install({ workspaceStorage: { enabled: false } }), "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === "alasio-clone-job"));
+  });
+});

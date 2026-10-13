@@ -18,6 +18,8 @@ import { readFileSync } from "node:fs";
 import type { V1Job, V1PersistentVolumeClaim, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Config, Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
 
+import { CLAIM_TEMPLATE_MAX } from "../sandbox/names.ts";
+
 /** The deployment's templates could not be read, or are not what alasio needs; the message says which. */
 export class KubeTemplatesError extends Schema.TaggedError<KubeTemplatesError>()("KubeTemplatesError", {
   message: Schema.String,
@@ -72,11 +74,18 @@ const VolumeClaimTemplates = said(
  */
 const Clone = said(
   Schema.Struct({
-    claimTemplate: said(Schema.NonEmptyString, "must be a claim template's name"),
+    // Short enough that each claim of it, named `<template>-<volume id>`, is a DNS label.
+    claimTemplate: said(
+      Schema.String.check(Schema.isPattern(new RegExp(`^[a-z0-9]([-a-z0-9]{0,${CLAIM_TEMPLATE_MAX - 2}}[a-z0-9])?$`, "u"))),
+      `must be a claim template's name, a DNS label of at most ${CLAIM_TEMPLATE_MAX} characters`,
+    ),
     job: said(Schema.declare((value): value is V1Job => Predicate.isObject(value)), "must be an object"),
   }),
   "must be an object",
 );
+
+/** The variables a clone's Job is given, after its own, in this order (src/sandbox/index.ts). */
+export const CLONE_VARIABLES = ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"] as const;
 
 /** Whether `podTemplate`, as the installation gives it, runs a container named `bayma`. */
 function runsBayma(podTemplate: unknown): boolean {

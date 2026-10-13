@@ -40,7 +40,7 @@ import type { V1EnvVar, V1Job, V1JobCondition, V1PersistentVolumeClaim, V1Pod } 
 import { Config, Context, Duration, Effect, FiberSet, Layer, Option, RcRef, Schedule, Schema, Semaphore } from "effect";
 
 import { type KubeApiError, KubeClient, type KubeExecError } from "../kube/client.ts";
-import type { SessionsProfile } from "../kube/config.ts";
+import { CLONE_VARIABLES, type SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
   type BaymaEndpoint,
@@ -291,12 +291,13 @@ export function sessionSandboxManifest({
  * `destination`, as its containers are told. Pure, for tests.
  */
 export function cloneJobManifest(job: V1Job, source: ClaimRef, destination: ClaimRef): V1Job {
-  const env: V1EnvVar[] = [
-    { name: "SOURCE_NAMESPACE", value: source.namespace },
-    { name: "SOURCE_CLAIM", value: source.name },
-    { name: "DESTINATION_NAMESPACE", value: destination.namespace },
-    { name: "DESTINATION_CLAIM", value: destination.name },
-  ];
+  const values: Record<(typeof CLONE_VARIABLES)[number], string> = {
+    SOURCE_NAMESPACE: source.namespace,
+    SOURCE_CLAIM: source.name,
+    DESTINATION_NAMESPACE: destination.namespace,
+    DESTINATION_CLAIM: destination.name,
+  };
+  const env: V1EnvVar[] = CLONE_VARIABLES.map((name) => ({ name, value: values[name] }));
   const made = structuredClone(job);
   for (const container of made.spec?.template.spec?.containers ?? []) container.env = [...(container.env ?? []), ...env];
   return made;
