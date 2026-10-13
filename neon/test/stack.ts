@@ -2,8 +2,8 @@
  * alasio's Neon as alasio installs it: its components killed, the whole stack stopped at
  * once, a safekeeper's volume lost, with nothing committed lost; a day of its history
  * kept, its garbage collected, its dumps restorable, its past readable, its branches
- * made, run and deleted, its compute reached through Neon's proxy alone, and its lake
- * loading; and an upgrade that changes nothing restarting none of it.
+ * made, run and deleted, its compute reached through Neon's proxy alone and woken by
+ * it, and its lake loading; and an upgrade that changes nothing restarting none of it.
  *
  * Part of the end-to-end run (test/e2e/alasio.test.ts), which registers it with
  * neonStack() and has installed alasio before it runs; slow (about fifteen minutes).
@@ -15,6 +15,7 @@ import { after, before, describe, test } from "node:test";
 import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
+import type { ObjectRef } from "../../cli/src/kube/api.ts";
 import { dataNodes } from "../../cli/src/kube/object-store-scale.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../../cli/src/manifests/common.ts";
@@ -23,6 +24,7 @@ import { NeonSessionStore } from "../../src/harness/claude/session-store.ts";
 import { AGENTS, alasioOk, type Forward, kube, lakeQuery, ref, tcp } from "../../test/e2e/harness.ts";
 import { sessionStoreConformance } from "../../test/support/session-store-conformance.ts";
 import { type Branch, type BranchView, COMPUTE_PORT, computeId, MAIN, type ReadyBranch, tokenSha256 } from "../control/branches.ts";
+import { SUSPEND_AFTER } from "../control/endpoints.ts";
 import { signToken } from "../control/jwt.ts";
 import { scramVerifier } from "../control/scram.ts";
 import type { StackSecrets } from "../control/secrets.ts";
@@ -874,6 +876,260 @@ export function neonStack(): void {
             assert.ok(Date.now() < deadline, `safekeeper ${index + 1} keeps the deleted branch's timeline`);
             await sleep(3000);
           }
+        }
+      });
+    });
+
+    // After the branches': this stops main's clients, and main's compute, as neon-control does when no client has a session on it.
+    describe("Neon's proxy", () => {
+      const COMPUTE_DEPLOYMENT = ref("Deployment", neonName("compute"), NAMESPACE);
+      const CONTROL = ref("Deployment", neonName("control"), NAMESPACE);
+      /** Main's clients, which hold sessions on its compute, its lake's loader always. */
+      const CLIENTS = [RELEASE, componentName("lake"), componentName("grafana")].map((name) => ref("Deployment", name, NAMESPACE));
+
+      /** The Deployment scaled to none, and its pods gone, a terminating one too. */
+      async function stopped(workload: ObjectRef) {
+        await kube.patch(workload, { spec: { replicas: 0 } });
+        const labels = (await kube.get<V1Deployment>(workload))?.spec?.selector.matchLabels ?? {};
+        const deadline = Date.now() + 120_000;
+        while ((await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).length > 0) {
+          assert.ok(Date.now() < deadline, `${workload.name} did not stop`);
+          await sleep(1000);
+        }
+      }
+
+      /** The compute put to sleep, as neon-control puts it, and gone. */
+      const asleep = () => stopped(COMPUTE_DEPLOYMENT);
+
+      /** Every pod of main's compute, one stopping among them. */
+      const COMPUTE_PODS = selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-compute" });
+
+      /** How long main's compute may be idle before it sleeps, as installed, which the suite's tests shorten and its end gives back. */
+      let installedSuspend: string | undefined;
+
+      /** Has main's compute sleep once idle for `seconds`, as its Deployment's annotation tells neon-control. */
+      async function suspendingAfter(seconds: number): Promise<void> {
+        const annotations = (await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.metadata?.annotations ?? {};
+        installedSuspend ??= annotations[SUSPEND_AFTER];
+        await kube.patch(COMPUTE_DEPLOYMENT, { metadata: { annotations: { [SUSPEND_AFTER]: String(seconds) } } });
+      }
+
+      /** neon-control's running replicas. */
+      const controlReplicas = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-control" }), fieldSelector: "status.phase=Running" }))
+          .filter((pod) => pod.metadata?.deletionTimestamp === undefined)
+          .map((pod) => pod.metadata?.name ?? "");
+
+      /** What `pod` of neon-control logged, a line each. */
+      const logsOf = async (pod: string) => (await kube.logs(NAMESPACE, pod, "neon-control")).split("\n");
+
+      /** Every line every running replica of neon-control logged. */
+      const controlLogs = async () => (await Promise.all((await controlReplicas()).map(logsOf))).flat();
+
+      /** Of `pods` of neon-control, those that lead now: that last said they lead, and not since that they no longer do. */
+      async function leaders(pods: readonly string[]): Promise<string[]> {
+        const said = await Promise.all(pods.map(async (pod) => [pod, (await logsOf(pod)).filter((line) => /"message":"(no longer )?leading"/u.test(line)).at(-1)] as const));
+        return said.filter(([, last]) => last?.includes('"message":"leading"')).map(([pod]) => pod);
+      }
+
+      /** How long one connection through the proxy takes to its first answer, with alasio's patience. */
+      async function connected(): Promise<number> {
+        const started = Date.now();
+        const client = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 60_000 });
+        client.on("error", () => {});
+        try {
+          await client.connect();
+          await client.query("select 1");
+          return Date.now() - started;
+        } finally {
+          await client.end().catch(() => {});
+        }
+      }
+
+      after(async () => {
+        if (installedSuspend !== undefined) await kube.patch(COMPUTE_DEPLOYMENT, { metadata: { annotations: { [SUSPEND_AFTER]: installedSuspend } } });
+        for (const workload of [CONTROL, ...CLIENTS]) await kube.patch(workload, { spec: { replicas: 1 } });
+        await up();
+        await kube.awaitReady(CLIENTS, "5 minutes");
+      });
+
+      test("is what every client's session on the compute comes from", async () => {
+        const proxies = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-proxy" }) }))
+          .map((pod) => pod.status?.podIP);
+        const compute = await kube.runningPod(NAMESPACE, neonName("compute"));
+        const sessions = await kube.execOk(NAMESPACE, compute, [
+          "psql", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "postgres", "-Atc",
+          "select distinct usename || ' ' || host(client_addr) from pg_stat_activity where usename in ('alasio', 'lake', 'lake_reader', 'grafana')",
+        ], { container: "compute" });
+        const seen = sessions.trim().split("\n").filter(Boolean).map((line) => line.split(" "));
+        assert.ok(seen.some(([role]) => role === "lake"), `the lake's loader holds a session: ${sessions}`);
+        for (const [role, address] of seen) assert.ok(proxies.includes(address), `${role}'s session comes from ${address}, not the proxy (${proxies.join(", ")})`);
+      });
+
+      test("wakes a compute that sleeps on the first connection to it, within alasio's patience, warm and with the pageserver just restarted", async () => {
+        // Main's clients stopped, which would wake it again at once, a terminating one's last reconnection too.
+        for (const workload of CLIENTS) await stopped(workload);
+        const warm: number[] = [];
+        for (let wake = 0; wake < 3; wake++) {
+          await asleep();
+          warm.push(await connected());
+        }
+        await asleep();
+        await kube.kill(NAMESPACE, await podOf("neon-pageserver"));
+        await sleep(2000);
+        await kube.awaitReady([ref("StatefulSet", neonName("pageserver"), NAMESPACE)], "5 minutes");
+        const cold = await connected();
+        console.error(`# woken in ${warm.join(", ")} ms; with the pageserver just restarted, ${cold} ms`);
+        for (const ms of [...warm, cold]) assert.ok(ms < 60_000, `a wake took ${ms} ms`);
+      });
+
+      test("lets twenty first connections at once all through", async () => {
+        await asleep();
+        const answered = await Promise.allSettled(Array.from({ length: 20 }, connected));
+        assert.deepEqual(answered.filter(({ status }) => status === "rejected"), []);
+      });
+
+      test("wakes a compute whose wake neon-control was restarted in, once asked again", async () => {
+        await asleep();
+        const first = connected().catch(() => null);
+        // In flight: neon-control has scaled the compute, and waits for it to take connections.
+        const deadline = Date.now() + 60_000;
+        while ((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 1) {
+          assert.ok(Date.now() < deadline, "no wake began");
+          await sleep(100);
+        }
+        const computes = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: COMPUTE_PODS });
+        assert.ok(!computes.some((pod) => pod.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True")), "the compute is not ready yet");
+        await kube.kill(NAMESPACE, await podOf("neon-control"));
+        await first;
+        // The client asks again, as alasio's pool does, until neon-control is back: the compute is scaling already, and the wake waits for it.
+        const started = Date.now();
+        while (!(await connected().then(() => true, () => false))) {
+          assert.ok(Date.now() - started < 120_000, "no connection got through since neon-control was restarted");
+          await sleep(1000);
+        }
+        assert.equal((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas, 1);
+      });
+
+      test("is served by neon-control's replicas alike, each waking a compute that sleeps, which record a branch made through two at once, once, and of which one leads", async () => {
+        await kube.patch(CONTROL, { spec: { replicas: 2 } });
+        await kube.awaitReady([CONTROL], "5 minutes");
+        const replicas = await controlReplicas();
+        assert.equal(replicas.length, 2);
+        const name = `twice-${Date.now()}`;
+        const body = { name, compute: { verifiers: { alasio: scramVerifier(randomUUID()), lake: scramVerifier(randomUUID()) }, tokenSha256: tokenSha256(randomUUID()) } };
+        const answers = await Promise.all(replicas.map(async (pod) => JSON.parse(await inside(pod, "POST", "http://127.0.0.1:8080/branches", "admin", body)) as Listed));
+        assert.equal(new Set(answers.map(({ timelineId }) => timelineId)).size, 1, JSON.stringify(answers));
+        assert.equal((await recorded()).filter((branch) => branch.name === name).length, 1);
+        const [one] = replicas;
+        assert.ok(one);
+        assert.equal(await inside(one, "DELETE", `http://127.0.0.1:8080/branches/${name}`, "admin"), "");
+        // Each answers the proxy, a role's secret and a wake from sleep, itself.
+        for (const pod of replicas) {
+          await asleep();
+          const access = JSON.parse(await inside(pod, "GET", "http://127.0.0.1:8080/get_endpoint_access_control?endpointish=alasio&role=alasio", "proxy")) as { role_secret?: string };
+          assert.match(access.role_secret ?? "", /^SCRAM-SHA-256\$/u, pod);
+          const woke = JSON.parse(await inside(pod, "GET", "http://127.0.0.1:8080/wake_compute?endpointish=alasio", "proxy")) as { aux?: { cold_start_info?: string } };
+          assert.equal(woke.aux?.cold_start_info, "pool_miss", pod);
+          assert.equal((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas, 1, pod);
+        }
+        // One leads; once it is gone, one other does: the replica left, or the one made in its place.
+        const leading = await leaders(replicas);
+        assert.equal(leading.length, 1, `leading: ${leading.join(", ")}`);
+        const [gone] = leading;
+        assert.ok(gone);
+        await kube.kill(NAMESPACE, gone);
+        const handedOver = Date.now();
+        for (;;) {
+          const now = await leaders((await controlReplicas()).filter((pod) => pod !== gone));
+          assert.ok(now.length <= 1, `leading at once: ${now.join(", ")}`);
+          if (now.length === 1) break;
+          assert.ok(Date.now() - handedOver < 120_000, "no replica took the lead");
+          await sleep(2000);
+        }
+        await kube.patch(CONTROL, { spec: { replicas: 1 } });
+        await kube.awaitReady([CONTROL], "5 minutes");
+      });
+
+      test("reaches main's compute awake while the storage controller's Postgres, neon-control's record, is down", async () => {
+        await connected();
+        const database = ref("StatefulSet", neonName("controller-db"), NAMESPACE);
+        await kube.patch(database, { spec: { replicas: 0 } });
+        try {
+          const deadline = Date.now() + 120_000;
+          while ((await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "neon-controller-db" }) })).length > 0) {
+            assert.ok(Date.now() < deadline, "the storage controller's Postgres did not stop");
+            await sleep(1000);
+          }
+          // Past the proxy's ten seconds of a role's secret, so neon-control is asked for it again.
+          await sleep(11_000);
+          assert.ok((await connected()) < 60_000);
+          // And a wake, which a running compute answers without the record.
+          for (const pod of await controlReplicas()) {
+            const woke = JSON.parse(await inside(pod, "GET", "http://127.0.0.1:8080/wake_compute?endpointish=alasio", "proxy")) as { aux?: { cold_start_info?: string } };
+            assert.equal(woke.aux?.cold_start_info, "warm", pod);
+          }
+        } finally {
+          await kube.patch(database, { spec: { replicas: 1 } });
+          await kube.awaitReady([database], "5 minutes");
+        }
+      });
+
+      test("is put to sleep by neon-control once idle as long as its Deployment says, a client connecting as it stops finding it awake again, and never two of it at once", async () => {
+        await suspendingAfter(60);
+        await connected();
+        // Every compute pod whose containers may run, a stopping one too, counted all the while:
+        // one deleted whose containers all ended is in a terminal phase until it is gone.
+        let most = 0;
+        let seen = "";
+        let counting = true;
+        const counted = (async () => {
+          while (counting) {
+            const pods = (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: COMPUTE_PODS }))
+              .filter(({ status }) => status?.phase !== "Succeeded" && status?.phase !== "Failed");
+            if (pods.length > most) seen = pods.map(({ metadata, status }) => `${metadata?.name} ${status?.phase}${metadata?.deletionTimestamp ? " deleted" : ""}`).join(", ");
+            most = Math.max(most, pods.length);
+            await sleep(200);
+          }
+        })();
+        try {
+          const deadline = Date.now() + 240_000;
+          while ((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 0) {
+            assert.ok(Date.now() < deadline, "neon-control did not put the compute to sleep");
+            await sleep(200);
+          }
+          // As it stops: a connection may yet reach the pod stopping, which ends it; asked again, as
+          // alasio's pool asks, one gets through to the compute woken once that pod is gone.
+          const asked = Date.now();
+          while (!(await connected().then(() => true, () => false)) || (await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 1) {
+            assert.ok(Date.now() - asked < 120_000, "no connection got through to the compute woken again");
+            await sleep(1000);
+          }
+        } finally {
+          counting = false;
+          await counted;
+        }
+        assert.equal(most, 1, `two compute pods ran at once: ${seen}`);
+        assert.ok((await controlLogs()).some((line) => line.includes('"compute suspended"') && line.includes('"compute":"alasio"')));
+      });
+
+      test("keeps a compute awake while a client's idle session holds an advisory lock, and puts it to sleep once that ends", async () => {
+        await suspendingAfter(60);
+        const holder = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 60_000 });
+        holder.on("error", () => {});
+        await holder.connect();
+        try {
+          await holder.query("select pg_advisory_lock(42)");
+          // Idle well past its minute, and two of neon-control's rounds.
+          await sleep(150_000);
+          assert.equal((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas, 1);
+        } finally {
+          await holder.end();
+        }
+        const deadline = Date.now() + 240_000;
+        while ((await kube.get<V1Deployment>(COMPUTE_DEPLOYMENT))?.spec?.replicas !== 0) {
+          assert.ok(Date.now() < deadline, "neon-control did not put the compute to sleep once the session ended");
+          await sleep(1000);
         }
       });
     });

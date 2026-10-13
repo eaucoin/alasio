@@ -18,6 +18,7 @@ import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
 import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1PersistentVolume, V1Pod, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import { componentName, NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
@@ -1074,8 +1075,8 @@ if (inShard("branches")) {
     test("alasio branch create makes the branch, serving its own bot, and main's lake keeps its files while it is", async () => {
       const work = mkdtempSync(join(tmpdir(), "alasio-e2e-branch-"));
       writeFileSync(join(work, "bot-token"), "456:branch", { mode: 0o600 });
-      // The branch's alasio talks to its own bot's stand-in, as the command line checks its token with it.
-      writeFileSync(join(work, "overrides.json"), JSON.stringify({ alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } } }));
+      // The branch's alasio talks to its own bot's stand-in, as the command line checks its token with it; its compute sleeps after a minute idle.
+      writeFileSync(join(work, "overrides.json"), JSON.stringify({ alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } }, neon: { compute: { suspendAfter: "1m" } } }));
       const started = Date.now();
       await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"));
       console.error(`# the branch ran ${((Date.now() - started) / 1000).toFixed(1)}s after alasio branch create was run`);
@@ -1155,6 +1156,36 @@ if (inShard("branches")) {
       }
       assert.equal(measured.length, 3, "the metrics server measured the branch's three pods");
       if (AGENTS === 0) assert.equal(new Set(pods.map((pod) => pod.spec?.nodeName)).size, 1);
+    });
+
+    test("the branch's compute sleeps once nothing has had a session on it for its minute, and its first connection, through main's proxy, wakes it", async () => {
+      // Its alasio and lake stopped, which hold sessions on it, its lake's loader always.
+      for (const name of ["alasio", "alasio-lake"]) await kube.patch(ref("Deployment", name, BRANCH_NAMESPACE), { spec: { replicas: 0 } });
+      const compute = ref("Deployment", "alasio-neon-compute", BRANCH_NAMESPACE);
+      const deadline = Date.now() + 300_000;
+      while ((await kube.get<V1Deployment>(compute))?.spec?.replicas !== 0) {
+        assert.ok(Date.now() < deadline, "the branch's compute did not sleep");
+        await sleep(5000);
+      }
+      // With the branch's own credentials, as its alasio connects.
+      const proxy = await kube.forward(NAMESPACE, "alasio-neon-proxy", 5432);
+      try {
+        const url = new URL(await kube.secret(BRANCH_NAMESPACE, "alasio-database", "url"));
+        Object.assign(url, { hostname: "127.0.0.1", port: String(proxy.port) });
+        const started = Date.now();
+        const client = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 60_000 });
+        await client.connect();
+        try {
+          const { rows } = await client.query<{ messages: number }>("select count(*)::int as messages from state.messages");
+          console.error(`# the branch's compute woke in ${Date.now() - started} ms`);
+          assert.ok(rows[0] && rows[0].messages > 0);
+        } finally {
+          await client.end();
+        }
+      } finally {
+        proxy.close();
+      }
+      assert.equal((await kube.get<V1Deployment>(compute))?.spec?.replicas, 1);
     });
 
     test("alasio branch delete leaves nothing of the branch, and main's lake maintenance deletes files again", async () => {
