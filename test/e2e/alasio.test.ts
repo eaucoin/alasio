@@ -149,6 +149,12 @@ describe("alasio's command line, on the alasio it installed", () => {
     }
     assert.ok(said.includes(`  Deployment ${NAMESPACE}/${RELEASE}: ready\n`), said);
     assert.ok(said.includes(`  StatefulSet ${NAMESPACE}/${RELEASE}-neon-pageserver: ready\n`), said);
+    // The object store's copies, as the run gives them, and each volume server's disk, as its metrics say.
+    assert.ok(said.includes(AGENTS >= 2 ? "\nthe object store: each object kept twice (replication 001)\n" : "\nthe object store: each object kept once (replication 000)\n"), said);
+    const servers = AGENTS >= 2 ? 3 : 1;
+    for (let ordinal = 0; ordinal < servers; ordinal += 1) {
+      assert.match(said, new RegExp(`\\n {2}${RELEASE}-seaweedfs-volume-${ordinal}: \\S+ \\S+ to fill before it takes no more writes, of \\S+ \\S+ free on its disk`, "u"));
+    }
   });
 
   test("logs shows what alasio and its components log, and names those it has when asked for another", async () => {
@@ -530,7 +536,12 @@ if (inShard("telemetry")) {
       await untilInLake("metric of the compute's", metricRows("ServiceName = 'compute'"));
       await untilInLake("log record of the lake's", "select count(*) as n from otel.logs where ServiceName = 'alasio-lake'");
       await untilInLake("metric of JuiceFS's", metricRows("MetricName like 'juicefs_%'"));
-      await untilInLake("metric of Valkey's", metricRows("MetricName = 'redis.memory.used'"));
+      // Each Valkey's, named by its Service.
+      for (const valkey of [`${RELEASE}-valkey`, `${RELEASE}-seaweedfs-filer-store`]) {
+        await untilInLake(`metric of ${valkey}'s`, metricRows(`MetricName = 'redis.memory.used' and ResourceAttributes['server.address'] = '${valkey}'`));
+      }
+      // The object store's volume servers', of their disks, labelled with their pods.
+      await untilInLake("metric of the object store's volume servers' disks", metricRows("ServiceName = 'seaweedfs' and MetricName = 'SeaweedFS_volumeServer_resource' and Attributes['pod'] like '%-seaweedfs-volume-%'"));
     });
 
     describe("Grafana", () => {
@@ -553,18 +564,20 @@ if (inShard("telemetry")) {
         assert.deepEqual((await api("/api/datasources/uid/lake/health")).body, { message: "Health check successful", status: "OK" });
         const dashboards = (await api("/api/search?type=dash-db")).body as { title: string; folderTitle: string }[];
         assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Stack health"]);
-        // The Stack health dashboard's table of services, as its panel queries it.
+        // The Stack health dashboard's tables of services and of the object store's volume servers, as their panels query them.
         const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
-        const services = stack.panels.find(({ title }) => title === "Services now")?.targets?.[0];
-        assert.ok(services);
-        let rows = 0;
-        for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
-          const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [services] }) })).body as {
-            results: { A: { frames?: { data: { values: unknown[][] } }[] } };
-          };
-          rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+        const queryOf = (panel: string) => stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`);
+        const services = queryOf("Services now");
+        for (const panel of ["Services now", "The object store's volume servers"]) {
+          let rows = 0;
+          for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
+            const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [queryOf(panel)] }) })).body as {
+              results: { A: { frames?: { data: { values: unknown[][] } }[] } };
+            };
+            rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+          }
+          assert.ok(rows > 0, `${panel} answered with no row`);
         }
-        assert.ok(rows > 0, "the panel answered with no service");
         // A query the lake refuses says why, in Grafana.
         const refused = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [{ ...services, url_options: { ...(services as { url_options: object }).url_options, data: "select nothing" } }] }) })).body as {
           results: { A: { error?: string } };

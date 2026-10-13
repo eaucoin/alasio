@@ -1,5 +1,5 @@
 /** `alasio status`: what runs, and whether it is healthy; how it is scaled and sized, and the cluster's memory. */
-import type { KubernetesObject, V1Node, V1Pod } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Node, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
 import { Console, Effect, Option, Schema } from "effect";
 import { Command } from "effect/cli";
 
@@ -12,12 +12,14 @@ import { loadConfig } from "../config.ts";
 import { describeMemory, describeScale, describeSizing, memoryBytes, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
-import { diagnose, readiness } from "../kube/rollout.ts";
+import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../manifests/common.ts";
+import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
+import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
-import { notRunning } from "./common.ts";
+import { notRunning, runIn } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
@@ -90,6 +92,39 @@ const memory = Effect.gen(function*() {
   };
 });
 
+/** The StatefulSet of `workloads` named `name`, in alasio's namespace. */
+const statefulSet = (workloads: readonly KubernetesObject[], name: string): V1StatefulSet | undefined =>
+  workloads.find(({ kind: of, metadata }) => of === "StatefulSet" && metadata?.namespace === NAMESPACE && metadata.name === name);
+
+/**
+ * What the bundled object store keeps, where it runs among `workloads`: the copies of
+ * each object, as its masters are told; and of each volume server, its disk, as its
+ * metrics say it, read in its pod; or why it is not measured.
+ */
+const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<string[], KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const master = statefulSet(workloads, MASTER);
+    const volumeServers = statefulSet(workloads, VOLUME_SERVER);
+    if (!master || !volumeServers) return [];
+    const kube = yield* KubeApi;
+    const replication = master.spec?.template.spec?.containers[0]?.args?.find((arg) => arg.startsWith("-defaultReplication="))?.split("=")[1] ?? "000";
+    const listed = yield* seen(kube.list<V1Pod>(kind("Pod"), { namespace: NAMESPACE, labelSelector: selectorOf(volumeServers.spec?.selector.matchLabels ?? {}) }));
+    if (Option.isNone(listed)) return [describeReplication(replication), "  its volume servers: not seen, as this kubeconfig may not list their pods"];
+    const disks = yield* Effect.forEach(listed.value.toSorted((a, b) => (a.metadata?.name ?? "").localeCompare(b.metadata?.name ?? "")), (pod) => {
+      const name = pod.metadata?.name ?? "";
+      if (pod.status?.phase !== "Running") return Effect.succeed(`${name}: not measured, as it does not run`);
+      return runIn({ namespace: NAMESPACE, pod: name, container: "volume" }, ["wget", "-q", "-O", "-", `http://127.0.0.1:${METRICS_PORT}/metrics`]).pipe(
+        Effect.map(({ exitCode, stdout }) => {
+          const disk = exitCode === 0 ? volumeServerDisk(stdout) : null;
+          return disk ? describeVolumeServer(name, disk) : `${name}: not measured, as its metrics do not say its disk`;
+        }),
+        Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed(`${name}: not measured, as this kubeconfig may not run commands in its pods`)),
+        Effect.catch((error) => Effect.succeed(`${name}: not measured: ${error.message}`)),
+      );
+    });
+    return [describeReplication(replication), ...disks.map((line) => `  ${line}`)];
+  });
+
 /** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
 const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
@@ -148,6 +183,7 @@ export const status = Command.make("status", {}, () =>
         if (listed.some(({ whole }) => !whole)) {
           yield* Console.log(`  alasio's workloads outside its namespace, ${NAMESPACE}: not seen, as this kubeconfig may list them there alone`);
         }
+        for (const line of yield* objectStore(workloads)) yield* Console.log(line);
         const cluster = yield* memory;
         yield* Console.log(cluster.memory ? describeMemory(cluster.memory) : "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods");
         if (cluster.measures === null) yield* Console.log("whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices");
@@ -168,7 +204,9 @@ export const status = Command.make("status", {}, () =>
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready, or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
-        "what VPA recommends once it has measured them. Then the memory the cluster's pods request and use, of what its nodes have " +
+        "what VPA recommends once it has measured them. Of the bundled object store, the copies it keeps of each object, and of each " +
+        "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
+        "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +
         "rights do not reach, it says is not seen. Exits with 1 when something " +
         "is not ready, or the limits are too low, or this machine is not Linux on x86-64, which the cluster here needs.",

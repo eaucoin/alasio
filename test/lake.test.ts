@@ -1213,6 +1213,54 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, and which collection keeps too few copies", async () => {
+    const now = String(BigInt(Date.now()) * 1_000_000n);
+    const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
+    const gauge = (resource: Record<string, string>, name: string, value: number, attributes: Record<string, string> = {}) => ({
+      resource: { attributes: strings(resource) },
+      scopeMetrics: [{ metrics: [{ name, gauge: { dataPoints: [{ timeUnixNano: now, asDouble: value, attributes: strings(attributes) }] } }] }],
+    });
+    // Two volume servers' disks of 1000 bytes, one with 50 to fill, the other 500; as the collector names what it scrapes for its job.
+    const disk = (pod: string, type: string, bytes: number) => gauge({ "service.name": "seaweedfs" }, "SeaweedFS_volumeServer_resource", bytes, { pod, type, name: "/data" });
+    // Two Valkeys, one holding 95% of its limit, the other 10%, each named by its receiver.
+    const valkey = (address: string, name: string, bytes: number) => gauge({ "service.name": "redis", "server.address": address }, name, bytes);
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", {
+        resourceMetrics: [
+          disk("filling-0", "all", 1000),
+          disk("filling-0", "avail", 50),
+          disk("roomy-0", "all", 1000),
+          disk("roomy-0", "avail", 500),
+          valkey("filer-store", "redis.memory.used", 950),
+          valkey("filer-store", "redis.maxmemory", 1000),
+          valkey("roomy-valkey", "redis.memory.used", 100),
+          valkey("roomy-valkey", "redis.maxmemory", 1000),
+          // Two masters, the leader saying 2 of neon's volumes under-replicated, the other its stale 0.
+          gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 2, { pod: "leader-0", collection: "neon-gate", rp: "001" }),
+          gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 0, { pod: "follower-1", collection: "neon-gate", rp: "001" }),
+        ],
+      }));
+      await flushTelemetry(db);
+    });
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const rule = (title: string) => {
+      const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf(`title: ${title}`))) ?? [];
+      return block.replaceAll(`\n${indent}  `, "\n").trim();
+    };
+    const reader = await openReader(readerConfig);
+    try {
+      const left = Object.fromEntries((await answer(reader.db, rule("The object store is filling its disk"))).map((row) => [row["server"], row["left"]]));
+      assert.deepEqual([left["filling-0"], left["roomy-0"]], [5, 50]);
+      const held = Object.fromEntries((await answer(reader.db, rule("A Valkey nears its memory limit"))).map((row) => [row["valkey"], row["held"]]));
+      assert.deepEqual([held["filer-store"], held["roomy-valkey"]], [95, 10]);
+      const under = Object.fromEntries((await answer(reader.db, rule("The object store keeps fewer copies than it should"))).map((row) => [row["collection"], row["volumes"]]));
+      assert.equal(under["neon-gate"], 2);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the query endpoint answers 503 while it cannot open the lake", async () => {
     const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
     const server = createServer(endpoint.handle);

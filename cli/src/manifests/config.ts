@@ -373,7 +373,12 @@ const ObjectStore = Schema.Struct({
           storage: Storage("100Gi"),
           /** The most volumes each keeps, each up to 1GiB. */
           volumes: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(30, { message: "must be at least 30" })), 100),
-          /** The disk each leaves free. */
+          /**
+           * The disk each leaves free. Once its disk has less free, a volume server takes no
+           * more writes; once none takes any, nor does the store, as each of its filers'
+           * writes is logged to a volume: `alasio status`, the Stack health dashboard and an
+           * alert say how near each is.
+           */
           minFreeSpace: defaulted(matching(/^[0-9]+(KiB|MiB|GiB|TiB)$/u, "must be a size in KiB, MiB, GiB or TiB"), "5GiB"),
           resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "2Gi" } }),
         }),
@@ -397,7 +402,8 @@ const ObjectStore = Schema.Struct({
       ),
       /**
        * The filers' store: a Valkey of its own, its memory sized for `entries`, the store's
-       * objects and directories, as about 1.4 KB each, with a quarter more.
+       * objects and directories, as about 1.4 KB each, with a quarter more. Full, it
+       * refuses writes, and the store with it: an alert says when it nears that.
        */
       filerStore: defaulted(
         Schema.Struct({

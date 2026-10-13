@@ -393,6 +393,48 @@ test("status says each workload's replicas and scale, its requests beside VPA's 
   assert.equal((await lines()).at(-1), "memory: 1.0 GiB requested, 3.5 GiB used, of 14.0 GiB the nodes have for pods");
 });
 
+test("status says the copies the object store keeps of each object, and of each volume server how near its disk is to its taking no more writes", async (t) => {
+  const { alasio, kube } = await installed(t);
+  const volumeServer = (name: string, phase: string) => ({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name, namespace: "alasio", labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "seaweedfs-volume" } },
+    status: { phase },
+  });
+  kube.put("pods", volumeServer("alasio-seaweedfs-volume-0", "Running"));
+  kube.put("pods", volumeServer("alasio-seaweedfs-volume-1", "Running"));
+  kube.put("pods", volumeServer("alasio-seaweedfs-volume-2", "Pending"));
+  const GiB = 2 ** 30;
+  // A volume server's metrics, as SeaweedFS serves them: its disk of 100 GiB, 20 free, 5 of them kept free.
+  const metrics = [
+    "# TYPE SeaweedFS_volumeServer_resource gauge",
+    `SeaweedFS_volumeServer_resource{name="/data",type="all"} ${100 * GiB}`,
+    `SeaweedFS_volumeServer_resource{name="/data",type="avail"} ${15 * GiB}`,
+    `SeaweedFS_volumeServer_resource{name="/data",type="free"} ${20 * GiB}`,
+    `SeaweedFS_volumeServer_resource{name="/data",type="used"} ${80 * GiB}`,
+    "SeaweedFS_volumeServer_max_volumes 100",
+    'SeaweedFS_volumeServer_volumes{collection="neon",type="volume"} 40',
+    'SeaweedFS_volumeServer_volumes{collection="lake",type="volume"} 4',
+    `SeaweedFS_volumeServer_total_disk_size{collection="neon",type="normal"} ${20 * GiB}`,
+    `SeaweedFS_volumeServer_total_disk_size{collection="neon",type="deleted_bytes"} ${GiB}`,
+    `SeaweedFS_volumeServer_total_disk_size{collection="lake",type="normal"} ${GiB}`,
+    'SeaweedFS_volumeServer_total_disk_size{collection="lake",type="deleted_bytes"} 0',
+    "",
+  ].join("\n");
+  // The second answers with no metrics of its disk.
+  kube.onExec = ({ pod, container, command }) =>
+    pod === "alasio-seaweedfs-volume-0" && container === "volume" && command.join(" ") === "wget -q -O - http://127.0.0.1:9327/metrics" ? { exitCode: 0, stdout: metrics } : { exitCode: 0, stdout: "" };
+  const run = await alasio(["status"]);
+  succeeded(run);
+  const at = run.printed.indexOf("the object store: each object kept once (replication 000)");
+  assert.ok(at > 0, run.printed.join("\n"));
+  assert.deepEqual(run.printed.slice(at + 1, at + 4), [
+    "  alasio-seaweedfs-volume-0: 15.0 GiB to fill before it takes no more writes, of 20.0 GiB free on its disk of 100.0 GiB, 5.0 GiB kept free (minFreeSpace); 44 of 100 volumes, taking 21.0 GiB, 1.0 GiB of it deleted",
+    "  alasio-seaweedfs-volume-1: not measured, as its metrics do not say its disk",
+    "  alasio-seaweedfs-volume-2: not measured, as it does not run",
+  ]);
+});
+
 test("status with rights in alasio's namespace alone says what it sees there, and what it does not see", async (t) => {
   const { alasio, kube } = await installed(t);
   for (const path of ["/apis/apps/v1/deployments", "/apis/apps/v1/statefulsets", "/apis/apps/v1/daemonsets", "/apis/keda.sh/v1alpha1/scaledobjects", "/apis/autoscaling.k8s.io/v1/verticalpodautoscalers", "/api/v1/pods", "/api/v1/nodes", "/apis/apiregistration.k8s.io/v1/apiservices/v1beta1.metrics.k8s.io"]) {
@@ -402,8 +444,11 @@ test("status with rights in alasio's namespace alone says what it sees there, an
   succeeded(run);
   assert.ok(run.printed.includes("  Deployment alasio/alasio: ready"));
   assert.ok(!run.printed.some((line) => line.includes("kube-system")), "nothing of kube-system's is listed");
-  assert.deepEqual(run.printed.slice(-3), [
+  // The object store's, in alasio's namespace, it sees; its volume server's metrics, here, say nothing.
+  assert.deepEqual(run.printed.slice(-5), [
     "  alasio's workloads outside its namespace, alasio: not seen, as this kubeconfig may list them there alone",
+    "the object store: each object kept once (replication 000)",
+    "  alasio-seaweedfs-volume-0: not measured, as its metrics do not say its disk",
     "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods",
     "whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices",
   ]);

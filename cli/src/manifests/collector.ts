@@ -177,6 +177,8 @@ function collectorConfig(config: InstallConfig): object {
         collection_interval: SCRAPE_INTERVAL,
         // How near it is to refusing writes: used memory against this.
         metrics: { "redis.maxmemory": { enabled: true } },
+        // Which Valkey it is, its Service's name, as the Stack health dashboard and the alert on their memory tell them.
+        resource_attributes: { "server.address": { enabled: true } },
       }])),
     },
     processors: {

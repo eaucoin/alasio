@@ -132,3 +132,131 @@ groups:
               type: threshold
               expression: points
               conditions: [{evaluator: {type: lt, params: [1]}}]
+
+      - uid: alasio-object-store-filling
+        title: The object store is filling its disk
+        condition: filling
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.server }} may fill {{ $values.left }}% more of its disk before it takes no more writes, past its minFreeSpace, and once none of the volume servers takes any, nor does the object store: give its disk room, or the store a volume server on another."
+        data:
+          - refId: left
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: left
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select Attributes['pod'] as server,
+                    round(100 * arg_max(Value, TimeUnix) filter (where Attributes['type'] = 'avail') / arg_max(Value, TimeUnix) filter (where Attributes['type'] = 'all'), 1) as "left"
+                  from otel.metrics_gauge
+                  where ServiceName = 'seaweedfs' and MetricName = 'SeaweedFS_volumeServer_resource' and TimeUnix > now()::timestamp - interval 5 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: server, text: server, type: string}
+                - {selector: left, text: left, type: number}
+          - refId: filling
+            datasourceUid: __expr__
+            model:
+              refId: filling
+              type: threshold
+              expression: left
+              conditions: [{evaluator: {type: lt, params: [10]}}]
+
+      - uid: alasio-valkey-memory
+        title: A Valkey nears its memory limit
+        condition: near
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.valkey }} holds {{ $values.held }}% of what it may: at its limit it refuses writes. Give it more: the filer store's objectStore.bundled.filerStore.entries, workspace storage's workspaceStorage.valkey.maxmemory."
+        data:
+          - refId: held
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: held
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select ResourceAttributes['server.address'] as valkey,
+                    round(100 * arg_max(Value, TimeUnix) filter (where MetricName = 'redis.memory.used') / arg_max(Value, TimeUnix) filter (where MetricName = 'redis.maxmemory'), 1) as held
+                  from otel.metrics_gauge
+                  where MetricName in ('redis.memory.used', 'redis.maxmemory') and ResourceAttributes['server.address'] is not null
+                    and TimeUnix > now()::timestamp - interval 5 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: valkey, text: valkey, type: string}
+                - {selector: held, text: held, type: number}
+          - refId: near
+            datasourceUid: __expr__
+            model:
+              refId: near
+              type: threshold
+              expression: held
+              conditions: [{evaluator: {type: gt, params: [90]}}]
+
+      - uid: alasio-object-store-under-replicated
+        title: The object store keeps fewer copies than it should
+        condition: under
+        for: 90m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.volumes }} volumes of the object store's collection {{ $labels.collection }} have had fewer copies than objectStore.bundled.replication keeps for longer than the hourly lifecycle pass takes to copy them again: is a volume server lost, or has none of the others room?"
+        data:
+          - refId: volumes
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: volumes
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  with latest as (
+                    select Attributes['pod'] as master, coalesce(Attributes['collection'], '') as collection, arg_max(Value, TimeUnix) as volumes
+                    from otel.metrics_gauge
+                    where ServiceName = 'seaweedfs' and MetricName = 'SeaweedFS_master_under_replicated_volumes' and TimeUnix > now()::timestamp - interval 5 minute
+                    group by 1, 2)
+                  select collection, max(volumes) as volumes from latest group by 1
+              root_selector: ""
+              columns:
+                - {selector: collection, text: collection, type: string}
+                - {selector: volumes, text: volumes, type: number}
+          - refId: under
+            datasourceUid: __expr__
+            model:
+              refId: under
+              type: threshold
+              expression: volumes
+              conditions: [{evaluator: {type: gt, params: [0]}}]

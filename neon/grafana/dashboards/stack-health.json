@@ -676,14 +676,14 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Valkey's memory",
+      "title": "The Valkeys' memory",
       "gridPos": {
         "x": 16,
         "y": 28,
         "w": 8,
         "h": 8
       },
-      "description": "The memory workspace storage's metadata takes in Valkey, against its limit, past which it refuses writes.",
+      "description": "The memory each Valkey's data takes, workspace storage's metadata's and the object store's filer store's, against its limit, past which it refuses writes.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "lake"
@@ -705,7 +705,7 @@
             "method": "POST",
             "body_type": "raw",
             "body_content_type": "text/plain",
-            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time,\ncase MetricName when 'redis.memory.used' then 'used' else 'limit' end as memory, max(Value) as bytes\nfrom otel.metrics_gauge where MetricName in ('redis.memory.used', 'redis.maxmemory') and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time,\ncoalesce(ResourceAttributes['server.address'], 'Valkey') || case MetricName when 'redis.memory.used' then ' used' else ' limit' end as memory, max(Value) as bytes\nfrom otel.metrics_gauge where MetricName in ('redis.memory.used', 'redis.maxmemory') and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
           },
           "root_selector": "",
           "columns": [
@@ -930,6 +930,234 @@
         "tooltip": {
           "mode": "multi"
         }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "The object store's disk",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Of each volume server of the bundled object store: what it may still fill of its disk before it takes no more writes, and once none does, nor does the store (its free space, less the minFreeSpace it keeps), and what its volumes hold deleted, which compaction frees.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "1m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with points as (\n  select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['pod'] as server,\n  case MetricName when 'SeaweedFS_volumeServer_resource' then 'to fill' else 'deleted' end as what, Attributes['collection'] as collection, max(Value) as bytes\n  from otel.metrics_gauge\n  where ServiceName = 'seaweedfs' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\n    and ((MetricName = 'SeaweedFS_volumeServer_resource' and Attributes['type'] = 'avail')\n      or (MetricName = 'SeaweedFS_volumeServer_total_disk_size' and Attributes['type'] = 'deleted_bytes'))\n  group by all)\nselect time, server || ' ' || what as space, sum(bytes) as bytes from points group by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "space",
+              "text": "space",
+              "type": "string"
+            },
+            {
+              "selector": "bytes",
+              "text": "bytes",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "displayName": "${__field.labels.space}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "The object store's volume servers",
+      "gridPos": {
+        "x": 12,
+        "y": 44,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Each volume server of the bundled object store, as it last said: its volumes of the most it keeps, what they take, deleted and not, and of its disk, what is free, what it keeps free (minFreeSpace), and what it may still fill before the store takes no more writes.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "table",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "with latest as (\n  select Attributes['pod'] as server, MetricName as metric, Attributes['type'] as type, Attributes['collection'] as collection, arg_max(Value, TimeUnix) as value\n  from otel.metrics_gauge\n  where ServiceName = 'seaweedfs' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to}) and MetricName in\n    ('SeaweedFS_volumeServer_resource', 'SeaweedFS_volumeServer_volumes', 'SeaweedFS_volumeServer_max_volumes', 'SeaweedFS_volumeServer_total_disk_size')\n  group by all)\nselect server,\n  sum(value) filter (where metric = 'SeaweedFS_volumeServer_volumes' and type = 'volume') as volumes,\n  max(value) filter (where metric = 'SeaweedFS_volumeServer_max_volumes') as most,\n  sum(value) filter (where metric = 'SeaweedFS_volumeServer_total_disk_size' and type = 'normal') as taken,\n  sum(value) filter (where metric = 'SeaweedFS_volumeServer_total_disk_size' and type = 'deleted_bytes') as deleted,\n  max(value) filter (where metric = 'SeaweedFS_volumeServer_resource' and type = 'free') as free,\n  max(value) filter (where metric = 'SeaweedFS_volumeServer_resource' and type = 'free') - max(value) filter (where metric = 'SeaweedFS_volumeServer_resource' and type = 'avail') as kept_free,\n  max(value) filter (where metric = 'SeaweedFS_volumeServer_resource' and type = 'avail') as to_fill\nfrom latest group by server order by server"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "server",
+              "text": "server",
+              "type": "string"
+            },
+            {
+              "selector": "volumes",
+              "text": "volumes",
+              "type": "number"
+            },
+            {
+              "selector": "most",
+              "text": "of",
+              "type": "number"
+            },
+            {
+              "selector": "taken",
+              "text": "taken",
+              "type": "number"
+            },
+            {
+              "selector": "deleted",
+              "text": "deleted",
+              "type": "number"
+            },
+            {
+              "selector": "free",
+              "text": "free",
+              "type": "number"
+            },
+            {
+              "selector": "kept_free",
+              "text": "kept free",
+              "type": "number"
+            },
+            {
+              "selector": "to_fill",
+              "text": "to fill",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "taken"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "deleted"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "free"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "kept free"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "to fill"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
       }
     }
   ]

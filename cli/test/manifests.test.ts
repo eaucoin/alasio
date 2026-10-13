@@ -1111,6 +1111,7 @@ describe("telemetry", () => {
       password: "${env:VALKEY_PASSWORD}",
       collection_interval: "60s",
       metrics: { "redis.maxmemory": { enabled: true } },
+      resource_attributes: { "server.address": { enabled: true } },
     });
     assert.deepEqual(config.service.pipelines["metrics/stack"].receivers, ["prometheus", "redis", "redis/filer-store"]);
     const collector = one<V1Deployment>(objects, "Deployment", "alasio-collector");
@@ -1159,6 +1160,7 @@ describe("telemetry", () => {
       password: "${env:FILER_STORE_PASSWORD}",
       collection_interval: "60s",
       metrics: { "redis.maxmemory": { enabled: true } },
+      resource_attributes: { "server.address": { enabled: true } },
     });
   });
 
