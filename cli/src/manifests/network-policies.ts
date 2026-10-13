@@ -121,32 +121,38 @@ const PARTS = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, C
 /** A component of main's, as a peer from any namespace. */
 const ofMain = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(component) } });
 
+/** The computes' components: a primary's, and its read replica's. */
+const COMPUTES = ["neon-compute", "neon-compute-ro"];
+
 /**
- * Neon's services, the lake and their jobs reach each other, but the compute, which
- * takes its clients' sessions from main's Neon proxy alone, which every client connects
- * through, and neon-control's, which wakes it and counts its sessions, and on
- * compute_ctl's port neon-control's, which gives it its spec anew, and the collector's
- * scrapes of compute_ctl's metrics. In a branch environment, its lake and compute
- * likewise, but for the scrapes, as the collector scrapes main's compute alone. The object
- * store's parts, of the stack too, are reached as partPolicies and gatewayPolicy say alone.
+ * Neon's services, the lake and their jobs reach each other, but the computes, primary
+ * and read replica, which take their clients' sessions from main's Neon proxy alone,
+ * which every client connects through, and neon-control's, which wakes them and counts
+ * their sessions, and on compute_ctl's port neon-control's, which gives them their specs
+ * anew, and the collector's scrapes of its metrics. In a branch environment, its lake and
+ * computes likewise, but for the scrapes, as the collector scrapes main's computes alone.
+ * The object store's parts, of the stack too, are reached as partPolicies and
+ * gatewayPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
     policy(componentName("neon"), namespace, "neon", {
-      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: [...PARTS, "neon-compute"] }] },
+      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: [...PARTS, ...COMPUTES] }] },
       policyTypes: ["Ingress"],
       ingress: [{ from: [{ podSelector: { matchLabels: STACK } }] }],
     }),
-    policy(componentName("neon-compute"), namespace, "neon", {
-      podSelector: { matchLabels: selectorLabels("neon-compute") },
-      policyTypes: ["Ingress"],
-      ingress: [
-        { from: [ofMain("neon-proxy"), ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
-        { from: [ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] },
-        // The collector scrapes main's compute_ctl alone (collector.ts).
-        ...(namespace === NAMESPACE ? [{ from: [ofMain("collector")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] }] : []),
-      ],
-    }),
+    ...COMPUTES.map((component) =>
+      policy(componentName(component), namespace, "neon", {
+        podSelector: { matchLabels: selectorLabels(component) },
+        policyTypes: ["Ingress"],
+        ingress: [
+          { from: [ofMain("neon-proxy"), ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
+          { from: [ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] },
+          // The collector scrapes main's computes' compute_ctl alone (collector.ts).
+          ...(namespace === NAMESPACE ? [{ from: [ofMain("collector")], ports: [{ protocol: "TCP", port: COMPUTE_CTL_PORT }] }] : []),
+        ],
+      })
+    ),
   ];
 }
 

@@ -401,7 +401,7 @@ describe("neon", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    const count = (name: string | undefined) => (name === "alasio-neon-safekeeper" ? 3 : name === "alasio-neon-compute" ? undefined : 1);
+    const count = (name: string | undefined) => (name === "alasio-neon-safekeeper" ? 3 : name === "alasio-neon-compute" || name === "alasio-neon-compute-ro" ? undefined : 1);
     for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, count(metadata?.name), metadata?.name);
   });
 
@@ -478,6 +478,21 @@ describe("neon", () => {
     assert.equal(decoded.failure.message, "neon.pageserver.scaling.max must equal min: nothing scales it between them");
   });
 
+  test("runs a read replica of main's compute while the lake runs, which the lake loads from, asleep as the compute may be", () => {
+    const objects = install();
+    const replica = one<V1Deployment>(objects, "Deployment", "alasio-neon-compute-ro");
+    const args = container(replica).args ?? [];
+    assert.equal(args[args.indexOf("--compute-id") + 1], "alasio-ro");
+    assert.equal(replica.spec?.replicas, undefined);
+    assert.equal(replica.metadata?.annotations?.["alasio.dev/suspend-after-seconds"], "300");
+    assert.deepEqual(container(replica).resources, { requests: { cpu: "100m", memory: "192Mi" }, limits: { memory: "1Gi" } });
+    assert.equal(one<V1Service>(objects, "Service", "alasio-neon-compute-ro").spec?.publishNotReadyAddresses, true);
+    assert.equal(container(one<V1Deployment>(objects, "Deployment", "alasio-lake")).env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, "alasio-ro");
+    // Without the lake, nothing reads from one.
+    const without = install({ lake: { enabled: false } });
+    assert.deepEqual(without.filter(({ kind, metadata }) => kind !== "NetworkPolicy" && metadata?.name === "alasio-neon-compute-ro"), []);
+  });
+
   test("runs one compute at a time, its spec fetched from neon-control", () => {
     const compute = one<V1Deployment>(install(), "Deployment", "alasio-neon-compute");
     assert.equal(compute.spec?.strategy?.type, "Recreate");
@@ -533,8 +548,8 @@ describe("neon", () => {
     const env = Object.fromEntries((container(control).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual([env["NEON_CONTROLLER_DB_HOST"], env["NEON_COMPUTE_NAME"], env["NAMESPACE"]], ["alasio-neon-controller-db", "alasio-neon-compute", { fieldRef: { fieldPath: "metadata.namespace" } }]);
     assert.deepEqual(one<V1Role>(objects, "Role", "alasio-neon-control").rules, [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get", "patch"] },
-      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute", "alasio-neon-compute-ro"], verbs: ["get", "patch"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute", "alasio-neon-compute-ro"], verbs: ["patch"] },
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
   });
@@ -933,11 +948,11 @@ describe("object store", () => {
     // The filer store takes its filers, the collector and its backups; the Valkey that serves a backup as it is restored, the Job that restores it alone.
     assert.deepEqual(admitted("alasio-seaweedfs-filer-store"), [[["seaweedfs-filer", "collector", "seaweedfs-filer-store-backup"], [6379]]]);
     assert.deepEqual(admitted("alasio-seaweedfs-filer-store-restore-source"), [[["seaweedfs-filer-store-restore"], [6379]]]);
-    // The data stack's pods reach none of the parts but as these say, nor the compute but as its own policy says.
+    // The data stack's pods reach none of the parts but as these say, nor the computes but as their own policies say.
     const stack = one<KubernetesObject & { spec: { podSelector: object } }>(objects, "NetworkPolicy", "alasio-neon").spec.podSelector;
     assert.deepEqual(stack, {
       matchLabels: { "app.kubernetes.io/instance": "alasio", "alasio.dev/stack": "neon" },
-      matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["seaweedfs", "seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "neon-compute"] }],
+      matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: ["seaweedfs", "seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer", "neon-compute", "neon-compute-ro"] }],
     });
     // The lifecycle pass and the backups are admitted by the components their pods carry.
     const pass = one<V1CronJob>(objects, "CronJob", "alasio-seaweedfs-lifecycle").spec?.jobTemplate.spec?.template.metadata?.labels;
@@ -1306,9 +1321,11 @@ describe("telemetry", () => {
     }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "lake").static_configs, [{ targets: ["alasio-lake:9464"] }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "proxy").static_configs, [{ targets: ["alasio-neon-proxy:7001"] }]);
-    // Each pageserver, at its own Service.
+    // The compute and, while the lake runs, its read replica; each pageserver at its own Service.
+    assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "compute").static_configs, [{ targets: ["alasio-neon-compute:3080", "alasio-neon-compute-ro:3080"] }]);
     const scraped = (file: Record<string, unknown>, job: string) =>
       collectorConfig(install(file)).receivers.prometheus.config.scrape_configs.find(({ job_name }: { job_name: string }) => job_name === job).static_configs[0].targets;
+    assert.deepEqual(scraped({ lake: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } }, "compute"), ["alasio-neon-compute:3080"]);
     assert.deepEqual(scraped({ neon: { pageserver: { scaling: { min: 2, max: 2 } } } }, "pageserver"), ["alasio-neon-pageserver-0:9898", "alasio-neon-pageserver-1:9898"]);
     // Each of neon-control's replicas, found among main's pods, as any of them wakes a compute.
     const control = jobs.find(({ job_name }: { job_name: string }) => job_name === "neon-control");
@@ -2074,9 +2091,9 @@ describe("branch environments", () => {
       ["ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes"],
       ["ValidatingAdmissionPolicyBinding", "alasio-branch-try-sandboxes"],
     ]);
-    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake", "alasio-neon-compute"]);
+    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake", "alasio-neon-compute", "alasio-neon-compute-ro"]);
     // Named as main's are, as each namespace is the branch's own.
-    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-lake", "alasio-neon-compute", "alasio-telemetry"]);
+    assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-lake", "alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
   });
 
   test("run an alasio that knows it is the branch, asks main to fork what it inherited with its token, and sends its telemetry tagged with the branch", () => {
@@ -2140,8 +2157,8 @@ describe("branch environments", () => {
     assert.deepEqual([variable(lake, "LAKE_DATABASE_HOST"), variable(lake, "LAKE_DATABASE_PORT"), variable(lake, "LAKE_DATABASE_ENDPOINT")], ["alasio-neon-proxy.alasio.svc", "5432", "branch-try"]);
     assert.equal(compute.spec?.replicas, undefined);
     assert.deepEqual(of<V1Role>("Role", "alasio-neon-control").rules, [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get", "patch"] },
-      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute", "alasio-neon-compute-ro"], verbs: ["get", "patch"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute", "alasio-neon-compute-ro"], verbs: ["patch"] },
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
     assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-neon-control").subjects, [{ kind: "ServiceAccount", name: "alasio-neon-control", namespace: "alasio" }]);
@@ -2150,6 +2167,15 @@ describe("branch environments", () => {
     assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio-neon-compute")).args?.at(-3), "alasio");
     const control = one<V1Deployment>(main, "Deployment", "alasio-neon-control");
     assert.deepEqual([variable(control, "NEON_PAGESERVERS"), variable(control, "NEON_SHARDS")], ["1", "1"]);
+  });
+
+  test("run a read replica of the branch's compute, which its lake loads from", () => {
+    const replica = of<V1Deployment>("Deployment", "alasio-neon-compute-ro");
+    const args = container(replica).args ?? [];
+    assert.equal(args[args.indexOf("--compute-id") + 1], "branch-try-ro");
+    assert.equal(replica.spec?.replicas, undefined);
+    assert.equal(variable(of<V1Deployment>("Deployment", "alasio-lake"), "LAKE_SOURCE_ENDPOINT"), "branch-try-ro");
+    assert.ok(of<KubernetesObject>("NetworkPolicy", "alasio-neon-compute-ro"));
   });
 
   test("confine the branch's sessions to its alasio, and have a policy of its compute's", () => {
@@ -2211,7 +2237,12 @@ describe("branch environments", () => {
     ];
     const proxy = podOf(main, "alasio-neon-proxy", "alasio");
     const control = podOf(main, "alasio-neon-control", "alasio");
-    const computes: [string, Pod][] = [["main's compute", podOf(main, "alasio-neon-compute", "alasio")], ["the branch's compute", podOf(branch, "alasio-neon-compute", "alasio-branch-try")]];
+    const computes: [string, Pod][] = [
+      ["main's compute", podOf(main, "alasio-neon-compute", "alasio")],
+      ["main's read replica", podOf(main, "alasio-neon-compute-ro", "alasio")],
+      ["the branch's compute", podOf(branch, "alasio-neon-compute", "alasio-branch-try")],
+      ["the branch's read replica", podOf(branch, "alasio-neon-compute-ro", "alasio-branch-try")],
+    ];
     for (const [client, pod] of clients) {
       assert.ok(admits(policies, pod, proxy, 5432), `${client} → the proxy`);
       for (const [name, compute] of computes) assert.ok(!admits(policies, pod, compute, 55433), `${client} → ${name}`);
@@ -2224,7 +2255,7 @@ describe("branch environments", () => {
       assert.ok(!admits(policies, proxy, compute, 3080), `the proxy → ${name}'s compute_ctl`);
     }
     const collector = podOf(main, "alasio-collector", "alasio");
-    assert.deepEqual(computes.filter(([, compute]) => admits(policies, collector, compute, 3080)).map(([name]) => name), ["main's compute"]);
+    assert.deepEqual(computes.filter(([, compute]) => admits(policies, collector, compute, 3080)).map(([name]) => name), ["main's compute", "main's read replica"]);
     // Sessions reach no database at all.
     assert.ok(!admits(policies, podIn("alasio-branch-try-sessions", { "alasio.dev/workload": "session" }), proxy, 5432));
   });
@@ -2306,6 +2337,8 @@ describe("scaling", () => {
     assert.deepEqual(held(branchObjects(configOf(), "try")), []);
     // Main's compute is alasio's database, which every turn needs.
     assert.equal(tiers.get("alasio-neon-compute"), "alasio-floor");
+    // Its read replica serves the lake's loads, which may wait.
+    assert.equal(tiers.get("alasio-neon-compute-ro"), "alasio-component");
     assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup", "clone"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
     assert.deepEqual(["alasio", "session", "folder-bayma"].map((name) => tiers.get(name)), Array(3).fill("alasio-turn"));
     // A branch's alasio runs turns; its lake serves no alert, and its compute sleeps.
@@ -2343,6 +2376,7 @@ describe("scaling", () => {
     const recommended = [
       "alasio",
       "alasio-neon-compute",
+      "alasio-neon-compute-ro",
       "alasio-neon-storage-controller",
       "alasio-neon-safekeeper",
       "alasio-neon-pageserver",

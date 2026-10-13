@@ -20,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { COMPUTE_CTL_PORT, COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
+import { COMPUTE_CTL_PORT, COMPUTE_PORT, computeId, MAIN, REPLICA_SUFFIX, replicaId } from "../../../neon/control/branches.ts";
 import { SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
 import { DATABASE, PAGESERVER_ZONE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
@@ -33,6 +33,7 @@ import {
   given,
   helperResources,
   imagePullSecrets,
+  lakeRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   neonName,
@@ -495,11 +496,11 @@ export const PROXY_PORT = 5432;
 
 /**
  * What neon-control may do to the compute of `namespace`, main's or a branch
- * environment's: read its Deployment, and restart it, to start on a spec anew, and scale
- * it, waking it and putting it to sleep, and list its pods, to see one put to sleep gone
- * before it wakes it; a Role there, bound to neon-control's ServiceAccount in main's. Of a
- * Deployment it patches, it may change the restart's annotation alone (./admission.ts's
- * computeRestartPolicy).
+ * environment's, and to its read replica: read its Deployment, and restart it, to start on
+ * a spec anew, and scale it, waking it and putting it to sleep, and list its pods, to see
+ * one put to sleep gone before it wakes it; a Role there, bound to neon-control's
+ * ServiceAccount in main's. Of a Deployment it patches, it may change the restart's
+ * annotation alone (./admission.ts's computeRestartPolicy).
  */
 export function computeScaling(namespace: string): KubernetesObject[] {
   const name = neonName("control");
@@ -509,8 +510,8 @@ export function computeScaling(namespace: string): KubernetesObject[] {
     kind: "Role",
     metadata,
     rules: [
-      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute")], verbs: ["get", "patch"] },
-      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute")], verbs: ["patch"] },
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute"), REPLICA_NAME], verbs: ["get", "patch"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute"), REPLICA_NAME], verbs: ["patch"] },
       // A list is of a namespace's pods, as no name narrows it.
       { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ],
@@ -679,12 +680,27 @@ function proxy(config: InstallConfig): KubernetesObject[] {
  * and none: so applying alasio gives it none, as it would take the count back, and a
  * compute made anew starts at one. Its Service takes connections before its pod is ready,
  * so a wake is answered as soon as Postgres takes them.
+ *
+ * Beside it, where the lake runs, its read replica (REPLICA_NAME), which the lake loads
+ * from: a compute of its own, on the same timeline, streaming its WAL from the
+ * safekeepers, as neon-control specifies it, smaller, woken and put to sleep as the
+ * primary is, of the class of what sleeps, as it serves the loader alone.
  */
 export function compute(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
-  const name = neonName("compute");
-  const component = "neon-compute";
+  return [...computeObjects(config, environment, false), ...(lakeRuns(config) ? computeObjects(config, environment, true) : [])];
+}
+
+/** The name of a read replica's Deployment and Service, beside its primary's in each environment. */
+export const REPLICA_NAME = `${neonName("compute")}${REPLICA_SUFFIX}`;
+
+/** The objects of the environment's primary compute, or with `replica` its read replica's. */
+function computeObjects(config: InstallConfig, environment: Environment, replica: boolean): KubernetesObject[] {
+  const name = replica ? REPLICA_NAME : neonName("compute");
+  const component = replica ? "neon-compute-ro" : "neon-compute";
   const control = `http://${neonName("control")}.${NAMESPACE}.svc:8080`;
-  const { suspendAfter, resources } = config.neon.compute;
+  const { suspendAfter } = config.neon.compute;
+  const resources = replica ? config.neon.readReplica.resources : config.neon.compute.resources;
+  const branch = environment.branch ?? MAIN;
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -701,8 +717,9 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          // Main's is alasio's database, which every turn needs; a branch's, a branch environment's.
-          ...priority(environment.branch === null ? "floor" : "component"),
+          // Main's primary is alasio's database, which every turn needs; a branch's, and every
+          // read replica, serve what may wait.
+          ...priority(environment.branch === null && !replica ? "floor" : "component"),
           ...imagePullSecrets(config),
           // The compute image runs as its own postgres user.
           securityContext: { fsGroup: config.neon.runAsGroup, seccompProfile: { type: "RuntimeDefault" } },
@@ -722,12 +739,13 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
               "--pgbin",
               "/usr/local/bin/postgres",
               "--compute-id",
-              computeId(environment.branch ?? MAIN),
+              replica ? replicaId(branch) : computeId(branch),
               "--control-plane-uri",
               control,
             ],
             env: [
-              secretVariable(name, "NEON_CONTROL_PLANE_TOKEN"),
+              // The primary's token, which fetches its replica's spec too.
+              secretVariable(neonName("compute"), "NEON_CONTROL_PLANE_TOKEN"),
               ...(collectorRuns(config)
                 ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config, environment)]
                 : [{ name: "OTEL_SDK_DISABLED", value: "true" }]),

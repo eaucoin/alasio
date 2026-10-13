@@ -13,6 +13,9 @@
  *   LAKE_DATABASE_PASSWORD                  role `lake`'s: read-only on alasio's sources,
  *                                           owner of the `lake` database, the catalog
  *   LAKE_SOURCE_DATABASE                    alasio's database (default alasio)
+ *   LAKE_SOURCE_ENDPOINT                    the compute the source is read on through the
+ *                                           proxy, its branch's read replica; none when
+ *                                           unset, as straight to a Postgres
  *   LAKE_CATALOG_DATABASE                   the catalog's database (default lake)
  *   LAKE_DATA_PATH                          where the Parquet files go: s3://lake/ on the stack
  *   LAKE_S3_ENDPOINT, LAKE_S3_KEY, LAKE_S3_SECRET  for an s3:// data path
@@ -79,9 +82,15 @@ export interface LakeAccess {
   extensionDirectory: string | null;
 }
 
+/** alasio's database, as the lake reads it: its name, and the options each connection sends, as DatabaseConfig's. */
+export interface SourceConfig {
+  database: string;
+  options: string;
+}
+
 export interface LakeConfig extends LakeAccess {
-  /** alasio's database, which the lake loads from: on the catalog's server, read as the catalog's role. */
-  source: string;
+  /** alasio's database, which the lake loads from: through the catalog's server, read as the catalog's role. */
+  source: SourceConfig;
   intervalMs: number;
   /** Null for a lake that is never maintained. */
   maintenanceIntervalMs: number | null;
@@ -158,7 +167,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
   const branchesUrl = env["LAKE_BRANCHES_URL"]?.trim();
   return {
     ...lake,
-    source: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
+    source: {
+      database: optional(env, "LAKE_SOURCE_DATABASE", "alasio"),
+      options: env["LAKE_SOURCE_ENDPOINT"]?.trim() ? `endpoint=${env["LAKE_SOURCE_ENDPOINT"].trim()}` : "",
+    },
     intervalMs: positive(env, "LAKE_INTERVAL_SECONDS", 300) * 1000,
     maintenanceIntervalMs: maintenanceHours === null ? null : maintenanceHours * 3_600_000,
     branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,

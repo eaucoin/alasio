@@ -15,19 +15,20 @@
  * Neon merges no shards, so fewer are refused (by alasio up, which asks the storage
  * controller first), and alasio removes no pageserver. It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
- * compute its spec, and reports healthy once main's compute can start. Each spec names
- * the pageserver of each of the tenant's shards (ShardLayout), as the storage controller
- * last notified them, as recorded, which any replica may have recorded: on a notification
- * (/notify-attach), after a split, a migration or a pageserver lost, one replica at a time
- * gives every running compute its spec anew (./reconfigure.ts), through compute_ctl's
- * /configure, which reloads it live, and answers 423 while any did not take it, which the
- * storage controller notifies again. It is the control plane of Neon's proxy
- * (./endpoints.ts), which every client connects through: it answers the proxy for
- * roles' secrets, main's from the stack's secrets alone and a branch's from the record,
- * or as last read while the record cannot be, and wakes a compute that sleeps; it serves
- * a compute its spec, likewise, as last read. The replica that leads
- * (./record.ts) repairs every branch's safekeepers, and puts to sleep each compute no
- * client has had a session on for as long as its Deployment says (./computes.ts).
+ * compute and its read replica their specs, and reports healthy once main's compute can
+ * start. Each spec names the pageserver of each of the tenant's shards (ShardLayout), as
+ * the storage controller last notified them, as recorded, which any replica may have
+ * recorded: on a notification (/notify-attach), after a split, a migration or a
+ * pageserver lost, one replica at a time gives every running compute its spec anew
+ * (./reconfigure.ts), through compute_ctl's /configure, which reloads it live, and answers
+ * 423 while any did not take it, which the storage controller notifies again. It is the
+ * control plane of Neon's proxy (./endpoints.ts), which every client connects through: it
+ * answers the proxy for roles' secrets, main's from the stack's secrets alone and a
+ * branch's from the record, or as last read while the record cannot be, and wakes a
+ * compute that sleeps; it serves a compute its spec, likewise, as last read. The replica
+ * that leads (./record.ts) repairs every branch's safekeepers, and puts to sleep each
+ * compute no client has had a session on for as long as its Deployment says
+ * (./computes.ts).
  *
  * A compute fetches its spec as Neon's compute_ctl does from a control plane
  * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with its
@@ -64,8 +65,8 @@
  * - `POST /computes/<id>/wake`: wakes the compute `id` (`alasio`, or `branch-<name>`),
  *   as the proxy's `wake_compute` does, for alasio's command line, which works in it
  *   (200, `{ address }`); 404 for a compute of no ready branch, or not deployed.
- * - `GET /computes`: every ready branch's compute, its namespace, and when it was last
- *   asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
+ * - `GET /computes`: every ready branch's compute and read replica, its namespace, and when
+ *   it was last asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
  * - `GET /tenant`: the tenant's shards, their stripe, and each pageserver, with how many of
  *   them it holds (200, `{ shards, stripeSize, pageservers }`), for `alasio status`.
  *
@@ -95,16 +96,17 @@ import {
   type Branch,
   BranchError,
   branchNamed,
-  branchOfCompute,
   branchPoint,
   branchRequest,
   type BranchRequest,
   branchView,
   callScopes,
   COMPUTE_PORT,
+  type ComputeCredentials,
   type ComputeStack,
   computeConfig,
   computeId,
+  computeNamed,
   computeOfToken,
   creationRefused,
   deleting,
@@ -117,6 +119,8 @@ import {
   placementOf,
   PROXY_PATHS,
   type ReadyBranch,
+  REPLICA_SUFFIX,
+  replicaId,
   type Safekeeper,
   safekeepersNotified,
   sameLayout,
@@ -143,7 +147,7 @@ import {
 import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
 import { bearsScope, computeCtlToken, publicJwks, signToken } from "./jwt.ts";
 import { createControlMetrics } from "./metrics.ts";
-import { reconcile, reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
+import { reconcile, type Reconfigured, reconfigure, settledLayout, tookLayout } from "./reconfigure.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { scramVerifier } from "./scram.ts";
 import { MONITOR_ROLE, type StackSecrets } from "./secrets.ts";
@@ -560,21 +564,43 @@ async function repairEverySafekeeper(branches: readonly Branch[]): Promise<void>
   }
 }
 
-/** The compute of the branch `name`: main's in neon-control's namespace, any other's in its branch environment's. */
-const computeOf = (name: string): ComputeRef => ({ namespace: name === MAIN ? NAMESPACE : branchNamespace(name), name: COMPUTE_NAME });
+/** A compute of a ready branch's: its primary, or its read replica. */
+interface Compute {
+  name: string;
+  replica: boolean;
+}
 
-/** Where the branch `name`'s compute's Service is, from any namespace. */
-const hostOf = (name: string): string => `${COMPUTE_NAME}.${computeOf(name).namespace}.svc.cluster.local`;
+/** The compute's id: the primary's computeId, a replica's replicaId. */
+const idOf = ({ name, replica }: Compute): string => (replica ? replicaId(name) : computeId(name));
 
-/** What the clients of the branch `name`'s compute are doing, counted as neon-control's own role there (./computes.ts); fails while it cannot log in. */
-function activityOn(name: string): Promise<Activity> {
-  return computeActivity(hostOf(name), COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
+/** The name of every compute's Deployment and Service, a replica's. */
+const REPLICA_NAME = `${COMPUTE_NAME}${REPLICA_SUFFIX}`;
+
+/** The compute's Deployment: main's in neon-control's namespace, any other's in its branch environment's. */
+const computeOf = ({ name, replica }: Compute): ComputeRef => ({
+  namespace: name === MAIN ? NAMESPACE : branchNamespace(name),
+  name: replica ? REPLICA_NAME : COMPUTE_NAME,
+});
+
+/** Where the compute's Service is, from any namespace. */
+const hostOf = (compute: Compute): string => {
+  const { namespace, name } = computeOf(compute);
+  return `${name}.${namespace}.svc.cluster.local`;
+};
+
+/**
+ * What the clients of the compute are doing, counted as neon-control's own role there
+ * (./computes.ts), with its primary's password, which a replica has of its primary; fails
+ * while it cannot log in.
+ */
+function activityOn(compute: Compute): Promise<Activity> {
+  return computeActivity(hostOf(compute), COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(compute.name)));
 }
 
 /** Waits until the compute has no pod, one stopping included, by `deadline`. */
 async function untilGone(ref: ComputeRef, deployment: ComputeDeployment, deadline: number): Promise<void> {
   while ((await computePods(ref, deployment)) > 0) {
-    if (Date.now() > deadline) throw new Error(`${ref.namespace}'s compute did not stop in time`);
+    if (Date.now() > deadline) throw new Error(`${ref.namespace}'s ${ref.name} did not stop in time`);
     await sleep(POLL_MS);
   }
 }
@@ -583,26 +609,26 @@ async function untilGone(ref: ComputeRef, deployment: ComputeDeployment, deadlin
 const waking = new Map<string, Promise<boolean>>();
 
 /**
- * Wakes the branch `name`'s compute (wakeCompute), and records it asked to wake, which
- * keeps it awake a while longer (suspendIdle), where the record can be written, as a
- * compute that runs needs nothing of it to be reached. One that sleeps it scales to one
- * under the compute's lock, waited for as long as the wake may take, longer than a sleep
- * holds it, so it never finds the pod a sleep is stopping, once the pod put to sleep is
- * gone, so no two serve the timeline at once. Then it waits until neon-control logs in to
- * it, so its clients may (./computes.ts), for as long as WAKE_PATIENCE_MS in all. Whether
- * it slept. A wake asked again, by the proxy after a restart of neon-control, finds it
- * scaling, and waits again.
+ * Wakes the compute (wakeCompute), and records it asked to wake, which keeps it awake a
+ * while longer (suspendIdle), where the record can be written, as a compute that runs
+ * needs nothing of it to be reached. One that sleeps it scales to one under the
+ * compute's lock, waited for as long as the wake may take, longer than a sleep holds it,
+ * so it never finds the pod a sleep is stopping, once the pod put to sleep is gone, so no
+ * two serve the timeline at once. Then it waits until neon-control logs in to it, so its
+ * clients may (./computes.ts), for as long as WAKE_PATIENCE_MS in all. Whether it slept.
+ * A wake asked again, by the proxy after a restart of neon-control, finds it scaling,
+ * and waits again.
  */
-function wake(name: string): Promise<boolean> {
-  const id = computeId(name);
+function wake(compute: Compute): Promise<boolean> {
+  const id = idOf(compute);
   const running = waking.get(id);
   if (running) return running;
   const started = Date.now();
   const deadline = started + WAKE_PATIENCE_MS;
-  const ref = computeOf(name);
+  const ref = computeOf(compute);
   const deployment = async (): Promise<ComputeDeployment> => {
     const found = await computeDeployment(ref);
-    if (!found) throw new BranchError(404, `${name}'s compute is not deployed`);
+    if (!found) throw new BranchError(404, `${id} is not deployed`);
     return found;
   };
   const woke = wakeCompute({
@@ -612,7 +638,7 @@ function wake(name: string): Promise<boolean> {
     untilGone: (now) => untilGone(ref, now, deadline),
     scaleUp: () => scaleCompute(ref, 1),
     accepts: () =>
-      activityOn(name).then(() => true, (error: unknown) => {
+      activityOn(compute).then(() => true, (error: unknown) => {
         if (Date.now() > deadline) throw new Error(`${id} did not take connections in ${WAKE_PATIENCE_MS} ms: ${errorText(error)}`);
         return false;
       }),
@@ -634,10 +660,10 @@ function wake(name: string): Promise<boolean> {
 /** Each running compute's idleness, as the replica that leads last counted it. */
 const idle = new Map<string, Idleness>();
 
-/** What the branch `name`'s compute's clients have done, and when it was last asked to wake. */
-async function useOf(name: string): Promise<Use> {
-  const id = computeId(name);
-  const [activity, computes] = await Promise.all([activityOn(name), record.computes()]);
+/** What the compute's clients have done, and when it was last asked to wake. */
+async function useOf(compute: Compute): Promise<Use> {
+  const id = idOf(compute);
+  const [activity, computes] = await Promise.all([activityOn(compute), record.computes()]);
   return { ...activity, wokenAt: computes.find((compute) => compute.id === id)?.wokenAt ?? null };
 }
 
@@ -648,27 +674,27 @@ async function useOf(name: string): Promise<Use> {
  * waiting until its pod is gone, so a wake after finds it gone. One whose lock a wake
  * holds is left until the next round. Says how many replicas each compute runs.
  */
-async function suspendIdle(names: readonly string[]): Promise<void> {
+async function suspendIdle(computes: readonly Compute[]): Promise<void> {
   const replicas = new Map<string, number>();
   // A compute deleted since is counted no more.
-  const ids = new Set(names.map(computeId));
+  const ids = new Set(computes.map(idOf));
   for (const id of idle.keys()) if (!ids.has(id)) idle.delete(id);
-  for (const name of names) {
-    const id = computeId(name);
+  for (const compute of computes) {
+    const id = idOf(compute);
     try {
-      const ref = computeOf(name);
+      const ref = computeOf(compute);
       const deployment = await computeDeployment(ref);
       if (deployment) replicas.set(id, deployment.replicas);
       if (!deployment || deployment.suspendAfterMs === null || deployment.replicas === 0 || deployment.ready === 0) {
         idle.delete(id);
         continue;
       }
-      const counted = idleness(idle.get(id), await useOf(name), Date.now());
+      const counted = idleness(idle.get(id), await useOf(compute), Date.now());
       idle.set(id, counted);
       if (!suspendDue(counted, Date.now(), deployment.suspendAfterMs)) continue;
       const suspendAfterMs = deployment.suspendAfterMs;
       const slept = await record.tryComputeLocked(id, async () => {
-        const recounted = idleness(counted, await useOf(name), Date.now());
+        const recounted = idleness(counted, await useOf(compute), Date.now());
         if (recounted.since === null) {
           idle.set(id, recounted);
           return false;
@@ -689,6 +715,10 @@ async function suspendIdle(names: readonly string[]): Promise<void> {
   }
   metrics.replicas(replicas);
 }
+
+/** Every ready branch's computes: its primary, and its read replica, where it runs one. */
+const computesOf = (branches: readonly Branch[]): Compute[] =>
+  branches.filter(({ state }) => state === "ready").flatMap(({ name }) => [{ name, replica: false }, { name, replica: true }]);
 
 /** Whether this replica led at its last round, which it says when that changes. */
 let led = false;
@@ -713,7 +743,7 @@ async function lead(): Promise<void> {
     }
     const branches = await record.branches();
     await repairEverySafekeeper(branches);
-    await suspendIdle(branches.filter(({ state }) => state === "ready").map(({ name }) => name));
+    await suspendIdle(computesOf(branches));
     await balanceShards();
     await reconcileLayout();
   } finally {
@@ -808,29 +838,33 @@ async function bootstrap(): Promise<void> {
  */
 async function configureRunning(branches: readonly Branch[], layout: ShardLayout): Promise<number> {
   const given = await record.givenLayouts();
-  const stale = branches.filter((branch): branch is ReadyBranch => {
-    const had = given.get(computeId(branch.name));
-    return branch.state === "ready" && !(had && sameLayout(had, layout));
+  const stale = computesOf(branches).filter((compute) => {
+    const had = given.get(idOf(compute));
+    return !(had && sameLayout(had, layout));
   });
-  const outcomes = await Promise.all(stale.map(async (branch) => {
-    const id = computeId(branch.name);
-    const ref = computeOf(branch.name);
-    const token = computeCtlToken(privateKeyPem, id);
-    const reconfigured = await reconfigure(layout, {
-      awake: async () => (await computeDeployment(ref))?.replicas === 1,
-      running: async () => {
-        const deployment = await computeDeployment(ref);
-        return deployment !== null && await computeRuns(ref, deployment);
-      },
-      configure: (to) => configureCompute(hostOf(branch.name), token, computeConfig(branch, stack, to)),
-      status: () => computeCtlStatus(hostOf(branch.name), token),
-      restart: () => restartCompute(ref),
-      gave: (to) => record.gaveLayout(id, to),
-    });
-    if (!tookLayout(reconfigured)) log("compute not given the layout yet", { compute: id, ...reconfigured });
-    return reconfigured;
-  }));
+  // Ready, as computesOf gave only those.
+  const outcomes = await Promise.all(stale.map((compute) => giveSpec(compute, branchNamed(branches, compute.name) as ReadyBranch, layout)));
   return outcomes.filter((reconfigured) => !tookLayout(reconfigured)).length;
+}
+
+/** Gives `compute`, of `branch`, its spec anew, with `layout`, as ./reconfigure.ts decides, saying where it did not take it. */
+async function giveSpec(compute: Compute, branch: ReadyBranch, layout: ShardLayout): Promise<Reconfigured> {
+  const id = idOf(compute);
+  const ref = computeOf(compute);
+  const token = computeCtlToken(privateKeyPem, id);
+  const reconfigured = await reconfigure(layout, {
+    awake: async () => (await computeDeployment(ref))?.replicas === 1,
+    running: async () => {
+      const deployment = await computeDeployment(ref);
+      return deployment !== null && await computeRuns(ref, deployment);
+    },
+    configure: (to) => configureCompute(hostOf(compute), token, computeConfig(branch, stack, to, { replica: compute.replica })),
+    status: () => computeCtlStatus(hostOf(compute), token),
+    restart: () => restartCompute(ref),
+    gave: (to) => record.gaveLayout(id, to),
+  });
+  if (!tookLayout(reconfigured)) log("compute not given its spec anew yet", { compute: id, ...reconfigured });
+  return reconfigured;
 }
 
 /** Whether the request bears a token of a scope its call is taken with (callScopes). */
@@ -856,27 +890,36 @@ function answer(response: ServerResponse, status: number, body?: unknown): void 
   response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 }
 
-/** Main's compute's id, which the proxy is answered for from the stack's secrets alone, without the record. */
-const MAIN_COMPUTE = computeId(MAIN);
+/**
+ * The compute the proxy names by `endpoint`: main's from the stack's secrets alone, so its
+ * clients reach it while the record cannot be read, its read replica's likewise; a
+ * branch's from the record, or as last read. Its credentials are its primary's.
+ */
+async function proxiedCompute(endpoint: string): Promise<{ compute: Compute; credentials: ComputeCredentials | null } | undefined> {
+  for (const replica of [false, true]) {
+    if (endpoint === idOf({ name: MAIN, replica })) return { compute: { name: MAIN, replica }, credentials: null };
+  }
+  const named = computeNamed(await knownBranches(), endpoint);
+  return named && { compute: { name: named.branch.name, replica: named.replica }, credentials: named.branch.compute };
+}
 
 /**
  * Answers Neon's proxy (./endpoints.ts) at `path`: a role's secret, or a compute woken.
- * Main's from the stack's secrets alone, so its clients reach it while the record cannot be
- * read; a branch's from the record, or as last read. Every refusal is Neon's error; a
- * wake that fails is one the proxy asks again.
+ * Every refusal is Neon's error; a wake that fails is one the proxy asks again.
  */
 async function answerProxy(request: IncomingMessage, response: ServerResponse, path: string): Promise<void> {
   const query = proxyQuery(request.url ?? "");
-  const branch = !query ? undefined : query.endpoint === MAIN_COMPUTE ? { name: MAIN, compute: null } : branchOfCompute(await knownBranches(), query.endpoint);
-  if (!query || !branch) return answer(response, 404, controlPlaneError("ENDPOINT_NOT_FOUND", `no endpoint ${query?.endpoint ?? ""}`));
+  const named = query ? await proxiedCompute(query.endpoint) : undefined;
+  if (!query || !named) return answer(response, 404, controlPlaneError("ENDPOINT_NOT_FOUND", `no endpoint ${query?.endpoint ?? ""}`));
   if (path === "/get_endpoint_access_control") {
-    const secret = query.role === null ? null : roleSecret(branch.compute, query.role, stack.verifiers);
+    const secret = query.role === null ? null : roleSecret(named.credentials, query.role, stack.verifiers);
     if (secret === null) return answer(response, 404, controlPlaneError("RESOURCE_NOT_FOUND", `no role ${query.role ?? ""} on ${query.endpoint}`));
     return answer(response, 200, { role_secret: secret, project_id: "alasio", allowed_ips: null });
   }
   try {
-    const slept = await wake(branch.name);
-    return answer(response, 200, woken(computeAddress(COMPUTE_NAME, computeOf(branch.name).namespace), branch.name, query.endpoint, slept));
+    const slept = await wake(named.compute);
+    const { name, namespace } = computeOf(named.compute);
+    return answer(response, 200, woken(computeAddress(name, namespace), named.compute.name, query.endpoint, slept));
   } catch (error) {
     if (error instanceof BranchError && error.status === 404) return answer(response, 404, controlPlaneError("ENDPOINT_NOT_FOUND", error.message));
     log("wake failed", { compute: query.endpoint, error: errorText(error) });
@@ -884,15 +927,27 @@ async function answerProxy(request: IncomingMessage, response: ServerResponse, p
   }
 }
 
-/** Every ready branch's compute, where it runs, and when it was last asked to wake and put to sleep (./record.ts), for alasio's command line. */
+/**
+ * Every ready branch's compute and read replica, where it runs, and when it was last asked
+ * to wake and put to sleep (./record.ts), for alasio's command line.
+ */
 async function computesView(): Promise<object> {
-  const [branches, computes] = await Promise.all([record.branches(), record.computes()]);
+  const [branches, times] = await Promise.all([record.branches(), record.computes()]);
+  const at = (ms: number | null | undefined) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
+  // A read replica where its environment runs one, as the lake runs there.
+  const computes = computesOf(branches);
+  const run = await Promise.all(computes.map(async (compute) => !compute.replica || (await computeDeployment(computeOf(compute))) !== null));
   return {
-    computes: branches.filter(({ state }) => state === "ready").map(({ name }) => {
-      const id = computeId(name);
-      const times = computes.find((compute) => compute.id === id);
-      const at = (ms: number | null | undefined) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
-      return { id, namespace: computeOf(name).namespace, wokenAt: at(times?.wokenAt), suspendedAt: at(times?.suspendedAt) };
+    computes: computes.filter((_, index) => run[index]).map((compute) => {
+      const id = idOf(compute);
+      const recorded = times.find((each) => each.id === id);
+      return {
+        id,
+        namespace: computeOf(compute).namespace,
+        name: computeOf(compute).name,
+        wokenAt: at(recorded?.wokenAt),
+        suspendedAt: at(recorded?.suspendedAt),
+      };
     }),
   };
 }
@@ -931,14 +986,15 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     // Until bootstrapped there is no spec yet, nor perhaps a record; compute_ctl retries,
     // and then its container is restarted.
     if (!ready) return answer(response, 503);
-    // A compute's token is its own: main's the stack's, a branch's the one it was created with.
+    // A compute's token is its own: main's the stack's, a branch's the one it was created
+    // with, which its read replica holds too.
     const id = decodeURIComponent(spec[1] ?? "");
     const branches = await knownBranches();
     const holder = computeOfToken(branches, request.headers.authorization, secrets.computeControlToken);
     if (holder === null) return answer(response, 401);
-    if (holder !== id) return answer(response, 403, { error: `the token is not the compute ${id}'s` });
-    const branch = branchOfCompute(branches, id);
-    if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
+    const named = computeNamed(branches, id);
+    if (holder !== (named ? computeId(named.branch.name) : id)) return answer(response, 403, { error: `the token is not the compute ${id}'s` });
+    if (!named) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
     // Where its spec says the shards are, recorded for a new layout's (configureRunning) before
     // it is answered, and read again after, so one notified meanwhile is in this spec or in
     // the record of it; if the record can be written.
@@ -946,7 +1002,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
       log("layout given not recorded", { compute: id, error: errorText(error) });
       return currentLayout();
     });
-    return answer(response, 200, { ...computeConfig(branch, stack, layout), status: "attached" });
+    return answer(response, 200, { ...computeConfig(named.branch, stack, layout, { replica: named.replica }), status: "attached" });
   }
   const path = new URL(url, "http://neon-control").pathname;
   const proxied = method === "GET" && PROXY_PATHS.includes(path);
@@ -969,10 +1025,12 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   if (proxied) return answerProxy(request, response, path);
   if (wakeAsked) {
     const id = decodeURIComponent(wakeAsked[1] ?? "");
-    const compute = branchOfCompute(await record.branches(), id);
-    if (!compute) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
-    await wake(compute.name);
-    return answer(response, 200, { address: computeAddress(COMPUTE_NAME, computeOf(compute.name).namespace) });
+    const named = computeNamed(await record.branches(), id);
+    if (!named) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
+    const compute = { name: named.branch.name, replica: named.replica };
+    await wake(compute);
+    const { name, namespace } = computeOf(compute);
+    return answer(response, 200, { address: computeAddress(name, namespace) });
   }
   if (url === "/computes") return answer(response, 200, await computesView());
   if (url === "/tenant") return answer(response, 200, await tenantView());
@@ -1003,13 +1061,18 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   }
   if (url === "/notify-safekeepers") {
     // A timeline's safekeepers migrated, which alasio never starts itself: the branch's
-    // spec and repairs follow them from now on, and its compute at its next start.
+    // spec and repairs follow them from now on, and its compute at its next start; its read
+    // replica, which streams from them, is given its spec anew now, naming them.
     const notified = safekeepersNotified(await jsonBody(request));
-    await record.changing(async ({ branches, save }) => {
+    const placed = await record.changing(async ({ branches, save }) => {
       const next = withNotifiedPlacement(branches, notified);
       if (next) await save(next);
       log("compute hook /notify-safekeepers", { timelineId: notified.timelineId, placement: notified.placement, recorded: next !== null });
+      return (next ?? branches).find((branch): branch is ReadyBranch => branch.state === "ready" && branch.timelineId === notified.timelineId) ?? null;
     });
+    // Asked again until it takes it, as notified again after a 423.
+    const replica = placed && await giveSpec({ name: placed.name, replica: true }, placed, await currentLayout());
+    if (replica && !tookLayout(replica)) return answer(response, 423, { error: `${placed.name}'s read replica did not take its safekeepers yet; notify again` });
     return answer(response, 200);
   }
   if (method === "GET") return answer(response, 200, { branches: (await record.branches()).map(branchView) });

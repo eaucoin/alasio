@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, test } from "node:test";
 
-import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1PriorityClass, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
 import { cpuMillis } from "../../cli/src/capacity.ts";
@@ -431,10 +431,15 @@ export function neonStack(): void {
         // Two of three keep the quorum while it is away.
         await kube.patch(set, { spec: { replicas: 2 } });
         await awaitReplaced([pod]);
-        // What its node has left, its room with it, taken by a pod of the floor that prefers its node and may run on any.
+        // What its node has left, its room with it, taken by a pod of the floor that prefers its node and may run on any:
+        // all but what runs at the floor or above, as it takes the place of any pod below the floor there, a read
+        // replica's, which it does only where no other node takes it, so the others are cordoned until it runs.
+        const others = (await kube.list<V1Node>("Node")).map(({ metadata }) => metadata?.name ?? "").filter((other) => other !== node);
+        const cordoned = (unschedulable: boolean) => Promise.all(others.map((other) => kube.patch(ref("Node", other), { spec: { unschedulable } })));
         const allocatable = await kube.get<V1Node>(ref("Node", node));
+        const floor = (await kube.get<V1PriorityClass>(ref("PriorityClass", `${RELEASE}-floor`)))?.value ?? 0;
         const pods = await kube.list<V1Pod>("Pod", { fieldSelector: `spec.nodeName=${node},status.phase!=Succeeded,status.phase!=Failed` });
-        const requested = pods.reduce((sum, { spec }) => sum + (spec ? cpuRequested(spec) : 0), 0);
+        const requested = pods.filter(({ spec }) => (spec?.priority ?? 0) >= floor).reduce((sum, { spec }) => sum + (spec ? cpuRequested(spec) : 0), 0);
         const free = cpuMillis(allocatable?.status?.allocatable?.["cpu"] ?? "0") - requested;
         assert.ok(free > 0, `${node} has ${free}m of CPU free`);
         const filler = `${RELEASE}-e2e-filler`;
@@ -461,6 +466,7 @@ export function neonStack(): void {
           },
         };
         try {
+          await cordoned(true);
           await kube.apply(deployment);
           const placed = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).find(({ spec, status }) => spec?.nodeName === node && status?.phase === "Running");
           const deadline = Date.now() + 120_000;
@@ -470,12 +476,14 @@ export function neonStack(): void {
             await sleep(2000);
             first = await placed();
           }
+          await cordoned(false);
           await kube.patch(set, { spec: { replicas: 3 } });
           await awaitPodReady(name, 180_000);
           assert.equal((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.spec?.nodeName, node);
           // The filler gave its place, and is made again, elsewhere where there is room.
           await awaitReplaced([first], 30_000);
         } finally {
+          await cordoned(false);
           await kube.remove(ref("Deployment", filler, NAMESPACE)).catch(() => {});
           await kube.patch(set, { spec: { replicas: 3 } });
         }

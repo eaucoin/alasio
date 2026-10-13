@@ -42,7 +42,7 @@ import { priority } from "./priorities.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { DRIVER_METRICS_PORT, DRIVER_POD_NAME, JUICEFS_METRICS_PORT, MOUNT_POD_NAME } from "./juicefs-csi.ts";
 import { LAKE_INTAKE_PORT } from "./lake.ts";
-import { pageserverName } from "./neon.ts";
+import { pageserverName, REPLICA_NAME } from "./neon.ts";
 import { COMPONENTS, FILER_STORE, FILER_STORE_USERS, METRICS_PORT as SEAWEEDFS_METRICS_PORT } from "./object-store.ts";
 import { VALKEY_PORT, valkeyPassword } from "./valkey.ts";
 import { VALKEY } from "./workspace-storage.ts";
@@ -107,7 +107,7 @@ function scrapes(config: InstallConfig): object[] {
     pageserver: Array.from({ length: neon.pageserver.scaling.min }, (_, index) => `${pageserverName(index)}:9898`),
     "storage-controller": [`${neonName("storage-controller")}:1234`],
     "storage-broker": [`${neonName("storage-broker")}:50051`],
-    compute: [`${neonName("compute")}:${COMPUTE_CTL_PORT}`],
+    compute: [`${neonName("compute")}:${COMPUTE_CTL_PORT}`, ...(lakeRuns(config) ? [`${REPLICA_NAME}:${COMPUTE_CTL_PORT}`] : [])],
     proxy: [`${neonName("proxy")}:7001`],
     safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),

@@ -16,6 +16,7 @@ import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, re
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
+import { REPLICA_NAME } from "../manifests/neon.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
@@ -129,12 +130,12 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
   });
 
 /**
- * A compute that is ready: asleep at no replica, as neon-control puts one no client has
- * used for a while, until the next connection wakes it, or awake; and when it was last
- * woken, as neon-control recorded it.
+ * A compute that is ready, a primary or a read replica: asleep at no replica, as
+ * neon-control puts one no client has used for a while, until the next connection wakes
+ * it, or awake; and when it was last woken, as neon-control recorded it.
  */
 function describeCompute(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>): string {
-  const woken = computes.get(workload.metadata?.namespace ?? "")?.wokenAt;
+  const woken = computes.get(`${workload.metadata?.namespace ?? ""}/${workload.metadata?.name ?? ""}`)?.wokenAt;
   return `${workload.spec?.replicas === 0 ? "asleep" : "awake"}${woken ? `, last woken ${woken}` : ""}`;
 }
 
@@ -193,7 +194,8 @@ export const status = Command.make("status", {}, () =>
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name))}; `;
           const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
-            yield* Console.log(`  ${describeRef(refOf(workload))}: ${workload.metadata?.name === neonName("compute") ? describeCompute(workload, computes) : "ready"}`);
+            const isCompute = workload.metadata?.name === neonName("compute") || workload.metadata?.name === REPLICA_NAME;
+            yield* Console.log(`  ${describeRef(refOf(workload))}: ${isCompute ? describeCompute(workload, computes) : "ready"}`);
             yield* Console.log(sizing);
             continue;
           }

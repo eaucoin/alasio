@@ -14,6 +14,7 @@ import {
   type ComputeStack,
   computeConfig,
   computeId,
+  computeNamed,
   computeOfToken,
   creationRefused,
   deleting,
@@ -25,6 +26,7 @@ import {
   placementOf,
   PROXY_SCOPE,
   type ReadyBranch,
+  replicaId,
   safekeepersNotified,
   sameLayout,
   type ShardLayout,
@@ -289,6 +291,41 @@ test("a compute reads each shard from the pageserver the storage controller plac
   assert.equal(two.shard_stripe_size, 2048);
   // The tenant's own id, never a shard's.
   assert.equal(two.tenant_id, "t");
+});
+
+test("a branch's read replica's spec streams the branch's timeline from its safekeepers, makes no role, and syncs with none", () => {
+  const { spec } = computeConfig(dev, stack, ONE_SHARD, { replica: true });
+  assert.equal(spec.mode, "Replica");
+  assert.deepEqual([spec.timeline_id, spec.pageserver_connstring], [DEV_TIMELINE, computeConfig(dev, stack, ONE_SHARD).spec.pageserver_connstring]);
+  assert.deepEqual([spec.cluster.roles, spec.cluster.databases, spec.safekeeper_connstrings], [[], [], []]);
+  assert.equal(spec.cluster.settings.find(({ name }) => name === "shared_buffers")?.value, "64MB");
+  assert.equal(
+    spec.cluster.postgresql_conf,
+    [
+      "primary_conninfo = 'host=sk-1,sk-2,sk-0 port=5454,5454,5454 options=''-c timeline_id=" + DEV_TIMELINE + " tenant_id=t'' application_name=replica replication=true password=token'",
+      `primary_slot_name = 'repl_${DEV_TIMELINE}_'`,
+      "hot_standby = on",
+      "hot_standby_feedback = on",
+      "max_standby_streaming_delay = 5min",
+      "recovery_prefetch = off",
+      "",
+    ].join("\n"),
+  );
+  assert.equal(computeConfig(dev, stack, ONE_SHARD).spec.cluster.postgresql_conf, undefined, "a primary streams to the safekeepers, as compute_ctl sets it to");
+});
+
+describe("a compute named", () => {
+  test("is a ready branch's primary, or with -ro its read replica", () => {
+    assert.deepEqual(computeNamed([main, dev], "alasio"), { branch: main, replica: false });
+    assert.deepEqual(computeNamed([main, dev], "alasio-ro"), { branch: main, replica: true });
+    assert.deepEqual(computeNamed([main, dev], replicaId("dev")), { branch: dev, replica: true });
+    assert.equal(computeNamed([main, dev], "branch-other-ro"), undefined);
+  });
+
+  test("leaves no branch a name the replica's would take", () => {
+    assert.match(nameProblem("try-ro") ?? "", /does not end in -ro/u);
+    assert.equal(nameProblem("try-row"), null);
+  });
 });
 
 describe("the shards", () => {

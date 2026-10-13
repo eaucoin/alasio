@@ -1423,7 +1423,7 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.throws(() => loadConfig(base), /LAKE_S3_ENDPOINT is not set/);
   assert.throws(() => loadConfig({ ...base, LAKE_DATA_PATH: "/data", LAKE_INTERVAL_SECONDS: "soon" }), /LAKE_INTERVAL_SECONDS must be a positive number/);
   const config = loadConfig({ ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_S3_KEY: "k", LAKE_S3_SECRET: "s" });
-  assert.deepEqual([config.source, config.catalog.database, config.catalog.user, config.intervalMs], ["alasio", "lake", "lake", 300_000]);
+  assert.deepEqual([config.source, config.catalog.database, config.catalog.user, config.intervalMs], [{ database: "alasio", options: "" }, "lake", "lake", 300_000]);
   // The query endpoint has the reader's credentials alone.
   const reader = { ...base, LAKE_S3_ENDPOINT: "http://seaweedfs:8333", LAKE_READER_PASSWORD: "r", LAKE_READER_S3_KEY: "rk", LAKE_READER_S3_SECRET: "rs" };
   assert.throws(() => loadEndpointConfig(reader), /LAKE_QUERY_TOKEN is not set/);
@@ -1442,6 +1442,9 @@ test("the lake's configuration names what is missing and refuses what is malform
   assert.equal(loadConfig(local).catalog.options, "");
   assert.equal(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "branch-try" }).catalog.options, "endpoint=branch-try");
   assert.equal(loadEndpointConfig({ ...reader, LAKE_QUERY_TOKEN: "t", LAKE_DATABASE_ENDPOINT: "alasio" }).catalog.options, "endpoint=alasio");
+  // Its source on the read replica, its catalog on the primary, each named apart.
+  assert.deepEqual(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "alasio", LAKE_SOURCE_ENDPOINT: "alasio-ro" }).source, { database: "alasio", options: "endpoint=alasio-ro" });
+  assert.deepEqual(loadConfig({ ...local, LAKE_DATABASE_ENDPOINT: "alasio" }).source, { database: "alasio", options: "" });
   assert.equal(conninfo("lake"), "dbname='lake' connect_timeout=60");
   assert.equal(conninfo("it's", "endpoint=alasio"), "dbname='it\\'s' connect_timeout=60 options='endpoint=alasio'");
 });

@@ -1211,7 +1211,7 @@ interface FakeNeon {
   /** The active turns a branch's database has. */
   turns: string;
   /** Each compute as neon-control lists it. */
-  readonly computes: { id: string; namespace: string; wokenAt: string | null; suspendedAt: string | null }[];
+  readonly computes: { id: string; namespace: string; name: string; wokenAt: string | null; suspendedAt: string | null }[];
   /** Neon's tenant as neon-control has it; null while it cannot say (503). */
   tenant: TenantView | null;
   /** Neon's storage as the storage controller holds it. */
@@ -1310,7 +1310,9 @@ test("status says of each compute whether it is awake or asleep, and when neon-c
   let run = await alasio(["status"]);
   succeeded(run);
   assert.ok(run.printed.includes("  Deployment alasio/alasio-neon-compute: awake"), run.printed.join("\n"));
-  neon.computes.push({ id: "alasio", namespace: "alasio", wokenAt: "2026-10-12T08:00:00.000Z", suspendedAt: null });
+  // Its read replica, a compute too.
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-neon-compute-ro: awake"), run.printed.join("\n"));
+  neon.computes.push({ id: "alasio", namespace: "alasio", name: "alasio-neon-compute", wokenAt: "2026-10-12T08:00:00.000Z", suspendedAt: null });
   compute.spec["replicas"] = 0;
   run = await alasio(["status"]);
   succeeded(run);
@@ -1554,7 +1556,7 @@ test("branch list says each branch, what it is a branch of, its age, the release
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const listed = await alasio(["branch", "list"]);
   succeeded(listed);
-  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.6 GiB requested, 0 MiB used"]);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.8 GiB requested, 0 MiB used"]);
 });
 
 test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {
@@ -1578,6 +1580,8 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   const deleted = kube.changes.filter(({ method }) => method === "DELETE").map(({ path }) => path);
   const at = (path: string) => deleted.indexOf(path);
   assert.ok(at(BRANCH_DEPLOYMENT) >= 0 && at(BRANCH_DEPLOYMENT) < at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute"), deleted.join("\n"));
+  // Its read replica too, before its branch of Neon is deleted.
+  assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-neon-compute-ro") >= 0, deleted.join("\n"));
   assert.ok(at("/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio-lake") < at("/api/v1/namespaces/alasio-branch-try"));
   assert.deepEqual(neon.branches.map(({ name }) => name), ["main"]);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);

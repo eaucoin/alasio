@@ -359,6 +359,11 @@ const Neon = Schema.Struct({
     Schema.Int.check(Schema.makeFilter((shards) => (shards >= 1 && shards <= 16 && (shards & (shards - 1)) === 0) || "must be a power of two from 1 to 16")),
     1,
   ),
+  /** Each branch's read replica, which its lake loads from, beside its primary: smaller, as it serves the loader alone. */
+  readReplica: defaulted(
+    Schema.Struct({ resources: Resources({ requests: { cpu: "100m", memory: "192Mi" }, limits: { memory: "1Gi" } }) }),
+    {},
+  ),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of
    * JuiceFS's newest dump of workspace storage's metadata beside it; of each, the last

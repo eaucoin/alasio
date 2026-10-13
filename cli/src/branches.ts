@@ -19,7 +19,7 @@
  *
  * A branch is deleted in the order nothing of it outlives what it runs on: its alasio and
  * lake stopped, its Sandboxes and their claims deleted (JuiceFS keeps every chunk main
- * still uses), its compute stopped, its branch of Neon's deleted, and its namespaces with
+ * still uses), its computes stopped, its branch of Neon's deleted, and its namespaces with
  * all that is left in them.
  */
 import { randomBytes } from "node:crypto";
@@ -39,6 +39,7 @@ import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReady, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
 import { sandboxPolicyName } from "./manifests/admission.ts";
 import { branchObjects } from "./manifests/branch.ts";
+import { REPLICA_NAME } from "./manifests/neon.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
@@ -104,17 +105,18 @@ function neonControl<Body>(method: "GET" | "POST" | "DELETE", path: string, body
   });
 }
 
-/** A compute as neon-control lists it: where it runs, and when it was last asked to wake and put to sleep, if ever. */
+/** A compute as neon-control lists it: its Deployment, and when it was last asked to wake and put to sleep, if ever. */
 export interface ComputeTimes {
   readonly id: string;
   readonly namespace: string;
+  readonly name: string;
   readonly wokenAt: string | null;
   readonly suspendedAt: string | null;
 }
 
-/** Each compute neon-control knows of, by its namespace; none where neon-control does not answer. */
+/** Each compute neon-control knows of, by its Deployment, `<namespace>/<name>`; none where neon-control does not answer. */
 export const computeTimes = neonControl<{ readonly computes: readonly ComputeTimes[] }>("GET", "/computes").pipe(
-  Effect.map((answer) => new Map(answer.status === 200 && answer.body ? answer.body.computes.map((compute) => [compute.namespace, compute] as const) : [])),
+  Effect.map((answer) => new Map(answer.status === 200 && answer.body ? answer.body.computes.map((compute) => [`${compute.namespace}/${compute.name}`, compute] as const) : [])),
   Effect.orElseSucceed(() => new Map<string, ComputeTimes>()),
 );
 
@@ -175,7 +177,7 @@ const used = (of: MemoryUsage): number =>
     : memoryBytes(of.usage?.memory ?? "0");
 
 /** The components a branch environment runs its own of. */
-const BRANCHED_COMPONENTS = ["alasio", "neon-compute", "lake"] as const;
+const BRANCHED_COMPONENTS = ["alasio", "neon-compute", "neon-compute-ro", "lake"] as const;
 
 /** What a branch takes and what the cluster has, measured now: null where the cluster measures nothing. */
 export interface MemoryMeasure {
@@ -443,7 +445,7 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     const claimed = (yield* kube.list<V1PersistentVolume>(kind("PersistentVolume"))).filter(({ spec }) => spec?.claimRef?.namespace === sessions);
     yield* removed((yield* kube.list(kind("PersistentVolumeClaim"), { namespace: sessions })).map(refOf), options);
     yield* awaitReclaimed(claimed.map(refOf), options);
-    yield* stopped(namespace, [neonName("compute")], options);
+    yield* stopped(namespace, [neonName("compute"), REPLICA_NAME], options);
   }
   if (branch) {
     // neon-control answers 409 while the storage controller is still deleting it.

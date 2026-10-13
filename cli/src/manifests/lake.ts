@@ -10,7 +10,7 @@
  */
 import type { KubernetesObject, V1Container, V1Deployment, V1EnvVar, V1Service } from "@kubernetes/client-node";
 
-import { computeId, MAIN } from "../../../neon/control/branches.ts";
+import { computeId, MAIN, replicaId } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   componentName,
@@ -115,6 +115,9 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
               imagePullPolicy: config.images.pullPolicy,
               env: [
                 ...lakeEnv,
+                // alasio's database, which it loads from, on its environment's read replica, which
+                // takes nothing of what alasio's own compute serves alasio.
+                { name: "LAKE_SOURCE_ENDPOINT", value: replicaId(environment.branch ?? MAIN) },
                 { name: "LAKE_RETENTION_DAYS", value: String(config.telemetry.retentionDays) },
                 // Main's keeps its files while Neon has branches, whose lakes read them; a branch's is never maintained.
                 ...(main ? [{ name: "LAKE_BRANCHES_URL", value: `http://${neonName("control")}:8080/branches` }] : [{ name: "LAKE_MAINTENANCE_HOURS", value: "0" }]),

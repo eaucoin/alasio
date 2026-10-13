@@ -128,6 +128,7 @@ export function nameProblem(name: string): string | null {
   if (name.length > MAX_NAME_LENGTH) return `a branch's name is at most ${MAX_NAME_LENGTH} characters`;
   // A DNS-1123 label, as the names of the objects named after it must be.
   if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/u.test(name)) return "a branch's name is lowercase letters, digits and inner hyphens";
+  if (name.endsWith(REPLICA_SUFFIX)) return `a branch's name does not end in ${REPLICA_SUFFIX}, which names a read replica's compute`;
   return null;
 }
 
@@ -188,6 +189,19 @@ export function computeId(name: string): string {
 /** The ready branch whose compute is `id`, if any. */
 export function branchOfCompute(branches: readonly Branch[], id: string): ReadyBranch | undefined {
   return branches.find((branch): branch is ReadyBranch => branch.state === "ready" && computeId(branch.name) === id);
+}
+
+/** What ends the id of a branch's read replica's compute, after its primary's. */
+export const REPLICA_SUFFIX = "-ro";
+
+/** The id of the read replica's compute of the branch `name`: `<computeId>-ro`. */
+export const replicaId = (name: string): string => `${computeId(name)}${REPLICA_SUFFIX}`;
+
+/** The compute `id` names, a ready branch's primary or its read replica, if any. */
+export function computeNamed(branches: readonly Branch[], id: string): { branch: ReadyBranch; replica: boolean } | undefined {
+  const replica = id.endsWith(REPLICA_SUFFIX);
+  const branch = branchOfCompute(branches, replica ? id.slice(0, -REPLICA_SUFFIX.length) : id);
+  return branch && { branch, replica };
 }
 
 /** The compute whose token `authorization` bears, by its id: main's, the stack's `mainToken`, or a branch's own; null for none. */
@@ -456,11 +470,13 @@ export interface ComputeSpec {
     roles: { name: string; encrypted_password: string; options: null }[];
     databases: { name: string; owner: string; options: null }[];
     settings: ComputeSetting[];
+    /** Lines added to postgresql.conf as they are: a replica's streaming of WAL. */
+    postgresql_conf?: string;
   };
   delta_operations: unknown[];
   tenant_id: string;
   timeline_id: string;
-  mode: "Primary";
+  mode: "Primary" | "Replica";
   pageserver_connstring: string;
   /** The pages of each stripe a key's shard is chosen by, where the tenant has several shards. */
   shard_stripe_size?: number;
@@ -495,19 +511,37 @@ function setting(name: string, value: string | number, vartype: SettingType): Co
   return { name, value: String(value), vartype };
 }
 
+/** `value` as a postgresql.conf string, quoted. */
+const confString = (value: string): string => `'${value.replaceAll("'", "''")}'`;
+
 /**
  * The spec of `branch`'s compute: a primary on its timeline, at its safekeepers, reading
  * each shard's pages from the pageserver `layout` places it on. The role and database are
  * main's, which every branch inherits with its data; the role's password is the branch's
  * own.
  *
+ * With `replica`, its read replica's (`<computeId>-ro`): Neon's Replica mode, its
+ * basebackup the pageserver's latest, streaming the timeline's WAL from the branch's
+ * safekeepers, which Neon's compute_ctl leaves to its control plane to say, as neon_local
+ * does (control_plane/src/endpoint.rs at Neon's release-9129), with the storage token as
+ * the safekeepers' password. It makes no role, as a replica writes nothing: its roles are
+ * its primary's, neon-control's own among them, with its primary's password.
+ *
  * Its storage token is the tenant's, as the pageserver and safekeepers take no narrower
  * one: a timeline is not a scope of theirs. A branch's compute could read main's timeline
  * with it, which only Neon's storage services take, and only from the stack's pods.
  */
-export function computeConfig(branch: ReadyBranch, stack: ComputeStack, layout: ShardLayout): ComputeConfig {
+export function computeConfig(branch: ReadyBranch, stack: ComputeStack, layout: ShardLayout, { replica = false } = {}): ComputeConfig {
   // The timeline was placed on safekeepers of the stack, so each id is one of theirs.
-  const safekeeper = (id: number) => stack.safekeepers.find((sk) => sk.id === id)!;
+  const placed = branch.safekeepers.ids.map((id) => stack.safekeepers.find((sk) => sk.id === id)!);
+  const streaming = [
+    `host=${placed.map(({ host }) => host).join(",")}`,
+    `port=${placed.map(({ pgPort }) => pgPort).join(",")}`,
+    `options='-c timeline_id=${branch.timelineId} tenant_id=${stack.tenantId}'`,
+    "application_name=replica",
+    "replication=true",
+    `password=${stack.storageAuthToken}`,
+  ].join(" ");
   return {
     spec: {
       format_version: 1.0,
@@ -515,17 +549,20 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack, layout: 
       cluster: {
         cluster_id: "alasio",
         name: "alasio",
-        roles: [
-          { name: ROLE, encrypted_password: branch.compute?.verifiers.alasio ?? stack.verifiers.alasio, options: null },
-          // After alasio's: compute_ctl applies them in order, so once it may log in, alasio may too.
-          { name: stack.monitor.role, encrypted_password: stack.monitor.verifier(computeId(branch.name)), options: null },
-        ],
-        databases: [{ name: DATABASE, owner: ROLE, options: null }],
+        roles: replica
+          ? []
+          : [
+            { name: ROLE, encrypted_password: branch.compute?.verifiers.alasio ?? stack.verifiers.alasio, options: null },
+            // After alasio's: compute_ctl applies them in order, so once it may log in, alasio may too.
+            { name: stack.monitor.role, encrypted_password: stack.monitor.verifier(computeId(branch.name)), options: null },
+          ],
+        databases: replica ? [] : [{ name: DATABASE, owner: ROLE, options: null }],
         settings: [
           setting("listen_addresses", "0.0.0.0", "string"),
           setting("port", COMPUTE_PORT, "integer"),
           setting("max_connections", 100, "integer"),
-          setting("shared_buffers", "128MB", "string"),
+          // A replica serves the lake's loader alone.
+          setting("shared_buffers", replica ? "64MB" : "128MB", "string"),
           setting("password_encryption", "scram-sha-256", "enum"),
           // Durability is the safekeepers': a commit waits for their quorum,
           // and the compute's own disk is rebuilt on every start.
@@ -549,15 +586,31 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack, layout: 
           setting("max_replication_flush_lag", "10GB", "string"),
           setting("restart_after_crash", "off", "bool"),
         ],
+        ...(replica
+          ? {
+            postgresql_conf: [
+              `primary_conninfo = ${confString(streaming)}`,
+              `primary_slot_name = ${confString(`repl_${branch.timelineId}_`)}`,
+              "hot_standby = on",
+              // The loader's reads hold back the cleanup of what they read, on the primary, rather
+              // than be cancelled by its replay; and WAL that would cancel one waits for it a while.
+              "hot_standby_feedback = on",
+              "max_standby_streaming_delay = 5min",
+              "recovery_prefetch = off",
+              "",
+            ].join("\n"),
+          }
+          : {}),
       },
       delta_operations: [],
       tenant_id: stack.tenantId,
       timeline_id: branch.timelineId,
-      mode: "Primary",
+      mode: replica ? "Replica" : "Primary",
       pageserver_connstring: layout.pageservers.map((pageserver) => `postgresql://no_user@${pageserver}`).join(","),
       ...(layout.stripeSize === null ? {} : { shard_stripe_size: layout.stripeSize }),
       safekeepers_generation: branch.safekeepers.generation,
-      safekeeper_connstrings: branch.safekeepers.ids.map((id) => `${safekeeper(id).host}:${safekeeper(id).pgPort}`),
+      // A replica syncs with no safekeeper: it streams from them (postgresql_conf).
+      safekeeper_connstrings: replica ? [] : placed.map(({ host, pgPort }) => `${host}:${pgPort}`),
       storage_auth_token: stack.storageAuthToken,
     },
     compute_ctl_config: { jwks: stack.jwks },

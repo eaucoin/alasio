@@ -17,7 +17,7 @@ import { join } from "node:path";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
 
-import type { LakeAccess } from "./config.ts";
+import type { LakeAccess, SourceConfig } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
@@ -36,7 +36,7 @@ export interface OpenLakeOptions {
   /** Attach the lake read-only, for queries. */
   readOnly?: boolean;
   /** alasio's database, on the catalog's server, to attach too, read-only and as the catalog's role, for loading. */
-  source?: string;
+  source?: SourceConfig;
   /** DuckDB's memory limit, when not the configuration's. */
   memoryLimit?: string;
 }
@@ -103,7 +103,7 @@ export async function openLake(config: LakeAccess, { readOnly = false, source, m
     await db.run(`create temporary secret (
       type postgres, host ${literal(host)}, port ${port}, user ${literal(user)}, password ${literal(password)})`);
     if (source) {
-      await db.run(`attach ${literal(conninfo(source, config.catalog.options))} as ${SOURCE} (type postgres, read_only)`);
+      await db.run(`attach ${literal(conninfo(source.database, source.options))} as ${SOURCE} (type postgres, read_only)`);
     }
     // Serially, as the lake's first attach writes its catalog.
     await serially(() =>

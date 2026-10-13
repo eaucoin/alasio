@@ -1799,19 +1799,19 @@ if (inShard("branches")) {
       await branch.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^This is the branch environment e2e, .* A folder is this machine's own files/mu.test(call.payload.text ?? ""));
     });
 
-    test("the branch's alasio, compute and lake fit the run's cluster, as the metrics server measures them", async () => {
+    test("the branch's alasio, compute, read replica and lake fit the run's cluster, as the metrics server measures them", async () => {
       const deadline = Date.now() + 300_000;
       let measured: readonly (KubernetesObject & { containers?: { usage?: { memory?: string } }[] })[] = [];
-      while (Date.now() < deadline && measured.length < 3) {
+      while (Date.now() < deadline && measured.length < 4) {
         measured = await kube.list("PodMetrics", { namespace: BRANCH_NAMESPACE }).catch(() => []);
-        if (measured.length < 3) await sleep(10_000);
+        if (measured.length < 4) await sleep(10_000);
       }
       const pods = await kube.list<V1Pod>("Pod", { namespace: BRANCH_NAMESPACE });
       for (const { metadata, containers } of measured) {
         const node = pods.find((pod) => pod.metadata?.name === metadata?.name)?.spec?.nodeName;
         console.error(`# measured: ${metadata?.name} on ${node} uses ${containers?.map(({ usage }) => usage?.memory).join(" + ")}`);
       }
-      assert.equal(measured.length, 3, "the metrics server measured the branch's three pods");
+      assert.equal(measured.length, 4, "the metrics server measured the branch's four pods");
       if (AGENTS === 0) assert.equal(new Set(pods.map((pod) => pod.spec?.nodeName)).size, 1);
     });
 
