@@ -11,8 +11,12 @@
   "gvisor": {
     "releases": [
       {
-        "release": "20260921.0-eaucoin.3",
-        "sha512": "ab59ce25025c28460cc07742e7a7e0679f8bda989513c113dca2a1b6215a791e6e2134022ed5bee33524f7132eb379eb0c83d6a8e796c15d4319dfd1b1a9647b"
+        "release": "20260921.0-eaucoin.5",
+        "sha512": "f721dbc604125ab6dddd19c51f4a5e820c5eccc865f5b59a7f1879e446e57701141415c63842b47a583d7f6bb1e764c8c8846dfe957e7d0841aa635f1e18e9c8"
+      },
+      {
+        "release": "20260921.0-eaucoin.4",
+        "sha512": "fe28f5f33cd554ad719317e6e98220fef4cb2b9687b82ee0bf7ea841bccfb0f568e9eca26297951fe868ad51ed4bbfe03c28256a4978c5d7bc1c86e60c970e09"
       }
     ]
   }
