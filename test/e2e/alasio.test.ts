@@ -738,6 +738,19 @@ if (inShard("snapshots")) {
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       assert.equal(await snapshotOf(corrupt), null);
+      // A restore that fell back for a failure, as this one did, is what the alert on
+      // restores falling back is for: it fires, whenever its message came during the turn.
+      const stub = telegram?.base;
+      assert.ok(stub, "the Telegram stand-in is not forwarded");
+      const deadline = Date.now() + 420_000;
+      const alerted = async () => {
+        const listed = (await (await fetch(`${stub}/control/calls?since=0`)).json()) as CallsListing;
+        return listed.calls.some((call) => call.method === "sendMessage" && /^\*\*Firing\*\*[\s\S]*alertname = Restores are falling back/u.test(call.payload.text ?? ""));
+      };
+      while (!(await alerted())) {
+        assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
+        await sleep(5_000);
+      }
     });
 
     test("a fork of a released session restores its source's REPL", async () => {
