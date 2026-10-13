@@ -6,8 +6,8 @@
  * with the lake on (ALASIO_LAKE_ENABLED) grants the lake its reads; with it off, it
  * revokes them. It makes the lake reader's role (./lake.ts) and Grafana's role and
  * database (./grafana.ts) when the deployment gives their verifiers, as it does while
- * they run. It sets each role's password to the SCRAM verifier the deployment gives, made
- * once where the password is, and never sees a password.
+ * they run. It sets each role's password to the SCRAM verifier the deployment gives, the
+ * one neon-control answers Neon's proxy with, and never sees a password.
  */
 import { readFileSync } from "node:fs";
 

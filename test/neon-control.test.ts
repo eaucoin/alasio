@@ -19,6 +19,7 @@ import {
   existingBranch,
   nameProblem,
   placementOf,
+  PROXY_SCOPE,
   type ReadyBranch,
   safekeepersNotified,
   tokenSha256,
@@ -30,8 +31,11 @@ import { scramVerifier } from "../neon/control/scram.ts";
 const MAIN_TIMELINE = "11111111111111111111111111111111";
 const DEV_TIMELINE = "22222222222222222222222222222222";
 
-/** dev's compute's own credentials: its role's password's verifier, and its token's hash. */
-const DEV_COMPUTE = { passwordVerifier: scramVerifier("dev-password"), tokenSha256: tokenSha256("dev-token") };
+/** dev's compute's own credentials: its roles' passwords' verifiers, and its token's hash. */
+const DEV_COMPUTE = {
+  verifiers: { alasio: scramVerifier("dev-password"), lake: scramVerifier("dev-lake-password") },
+  tokenSha256: tokenSha256("dev-token"),
+};
 
 const main: ReadyBranch = {
   name: "main",
@@ -106,7 +110,9 @@ describe("a branch asked for", () => {
         // Its compute's credentials, which are its own, and hashes alone.
         { name: "dev" },
         { name: "dev", compute: { ...compute, password: "dev-password" } },
-        { name: "dev", compute: { ...compute, passwordVerifier: "dev-password" } },
+        { name: "dev", compute: { ...compute, verifiers: { ...compute.verifiers, alasio: "dev-password" } } },
+        { name: "dev", compute: { ...compute, verifiers: { alasio: compute.verifiers.alasio } } },
+        { name: "dev", compute: { ...compute, verifiers: { ...compute.verifiers, grafana: compute.verifiers.lake } } },
         { name: "dev", compute: { ...compute, tokenSha256: "dev-token" } },
       ]
     ) {
@@ -232,12 +238,13 @@ const stack: ComputeStack = {
   tenantId: "t",
   pageserverHost: "pageserver",
   safekeepers: [1, 2, 3].map((id) => ({ id, host: `sk-${id - 1}`, pgPort: 5454, httpPort: 7676 })),
-  passwordVerifier: "SCRAM-SHA-256$verifier",
+  verifiers: { alasio: "SCRAM-SHA-256$verifier" },
+  monitor: { role: "neon_control", verifier: (id) => `SCRAM-SHA-256$monitor-${id}` },
   storageAuthToken: "token",
   jwks: { keys: [] },
 };
 
-test("a branch's compute spec is main's but for its timeline, its safekeepers and its role's password", () => {
+test("a branch's compute spec is main's but for its timeline, its safekeepers and its roles' passwords", () => {
   const ofMain = computeConfig(main, stack);
   const ofDev = computeConfig({ ...dev, safekeepers: { generation: 2, ids: [2, 3] } }, stack);
   assert.equal(ofDev.spec.timeline_id, DEV_TIMELINE);
@@ -249,8 +256,15 @@ test("a branch's compute spec is main's but for its timeline, its safekeepers an
   const { cluster: { roles: mainRoles, ...mainCluster }, ...mainSpec } = mainRest;
   const { cluster: { roles: devRoles, ...devCluster }, ...devSpec } = devRest;
   assert.deepEqual([devSpec, devCluster], [mainSpec, mainCluster]);
-  assert.deepEqual(mainRoles, [{ name: "alasio", encrypted_password: "SCRAM-SHA-256$verifier", options: null }]);
-  assert.deepEqual(devRoles, [{ name: "alasio", encrypted_password: DEV_COMPUTE.passwordVerifier, options: null }]);
+  // neon-control's own role last, with a password of the compute's own, so it logs in once the spec's roles are applied.
+  assert.deepEqual(mainRoles, [
+    { name: "alasio", encrypted_password: "SCRAM-SHA-256$verifier", options: null },
+    { name: "neon_control", encrypted_password: "SCRAM-SHA-256$monitor-alasio", options: null },
+  ]);
+  assert.deepEqual(devRoles, [
+    { name: "alasio", encrypted_password: DEV_COMPUTE.verifiers.alasio, options: null },
+    { name: "neon_control", encrypted_password: "SCRAM-SHA-256$monitor-branch-dev", options: null },
+  ]);
 });
 
 test("every compute checkpoints hourly, unless an hour's WAL comes to a gigabyte first", () => {
@@ -279,5 +293,20 @@ test("the lake's token of the branches scope lists the branches, and calls nothi
   assert.ok(!takes("POST", "/branches"));
   assert.ok(!takes("DELETE", "/branches/dev"));
   assert.ok(!takes("PUT", "/notify-safekeepers"));
+  assert.ok(!takes("GET", "/get_endpoint_access_control?endpointish=alasio&role=alasio"));
   assert.ok(bearsScope(publicKeyPem, `Bearer ${signToken(privateKeyPem, "admin")}`, ...callScopes("POST", "/branches")));
+});
+
+test("the proxy's token of the proxy scope asks for roles' secrets and wakes computes, and calls nothing else; nothing else calls those", () => {
+  const { privateKeyPem, publicKeyPem } = generateKeyPair();
+  const as = (scope: string) => (method: string, url: string) => bearsScope(publicKeyPem, `Bearer ${signToken(privateKeyPem, scope)}`, ...callScopes(method, url));
+  const proxy = as(PROXY_SCOPE);
+  const admin = as("admin");
+  assert.ok(proxy("GET", "/get_endpoint_access_control?session_id=s&application_name=&endpointish=alasio&role=lake"));
+  assert.ok(proxy("GET", "/wake_compute?session_id=s&application_name=&endpointish=branch-dev"));
+  assert.ok(!admin("GET", "/wake_compute?endpointish=alasio"));
+  for (const [method, url] of [["GET", "/branches"], ["POST", "/branches"], ["DELETE", "/branches/dev"], ["POST", "/computes/alasio/wake"], ["PUT", "/notify-attach"]] as const) {
+    assert.ok(!proxy(method, url), `${method} ${url}`);
+  }
+  assert.ok(admin("POST", "/computes/alasio/wake"));
 });

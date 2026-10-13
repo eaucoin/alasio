@@ -403,14 +403,45 @@ describe("neon", () => {
     assert.equal(args[args.indexOf("--compute-id") + 1], "alasio");
   });
 
-  test("runs neon-control with no volume, its record in the storage controller's Postgres, at the count its scale fixes", () => {
-    const control = one<V1Deployment>(install(), "Deployment", "alasio-neon-control");
+  test("has the compute's Service take connections as soon as Postgres does, before kubelet next probes the pod, as a wake waits for them", () => {
+    assert.equal(one<V1Service>(install(), "Service", "alasio-neon-compute").spec?.publishNotReadyAddresses, true);
+  });
+
+  test("runs Neon's proxy, from Neon's image, which asks neon-control as its control plane with a token of its own, and keeps no TLS", () => {
+    const objects = install();
+    const proxy = one<V1Deployment>(objects, "Deployment", "alasio-neon-proxy");
+    assert.equal(container(proxy).image, container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-neon-pageserver")).image);
+    assert.deepEqual(container(proxy).command, [
+      "proxy",
+      "--proxy", "0.0.0.0:5432",
+      "--http", "0.0.0.0:7001",
+      "--auth-backend", "control-plane",
+      "--auth-endpoint", "http://alasio-neon-control:8080",
+      "--wake-compute-cache", "size=4000,ttl=4m",
+      "--project-info-cache", "size=10000,ttl=10s,max_roles=10,gc_interval=60m",
+    ]);
+    assert.deepEqual(container(proxy).env, [{ name: "NEON_PROXY_TO_CONTROLPLANE_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-neon-proxy", key: "NEON_PROXY_TO_CONTROLPLANE_TOKEN" } } }]);
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-neon-proxy").spec?.ports, [{ name: "postgres", port: 5432 }, { name: "http", port: 7001 }]);
+    assert.equal(proxy.spec?.replicas, 1);
+    const two = install({ neon: { proxy: { scaling: { min: 2, max: 2 } }, control: { scaling: { min: 2, max: 2 } } } });
+    for (const name of ["alasio-neon-proxy", "alasio-neon-control"]) {
+      assert.equal(one<V1Deployment>(two, "Deployment", name).spec?.replicas, 2, name);
+      assert.ok(one(two, "PodDisruptionBudget", name), name);
+    }
+  });
+
+  test("runs neon-control with no volume, its record in the storage controller's Postgres, and its own ServiceAccount, which may scale main's compute alone", () => {
+    const objects = install();
+    const control = one<V1Deployment>(objects, "Deployment", "alasio-neon-control");
     assert.deepEqual(control.spec?.template.spec?.volumes?.map(({ name }) => name), ["root", "keys"]);
     assert.equal(control.spec?.strategy, undefined, "rolled out a replica at a time, as any of them serves");
-    assert.equal(container(control).env?.find(({ name }) => name === "NEON_CONTROLLER_DB_HOST")?.value, "alasio-neon-controller-db");
-    const two = install({ neon: { control: { scaling: { min: 2, max: 2 } } } });
-    assert.equal(one<V1Deployment>(two, "Deployment", "alasio-neon-control").spec?.replicas, 2);
-    assert.ok(one(two, "PodDisruptionBudget", "alasio-neon-control"));
+    assert.equal(control.spec?.template.spec?.serviceAccountName, "alasio-neon-control");
+    const env = Object.fromEntries((container(control).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
+    assert.deepEqual([env["NEON_CONTROLLER_DB_HOST"], env["NEON_COMPUTE_NAME"], env["NAMESPACE"]], ["alasio-neon-controller-db", "alasio-neon-compute", { fieldRef: { fieldPath: "metadata.namespace" } }]);
+    assert.deepEqual(one<V1Role>(objects, "Role", "alasio-neon-control").rules, [
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+    ]);
   });
 
   test("pins every third-party image by digest", () => {
@@ -1124,6 +1155,7 @@ describe("telemetry", () => {
       targets: [0, 1, 2].map((index) => `alasio-neon-safekeeper-${index}.alasio-neon-safekeeper:7676`),
     }]);
     assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "lake").static_configs, [{ targets: ["alasio-lake:9464"] }]);
+    assert.deepEqual(jobs.find(({ job_name }: { job_name: string }) => job_name === "proxy").static_configs, [{ targets: ["alasio-neon-proxy:7001"] }]);
     for (const job of jobs) assert.equal(job.scrape_interval, "60s", job.job_name);
     assert.equal(config.receivers.redis.collection_interval, "60s");
   });
@@ -1736,6 +1768,8 @@ describe("branch environments", () => {
       ["alasio-branch-try-sessions", "alasio"],
       // Its own pod, which it labels busy as main's does.
       ["alasio-branch-try", "alasio"],
+      // main's neon-control, which wakes its compute.
+      ["alasio-branch-try", "alasio-neon-control"],
       ["alasio-branch-try-sessions", "alasio-parent"],
     ]);
     assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
@@ -1749,7 +1783,7 @@ describe("branch environments", () => {
     assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-parent", "alasio-branch-try-sessions").subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
   });
 
-  test("run a compute on the branch's timeline, from main's neon-control, and a lake that is never maintained", () => {
+  test("run a compute on the branch's timeline, from main's neon-control, which alone scales it, and a lake that is never maintained", () => {
     const compute = of<V1Deployment>("Deployment", "alasio-neon-compute");
     const args = container(compute).args ?? [];
     assert.equal(args[args.indexOf("--compute-id") + 1], "branch-try");
@@ -1762,6 +1796,11 @@ describe("branch environments", () => {
     assert.deepEqual(of<V1Service>("Service", "alasio-lake").spec?.ports?.map(({ name }) => name), ["metrics", "otlp-http"]);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("grafana")), []);
     assert.equal(variable(lake, "LAKE_DATABASE_HOST"), "alasio-neon-compute");
+    assert.deepEqual(of<V1Role>("Role", "alasio-neon-control").rules, [
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+    ]);
+    assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-neon-control").subjects, [{ kind: "ServiceAccount", name: "alasio-neon-control", namespace: "alasio" }]);
     assert.equal(variable(lake, "LAKE_S3_ENDPOINT"), "http://alasio-seaweedfs.alasio.svc:8333");
     const main = install();
     assert.equal(container(one<V1Deployment>(main, "Deployment", "alasio-neon-compute")).args?.at(-3), "alasio");
@@ -1805,6 +1844,25 @@ describe("branch environments", () => {
       targets.filter(([, target, port]) => admits(policies, pod, target, port)).map(([to]) => `${from} → ${to}`)
     );
     assert.deepEqual(reached, ["alasio → main's alasio on 4319"]);
+  });
+
+  test("are reached by main's Neon proxy and neon-control, each compute", () => {
+    const main = install({ grafana: { enabled: true } });
+    const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
+    const namespaces = new Map(all<V1Namespace>(branch, "Namespace").map(({ metadata }) => [metadata?.name ?? "", metadata?.labels ?? {}]));
+    const podIn = (namespace: string, labels: Readonly<Record<string, string>> = {}): Pod => ({ namespace, namespaceLabels: { ...namespaces.get(namespace), "kubernetes.io/metadata.name": namespace }, labels });
+    const podOf = (objects: readonly KubernetesObject[], name: string, namespace: string): Pod => {
+      const deployment = all<V1Deployment>(objects, "Deployment").find(({ metadata }) => metadata?.name === name && metadata.namespace === namespace);
+      assert.ok(deployment, `${namespace}/${name}`);
+      return podIn(namespace, deployment.spec?.template.metadata?.labels);
+    };
+    const proxy = podOf(main, "alasio-neon-proxy", "alasio");
+    const control = podOf(main, "alasio-neon-control", "alasio");
+    const computes: [string, Pod][] = [["main's compute", podOf(main, "alasio-neon-compute", "alasio")], ["the branch's compute", podOf(branch, "alasio-neon-compute", "alasio-branch-try")]];
+    for (const [name, compute] of computes) {
+      assert.ok(admits(policies, proxy, compute, 55433), `the proxy → ${name}`);
+      assert.ok(admits(policies, control, compute, 55433), `neon-control → ${name}`);
+    }
   });
 
   test("are admitted by main to what they share of its storage alone, and to its fork of their sessions, which only main forks", () => {

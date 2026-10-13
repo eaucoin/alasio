@@ -84,7 +84,7 @@ test("alasio makes the lake reader's role and Grafana's, with Grafana's database
     );
     assert.deepEqual(roles, [], "neither is a member of another role");
     assert.deepEqual(privileges, [{ public_connects: false, reader_connects: false, reader_reads_lake: true }]);
-    // Each stored as the verifier given, to the byte.
+    // Each stored as the verifier given, the one neon-control answers Neon's proxy with for it, to the byte.
     const [stored] = await run(database.url, "select rolname, rolpassword from pg_authid where rolname in ('lake', 'lake_reader', 'grafana') order by rolname");
     assert.deepEqual(stored, [
       { rolname: "grafana", rolpassword: verifiers.grafana },

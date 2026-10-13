@@ -299,6 +299,14 @@ const Neon = Schema.Struct({
     }),
     {},
   ),
+  /** Neon's proxy, which a client of a compute connects through, and which wakes it: a count. */
+  proxy: defaulted(
+    Schema.Struct({
+      scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+      resources: Resources({ requests: { cpu: "20m", memory: "64Mi" }, limits: { memory: "256Mi" } }),
+    }),
+    {},
+  ),
   compute: NeonService({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of

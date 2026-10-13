@@ -10,9 +10,13 @@
  * and its timeline, the branch `main`, once, and configures the tenant to keep
  * a day of history (HISTORY_DAYS). It then manages branches, child
  * timelines of main or of each other (./branches.ts), serves each branch's
- * compute its spec, from the record, or as last read while the record cannot be, answers
- * the storage controller's compute hooks, and reports healthy once main's compute can
- * start. The replica that leads (./record.ts) repairs every branch's safekeepers.
+ * compute its spec, answers the storage controller's compute hooks, and reports
+ * healthy once main's compute can start. It is the control plane of Neon's proxy
+ * (./endpoints.ts), which a client connects through: it answers the proxy for
+ * roles' secrets, main's from the stack's secrets alone and a branch's from the record,
+ * or as last read while the record cannot be, and wakes a compute that sleeps; it serves
+ * a compute its spec, likewise, as last read. The replica that leads (./record.ts)
+ * repairs every branch's safekeepers.
  *
  * A compute fetches its spec as Neon's compute_ctl does from a control plane
  * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with its
@@ -21,13 +25,14 @@
  * serves a branch's spec; it does not run its compute.
  *
  * Its API takes a token of the admin scope, as the storage controller's hooks
- * do, or for `GET /branches` alone one of the `branches` scope, the lake's, and
- * answers 401 without one, and 503 until bootstrapped. It speaks JSON; a
- * refusal is `{ "error": "<why>" }` with its status:
+ * do, or for `GET /branches` alone one of the `branches` scope, the lake's, or for
+ * the proxy's paths one of the `proxy` scope, and answers 401 without one, and 503
+ * until bootstrapped. It speaks JSON; a refusal is `{ "error": "<why>" }` with its
+ * status (the proxy's paths answer with Neon's errors, ./endpoints.ts):
  *
  * - `POST /branches`, `{ name, parent?, lsn?, compute }`: creates the branch
  *   `name` of `parent` (main if not given) at `lsn`, its compute's credentials
- *   `compute` (`{ passwordVerifier, tokenSha256 }`, ./branches.ts), and answers
+ *   `compute` (`{ verifiers, tokenSha256 }`, ./branches.ts), and answers
  *   it (201), or the same
  *   branch asked for again (200). Without `lsn`, the branch point is where the
  *   pageserver has the parent's WAL up to, which trails its last commits by as
@@ -45,6 +50,9 @@
  *   does not run computes. 400 for main; 404 for a branch there is not; 412 for
  *   one with branches of its own; 409 while the storage controller is still
  *   deleting it, and 503 when it did not, when it is asked again.
+ * - `POST /computes/<id>/wake`: wakes the compute `id` (`alasio`, or `branch-<name>`),
+ *   as the proxy's `wake_compute` does, for alasio's command line, which works in it
+ *   (200, `{ address }`); 404 for a compute of no ready branch, or not deployed.
  *
  * 503, `{ error }`, too, for a lock of the record another replica held for longer than its
  * patience (./record.ts), when it may be asked again.
@@ -53,13 +61,17 @@
  * safekeepers?, computeId }`, its state `creating`, `ready` or `deleting`.
  *
  * Environment: CONTROLLER_URL; NEON_SAFEKEEPER_HOSTS, the safekeepers' hosts in
- * the order of their ids, comma-separated; NEON_PAGESERVER_HOST; and NEON_CONTROLLER_DB_HOST,
- * the storage controller's Postgres, which its record is in. Mounts: /secrets
- * (secrets.json, the signing key), /keys (the public key).
+ * the order of their ids, comma-separated; NEON_PAGESERVER_HOST; NEON_CONTROLLER_DB_HOST,
+ * the storage controller's Postgres, which its record is in; NAMESPACE, its own, main's
+ * compute's; and NEON_COMPUTE_NAME, the name of every compute's Deployment and Service,
+ * in main's namespace or a branch environment's. Mounts: /secrets (secrets.json, the
+ * signing key), /keys (the public key).
  */
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+
+import { branchNamespace } from "../../src/branch/names.ts";
 
 import {
   type Branch,
@@ -71,8 +83,10 @@ import {
   type BranchRequest,
   branchView,
   callScopes,
+  COMPUTE_PORT,
   type ComputeStack,
   computeConfig,
+  computeId,
   computeOfToken,
   creationRefused,
   deleting,
@@ -80,6 +94,7 @@ import {
   HISTORY_DAYS,
   MAIN,
   placementOf,
+  PROXY_PATHS,
   type ReadyBranch,
   type Safekeeper,
   safekeepersNotified,
@@ -88,9 +103,12 @@ import {
   withNotifiedPlacement,
   withoutBranch,
 } from "./branches.ts";
+import { computeAccepts, computeDeployment, type ComputeRef, scaleCompute } from "./computes.ts";
+import { computeAddress, controlPlaneError, proxyQuery, roleSecret, woken } from "./endpoints.ts";
 import { bearsScope, publicJwks, signToken } from "./jwt.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
-import { ROLE, type StackSecrets } from "./secrets.ts";
+import { scramVerifier } from "./scram.ts";
+import { MONITOR_ROLE, type StackSecrets } from "./secrets.ts";
 
 /** A call to the storage controller. */
 interface ControllerRequest {
@@ -135,6 +153,8 @@ const SAFEKEEPER_HOSTS = setting("NEON_SAFEKEEPER_HOSTS").split(",").map((host) 
 const SAFEKEEPERS: Safekeeper[] = SAFEKEEPER_HOSTS.map((host, index) => ({ id: index + 1, host, pgPort: 5454, httpPort: 7676 }));
 const PAGESERVER_HOST = setting("NEON_PAGESERVER_HOST");
 const CONTROLLER_DB_HOST = setting("NEON_CONTROLLER_DB_HOST");
+const NAMESPACE = setting("NAMESPACE");
+const COMPUTE_NAME = setting("NEON_COMPUTE_NAME");
 
 // Written by the setup job (./kube-setup.ts).
 const secrets: StackSecrets = JSON.parse(readFileSync("/secrets/secrets.json", "utf8"));
@@ -145,17 +165,26 @@ const adminToken = signToken(privateKeyPem, "admin");
 const safekeeperToken = signToken(privateKeyPem, "safekeeperdata");
 /** How often the replica that leads repairs safekeepers. */
 const LEAD_INTERVAL_MS = 30_000;
+/** How long a wake may take in all, beyond any client's patience. */
+const WAKE_PATIENCE_MS = 180_000;
+/** How often a wake looks again at what it waits for. */
+const POLL_MS = 250;
 /** How long a call of the storage controller may take: longer than its own waits for the pageserver. */
 const CONTROLLER_PATIENCE_MS = 120_000;
 /** How long a call of a safekeeper may take. */
 const SAFEKEEPER_PATIENCE_MS = 30_000;
+
+/** The password of neon-control's own role on the compute `id`: of that compute's alone, drawn from the stack's monitor key, which no client holds. */
+const monitorPassword = (id: string) => createHmac("sha256", secrets.monitorKey).update(`${MONITOR_ROLE}:${id}`).digest("base64url");
 
 /** What every branch's compute spec shares. */
 const stack: ComputeStack = {
   tenantId: secrets.tenantId,
   pageserverHost: PAGESERVER_HOST,
   safekeepers: SAFEKEEPERS,
-  passwordVerifier: secrets.verifiers[ROLE],
+  // Main's clients' roles': the verifiers alasio sets them to (src/neon/), and main's spec alasio's.
+  verifiers: secrets.verifiers,
+  monitor: { role: MONITOR_ROLE, verifier: (id) => scramVerifier(monitorPassword(id)) },
   storageAuthToken: signToken(privateKeyPem, "tenant", secrets.tenantId),
   jwks: publicJwks(publicKeyPem),
 };
@@ -403,6 +432,51 @@ async function repairEverySafekeeper(branches: readonly Branch[]): Promise<void>
   }
 }
 
+/** The compute of the branch `name`: main's in neon-control's namespace, any other's in its branch environment's. */
+const computeOf = (name: string): ComputeRef => ({ namespace: name === MAIN ? NAMESPACE : branchNamespace(name), name: COMPUTE_NAME });
+
+/** Logs in to the branch `name`'s compute as neon-control's own role there (./computes.ts); fails while it cannot. */
+function accepts(name: string): Promise<void> {
+  const { namespace } = computeOf(name);
+  return computeAccepts(`${COMPUTE_NAME}.${namespace}.svc.cluster.local`, COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
+}
+
+/** The wakes under way, by compute: concurrent wakes of one compute share one. */
+const waking = new Map<string, Promise<boolean>>();
+
+/**
+ * Wakes the branch `name`'s compute: scales it to one if it sleeps, and waits until
+ * neon-control logs in to it, so its clients may (./computes.ts), for as long as
+ * WAKE_PATIENCE_MS in all. Whether it slept. A wake asked again, by the proxy after a
+ * restart of neon-control, finds it scaling, and waits again.
+ */
+function wake(name: string): Promise<boolean> {
+  const id = computeId(name);
+  const running = waking.get(id);
+  if (running) return running;
+  const started = Date.now();
+  const deadline = started + WAKE_PATIENCE_MS;
+  const ref = computeOf(name);
+  const woke = (async () => {
+    const deployment = await computeDeployment(ref);
+    if (!deployment) throw new BranchError(404, `${name}'s compute is not deployed`);
+    const slept = deployment.replicas === 0;
+    if (slept) await scaleCompute(ref, 1);
+    for (;;) {
+      const taken = await accepts(name).then(() => true, (error: unknown) => {
+        if (Date.now() > deadline) throw new Error(`${id} did not take connections in ${WAKE_PATIENCE_MS} ms: ${errorText(error)}`);
+        return false;
+      });
+      if (taken) break;
+      await sleep(POLL_MS);
+    }
+    if (slept) log("compute woken", { compute: id, ms: Date.now() - started });
+    return slept;
+  })().finally(() => waking.delete(id));
+  waking.set(id, woke);
+  return woke;
+}
+
 /** Whether this replica led at its last round, which it says when that changes. */
 let led = false;
 /** Whether a round of leading is under way: one never starts beside another. */
@@ -423,7 +497,7 @@ async function lead(): Promise<void> {
   }
 }
 
-/** The branches as last read: what serves the computes their specs while the record cannot be read. */
+/** The branches as last read: what answers the proxy and the computes while the record cannot be read. */
 let lastRead: Branch[] | null = null;
 /** Until when the record is not asked again, having failed to be read: each lookup meanwhile answers at once. */
 let unreadUntil = 0;
@@ -489,7 +563,36 @@ function answer(response: ServerResponse, status: number, body?: unknown): void 
   response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 }
 
+/** Main's compute's id, which the proxy is answered for from the stack's secrets alone, without the record. */
+const MAIN_COMPUTE = computeId(MAIN);
+
+/**
+ * Answers Neon's proxy (./endpoints.ts) at `path`: a role's secret, or a compute woken.
+ * Main's from the stack's secrets alone, so its clients reach it while the record cannot be
+ * read; a branch's from the record, or as last read. Every refusal is Neon's error; a
+ * wake that fails is one the proxy asks again.
+ */
+async function answerProxy(request: IncomingMessage, response: ServerResponse, path: string): Promise<void> {
+  const query = proxyQuery(request.url ?? "");
+  const branch = !query ? undefined : query.endpoint === MAIN_COMPUTE ? { name: MAIN, compute: null } : branchOfCompute(await knownBranches(), query.endpoint);
+  if (!query || !branch) return answer(response, 404, controlPlaneError("ENDPOINT_NOT_FOUND", `no endpoint ${query?.endpoint ?? ""}`));
+  if (path === "/get_endpoint_access_control") {
+    const secret = query.role === null ? null : roleSecret(branch.compute, query.role, stack.verifiers);
+    if (secret === null) return answer(response, 404, controlPlaneError("RESOURCE_NOT_FOUND", `no role ${query.role ?? ""} on ${query.endpoint}`));
+    return answer(response, 200, { role_secret: secret, project_id: "alasio", allowed_ips: null });
+  }
+  try {
+    const slept = await wake(branch.name);
+    return answer(response, 200, woken(computeAddress(COMPUTE_NAME, computeOf(branch.name).namespace), branch.name, query.endpoint, slept));
+  } catch (error) {
+    if (error instanceof BranchError && error.status === 404) return answer(response, 404, controlPlaneError("ENDPOINT_NOT_FOUND", error.message));
+    log("wake failed", { compute: query.endpoint, error: errorText(error) });
+    return answer(response, 503, controlPlaneError("RUNNING_OPERATIONS", `${query.endpoint} did not wake: ${errorText(error)}`, 1000));
+  }
+}
+
 const SPEC = /^\/compute\/api\/v2\/computes\/([^/]+)\/spec$/u;
+const WAKE = /^\/computes\/([^/]+)\/wake$/u;
 const BRANCH = /^\/branches\/([^/]+)$/u;
 
 async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -513,12 +616,28 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     if (!branch) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
     return answer(response, 200, { ...computeConfig(branch, stack), status: "attached" });
   }
+  const path = new URL(url, "http://neon-control").pathname;
+  const proxied = method === "GET" && PROXY_PATHS.includes(path);
+  const wakeAsked = method === "POST" ? WAKE.exec(url) : null;
   const branch = BRANCH.exec(url);
   const hook = method === "PUT" && (url === "/notify-attach" || url === "/notify-safekeepers");
   const api = url === "/branches" ? method === "GET" || method === "POST" : branch !== null && method === "DELETE";
-  if (!hook && !api) return answer(response, 404);
+  if (!proxied && !wakeAsked && !hook && !api) return answer(response, 404);
   if (!authorized(request)) return answer(response, 401);
-  if (!ready) return answer(response, 503, { error: "neon-control is bootstrapping" });
+  if (!ready) {
+    // The proxy reads Neon's errors alone, and asks again after the delay given.
+    return proxied
+      ? answer(response, 503, controlPlaneError("RUNNING_OPERATIONS", "neon-control is bootstrapping", 1000))
+      : answer(response, 503, { error: "neon-control is bootstrapping" });
+  }
+  if (proxied) return answerProxy(request, response, path);
+  if (wakeAsked) {
+    const id = decodeURIComponent(wakeAsked[1] ?? "");
+    const compute = branchOfCompute(await record.branches(), id);
+    if (!compute) return answer(response, 404, { error: `no ready branch has the compute ${id}` });
+    await wake(compute.name);
+    return answer(response, 200, { address: computeAddress(COMPUTE_NAME, computeOf(compute.name).namespace) });
+  }
   if (url === "/notify-attach") {
     // Every compute reaches the stack's one pageserver by its Service, whichever of
     // its nodes the tenant is attached to: an attach changes no branch's spec.

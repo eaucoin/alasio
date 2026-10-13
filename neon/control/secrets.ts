@@ -17,6 +17,8 @@ export const LAKE_ROLE = "lake";
 export const LAKE_READER_ROLE = "lake_reader";
 /** Grafana's (src/neon/grafana.ts), which alasio makes. */
 export const GRAFANA_ROLE = "grafana";
+/** neon-control's own (./computes.ts), which every compute's spec gives it, and no client connects as. */
+export const MONITOR_ROLE = "neon_control";
 
 /** The roles main's clients connect as, whose verifiers the stack keeps. */
 export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE] as const;
@@ -55,8 +57,16 @@ export interface StackSecrets {
   /** What alasio signs each branch environment's token to fork its sessions with (src/branch/names.ts). */
   branchForkKey: string;
   /**
+   * What neon-control draws the password of its own role on each compute from (MONITOR_ROLE),
+   * a password of that compute's alone. Rotated by replacing it here and restarting every
+   * compute, each of which then takes a spec with its new password; neon-control logs in
+   * to one not yet restarted no more, so it neither wakes nor sleeps until it is.
+   */
+  monitorKey: string;
+  /**
    * The SCRAM verifier (./scram.ts) of each of CLIENT_ROLES' passwords above, made once:
-   * the one main's compute stores, alasio's by its spec, the others' by alasio.
+   * the one main's compute stores (alasio's by its spec, the others' by alasio) and
+   * neon-control answers Neon's proxy with.
    */
   verifiers: Record<ClientRole, string>;
 }
@@ -159,6 +169,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
     filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
     filerStoreBackupPassword: kept(stored.filerStoreBackupPassword, () => secret()),
+    monitorKey: kept(stored.monitorKey, () => secret()),
     // Each of its password above, whether that was kept or made now.
     verifiers: {
       ...verifiers,

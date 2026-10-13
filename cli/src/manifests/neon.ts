@@ -1,7 +1,8 @@
 /**
  * Neon, alasio's database: Postgres whose storage is safekeepers and a pageserver on
  * object storage, with a storage controller and its own Postgres, a storage broker, the
- * compute, neon-control (alasio's stand-in for Neon's control plane, neon/control/),
+ * compute, Neon's proxy, which a client connects to the compute through, waking it when
+ * it sleeps, neon-control (alasio's stand-in for Neon's control plane, neon/control/),
  * the setup that makes the stack's secrets, and a daily backup.
  */
 import type {
@@ -19,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { computeId, MAIN } from "../../../neon/control/branches.ts";
+import { COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
 import {
   claimSpec,
@@ -431,11 +432,41 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
   return [service(name, component, [{ name: "pg", port: 6400 }, { name: "http", port: 9898 }]), statefulSet, verticalPodAutoscaler(statefulSet, "Recommended")];
 }
 
+/** The port Neon's proxy takes clients on, Postgres's own. */
+export const PROXY_PORT = 5432;
+
+/**
+ * What neon-control may do to the compute of `namespace`, main's or a branch
+ * environment's: read its Deployment, and scale it, waking it; a Role there, bound to
+ * neon-control's ServiceAccount in main's.
+ */
+export function computeScaling(namespace: string): KubernetesObject[] {
+  const name = neonName("control");
+  const metadata = { name, namespace, labels: stackLabels("neon-control") };
+  const role: V1Role = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "Role",
+    metadata,
+    rules: [
+      { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute")], verbs: ["get"] },
+      { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute")], verbs: ["patch"] },
+    ],
+  };
+  const binding: V1RoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "RoleBinding",
+    metadata,
+    subjects: [{ kind: "ServiceAccount", name, namespace: NAMESPACE }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name },
+  };
+  return [role, binding];
+}
+
 /**
  * neon-control: it bootstraps the tenant and main's timeline, makes and deletes branches,
- * serves each branch's compute its spec, answers the storage controller's hooks, and
- * repairs a safekeeper that lost its disk. Its record of the branches is in the storage
- * controller's Postgres, so any of its replicas serves.
+ * serves each branch's compute its spec, answers the storage controller's hooks and Neon's
+ * proxy, wakes computes, and repairs a safekeeper that lost its disk. Its record of the
+ * branches is in the storage controller's Postgres, so any of its replicas serves.
  */
 function control(config: InstallConfig): KubernetesObject[] {
   const name = neonName("control");
@@ -446,6 +477,7 @@ function control(config: InstallConfig): KubernetesObject[] {
     { length: config.neon.safekeepers.scaling.min },
     (_, index) => `${safekeeper}-${index}.${safekeeper}.${NAMESPACE}.svc.cluster.local`,
   );
+  const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) } };
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -456,6 +488,7 @@ function control(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
+          serviceAccountName: name,
           ...priority("floor"),
           ...stackPodSpec(config),
           ...spread(component, scaling),
@@ -470,6 +503,8 @@ function control(config: InstallConfig): KubernetesObject[] {
               // As every compute reaches it, a branch environment's in its own namespace too.
               { name: "NEON_PAGESERVER_HOST", value: `${neonName("pageserver")}.${NAMESPACE}.svc` },
               { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
+              { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
+              { name: "NEON_COMPUTE_NAME", value: neonName("compute") },
             ],
             ports: [{ name: "http", containerPort: 8080 }],
             readinessProbe: { httpGet: { path: "/healthz", port: "http" }, periodSeconds: 3 },
@@ -497,9 +532,73 @@ function control(config: InstallConfig): KubernetesObject[] {
   };
   return [
     service(name, component, [{ name: "http", port: 8080 }]),
+    serviceAccount,
+    ...computeScaling(NAMESPACE),
     deployment,
     ...replicaBudget(component, NAMESPACE, scaling),
     verticalPodAutoscaler(deployment, "Recommended"),
+  ];
+}
+
+/**
+ * Neon's proxy, from Neon's image: a client of a compute, main's or a branch
+ * environment's, connects to it, naming the compute by `options=endpoint=<id>` (the
+ * compute's id, as its spec is served under), without TLS, which would turn that option
+ * off. It asks neon-control, its control plane, for the role's verifier, authenticates the
+ * client against it, has neon-control wake the compute if it sleeps, and then passes the
+ * session through, whole, so session state such as advisory locks holds. It keeps where
+ * each compute is for four minutes, and asks again when a connection there fails, as one
+ * to a compute that has gone to sleep since does. It cancels no query: that needs a Redis
+ * of its own, and alasio cancels none.
+ */
+function proxy(config: InstallConfig): KubernetesObject[] {
+  const name = neonName("proxy");
+  const component = "neon-proxy";
+  const { scaling, resources } = config.neon.proxy;
+  const deployment: V1Deployment = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name, namespace: NAMESPACE, labels: stackLabels(component) },
+    spec: {
+      ...replicasOf(scaling),
+      selector: { matchLabels: selectorLabels(component) },
+      template: {
+        metadata: { labels: stackLabels(component) },
+        spec: {
+          ...priority("floor"),
+          ...stackPodSpec(config),
+          ...spread(component, scaling),
+          containers: [{
+            name: "proxy",
+            image: imageReference(config.neon.image),
+            imagePullPolicy: "IfNotPresent",
+            command: [
+              "proxy",
+              "--proxy", `0.0.0.0:${PROXY_PORT}`,
+              "--http", "0.0.0.0:7001",
+              "--auth-backend", "control-plane",
+              "--auth-endpoint", `http://${neonName("control")}:8080`,
+              "--wake-compute-cache", "size=4000,ttl=4m",
+              // A role's secret is kept ten seconds, not its four minutes: no Redis tells it of a
+              // branch deleted and made again under its name, with new passwords.
+              "--project-info-cache", "size=10000,ttl=10s,max_roles=10,gc_interval=60m",
+            ],
+            // Its token for neon-control, of the scope that answers it alone.
+            env: [secretVariable(name, "NEON_PROXY_TO_CONTROLPLANE_TOKEN")],
+            ports: [{ name: "postgres", containerPort: PROXY_PORT }, { name: "http", containerPort: 7001 }],
+            readinessProbe: { tcpSocket: { port: "postgres" }, periodSeconds: 5 },
+            securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+            resources,
+          }],
+        },
+      },
+    },
+  };
+  return [
+    service(name, component, [{ name: "postgres", port: PROXY_PORT }, { name: "http", port: 7001 }]),
+    deployment,
+    ...replicaBudget(component, NAMESPACE, scaling),
+    verticalPodAutoscaler(deployment, "InPlace"),
   ];
 }
 
@@ -510,11 +609,16 @@ function control(config: InstallConfig): KubernetesObject[] {
  * scrapes, and exports compute_ctl's traces to the collector, when it runs. A branch
  * environment's is on the branch's timeline, in its namespace, reaching the stack's
  * storage and neon-control in main's.
+ *
+ * neon-control wakes it, scaling its Deployment to one replica. Its Service takes
+ * connections before its pod is ready, so a wake is answered as soon as Postgres takes
+ * them.
  */
 export function compute(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
   const name = neonName("compute");
   const component = "neon-compute";
   const control = `http://${neonName("control")}.${NAMESPACE}.svc:8080`;
+  const { resources } = config.neon.compute;
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -543,7 +647,7 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
               "--pgdata",
               "/var/db/postgres/compute",
               "--connstr",
-              "postgresql://cloud_admin@localhost:55433/postgres",
+              `postgresql://cloud_admin@localhost:${COMPUTE_PORT}/postgres`,
               "--pgbin",
               "/usr/local/bin/postgres",
               "--compute-id",
@@ -557,10 +661,10 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
                 ? [{ name: "OTEL_SERVICE_NAME", value: "compute_ctl" }, ...otelEnv(config, environment)]
                 : [{ name: "OTEL_SDK_DISABLED", value: "true" }]),
             ],
-            ports: [{ name: "postgres", containerPort: 55433 }, { name: "http", containerPort: 3080 }],
-            readinessProbe: { exec: { command: ["pg_isready", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "postgres"] }, periodSeconds: 5 },
+            ports: [{ name: "postgres", containerPort: COMPUTE_PORT }, { name: "http", containerPort: 3080 }],
+            readinessProbe: { exec: { command: ["pg_isready", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "postgres"] }, periodSeconds: 5 },
             securityContext: restrictedContainer(),
-            resources: config.neon.compute.resources,
+            resources,
             volumeMounts: [{ name: "pgdata", mountPath: "/var/db/postgres" }],
           }],
           volumes: [{ name: "pgdata", emptyDir: {} }],
@@ -568,7 +672,13 @@ export function compute(config: InstallConfig, environment: Environment = MAIN_E
       },
     },
   };
-  return [service(name, component, [{ name: "postgres", port: 55433 }, { name: "http", port: 3080 }], environment), deployment, verticalPodAutoscaler(deployment, "Recommended")];
+  const service: V1Service = {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
+    spec: { selector: selectorLabels(component), publishNotReadyAddresses: true, ports: [{ name: "postgres", port: COMPUTE_PORT }, { name: "http", port: 3080 }] },
+  };
+  return [service, deployment, verticalPodAutoscaler(deployment, "Recommended")];
 }
 
 /**
@@ -681,6 +791,7 @@ export function neonObjects(config: InstallConfig): KubernetesObject[] {
     ...safekeepers(config),
     ...pageserver(config),
     ...control(config),
+    ...proxy(config),
     ...compute(config),
     ...(neon.backup.enabled ? [backup(config)] : []),
   ];

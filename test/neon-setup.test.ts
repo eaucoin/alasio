@@ -106,10 +106,15 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.deepEqual(verifyToken(publicKey, value(kube, names.safekeeper, "safekeeper_peer_token")), { scope: "safekeeperdata" });
   assert.equal(value(kube, names.compute, "NEON_CONTROL_PLANE_TOKEN"), root.computeControlToken);
   assert.equal(value(kube, names.database, "url"), `postgresql://alasio:${encodeURIComponent(root.alasioPassword)}@q-neon-compute:55433/alasio`);
+  // Neon's proxy, with a token that does nothing else.
+  assert.deepEqual(verifyToken(publicKey, value(kube, names.proxy, "NEON_PROXY_TO_CONTROLPLANE_TOKEN")), { scope: "proxy" });
   assert.equal(value(kube, names.lake, "LAKE_S3_KEY"), root.s3.lake.accessKey);
   assert.deepEqual(verifyToken(publicKey, value(kube, names.lake, "LAKE_BRANCHES_TOKEN")), { scope: "branches" });
   assert.deepEqual(verifyToken(publicKey, value(kube, names.branches, "control-token")), { scope: "admin" });
   assert.equal(value(kube, names.branches, "fork-key"), root.branchForkKey);
+  // neon-control's own, which it draws its role's passwords on the computes from, rendered nowhere but the root.
+  assert.match(root.monitorKey ?? "", /^[\w-]{32}$/u);
+  assert.ok(![...kube.secrets.entries()].some(([name, secret]) => name !== names.root && Object.values(secret.data ?? {}).some((data) => Buffer.from(data, "base64").toString("utf8").includes(root.monitorKey ?? "-"))));
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /control_plane_api='http:\/\/q-neon-storage-controller:1234\/upcall\/v1\/'/u);
   assert.match(value(kube, names.pageserver, "pageserver.toml"), /endpoint="http:\/\/q-seaweedfs:8333", bucket_name="neon"/u);
   // It evicts layers only once the node's disk, which it shares, is nearly full: at 94 % used or under 8 GiB free.
@@ -129,7 +134,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.lake, "LAKE_READER_PASSWORD"), root.lakeReaderPassword);
   assert.equal(value(kube, names.lake, "LAKE_READER_S3_KEY"), root.s3.lakeReader.accessKey);
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "lakeReader")?.actions, ["Read:lake", "List:lake"]);
-  // alasio sets each role it makes to the verifier made once with its password.
+  // alasio sets each role it makes to the verifier made once with its password, the one neon-control answers Neon's proxy with.
   for (const [key, role, password] of [["lake-verifier", "lake", root.lakePassword], ["lake-reader-verifier", "lake_reader", root.lakeReaderPassword], ["grafana-verifier", "grafana", root.grafanaPassword]] as const) {
     const verifier = value(kube, names.database, key);
     assert.equal(verifier, root.verifiers?.[role], key);
@@ -212,6 +217,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreFilerPassword: "p",
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
+    monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
   };
 }

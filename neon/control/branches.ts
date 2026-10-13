@@ -12,15 +12,17 @@
  * asked again, after a failure or a restart, asks for exactly the same timeline.
  *
  * A branch's compute has credentials of its own, which whoever asks for the branch makes
- * and neon-control is given only the hashes of: the SCRAM verifier of the password of
- * alasio's role on it, which its spec gives the role, and the SHA-256 of the token it
- * fetches its spec with, which fetches its spec alone. So what a branch is given reaches
- * neither main's compute nor another branch's spec. main's compute keeps the stack's.
+ * and neon-control is given only the hashes of: the SCRAM verifiers of the passwords of
+ * the roles its clients connect as (alasio's, which its spec gives the role, and the
+ * lake's, which its alasio sets), which neon-control answers Neon's proxy with, and the
+ * SHA-256 of the token it fetches its spec with, which fetches its spec alone. So what a
+ * branch is given reaches neither main's compute nor another branch's spec. main's
+ * compute keeps the stack's.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
 import type { JsonWebKeySet } from "./jwt.ts";
-import { DATABASE, ROLE } from "./secrets.ts";
+import { DATABASE, LAKE_ROLE, ROLE } from "./secrets.ts";
 
 /** alasio's own branch: its first timeline, bootstrapped, never deleted. */
 export const MAIN = "main";
@@ -48,10 +50,13 @@ export interface Placement {
   ids: number[];
 }
 
+/** The roles a branch's clients connect as: alasio's, and its lake's. */
+export const BRANCH_ROLES = [ROLE, LAKE_ROLE] as const;
+
 /** A branch's compute's own credentials, as neon-control keeps them: hashes alone. */
 export interface ComputeCredentials {
-  /** The SCRAM verifier of the password of alasio's role on the branch. */
-  passwordVerifier: string;
+  /** The SCRAM verifier (./scram.ts) of the password of each of BRANCH_ROLES on the branch, by role. */
+  verifiers: Record<(typeof BRANCH_ROLES)[number], string>;
   /** The SHA-256, in hexadecimal, of the token its compute fetches its spec with. */
   tokenSha256: string;
 }
@@ -90,12 +95,20 @@ export interface BranchRequest {
  */
 export const BRANCHES_SCOPE = "branches";
 
+/** The scope of Neon's proxy's token, which asks for roles' secrets and wakes computes, and does nothing else. */
+export const PROXY_SCOPE = "proxy";
+
+/** The paths of neon-control's API that Neon's proxy calls, as its control plane (./endpoints.ts). */
+export const PROXY_PATHS: readonly string[] = ["/get_endpoint_access_control", "/wake_compute"];
+
 /**
  * The scopes of the tokens a call of neon-control's API (`method` on `url`) is taken
- * with: the admin's, as the storage controller's hooks bear it, and for a list of the
- * branches the lake's too, which keeps its files while any branch may read them.
+ * with: the admin's, as the storage controller's hooks bear it; for a list of the
+ * branches the lake's too, which keeps its files while any branch may read them; and for
+ * what the proxy calls, the proxy's alone.
  */
 export function callScopes(method: string, url: string): readonly string[] {
+  if (method === "GET" && PROXY_PATHS.includes(new URL(url, "http://neon-control").pathname)) return [PROXY_SCOPE];
   return method === "GET" && url === "/branches" ? ["admin", BRANCHES_SCOPE] : ["admin"];
 }
 
@@ -136,14 +149,18 @@ export const tokenSha256 = (token: string): string => createHash("sha256").updat
 
 /** The credentials `value` gives a branch's compute, checked. */
 function computeCredentials(value: unknown): ComputeCredentials {
-  const { passwordVerifier, tokenSha256: sha, ...rest } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const object = (candidate: unknown) => (typeof candidate === "object" && candidate !== null ? candidate as Record<string, unknown> : {});
+  const { verifiers, tokenSha256: sha, ...rest } = object(value);
+  const given = object(verifiers);
+  const verifier = (role: string) => typeof given[role] === "string" && given[role].startsWith("SCRAM-SHA-256$");
   if (
-    Object.keys(rest).length > 0 || typeof passwordVerifier !== "string" || !passwordVerifier.startsWith("SCRAM-SHA-256$") ||
+    Object.keys(rest).length > 0 || Object.keys(given).length !== BRANCH_ROLES.length || !BRANCH_ROLES.every(verifier) ||
     typeof sha !== "string" || !/^[0-9a-f]{64}$/u.test(sha)
   ) {
-    throw new BranchError(400, "a branch's compute is given as { passwordVerifier, tokenSha256 }: a SCRAM-SHA-256 verifier, and a SHA-256 in hexadecimal");
+    throw new BranchError(400, `a branch's compute is given as { verifiers, tokenSha256 }: a SCRAM-SHA-256 verifier of each of ${BRANCH_ROLES.join(" and ")}, and a SHA-256 in hexadecimal`);
   }
-  return { passwordVerifier, tokenSha256: sha };
+  // Each checked above to be a verifier.
+  return { verifiers: { [ROLE]: given[ROLE] as string, [LAKE_ROLE]: given[LAKE_ROLE] as string }, tokenSha256: sha };
 }
 
 /** The branch `body` asks for: `{ name, parent?, lsn?, compute }`, its parent main if not given. */
@@ -318,8 +335,10 @@ export interface ComputeStack {
   tenantId: string;
   pageserverHost: string;
   safekeepers: readonly Safekeeper[];
-  /** The SCRAM verifier of alasio's role's password on main. */
-  passwordVerifier: string;
+  /** The verifiers of the passwords of the roles main's clients connect as, by role: alasio's, which main's spec gives it, among them. */
+  verifiers: Readonly<Record<string, string>> & { readonly alasio: string };
+  /** neon-control's own role on every compute, which it logs in to the compute as, and a verifier of its password on the compute of an id, made afresh for each spec. */
+  monitor: { readonly role: string; readonly verifier: (computeId: string) => string };
   /** The tenant-scoped token the compute reaches the pageserver and safekeepers with. */
   storageAuthToken: string;
   /** The keys compute_ctl verifies its API's tokens with. */
@@ -388,7 +407,11 @@ export function computeConfig(branch: ReadyBranch, stack: ComputeStack): Compute
       cluster: {
         cluster_id: "alasio",
         name: "alasio",
-        roles: [{ name: ROLE, encrypted_password: branch.compute?.passwordVerifier ?? stack.passwordVerifier, options: null }],
+        roles: [
+          { name: ROLE, encrypted_password: branch.compute?.verifiers.alasio ?? stack.verifiers.alasio, options: null },
+          // After alasio's: compute_ctl applies them in order, so once it may log in, alasio may too.
+          { name: stack.monitor.role, encrypted_password: stack.monitor.verifier(computeId(branch.name)), options: null },
+        ],
         databases: [{ name: DATABASE, owner: ROLE, options: null }],
         settings: [
           setting("listen_addresses", "0.0.0.0", "string"),

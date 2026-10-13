@@ -723,10 +723,10 @@ export function neonStack(): void {
       const BRANCH = "e2e";
       /** The pod of the branch's compute, which runs as main's does, but on the branch. */
       const COMPUTE = `${computeId(BRANCH)}-compute`;
-      /** Its compute's own credentials: its role's password, and its token, which neon-control is given the hashes of. */
+      /** Its compute's own credentials: its roles' passwords, and its token, which neon-control is given the hashes of. */
       const PASSWORD = `branch-${randomUUID()}`;
       const COMPUTE_TOKEN = `compute-${randomUUID()}`;
-      const compute = { passwordVerifier: scramVerifier(PASSWORD), tokenSha256: tokenSha256(COMPUTE_TOKEN) };
+      const compute = { verifiers: { alasio: scramVerifier(PASSWORD), lake: scramVerifier(`lake-${randomUUID()}`) }, tokenSha256: tokenSha256(COMPUTE_TOKEN) };
       let control: Forward | undefined;
 
       /** neon-control's API, called with `bearer`, a token of the admin scope unless given: its status, and what it answered. */

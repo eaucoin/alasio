@@ -25,7 +25,7 @@ import { randomBytes } from "node:crypto";
 import type { KubernetesObject, V1Deployment, V1Namespace, V1Node, V1PersistentVolume, V1Pod, V1Secret } from "@kubernetes/client-node";
 import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "effect";
 
-import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
+import { type BranchView, COMPUTE_PORT, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
@@ -113,7 +113,7 @@ const neonBranches = Effect.gen(function*() {
 
 /** Runs `sql` as the compute's own superuser, in its pod: what psql printed of its one value. */
 const onCompute = (namespace: string, pod: string, sql: string) =>
-  runIn({ namespace, pod, container: "compute" }, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", "alasio", "-Atc", sql]).pipe(
+  runIn({ namespace, pod, container: "compute" }, ["psql", "-h", "127.0.0.1", "-p", String(COMPUTE_PORT), "-U", "cloud_admin", "-d", "alasio", "-Atc", sql]).pipe(
     Effect.flatMap(succeeded(`asking the compute in ${namespace}`)),
     Effect.map((printed) => printed.trim()),
   );
@@ -241,7 +241,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
   const credentials = { alasio: own(), lake: own(), compute: own() };
-  // Their verifiers, each made once and given to whatever sets the role.
+  // Their verifiers, each made once and given to whatever sets the role or answers for it.
   const verifiers = { [ROLE]: scramVerifier(credentials.alasio), [LAKE_ROLE]: scramVerifier(credentials.lake) };
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
@@ -263,7 +263,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   const made = yield* neonControl<BranchView>("POST", "/branches", {
     name,
     lsn,
-    compute: { passwordVerifier: verifiers[ROLE], tokenSha256: tokenSha256(credentials.compute) },
+    compute: { verifiers, tokenSha256: tokenSha256(credentials.compute) },
   });
   if (made.status !== 201 && made.status !== 200) return yield* new BranchRefused({ message: `neon-control did not make the branch ${name}: ${refusalOf(made)}` });
 

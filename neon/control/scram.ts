@@ -2,8 +2,10 @@
  * A Postgres SCRAM-SHA-256 password verifier (RFC 5802, 7677), in the form
  * Postgres stores and compute_ctl passes through as a role's
  * encrypted_password: the password itself never reaches the compute's spec. Each is
- * salted at random, as Postgres salts one, and made once, where its password is made:
- * whatever sets a role's password (a compute's spec, alasio) is given that verifier.
+ * salted at random, as Postgres salts one, and made once: whoever sets a role's
+ * password (a compute's spec, alasio) and whoever answers for it (neon-control, to
+ * Neon's proxy, which authenticates a client with the keys of the verifier it is
+ * answered) are given the one verifier, which the compute must store to the byte.
  */
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 

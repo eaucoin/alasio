@@ -1,9 +1,9 @@
 /**
  * A branch environment's objects (`alasio branch create`): a different alasio, on a
- * copy-on-write copy of main's data, with a compute on the branch's timeline of Neon's
- * and a lake on the branch's copy of the lake's catalog, in a namespace of its own, and
- * its sessions in another; named as main's are, and found, as they are deleted, by those
- * namespaces and BRANCH_LABEL.
+ * copy-on-write copy of main's data, with a compute on the branch's timeline of Neon's,
+ * which main's neon-control wakes, and a lake on the branch's copy of the lake's catalog,
+ * in a namespace of its own, and its sessions in another; named as main's are, and found,
+ * as they are deleted, by those namespaces and BRANCH_LABEL.
  *
  * Its configuration is main's, with the operator's overrides, and never the host
  * profile: a folder is the machine's own files, which a branch cannot copy. Its alasio's
@@ -21,7 +21,7 @@ import { alasioObjects, sessionsNamespace } from "./alasio.ts";
 import { BRANCH_LABEL, componentName, type Environment, labels, NAMESPACE, RELEASE } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { lakeObjects } from "./lake.ts";
-import { compute } from "./neon.ts";
+import { compute, computeScaling } from "./neon.ts";
 import { networkPolicyObjects } from "./network-policies.ts";
 
 /** The environment of the branch `name`. */
@@ -60,6 +60,7 @@ export function branchObjects(config: InstallConfig, name: string): KubernetesOb
   return [
     ...alasioObjects(config, environment),
     ...compute(config, environment),
+    ...computeScaling(environment.namespace),
     ...lakeObjects(config, environment),
     ...networkPolicyObjects(config, environment),
     ...(config.sessions.enabled ? parentAccess(config, environment) : []),

@@ -17,7 +17,7 @@
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
-import { BRANCHES_SCOPE } from "./branches.ts";
+import { BRANCHES_SCOPE, PROXY_SCOPE } from "./branches.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
@@ -52,6 +52,7 @@ export interface SecretNames {
   filerStoreBackup: string;
   s3Admin: string;
   compute: string;
+  proxy: string;
   database: string;
   lake: string;
   grafana: string;
@@ -131,6 +132,7 @@ export function secretNames(prefix: string): SecretNames {
     filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
     s3Admin: `${prefix}-neon-s3-admin`,
     compute: `${prefix}-neon-compute`,
+    proxy: `${prefix}-neon-proxy`,
     database: `${prefix}-database`,
     lake: `${prefix}-lake`,
     grafana: `${prefix}-grafana`,
@@ -191,10 +193,11 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     [names.controllerDb]: { POSTGRES_PASSWORD: secrets.controllerDbPassword },
     [names.s3Admin]: aws("admin"),
     [names.compute]: { NEON_CONTROL_PLANE_TOKEN: secrets.computeControlToken },
+    [names.proxy]: { NEON_PROXY_TO_CONTROLPLANE_TOKEN: token(PROXY_SCOPE) },
     [names.database]: {
       url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${config.computeHost}:55433/${DATABASE}`,
       password: secrets.alasioPassword,
-      // What alasio sets the roles it makes to: their verifiers, made once.
+      // What alasio sets the roles it makes to: the verifiers neon-control answers for them.
       "lake-verifier": secrets.verifiers[LAKE_ROLE],
       "lake-reader-verifier": secrets.verifiers[LAKE_READER_ROLE],
       "grafana-verifier": secrets.verifiers[GRAFANA_ROLE],

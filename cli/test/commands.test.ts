@@ -1113,7 +1113,7 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   // Asked nothing before, as asserted: what it was asked since.
   const posted = (neon.asked as FakeNeon["asked"]).filter(({ method }) => method === "POST");
   assert.deepEqual(posted.map(({ path }) => path), ["/branches"]);
-  const { compute, ...branched } = (posted[0]?.body ?? {}) as { readonly compute?: { readonly passwordVerifier: string; readonly tokenSha256: string } };
+  const { compute, ...branched } = (posted[0]?.body ?? {}) as { readonly compute?: { readonly verifiers: Record<string, string>; readonly tokenSha256: string } };
   assert.deepEqual(branched, { name: "try", lsn: "0/1A2B3C8" });
   const deployment = kube.get(BRANCH_DEPLOYMENT) as { metadata: { labels: Record<string, string> }; spec: { template: { spec: { containers: { image: string }[] } } } } | undefined;
   assert.equal(deployment?.spec.template.spec.containers[0]?.image, "registry.example:5000/alasio:next");
@@ -1123,19 +1123,21 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   // Its own bot, for main's users; its own token to ask main to fork with.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "token"), "456:branch");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-telegram", "allowedUserIds"), "42");
-  // Its own password of alasio's role, whose verifier alone neon-control is given for its compute's spec.
+  // Its own password of alasio's role, whose verifier alone neon-control is given, for its compute's spec and Neon's proxy.
   const url = new URL(secretIn(kube, "alasio-branch-try", "alasio-database", "url") ?? "");
   assert.deepEqual([url.username, url.host, url.pathname], ["alasio", "alasio-neon-compute:55433", "/alasio"]);
   assert.notEqual(url.password, "p");
-  assert.ok(verifies(compute?.passwordVerifier, decodeURIComponent(url.password)));
+  assert.ok(verifies(compute?.verifiers["alasio"], decodeURIComponent(url.password)));
   // Its compute's own token, whose hash alone neon-control is given; its lake's role's own password.
   const computeToken = secretIn(kube, "alasio-branch-try", "alasio-neon-compute", "NEON_CONTROL_PLANE_TOKEN") ?? "";
   assert.notEqual(computeToken, "c");
   assert.equal(compute?.tokenSha256, tokenSha256(computeToken));
   const lakePassword = secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_DATABASE_PASSWORD");
   assert.notEqual(lakePassword, "l");
-  // Its lake's role's verifier, which its alasio sets the role to.
-  assert.ok(verifies(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-verifier"), lakePassword ?? ""));
+  // Its lake's role's verifier, which its alasio sets the role to, the one neon-control is given.
+  assert.ok(verifies(compute?.verifiers["lake"], lakePassword ?? ""));
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-database", "lake-verifier"), compute?.verifiers["lake"]);
+  assert.deepEqual(Object.keys(compute?.verifiers ?? {}), ["alasio", "lake"]);
   // Of main's, only the lake's object store identity, which reads main's files where they are.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-lake", "LAKE_S3_KEY"), "k");
   const keys = (name: string) => Object.keys((kube.get(`/api/v1/namespaces/alasio-branch-try/secrets/${name}`)?.["data"] ?? {}) as object).sort();

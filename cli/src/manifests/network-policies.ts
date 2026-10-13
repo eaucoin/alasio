@@ -7,6 +7,7 @@
  */
 import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, V1NetworkPolicySpec } from "@kubernetes/client-node";
 
+import { COMPUTE_PORT } from "../../../neon/control/branches.ts";
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
 import {
@@ -105,11 +106,15 @@ function sessionPolicies(config: InstallConfig, environment: Environment): Netwo
 /** The object store's parts, of the stack, to each of which partPolicies and gatewayPolicy admit what talks to it alone. */
 const PARTS = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
 
+/** A component of main's, as a peer from any namespace. */
+const ofMain = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(component) } });
+
 /**
  * Neon's services, the lake and their jobs reach each other; alasio reaches the compute,
- * its database. In a branch environment, its compute and its lake reach each other, and
- * its alasio its compute, as main's do. The object store's parts, of the stack too, are
- * reached as partPolicies and gatewayPolicy say alone.
+ * its database, and main's Neon proxy and neon-control reach every compute, the proxy for
+ * its clients and neon-control as it wakes it. In a branch environment, its compute and
+ * its lake reach each other, and its alasio its compute, as main's do. The object store's
+ * parts, of the stack too, are reached as partPolicies and gatewayPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
@@ -121,7 +126,10 @@ function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
     policy(componentName("neon-compute"), namespace, "neon", {
       podSelector: { matchLabels: selectorLabels("neon-compute") },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: 55433 }] }],
+      ingress: [
+        { from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
+        { from: [ofMain("neon-proxy"), ofMain("neon-control")], ports: [{ protocol: "TCP", port: COMPUTE_PORT }] },
+      ],
     }),
   ];
 }

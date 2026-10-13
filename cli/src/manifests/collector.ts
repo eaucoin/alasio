@@ -105,6 +105,7 @@ function scrapes(config: InstallConfig): object[] {
     "storage-controller": [`${neonName("storage-controller")}:1234`],
     "storage-broker": [`${neonName("storage-broker")}:50051`],
     compute: [`${neonName("compute")}:3080`],
+    proxy: [`${neonName("proxy")}:7001`],
     safekeeper: Array.from({ length: neon.safekeepers.scaling.min }, (_, index) => `${safekeeper}-${index}.${safekeeper}:7676`),
     ...(lakeRuns(config) ? { lake: [`${componentName("lake")}:9464`] } : {}),
   };
