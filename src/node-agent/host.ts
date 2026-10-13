@@ -17,9 +17,10 @@ const K3S_BIN = "/var/lib/rancher/k3s/data/current/bin";
  * The PATH commands run with on the node, as k3s orders it for what it runs, kube-router
  * among it (cmd/k3s/main.go): its binaries, the node's own, then its `aux/`, so a node's
  * own iptables is the one kube-router programs where the node has one. A node in Docker
- * (cli/src/cluster/docker.ts) has its image's, which k3s's are too.
+ * (cli/src/cluster/docker.ts) runs k3s's image, which holds k3s's binaries in /bin and
+ * its `aux/` in /bin/aux (iptables-save among them), last on the image's PATH, as here.
  */
-export const NODE_PATH = `${K3S_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${K3S_BIN}/aux`;
+export const NODE_PATH = `${K3S_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${K3S_BIN}/aux:/bin/aux`;
 
 /** How a command run on the node exited, and what it printed. */
 export interface HostRun {
