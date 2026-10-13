@@ -2,7 +2,7 @@
  * neon-control's record, in the storage controller's Postgres, in a schema of its own
  * (`neon_control`), so that it outlives any replica of neon-control and is shared by all
  * of them: a row of each branch, its name and its record as ./branches.ts has it; and a
- * row of each compute asked to wake, and when.
+ * row of each compute woken or put to sleep, and when.
  *
  * What changes branches runs under one lock, a session's advisory lock on the database,
  * so two replicas never change them at once, nor repair a timeline whose deletion one of
@@ -63,10 +63,11 @@ export interface Changing {
   save(next: Branch[]): Promise<void>;
 }
 
-/** A compute, as recorded: when it was last asked to wake, in milliseconds since the epoch. */
+/** A compute, as recorded: when it was last woken, and last put to sleep, in milliseconds since the epoch, or null for never. */
 export interface ComputeTimes {
   id: string;
-  wokenAt: number;
+  wokenAt: number | null;
+  suspendedAt: number | null;
 }
 
 /** The record, in the database `url` reaches. */
@@ -91,7 +92,7 @@ export class BranchRecord {
     return this.#holding(CHANGE_LOCK, "the lock of changes", async (client) => {
       await client.query("create schema if not exists neon_control");
       await client.query("create table if not exists neon_control.branches (name text primary key, branch jsonb not null)");
-      await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz)");
+      await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz, suspended_at timestamptz)");
     });
   }
 
@@ -128,10 +129,20 @@ export class BranchRecord {
     );
   }
 
-  /** Every compute recorded asked to wake. */
+  /** Records the compute `id` put to sleep now. */
+  async suspended(id: string): Promise<void> {
+    await this.#pool.query(
+      "insert into neon_control.computes (id, suspended_at) values ($1, now()) on conflict (id) do update set suspended_at = excluded.suspended_at",
+      [id],
+    );
+  }
+
+  /** Every compute recorded woken or put to sleep. */
   async computes(): Promise<ComputeTimes[]> {
-    const { rows } = await this.#pool.query<{ id: string; woken_at: Date }>("select id, woken_at from neon_control.computes order by id");
-    return rows.map(({ id, woken_at }) => ({ id, wokenAt: woken_at.getTime() }));
+    const { rows } = await this.#pool.query<{ id: string; woken_at: Date | null; suspended_at: Date | null }>(
+      "select id, woken_at, suspended_at from neon_control.computes order by id",
+    );
+    return rows.map(({ id, woken_at, suspended_at }) => ({ id, wokenAt: woken_at?.getTime() ?? null, suspendedAt: suspended_at?.getTime() ?? null }));
   }
 
   /**

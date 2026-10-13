@@ -13,11 +13,12 @@ import { describeMemory, describeScale, describeSizing, memoryBytes, type Scaled
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
-import { NAMESPACE, RELEASE } from "../manifests/common.ts";
+import { NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
+import { type ComputeTimes, computeTimes } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
 import { notRunning, runIn } from "./common.ts";
 
@@ -125,6 +126,16 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
     return [describeReplication(replication), ...disks.map((line) => `  ${line}`)];
   });
 
+/**
+ * A compute that is ready: asleep at no replica, as neon-control puts one no client has
+ * used for a while, until the next connection wakes it, or awake; and when it was last
+ * woken, as neon-control recorded it.
+ */
+function describeCompute(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>): string {
+  const woken = computes.get(workload.metadata?.namespace ?? "")?.wokenAt;
+  return `${workload.spec?.replicas === 0 ? "asleep" : "awake"}${woken ? `, last woken ${woken}` : ""}`;
+}
+
 /** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
 const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
@@ -164,6 +175,7 @@ export const status = Command.make("status", {}, () =>
         const scaledObjects = (yield* installedOf<ScaledObject>(kind("ScaledObject"))).objects;
         const sizings = (yield* installedOf<VerticalPodAutoscaler>(kind("VerticalPodAutoscaler"))).objects;
         yield* Console.log(`alasio${version ? ` ${version}` : ""}, in ${describeTarget(target)} (${kube.server}):`);
+        const computes = yield* computeTimes;
         let notReady = 0;
         for (const workload of workloads as readonly ScaledWorkload[]) {
           const state = readiness(workload);
@@ -171,7 +183,7 @@ export const status = Command.make("status", {}, () =>
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, of(scaledObjects, workload, ({ spec }) => spec.scaleTargetRef.name))}; `;
           const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
-            yield* Console.log(`  ${describeRef(refOf(workload))}: ready`);
+            yield* Console.log(`  ${describeRef(refOf(workload))}: ${workload.metadata?.name === neonName("compute") ? describeCompute(workload, computes) : "ready"}`);
             yield* Console.log(sizing);
             continue;
           }
@@ -202,7 +214,8 @@ export const status = Command.make("status", {}, () =>
     Command.withShortDescription("Say what runs, and whether it is healthy"),
     Command.withDescription(
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
-        "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready, or what it is at and " +
+        "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
+        "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +

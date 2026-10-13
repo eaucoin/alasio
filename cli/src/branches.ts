@@ -101,6 +101,20 @@ function neonControl<Body>(method: "GET" | "POST" | "DELETE", path: string, body
   });
 }
 
+/** A compute as neon-control lists it: where it runs, and when it was last asked to wake and put to sleep, if ever. */
+export interface ComputeTimes {
+  readonly id: string;
+  readonly namespace: string;
+  readonly wokenAt: string | null;
+  readonly suspendedAt: string | null;
+}
+
+/** Each compute neon-control knows of, by its namespace; none where neon-control does not answer. */
+export const computeTimes = neonControl<{ readonly computes: readonly ComputeTimes[] }>("GET", "/computes").pipe(
+  Effect.map((answer) => new Map(answer.status === 200 && answer.body ? answer.body.computes.map((compute) => [compute.namespace, compute] as const) : [])),
+  Effect.orElseSucceed(() => new Map<string, ComputeTimes>()),
+);
+
 /** What neon-control says of a refusal: its error, or its status. */
 const refusalOf = (answer: ControlAnswer<unknown>): string =>
   Predicate.hasProperty(answer.body, "error") ? String(answer.body.error) : `it answered ${answer.status}`;

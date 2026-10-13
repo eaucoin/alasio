@@ -150,7 +150,7 @@ test("each lock is held on a connection of its own, so reads go on however many 
   }
 });
 
-test("records when each compute was last asked to wake", async () => {
+test("records when each compute was asked to wake, and put to sleep", async () => {
   const database = await startPostgres();
   const record = new BranchRecord(database.url);
   try {
@@ -158,14 +158,16 @@ test("records when each compute was last asked to wake", async () => {
     assert.deepEqual(await record.computes(), []);
     const before = Date.now();
     await record.woke("alasio");
-    const [first] = await record.computes();
-    assert.equal(first?.id, "alasio");
-    assert.ok((first?.wokenAt ?? 0) >= before - 1000);
-    await sleep(50);
-    await record.woke("alasio");
-    const [again, ...others] = await record.computes();
-    assert.ok((again?.wokenAt ?? 0) > (first?.wokenAt ?? 0));
-    assert.deepEqual(others, []);
+    await record.suspended("branch-dev");
+    const [main, dev] = await record.computes();
+    assert.equal(main?.id, "alasio");
+    assert.ok((main?.wokenAt ?? 0) >= before - 1000);
+    assert.equal(main?.suspendedAt, null);
+    assert.deepEqual([dev?.id, dev?.wokenAt], ["branch-dev", null]);
+    await record.suspended("alasio");
+    const [again] = await record.computes();
+    assert.equal(again?.wokenAt, main?.wokenAt, "a sleep keeps when it last woke");
+    assert.ok(again?.suspendedAt);
   } finally {
     await record.end();
     await database.stop();

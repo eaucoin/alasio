@@ -54,6 +54,8 @@
  * - `POST /computes/<id>/wake`: wakes the compute `id` (`alasio`, or `branch-<name>`),
  *   as the proxy's `wake_compute` does, for alasio's command line, which works in it
  *   (200, `{ address }`); 404 for a compute of no ready branch, or not deployed.
+ * - `GET /computes`: every ready branch's compute, its namespace, and when it was last
+ *   asked to wake and put to sleep (200, `{ computes }`), for `alasio status`.
  *
  * 503, `{ error }`, too, for a lock of the record another replica held for longer than its
  * patience (./record.ts), when it may be asked again.
@@ -541,6 +543,7 @@ async function suspendIdle(names: readonly string[]): Promise<void> {
         await scaleCompute(ref, 0);
         idle.delete(id);
         await untilGone(ref, deployment, Date.now() + SUSPEND_PATIENCE_MS);
+        await record.suspended(id);
         return true;
       });
       if (!slept?.value) continue;
@@ -670,6 +673,19 @@ async function answerProxy(request: IncomingMessage, response: ServerResponse, p
   }
 }
 
+/** Every ready branch's compute, where it runs, and when it was last asked to wake and put to sleep (./record.ts), for alasio's command line. */
+async function computesView(): Promise<object> {
+  const [branches, computes] = await Promise.all([record.branches(), record.computes()]);
+  return {
+    computes: branches.filter(({ state }) => state === "ready").map(({ name }) => {
+      const id = computeId(name);
+      const times = computes.find((compute) => compute.id === id);
+      const at = (ms: number | null | undefined) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
+      return { id, namespace: computeOf(name).namespace, wokenAt: at(times?.wokenAt), suspendedAt: at(times?.suspendedAt) };
+    }),
+  };
+}
+
 const SPEC = /^\/compute\/api\/v2\/computes\/([^/]+)\/spec$/u;
 const WAKE = /^\/computes\/([^/]+)\/wake$/u;
 const BRANCH = /^\/branches\/([^/]+)$/u;
@@ -700,7 +716,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
   const wakeAsked = method === "POST" ? WAKE.exec(url) : null;
   const branch = BRANCH.exec(url);
   const hook = method === "PUT" && (url === "/notify-attach" || url === "/notify-safekeepers");
-  const api = url === "/branches" ? method === "GET" || method === "POST" : branch !== null && method === "DELETE";
+  const api = url === "/branches" ? method === "GET" || method === "POST" : url === "/computes" ? method === "GET" : branch !== null && method === "DELETE";
   if (!proxied && !wakeAsked && !hook && !api) return answer(response, 404);
   if (!authorized(request)) return answer(response, 401);
   if (!ready) {
@@ -717,6 +733,7 @@ async function route(request: IncomingMessage, response: ServerResponse): Promis
     await wake(compute.name);
     return answer(response, 200, { address: computeAddress(COMPUTE_NAME, computeOf(compute.name).namespace) });
   }
+  if (url === "/computes") return answer(response, 200, await computesView());
   if (url === "/notify-attach") {
     // Every compute reaches the stack's one pageserver by its Service, whichever of
     // its nodes the tenant is attached to: an attach changes no branch's spec.

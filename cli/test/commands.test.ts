@@ -341,6 +341,13 @@ test("status says each workload's state, and fails when one is not ready", async
   for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
     assert.ok(healthy.printed.includes(line), line);
   }
+  // A compute neon-control has put to sleep sleeps, and is not unready.
+  const compute = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute");
+  assert.ok(compute?.spec);
+  compute.spec["replicas"] = 0;
+  const sleeping = await alasio(["status"]);
+  succeeded(sleeping);
+  assert.ok(sleeping.printed.includes("  Deployment alasio/alasio-neon-compute: asleep"), sleeping.printed.join("\n"));
   const deployment = kube.get(DEPLOYMENT);
   assert.ok(deployment?.status);
   deployment.status["availableReplicas"] = 0;
@@ -1012,6 +1019,8 @@ interface FakeNeon {
   readonly asked: { readonly method: string; readonly path: string; readonly body?: unknown }[];
   /** The active turns a branch's database has. */
   turns: string;
+  /** Each compute as neon-control lists it. */
+  readonly computes: { id: string; namespace: string; wokenAt: string | null; suspendedAt: string | null }[];
 }
 
 /** A Secret of main's, as the stack's setup makes it. */
@@ -1051,7 +1060,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
   });
   stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
   stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
-  const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0" };
+  const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [] };
   setup.kube.onExec = ({ container, command }) => {
     if (container === "neon-control") {
       const method = command[command.indexOf("-X") + 1] ?? "";
@@ -1060,6 +1069,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
       const body: unknown = data === -1 ? undefined : JSON.parse(command[data + 1] ?? "");
       neon.asked.push({ method, path, ...(body === undefined ? {} : { body }) });
       const answer = (status: number, answered?: unknown) => ({ exitCode: 0, stdout: `${answered === undefined ? "" : JSON.stringify(answered)}\n${status}` });
+      if (method === "GET" && path === "/computes") return answer(200, { computes: neon.computes });
       if (method === "GET") return answer(200, { branches: neon.branches });
       if (method === "POST") {
         const { name } = body as { name: string };
@@ -1086,6 +1096,26 @@ function secretIn(kube: FakeKube, namespace: string, name: string, key: string):
 }
 
 const BRANCH_DEPLOYMENT = "/apis/apps/v1/namespaces/alasio-branch-try/deployments/alasio";
+
+test("status says of each compute whether it is awake or asleep, and when neon-control last woke it, and of nothing else that it sleeps", async (t) => {
+  const { alasio, kube, neon } = await branchable(t);
+  const compute = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute");
+  assert.ok(compute?.spec);
+  let run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-neon-compute: awake"), run.printed.join("\n"));
+  neon.computes.push({ id: "alasio", namespace: "alasio", wokenAt: "2026-10-12T08:00:00.000Z", suspendedAt: null });
+  compute.spec["replicas"] = 0;
+  run = await alasio(["status"]);
+  succeeded(run);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-neon-compute: asleep, last woken 2026-10-12T08:00:00.000Z"), run.printed.join("\n"));
+  // Another workload at no replica is ready, as KEDA leaves one, not asleep.
+  const collector = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-collector");
+  assert.ok(collector?.spec);
+  collector.spec["replicas"] = 0;
+  run = await alasio(["status"]);
+  assert.ok(run.printed.includes("  Deployment alasio/alasio-collector: ready"), run.printed.join("\n"));
+});
 
 test("branch create's help says how far back Neon keeps its history, and so a branch point", async (t) => {
   const { alasio } = await rig(t);
