@@ -4,6 +4,8 @@
  * its workspaces' Sandboxes from (src/kube/config.ts); main's, or a branch environment's
  * in its own namespaces (./branch.ts), and main's Service of the forks it makes for them.
  */
+import { isDeepStrictEqual } from "node:util";
+
 import type {
   KubernetesObject,
   V1ConfigMap,
@@ -18,8 +20,10 @@ import type {
   V1Volume,
 } from "@kubernetes/client-node";
 
+import { Result } from "effect";
+
 import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
+import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -238,11 +242,48 @@ function hostProfile(config: InstallConfig): HostProfile {
   };
 }
 
+/**
+ * What `alasio up` carries forward from the installation it replaces: the sessions'
+ * profile before the current one, whose template their snapshots may still restore onto
+ * (src/sandbox/snapshots.ts), and the Sandbox policy pins beside the current one
+ * (./admission.ts), until the template changes again.
+ */
+export interface Carried {
+  readonly previousSessions: SessionsProfile | null;
+}
+
+/** Nothing carried forward: a first installation's, and a branch environment's. */
+export const NOTHING_CARRIED: Carried = { previousSessions: null };
+
+/** The ConfigMap of the templates, by its name. */
+export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
+
+/**
+ * What the installation `config` describes carries forward from `live`, the templates
+ * of the installation it replaces (its ConfigMap's `templates.json`, if it has one): the
+ * sessions' profile it ran, where their template changes, or else the one it carried. A
+ * profile is carried for one change of the template, and no more. Pure, for tests.
+ */
+export function carriedFrom(config: InstallConfig, live: string | undefined): Carried {
+  if (!config.sessions.enabled || live === undefined) return NOTHING_CARRIED;
+  // Carried as the ConfigMap held them, which alasio read as they are: the profile a snapshot recorded the hash of.
+  if (Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return NOTHING_CARRIED;
+  const held = JSON.parse(live) as { readonly sessions?: SessionsProfile | null; readonly previousSessions?: SessionsProfile | null };
+  if (!held.sessions) return NOTHING_CARRIED;
+  // The current profile as the ConfigMap holds it, to compare with what it held.
+  const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT), "")) as SessionsProfile;
+  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions };
+}
+
 /** The ConfigMap of the templates, and their checksum, which alasio's pod carries so it is replaced when they change. */
-function sandboxTemplates(config: InstallConfig, environment: Environment): { readonly configMap: V1ConfigMap; readonly checksum: string } {
-  const name = componentName("sandbox-templates");
+function sandboxTemplates(config: InstallConfig, environment: Environment, carried: Carried): { readonly configMap: V1ConfigMap; readonly checksum: string } {
+  const name = SANDBOX_TEMPLATES;
   const templates = goJson(
-    { ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment) } : {}), ...(config.host.enabled ? { host: hostProfile(config) } : {}) },
+    {
+      ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment) } : {}),
+      ...(config.sessions.enabled && carried.previousSessions ? { previousSessions: carried.previousSessions } : {}),
+      ...(config.host.enabled ? { host: hostProfile(config) } : {}),
+    },
     "  ",
   );
   return {
@@ -478,8 +519,7 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * alasio's identity: it drives its workspaces' Sandboxes, their token Secrets, and reads
  * files from sessions through exec, in the namespaces it owns, labelling their pods busy
  * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
- * it snapshots sessions, records the templates their snapshots restore into in a ConfigMap
- * of the sessions namespace, and sets a restored session's readiness; where it forks
+ * it snapshots sessions, sets a restored session's readiness; where it forks
  * sessions, reads sessions' volume claims and runs the Jobs that clone them in its own;
  * where the node agents run, watches pods in its own, theirs among them; and, where it
  * installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount
@@ -529,11 +569,8 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
           { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
           ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
-          // Which session templates its sessions' snapshots restore into, and a restored
-          // session's readiness, once its sandbox is let run (src/sandbox/snapshots.ts).
-          ...(snapshotted
-            ? [{ apiGroups: [""], resources: ["configmaps"], verbs: ["get", "create", "update"] }, { apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] }]
-            : []),
+          // A restored session's readiness, once its sandbox is let run (src/sandbox/snapshots.ts).
+          ...(snapshotted ? [{ apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] }] : []),
         ],
       };
       return [role, binding(metadata)];
@@ -577,9 +614,9 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
   return [serviceAccount, role, binding];
 }
 
-/** The objects of the alasio of `environment`, main's unless a branch environment's. */
-export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
-  const templates = sandboxTemplates(config, environment);
+/** The objects of the alasio of `environment`, main's unless a branch environment's, with what main's carries forward. */
+export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, carried: Carried = NOTHING_CARRIED): KubernetesObject[] {
+  const templates = sandboxTemplates(config, environment, carried);
   const alasio = deployment(config, templates.checksum, environment);
   return [
     ...namespaces(config, environment),
@@ -598,7 +635,11 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     ...sandboxPolicy(
       sandboxPolicyName(environment.namespace),
       alasioAccount(environment.namespace),
-      { sessions: config.sessions.enabled ? sessionsProfile(config, environment) : null, host: config.host.enabled ? hostProfile(config) : null },
+      {
+        sessions: config.sessions.enabled ? sessionsProfile(config, environment) : null,
+        previousSessions: config.sessions.enabled ? carried.previousSessions : null,
+        host: config.host.enabled ? hostProfile(config) : null,
+      },
     ),
   ];
 }

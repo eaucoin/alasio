@@ -109,7 +109,7 @@ function workspaceServices({ kubeTemplates, stateDir, branch }: AlasioOptions): 
     sessions
       ? Layer.unwrap(Effect.gen(function*() {
         const inherit = branch ? inheritance(branch, yield* Store) : undefined;
-        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, stateDir, inherit }));
+        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, previous: kubeTemplates?.previousSessions ?? null, stateDir, inherit }));
       }))
       : Layer.empty,
     host ? HostBayma.layer(host) : Layer.empty,

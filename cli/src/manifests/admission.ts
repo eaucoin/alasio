@@ -30,13 +30,20 @@ import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
   BAYMA_CONTAINER,
+  CPU_FEATURES_ANNOTATION,
   DEFAULT_FULL_MODE_NAMESERVERS,
   EGRESS_GATE,
   EGRESS_GATE_SCRIPT,
   HARNESS_LABEL,
   MANAGED_BY,
   NET_MODE_LABEL,
+  RESTORE_ANNOTATION,
+  RESTORE_PAUSED_ANNOTATION,
+  RESUMED_CONDITION,
   SANDBOX_LABEL,
+  SESSION_TEMPLATE_ANNOTATION,
+  SNAPSHOT_CACHE_DIR,
+  SNAPSHOT_ID,
   STATE_DIR_ARG,
   TELEMETRY_TOKEN_FILE_ARGS,
   TOKEN_DIR,
@@ -261,15 +268,49 @@ const literally = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
 /** A variable of the environment, set to a string. */
 const SET: Pinned = { name: ANY_STRING, value: ANY_STRING };
 
+/** A node's name: a DNS subdomain. */
+const NODE_NAME = "[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?";
+
+/** A pod template's hash, as podTemplateHash makes one (src/kube/sandboxes.ts). */
+const TEMPLATE_HASH = "[0-9a-f]{64}";
+
+/** CPU features, as cpuBaseline names those a sandbox is held to: gVisor's names, separated by commas, if any. */
+const CPU_FEATURES = "([a-z0-9_.]+(,[a-z0-9_.]+)*)?";
+
+/**
+ * Where a node agent prepares a snapshot of the Sandbox asked about, of the sessions of
+ * `namespace`, for its pod to be restored from: under the snapshot cache, in its
+ * environment's directory, in its workspace's, the Sandbox's own, a snapshot's.
+ */
+const restoredFrom = (namespace: string) =>
+  new Check((expression) => {
+    const own = `${JSON.stringify(`${SNAPSHOT_CACHE_DIR}/${namespace}/`)} + object.metadata.name + "/"`;
+    return `type(${expression}) == string && ${expression}.startsWith(${own}) && ${expression}.substring(size(${own})).matches(${JSON.stringify(`^${SNAPSHOT_ID}$`)})`;
+  });
+
+/** What a session's Sandbox is made of: its template, and the profile its snapshots are restored by, the current one's. */
+interface SessionWorkspace {
+  readonly session: SessionsProfile;
+  readonly current: SessionsProfile;
+}
+
 /**
  * The Sandbox of a workspace alasio makes from `template`: a session's (`session`, with
- * the session's profile) or a folder's bayma's (`folder`, with its state root), as
- * sandboxManifest and sessionSandboxManifest or hostBaymaManifest make it.
+ * the session's profile, and `current`, the profile its snapshots are restored by) or a
+ * folder's bayma's (`folder`, with its state root), as sandboxManifest and
+ * sessionSandboxManifest or hostBaymaManifest make it.
+ *
+ * Of a session's, what its snapshots add (src/sandbox/snapshots.ts): the hash of the
+ * template its pod is made from, which they record; where it is snapshotted, the CPU
+ * features it is held to; and, restored from one, the image of the Sandbox's own that its
+ * node prepared, left paused until it is resumed, under a release `current` keeps, on
+ * that node, and ready once resumed.
  */
-function sandboxOf(template: SessionsProfile | HostProfile, workspace: { readonly session: SessionsProfile } | { readonly folder: HostProfile }): Pinned {
+function sandboxOf(template: SessionsProfile | HostProfile, workspace: SessionWorkspace | { readonly folder: HostProfile }): Pinned {
   const podTemplate: V1PodTemplateSpec = template.podTemplate as V1PodTemplateSpec;
   const spec: V1PodSpec = podTemplate.spec ?? { containers: [] };
   const session = "session" in workspace ? workspace.session : null;
+  const snapshots = "current" in workspace ? (workspace.current.snapshots ?? null) : null;
   const bayma = spec.containers.find(({ name }) => name === BAYMA_CONTAINER);
   const tokenMount = { name: TOKEN_VOLUME, mountPath: TOKEN_DIR, readOnly: true };
   // Under the state root as hostBaymaStateDir joins it: normalized, its one slash after it.
@@ -304,6 +345,35 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: { readonl
     [SANDBOX_LABEL]: sameAs("object.metadata.name"),
     ...(session ? { [WORKLOAD_LABEL]: "session", [NET_MODE_LABEL]: oneOf("none", "full") } : { [WORKLOAD_LABEL]: "folder", [HARNESS_LABEL]: matching(PATH_TOKEN) }),
   };
+  const annotations = (podTemplate.metadata?.annotations ?? {}) as PinnedMap;
+  const added: PinnedMap = session
+    ? {
+      [SESSION_TEMPLATE_ANNOTATION]: optional(matching(TEMPLATE_HASH)),
+      ...(snapshots && session
+        ? {
+          [CPU_FEATURES_ANNOTATION]: optional(matching(CPU_FEATURES)),
+          [RESTORE_ANNOTATION]: optional(restoredFrom(session.namespace)),
+          [RESTORE_PAUSED_ANNOTATION]: optional("true"),
+        }
+        : {}),
+    }
+    : {};
+  // The template's annotations, and those added where they may be; a template of none has a map of them only where some are added.
+  const metadataAnnotations = Object.keys(added).length === 0 ? {} : { annotations: Object.keys(annotations).length > 0 ? { ...annotations, ...added } : optional({ ...added }) };
+  const restoredOn: Pinned = {
+    ...((spec.affinity ?? {}) as PinnedMap),
+    nodeAffinity: {
+      requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] },
+    },
+  };
+  const readinessGates = (spec.readinessGates ?? []) as unknown as Pinned[];
+  const restorable = snapshots
+    ? {
+      runtimeClassName: oneOf(...new Set([spec.runtimeClassName ?? "", ...snapshots.releases.map(({ runtimeClassName }) => runtimeClassName)].filter((each) => each !== ""))),
+      readinessGates: spec.readinessGates ? oneOf(readinessGates, [...readinessGates, { conditionType: RESUMED_CONDITION }]) : optional([{ conditionType: RESUMED_CONDITION }]),
+      affinity: spec.affinity ? oneOf(spec.affinity as unknown as PinnedMap, restoredOn) : optional(restoredOn),
+    }
+    : {};
   const nameservers = session ? [...(session.fullModeNameservers ?? DEFAULT_FULL_MODE_NAMESERVERS)] : [];
   const podSpec = {
     ...spec,
@@ -314,13 +384,18 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: { readonl
     ...(session
       ? { automountServiceAccountToken: false, enableServiceLinks: false, dnsPolicy: "None", dnsConfig: { nameservers: oneOf(nameservers, ["127.0.0.1"]) } }
       : {}),
+    ...restorable,
   };
+  // A Sandbox restored onto the template before the current one keeps the claims it was made with, of either.
+  const claims = [...new Set([session, "current" in workspace ? workspace.current : null].map((each) => JSON.stringify(each?.volumeClaimTemplates ?? [])))]
+    .map((each) => JSON.parse(each) as Pinned[])
+    .filter((each) => each.length > 0);
   // Its CRD defaults what is done with it at its shutdown time, which alasio gives none.
   return defaulted({
     operatingMode: oneOf("Running", "Suspended"),
     service: true,
-    podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, labels: { ...podTemplate.metadata?.labels, ...own } }, spec: podSpec },
-    ...(session?.volumeClaimTemplates?.length ? { volumeClaimTemplates: session.volumeClaimTemplates } : {}),
+    podTemplate: { ...podTemplate, metadata: { ...podTemplate.metadata, labels: { ...podTemplate.metadata?.labels, ...own }, ...metadataAnnotations }, spec: podSpec },
+    ...(claims.length > 0 ? { volumeClaimTemplates: claims.length === 1 ? claims[0] : oneOf(...(claims as Pinned[])) } : {}),
   } as unknown as PinnedMap, { shutdownPolicy: "Retain" });
 }
 
@@ -329,24 +404,34 @@ export const sandboxPolicyName = (namespace: string): string => `${namespace}-sa
 
 /**
  * What alasio may make as a Sandbox, by `account`, the ServiceAccount of the alasio of
- * `name`: a session's from `sessions`, in any namespace but `host`'s, and a folder's bayma's
- * from `host`, in its namespace. A Sandbox moved onto no other pod template, as alasio
- * suspends and resumes it, is left as it was made.
+ * `name`: a session's from `sessions`, or from `previousSessions`, the sessions' template
+ * before it, which `alasio up` carries forward until the template changes again, so a
+ * snapshot taken on it restores onto it whole (src/sandbox/snapshots.ts), in any namespace
+ * but `host`'s; and a folder's bayma's from `host`, in its namespace. A Sandbox moved onto
+ * no other pod template, as alasio suspends and resumes it, is left as it was made. Each
+ * template is a variable of its own, as each is checked whole.
  */
 export function sandboxPolicy(
   name: string,
   account: string,
-  templates: { readonly sessions: SessionsProfile | null; readonly host: HostProfile | null },
+  templates: { readonly sessions: SessionsProfile | null; readonly previousSessions: SessionsProfile | null; readonly host: HostProfile | null },
 ): KubernetesObject[] {
-  const { sessions, host } = templates;
-  const ofSessions = sessions ? pinned("object.spec", sandboxOf(sessions, { session: sessions })) : "false";
-  const made = host ? `(request.namespace == ${JSON.stringify(host.namespace)} ? ${pinned("object.spec", sandboxOf(host, { folder: host }))} : ${ofSessions})` : ofSessions;
+  const { sessions, previousSessions, host } = templates;
+  const ofSessions = sessions
+    ? [
+      { name: "sessions", expression: pinned("object.spec", sandboxOf(sessions, { session: sessions, current: sessions })) },
+      ...(previousSessions ? [{ name: "previousSessions", expression: pinned("object.spec", sandboxOf(previousSessions, { session: previousSessions, current: sessions })) }] : []),
+    ]
+    : [];
+  const ofHost = host ? [{ name: "host", expression: pinned("object.spec", sandboxOf(host, { folder: host })) }] : [];
+  const session = ofSessions.length > 0 ? `(${ofSessions.map((each) => `variables.${each.name}`).join(" || ")})` : "false";
+  const made = host ? `(request.namespace == ${JSON.stringify(host.namespace)} ? variables.host : ${session})` : session;
   const unmoved = "request.operation == \"UPDATE\" && object.spec.podTemplate == oldObject.spec.podTemplate && " +
     "object.spec.?volumeClaimTemplates.orValue([]) == oldObject.spec.?volumeClaimTemplates.orValue([])";
   return admissionPolicy(name, [{ apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], operations: ["CREATE", "UPDATE"] }], `request.userInfo.username == "${account}"`, [{
     expression: `${unmoved} || ${made}`,
     message: "alasio makes no Sandbox but from its workspaces' templates, as alasio up renders them",
-  }]);
+  }], [...ofSessions, ...ofHost]);
 }
 
 /** What alasio may make as a Secret: a Sandbox's token, of its one key, as tokenSecretManifest makes it. Main's alasio's and each branch environment's. */

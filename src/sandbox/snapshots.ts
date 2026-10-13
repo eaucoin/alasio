@@ -9,23 +9,34 @@
  * then spent, as the session moves on from it.
  *
  * A snapshot restores into the pod template it was taken on: alasio's current one, or the
- * one before it, which the sessions namespace records (TEMPLATES_CONFIG_MAP), so a
- * snapshot outlives one change of the template, as it outlives one of the gVisor release
- * (the profile's kept releases), and no more. A session restored onto the template before
- * the current one stays on it while its pod runs, and is moved onto the current one as it
- * is resumed without a snapshot.
+ * one before it, which `alasio up` carries forward until the template changes again
+ * (ALASIO_KUBE_TEMPLATES `previousSessions`), the admission policy pinning both whole
+ * (cli/src/manifests/admission.ts); so a snapshot outlives one change of the template, as
+ * it outlives one of the gVisor release (the profile's kept releases), and no more. Both
+ * are the templates as the sessions' CPU baseline holds them, so a change of the baseline
+ * is one of the template. A session restored onto the template before the current one
+ * stays on it while its pod runs, and is moved onto the current one as it is resumed
+ * without a snapshot.
  *
  * A snapshot that cannot restore is never so silently: the session is resumed as one
  * without a snapshot, from bayma's checkpoints of its sessions, which bayma tells its next
  * exec of, and why it was not restored is logged and counted, the snapshot forgotten.
  */
-import type { V1ConfigMap, V1Container, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { V1Container, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
-import { BAYMA_CONTAINER, SANDBOX_LABEL } from "../kube/sandbox-shape.ts";
+import {
+  BAYMA_CONTAINER,
+  CPU_FEATURES_ANNOTATION,
+  RESTORE_ANNOTATION,
+  RESTORE_PAUSED_ANNOTATION,
+  RESUMED_CONDITION,
+  SANDBOX_LABEL,
+  SESSION_TEMPLATE_ANNOTATION,
+} from "../kube/sandbox-shape.ts";
 import {
   podTemplateHash,
   SANDBOX_API_VERSION,
@@ -48,24 +59,12 @@ import type { NodeAgents } from "./node-agents.ts";
 /** How sessions are snapshotted, as the profile says. */
 export type SnapshotsProfile = NonNullable<SessionsProfile["snapshots"]>;
 
-/** The annotation of a session's pod template naming the profile's template it was made from, by its hash. */
-export const SESSION_TEMPLATE_ANNOTATION = "alasio.dev/session-template";
-/** The annotation alasio's fork of gVisor restores a pod's sandbox from, naming the image on the node. */
-const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
-/** The fork's annotation that leaves a restored sandbox paused, running nothing, until it is resumed. */
-const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
-/** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
-export const RESUMED_CONDITION = "alasio.dev/resumed";
 /** How long a restored pod is waited for to run its containers, its images pulled. */
 const POD_RUNNING_TIMEOUT = "3 minutes";
-/** The ConfigMap of the sessions namespace that records the profile's template, and the one before it, by their hashes. */
-export const TEMPLATES_CONFIG_MAP = "alasio-session-templates";
 /** How often running sessions are looked at for one to release. */
 const RELEASE_POLL: Duration.Input = "15 seconds";
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
-/** gVisor's annotation that holds a sandbox to the CPU features it names, of those its node has. */
-export const CPU_FEATURES_ANNOTATION = "dev.gvisor.internal.cpufeatures";
 /** How long alasio waits, as it starts, for a node agent to tell the CPU baseline by. */
 const BASELINE_WAIT: Duration.Input = "1 minute";
 
@@ -111,24 +110,6 @@ export function hookOf(bayma: V1Container): string[] | null {
   const stateDir = args[args.indexOf("--state-dir") + 1];
   return program.length > 0 && args.includes("--state-dir") && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
 }
-
-/** The templates kept, as the sessions namespace records them, `current` recorded as the current one first. */
-export const keptTemplates = Effect.fnUntraced(function*(namespace: string, current: string): Effect.fn.Return<KeptTemplates, KubeApiError, KubeClient> {
-  const kube = yield* KubeClient;
-  // A ConfigMap, as the API server returns one.
-  const recorded = (yield* kube.read("v1", "ConfigMap", namespace, TEMPLATES_CONFIG_MAP)) as V1ConfigMap | null;
-  const was = recorded?.data?.["current"];
-  const previous = was === current ? (recorded?.data?.["previous"] ?? null) : (was ?? null);
-  const data = { current, ...(previous === null ? {} : { previous }) };
-  const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: TEMPLATES_CONFIG_MAP, namespace }, data };
-  if (!recorded) yield* kube.create(configMap);
-  else if (was !== current) {
-    // Replaced over the version read, as one alasio alone writes.
-    const version = recorded.metadata?.resourceVersion;
-    yield* kube.replace({ ...configMap, metadata: { ...configMap.metadata, ...(version === undefined ? {} : { resourceVersion: version }) } });
-  }
-  return { current, previous };
-});
 
 /**
  * The CPU features every node with an agent has under gVisor's `release`, which sessions'

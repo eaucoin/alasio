@@ -21,6 +21,7 @@ import { TestClock } from "effect/testing";
 // First: alasio's modules create their metrics as they load.
 import { added, collected } from "./support/metrics.ts";
 import { KubeClient } from "../src/kube/client.ts";
+import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent, PoliciesNotInForce, type ResumeRequest } from "../src/node-agent/agent.ts";
 import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
@@ -196,7 +197,7 @@ test("a checkpoint saves the sandbox with its release's runsc, uploads its files
       ]);
       const pages = Buffer.alloc(4096, CONTAINER);
       const { pauseMs, uploadMs, takenAt, snapshot, ...rest } = first;
-      assert.match(snapshot, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
+      assert.match(snapshot, new RegExp(`^${SNAPSHOT_ID}$`, "u"));
       assert.ok(pauseMs >= 0 && uploadMs >= 0 && Date.parse(takenAt) <= Date.now());
       assert.deepEqual(rest, {
         environment: "main",

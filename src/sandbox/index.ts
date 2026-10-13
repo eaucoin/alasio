@@ -48,6 +48,7 @@ import {
   EGRESS_GATE,
   EGRESS_GATE_SCRIPT,
   NET_MODE_LABEL,
+  SESSION_TEMPLATE_ANNOTATION,
   TELEMETRY_TOKEN_FILE_ARGS,
   WORKLOAD_LABEL,
 } from "../kube/sandbox-shape.ts";
@@ -69,15 +70,7 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import {
-  cpuBaseline,
-  keptTemplates,
-  makeSessionSnapshots,
-  SESSION_TEMPLATE_ANNOTATION,
-  type SessionSnapshots,
-  sessionTemplateHash,
-  withCpuBaseline,
-} from "./snapshots.ts";
+import { cpuBaseline, makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, withCpuBaseline } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -167,6 +160,8 @@ export interface SessionSandboxesOptions {
   readonly resolve?: (hostname: string) => Promise<LookupAddress>;
   /** Where alasio is a branch environment, how it comes by the sessions it inherited. */
   readonly inherit?: Inheritance | undefined;
+  /** The sessions' template before the current one, which `alasio up` carried forward, that their snapshots may restore onto (./snapshots.ts). */
+  readonly previous?: SessionsProfile | null | undefined;
 }
 
 /**
@@ -226,7 +221,6 @@ const FORKED_FROM_ANNOTATION = "alasio.dev/forked-from";
 /** Where sessions' telemetry is received: the receiver's Service, when sessions export any, and its port. */
 const ReceiverService = Config.String("ALASIO_TELEMETRY_RECEIVER_SERVICE").pipe(Config.map((service) => service.trim()), Config.withDefault(""));
 const ReceiverPort = Config.Port("ALASIO_TELEMETRY_RECEIVER_PORT").pipe(Config.withDefault(4318));
-
 
 /**
  * The Sandbox for a session on `volumeId` with internet mode `netMode`, from the
@@ -374,27 +368,25 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
 
 /**
  * How the sessions of `given` are snapshotted (./snapshots.ts), where they are: with the
- * node agents, their pods held to the nodes' CPU baseline, onto the templates the
- * sessions namespace records as kept, the profile's recorded as the current one; and the
- * profile, with that baseline. Sessions that cannot be snapshotted are not, saying why.
+ * node agents, their pods held to the nodes' CPU baseline, onto `given`'s template and
+ * `previous`'s, the one `alasio up` carried forward, each as the baseline holds it; and
+ * the profile, with that baseline.
  */
-const sessionSnapshots = Effect.fnUntraced(function*(given: SessionsProfile): Effect.fn.Return<{ readonly profile: SessionsProfile; readonly snapshots: SessionSnapshots | null }, Config.ConfigError, KubeClient> {
+const sessionSnapshots = Effect.fnUntraced(function*(given: SessionsProfile, previous: SessionsProfile | null): Effect.fn.Return<{ readonly profile: SessionsProfile; readonly snapshots: SessionSnapshots | null }, Config.ConfigError, KubeClient> {
   const { snapshots } = given;
   const [current] = snapshots?.releases ?? [];
   if (!snapshots || !current) return { profile: given, snapshots: null };
   const agents = yield* makeNodeAgents(snapshots.agents);
   const baseline = yield* cpuBaseline(agents, current.release);
-  const profile = baseline ? withCpuBaseline(given, baseline) : given;
-  const templates = yield* keptTemplates(profile.namespace, sessionTemplateHash(profile)).pipe(Effect.result);
-  if (templates._tag === "Failure") {
-    yield* Effect.logWarning(`sessions are not snapshotted: the templates they restore into could not be recorded: ${templates.failure.message}`);
-    return { profile, snapshots: null };
-  }
-  return { profile, snapshots: yield* makeSessionSnapshots({ profile, snapshots, agents, templates: templates.success }) };
+  const held = (profile: SessionsProfile) => (baseline ? withCpuBaseline(profile, baseline) : profile);
+  const profile = held(given);
+  const templates = { current: sessionTemplateHash(profile), previous: previous ? sessionTemplateHash(held(previous)) : null };
+  return { profile, snapshots: yield* makeSessionSnapshots({ profile, snapshots, agents, templates }) };
 });
 
 const makeSessionSandboxes = Effect.fnUntraced(function*({
   profile: given,
+  previous = null,
   stateDir,
   env = process.env,
   createForwarder = loadForwarder,
@@ -402,7 +394,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   inherit,
 }: SessionSandboxesOptions) {
   const kube = yield* KubeClient;
-  const { profile, snapshots } = yield* sessionSnapshots(given);
+  const { profile, snapshots } = yield* sessionSnapshots(given, previous);
 
   /**
    * The ids of the volumes JuiceFS's mount pods in `mountPodNamespace` serve `pod`, as

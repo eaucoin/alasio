@@ -51,6 +51,27 @@ export function sanitizePathToken(value: string): string {
   return String(value).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[-.]+|-+$/g, "") || "default";
 }
 
+/**
+ * What a session's pod template carries of its whole-sandbox snapshots
+ * (../sandbox/snapshots.ts): the hash of the template it was made from, which its
+ * snapshots record; the CPU features its sandbox is held to; and, of a pod restored from
+ * a snapshot, the image it is restored from, on its node under the snapshot cache, left
+ * paused until its node's agent resumes it, which its readiness gate waits for.
+ */
+export const SESSION_TEMPLATE_ANNOTATION = "alasio.dev/session-template";
+/** gVisor's annotation that holds a sandbox to the CPU features it names, of those its node has. */
+export const CPU_FEATURES_ANNOTATION = "dev.gvisor.internal.cpufeatures";
+/** The annotation alasio's fork of gVisor restores a pod's sandbox from, naming the image on the node. */
+export const RESTORE_ANNOTATION = "dev.gvisor.internal.restore.host-image-path";
+/** The fork's annotation that leaves a restored sandbox paused, running nothing, until it is resumed. */
+export const RESTORE_PAUSED_ANNOTATION = "dev.gvisor.internal.restore.paused";
+/** The condition of a restored pod's readiness gate, which alasio sets once its sandbox is resumed. */
+export const RESUMED_CONDITION = "alasio.dev/resumed";
+/** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
+export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
+/** A snapshot's id, as a node agent names it: when it was taken, then 32 random bits. */
+export const SNAPSHOT_ID = "[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}";
+
 /** The init container that holds a session's pod until its egress is confined: its name, and its resources. */
 export const EGRESS_GATE = { name: "egress-gate", resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "64Mi" } } } as const;
 

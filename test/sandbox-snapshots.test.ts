@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { KubernetesObject, V1ConfigMap, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
@@ -14,18 +14,8 @@ import type { Sandbox, Sandboxes, StoredSandbox } from "../src/kube/sandboxes.ts
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
-import {
-  CPU_FEATURES_ANNOTATION,
-  cpuBaseline,
-  hookOf,
-  keptTemplates,
-  makeSessionSnapshots,
-  RESUMED_CONDITION,
-  SESSION_TEMPLATE_ANNOTATION,
-  sessionTemplateHash,
-  TEMPLATES_CONFIG_MAP,
-  withCpuBaseline,
-} from "../src/sandbox/snapshots.ts";
+import { CPU_FEATURES_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../src/kube/sandbox-shape.ts";
+import { cpuBaseline, hookOf, makeSessionSnapshots, sessionTemplateHash, withCpuBaseline } from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";
@@ -196,18 +186,6 @@ test("sessions are held to the CPU features every node has under the current rel
     return yield* Fiber.join(telling);
   }).pipe(Effect.provide(TestClock.layer())));
   assert.equal(none, null);
-});
-
-test("the sessions namespace records the current template and the one before it, which a new one moves along", async () => {
-  const kube = fakeKube();
-  const first = await run(kube, keptTemplates("alasio-sessions", "a"));
-  assert.deepEqual(first, { current: "a", previous: null });
-  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "a")), { current: "a", previous: null });
-  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "b")), { current: "b", previous: "a" });
-  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "b")), { current: "b", previous: "a" });
-  assert.deepEqual(await run(kube, keptTemplates("alasio-sessions", "c")), { current: "c", previous: "b" });
-  assert.deepEqual((kube.objects.get(`ConfigMap/alasio-sessions/${TEMPLATES_CONFIG_MAP}`) as V1ConfigMap).data, { current: "c", previous: "b" });
-  assert.deepEqual(kube.writes, ["create ConfigMap", "replace ConfigMap", "replace ConfigMap"]);
 });
 
 test("a session with a snapshot on the current template is restored on a node that can, the one holding it first, into what it is now", async () => {

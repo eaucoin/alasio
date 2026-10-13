@@ -87,6 +87,7 @@ const Clone = said(
 
 /** The variables a clone's Job is given, after its own, in this order (src/sandbox/index.ts). */
 export const CLONE_VARIABLES = ["SOURCE_NAMESPACE", "SOURCE_CLAIM", "DESTINATION_NAMESPACE", "DESTINATION_CLAIM"] as const;
+
 const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole number" }), Schema.isGreaterThan(0, { message: "must be positive" })), "must be a positive whole number");
 
 /**
@@ -161,8 +162,16 @@ const HostProfile = said(
 const optionalProfile = <S extends Schema.Top>(schema: S) =>
   said(Schema.NullOr(schema), "must be an object").pipe(Schema.withDecodingDefaultKey(Effect.succeed(null)));
 
-/** ALASIO_KUBE_TEMPLATES, checked: a profile the deployment does not render is null. */
-const KubeTemplates = said(Schema.Struct({ sessions: optionalProfile(SessionsProfile), host: optionalProfile(HostProfile) }), "must be an object");
+/**
+ * ALASIO_KUBE_TEMPLATES, checked: a profile the deployment does not render is null; and
+ * the sessions' profile before the current one, as `alasio up` carries it forward until
+ * their template changes again, which sessions' snapshots may restore onto
+ * (../sandbox/snapshots.ts), null where there is none.
+ */
+const KubeTemplates = said(
+  Schema.Struct({ sessions: optionalProfile(SessionsProfile), previousSessions: optionalProfile(SessionsProfile), host: optionalProfile(HostProfile) }),
+  "must be an object",
+);
 
 export type SessionsProfile = typeof SessionsProfile.Type;
 export type HostProfile = typeof HostProfile.Type;

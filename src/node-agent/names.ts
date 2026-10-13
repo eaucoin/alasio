@@ -2,8 +2,8 @@
  * Where a node keeps its gVisor releases, containerd's runtimes of them and its
  * snapshots, and where its node agent serves: as the agent reads them, the clusters alasio
  * makes lay them out (cli/src/cluster/), and the installation's manifests give them to
- * the agent (cli/src/manifests/node-agent.ts). Free of any import, so the command line
- * takes it without the agent.
+ * the agent (cli/src/manifests/node-agent.ts). Free of any import but sandbox-shape's,
+ * itself free of any, so the command line takes it without the agent.
  */
 
 /** The port a node agent serves its API on, on its pod's address. */
@@ -40,8 +40,8 @@ export const runscVersion = (release: string): string => `release-${release}`;
 /** The root the gVisor shims run runsc with for Kubernetes' containers, under the node's /run. */
 export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 
-/** The node's snapshot cache, where its sandboxes are restored from. */
-export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
+/** The node's snapshot cache, where its sandboxes are restored from, as the admission policy holds a restore to. */
+export { SNAPSHOT_CACHE_DIR } from "../kube/sandbox-shape.ts";
 
 /** The variable holding the token alasio presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";

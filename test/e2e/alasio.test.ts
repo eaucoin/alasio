@@ -768,6 +768,68 @@ if (inShard("snapshots")) {
       assert.deepEqual([seen.live, seen.checkpointed], [`forked from ${source}`, `forked from ${source}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
+
+    test("a session released before alasio up changes the sessions' template is restored onto the one it was taken on, which the admission policy pins whole beside the new one, and admits no variant of", async (t) => {
+      const taken = await newSession("none");
+      const { sessionId: kept } = await repl.set(taken, `taken on the template before by ${taken}`);
+      const cpuOf = (sandbox: Sandbox | null) => sandbox?.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["cpu"];
+      const before = cpuOf(await kube.get<Sandbox>(ref("Sandbox", taken, SESSIONS)));
+      assert.ok(before, `the session ${taken} asks for no CPU`);
+      await untilReleased(taken, Date.now());
+      // alasio up, the sessions' pods asking for other CPU: their template changes.
+      const { configFile } = paths();
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      const after = before === "37m" ? "41m" : "37m";
+      config.install.sessions = { ...config.install.sessions, resources: { ...config.install.sessions?.resources, requests: { ...config.install.sessions?.resources?.requests, cpu: after } } };
+      writeFileSync(configFile, JSON.stringify(config));
+      await alasioOk("up", "--timeout", "20m");
+      const templates = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE)))?.data?.["templates.json"] ?? "{}");
+      const cpuIn = (profile: { podTemplate: V1Pod }) => profile.podTemplate.spec?.containers.find(({ name }) => name === "bayma")?.resources?.requests?.["cpu"];
+      assert.deepEqual([cpuIn(templates.sessions), cpuIn(templates.previousSessions)], [after, before]);
+
+      // Its next turn restores it onto the template it was taken on, its REPL whole.
+      const answered = await turn("hello across the change");
+      const restored = await kube.get<Sandbox>(ref("Sandbox", taken, SESSIONS));
+      assert.equal(cpuOf(restored), before);
+      const seen = await repl.read(taken, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [`taken on the template before by ${taken}`, `taken on the template before by ${taken}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored onto the template before the current one`);
+
+      // As alasio: a Sandbox as it, on the template before, is made; one of another image on it, or restored from another's image, is not.
+      assert.ok(restored);
+      const sandboxes = `/apis/agents.x-k8s.io/v1beta1/namespaces/${SESSIONS}/sandboxes`;
+      const copied = (name: string, change: (sandbox: Sandbox) => void = () => {}) => {
+        const sandbox: Sandbox = JSON.parse(
+          JSON.stringify({ apiVersion: restored.apiVersion, kind: restored.kind, metadata: { name, namespace: SESSIONS }, spec: { ...restored.spec, operatingMode: "Suspended" } }).replaceAll(taken, name),
+        );
+        change(sandbox);
+        return sandbox;
+      };
+      const bayma = (sandbox: Sandbox) => sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma");
+      const restoringFrom = (workspace: string) => (sandbox: Sandbox) => {
+        sandbox.spec.podTemplate.metadata = {
+          ...sandbox.spec.podTemplate.metadata,
+          annotations: { ...sandbox.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000Z-0123abcd` },
+        };
+      };
+      for (const [name, change, status] of [
+        ["e2e-before", undefined, 201],
+        ["e2e-before-image", (sandbox: Sandbox) => {
+          const container = bayma(sandbox);
+          if (container) container.image = `${container.image?.split("@")[0]}@sha256:${"0".repeat(64)}`;
+        }, 422],
+        ["e2e-before-own", restoringFrom("e2e-before-own"), 201],
+        ["e2e-before-other", restoringFrom(taken), 422],
+      ] as const) {
+        assert.equal(await asAlasio("POST", sandboxes, "application/json", copied(name, change)), status, name);
+        if (status === 201) await kube.remove(ref("Sandbox", name, SESSIONS));
+      }
+
+      // A session made now is on the new template.
+      const made = await newSession("none");
+      assert.equal(cpuOf(await kube.get<Sandbox>(ref("Sandbox", made, SESSIONS))), after);
+    });
   });
 }
 

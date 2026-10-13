@@ -41,7 +41,7 @@ import { installConfigOf } from "../src/config.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
-import { decodeInstallConfig, type InstallConfig, manifests } from "../src/manifests/index.ts";
+import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
@@ -1919,13 +1919,14 @@ describe("security", () => {
       agents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
     });
     assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
-    assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.join() === "get,create,update"));
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
+    // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record.
+    assert.ok(!sessionsRole(objects).some(({ resources }) => resources?.includes("configmaps")));
     // Under the cluster's default runtime, nothing is snapshotted.
     const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
     assert.equal(sessions(unsnapshotted).snapshots, undefined);
     assert.equal(tokenOf(unsnapshotted), undefined);
-    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("configmaps")));
+    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("pods/status")));
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
@@ -2379,7 +2380,12 @@ describe("scaling", () => {
 });
 
 describe("admission", () => {
-  type Policy = KubernetesObject & { spec: { matchConstraints: { resourceRules: object[] }; matchConditions: { expression: string }[]; validations: { expression: string }[] } };
+  type Policy = KubernetesObject & {
+    spec: { matchConstraints: { resourceRules: object[] }; matchConditions: { expression: string }[]; validations: { expression: string }[]; variables?: { name: string; expression: string }[] };
+  };
+  /** The expression of the variable `name` of the policy `policy` of `objects`. */
+  const variableOf = (objects: readonly KubernetesObject[], policy: string, name: string): string =>
+    one<Policy>(objects, "ValidatingAdmissionPolicy", policy).spec.variables?.find((variable) => variable.name === name)?.expression ?? "";
   /** The keys the pin of `field` in `expression` allows, of its last pin where `last`. */
   const keysOf = (expression: string, field: string, last = false) => {
     const pin = `${field}.all(key, key in [`;
@@ -2413,13 +2419,14 @@ describe("admission", () => {
     const sandbox = sandboxes.spec.validations[0]?.expression ?? "";
     // A Sandbox not moved onto another template is left be; one made, or moved, is its namespace's template's.
     assert.ok(sandbox.startsWith('request.operation == "UPDATE" && object.spec.podTemplate == oldObject.spec.podTemplate'));
-    assert.ok(sandbox.includes('(request.namespace == "alasio-host" ? '));
+    assert.ok(sandbox.endsWith(' || (request.namespace == "alasio-host" ? variables.host : (variables.sessions))'));
     // A session's pod is as no one, under the sessions' runtime; a folder's bayma's as its own account alone.
-    const sessionKeys = keysOf(sandbox, 'object.spec["podTemplate"]["spec"]', true);
+    const session = variableOf(objects, "alasio-sandboxes", "sessions");
+    const sessionKeys = keysOf(session, 'object.spec["podTemplate"]["spec"]');
     for (const key of ["serviceAccountName", "hostNetwork", "hostPID", "nodeName", "ephemeralContainers"]) assert.ok(!sessionKeys.includes(key), key);
-    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["runtimeClassName"] == "gvisor"'));
-    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["automountServiceAccountToken"] == false'));
-    assert.ok(sandbox.includes('object.spec["podTemplate"]["spec"]["serviceAccountName"] == "alasio-host-agent"'));
+    assert.ok(session.includes('object.spec["podTemplate"]["spec"]["runtimeClassName"] == "gvisor"'));
+    assert.ok(session.includes('object.spec["podTemplate"]["spec"]["automountServiceAccountToken"] == false'));
+    assert.ok(variableOf(objects, "alasio-sandboxes", "host").includes('object.spec["podTemplate"]["spec"]["serviceAccountName"] == "alasio-host-agent"'));
     assert.deepEqual(binding(objects, "alasio-sandboxes"), { policyName: "alasio-sandboxes", validationActions: ["Deny"] });
     // A branch's is its own, of its own templates, by its own ServiceAccount.
     const branch = one<Policy>(branchObjects(configOf(), "try"), "ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes");
@@ -2435,7 +2442,7 @@ describe("admission", () => {
 
   test("holds a folder's bayma's state directory under its template's state root as alasio joins it, however the root is written", () => {
     for (const stateRoot of ["/home/op/state", "/home/op//state/", "/"]) {
-      const sandbox = one<Policy>(install({ host: { enabled: true, stateRoot } }), "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[0]?.expression ?? "";
+      const sandbox = variableOf(install({ host: { enabled: true, stateRoot } }), "alasio-sandboxes", "host");
       // The patterns of path segments: the state directory's.
       const patterns = [...sandbox.matchAll(/\.matches\(("(?:[^"\\]|\\.)*")\)/gu)]
         .map(([, quoted = '""']) => JSON.parse(quoted) as string)
@@ -2446,5 +2453,56 @@ describe("admission", () => {
       assert.match(hostBaymaStateDir(profile, "claude", "telegram:1"), patterns[0] ?? /^$/u, stateRoot);
       assert.doesNotMatch("/elsewhere/claude/telegram-1", patterns[0] ?? /^$/u, stateRoot);
     }
+  });
+
+  test("lets a session's Sandbox carry what its snapshots add, and be restored from one with no more than a restore adds, each as alasio adds it", () => {
+    const session = variableOf(install(), "alasio-sandboxes", "sessions");
+    const annotation = (key: string) => `object.spec["podTemplate"]["metadata"]["annotations"][${JSON.stringify(key)}]`;
+    // Each may be left out: a session's template hash, the CPU features it is held to, and the restore's two.
+    for (const key of ["alasio.dev/session-template", "dev.gvisor.internal.cpufeatures", "dev.gvisor.internal.restore.host-image-path", "dev.gvisor.internal.restore.paused"]) {
+      assert.ok(session.includes(`(!(${JSON.stringify(key)} in object.spec["podTemplate"]["metadata"]["annotations"]) || `), key);
+    }
+    assert.ok(session.includes(`${annotation("alasio.dev/session-template")}.matches("^([0-9a-f]{64})$")`));
+    assert.ok(session.includes(`${annotation("dev.gvisor.internal.restore.paused")} == "true"`));
+    // The image is the Sandbox's own, of a snapshot its node prepared in its cache.
+    const image = annotation("dev.gvisor.internal.restore.host-image-path");
+    const own = '"/var/lib/alasio/snapshots/alasio-sessions/" + object.metadata.name + "/"';
+    assert.ok(session.includes(`${image}.startsWith(${own}) && ${image}.substring(size(${own})).matches("^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")`));
+    // Under the sessions' runtime or a kept release's, on one node, ready once resumed.
+    for (const { release } of NODE_PINS.gvisor.releases) assert.ok(session.includes(`["runtimeClassName"] == "gvisor-${release.split(".").join("-")}"`), release);
+    assert.ok(session.includes('["conditionType"] == "alasio.dev/resumed"'));
+    assert.ok(session.includes('["matchFields"][0]["key"] == "metadata.name" && '));
+    assert.ok(session.includes('["matchFields"][0]["operator"] == "In" && '));
+    // Where sessions are not snapshotted, nothing of a restore.
+    const unsnapshotted = variableOf(install({ sessions: { runtimeClassName: "" } }), "alasio-sandboxes", "sessions");
+    assert.ok(unsnapshotted.includes('"alasio.dev/session-template"'));
+    for (const key of ["dev.gvisor.internal.cpufeatures", "dev.gvisor.internal.restore", "alasio.dev/resumed", "matchFields"]) assert.ok(!unsnapshotted.includes(key), key);
+  });
+
+  test("pins the sessions' template before the current one, which alasio up carries forward whole for one change of the template, beside it", () => {
+    const templatesOf = (objects: readonly KubernetesObject[]) => one<V1ConfigMap>(objects, "ConfigMap", "alasio-sandbox-templates").data?.["templates.json"];
+    const cpu = (cpu: string) => ({ sessions: { resources: { requests: { cpu } } } });
+    // Installed first, nothing is carried.
+    const first = install(cpu("101m"));
+    assert.deepEqual(carriedFrom(configOf(cpu("101m")), undefined), NOTHING_CARRIED);
+    assert.equal(JSON.parse(templatesOf(first) ?? "{}").previousSessions, undefined);
+    assert.equal(variableOf(first, "alasio-sandboxes", "previousSessions"), "");
+    // The template changed: what ran before is carried, its own image and resources pinned whole beside the current one.
+    const carried = carriedFrom(configOf(cpu("102m")), templatesOf(first));
+    assert.deepEqual(carried.previousSessions, JSON.parse(templatesOf(first) ?? "{}").sessions);
+    const second = manifests(configOf(cpu("102m")), carried);
+    assert.deepEqual(JSON.parse(templatesOf(second) ?? "{}").previousSessions, carried.previousSessions);
+    const previous = variableOf(second, "alasio-sandboxes", "previousSessions");
+    assert.ok(previous.includes('== "101m"') && !previous.includes('== "102m"'));
+    assert.ok(variableOf(second, "alasio-sandboxes", "sessions").includes('== "102m"'));
+    assert.ok(one<Policy>(second, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[0]?.expression.endsWith(" || (variables.sessions || variables.previousSessions)"));
+    // Brought up again on the same template, it is still carried; changed again, the one after it is, and it is gone.
+    assert.deepEqual(carriedFrom(configOf(cpu("102m")), templatesOf(second)), carried);
+    const third = carriedFrom(configOf(cpu("103m")), templatesOf(second));
+    assert.deepEqual(third.previousSessions, JSON.parse(templatesOf(second) ?? "{}").sessions);
+    assert.ok(!JSON.stringify(third).includes('"101m"'));
+    // Templates it cannot read carry nothing, nor does an installation without sessions.
+    assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON"), NOTHING_CARRIED);
+    assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first)), NOTHING_CARRIED);
   });
 });

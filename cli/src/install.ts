@@ -5,27 +5,33 @@
  * against the cluster's autoscalers and its object store's layout and scale, applied, and
  * waited for.
  */
-import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
+import type { KubernetesObject, V1ConfigMap, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
-import { KubeApi, type KubeApiError } from "./kube/api.ts";
+import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
 import { labels, NAMESPACE } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
-import { manifests } from "./manifests/index.ts";
+import { type Carried, carriedFrom, manifests, NOTHING_CARRIED, SANDBOX_TEMPLATES } from "./manifests/index.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
 
 /** alasio's namespace. */
 const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: NAMESPACE, labels: labels("alasio") } };
 
-/** The objects of the installation `config` describes. */
-export function installationObjects(config: InstallConfig): readonly KubernetesObject[] {
-  return [NAMESPACE_OBJECT, ...manifests(config)];
+/** The objects of the installation `config` describes, with what it carries forward from the one it replaces. */
+export function installationObjects(config: InstallConfig, carried: Carried = NOTHING_CARRIED): readonly KubernetesObject[] {
+  return [NAMESPACE_OBJECT, ...manifests(config, carried)];
 }
+
+/** What the installation `config` describes carries forward from the one the cluster runs, as its templates' ConfigMap says. */
+export const carried = Effect.fnUntraced(function*(config: InstallConfig): Effect.fn.Return<Carried, KubeApiError, KubeApi> {
+  const live = yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: SANDBOX_TEMPLATES });
+  return carriedFrom(config, live?.data?.["templates.json"]);
+});
 
 /** alasio's namespace, applied as the installation's, so its Secrets can be written before the rest of it is. */
 export const applyNamespace: Effect.Effect<void, KubeApiError, KubeApi> = Effect.flatMap(KubeApi, (kube) => kube.apply(labelled(NAMESPACE_OBJECT))).pipe(
@@ -67,7 +73,7 @@ export const checkInstallation = Effect.fnUntraced(function*(
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
-  const objects = installationObjects(settings);
+  const objects = installationObjects(settings, yield* carried(settings));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
