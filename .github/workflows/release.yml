@@ -77,8 +77,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # alasio's own images pushed as eStargz (tooling/push-estargz.sh), which the clusters
+      # alasio makes pull lazily.
+      - uses: docker/setup-buildx-action@v3
       # All eight at once, each line said with its image's name, the node image with its pins
-      # (tooling/node-image.ts); then each one's digest.
+      # (tooling/node-image.ts), whole, as Docker runs it; then each one's digest, as buildx
+      # pushed it, or as Docker has it.
       - id: images
         name: Build and push the images, recording their digests
         shell: bash
@@ -88,13 +92,15 @@ jobs:
           declare -A pids
           for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-webhook:webhook" "alasio-node:cluster/node"; do
             name=${image%%:*}
-            args=()
-            [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
+            labels=(--label "org.opencontainers.image.source=$SOURCE" --label "org.opencontainers.image.version=$VERSION")
             {
-              docker build "${args[@]}" --tag "$REGISTRY/$name:$VERSION" \
-                --label "org.opencontainers.image.source=$SOURCE" \
-                --label "org.opencontainers.image.version=$VERSION" "${image#*:}" &&
-                docker push "$REGISTRY/$name:$VERSION"
+              if [ "$name" = alasio-node ]; then
+                mapfile -t args < <(node tooling/node-image.ts)
+                docker build "${args[@]}" --tag "$REGISTRY/$name:$VERSION" "${labels[@]}" "${image#*:}" &&
+                  docker push "$REGISTRY/$name:$VERSION"
+              else
+                METADATA="$RUNNER_TEMP/$name.json" tooling/push-estargz.sh "$REGISTRY/$name:$VERSION" "${image#*:}" "${labels[@]}"
+              fi
             } 2>&1 | sed -u "s/^/$name: /" &
             pids[$name]=$!
           done
@@ -104,8 +110,13 @@ jobs:
           done
           [ "$failed" = 0 ] || exit 1
           for name in "${!pids[@]}"; do
-            digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
-            echo "${name//-/_}=${digest#*@}" >>"$GITHUB_OUTPUT"
+            if [ "$name" = alasio-node ]; then
+              digest=$(docker image inspect "$REGISTRY/$name:$VERSION" --format '{{index .RepoDigests 0}}')
+              digest=${digest#*@}
+            else
+              digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/$name.json")
+            fi
+            echo "${name//-/_}=$digest" >>"$GITHUB_OUTPUT"
           done
       # The attestations alone, as the major before made: its storage records need the
       # artifact-metadata permission, of an organization's artifacts.
