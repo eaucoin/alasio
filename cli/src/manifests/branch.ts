@@ -1,10 +1,10 @@
 /**
  * A branch environment's objects (`alasio branch create`): a different alasio, on a
  * copy-on-write copy of main's data, with a compute on the branch's timeline of Neon's,
- * which main's neon-control wakes, and a lake on the branch's copy of the lake's
- * catalog, both reaching it through main's Neon proxy, in a namespace of its own, and
- * its sessions in another; named as main's are, and found, as they are deleted, by
- * those namespaces and BRANCH_LABEL.
+ * which main's neon-control wakes and puts to sleep, and a lake on the branch's copy of
+ * the lake's catalog, both reaching it through main's Neon proxy, in a namespace of its
+ * own, and its sessions in another; named as main's are, and found, as they are deleted,
+ * by those namespaces and BRANCH_LABEL.
  *
  * Its configuration is main's, with the operator's overrides, and never the host
  * profile: a folder is the machine's own files, which a branch cannot copy. Its alasio's

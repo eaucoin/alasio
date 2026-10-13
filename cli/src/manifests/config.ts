@@ -307,7 +307,17 @@ const Neon = Schema.Struct({
     }),
     {},
   ),
-  compute: NeonService({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
+  compute: defaulted(
+    Schema.Struct({
+      /** How long the compute may have no client session before it sleeps, until the next connection wakes it: a duration of 1m or more. */
+      suspendAfter: defaulted(
+        Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) >= 60 || "must be a duration of 1m or more, such as 5m")),
+        "5m",
+      ),
+      resources: Resources({ requests: { cpu: "250m", memory: "384Mi" }, limits: { memory: "4Gi" } }),
+    }),
+    {},
+  ),
   /**
    * A daily logical dump of alasio's database to the object store, and a copy of
    * JuiceFS's newest dump of workspace storage's metadata beside it; of each, the last
@@ -470,8 +480,8 @@ const ObjectStore = Schema.Struct({
   ),
 });
 
-/** The seconds of a duration as JuiceFS takes one (1h, 1h30m, 90s), or null when it is none. */
-function durationSeconds(duration: string): number | null {
+/** The seconds of a duration, as alasio's settings and JuiceFS take one (1h, 1h30m, 90s), or null when it is none. */
+export function durationSeconds(duration: string): number | null {
   const match = /^(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?$/u.exec(duration);
   if (!match || duration === "") return null;
   return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);

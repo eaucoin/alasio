@@ -15,8 +15,9 @@
  * (./endpoints.ts), which every client connects through: it answers the proxy for
  * roles' secrets, main's from the stack's secrets alone and a branch's from the record,
  * or as last read while the record cannot be, and wakes a compute that sleeps; it serves
- * a compute its spec, likewise, as last read. The replica that leads (./record.ts)
- * repairs every branch's safekeepers.
+ * a compute its spec, likewise, as last read. The replica that leads
+ * (./record.ts) repairs every branch's safekeepers, and puts to sleep each compute no
+ * client has had a session on for as long as its Deployment says (./computes.ts).
  *
  * A compute fetches its spec as Neon's compute_ctl does from a control plane
  * (`--control-plane-uri`): `GET /compute/api/v2/computes/<id>/spec`, with its
@@ -103,8 +104,8 @@ import {
   withNotifiedPlacement,
   withoutBranch,
 } from "./branches.ts";
-import { computeAccepts, computeDeployment, type ComputeRef, scaleCompute } from "./computes.ts";
-import { computeAddress, controlPlaneError, proxyQuery, roleSecret, woken } from "./endpoints.ts";
+import { type ComputeDeployment, computePods, type ComputeRef, computeActivity, computeDeployment, scaleCompute } from "./computes.ts";
+import { type Activity, computeAddress, controlPlaneError, type Idleness, idleness, proxyQuery, roleSecret, suspendDue, type Use, wakeCompute, woken } from "./endpoints.ts";
 import { bearsScope, publicJwks, signToken } from "./jwt.ts";
 import { BranchRecord, type Changing, RecordBusy } from "./record.ts";
 import { scramVerifier } from "./scram.ts";
@@ -163,11 +164,13 @@ const publicKeyPem = readFileSync("/keys/auth_public_key.pem", "utf8");
 // The storage controller's /control and /debug APIs take the admin scope.
 const adminToken = signToken(privateKeyPem, "admin");
 const safekeeperToken = signToken(privateKeyPem, "safekeeperdata");
-/** How often the replica that leads repairs safekeepers. */
+/** How often the replica that leads repairs safekeepers, and counts each running compute's sessions. */
 const LEAD_INTERVAL_MS = 30_000;
-/** How long a wake may take in all, beyond any client's patience. */
+/** How long a wake may take in all, its compute's lock waited for, and its pod for, beyond any client's patience. */
 const WAKE_PATIENCE_MS = 180_000;
-/** How often a wake looks again at what it waits for. */
+/** How long a compute put to sleep is waited for to be gone. */
+const SUSPEND_PATIENCE_MS = 120_000;
+/** How often a wake or a sleep looks again at what it waits for. */
 const POLL_MS = 250;
 /** How long a call of the storage controller may take: longer than its own waits for the pageserver. */
 const CONTROLLER_PATIENCE_MS = 120_000;
@@ -435,20 +438,33 @@ async function repairEverySafekeeper(branches: readonly Branch[]): Promise<void>
 /** The compute of the branch `name`: main's in neon-control's namespace, any other's in its branch environment's. */
 const computeOf = (name: string): ComputeRef => ({ namespace: name === MAIN ? NAMESPACE : branchNamespace(name), name: COMPUTE_NAME });
 
-/** Logs in to the branch `name`'s compute as neon-control's own role there (./computes.ts); fails while it cannot. */
-function accepts(name: string): Promise<void> {
+/** What the clients of the branch `name`'s compute are doing, counted as neon-control's own role there (./computes.ts); fails while it cannot log in. */
+function activityOn(name: string): Promise<Activity> {
   const { namespace } = computeOf(name);
-  return computeAccepts(`${COMPUTE_NAME}.${namespace}.svc.cluster.local`, COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
+  return computeActivity(`${COMPUTE_NAME}.${namespace}.svc.cluster.local`, COMPUTE_PORT, MONITOR_ROLE, monitorPassword(computeId(name)));
+}
+
+/** Waits until the compute has no pod, one stopping included, by `deadline`. */
+async function untilGone(ref: ComputeRef, deployment: ComputeDeployment, deadline: number): Promise<void> {
+  while ((await computePods(ref, deployment)) > 0) {
+    if (Date.now() > deadline) throw new Error(`${ref.namespace}'s compute did not stop in time`);
+    await sleep(POLL_MS);
+  }
 }
 
 /** The wakes under way, by compute: concurrent wakes of one compute share one. */
 const waking = new Map<string, Promise<boolean>>();
 
 /**
- * Wakes the branch `name`'s compute: scales it to one if it sleeps, and waits until
- * neon-control logs in to it, so its clients may (./computes.ts), for as long as
- * WAKE_PATIENCE_MS in all. Whether it slept. A wake asked again, by the proxy after a
- * restart of neon-control, finds it scaling, and waits again.
+ * Wakes the branch `name`'s compute (wakeCompute), and records it asked to wake, which
+ * keeps it awake a while longer (suspendIdle), where the record can be written, as a
+ * compute that runs needs nothing of it to be reached. One that sleeps it scales to one
+ * under the compute's lock, waited for as long as the wake may take, longer than a sleep
+ * holds it, so it never finds the pod a sleep is stopping, once the pod put to sleep is
+ * gone, so no two serve the timeline at once. Then it waits until neon-control logs in to
+ * it, so its clients may (./computes.ts), for as long as WAKE_PATIENCE_MS in all. Whether
+ * it slept. A wake asked again, by the proxy after a restart of neon-control, finds it
+ * scaling, and waits again.
  */
 function wake(name: string): Promise<boolean> {
   const id = computeId(name);
@@ -457,24 +473,82 @@ function wake(name: string): Promise<boolean> {
   const started = Date.now();
   const deadline = started + WAKE_PATIENCE_MS;
   const ref = computeOf(name);
-  const woke = (async () => {
-    const deployment = await computeDeployment(ref);
-    if (!deployment) throw new BranchError(404, `${name}'s compute is not deployed`);
-    const slept = deployment.replicas === 0;
-    if (slept) await scaleCompute(ref, 1);
-    for (;;) {
-      const taken = await accepts(name).then(() => true, (error: unknown) => {
+  const deployment = async (): Promise<ComputeDeployment> => {
+    const found = await computeDeployment(ref);
+    if (!found) throw new BranchError(404, `${name}'s compute is not deployed`);
+    return found;
+  };
+  const woke = wakeCompute({
+    deployment,
+    asked: () => record.woke(id).catch((error: unknown) => log("wake not recorded", { compute: id, error: errorText(error) })),
+    locked: (scaling) => record.computeLocked(id, scaling, deadline - Date.now()),
+    untilGone: (now) => untilGone(ref, now, deadline),
+    scaleUp: () => scaleCompute(ref, 1),
+    accepts: () =>
+      activityOn(name).then(() => true, (error: unknown) => {
         if (Date.now() > deadline) throw new Error(`${id} did not take connections in ${WAKE_PATIENCE_MS} ms: ${errorText(error)}`);
         return false;
-      });
-      if (taken) break;
-      await sleep(POLL_MS);
-    }
+      }),
+    pause: () => sleep(POLL_MS),
+  }).then((slept) => {
     if (slept) log("compute woken", { compute: id, ms: Date.now() - started });
     return slept;
-  })().finally(() => waking.delete(id));
+  }).finally(() => waking.delete(id));
   waking.set(id, woke);
   return woke;
+}
+
+/** Each running compute's idleness, as the replica that leads last counted it. */
+const idle = new Map<string, Idleness>();
+
+/** What the branch `name`'s compute's clients have done, and when it was last asked to wake. */
+async function useOf(name: string): Promise<Use> {
+  const id = computeId(name);
+  const [activity, computes] = await Promise.all([activityOn(name), record.computes()]);
+  return { ...activity, wokenAt: computes.find((compute) => compute.id === id)?.wokenAt ?? null };
+}
+
+/**
+ * Puts to sleep each running compute that has had no client session, nor been asked to
+ * wake, for as long as its Deployment says: under the compute's lock, counted again
+ * first, so a session opened since is not cut, nor a wake asked for since undone, and
+ * waiting until its pod is gone, so a wake after finds it gone. One whose lock a wake
+ * holds is left until the next round.
+ */
+async function suspendIdle(names: readonly string[]): Promise<void> {
+  // A compute deleted since is counted no more.
+  const ids = new Set(names.map(computeId));
+  for (const id of idle.keys()) if (!ids.has(id)) idle.delete(id);
+  for (const name of names) {
+    const id = computeId(name);
+    try {
+      const ref = computeOf(name);
+      const deployment = await computeDeployment(ref);
+      if (!deployment || deployment.suspendAfterMs === null || deployment.replicas === 0 || deployment.ready === 0) {
+        idle.delete(id);
+        continue;
+      }
+      const counted = idleness(idle.get(id), await useOf(name), Date.now());
+      idle.set(id, counted);
+      if (!suspendDue(counted, Date.now(), deployment.suspendAfterMs)) continue;
+      const suspendAfterMs = deployment.suspendAfterMs;
+      const slept = await record.tryComputeLocked(id, async () => {
+        const recounted = idleness(counted, await useOf(name), Date.now());
+        if (recounted.since === null) {
+          idle.set(id, recounted);
+          return false;
+        }
+        await scaleCompute(ref, 0);
+        idle.delete(id);
+        await untilGone(ref, deployment, Date.now() + SUSPEND_PATIENCE_MS);
+        return true;
+      });
+      if (!slept?.value) continue;
+      log("compute suspended", { compute: id, idleMs: Date.now() - (counted.since ?? Date.now()), suspendAfterMs });
+    } catch (error) {
+      log("compute not checked for idleness", { compute: id, error: errorText(error) });
+    }
+  }
 }
 
 /** Whether this replica led at its last round, which it says when that changes. */
@@ -482,7 +556,10 @@ let led = false;
 /** Whether a round of leading is under way: one never starts beside another. */
 let leading = false;
 
-/** What the replica that leads does, now and then: each branch's safekeepers repaired. */
+/**
+ * What the replica that leads does, now and then: each branch's safekeepers repaired, and
+ * each compute idle long enough put to sleep.
+ */
 async function lead(): Promise<void> {
   if (leading) return;
   leading = true;
@@ -491,7 +568,9 @@ async function lead(): Promise<void> {
     if (leads !== led) log(leads ? "leading" : "no longer leading");
     led = leads;
     if (!leads) return;
-    await repairEverySafekeeper(await record.branches());
+    const branches = await record.branches();
+    await repairEverySafekeeper(branches);
+    await suspendIdle(branches.filter(({ state }) => state === "ready").map(({ name }) => name));
   } finally {
     leading = false;
   }

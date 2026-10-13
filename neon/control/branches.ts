@@ -337,7 +337,7 @@ export interface ComputeStack {
   safekeepers: readonly Safekeeper[];
   /** The verifiers of the passwords of the roles main's clients connect as, by role: alasio's, which main's spec gives it, among them. */
   verifiers: Readonly<Record<string, string>> & { readonly alasio: string };
-  /** neon-control's own role on every compute, which it logs in to the compute as, and a verifier of its password on the compute of an id, made afresh for each spec. */
+  /** neon-control's own role on every compute, which it counts the compute's sessions as, and a verifier of its password on the compute of an id, made afresh for each spec. */
   monitor: { readonly role: string; readonly verifier: (computeId: string) => string };
   /** The tenant-scoped token the compute reaches the pageserver and safekeepers with. */
   storageAuthToken: string;

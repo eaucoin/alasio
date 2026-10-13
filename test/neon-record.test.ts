@@ -1,8 +1,8 @@
 /**
  * neon-control's record in Postgres (neon/control/record.ts), as two replicas share it:
- * made once by either, its branches changed by one at a time, read by both, and led by
- * one; its locks on connections of their own, which reads never wait behind, and given up
- * after their patience.
+ * made once by either, its branches changed by one at a time, each compute woken or put to
+ * sleep by one at a time, read by both, and led by one; its locks on connections of their
+ * own, which reads never wait behind, and given up after their patience.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -136,14 +136,38 @@ test("each lock is held on a connection of its own, so reads go on however many 
     // Given up after its patience, of a lock never released.
     const patient = new BranchRecord(database.url, { patienceMs: 1000 });
     const forever = new Promise<void>(() => {});
-    void one.changing(() => forever);
+    void one.computeLocked("alasio", () => forever);
     await sleep(200);
     const started = Date.now();
-    await assert.rejects(patient.changing(async () => "changed"), RecordBusy);
+    await assert.rejects(patient.computeLocked("alasio", async () => "woken"), RecordBusy);
     assert.ok(Date.now() - started >= 900);
+    assert.equal(await patient.tryComputeLocked("alasio", async () => "woken"), null);
+    assert.deepEqual(await patient.tryComputeLocked("branch-dev", async () => "woken"), { value: "woken" }, "each compute's lock is its own");
     await patient.end();
   } finally {
     await Promise.all([one.end(), two.end()]);
+    await database.stop();
+  }
+});
+
+test("records when each compute was last asked to wake", async () => {
+  const database = await startPostgres();
+  const record = new BranchRecord(database.url);
+  try {
+    await record.ensureSchema();
+    assert.deepEqual(await record.computes(), []);
+    const before = Date.now();
+    await record.woke("alasio");
+    const [first] = await record.computes();
+    assert.equal(first?.id, "alasio");
+    assert.ok((first?.wokenAt ?? 0) >= before - 1000);
+    await sleep(50);
+    await record.woke("alasio");
+    const [again, ...others] = await record.computes();
+    assert.ok((again?.wokenAt ?? 0) > (first?.wokenAt ?? 0));
+    assert.deepEqual(others, []);
+  } finally {
+    await record.end();
     await database.stop();
   }
 });

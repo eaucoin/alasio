@@ -1,9 +1,9 @@
 /**
  * The PriorityClasses every pod of alasio's runs under. Highest, two classes of one
  * value: the floor, what never sleeps (Neon's storage, its proxy and neon-control, and
- * main's compute, the object store, workspace storage's metadata, main's lake, Grafana,
- * the collector and the controllers); and the pods that run turns, alasio's own,
- * sessions' and folder workspaces' bayma. Of one value, neither takes the
+ * main's compute while it runs, the object store, workspace storage's metadata, main's
+ * lake, Grafana, the collector and the controllers); and the pods that run turns,
+ * alasio's own, sessions' and folder workspaces' bayma. Of one value, neither takes the
  * other's place: no Grafana scaled up, nor a pod of the floor recreated, ends a turn.
  * Then alasio's other components, which sleep or run once (branch environments' computes
  * and lakes, Jobs); and last the headroom's placeholders, which take no pod's place and

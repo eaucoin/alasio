@@ -21,6 +21,7 @@ import type {
 } from "@kubernetes/client-node";
 
 import { COMPUTE_PORT, computeId, MAIN } from "../../../neon/control/branches.ts";
+import { SUSPEND_AFTER } from "../../../neon/control/endpoints.ts";
 import { DATABASE, ROLE } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
 import {
@@ -47,7 +48,7 @@ import {
   waitFor,
   waitForObjectStore,
 } from "./common.ts";
-import type { InstallConfig } from "./config.ts";
+import { durationSeconds, type InstallConfig } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { VOLUME_DRIVER } from "./juicefs-csi.ts";
 import { priority } from "./priorities.ts";
@@ -440,7 +441,8 @@ export const PROXY_PORT = 5432;
 
 /**
  * What neon-control may do to the compute of `namespace`, main's or a branch
- * environment's: read its Deployment, and scale it, waking it; a Role there, bound to
+ * environment's: read its Deployment, and scale it, waking it and putting it to sleep, and
+ * list its pods, to see one put to sleep gone before it wakes it; a Role there, bound to
  * neon-control's ServiceAccount in main's.
  */
 export function computeScaling(namespace: string): KubernetesObject[] {
@@ -453,6 +455,8 @@ export function computeScaling(namespace: string): KubernetesObject[] {
     rules: [
       { apiGroups: ["apps"], resources: ["deployments"], resourceNames: [neonName("compute")], verbs: ["get"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: [neonName("compute")], verbs: ["patch"] },
+      // A list is of a namespace's pods, as no name narrows it.
+      { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ],
   };
   const binding: V1RoleBinding = {
@@ -468,8 +472,9 @@ export function computeScaling(namespace: string): KubernetesObject[] {
 /**
  * neon-control: it bootstraps the tenant and main's timeline, makes and deletes branches,
  * serves each branch's compute its spec, answers the storage controller's hooks and Neon's
- * proxy, wakes computes, and repairs a safekeeper that lost its disk. Its record of the
- * branches is in the storage controller's Postgres, so any of its replicas serves.
+ * proxy, wakes computes and puts them to sleep, and repairs a safekeeper that lost its
+ * disk. Its record of the branches is in the storage controller's Postgres, so any of its
+ * replicas serves.
  */
 function control(config: InstallConfig): KubernetesObject[] {
   const name = neonName("control");
@@ -613,27 +618,33 @@ function proxy(config: InstallConfig): KubernetesObject[] {
  * environment's is on the branch's timeline, in its namespace, reaching the stack's
  * storage and neon-control in main's.
  *
- * neon-control wakes it, scaling its Deployment to one replica. Its Service takes
- * connections before its pod is ready, so a wake is answered as soon as Postgres takes
- * them.
+ * neon-control wakes it and puts it to sleep, scaling its Deployment between one replica
+ * and none: so applying alasio gives it none, as it would take the count back, and a
+ * compute made anew starts at one. Its Service takes connections before its pod is ready,
+ * so a wake is answered as soon as Postgres takes them.
  */
 export function compute(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
   const name = neonName("compute");
   const component = "neon-compute";
   const control = `http://${neonName("control")}.${NAMESPACE}.svc:8080`;
-  const { resources } = config.neon.compute;
+  const { suspendAfter, resources } = config.neon.compute;
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
-    metadata: { name, namespace: environment.namespace, labels: stackLabels(component) },
+    metadata: {
+      name,
+      namespace: environment.namespace,
+      labels: stackLabels(component),
+      // A valid duration, as the configuration checks.
+      annotations: { [SUSPEND_AFTER]: String(durationSeconds(suspendAfter)) },
+    },
     spec: {
-      ...replicasOf(ONE),
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels(component) },
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          // Main's is alasio's database, which every turn needs; a branch's sleeps.
+          // Main's is alasio's database, which every turn needs; a branch's, a branch environment's.
           ...priority(environment.branch === null ? "floor" : "component"),
           ...imagePullSecrets(config),
           // The compute image runs as its own postgres user.

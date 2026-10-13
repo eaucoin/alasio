@@ -113,10 +113,10 @@ const ofMain = (component: string): V1NetworkPolicyPeer => ({ namespaceSelector:
 /**
  * Neon's services, the lake and their jobs reach each other, but the compute, which
  * takes its clients' sessions from main's Neon proxy alone, which every client connects
- * through, neon-control's, which wakes it, and the collector's scrapes of compute_ctl's
- * metrics. In a branch environment, its lake and compute likewise, but for the scrapes,
- * as the collector scrapes main's compute alone. The object store's parts, of the stack
- * too, are reached as partPolicies and gatewayPolicy say alone.
+ * through, neon-control's, which wakes it and counts its sessions, and the collector's
+ * scrapes of compute_ctl's metrics. In a branch environment, its lake and compute
+ * likewise, but for the scrapes, as the collector scrapes main's compute alone. The object
+ * store's parts, of the stack too, are reached as partPolicies and gatewayPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [

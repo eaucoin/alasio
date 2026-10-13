@@ -1,15 +1,18 @@
 /**
  * neon-control's record, in the storage controller's Postgres, in a schema of its own
  * (`neon_control`), so that it outlives any replica of neon-control and is shared by all
- * of them: a row of each branch, its name and its record as ./branches.ts has it.
+ * of them: a row of each branch, its name and its record as ./branches.ts has it; and a
+ * row of each compute asked to wake, and when.
  *
  * What changes branches runs under one lock, a session's advisory lock on the database,
  * so two replicas never change them at once, nor repair a timeline whose deletion one of
  * them has begun: `changing` holds it for the whole of its work, and each `save` within
  * it is written at once, so a creation asked again after a failure, or of another
- * replica, finds what the first recorded. One replica leads, running what must run once
- * (./service.ts's loops): the one holding another advisory lock, on a connection of its
- * own, for as long as that connection lives.
+ * replica, finds what the first recorded. A compute is woken or put to sleep under a lock
+ * of its own (`computeLocked`), so a wake never finds the pod a sleep is stopping. One
+ * replica leads, running what must run once (./service.ts's loops): the one holding
+ * another advisory lock, on a connection of its own, for as long as that connection
+ * lives.
  *
  * Each lock is held on a connection of its own, made for it, and what only reads takes
  * none, on a pool of its own: so however many wait for a lock, reads go on. A lock is
@@ -29,6 +32,9 @@ const CHANGE_LOCK = 0x6e65_6f6e_5f63_746cn;
 
 /** The advisory lock key of the replica that leads (./service.ts): `neon_ldr`, likewise. */
 const LEADER_LOCK = 0x6e65_6f6e_5f6c_6472n;
+
+/** The first of the two keys of each compute's advisory lock, the second its id's hash: `neon`, its bytes read as a number. */
+const COMPUTE_LOCKS = 0x6e65_6f6e;
 
 /** What every connection is made with: a bound on connecting, and keepalives, the client's and the server's. */
 const CONNECTION = {
@@ -57,6 +63,12 @@ export interface Changing {
   save(next: Branch[]): Promise<void>;
 }
 
+/** A compute, as recorded: when it was last asked to wake, in milliseconds since the epoch. */
+export interface ComputeTimes {
+  id: string;
+  wokenAt: number;
+}
+
 /** The record, in the database `url` reaches. */
 export class BranchRecord {
   readonly #url: string;
@@ -79,6 +91,7 @@ export class BranchRecord {
     return this.#holding(CHANGE_LOCK, "the lock of changes", async (client) => {
       await client.query("create schema if not exists neon_control");
       await client.query("create table if not exists neon_control.branches (name text primary key, branch jsonb not null)");
+      await client.query("create table if not exists neon_control.computes (id text primary key, woken_at timestamptz)");
     });
   }
 
@@ -95,6 +108,30 @@ export class BranchRecord {
   /** Runs `work` as `changing` does, if no other holds the lock now; null, without running it, if one does. */
   async tryChanging<T>(work: (changing: Changing) => Promise<T>): Promise<{ value: T } | null> {
     return this.#trying(CHANGE_LOCK, async (client) => this.#change(client, work));
+  }
+
+  /** Runs `work` holding the lock of the compute `id`, waiting for it as long as `patienceMs`, the record's patience unless given. */
+  computeLocked<T>(id: string, work: () => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
+    return this.#holding([COMPUTE_LOCKS, id], `the lock of ${id}`, () => work(), patienceMs);
+  }
+
+  /** Runs `work` as `computeLocked` does, if no other holds the compute's lock now; null, without running it, if one does. */
+  tryComputeLocked<T>(id: string, work: () => Promise<T>): Promise<{ value: T } | null> {
+    return this.#trying([COMPUTE_LOCKS, id], () => work());
+  }
+
+  /** Records the compute `id` woken, or asked to be, now. */
+  async woke(id: string): Promise<void> {
+    await this.#pool.query(
+      "insert into neon_control.computes (id, woken_at) values ($1, now()) on conflict (id) do update set woken_at = excluded.woken_at",
+      [id],
+    );
+  }
+
+  /** Every compute recorded asked to wake. */
+  async computes(): Promise<ComputeTimes[]> {
+    const { rows } = await this.#pool.query<{ id: string; woken_at: Date }>("select id, woken_at from neon_control.computes order by id");
+    return rows.map(({ id, woken_at }) => ({ id, wokenAt: woken_at.getTime() }));
   }
 
   /**
@@ -148,16 +185,17 @@ export class BranchRecord {
   }
 
   /**
-   * Runs `work` on a connection of its own holding the advisory lock `key`, waited for as
-   * long as the record's patience (RecordBusy after that). The lock ends with the
-   * connection.
+   * Runs `work` on a connection of its own holding the advisory lock `key` (one key, or
+   * two: a class and a name hashed), waited for as long as the record's patience
+   * (RecordBusy after that). The lock ends with the connection.
    */
-  async #holding<T>(key: bigint, what: string, work: (client: pg.Client) => Promise<T>): Promise<T> {
+  async #holding<T>(key: bigint | readonly [number, string], what: string, work: (client: pg.Client) => Promise<T>, patienceMs = this.#patienceMs): Promise<T> {
     const client = this.#client();
     await client.connect();
     try {
-      await client.query(`set lock_timeout = ${Math.round(this.#patienceMs)}`);
-      await client.query("select pg_advisory_lock($1)", [String(key)]).catch((error: unknown) => {
+      // At least a millisecond: lock_timeout 0 waits for ever.
+      await client.query(`set lock_timeout = ${Math.max(1, Math.round(patienceMs))}`);
+      await client.query(lockQuery("pg_advisory_lock", key), lockParameters(key)).catch((error: unknown) => {
         // Postgres's lock_not_available: lock_timeout ran out.
         throw (error as { code?: string }).code === "55P03" ? new RecordBusy(what) : error;
       });
@@ -168,11 +206,11 @@ export class BranchRecord {
   }
 
   /** Runs `work` as #holding does, if the lock `key` is free now; null if it is not. */
-  async #trying<T>(key: bigint, work: (client: pg.Client) => Promise<T>): Promise<{ value: T } | null> {
+  async #trying<T>(key: bigint | readonly [number, string], work: (client: pg.Client) => Promise<T>): Promise<{ value: T } | null> {
     const client = this.#client();
     await client.connect();
     try {
-      const { rows } = await client.query<{ held: boolean }>("select pg_try_advisory_lock($1) as held", [String(key)]);
+      const { rows } = await client.query<{ held: boolean }>(`${lockQuery("pg_try_advisory_lock", key)} as held`, lockParameters(key));
       if (!rows[0]?.held) return null;
       return { value: await work(client) };
     } finally {
@@ -192,6 +230,12 @@ export class BranchRecord {
     return work(changing);
   }
 }
+
+/** The query taking the advisory lock `key` with the function `lock`. */
+const lockQuery = (lock: string, key: bigint | readonly [number, string]): string =>
+  typeof key === "bigint" ? `select ${lock}($1)` : `select ${lock}($1, hashtext($2))`;
+
+const lockParameters = (key: bigint | readonly [number, string]): string[] => (typeof key === "bigint" ? [String(key)] : [String(key[0]), key[1]]);
 
 /** Writes what differs between `previous` and `next`, in one transaction. */
 async function save(client: pg.Client, previous: readonly Branch[], next: readonly Branch[]): Promise<void> {

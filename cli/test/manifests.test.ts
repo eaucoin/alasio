@@ -368,11 +368,12 @@ describe("neon", () => {
     assert.equal(setup?.env?.find(({ name }) => name === "S3_EXTERNAL"), undefined);
   });
 
-  test("runs each workload at the count its scale fixes: one, but for the safekeepers", () => {
+  test("runs each workload at the count its scale fixes: one, but for the safekeepers, and the compute, whose count neon-control owns", () => {
     const objects = install({ host: { enabled: true } });
     const workloads = [...all<V1Deployment>(objects, "Deployment"), ...all<V1StatefulSet>(objects, "StatefulSet")];
     assert.ok(workloads.length > 10);
-    for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, metadata?.name === "alasio-neon-safekeeper" ? 3 : 1, metadata?.name);
+    const count = (name: string | undefined) => (name === "alasio-neon-safekeeper" ? 3 : name === "alasio-neon-compute" ? undefined : 1);
+    for (const { metadata, spec } of workloads) assert.equal(spec?.replicas, count(metadata?.name), metadata?.name);
   });
 
   test("places each timeline on as many safekeepers as run", () => {
@@ -403,7 +404,17 @@ describe("neon", () => {
     assert.equal(args[args.indexOf("--compute-id") + 1], "alasio");
   });
 
-  test("has the compute's Service take connections as soon as Postgres does, before kubelet next probes the pod, as a wake waits for them", () => {
+  test("leaves the compute's count to neon-control, which wakes it and puts it to sleep once idle as long as configured", () => {
+    const compute = one<V1Deployment>(install(), "Deployment", "alasio-neon-compute");
+    assert.equal(compute.spec?.replicas, undefined);
+    assert.equal(compute.metadata?.annotations?.["alasio.dev/suspend-after-seconds"], "300");
+    assert.equal(one<V1Deployment>(install({ neon: { compute: { suspendAfter: "1h30m" } } }), "Deployment", "alasio-neon-compute").metadata?.annotations?.["alasio.dev/suspend-after-seconds"], "5400");
+    for (const suspendAfter of ["30s", "5", "soon"]) {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, neon: { compute: { suspendAfter } } });
+      assert.ok(Result.isFailure(decoded), suspendAfter);
+      assert.match(decoded.failure.message, /^neon\.compute\.suspendAfter must be a duration of 1m or more/u);
+    }
+    // Its Service takes connections as soon as Postgres does, before kubelet next probes the pod.
     assert.equal(one<V1Service>(install(), "Service", "alasio-neon-compute").spec?.publishNotReadyAddresses, true);
   });
 
@@ -441,6 +452,7 @@ describe("neon", () => {
     assert.deepEqual(one<V1Role>(objects, "Role", "alasio-neon-control").rules, [
       { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+      { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
   });
 
@@ -1782,7 +1794,7 @@ describe("branch environments", () => {
       ["alasio-branch-try-sessions", "alasio"],
       // Its own pod, which it labels busy as main's does.
       ["alasio-branch-try", "alasio"],
-      // main's neon-control, which wakes its compute.
+      // main's neon-control, which wakes its compute and puts it to sleep.
       ["alasio-branch-try", "alasio-neon-control"],
       ["alasio-branch-try-sessions", "alasio-parent"],
     ]);
@@ -1811,9 +1823,11 @@ describe("branch environments", () => {
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.name?.includes("grafana")), []);
     // Its compute, through main's Neon proxy.
     assert.deepEqual([variable(lake, "LAKE_DATABASE_HOST"), variable(lake, "LAKE_DATABASE_PORT"), variable(lake, "LAKE_DATABASE_ENDPOINT")], ["alasio-neon-proxy.alasio.svc", "5432", "branch-try"]);
+    assert.equal(compute.spec?.replicas, undefined);
     assert.deepEqual(of<V1Role>("Role", "alasio-neon-control").rules, [
       { apiGroups: ["apps"], resources: ["deployments"], resourceNames: ["alasio-neon-compute"], verbs: ["get"] },
       { apiGroups: ["apps"], resources: ["deployments/scale"], resourceNames: ["alasio-neon-compute"], verbs: ["patch"] },
+      { apiGroups: [""], resources: ["pods"], verbs: ["list"] },
     ]);
     assert.deepEqual(of<V1RoleBinding>("RoleBinding", "alasio-neon-control").subjects, [{ kind: "ServiceAccount", name: "alasio-neon-control", namespace: "alasio" }]);
     assert.equal(variable(lake, "LAKE_S3_ENDPOINT"), "http://alasio-seaweedfs.alasio.svc:8333");
