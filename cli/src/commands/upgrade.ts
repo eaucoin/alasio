@@ -79,7 +79,7 @@ export const upgrade = Command.make("upgrade", {
     Command.withShortDescription("Upgrade alasio to this version"),
     Command.withDescription(
       "Does what alasio up does, with the images this version of alasio's package pins, after saying which images change " +
-        "and from which version of alasio, and, for k3s on this machine, with the k3s and gVisor it pins, saying which it " +
+        "and from which version of alasio, and, for k3s on this machine, with the k3s, gVisor and stargz-snapshotter it pins, saying which it " +
         "installs in place of which. It upgrades main alone, and refuses while a branch environment another release of alasio " +
         "made exists, which would not run on what it changes: delete each first, and make it again once upgraded. What it refuses " +
         "it refuses before it changes anything, and with --check it checks for that alone, changing nothing; on this machine, of " +

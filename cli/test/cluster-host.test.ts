@@ -22,18 +22,19 @@ import { CERTIFICATE, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
 import { fakeReleases } from "./support/fake-releases.ts";
 
-const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: gvisorReleases(NODE_PINS), config: "digest" };
+const INSTALLED = { k3s: NODE_PINS.k3s.version, gvisor: gvisorReleases(NODE_PINS), stargz: NODE_PINS.stargz.version, config: "digest" };
 const RUNNING = { loaded: true, active: "active", enabled: true };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
   const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
     planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, kept: gvisorReleases(NODE_PINS), ...changes });
-  const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, k3s: null, kubeconfig: false, renew: false };
+  const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, stargz: false, k3s: null, kubeconfig: false, renew: false };
   assert.deepEqual(plan({}), none);
   assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), {
     firewall: null,
     configure: true,
     gvisor: { install: gvisorReleases(NODE_PINS), remove: [] },
+    stargz: true,
     k3s: "install",
     kubeconfig: true,
     renew: false,
@@ -42,6 +43,8 @@ test("planNode asks for nothing once all is as alasio installed it, and for what
   assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: ["20200101.0"] } }), { ...none, gvisor: { install: gvisorReleases(NODE_PINS), remove: ["20200101.0"] }, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: [...INSTALLED.gvisor, "20200101.0"] } }), { ...none, gvisor: { install: [], remove: ["20200101.0"] }, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, gvisor: [] } }), { ...none, gvisor: { install: gvisorReleases(NODE_PINS), remove: [] }, k3s: "restart", kubeconfig: true });
+  // A new stargz-snapshotter restarts k3s, and its daemon with it.
+  assert.deepEqual(plan({ stamp: { ...INSTALLED, stargz: "v0.1.0" } }), { ...none, stargz: true, k3s: "restart", kubeconfig: true });
   assert.deepEqual(plan({ stamp: { ...INSTALLED, k3s: "v1.30.0+k3s1" } }), { ...none, k3s: "install", kubeconfig: true });
   assert.deepEqual(plan({ unit: { ...RUNNING, active: "inactive", enabled: false } }), { ...none, k3s: "start", kubeconfig: true });
   assert.deepEqual(plan({ unit: { ...RUNNING, active: "failed" } }), { ...none, k3s: "start", kubeconfig: true });
@@ -197,8 +200,8 @@ test("what root's work did not do as it failed is done the next time, as alasio 
   const { machine, up } = await rig(t, { since: true });
   machine.onRun = (ran) => (ran.command === "sh" ? "exited with 1" : machine.act(ran));
   assert.match(await up() ?? "", /^sh \/.*\/install\.sh exited with 1$/u);
-  assert.deepEqual(Object.keys(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? "")).sort(), ["config", "gvisor"]);
+  assert.deepEqual(Object.keys(JSON.parse(machine.read("/etc/rancher/k3s/alasio.json") ?? "")).sort(), ["config", "gvisor", "stargz"]);
   machine.onRun = (ran) => machine.act(ran);
   assert.equal(await up(), null);
-  assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["sh install.sh", "sh install.sh"]);
+  assert.deepEqual(machine.commands().map((command) => command.replace(/\/\S+\/install\.sh/u, "install.sh")), ["systemctl daemon-reload", "sh install.sh", "sh install.sh"]);
 });

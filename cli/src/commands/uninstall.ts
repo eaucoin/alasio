@@ -1,4 +1,4 @@
-/** `alasio uninstall [--purge]`: removes alasio, and with --purge its data and the cluster on this machine, k3s and gVisor or the one in Docker. */
+/** `alasio uninstall [--purge]`: removes alasio, and with --purge its data and the cluster on this machine, k3s, gVisor and stargz-snapshotter or the one in Docker. */
 import { Console, Effect, FileSystem, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
@@ -33,7 +33,7 @@ export const uninstall = Command.make(
   {
     purge: Flag.Boolean("purge").pipe(
       Flag.withDefault(false),
-      Flag.withDescription("Also remove alasio's data: its database, its own and its workspaces' volumes, its Secrets; and the cluster on this machine, k3s and gVisor or the one in Docker, if that is where it runs"),
+      Flag.withDescription("Also remove alasio's data: its database, its own and its workspaces' volumes, its Secrets; and the cluster on this machine, k3s, gVisor and stargz-snapshotter or the one in Docker, if that is where it runs"),
     ),
     yes: Flag.Boolean("yes").pipe(Flag.withAlias("y"), Flag.withDefault(false), Flag.withDescription("Do not ask for confirmation")),
     timeout: timeoutFlag,
@@ -46,7 +46,7 @@ export const uninstall = Command.make(
       const confirmed = yes || (yield* Prompt.run(Prompt.Confirm({
         message: purge
           ? `Remove alasio and all its data from ${where}${
-            target._tag === "Host" ? ", and k3s and gVisor themselves" : target._tag === "Docker" ? ", and the cluster itself" : ""
+            target._tag === "Host" ? ", and k3s, gVisor and stargz-snapshotter themselves" : target._tag === "Docker" ? ", and the cluster itself" : ""
           }? This cannot be undone`
           : `Remove alasio from ${where}, keeping its data?`,
         initial: false,
@@ -56,7 +56,7 @@ export const uninstall = Command.make(
         // k3s here is alasio's own: removing it, with its storage, removes everything, as root at once.
         yield* Effect.provide(Effect.flatMap(HostCluster, (cluster) => cluster.remove({ storage: true })), HostCluster.layer(target.cluster));
         yield* Effect.flatMap(FileSystem.FileSystem, (fs) => fs.remove(target.kubeconfig.path, { force: true }));
-        yield* Console.log(`alasio and k3s on this machine are removed, with gVisor and all their data; the config at ${config.path} is kept.`);
+        yield* Console.log(`alasio and k3s on this machine are removed, with gVisor, stargz-snapshotter and all their data; the config at ${config.path} is kept.`);
         return;
       }
       if (purge && target._tag === "Docker") {

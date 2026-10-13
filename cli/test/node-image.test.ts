@@ -11,10 +11,12 @@ import { NODE_BUILD_ARGS } from "../../tooling/node-image.ts";
 
 const DOCKERFILE = readFileSync(new URL("../../cluster/node/Dockerfile", import.meta.url), "utf8");
 
-test("the node image is built from the k3s image and the gVisor releases pins.json pins, each with its sha512", () => {
+test("the node image is built from the k3s image, the gVisor releases, each with its sha512, and the stargz-snapshotter release pins.json pins", () => {
   assert.deepEqual(NODE_BUILD_ARGS, [
     `--build-arg=K3S_IMAGE=${pins.k3s.image}`,
     `--build-arg=GVISOR_RELEASES=${pins.gvisor.releases.map(({ release, sha512 }) => `${release}:${sha512}`).join(" ")}`,
+    `--build-arg=STARGZ_VERSION=${pins.stargz.version}`,
+    `--build-arg=STARGZ_SHA256=${pins.stargz.sha256}`,
   ]);
   // The current release, then at most the one before it.
   assert.match(NODE_BUILD_ARGS[1] ?? "", /^--build-arg=GVISOR_RELEASES=[^\s:]+:[0-9a-f]{128}( [^\s:]+:[0-9a-f]{128})?$/u);

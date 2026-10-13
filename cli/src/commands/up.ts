@@ -95,8 +95,12 @@ export const up = Command.make("up", { timeout: timeoutFlag }, ({ timeout }) => 
   Command.withShortDescription("Start alasio, installing or updating it"),
   Command.withDescription(
     "Makes the cluster on this machine, or starts it, when that is where alasio runs, once this machine is one it runs on, " +
-      "Linux on x86-64: k3s on the machine itself, installing or upgrading k3s and gVisor and setting k3s as the config says, or " +
-      "a cluster in Docker; for either, raising its inotify limits where they are too low for it. What it changes on the machine " +
+      "Linux on x86-64: k3s on the machine itself, installing or upgrading k3s, gVisor and stargz-snapshotter and setting k3s as the config says, or " +
+      "a cluster in Docker; for either, raising its inotify limits where they are too low for it. Its nodes pull images through " +
+      "stargz-snapshotter: an eStargz image's layers are read from its registry, or a mirror, as its pods read them, which " +
+      "needs both to answer range requests, and fetched whole meanwhile; any other image is pulled whole. So a machine that " +
+      "boots again while a registry it pulled from so is out of reach runs no pod until it answers, as the daemon mounts those " +
+      "layers from it again before it serves any. What it changes on the machine " +
       "it changes as root, through sudo, at once, after saying what. Then it applies alasio as the config says, " +
       "with this version's images, and with KEDA and VPA, which scale and size its components, unless the cluster has its own, " +
       "which the config then says to use; and waits until it runs, saying what it waits for. Run it again after changing the config. " +

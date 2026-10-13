@@ -1,9 +1,10 @@
 /**
  * What the clusters alasio makes on this machine, in Docker (./docker.ts) and on the
  * machine itself (./host.ts), share of k3s: how kubelet is set, the registries containerd
- * pulls from, the host aliases CoreDNS resolves, the gVisor releases kept as containerd's
- * runtimes and their RuntimeClasses, nodes ready since they started, the kubeconfig k3s
- * writes made the operator's, and waits for all that.
+ * pulls from, the host aliases CoreDNS resolves, containerd's files, which pull images
+ * through stargz-snapshotter's daemon and keep the gVisor releases as runtimes, and their
+ * RuntimeClasses, nodes ready since they started, the kubeconfig k3s writes made the
+ * operator's, and waits for all that.
  */
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
@@ -12,6 +13,7 @@ import { type Cluster, KubeConfig, type User, type V1Node, type V1RuntimeClass }
 import { Duration, Effect, FileSystem, type PlatformError, Schedule, Schema } from "effect";
 
 import { CONTAINERD, gvisorDirectory, gvisorHandler, gvisorRuntimeClass } from "../../../src/node-agent/names.ts";
+import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "./stargz.ts";
 
 /** A name the cluster's DNS resolves to an address, as an /etc/hosts line says. */
 export interface HostAlias {
@@ -65,15 +67,16 @@ export const KUBELET_ARGS: readonly string[] = [
 const GVISOR_POD_ANNOTATIONS = ["dev.gvisor.internal.restore.*", "dev.gvisor.internal.cpufeatures", "dev.gvisor.spec.mount.*"];
 
 /**
- * The files that make each of gVisor's `releases` a runtime of k3s's containerd, by their
- * paths: the containerd template, k3s's own configuration with a runtime for each
- * release, which runs that release's shim, and each runtime's runsc options, which run
- * that release's runsc, and, where `systemd` runs the machine, place its sandboxes'
- * cgroups through systemd, as kubelet does there. alasio writes them on the machine (the
- * host target), and puts them into each node's container (the cluster in Docker). Pure,
- * for tests.
+ * The files of k3s's containerd on a node pulling images through stargz-snapshotter's
+ * daemon and running each of gVisor's `releases`, by their paths: the containerd template,
+ * k3s's own configuration with the CRI's images pulled through the daemon (./stargz.ts),
+ * and a runtime for each release, which runs that release's shim; and each runtime's runsc
+ * options, which run that release's runsc, and, where `systemd` runs the machine, place
+ * its sandboxes' cgroups through systemd, as kubelet does there. alasio writes them on the
+ * machine (the host target), and puts them into each node's container (the cluster in
+ * Docker). Pure, for tests.
  */
-export function gvisorRuntimeFiles(releases: readonly string[], { systemd }: { readonly systemd: boolean }): ReadonlyMap<string, string> {
+export function containerdFiles(releases: readonly string[], { systemd }: { readonly systemd: boolean }): ReadonlyMap<string, string> {
   const optionsPath = (release: string) => `${CONTAINERD}/${gvisorHandler(release)}.toml`;
   const runtime = (release: string) => {
     const table = `plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.${gvisorHandler(release)}`;
@@ -108,6 +111,21 @@ export function gvisorRuntimeFiles(releases: readonly string[], { systemd }: { r
   return new Map([
     [`${CONTAINERD}/config-v3.toml.tmpl`, file([
       `{{ template "base" . }}`,
+      "",
+      "# Images pulled through stargz-snapshotter's daemon (cli/src/cluster/stargz.ts), which mounts an eStargz layer",
+      "# lazily: k3s, its snapshotter set to none, says nothing of the CRI's images, and alasio says it here, the",
+      "# snapshot annotations the daemon reads passed.",
+      "[plugins.'io.containerd.cri.v1.images']",
+      `  snapshotter = "${SNAPSHOTTER}"`,
+      "  disable_snapshot_annotations = false",
+      "  use_local_image_pull = true",
+      "",
+      `[proxy_plugins.${SNAPSHOTTER}]`,
+      `  type = "snapshot"`,
+      `  address = "${STARGZ_SOCKET}"`,
+      `[proxy_plugins.${SNAPSHOTTER}.exports]`,
+      `  root = "${STARGZ_ROOT}/"`,
+      `  enable_remote_snapshot_annotations = "true"`,
       "",
       "# Each gVisor release alasio keeps, a runtime of its own, runsc-RELEASE (its dots made dashes), which runs that",
       "# release's shim, with the pod annotations gVisor reads, and the runsc options beside this file.",

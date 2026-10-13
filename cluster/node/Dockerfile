@@ -1,10 +1,12 @@
 # alasio's cluster node, ghcr.io/eaucoin/alasio-node: k3s with the gVisor releases alasio
-# keeps, each in /usr/local/lib/alasio/gvisor/RELEASE, and an entrypoint that readies the
-# container for k3s (entrypoint.sh). What alasio's cluster in Docker runs on, on a single
-# machine and in CI; alasio puts the files that make each release a runtime of
-# containerd's, so pods with the `gvisor` RuntimeClass run sandboxed, into each node's
-# container itself (cli/src/cluster/docker.ts). The k3s image, and the gVisor releases
-# with their sha512s, are pins.json's, whose k3s and gVisor the host target installs on a
+# keeps, each in /usr/local/lib/alasio/gvisor/RELEASE, stargz-snapshotter's daemon, which
+# pulls eStargz images lazily, and an entrypoint that readies the container for k3s and
+# starts the daemon (entrypoint.sh). What alasio's cluster in Docker runs on, on a single
+# machine and in CI; alasio puts the files that make the daemon containerd's snapshotter
+# and each release a runtime of containerd's, so pods with the `gvisor` RuntimeClass run
+# sandboxed, into each node's container itself (cli/src/cluster/docker.ts). The k3s image,
+# the gVisor releases with their sha512s and stargz-snapshotter's with its sha256 are
+# pins.json's, whose k3s, gVisor and stargz-snapshotter the host target installs on a
 # machine itself, at the same paths: every build passes them as build arguments, as
 # tooling/node-image.ts says them, GVISOR_RELEASES as RELEASE:SHA512 pairs, separated by
 # spaces. gVisor is alasio's fork of it, github.com/eaucoin/gvisor.
@@ -27,7 +29,17 @@ RUN set -eu; \
       rm -r /tmp/gvisor /tmp/gvisor.tar.zstd; \
     done
 
+FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS stargz
+ARG STARGZ_VERSION
+ARG STARGZ_SHA256
+ADD https://github.com/containerd/stargz-snapshotter/releases/download/${STARGZ_VERSION}/stargz-snapshotter-${STARGZ_VERSION}-linux-amd64.tar.gz /tmp/stargz.tar.gz
+RUN echo "${STARGZ_SHA256}  /tmp/stargz.tar.gz" | sha256sum -c - \
+ && mkdir /stargz \
+ && tar -xzf /tmp/stargz.tar.gz -C /stargz containerd-stargz-grpc stargz-fuse-manager
+
 FROM ${K3S_IMAGE}
 COPY --from=gvisor /gvisor /usr/local/lib/alasio/gvisor
+# stargz-snapshotter's daemon and its FUSE manager, where its configuration names them.
+COPY --from=stargz /stargz/containerd-stargz-grpc /stargz/stargz-fuse-manager /usr/local/bin/
 COPY entrypoint.sh /bin/alasio-node-entrypoint
 ENTRYPOINT ["/bin/alasio-node-entrypoint"]

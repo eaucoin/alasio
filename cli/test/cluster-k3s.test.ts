@@ -1,15 +1,17 @@
 /**
  * What the clusters alasio makes on this machine share of k3s (cli/src/cluster/k3s.ts):
- * the registries containerd pulls from, CoreDNS's host aliases, gVisor's releases as
- * containerd's runtimes and their RuntimeClasses, nodes ready since they started, and the
- * kubeconfig k3s writes made the operator's.
+ * the registries containerd pulls from, CoreDNS's host aliases, containerd's files, which
+ * pull through stargz-snapshotter's daemon and keep gVisor's releases as runtimes, and their
+ * RuntimeClasses, nodes ready since they started, and the kubeconfig k3s writes made the
+ * operator's.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { KubeConfig } from "@kubernetes/client-node";
 
-import { clusterKubeconfig, gvisorRuntimeClasses, gvisorRuntimeFiles, nodeHostsWith, readySince, registriesYaml, staleRuntimeClasses } from "../src/cluster/k3s.ts";
+import { clusterKubeconfig, containerdFiles, gvisorRuntimeClasses, nodeHostsWith, readySince, registriesYaml, staleRuntimeClasses } from "../src/cluster/k3s.ts";
+import { SNAPSHOTTER, STARGZ_ROOT, STARGZ_SOCKET } from "../src/cluster/stargz.ts";
 
 /** The kubeconfig k3s writes. */
 const K3S_YAML = `apiVersion: v1
@@ -58,7 +60,7 @@ test("nodeHostsWith keeps k3s's lines for the nodes and replaces every other wit
 const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
 
 test("each gVisor release kept is a runtime of containerd's, after k3s's own configuration, running its own shim, with gVisor's pod annotations and its runsc options", () => {
-  const files = gvisorRuntimeFiles(["20260921.0-eaucoin.4", "20260921.0-eaucoin.3"], { systemd: false });
+  const files = containerdFiles(["20260921.0-eaucoin.4", "20260921.0-eaucoin.3"], { systemd: false });
   assert.deepEqual([...files.keys()], [`${CONTAINERD}/config-v3.toml.tmpl`, `${CONTAINERD}/runsc-20260921-0-eaucoin-4.toml`, `${CONTAINERD}/runsc-20260921-0-eaucoin-3.toml`]);
   const template = files.get(`${CONTAINERD}/config-v3.toml.tmpl`) ?? "";
   assert.match(template, /^\{\{ template "base" \. \}\}\n\n# /u);
@@ -80,8 +82,15 @@ test("each gVisor release kept is a runtime of containerd's, after k3s's own con
   assert.match(options, /\nbinary_name = "\/usr\/local\/lib\/alasio\/gvisor\/20260921\.0-eaucoin\.3\/runsc"\nrestore_direct = true\n\n\[runsc_config\]\n {2}restore-validate-files = "all"\n(?: {2}# [^\n]*\n)+ {2}allow-live-tcp-migration = "false"\n$/u);
 });
 
+test("containerd's template, after k3s's, which says no snapshotter, has the CRI pull through stargz-snapshotter's daemon, the annotations it reads passed", () => {
+  const template = containerdFiles(["20990101.0"], { systemd: false }).get(`${CONTAINERD}/config-v3.toml.tmpl`) ?? "";
+  assert.match(template, new RegExp(`^\\[plugins\\.'io\\.containerd\\.cri\\.v1\\.images'\\]\\n {2}snapshotter = "${SNAPSHOTTER}"\\n {2}disable_snapshot_annotations = false\\n {2}use_local_image_pull = true\\n`, "mu"));
+  assert.match(template, new RegExp(`^\\[proxy_plugins\\.${SNAPSHOTTER}\\]\\n {2}type = "snapshot"\\n {2}address = "${STARGZ_SOCKET}"\\n`, "mu"));
+  assert.match(template, new RegExp(`^ {2}root = "${STARGZ_ROOT}/"\\n {2}enable_remote_snapshot_annotations = "true"\\n`, "mu"));
+});
+
 test("a single release kept is one runtime of containerd's, and nothing is rendered for a release before it", () => {
-  const files = gvisorRuntimeFiles(["21000101.0"], { systemd: false });
+  const files = containerdFiles(["21000101.0"], { systemd: false });
   assert.deepEqual([...files.keys()], [`${CONTAINERD}/config-v3.toml.tmpl`, `${CONTAINERD}/runsc-21000101-0.toml`]);
   assert.equal((files.get(`${CONTAINERD}/config-v3.toml.tmpl`) ?? "").match(/^\[plugins\.'io\.containerd\.cri\.v1\.runtime'\.containerd\.runtimes\.runsc-[^.\]]+\]$/gmu)?.length, 1);
   assert.deepEqual(gvisorRuntimeClasses(["21000101.0"]).map(({ metadata, handler }) => [metadata?.name, handler]), [["gvisor", "runsc-21000101-0"], ["gvisor-21000101-0", "runsc-21000101-0"]]);
@@ -90,7 +99,7 @@ test("a single release kept is one runtime of containerd's, and nothing is rende
 });
 
 test("where systemd runs the machine, runsc places its sandboxes' cgroups through it, and only there", () => {
-  const options = (systemd: boolean) => gvisorRuntimeFiles(["20990101.0"], { systemd }).get(`${CONTAINERD}/runsc-20990101-0.toml`) ?? "";
+  const options = (systemd: boolean) => containerdFiles(["20990101.0"], { systemd }).get(`${CONTAINERD}/runsc-20990101-0.toml`) ?? "";
   assert.match(options(true), /\n {2}allow-live-tcp-migration = "false"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
   assert.doesNotMatch(options(false), /systemd/u);
 });

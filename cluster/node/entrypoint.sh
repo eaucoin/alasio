@@ -1,7 +1,8 @@
 #!/bin/sh
-# Readies the node's container for k3s, then runs k3s with the container's arguments
-# (`server ...` or `agent ...`). It runs at every start of the container: what it changes
-# lives in the container's namespaces, which a restart makes anew.
+# Readies the node's container for k3s, starts stargz-snapshotter's daemon, its
+# containerd's snapshotter, then runs k3s with the container's arguments (`server ...` or
+# `agent ...`). It runs at every start of the container: what it changes lives in the
+# container's namespaces, which a restart makes anew.
 set -eu
 
 # cgroup v2, in the container's own cgroup namespace: a cgroup that holds processes
@@ -40,5 +41,18 @@ fi
 
 # The root's mounts shared, so mounts kubelet makes for pods propagate as they ask.
 mount --make-rshared /
+
+# stargz-snapshotter's daemon, with its configuration as the node was made with it
+# (ALASIO_STARGZ_CONFIG), which containerd pulls images through once its socket is there:
+# it lives as long as the container, which k3s does too.
+mkdir -p /etc/containerd-stargz-grpc
+printf '%s\n' "$ALASIO_STARGZ_CONFIG" >/etc/containerd-stargz-grpc/config.toml
+/usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
+  --config=/etc/containerd-stargz-grpc/config.toml --root=/var/lib/containerd-stargz-grpc &
+daemon=$!
+until [ -S /run/containerd-stargz-grpc/containerd-stargz-grpc.sock ]; do
+  kill -0 "$daemon" 2>/dev/null || { echo "stargz-snapshotter's daemon exited" >&2; exit 1; }
+  sleep 0.1
+done
 
 exec /bin/k3s "$@"

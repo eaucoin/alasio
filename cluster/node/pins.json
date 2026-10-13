@@ -15,5 +15,9 @@
         "sha512": "86f85cca0f604e40887b6244cd9f57b3efbba760b3bdcabf066b3a408dde5b84fa2b1fc94e4db00ded989e1bb08522ad9343af8735a66b4964b3ca9b3a2c08b0"
       }
     ]
+  },
+  "stargz": {
+    "version": "v0.19.0",
+    "sha256": "696487c151b275bfc7818dcaba4eaadd40b8c4a8f87a60af919d8967f2e31ea1"
   }
 }
