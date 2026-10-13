@@ -35,6 +35,7 @@ import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
   alasio,
+  BIG_REPL_MEBIBYTES,
   alasioOk,
   alasioOkWith,
   alasioRunning,
@@ -66,7 +67,7 @@ import {
   tearDown,
 } from "./harness.ts";
 import type { ListedExport } from "./otlp-sink.ts";
-import type { ReplSeen, ReplSet } from "./session-repl.ts";
+import type { ReplFilled, ReplSeen, ReplSet, ReplSummed } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
 import type { Corrupted } from "./snapshot-bucket.ts";
 import { OTLP, STAND_INS, type StandIn, TELEGRAM, TELEGRAM_BRANCH, urlOf } from "./stand-ins.ts";
@@ -574,6 +575,8 @@ if (inShard("sessions")) {
 const repl = {
   set: (volumeId: string, value: string) => inAlasio<ReplSet>("./session-repl.ts", "set", volumeId, value),
   read: (volumeId: string, sessionId: string) => inAlasio<ReplSeen>("./session-repl.ts", "read", volumeId, sessionId),
+  fill: (volumeId: string, mebibytes: number) => inAlasio<ReplFilled>("./session-repl.ts", "fill", volumeId, String(mebibytes)),
+  sum: (volumeId: string, sessionId: string) => inAlasio<ReplSummed>("./session-repl.ts", "sum", volumeId, sessionId),
 };
 
 /** What bayma tells the first exec of a session that came back whole with its sandbox, and of one that came back from its checkpoint. */
@@ -767,6 +770,37 @@ if (inShard("snapshots")) {
       const seen = await repl.read(fork, forked);
       assert.deepEqual([seen.live, seen.checkpointed], [`forked from ${source}`, `forked from ${source}`]);
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+    });
+
+    test(`a session holding ${BIG_REPL_MEBIBYTES} MiB live is saved, and restored whole from its node's cache and from the bucket, as the next turn waits`, async (t) => {
+      const big = await newSession("none");
+      const { sessionId: held, sha256 } = await repl.fill(big, BIG_REPL_MEBIBYTES);
+      /** The last line the node agents logged of preparing `snapshot`. */
+      const prepared = async (snapshot: string) => {
+        for (const pod of (await nodeAgents()).values()) {
+          const line = (await kube.logs(NAMESPACE, pod, "node-agent")).split("\n").findLast((each) => each.includes(`prepared the snapshot ${snapshot} `));
+          if (line) return line.slice(line.indexOf("prepared"));
+        }
+        return "not logged";
+      };
+      for (const from of ["cache", "bucket"] as const) {
+        const released = await untilReleased(big, Date.now());
+        const snapshot = await snapshotOf(big);
+        assert.ok(snapshot, `the session ${big} was released with no snapshot`);
+        assert.ok(snapshot.bytes >= BIG_REPL_MEBIBYTES * 1024 * 1024, `its image is ${snapshot.bytes} bytes`);
+        t.diagnostic(`saved ${released} ms after its last exec: ${snapshot.bytes} bytes, its sandbox paused ${snapshot.pauseMs} ms, uploaded in ${snapshot.uploadMs} ms`);
+        // Restored from the bucket where no node's cache holds it.
+        if (from === "bucket") {
+          for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
+        }
+        const answered = await turn(`hello with ${BIG_REPL_MEBIBYTES} MiB from the ${from}`);
+        const summed = await repl.sum(big, held);
+        assert.equal(summed.sha256, sha256);
+        assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
+        const line = await prepared(snapshot.snapshot);
+        assert.ok(line.includes(` from the ${from}: `), line);
+        t.diagnostic(`restored from the ${from}: the turn's answer came ${answered} ms after its prompt; ${line}`);
+      }
     });
 
     test("a session released before alasio up changes the sessions' template is restored onto the one it was taken on, which the admission policy pins whole beside the new one, and admits no variant of", async (t) => {

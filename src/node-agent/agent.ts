@@ -562,13 +562,16 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         const why = yield* unrestorable(manifest);
         if (why !== null) return yield* new Unrestorable({ environment, workspace, snapshot, reason: why });
         const cached = yield* cache.holds(environment, workspace, snapshot);
+        const started = yield* Clock.currentTimeMillis;
         if (cached) yield* cache.use(environment, workspace, snapshot);
         else yield* download(manifest);
+        const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* cache.clear(environment, workspace, snapshot);
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
         const source = cached ? "cache" : "bucket";
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
-        yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes });
+        yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
+        yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
         return { manifest, imagePath: cache.path(environment, workspace, snapshot) };
       }),
     ).pipe(

@@ -8,6 +8,10 @@
  * - `read <volumeId> <sessionId>`: takes the session over, as a client that reconnected
  *   does, and reads both back in an exec; prints what it held, and what bayma told the
  *   exec of how the session came back.
+ * - `fill <volumeId> <mebibytes>`: a new Bun session holding that many random bytes live,
+ *   which no checkpoint of bayma's keeps; prints its id and their SHA-256.
+ * - `sum <volumeId> <sessionId>`: takes the session over and prints the SHA-256 of the bytes
+ *   it holds live, null where it holds none, and bayma's notice to the exec.
  *
  * alasio's modules are imported by their paths in the repository, which inAlasio in
  * harness.ts rewrites to the image's as it pipes this in.
@@ -29,6 +33,18 @@ export interface ReplSet {
   readonly sessionId: string;
 }
 
+/** The REPL session `fill` made, and the SHA-256 of what it holds. */
+export interface ReplFilled {
+  readonly sessionId: string;
+  readonly sha256: string;
+}
+
+/** What `sum` saw: the SHA-256 of the bytes the REPL holds live, null where it holds none, and bayma's notice to the exec, if any. */
+export interface ReplSummed {
+  readonly sha256: string | null;
+  readonly notice: string | null;
+}
+
 /** What `read` saw: the value the REPL holds live and in its checkpoint, null where it holds none, and bayma's notice to the exec, if any. */
 export interface ReplSeen {
   readonly live: string | null;
@@ -37,7 +53,12 @@ export interface ReplSeen {
 }
 
 const [verb, volumeId, argument] = process.argv.slice(2);
-if (!volumeId || !argument || (verb !== "set" && verb !== "read")) throw new Error("usage: session-repl.ts set <volumeId> <value> | read <volumeId> <sessionId>");
+if (!volumeId || !argument || !["set", "read", "fill", "sum"].includes(verb ?? "")) {
+  throw new Error("usage: session-repl.ts set <volumeId> <value> | read <volumeId> <sessionId> | fill <volumeId> <mebibytes> | sum <volumeId> <sessionId>");
+}
+
+/** The SHA-256 of the bytes the REPL holds live, as an exec prints it. */
+const SUM = 'console.log(JSON.stringify(globalThis.filled ? new Bun.CryptoHasher("sha256").update(globalThis.filled).digest("hex") : null))';
 
 /** The text of a part of a tool's answer, where bayma gives its JSON. */
 function text(part: ContentBlock | undefined): string {
@@ -80,6 +101,17 @@ try {
     await exec(client, session.session_id, `globalThis.kept = ${value}; $checkpoint = { kept: ${value} }; console.log("set")`);
     const set: ReplSet = { sessionId: session.session_id };
     console.log(JSON.stringify(set));
+  } else if (verb === "fill") {
+    const { session } = await call<BaymaSessionCreated>(client, "session.create", { runtime: "bun", title: "e2e", cwd: "/workspace" });
+    // Random, so that no page of it is one of zeros, which a save could skip.
+    const { stdout } = await exec(client, session.session_id, `globalThis.filled = require("node:crypto").randomFillSync(Buffer.allocUnsafe(${Number(argument)} * 1024 * 1024)); ${SUM}`);
+    const filled: ReplFilled = { sessionId: session.session_id, sha256: JSON.parse(stdout) };
+    console.log(JSON.stringify(filled));
+  } else if (verb === "sum") {
+    await call(client, "session.acquire_controller", { session_id: argument });
+    const { stdout, notice } = await exec(client, argument, SUM);
+    const summed: ReplSummed = { sha256: JSON.parse(stdout), notice };
+    console.log(JSON.stringify(summed));
   } else {
     await call(client, "session.acquire_controller", { session_id: argument });
     const { stdout, notice } = await exec(client, argument, "console.log(JSON.stringify({ live: globalThis.kept ?? null, checkpointed: $checkpoint?.kept ?? null }))");

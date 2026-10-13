@@ -139,6 +139,8 @@ export const PREVIOUS = process.env["ALASIO_E2E_PREVIOUS"] || undefined;
 
 /** How long a session of the snapshots and upgrade shards runs no exec, and no turn, before alasio releases it. */
 export const RELEASE_AFTER_SECONDS = 60;
+/** How much a REPL of the snapshots shard holds live, whose snapshots it times. */
+export const BIG_REPL_MEBIBYTES = 1024;
 
 /**
  * The images built here: their names, and what they are built from. alasio's runs in
@@ -523,7 +525,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
     host: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
     sessions: {
       storage: { size: "1Gi" },
-      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: "1Gi" } },
+      // The snapshots shard's sessions hold a REPL of BIG_REPL_MEBIBYTES live, with room for bayma and gVisor.
+      resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
       // Never released within the run but in the snapshots and upgrade shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
       // their pods under them. 6.0.0 releases none, and has no such setting.
