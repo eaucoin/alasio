@@ -135,7 +135,7 @@ test("up makes the cluster: its image, network, volumes and server, waits for it
       // No snapshotter of k3s's: the node image's template says stargz-snapshotter's daemon's.
       "--snapshotter=",
     ],
-    Env: [`ALASIO_STARGZ_CONFIG=${stargzConfig()}`],
+    Env: [`ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"],
     ExposedPorts: { "6443/tcp": {} },
     HostConfig: {
       Privileged: true,
@@ -262,7 +262,7 @@ test("agents join the server with the token it made, at the addresses after it, 
     NetworkingConfig: unknown;
   };
   assert.equal(agent.Cmd[0], "agent");
-  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`, `ALASIO_STARGZ_CONFIG=${stargzConfig()}`]);
+  assert.deepEqual(agent.Env, ["K3S_URL=https://dev-server-0:6443", `K3S_TOKEN=${K3S_TOKEN}`, `ALASIO_STARGZ_CONFIG=${stargzConfig()}`, "ALASIO_STARGZ_MEMORY_LIMIT=128MiB"]);
   assert.equal(agent.Labels["alasio.role"], "agent");
   assert.equal(agent.ExposedPorts, undefined);
   assert.equal(agent.HostConfig.PortBindings, undefined);

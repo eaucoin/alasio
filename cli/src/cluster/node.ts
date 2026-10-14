@@ -30,7 +30,7 @@ import { CONTAINERD, GVISOR_RELEASES, gvisorDirectory, gvisorHandler } from "../
 import { Registries } from "../config.ts";
 import { clusterKubeconfig, containerdFiles, KUBELET_ARGS, NotYet, registriesYaml } from "./k3s.ts";
 import { Machine, type RootCommandFailed, RootSystem, under } from "./machine.ts";
-import { STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
+import { STARGZ_CONFIG, STARGZ_EXECUTABLES, STARGZ_MEMORY_LIMIT, STARGZ_ROOT, STARGZ_SOCKET, stargzConfig } from "./stargz.ts";
 import { tarEntries } from "./tar.ts";
 
 /**
@@ -173,6 +173,8 @@ export function nodeFiles(config: NodeConfig): ReadonlyMap<string, string> {
       `PartOf=${SERVICE}.service`,
       "",
       "[Service]",
+      "# Go's soft limit on its heap and its FUSE manager's (./stargz.ts's STARGZ_MEMORY_LIMIT).",
+      `Environment=GOMEMLIMIT=${STARGZ_MEMORY_LIMIT}`,
       `ExecStart=${BIN}/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=${STARGZ_CONFIG} --root=${STARGZ_ROOT}`,
       "Restart=always",
       "# Its FUSE manager keeps the mounts of the images running pods read, through the daemon's restarts.",

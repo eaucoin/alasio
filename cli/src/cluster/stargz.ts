@@ -25,6 +25,15 @@ export const STARGZ_ROOT = "/var/lib/containerd-stargz-grpc";
 export const STARGZ_SOCKET = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock";
 /** The daemon's configuration. */
 export const STARGZ_CONFIG = "/etc/containerd-stargz-grpc/config.toml";
+/**
+ * The soft limit of Go's on the heap of the daemon and of its FUSE manager, which inherits
+ * its environment. Unbounded, the manager's heap grew to 311 MB with a 2.1 GB image lazily
+ * mounted and fetched, and kept 184 MB once it was gone, most of it garbage not collected
+ * yet; at 128 MiB it held 129 MB, and starts took as long. What lives is about 45 MB of
+ * the manager's own, and 45 MB more for each 2 GB image mounted (measured in CI), which
+ * the limit does not bound: past it, Go collects more often.
+ */
+export const STARGZ_MEMORY_LIMIT = "128MiB";
 /** The daemon's executables, as its release has them: the daemon and its FUSE manager. */
 export const STARGZ_EXECUTABLES = ["containerd-stargz-grpc", "stargz-fuse-manager"] as const;
 
