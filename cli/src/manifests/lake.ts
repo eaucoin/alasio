@@ -201,7 +201,8 @@ function intakeObjects(config: InstallConfig, lakeEnv: V1EnvVar[]): KubernetesOb
             ],
             ports: [{ name: "metrics", containerPort: METRICS_PORT }],
             readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },
-            livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
+            // A batch being decoded holds its event loop a while: given time to answer.
+            livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 3 },
             securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
             resources,
             volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],

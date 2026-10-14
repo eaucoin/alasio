@@ -580,7 +580,14 @@ if (inShard("telemetry")) {
             };
             rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
           }
-          assert.ok(rows > 0, `${panel} answered with no row`);
+          if (rows === 0) {
+            // The metrics the panel reads, by their names' starts, as the lake has them.
+            const names = await lakeQuery(
+              "select ServiceName, MetricName, Attributes['type'] as type, count(*) as n from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
+                "and (MetricName like 'kafka_request_time%' or MetricName like 'kafka_stream_wal%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2, 3 limit 80",
+            ).catch((error: unknown) => String(error));
+            assert.fail(`${panel} answered with no row; the log's and the intake's metrics it reads: ${JSON.stringify(names)}`);
+          }
         }
         // A query the lake refuses says why, in Grafana.
         const refused = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [{ ...services, url_options: { ...(services as { url_options: object }).url_options, data: "select nothing" } }] }) })).body as {
@@ -669,6 +676,23 @@ if (inShard("telemetry")) {
         return taken;
       };
 
+      /** The tail of `container`'s log in the pod `pod`, its lines that match `only` where given, for a failure's message. */
+      const tail = async (pod: Promise<string>, container: string, only?: RegExp): Promise<string> => {
+        const logged = await pod.then((name) => kube.logs(NAMESPACE, name, container)).catch((error: unknown) => String(error));
+        return logged.split("\n").filter((line) => !only || only.test(line)).slice(-30).join("\n");
+      };
+
+      /** What the intake, the log and KEDA say, for a failure's message: the intake's records by outcome, and each one's last lines. */
+      const logState = async (): Promise<string> => {
+        const outcomes = await lakeQuery("select Attributes['topic'] as topic, Attributes['outcome'] as outcome, max(Value) as n from otel.metrics_sum where ServiceName = 'lake-intake' and MetricName like 'lake_telemetry_records%' group by all").catch((error: unknown) => String(error));
+        return [
+          `the intake's records: ${JSON.stringify(outcomes)}`,
+          `the intake's log:\n${await tail(kube.runningPod(NAMESPACE, componentName("lake-intake")), "intake")}`,
+          `the log's warnings:\n${await tail(Promise.resolve(`${componentName("log")}-0`), "log", /WARN|ERROR/u)}`,
+          `KEDA's operator:\n${await tail(kube.runningPod(NAMESPACE, componentName("keda-operator")), "keda-operator", /kafka|lake-intake/u)}`,
+        ].join("\n");
+      };
+
       /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each. */
       const untilWritten = async (run: string, taken: readonly number[], timeoutMs = 600_000): Promise<Map<number, number>> => {
         const deadline = Date.now() + timeoutMs;
@@ -676,7 +700,9 @@ if (inShard("telemetry")) {
           const rows = await lakeQuery(`select SpanAttributes['e2e.seq'] as seq, count(*) as n from otel.traces where ServiceName = 'e2e-log' and SpanAttributes['e2e.run'] = '${run}' group by 1`).catch(() => []);
           const written = new Map(rows.map((row) => [Number(row["seq"]), Number(row["n"])]));
           if (taken.every((seq) => written.has(seq))) return written;
-          if (Date.now() > deadline) assert.fail(`of the ${taken.length} spans the gateway took, the lake has ${taken.filter((seq) => written.has(seq)).length}`);
+          if (Date.now() > deadline) {
+            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${await logState()}`);
+          }
           await sleep(5000);
         }
       };
@@ -714,11 +740,27 @@ if (inShard("telemetry")) {
         const intake = ref("Deployment", componentName("lake-intake"), NAMESPACE);
         // What KEDA, and the HPA it makes, scale it to.
         const replicas = async () => (await kube.get<V1Deployment>(intake))?.spec?.replicas ?? 0;
+        // The lake's write lock, held in a session of the catalog's database as long as the test says, as while the lake cannot be written:
+        // the backlog stays in the log, however fast the intake reads it, until KEDA has scaled it out.
+        const compute = await kube.runningPod(NAMESPACE, "alasio-neon-compute");
+        const catalog = (sql: string, application = "e2e") =>
+          kube.exec(NAMESPACE, compute, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", `dbname=lake application_name=${application}`, "-Atc", sql], { container: "compute" });
+        let held: Promise<unknown> | null = null;
+        const release = async () => {
+          await catalog("select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'e2e-write-lock'");
+          await held?.catch(() => {});
+        };
         // Held at none, as while nothing waits.
         await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
         try {
           for (const deadline = Date.now() + 300_000; (await kube.get<V1Deployment>(intake))?.status?.replicas; await sleep(2000)) {
             if (Date.now() > deadline) assert.fail("the intake did not stop while paused at none");
+          }
+          held = catalog("select pg_advisory_lock(hashtext('alasio.lake.write')); select pg_sleep(1200)", "e2e-write-lock");
+          for (const deadline = Date.now() + 60_000; ; await sleep(1000)) {
+            const granted = await catalog("select count(*) from pg_locks join pg_stat_activity using (pid) where locktype = 'advisory' and granted and application_name = 'e2e-write-lock'");
+            if (granted.stdout.trim() === "1") break;
+            if (Date.now() > deadline) assert.fail(`the test could not hold the lake's write lock: ${granted.stderr}${granted.stdout}`);
           }
           const run = randomUUID();
           // Some thousands a partition, as after an outage: KEDA gives it a replica a thousand.
@@ -727,13 +769,19 @@ if (inShard("telemetry")) {
           await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
           let most = 0;
           for (const deadline = Date.now() + 300_000; most < 2; await sleep(2000)) {
-            if (Date.now() > deadline) assert.fail(`the intake ran ${most} replica(s) at most, on a backlog of 6000 records`);
+            if (Date.now() > deadline) {
+              const scaled = await kube.get<KubernetesObject & { status?: object }>(scaledObject);
+              assert.fail(`the intake ran ${most} replica(s) at most, on a backlog of 6000 records; its ScaledObject: ${JSON.stringify(scaled?.status)}\n${await logState()}`);
+            }
             most = Math.max(most, await replicas());
           }
           t.diagnostic(`the intake ran ${most} replicas on the backlog`);
+          // The lake writable again, each replica writes what it read, its share once, whichever had it before a rebalance.
+          await release();
           const written = await untilWritten(run, taken);
           assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
         } finally {
+          await release();
           await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
         }
       });

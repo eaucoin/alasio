@@ -291,6 +291,7 @@ groups:
                     from otel.metrics_gauge
                     where ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records' and TimeUnix > now()::timestamp - interval 5 minute
                     group by 1)
+                  having count(*) > 0
               root_selector: ""
               columns:
                 - {selector: waiting, text: waiting, type: number}
