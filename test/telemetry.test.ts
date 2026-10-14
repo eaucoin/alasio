@@ -334,8 +334,10 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
     };
     const delivered: string[] = [];
     const outbox = Outbox.layer.pipe(Layer.provide([
+      // The turn's status message, and its edit, are delivered too; the reply is the rich message.
       botApiLayer(async (call) => {
-        delivered.push(paramsOf(call, "sendRichMessage").rich_message.markdown ?? "");
+        if (call.method === "editMessageText") return true;
+        if (call.method === "sendRichMessage") delivered.push(paramsOf(call, "sendRichMessage").rich_message.markdown ?? "");
         return { message_id: 100 + delivered.length, date: 0, chat: { id: 42, type: "private", first_name: "Operator" } };
       }),
       Layer.succeed(Store, store),
@@ -353,7 +355,8 @@ test("a prompt's update, turn, and reply delivery are one trace, however long th
 
     const update = finishedSpan("alasio.update");
     const turn = finishedSpan("alasio.turn");
-    const delivery = finishedSpan("alasio.delivery");
+    const delivery = spans.getFinishedSpans().find((span) => span.name === "alasio.delivery" && span.attributes["alasio.outbox.kind"] === "text");
+    assert.ok(delivery, "the reply's delivery has no span");
     const traceId = update.spanContext().traceId;
     assert.equal(turn.spanContext().traceId, traceId);
     assert.equal(turn.parentSpanContext?.spanId, update.spanContext().spanId);

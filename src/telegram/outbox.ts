@@ -1,7 +1,7 @@
 import type { ObservableResult } from "@opentelemetry/api";
 import { Clock, Context, Effect, Latch, Layer, Semaphore } from "effect";
 
-import type { NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
+import type { DueOutboxEntry, NewOutboxStatus, NewOutboxText, OutboxEntry } from "../persistence/outbox-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { withLogScope } from "../shared/log.ts";
@@ -25,6 +25,18 @@ const pendingReplies = meter.createObservableGauge("alasio.outbox.pending", {
 
 /** A reply to queue: everything but the trace, which the outbox takes from where it is queued. */
 export type OutboxText = Omit<NewOutboxText, "traceparent">;
+/** A status message, or an edit of one, to queue: everything but the trace, as a reply. */
+export type OutboxStatus = Omit<NewOutboxStatus, "traceparent">;
+
+/**
+ * Whether Telegram refused a status message, or an edit of one, for good: one it answers
+ * 400 to (the chat refuses it, the message is gone, too old, or already says it) is given
+ * up on, so it holds nothing of the chat's back, its reply above all. A status message
+ * given up on has no message, so its edits are given up on too. A reply is never given
+ * up on.
+ */
+const refusedForGood = (item: DueOutboxEntry, error: TelegramError): boolean =>
+  item.kind !== "text" && error._tag === "TelegramApiError" && error.status === 400;
 
 /** How long a failed delivery waits: what Telegram asked for, or longer as attempts mount. */
 function retryDelayMs(item: OutboxEntry, error: TelegramError): number {
@@ -34,14 +46,18 @@ function retryDelayMs(item: OutboxEntry, error: TelegramError): number {
 }
 
 /**
- * alasio's replies to Telegram, kept in the store until Telegram accepts them, so none is
- * lost to a failure or a restart. Delivery runs while the service does: every few
- * seconds and whenever a reply is queued, one pass at a time, each chat's replies in
- * the order they were queued.
+ * What alasio sends to Telegram, kept in the store until Telegram accepts it, so nothing
+ * is lost to a failure or a restart: replies, and turns' status messages and their
+ * edits. Delivery runs while the service does: every few seconds and whenever something
+ * is queued, one pass at a time, each chat's in the order it was queued.
  */
 export class Outbox extends Context.Service<Outbox, {
   /** Queues a reply and wakes delivery; its delivery joins the trace it is queued in. The reply's id. */
   readonly enqueueText: (text: OutboxText) => Effect.Effect<string, StoreError>;
+  /** Queues a turn's status message and wakes delivery: its id, which an edit of it names. */
+  readonly enqueueStatus: (status: OutboxStatus) => Effect.Effect<string, StoreError>;
+  /** Queues an edit of the status message `edits` and wakes delivery. */
+  readonly enqueueEdit: (edits: string, edit: OutboxStatus) => Effect.Effect<string, StoreError>;
   /** A delivery pass, after the one running if one is. */
   readonly deliverDue: Effect.Effect<void, StoreError>;
 }>()("alasio/telegram/Outbox") {
@@ -66,32 +82,64 @@ export class Outbox extends Context.Service<Outbox, {
       (observe) => Effect.sync(() => pendingReplies.removeCallback(observe)),
     );
 
-    /** Sends one reply with its media, or defers it with backoff and fails with what stopped it. */
-    const deliver = Effect.fnUntraced(function*(item: OutboxEntry): Effect.fn.Return<void, TelegramError | StoreError> {
-      const media = yield* store.getOutboxMedia(item.id);
-      yield* client.sendMessage(item.chat_id, item.text, media.length ? { ...item.options, media } : item.options).pipe(
-        Effect.tapError((error) => {
-          const delayMs = retryDelayMs(item, error);
-          return store.rescheduleOutbox(item.id, error, delayMs).pipe(
-            Effect.andThen(Effect.logWarning(`Telegram outbox delivery deferred id=${item.id} delay_ms=${delayMs} error=${error.message}`)),
-          );
-        }),
-      );
-      yield* store.markOutboxSent(item.id);
+    /**
+     * Sends one entry: a reply with its media, a status message, whose message's id is
+     * recorded, or an edit of one. An edit of a status message that has no message (it was
+     * pruned, refused, or Telegram gave none), and a status message or an edit Telegram
+     * refuses for good, are given up on; anything else that fails is deferred with
+     * backoff, failing with what stopped it.
+     */
+    const deliver = Effect.fnUntraced(function*(item: DueOutboxEntry): Effect.fn.Return<void, TelegramError | StoreError> {
+      const deferred = (error: TelegramError) => {
+        const delayMs = retryDelayMs(item, error);
+        return store.rescheduleOutbox(item.id, error, delayMs).pipe(
+          Effect.andThen(Effect.logWarning(`Telegram outbox delivery deferred id=${item.id} delay_ms=${delayMs} error=${error.message}`)),
+        );
+      };
+      if (item.kind === "edit") {
+        if (item.edited_message_id === null) {
+          yield* store.markOutboxSent(item.id, { refused: `the status message ${item.edits} has no message to edit` });
+          return;
+        }
+        const edited = yield* client.editMessageText(item.chat_id, Number(item.edited_message_id), item.text, item.options).pipe(
+          Effect.as(null),
+          Effect.catchIf((error) => refusedForGood(item, error), (error) => Effect.succeed(error.message)),
+          Effect.tapError(deferred),
+        );
+        yield* store.markOutboxSent(item.id, { refused: edited });
+      } else {
+        const media = yield* store.getOutboxMedia(item.id);
+        const sent = yield* client.sendMessage(item.chat_id, item.text, media.length ? { ...item.options, media } : item.options).pipe(
+          Effect.map(([message]) => ({ telegramMessageId: item.kind === "status" ? (message?.message_id ?? null) : null })),
+          Effect.catchIf((error) => refusedForGood(item, error), (error) => Effect.succeed({ refused: error.message })),
+          Effect.tapError(deferred),
+        );
+        yield* store.markOutboxSent(item.id, sent);
+      }
       deliveryLag.record(((yield* Clock.currentTimeMillis) - item.created_at.getTime()) / 1000);
     });
 
+    // What is due is each chat's next entry, so a pass asks again until nothing is due. An
+    // entry's delivery is not interrupted but where it waits out a rate limit before
+    // Telegram has taken any call of it (./client.ts): so a pass cut short, as alasio stops,
+    // never leaves an entry sent, or a part of one, and not marked so, to be sent again
+    // after the restart. Each call of it is bounded by its timeout.
     const deliverDue = passes.withPermit(Effect.gen(function*() {
-      for (const item of yield* store.getDueOutbox(20)) {
-        const delivered = yield* deliver(item).pipe(
-          withAlasioSpan("alasio.delivery", {
-            parent: item.traceparent,
-            attributes: { "alasio.outbox.id": item.id, "alasio.delivery.attempt": item.attempts + 1, "telegram.chat.id": item.chat_id },
-          }),
-          Effect.match({ onFailure: () => false, onSuccess: () => true }),
-        );
-        // Deferred; the rest wait behind it so replies keep their order.
-        if (!delivered) break;
+      for (;;) {
+        const due = yield* store.getDueOutbox(20);
+        if (due.length === 0) return;
+        for (const item of due) {
+          const delivered = yield* deliver(item).pipe(
+            withAlasioSpan("alasio.delivery", {
+              parent: item.traceparent,
+              attributes: { "alasio.outbox.id": item.id, "alasio.outbox.kind": item.kind, "alasio.delivery.attempt": item.attempts + 1, "telegram.chat.id": item.chat_id },
+            }),
+            Effect.match({ onFailure: () => false, onSuccess: () => true }),
+            Effect.uninterruptible,
+          );
+          // Deferred; the rest wait behind it so each chat's entries keep their order.
+          if (!delivered) return;
+        }
       }
     })).pipe(withLogScope("telegram-app"));
 
@@ -105,11 +153,14 @@ export class Outbox extends Context.Service<Outbox, {
       Effect.forkScoped,
     );
 
+    /** Queues with the trace it is queued in, and wakes delivery. */
+    const queued = (enqueue: (traceparent: string | null) => Effect.Effect<string, StoreError>) =>
+      Effect.suspend(() => enqueue(currentTraceparent())).pipe(Effect.tap(() => Effect.sync(() => wakeup.openUnsafe())));
+
     return Outbox.of({
-      enqueueText: (text) =>
-        Effect.suspend(() => store.enqueueOutboxText({ ...text, traceparent: currentTraceparent() })).pipe(
-          Effect.tap(() => Effect.sync(() => wakeup.openUnsafe())),
-        ),
+      enqueueText: (text) => queued((traceparent) => store.enqueueOutboxText({ ...text, traceparent })),
+      enqueueStatus: (status) => queued((traceparent) => store.enqueueOutboxStatus({ ...status, traceparent })),
+      enqueueEdit: (edits, edit) => queued((traceparent) => store.enqueueOutboxEdit(edits, { ...edit, traceparent })),
       deliverDue,
     });
   }));

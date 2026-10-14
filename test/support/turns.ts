@@ -25,7 +25,12 @@ import { WorkflowHooks } from "../../src/workflow/hook-server.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
-const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({ enqueueText: () => Effect.succeed("outbox-1"), deliverDue: Effect.void }));
+const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({
+  enqueueText: () => Effect.succeed("outbox-1"),
+  enqueueStatus: () => Effect.succeed("outbox-status-1"),
+  enqueueEdit: () => Effect.succeed("outbox-edit-1"),
+  deliverDue: Effect.void,
+}));
 
 /** No workflow hook server: no workflow waits are reported. */
 export const noWorkflowHooks: Layer.Layer<WorkflowHooks> = Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map() }));

@@ -117,7 +117,23 @@ interface SendOptions {
   readonly traced: boolean;
   /** How many times a call Telegram rate-limits is retried after the wait it asks for. */
   readonly rateLimitRetries: number;
+  /** How long the call waits for Telegram's answer before it fails, as a call that reached Telegram not. */
+  readonly timeoutMs: number;
+  /** The message the call is a part of, which knows whether Telegram took a call of it yet: a call of none, by itself. */
+  readonly message?: MessageSending | undefined;
 }
+
+/**
+ * A message that goes as several calls (its text in chunks, its rich parts, its media),
+ * and whether Telegram has taken one of them yet.
+ */
+interface MessageSending {
+  accepted: boolean;
+}
+
+/** How long a call waits for Telegram, and one that uploads files. */
+const CALL_TIMEOUT_MS = 30_000;
+const UPLOAD_TIMEOUT_MS = 120_000;
 
 /** Telegram refused a call: its HTTP status, what it answered, and the wait it asked for. */
 export class TelegramApiError extends Schema.TaggedError<TelegramApiError>()("TelegramApiError", {
@@ -280,21 +296,30 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
   const outbound = yield* Semaphore.make(1);
 
   /**
-   * Posts `method` to the Bot API, waiting out and retrying the rate limits it reports.
-   * The URL holds the bot token, so only the method, never the URL, reaches the call's
-   * span, if it has one.
+   * Posts `method` to the Bot API, waiting out and retrying the rate limits it reports,
+   * each attempt failing once it has waited `timeoutMs` for Telegram's answer. The URL
+   * holds the bot token, so only the method, never the URL, reaches the call's span, if it
+   * has one.
+   *
+   * A rate limit's wait may be interrupted even where the call is not (the outbox delivers
+   * each entry so) as long as Telegram has taken nothing of the message the call is part
+   * of: an interruption then sends none of it twice. Once it has taken a part, the wait is
+   * as the call is, so the message is not cut short to go again whole. An attempt is never
+   * interrupted mid-way where the call is not, for Telegram may have taken it: its timeout
+   * bounds it.
    */
-  const send = <M extends BotMethod>(method: M, makeBody: () => RequestBody, { traced, rateLimitRetries }: SendOptions): Effect.Effect<BotResult<M>, TelegramError> => {
+  const send = <M extends BotMethod>(method: M, makeBody: () => RequestBody, { traced, rateLimitRetries, timeoutMs, message }: SendOptions): Effect.Effect<BotResult<M>, TelegramError> => {
     const attempt = (retriesLeft: number): Effect.Effect<BotResult<M>, TelegramError> => Effect.gen(function*() {
       const body = yield* Effect.try({ try: makeBody, catch: (cause) => TelegramTransportError.of(method, cause) });
       const response = yield* Effect.tryPromise({
-        try: (signal) => fetch(`${apiBase}/${method}`, { method: "POST", ...body, signal }),
+        try: (signal) => fetch(`${apiBase}/${method}`, { method: "POST", ...body, signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) }),
         catch: (cause) => TelegramTransportError.of(method, cause),
       });
       if (traced) yield* Effect.annotateCurrentSpan("http.response.status_code", response.status);
       // The Bot API answers every call with an ApiResponse; anything else reads as null.
       const data = yield* Effect.promise(() => response.json().catch(() => null) as Promise<ApiResponse<BotResult<M>> | null>);
       if (response.ok && data?.ok) {
+        if (message) message.accepted = true;
         return data.result;
       }
       const error = TelegramApiError.fromResponse(method, response.status, data);
@@ -302,20 +327,21 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
         return yield* error;
       }
       if (traced) yield* recordRateLimit(error.retryAfterMs);
-      yield* Effect.sleep(error.retryAfterMs + 100);
+      const wait = Effect.sleep(error.retryAfterMs + 100);
+      yield* message?.accepted ? wait : Effect.interruptible(wait);
       return yield* attempt(retriesLeft - 1);
     });
     return attempt(rateLimitRetries);
   };
 
-  /** A Bot API call, as a client span and a duration named by its method. */
-  const request = <M extends BotMethod>(method: M, makeBody: () => RequestBody): Effect.Effect<BotResult<M>, TelegramError> =>
-    send(method, makeBody, { traced: true, rateLimitRetries: 3 }).pipe(withRpcCall({ system: "telegram", service: "telegram", method }));
+  /** A Bot API call, as a client span and a duration named by its method; part of `message`, where given. */
+  const request = <M extends BotMethod>(method: M, makeBody: () => RequestBody, timeoutMs: number, message?: MessageSending): Effect.Effect<BotResult<M>, TelegramError> =>
+    send(method, makeBody, { traced: true, rateLimitRetries: 3, timeoutMs, message }).pipe(withRpcCall({ system: "telegram", service: "telegram", method }));
 
-  const call = <M extends BotMethod>(method: M, payload?: BotParams<M>): Effect.Effect<BotResult<M>, TelegramError> =>
-    request(method, () => jsonBody(payload));
+  const call = <M extends BotMethod>(method: M, payload?: BotParams<M>, message?: MessageSending): Effect.Effect<BotResult<M>, TelegramError> =>
+    request(method, () => jsonBody(payload), CALL_TIMEOUT_MS, message);
 
-  const callMultipart = <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[]): Effect.Effect<BotResult<M>, TelegramError> =>
+  const callMultipart = <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[], message?: MessageSending): Effect.Effect<BotResult<M>, TelegramError> =>
     request(method, () => {
       const form = new FormData();
       for (const [key, value] of Object.entries(fields)) {
@@ -326,47 +352,48 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
         form.append(file.name, new Blob([file.content]), file.fileName);
       }
       return { body: form };
-    });
+    }, UPLOAD_TIMEOUT_MS, message);
 
-  const sendTextChunks = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: TextMessageOptions): Effect.fn.Return<Message[], TelegramError> {
+  const sendTextChunks = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: TextMessageOptions, message: MessageSending): Effect.fn.Return<Message[], TelegramError> {
     const sent: Message[] = [];
     for (const chunk of splitTelegramText(text)) {
-      sent.push(yield* call("sendMessage", buildTextPayload(chatId, chunk, options)).pipe(
-        Effect.catchIf(shouldRetryAsPlainText(options), () => call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" }))),
+      sent.push(yield* call("sendMessage", buildTextPayload(chatId, chunk, options), message).pipe(
+        Effect.catchIf(shouldRetryAsPlainText(options), () => call("sendMessage", buildTextPayload(chatId, chunk, { ...options, format: "plain" }), message)),
       ));
     }
     return sent;
   });
 
-  const sendRichPart = (chatId: ChatId, part: string, partMedia: readonly MediaAttachment[], telegramOptions: TextMessageParams): Effect.Effect<Message, TelegramError> => {
+  const sendRichPart = (chatId: ChatId, part: string, partMedia: readonly MediaAttachment[], telegramOptions: TextMessageParams, message: MessageSending): Effect.Effect<Message, TelegramError> => {
     const richMessage: InputRichMessage<never> = { markdown: toRichMarkdown(part) || " " };
     if (!partMedia.length) {
-      return call("sendRichMessage", { chat_id: chatId, rich_message: richMessage, ...telegramOptions });
+      return call("sendRichMessage", { chat_id: chatId, rich_message: richMessage, ...telegramOptions }, message);
     }
     richMessage.media = partMedia.map((item) => ({ id: item.id, media: { type: telegramMediaType(item), media: `attach://${item.id}` } }));
     return callMultipart(
       "sendRichMessage",
       { chat_id: chatId, rich_message: richMessage, ...telegramOptions },
       partMedia.map(uploadOf),
+      message,
     );
   };
 
   /** One media item as its own message: a photo, video, or animation, or a document when Telegram will not take it as media. */
-  const sendMediaItem = (chatId: ChatId, item: MediaAttachment): Effect.Effect<Message, TelegramError> => {
+  const sendMediaItem = (chatId: ChatId, item: MediaAttachment, message: MessageSending): Effect.Effect<Message, TelegramError> => {
     const media = `attach://${item.id}`;
     const files = [uploadOf(item)];
     const asMedia = (): Effect.Effect<Message, TelegramError> => {
       switch (telegramMediaType(item)) {
         case "photo":
-          return callMultipart("sendPhoto", { chat_id: chatId, photo: media, disable_notification: true }, files);
+          return callMultipart("sendPhoto", { chat_id: chatId, photo: media, disable_notification: true }, files, message);
         case "video":
-          return callMultipart("sendVideo", { chat_id: chatId, video: media, disable_notification: true }, files);
+          return callMultipart("sendVideo", { chat_id: chatId, video: media, disable_notification: true }, files, message);
         case "animation":
-          return callMultipart("sendAnimation", { chat_id: chatId, animation: media, disable_notification: true }, files);
+          return callMultipart("sendAnimation", { chat_id: chatId, animation: media, disable_notification: true }, files, message);
       }
     };
     return asMedia().pipe(
-      Effect.catchIf(isBadRequest, () => callMultipart("sendDocument", { chat_id: chatId, document: media, disable_notification: true }, files)),
+      Effect.catchIf(isBadRequest, () => callMultipart("sendDocument", { chat_id: chatId, document: media, disable_notification: true }, files, message)),
     );
   };
 
@@ -374,24 +401,25 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
    * Media sent as their own messages (the fallback): one as a photo, video, or animation,
    * several as albums of up to ten, silently, since the text before them notified.
    */
-  const sendMediaClassic = Effect.fnUntraced(function*(chatId: ChatId, items: readonly MediaAttachment[]): Effect.fn.Return<Message[], TelegramError> {
+  const sendMediaClassic = Effect.fnUntraced(function*(chatId: ChatId, items: readonly MediaAttachment[], message: MessageSending): Effect.fn.Return<Message[], TelegramError> {
     const sent: Message[] = [];
     // Albums take photos and videos; an animation goes alone.
     const albumable = items.filter((item) => !item.animation);
-    for (const item of items.filter((item) => item.animation)) sent.push(yield* sendMediaItem(chatId, item));
+    for (const item of items.filter((item) => item.animation)) sent.push(yield* sendMediaItem(chatId, item, message));
     for (let i = 0; i < albumable.length; i += 10) {
       const group = albumable.slice(i, i + 10);
       const [only] = group;
       if (only !== undefined && group.length === 1) {
-        sent.push(yield* sendMediaItem(chatId, only));
+        sent.push(yield* sendMediaItem(chatId, only, message));
         continue;
       }
       sent.push(...yield* callMultipart(
         "sendMediaGroup",
         { chat_id: chatId, media: group.map((item) => ({ type: item.kind, media: `attach://${item.id}` })), disable_notification: true },
         group.map(uploadOf),
+        message,
       ).pipe(
-        Effect.catchIf(isBadRequest, () => Effect.forEach(group, (item) => sendMediaItem(chatId, item))),
+        Effect.catchIf(isBadRequest, () => Effect.forEach(group, (item) => sendMediaItem(chatId, item, message))),
       ));
     }
     return sent;
@@ -404,17 +432,17 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
    * instead, its media following as photos, videos, or an album, so a response is never
    * lost to its formatting.
    */
-  const sendRichParts = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: SendMessageOptions): Effect.fn.Return<Message[], TelegramError> {
+  const sendRichParts = Effect.fnUntraced(function*(chatId: ChatId, text: string, options: SendMessageOptions, message: MessageSending): Effect.fn.Return<Message[], TelegramError> {
     const { format: _format, media = [], ...telegramOptions } = options;
     const byId = new Map(media.map((item) => [item.id, item]));
     const sent: Message[] = [];
     for (const part of splitRichMarkdown(text || " ")) {
       const partMedia = [...new Set(mediaIdsIn(part))].map((id) => byId.get(id)).filter((item): item is MediaAttachment => Boolean(item));
-      sent.push(...yield* sendRichPart(chatId, part, partMedia, telegramOptions).pipe(
-        Effect.map((message) => [message]),
+      sent.push(...yield* sendRichPart(chatId, part, partMedia, telegramOptions, message).pipe(
+        Effect.map((sentPart) => [sentPart]),
         Effect.catchIf(isBadRequest, () => Effect.all([
-          sendTextChunks(chatId, withoutMediaLines(part), { ...telegramOptions, format: "markdown" }),
-          sendMediaClassic(chatId, partMedia),
+          sendTextChunks(chatId, withoutMediaLines(part), { ...telegramOptions, format: "markdown" }, message),
+          sendMediaClassic(chatId, partMedia, message),
         ]).pipe(Effect.map(([texts, media]) => [...texts, ...media]))),
       ));
     }
@@ -431,9 +459,13 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
     setMyCommands: (commands) => call("setMyCommands", { commands }),
     setChatMenuButton: (menuButton = { type: "commands" }) => call("setChatMenuButton", { menu_button: menuButton }),
     getUpdates: ({ offset, timeout = 50, allowedUpdates = ["message", "callback_query"] } = {}) =>
-      send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { traced: false, rateLimitRetries: 3 }),
+      // A long poll: Telegram answers within its timeout, or by the call's own past it.
+      send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { traced: false, rateLimitRetries: 3, timeoutMs: timeout * 1000 + CALL_TIMEOUT_MS }),
     sendMessage: (chatId, text, options = {}) =>
-      outbound.withPermit(options.format === "rich" ? sendRichParts(chatId, text, options) : sendTextChunks(chatId, text, options)),
+      Effect.suspend(() => {
+        const message: MessageSending = { accepted: false };
+        return outbound.withPermit(options.format === "rich" ? sendRichParts(chatId, text, options, message) : sendTextChunks(chatId, text, options, message));
+      }),
     editMessageText: (chatId, messageId, text, options = {}) => {
       const chunk = splitTelegramText(text)[0] || " ";
       const edit = (format: TextMessageOptions) => call("editMessageText", { ...buildTextPayload(chatId, chunk, format), message_id: messageId });
@@ -461,7 +493,7 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
       const ext = extname(preferredName) || extname(filePath) || "";
       const safeBase = basename(preferredName, ext).replace(/[^A-Za-z0-9_.-]+/g, "-") || "download";
       const response = yield* Effect.tryPromise({
-        try: (signal) => fetch(`${fileBase}/${filePath}`, { signal }),
+        try: (signal) => fetch(`${fileBase}/${filePath}`, { signal: AbortSignal.any([signal, AbortSignal.timeout(UPLOAD_TIMEOUT_MS)]) }),
         catch: (cause) => TelegramTransportError.of("getFile", cause),
       });
       if (!response.ok || !response.body) {
@@ -482,6 +514,6 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
         }
         form.append("document", new Blob([readFileSync(filePath)]), basename(filePath));
         return { body: form };
-      }, { traced: false, rateLimitRetries: 0 }),
+      }, { traced: false, rateLimitRetries: 0, timeoutMs: UPLOAD_TIMEOUT_MS }),
   });
 });

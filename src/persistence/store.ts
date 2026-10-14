@@ -25,7 +25,7 @@ import {
   type NewModelChoice,
   type WorkspaceConversation,
 } from "./conversation-repository.ts";
-import { NeonOutboxRepository, type NewOutboxText, type OutboxEntry } from "./outbox-repository.ts";
+import { type DueOutboxEntry, NeonOutboxRepository, type NewOutboxStatus, type NewOutboxText } from "./outbox-repository.ts";
 import { NeonPromptJobRepository, type NewPromptJob, type PromptJob, type PromptJobState } from "./prompt-job-repository.ts";
 import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } from "./response-repository.ts";
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
@@ -164,10 +164,15 @@ export class Store extends Context.Service<Store, {
 
   /** Queues a reply: its id, or that of the one already queued for its pending response. */
   readonly enqueueOutboxText: (text: NewOutboxText) => Stored<string>;
-  readonly getDueOutbox: (limit?: number) => Stored<OutboxEntry[]>;
+  /** Queues a turn's status message: its id, which an edit of it names. */
+  readonly enqueueOutboxStatus: (status: NewOutboxStatus) => Stored<string>;
+  /** Queues an edit of the status message `edits`. */
+  readonly enqueueOutboxEdit: (edits: string, edit: NewOutboxStatus) => Stored<string>;
+  readonly getDueOutbox: (limit?: number) => Stored<DueOutboxEntry[]>;
   /** The media a queued reply shows, kept with it until it is sent. */
   readonly getOutboxMedia: (id: string) => Stored<MediaAttachment[]>;
-  readonly markOutboxSent: (id: string) => Stored<void>;
+  /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
+  readonly markOutboxSent: (id: string, delivered?: { readonly telegramMessageId?: number | null; readonly refused?: string | null }) => Stored<void>;
   readonly rescheduleOutbox: (id: string, error: unknown, delayMs: number) => Stored<void>;
   readonly getPendingOutboxCount: Stored<number>;
 
@@ -283,9 +288,11 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
     enqueueOutboxText: (text) => outbox.enqueueText(text),
+    enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
+    enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
     getOutboxMedia: (id) => outbox.getMedia(id),
-    markOutboxSent: (id) => outbox.markSent(id),
+    markOutboxSent: (id, delivered) => outbox.markSent(id, delivered),
     rescheduleOutbox: (id, error, delayMs) => outbox.reschedule(id, error, delayMs),
     getPendingOutboxCount: outbox.getPendingCount(),
 

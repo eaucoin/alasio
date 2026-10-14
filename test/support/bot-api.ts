@@ -29,19 +29,21 @@ export type BotCall<M extends BotMethod = BotMethod> = {
 /** How the test answers a call: with Telegram's result, or by throwing as Telegram refuses it (botApiError). */
 export type BotAnswer = (call: BotCall) => Promise<unknown>;
 
-/** A refusal of a call, as Telegram answers it: an HTTP status and a description. */
+/** A refusal of a call, as Telegram answers it: an HTTP status, a description, and the wait it asks for, if any. */
 class BotApiRefusal extends Error {
   readonly status: number;
+  readonly retryAfter: number | undefined;
 
-  constructor(description: string, status: number) {
+  constructor(description: string, status: number, retryAfter: number | undefined) {
     super(description);
     this.status = status;
+    this.retryAfter = retryAfter;
   }
 }
 
-/** What a test throws from its BotAnswer to have Telegram refuse the call with `status`. */
-export function botApiError(description: string, status: number): Error {
-  return new BotApiRefusal(description, status);
+/** What a test throws from its BotAnswer to have Telegram refuse the call with `status`, asking to wait `retryAfter` seconds where given. */
+export function botApiError(description: string, status: number, retryAfter?: number): Error {
+  return new BotApiRefusal(description, status, retryAfter);
 }
 
 /** A multipart field as the client encoded it: objects as JSON, everything else as text. */
@@ -81,7 +83,7 @@ function botApiFetch(answer: BotAnswer): typeof globalThis.fetch {
       return Response.json({ ok: true, result });
     } catch (error) {
       if (!(error instanceof BotApiRefusal)) throw error;
-      return Response.json({ ok: false, error_code: error.status, description: error.message }, { status: error.status });
+      return Response.json({ ok: false, error_code: error.status, description: error.message, ...(error.retryAfter === undefined ? {} : { parameters: { retry_after: error.retryAfter } }) }, { status: error.status });
     }
   };
 }

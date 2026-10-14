@@ -12,12 +12,19 @@ export type OutboxMessageOptions = Omit<SendMessageOptions, "media">;
 
 export type OutboxState = "pending" | "sent";
 
-/** A row of `telegram_outbox`: a reply waiting for, or done with, delivery to Telegram. */
+/** What an entry is: a reply, a turn's status message, or an edit of a status message. */
+export type OutboxKind = "text" | "status" | "edit";
+
+/** A row of `telegram_outbox`: what waits for, or is done with, delivery to Telegram. */
 export interface OutboxEntry {
   readonly id: string;
   readonly conversation_id: string | null;
   readonly chat_id: string;
-  readonly kind: "text";
+  readonly kind: OutboxKind;
+  /** Of an edit, the entry it edits. */
+  readonly edits: string | null;
+  /** Of a status message, its message's id once Telegram accepted it. */
+  readonly telegram_message_id: string | null;
   readonly text: string;
   readonly options: OutboxMessageOptions;
   readonly pending_response_id: string | null;
@@ -29,6 +36,19 @@ export interface OutboxEntry {
   readonly traceparent: string | null;
   readonly created_at: Date;
   readonly sent_at: Date | null;
+}
+
+/** An entry due for delivery: an edit with the message id of the status message it edits, null where that has none. */
+export interface DueOutboxEntry extends OutboxEntry {
+  readonly edited_message_id: string | null;
+}
+
+/** A turn's status message, or an edit of one, to queue. */
+export interface NewOutboxStatus {
+  readonly chatId: number | string;
+  readonly text: string;
+  readonly options?: OutboxMessageOptions | undefined;
+  readonly traceparent?: string | null | undefined;
 }
 
 export interface NewOutboxText {
@@ -82,19 +102,41 @@ export class NeonOutboxRepository {
     ).pipe(Effect.map(([row]) => row!.id));
   }
 
+  /** Queues a turn's status message: its id, which an edit of it names. */
+  enqueueStatus(status: NewOutboxStatus): Effect.Effect<string, StoreError> {
+    return this.#enqueue("status", null, status);
+  }
+
+  /** Queues an edit of the status message `edits`, delivered after what the chat was sent before it. */
+  enqueueEdit(edits: string, edit: NewOutboxStatus): Effect.Effect<string, StoreError> {
+    return this.#enqueue("edit", edits, edit);
+  }
+
+  #enqueue(kind: "status" | "edit", edits: string | null, { chatId, text, options = {}, traceparent = null }: NewOutboxStatus): Effect.Effect<string, StoreError> {
+    const id = newId();
+    return this.#sql.query(
+      `insert into ${this.#schema}.telegram_outbox (id, conversation_id, chat_id, kind, edits, text, options, traceparent)
+       select $1, (select id from ${this.#schema}.conversations where transport = 'telegram' and chat_id = $2), $2, $3, $4, $5, $6, $7`,
+      [id, String(chatId), kind, edits, text, JSON.stringify(options), traceparent],
+    ).pipe(Effect.as(id));
+  }
+
   /**
-   * The replies due for delivery: each chat's in the order they were queued, so a reply
-   * waiting to be retried holds back those queued after it to the same chat.
+   * What is due for delivery: each chat's in the order it was queued, so an entry waiting
+   * to be retried holds back those queued after it to the same chat; an edit with the
+   * message id of the status message it edits, which was sent before it.
    */
-  getDue(limit = 20): Effect.Effect<OutboxEntry[], StoreError> {
-    return this.#sql.query<OutboxEntry>(
-      `select * from ${this.#schema}.telegram_outbox reply
-       where state = 'pending' and available_at <= now()
+  getDue(limit = 20): Effect.Effect<DueOutboxEntry[], StoreError> {
+    return this.#sql.query<DueOutboxEntry>(
+      `select reply.*, edited.telegram_message_id as edited_message_id
+       from ${this.#schema}.telegram_outbox reply
+       left join ${this.#schema}.telegram_outbox edited on edited.id = reply.edits
+       where reply.state = 'pending' and reply.available_at <= now()
          and not exists (
            select 1 from ${this.#schema}.telegram_outbox earlier
            where earlier.chat_id = reply.chat_id and earlier.state = 'pending' and earlier.seq < reply.seq
          )
-       order by seq
+       order by reply.seq
        limit $1`,
       [limit],
     );
@@ -108,14 +150,17 @@ export class NeonOutboxRepository {
     );
   }
 
-  /** Marks the reply sent, its media deleted with it. */
-  markSent(id: string): Effect.Effect<void, StoreError> {
+  /**
+   * Marks the entry delivered, its media deleted with it: of a status message, with its
+   * message's id; of one given up on, as Telegram refused it for good, with why.
+   */
+  markSent(id: string, { telegramMessageId = null, refused = null }: { readonly telegramMessageId?: number | null; readonly refused?: string | null } = {}): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
       `with media as (
          delete from ${this.#schema}.outbox_media where outbox_id = $1
        )
-       update ${this.#schema}.telegram_outbox set state = 'sent', sent_at = now(), last_error = null where id = $1`,
-      [id],
+       update ${this.#schema}.telegram_outbox set state = 'sent', sent_at = now(), telegram_message_id = $2, last_error = $3 where id = $1`,
+      [id, telegramMessageId, refused === null ? null : refused.slice(0, 2000)],
     ));
   }
 

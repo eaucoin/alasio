@@ -188,12 +188,19 @@ create table if not exists ${SCHEMA}.callback_actions (
   created_at timestamptz not null default now()
 );
 
+-- What alasio sends to Telegram, in each chat's order: a reply ('text'), a turn's status
+-- message ('status'), whose Telegram message id is recorded once it is sent, and an edit of
+-- one ('edit', of the entry its edits column names).
 create table if not exists ${SCHEMA}.telegram_outbox (
   seq bigint generated always as identity,
   id text primary key,
   conversation_id text references ${SCHEMA}.conversations (id) on delete cascade,
   chat_id text not null,
   kind text not null,
+  -- of an edit, the entry it edits; no reference, as a sent entry is pruned in time
+  edits text,
+  -- of a status message, its message's id once Telegram accepted it
+  telegram_message_id bigint,
   text text not null,
   options json not null,
   pending_response_id text,

@@ -37,7 +37,7 @@ function reporterFor(store: Store["Service"], enqueue: (text: OutboxText) => Eff
   return Effect.runSync(makeStatusReporter().pipe(Effect.provide(Layer.mergeAll(
     Layer.succeed(Store, store),
     unusedClient.layer,
-    Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, deliverDue: Effect.void })),
+    Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, enqueueStatus: () => Effect.succeed("status-1"), enqueueEdit: () => Effect.succeed("edit-1"), deliverDue: Effect.void })),
     noWorkflowHooks,
   ))));
 }
