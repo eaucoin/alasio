@@ -1,7 +1,8 @@
 /**
  * The lake's own metrics, in Prometheus's text format, for the stack's telemetry
- * collector to scrape (cli/src/manifests/collector.ts): how its loads, its maintenance
- * and its telemetry intake go, how much each changed, and the memory the process holds.
+ * collector to scrape (cli/src/manifests/collector.ts): how the lake service's loads and
+ * maintenance go, and the telemetry intake's batches (each a process of its own), how much
+ * each changed, and the memory the process holds.
  */
 
 interface Metric {
@@ -15,11 +16,15 @@ const METRICS = {
   lake_cycle_duration_seconds: { type: "gauge", help: "How long the last load took" },
   lake_last_success_timestamp_seconds: { type: "gauge", help: "When a load last succeeded" },
   lake_maintenance_total: { type: "counter", help: "Maintenance passes run, by outcome, and whether they deleted files or kept them for Neon's branches" },
-  lake_telemetry_requests_total: { type: "counter", help: "OTLP requests the telemetry intake took, by signal and outcome" },
+  lake_telemetry_records_total: { type: "counter", help: "Records of the log's the telemetry intake consumed, by topic and outcome: written, malformed, or repeated (written before)" },
+  lake_telemetry_batches_total: { type: "counter", help: "Batches the telemetry intake failed to write, which it reads again" },
+  lake_telemetry_commit_seconds: { type: "gauge", help: "How long the telemetry intake's last commit to the lake took" },
+  lake_telemetry_merges_total: { type: "counter", help: "Hourly merges of the telemetry's files, by outcome" },
   lake_telemetry_rows_total: { type: "counter", help: "Rows the telemetry intake wrote, by table" },
+  lake_telemetry_lag_records: { type: "gauge", help: "Records the telemetry intake's group has yet to read, by topic, as a member last asked the log" },
   lake_resident_memory_bytes: { type: "gauge", help: "The process's resident memory, what its container's memory limit counts" },
   lake_heap_used_bytes: { type: "gauge", help: "What V8's heap holds" },
-  lake_duckdb_memory_bytes: { type: "gauge", help: "What the buffer manager of each of its DuckDBs, the loader's and the intake's, holds; 0 while it is not open" },
+  lake_duckdb_memory_bytes: { type: "gauge", help: "What the buffer manager of its DuckDB, the loader's or the intake's, holds; 0 while it is not open" },
 } satisfies Record<string, Metric>;
 
 export type MetricName = keyof typeof METRICS;

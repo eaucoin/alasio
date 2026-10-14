@@ -9,8 +9,16 @@ export const PAGESERVER_ID = 1;
 export const DATABASE = "alasio";
 export const ROLE = "alasio";
 
-/** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader, and workspace storage's JuiceFS. */
-export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces";
+/** Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader, workspace storage's JuiceFS, and the log. */
+export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces" | "log";
+
+/**
+ * The log's principals besides its admin, each with a password of its own: the collector's
+ * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
+ * and KEDA, which reads how much the intake has yet to.
+ */
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler"] as const;
+export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
 
 export interface S3Credentials {
   accessKey: string;
@@ -41,10 +49,13 @@ export interface StackSecrets {
   grafanaSecretKey: string;
   /** What alasio signs each branch environment's token to fork its sessions with (src/branch/names.ts). */
   branchForkKey: string;
+  /** The log's: the id KRaft formats its nodes with, and each principal's password, its admin's among them. */
+  logClusterId: string;
+  log: Record<"admin" | LogPrincipal, string>;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
-export type StoredSecrets = Partial<Omit<StackSecrets, "s3">> & { s3?: Partial<Record<S3Identity, S3Credentials>> };
+export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "log">> & { s3?: Partial<Record<S3Identity, S3Credentials>>; log?: Partial<StackSecrets["log"]> };
 
 /** Where Neon keeps its files: an S3 bucket at an endpoint. */
 export interface RemoteStorageLocation {
@@ -58,6 +69,7 @@ export interface Buckets {
   neon: string;
   lake: string;
   workspaces: string | null;
+  log: string;
 }
 
 /** SeaweedFS's S3 configuration (its s3.json). */
@@ -89,6 +101,11 @@ function secret(): string {
   return randomBytes(24).toString("base64url");
 }
 
+/** A KRaft cluster's id, as Kafka writes one: 16 random bytes, in base64url. */
+function clusterId(): string {
+  return randomBytes(16).toString("base64url");
+}
+
 /**
  * The stack's secrets, `existing` completed: made on first run and then only added to,
  * never rotated. Each secret has a maker, and any absent is filled in, so a deployment
@@ -105,6 +122,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
   };
   // A secret already held keeps its place; one made is added after them, in this order.
   const s3: Partial<Record<S3Identity, S3Credentials>> = kept(stored.s3, () => ({}));
+  const log: Partial<StackSecrets["log"]> = kept(stored.log, () => ({}));
   const secrets: StackSecrets = {
     ...stored,
     tenantId: kept(stored.tenantId, () => hexId()),
@@ -116,6 +134,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       lake: kept(s3.lake, () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() })),
       lakeReader: kept(s3.lakeReader, () => ({ accessKey: `lakereader${hexId().slice(0, 12)}`, secretKey: secret() })),
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
+      log: kept(s3.log, () => ({ accessKey: `log${hexId().slice(0, 12)}`, secretKey: secret() })),
     },
     controllerDbPassword: kept(stored.controllerDbPassword, () => secret()),
     alasioPassword: kept(stored.alasioPassword, () => secret()),
@@ -131,6 +150,12 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     filerStoreFilerPassword: kept(stored.filerStoreFilerPassword, () => secret()),
     filerStoreCollectorPassword: kept(stored.filerStoreCollectorPassword, () => secret()),
     filerStoreBackupPassword: kept(stored.filerStoreBackupPassword, () => secret()),
+    logClusterId: kept(stored.logClusterId, () => clusterId()),
+    log: {
+      ...log,
+      admin: kept(log.admin, () => secret()),
+      ...Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, kept(log[principal], () => secret())])) as Record<LogPrincipal, string>,
+    },
   };
   return { secrets, changed };
 }
@@ -145,9 +170,9 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
 }
 
 /**
- * SeaweedFS's S3 identities: Neon, the lake and, when it is on, workspace storage, each
- * on their own bucket of `buckets`; the lake's reader, which may only read the lake's;
- * and an admin, which makes the buckets and keeps the backups.
+ * SeaweedFS's S3 identities: Neon, the lake, the log and, when it is on, workspace
+ * storage, each on their own bucket of `buckets`; the lake's reader, which may only read
+ * the lake's; and an admin, which makes the buckets and keeps the backups.
  */
 export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
   const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
@@ -161,6 +186,7 @@ export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),
+      { name: "log", credentials: [secrets.s3.log], actions: on(buckets.log) },
     ],
   };
 }

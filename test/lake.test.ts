@@ -6,7 +6,6 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { gzipSync } from "node:zlib";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue } from "@duckdb/node-api";
 import { ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
@@ -21,16 +20,16 @@ import { syncCodex } from "../neon/lake/src/codex.ts";
 import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } from "../neon/lake/src/config.ts";
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
-import { startIntake } from "../neon/lake/src/intake.ts";
-import { LAKE, openLake, type Row, rows, transaction } from "../neon/lake/src/lake.ts";
+import { type IntakeSource, type LogRecord, startIntake } from "../neon/lake/src/intake.ts";
+import { LAKE, openLake, type Row, rows, transaction, writeLock } from "../neon/lake/src/lake.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
-import { ensureOtel, flushTelemetry, mergeTelemetry, telemetryRows, writeTelemetry } from "../neon/lake/src/otel.ts";
-import type { LogsRequest, MetricsRequest } from "../neon/lake/src/otlp.ts";
+import { ensureOtel, mergeTelemetry, type Position, type TelemetryRows, telemetryRows, writeConsumed } from "../neon/lake/src/otel.ts";
+import { encodeRequest, type LogsRequest, type MetricsRequest } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
-import { lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
+import { type LakeLoad, lastMaintained, maintainLake, prepareLake, syncLake } from "../neon/lake/src/sync.ts";
 import { NeonRolloutStore, SESSION_FS_SCHEMA } from "../src/codex/rollouts/store.ts";
 import { NeonSessionStore } from "../src/harness/claude/session-store.ts";
 import { ensureLakeReaderRole, ensureLakeRole, LAKE_READER_ROLE, LAKE_ROLE, lakeEnabled, syncLakeReads } from "../src/neon/lake.ts";
@@ -487,6 +486,10 @@ const gaugeRequest = (service: string, time: bigint): MetricsRequest => ({
   }],
 });
 
+let testOffset = 0n;
+/** Writes `rows` as the intake writes a record's: of a partition of the tests' own, at its next offset. */
+const writeTelemetry = (db: DuckDBConnection, rows: TelemetryRows) => writeConsumed(db, [{ topic: "otel.test", partition: 0, offset: testOffset++, rows }]);
+
 /** The lake as the intake opens it: no source, the telemetry's schema ready. */
 async function openForIntake() {
   const lake = await openLake(config);
@@ -494,37 +497,57 @@ async function openForIntake() {
   return lake;
 }
 
-/** POSTs `body` to the intake at `base`, as the collector's exporter does. */
-const post = (base: string, path: string, body: Uint8Array | string, headers: Record<string, string>) =>
-  fetch(`${base}${path}`, { method: "POST", headers, body });
 
 describe("telemetry", () => {
-  test("the intake writes each request it takes, at once queryable from another DuckDB, and refuses what is not OTLP", async () => {
+  /** A record of the log's at `offset` of a topic's `partition`, its value a request in binary protobuf, as the collector writes each. */
+  const record = (topic: string, partition: number, offset: number, value: Uint8Array): LogRecord => ({ topic, partition, offset: BigInt(offset), value: Buffer.from(value) });
+  const logRecord = (partition: number, offset: number, service: string, ...times: bigint[]) => record("otel.logs", partition, offset, encodeRequest("logs", logRequest(service, ...times)));
+
+  /** A member of the group that hands out `batches` in turn, then nothing, recording what it is told; its commits fail where `failCommits`. */
+  function member(batches: LogRecord[][], { failCommits = false }: { failCommits?: boolean } = {}) {
+    const committed: Position[][] = [];
+    let closed = false;
+    const source: IntakeSource = {
+      async next() {
+        const batch = batches.shift();
+        if (batch) return batch;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return [];
+      },
+      async commit(offsets) {
+        if (failCommits) throw new Error("the group rebalanced");
+        committed.push([...offsets]);
+      },
+      async lag() {
+        return new Map([["otel.logs", batches.flat().length], ["otel.spans", 0]]);
+      },
+      async close() {
+        closed = true;
+      },
+    };
+    return { source, committed, closed: () => closed };
+  }
+
+  const until = async (what: string, done: () => boolean) => {
+    for (let waited = 0; !done(); waited += 20) {
+      if (waited > 30_000) assert.fail(`waited for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+
+  test("the intake writes each batch it consumes in one commit with its offsets, queryable from another DuckDB, skips a record that does not decode, only then tells the group, and says how far behind it is", async () => {
     const spans = new InMemorySpanExporter();
     const tracer = new BasicTracerProvider({ resource: resourceFromAttributes({ "service.name": "intake-test" }), spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("t");
     tracer.startSpan("alasio.turn", { attributes: { "alasio.conversation.id": "telegram:7" } }).end();
     const traces = ProtobufTraceSerializer.serializeRequest(spans.getFinishedSpans());
     assert.ok(traces);
-
+    const group = member([[record("otel.spans", 0, 0, traces), logRecord(1, 5, "intake-test", NOW, NOW + 1n), record("otel.logs", 1, 6, Uint8Array.from([0x0a, 0x05, 0x01]))]]);
     const metrics = createMetrics();
-    const intake = startIntake({ open: openForIntake, metrics, log: () => {} });
-    const server = createServer(intake.handle);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    // A server listening on a TCP port has an address of its own.
-    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics, log: () => {}, batchMs: 10 });
     try {
-      for (let waited = 0; !intake.ready() && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
+      await until("the batch's commit to the group", () => group.committed.length > 0);
+      assert.deepEqual(group.committed[0]?.toSorted((a, b) => a.topic.localeCompare(b.topic)), [{ topic: "otel.logs", partition: 1, offset: 7n }, { topic: "otel.spans", partition: 0, offset: 1n }]);
       assert.ok(intake.ready());
-      const protobuf = await post(base, "/v1/traces", gzipSync(traces), { "content-type": "application/x-protobuf", "content-encoding": "gzip" });
-      assert.deepEqual([protobuf.status, protobuf.headers.get("content-type"), (await protobuf.arrayBuffer()).byteLength], [200, "application/x-protobuf", 0]);
-      const json = await post(base, "/v1/logs", JSON.stringify(logRequest("intake-test", NOW, NOW + 1n)), { "content-type": "application/json; charset=utf-8" });
-      assert.deepEqual([json.status, await json.text()], [200, "{}"]);
-
-      assert.equal((await post(base, "/v1/logs", "{", { "content-type": "application/json" })).status, 400);
-      assert.equal((await post(base, "/v1/logs", "{}", { "content-type": "text/plain" })).status, 415);
-      assert.equal((await post(base, "/v1/logs", "{}", { "content-type": "application/json", "content-encoding": "br" })).status, 415);
-      assert.equal((await post(base, "/v1/profiles", "{}", { "content-type": "application/json" })).status, 404);
-
       const reader = await openLake(readerConfig, { readOnly: true });
       try {
         const [span] = await rows<{ SpanName: string; conversation: string }>(reader.db, `select SpanName, SpanAttributes['alasio.conversation.id'] as conversation from ${LAKE}.otel.traces where ServiceName = 'intake-test'`);
@@ -535,37 +558,65 @@ describe("telemetry", () => {
       }
       const text = metrics.render();
       assert.match(text, /^lake_telemetry_rows_total\{table="otel.logs"\} 2$/m);
-      assert.match(text, /^lake_telemetry_requests_total\{signal="logs",outcome="malformed"\} 1$/m);
+      assert.match(text, /^lake_telemetry_records_total\{topic="otel.logs",outcome="malformed"\} 1$/m);
+      // How far behind the group is, as the member asked once the batch was written.
+      assert.match(text, /^lake_telemetry_lag_records\{topic="otel.logs"\} 0$/m);
+      assert.match(text, /^lake_telemetry_lag_records\{topic="otel.spans"\} 0$/m);
     } finally {
-      server.close();
       await intake.stop();
     }
+    assert.ok(group.closed());
   });
 
-  test("the intake flushes what it inlined and merges the small files it wrote, every so often", async () => {
-    const intake = startIntake({ open: openForIntake, metrics: createMetrics(), log: () => {}, tidyIntervalMs: 500 });
-    const server = createServer(intake.handle);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const reader = await openLake(config, { readOnly: true });
+  test("a batch the lake has, read again as the group was not told of it, is written once", async () => {
+    const service = `repeated-${Date.now()}`;
+    const batch = [logRecord(2, 0, service, NOW), logRecord(2, 1, service, NOW)];
+    // The first member writes the batch, then cannot tell the group, as after a rebalance or a crash.
+    const first = member([batch], { failCommits: true });
+    const second = member([[...batch, logRecord(2, 2, service, NOW)]]);
+    const members = [first, second];
+    const metrics = createMetrics();
+    const intake = startIntake({ open: openForIntake, join: async () => members.shift()?.source ?? assert.fail("joined a third time"), metrics, log: () => {}, batchMs: 10, retryMs: 10 });
     try {
-      // A server listening on a TCP port has an address of its own.
-      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-      for (let waited = 0; !intake.ready() && waited < 30_000; waited += 50) await new Promise((resolve) => setTimeout(resolve, 50));
-      const today = new Date(Number(NOW / 1_000_000n));
-      const partition = `year=${today.getUTCFullYear()}/month=${today.getUTCMonth() + 1}/day=${today.getUTCDate()}/`;
-      // Today's files, which are those the intake merges.
-      const files = async () => (await one<Count>(reader.db, `select count(*) as n from ducklake_list_files('${LAKE}', 'metrics_gauge', schema => 'otel') where contains(data_file, '${partition}')`)).n;
-      const before = await files();
-      for (const offset of [0n, 1n, 2n]) {
-        assert.equal((await post(base, "/v1/metrics", JSON.stringify(gaugeRequest("tidied", NOW + offset)), { "content-type": "application/json" })).status, 200);
-      }
-      assert.equal(await files(), before + 3n);
-      for (let waited = 0; (await files()) > 1n && waited < 30_000; waited += 200) await new Promise((resolve) => setTimeout(resolve, 200));
-      assert.equal(await files(), 1n);
-      assert.equal((await one<Count>(reader.db, `select count(*) as n from ${LAKE}.otel.metrics_gauge where ServiceName = 'tidied'`)).n, 3n);
+      await until("the second member's commit", () => second.committed.length > 0);
     } finally {
-      reader.close();
-      server.close();
+      await intake.stop();
+    }
+    assert.ok(first.closed());
+    assert.deepEqual(second.committed[0], [{ topic: "otel.logs", partition: 2, offset: 3n }]);
+    const lake = await openLake(config, { readOnly: true });
+    try {
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 3n);
+    } finally {
+      lake.close();
+    }
+    assert.match(metrics.render(), /^lake_telemetry_records_total\{topic="",outcome="repeated"\} 2$/m);
+  });
+
+  test("the intake joins the group only once it holds the lake, and tries again until it can open it", async () => {
+    let opens = 0;
+    let joins = 0;
+    const group = member([[logRecord(3, 0, "late", NOW)]]);
+    const intake = startIntake({
+      open: async () => {
+        opens += 1;
+        if (opens < 3) throw new Error("the compute is restarting");
+        return openForIntake();
+      },
+      join: async () => {
+        joins += 1;
+        return group.source;
+      },
+      metrics: createMetrics(),
+      log: () => {},
+      batchMs: 10,
+      retryMs: 10,
+    });
+    try {
+      assert.equal(intake.ready(), false);
+      await until("the batch's commit", () => group.committed.length > 0);
+      assert.deepEqual([opens, joins], [3, 1]);
+    } finally {
       await intake.stop();
     }
   });
@@ -574,7 +625,7 @@ describe("telemetry", () => {
     await withLake(async (db) => {
       const { value } = await one<{ value: string }>(db, `select value from ducklake_options('${LAKE}') where option_name = 'target_file_size' and scope_entry = 'otel.metrics_gauge'`);
       const target = BigInt(value);
-      // A day of its own, as the hours of points the intake merged before come to make.
+      // A day of its own, as the hours of points merged before come to make.
       const start = NOW - 5n * DAY;
       const day = new Date(Number(start / 1_000_000n));
       const partition = `year=${day.getUTCFullYear()}/month=${day.getUTCMonth() + 1}/day=${day.getUTCDate()}/`;
@@ -582,7 +633,9 @@ describe("telemetry", () => {
       await db.run(`insert into ${LAKE}.otel.metrics_gauge by name
         select 'merged' as ServiceName, md5(i::VARCHAR) as MetricName, make_timestamp_ns(${start} + i) as TimeUnix, i::DOUBLE as Value
         from range(${target / 10n}) t(i)`);
-      for (const offset of [0n, 1n, 2n]) await writeTelemetry(db, telemetryRows("metrics", gaugeRequest("merged", start + offset)));
+      for (const offset of [0, 1, 2]) {
+        await writeConsumed(db, [{ topic: "otel.metrics", partition: 9, offset: BigInt(offset), rows: telemetryRows("metrics", gaugeRequest("merged", start + BigInt(offset))) }]);
+      }
       const large = (await files()).filter(({ size }) => size >= target).map(({ data_file }) => data_file);
       assert.ok(large.length > 0);
       await mergeTelemetry(db);
@@ -592,35 +645,22 @@ describe("telemetry", () => {
     });
   });
 
-  test("the intake answers 503 while it cannot open the lake, so the collector sends again", async () => {
-    const intake = startIntake({ open: () => Promise.reject(new Error("the compute is restarting")), metrics: createMetrics(), log: () => {}, retryMs: 10 });
-    const server = createServer(intake.handle);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    try {
-      const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-      assert.equal(intake.ready(), false);
-      assert.equal((await post(base, "/v1/logs", JSON.stringify(logRequest("unwritten", NOW)), { "content-type": "application/json" })).status, 503);
-    } finally {
-      server.close();
-      await intake.stop();
-    }
-  });
-
-  test("spans and log records are inlined in the catalog, and metric points written to files at once", async () => {
+  test("nothing of the telemetry is inlined in the catalog: each commit writes its files at once", async () => {
     await withLake(async (db) => {
       const files = async (table: string) => (await one<Count>(db, `select count(*) as n from ducklake_list_files('${LAKE}', '${table}', schema => 'otel')`)).n;
       const before = { logs: await files("logs"), gauge: await files("metrics_gauge") };
-      await writeTelemetry(db, telemetryRows("logs", logRequest("inlined", NOW)));
-      await writeTelemetry(db, telemetryRows("metrics", gaugeRequest("inlined", NOW)));
-      assert.deepEqual({ logs: await files("logs"), gauge: await files("metrics_gauge") }, { logs: before.logs, gauge: before.gauge + 1n });
+      await writeConsumed(db, [
+        { topic: "otel.logs", partition: 8, offset: 0n, rows: telemetryRows("logs", logRequest("files", NOW)) },
+        { topic: "otel.metrics", partition: 8, offset: 0n, rows: telemetryRows("metrics", gaugeRequest("files", NOW)) },
+      ]);
+      assert.deepEqual({ logs: await files("logs"), gauge: await files("metrics_gauge") }, { logs: before.logs + 1n, gauge: before.gauge + 1n });
     });
   });
 
   test("maintenance deletes the days of telemetry past its retention, and then their files", async () => {
     await withLake(async (db) => {
       const days = [40n, 31n, 30n, 0n];
-      await writeTelemetry(db, telemetryRows("logs", logRequest("retained", ...days.map((ago) => NOW - ago * DAY))));
-      await flushTelemetry(db); // to files, whose deletion follows
+      await writeConsumed(db, [{ topic: "otel.logs", partition: 7, offset: 0n, rows: telemetryRows("logs", logRequest("retained", ...days.map((ago) => NOW - ago * DAY))) }]);
       const day = (ago: bigint) => new Date(Number((NOW - ago * DAY) / 1_000_000n));
       const partition = (date: Date) => join(dataDir ?? "", "otel", "logs", `year=${date.getUTCFullYear()}`, `month=${date.getUTCMonth() + 1}`, `day=${date.getUTCDate()}`);
       const files = (ago: bigint) => readdirSync(partition(day(ago))).filter((name) => name.endsWith(".parquet"));
@@ -669,6 +709,31 @@ test("the lake's writes take turns, whichever DuckDB makes them", async () => {
   assert.equal(await transaction(second, async () => "the next still runs"), "the next still runs");
   for (const db of [first, second]) db.closeSync();
   for (const instance of instances) instance.closeSync();
+});
+
+test("once its write lock is set, every write of the lake waits for it, as every other writer's does, in any process", async () => {
+  writeLock(config.catalog);
+  const other = new pg.Client({ ...config.catalog });
+  await other.connect();
+  try {
+    // Another writer, the loader's process or another of the intake's, holds the lock.
+    await other.query("select pg_advisory_lock(hashtext('alasio.lake.write'))");
+    const instance = await DuckDBInstance.create(":memory:");
+    const db = await instance.connect();
+    const events: string[] = [];
+    const write = transaction(db, async () => {
+      events.push("began");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(events, []);
+    await other.query("select pg_advisory_unlock(hashtext('alasio.lake.write'))");
+    await write;
+    assert.deepEqual(events, ["began"]);
+    db.closeSync();
+    instance.closeSync();
+  } finally {
+    await other.end();
+  }
 });
 
 test("the lake loads the extension builds its image pins", async () => {
@@ -744,6 +809,24 @@ describe("the lake", () => {
       assert.equal(logs.filter((message) => message === "maintained").length, 1);
       await maintainLake(db, { retentionDays: 30, keepFiles: false }); // and on demand it runs at once
     });
+  });
+
+  test("the loader merges the telemetry's files once their interval has passed since its start or its last merge, a branch's lake never", async () => {
+    const merged: number[] = [];
+    const metrics = createMetrics();
+    const open = async () => ({ db: {} as DuckDBConnection, close: async () => {}, lost: () => false });
+    const sync = async () => ({ claude: { inserted: 0, deleted: 0 }, codex: { inserted: 0, deleted: 0 } }) as LakeLoad;
+    const options = { open, metrics, log: () => {}, intervalMs: 20, maintenanceIntervalMs: null, retentionDays: 30, sync, merge: async () => merged.push(Date.now()) };
+    const loader = startLoader({ ...options, mergeIntervalMs: 100 });
+    await new Promise((resolve) => setTimeout(resolve, 360));
+    await loader.stop();
+    assert.ok(merged.length >= 2 && merged.length <= 4, String(merged.length));
+    assert.match(metrics.render(), /^lake_telemetry_merges_total\{outcome="success"\} \d+$/m);
+    const branch = startLoader({ ...options, mergeIntervalMs: null });
+    merged.length = 0;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await branch.stop();
+    assert.deepEqual(merged, []);
   });
 
   test("maintenance merges the files written since its last pass, and leaves one already as large as it merges files to", async () => {
@@ -1004,7 +1087,6 @@ describe("the lake's reader", () => {
   test("reads the lake as its own role, and can write nothing, reach no other file, and change no setting", async () => {
     await withLake(async (db) => {
       await writeTelemetry(db, telemetryRows("logs", logRequest("read", NOW)));
-      await flushTelemetry(db); // to files, which the reader reads
     });
     const reader = await openReader(readerConfig);
     try {
@@ -1140,7 +1222,6 @@ describe("the lake's reader", () => {
     await withLake(async (db) => {
       await ensureOtel(db);
       await writeTelemetry(db, telemetryRows("traces", { resourceSpans: [turn(MAIN_TURN, {}), turn(BRANCH_TURN, { "alasio.branch": "try" })] }));
-      await flushTelemetry(db);
     });
     const dashboard: { panels: { title: string; type: string; targets?: { url_options: { data: string } }[] }[]; templating: { list: { name: string; query: { infinityQuery: { url_options: { data: string } } } }[] } } =
       JSON.parse(readFileSync(new URL("../neon/grafana/dashboards/agents.json", import.meta.url), "utf8"));
@@ -1201,7 +1282,6 @@ describe("the lake's reader", () => {
       await withLake(async (db) => {
         await writeTelemetry(db, telemetryRows("traces", { resourceSpans: [failed("telegram:main-failed", null), failed("telegram:branch-failed", "try")] }));
         await writeTelemetry(db, telemetryRows("metrics", { resourceMetrics: [gauge("try")] }));
-        await flushTelemetry(db);
       });
       const failing = (await answer(reader.db, rule("Turns are failing"))).map((row) => row["conversation"]);
       assert.ok(failing.includes("telegram:main-failed"), JSON.stringify(failing));
@@ -1241,7 +1321,6 @@ describe("the lake's reader", () => {
           gauge({ "service.name": "seaweedfs" }, "SeaweedFS_master_under_replicated_volumes", 0, { pod: "follower-1", collection: "neon-gate", rp: "001" }),
         ],
       }));
-      await flushTelemetry(db);
     });
     const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
     const rule = (title: string) => {

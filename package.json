@@ -31,6 +31,7 @@
     "@opentelemetry/instrumentation-runtime-node": "^0.35.0",
     "@opentelemetry/resources": "^2.11.0",
     "@opentelemetry/sdk-node": "^0.222.0",
+    "@platformatic/kafka": "2.14.0",
     "dotenv": "^16.4.0",
     "effect": "4.0.0",
     "import-in-the-middle": "^3.5.2",

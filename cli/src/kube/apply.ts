@@ -5,7 +5,8 @@
  * volumes and its CSI drivers; what pods run as and with, and where the API server
  * reaches its extensions (APIServices, webhooks); Jobs, each run to completion afresh
  * (the Neon setup, which makes the Secrets the stack mounts); the workloads; then what
- * scales and sizes them, for KEDA and VPA, whose CRDs are established by then. What the
+ * scales and sizes them, for KEDA and VPA, whose CRDs are established by then, with what
+ * KEDA's scalers authenticate as. What the
  * installation had and no longer has is deleted, but for what holds data and what serves
  * volumes that remain, and its workloads are waited for until they run; a scaler it no
  * longer has goes first, before the workloads it scaled are applied.
@@ -60,7 +61,7 @@ const PHASES: readonly (readonly KindName[])[] = [
   ],
   ["Job"],
   ["Deployment", "StatefulSet", "DaemonSet", "CronJob"],
-  ["ScaledObject", "VerticalPodAutoscaler"],
+  ["TriggerAuthentication", "ScaledObject", "VerticalPodAutoscaler"],
 ];
 
 /** The kinds alasio makes, in the order it applies them. */

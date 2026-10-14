@@ -6,26 +6,19 @@ import { test } from "node:test";
 import { DuckDBListValue, DuckDBMapValue, DuckDBStructValue, DuckDBTimestampNanosecondsValue, type DuckDBValue } from "@duckdb/node-api";
 import { ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, TraceFlags } from "@opentelemetry/api";
 import { SeverityNumber } from "@opentelemetry/api-logs";
-import {
-  JsonLogsSerializer,
-  JsonMetricsSerializer,
-  JsonTraceSerializer,
-  ProtobufLogsSerializer,
-  ProtobufMetricsSerializer,
-  ProtobufTraceSerializer,
-} from "@opentelemetry/otlp-transformer";
+import { ProtobufLogsSerializer, ProtobufMetricsSerializer, ProtobufTraceSerializer } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { AggregationType, MeterProvider, MetricReader } from "@opentelemetry/sdk-metrics";
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
 import { type TelemetryRows, telemetryRows } from "../neon/lake/src/otel.ts";
-import { decodeRequest, type Encoding, MalformedRequest, type Signal } from "../neon/lake/src/otlp.ts";
+import { decodeRequest, encodeRequest, MalformedRequest, type Signal } from "../neon/lake/src/otlp.ts";
 import { startTelemetry } from "../neon/lake/src/telemetry.ts";
 
-// Requests as OpenTelemetry's own SDK and serializers make them, in both encodings, are
-// decoded into the `otel` schema's rows (neon/lake/src/otel.ts), which must be alike
-// whichever encoding a request came in.
+// Requests as OpenTelemetry's own SDK and serializers make them, in binary protobuf as the
+// collector writes each to the log, are decoded into the `otel` schema's rows
+// (neon/lake/src/otel.ts).
 
 const RESOURCE = resourceFromAttributes({ "service.name": "alasio", "alasio.volume.id": "fs-abc123" });
 const TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
@@ -46,20 +39,16 @@ function plainRows(rows: TelemetryRows): Record<string, Record<string, unknown>[
   return Object.fromEntries(Object.entries(rows).map(([table, list]) => [table, list.map((row) => Object.fromEntries(Object.entries(row).map(([column, value]) => [column, plain(value)])))]));
 }
 
-/** The rows of `body`, a request for `signal` in `encoding`. */
-const rowsOf = (signal: Signal, encoding: Encoding, body: Uint8Array | undefined) => {
-  assert.ok(body, `a ${encoding} request`);
-  return plainRows(telemetryRows(signal, decodeRequest(signal, encoding, body)));
+/** The rows of `body`, a request for `signal` in binary protobuf. */
+const rowsOf = (signal: Signal, body: Uint8Array | undefined) => {
+  assert.ok(body, "a request");
+  return plainRows(telemetryRows(signal, decodeRequest(signal, body)));
 };
 
-/** Rows from a request serialized both ways, which must be alike: those rows. */
-function bothWays<T>(signal: Signal, serializers: { protobuf: { serializeRequest(data: T): Uint8Array | undefined }; json: { serializeRequest(data: T): Uint8Array | undefined } }, data: T) {
-  const fromProtobuf = rowsOf(signal, "protobuf", serializers.protobuf.serializeRequest(data));
-  assert.deepEqual(rowsOf(signal, "json", serializers.json.serializeRequest(data)), fromProtobuf);
-  return fromProtobuf;
-}
+/** An id, given as hex, as protobuf carries it. */
+const id = (hex: string) => Buffer.from(hex, "hex");
 
-test("spans are a row of otel.traces each, alike from protobuf and from JSON", () => {
+test("spans are a row of otel.traces each", () => {
   const spans = new InMemorySpanExporter();
   const tracer = new BasicTracerProvider({ resource: RESOURCE, spanProcessors: [new SimpleSpanProcessor(spans)] }).getTracer("alasio", "4.2.1");
   const parent = trace.setSpanContext(ROOT_CONTEXT, { traceId: TRACE_ID, spanId: PARENT_ID, traceFlags: TraceFlags.SAMPLED });
@@ -73,7 +62,7 @@ test("spans are a row of otel.traces each, alike from protobuf and from JSON", (
   span.setStatus({ code: SpanStatusCode.ERROR, message: "the harness failed" });
   span.end(at(START + 2_500_000_000n));
 
-  const { traces } = bothWays("traces", { protobuf: ProtobufTraceSerializer, json: JsonTraceSerializer }, spans.getFinishedSpans());
+  const { traces } = rowsOf("traces", ProtobufTraceSerializer.serializeRequest(spans.getFinishedSpans()));
   assert.equal(traces?.length, 1);
   const [row] = traces ?? [];
   assert.ok(row);
@@ -97,7 +86,7 @@ test("spans are a row of otel.traces each, alike from protobuf and from JSON", (
   assert.deepEqual(row["Links"], [{ TraceId: "1".repeat(32), SpanId: "2".repeat(16), TraceState: "", Attributes: { why: "queued" } }]);
 });
 
-test("log records are a row of otel.logs each, alike from protobuf and from JSON", async () => {
+test("log records are a row of otel.logs each", async () => {
   const exporter = new InMemoryLogRecordExporter();
   const provider = new LoggerProvider({ resource: RESOURCE, processors: [new SimpleLogRecordProcessor({ exporter })] });
   const logger = provider.getLogger("alasio-lake");
@@ -112,7 +101,7 @@ test("log records are a row of otel.logs each, alike from protobuf and from JSON
   logger.emit({ body: { nested: [1, "two"] } });
   await provider.forceFlush();
 
-  const { logs } = bothWays("logs", { protobuf: ProtobufLogsSerializer, json: JsonLogsSerializer }, exporter.getFinishedLogRecords());
+  const { logs } = rowsOf("logs", ProtobufLogsSerializer.serializeRequest(exporter.getFinishedLogRecords()));
   const [warned, structured] = logs ?? [];
   assert.ok(warned && structured);
   assert.deepEqual(
@@ -143,7 +132,7 @@ test("metric points are a row each of their kind's table", async () => {
   meter.createHistogram("alasio.turn.tokens").record(1200);
   const { resourceMetrics } = await reader.collect();
 
-  const rows = bothWays("metrics", { protobuf: ProtobufMetricsSerializer, json: JsonMetricsSerializer }, resourceMetrics);
+  const rows = rowsOf("metrics", ProtobufMetricsSerializer.serializeRequest(resourceMetrics));
   const one = (table: string, name: string) => {
     const found = rows[table]?.find((row) => row["MetricName"] === name);
     assert.ok(found, `${name} in ${table}`);
@@ -169,9 +158,9 @@ test("metric points are a row each of their kind's table", async () => {
   assert.equal(rows["metrics_summary"]?.length, 0);
 });
 
-test("a summary's quantiles and a point's exemplars are kept, as JSON gives them", () => {
+test("a summary's quantiles and a point's exemplars are kept", () => {
   const point = { timeUnixNano: String(START), startTimeUnixNano: "0" };
-  const { metrics_summary: [summary] = [], metrics_gauge: [gauge] = [] } = rowsOf("metrics", "json", Buffer.from(JSON.stringify({
+  const { metrics_summary: [summary] = [], metrics_gauge: [gauge] = [] } = rowsOf("metrics", encodeRequest("metrics", {
     resourceMetrics: [{
       resource: { attributes: [{ key: "service.name", value: { stringValue: "compute_ctl" } }] },
       scopeMetrics: [{
@@ -183,14 +172,14 @@ test("a summary's quantiles and a point's exemplars are kept, as JSON gives them
               dataPoints: [{
                 ...point,
                 asInt: "9007199254740993",
-                exemplars: [{ timeUnixNano: String(START), asDouble: 7, traceId: TRACE_ID.toUpperCase(), spanId: PARENT_ID, filteredAttributes: [{ key: "db", value: { stringValue: "alasio" } }] }],
+                exemplars: [{ timeUnixNano: String(START), asDouble: 7, traceId: id(TRACE_ID), spanId: id(PARENT_ID), filteredAttributes: [{ key: "db", value: { stringValue: "alasio" } }] }],
               }],
             },
           },
         ],
       }],
     }],
-  })));
+  }));
   assert.ok(summary && gauge);
   assert.deepEqual([summary["Count"], summary["Sum"], summary["ServiceName"]], [4n, 2.5, "compute_ctl"]);
   assert.deepEqual(summary["ValueAtQuantiles"], [{ Quantile: 0.5, Value: 0.4 }, { Quantile: 1, Value: 1.2 }]);
@@ -199,14 +188,14 @@ test("a summary's quantiles and a point's exemplars are kept, as JSON gives them
 });
 
 test("attribute values read as the ClickHouse exporter writes them, the last of a repeated key kept, and a record without a time of its own is timed when seen", () => {
-  const { logs: [row] = [] } = rowsOf("logs", "json", Buffer.from(JSON.stringify({
+  const { logs: [row] = [] } = rowsOf("logs", encodeRequest("logs", {
     resourceLogs: [{
       scopeLogs: [{
         logRecords: [{
           observedTimeUnixNano: String(START),
           body: { kvlistValue: { values: [{ key: "big", value: { intValue: "9007199254740993" } }, { key: "list", value: { arrayValue: { values: [{ boolValue: false }, { doubleValue: 1.5 }] } } }] } },
           attributes: [
-            { key: "bytes", value: { bytesValue: "AAEC" } },
+            { key: "bytes", value: { bytesValue: Uint8Array.from([0, 1, 2]) } },
             { key: "twice", value: { stringValue: "first" } },
             { key: "twice", value: { stringValue: "last" } },
             { key: "empty", value: {} },
@@ -214,7 +203,7 @@ test("attribute values read as the ClickHouse exporter writes them, the last of 
         }],
       }],
     }],
-  })));
+  }));
   assert.ok(row);
   assert.equal(row["Body"], '{"big":9007199254740993,"list":[false,1.5]}');
   assert.deepEqual(row["LogAttributes"], { bytes: "AAEC", twice: "last", empty: "" });
@@ -222,15 +211,11 @@ test("attribute values read as the ClickHouse exporter writes them, the last of 
   assert.equal(row["Timestamp"], START);
 });
 
-test("a request that is not its signal's OTLP is malformed", () => {
-  const malformed = (signal: Signal, encoding: Encoding, body: string | Uint8Array) =>
-    assert.throws(() => telemetryRows(signal, decodeRequest(signal, encoding, typeof body === "string" ? Buffer.from(body) : body)), MalformedRequest);
-  malformed("traces", "protobuf", Uint8Array.from([0x0a, 0x05, 0x01]));
-  malformed("traces", "json", "not json");
-  malformed("logs", "json", "[]");
-  malformed("metrics", "json", JSON.stringify({ resourceMetrics: 5 }));
-  malformed("traces", "json", JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{ startTimeUnixNano: "soon" }] }] }] }));
-  malformed("metrics", "json", JSON.stringify({ resourceMetrics: [{ scopeMetrics: [{ metrics: [{ histogram: { dataPoints: [{ count: "-1" }] } }] }] }] }));
+test("a record that is not its signal's OTLP is malformed", () => {
+  const malformed = (signal: Signal, body: Uint8Array) => assert.throws(() => telemetryRows(signal, decodeRequest(signal, body)), MalformedRequest);
+  // A length past the end, and a field of the wrong wire type.
+  malformed("traces", Uint8Array.from([0x0a, 0x05, 0x01]));
+  malformed("logs", Uint8Array.from([0x0b, 0x01]));
 });
 
 test("the lake's events are exported as log records where the standard variables say, and nowhere without them", async () => {
@@ -263,7 +248,7 @@ test("the lake's events are exported as log records where the standard variables
     });
     server.close();
   }
-  const logs = received.flatMap((body) => rowsOf("logs", "protobuf", body)["logs"] ?? []);
+  const logs = received.flatMap((body) => rowsOf("logs", body)["logs"] ?? []);
   assert.equal(logs.length, 1);
   const [event] = logs;
   assert.ok(event);

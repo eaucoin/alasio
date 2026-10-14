@@ -1,6 +1,6 @@
 /**
  * The lake's `otel` schema: alasio's traces, metrics and logs, as the telemetry intake
- * receives them from the stack's collector (./intake.ts). Its tables are those of
+ * consumes them from the log's topics, which the stack's collector writes (./intake.ts). Its tables are those of
  * OpenTelemetry's ClickHouse exporter, by name and column, so its queries carry over:
  *
  *   otel.traces                          a span a row
@@ -44,7 +44,7 @@
  */
 import { type DuckDBAppender, type DuckDBConnection, type DuckDBValue, listValue, mapValue, structValue, timestampNanosValue } from "@duckdb/node-api";
 
-import { LAKE, serially, transaction } from "./lake.ts";
+import { LAKE, rows, serially, transaction } from "./lake.ts";
 import {
   type AnyValue,
   base64,
@@ -73,10 +73,7 @@ const METRIC = `
   MetricName VARCHAR, MetricDescription VARCHAR, MetricUnit VARCHAR, Attributes ${MAP},
   StartTimeUnix TIMESTAMP_NS, TimeUnix TIMESTAMP_NS`;
 
-/**
- * Each table: its columns, the time it is partitioned and retained by, and whether an
- * insert into it is inlined in the catalog (INLINED_ROWS).
- */
+/** Each table: its columns, and the time it is partitioned and retained by. */
 const TABLES = {
   traces: {
     columns: `
@@ -87,7 +84,6 @@ const TABLES = {
       Events STRUCT(Timestamp TIMESTAMP_NS, Name VARCHAR, Attributes ${MAP})[],
       Links STRUCT(TraceId VARCHAR, SpanId VARCHAR, TraceState VARCHAR, Attributes ${MAP})[]`,
     time: "Timestamp",
-    inlined: true,
   },
   logs: {
     columns: `
@@ -96,31 +92,26 @@ const TABLES = {
       ResourceAttributes ${MAP}, ScopeSchemaUrl VARCHAR, ScopeName VARCHAR, ScopeVersion VARCHAR,
       ScopeAttributes ${MAP}, LogAttributes ${MAP}, EventName VARCHAR`,
     time: "Timestamp",
-    inlined: true,
   },
-  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix", inlined: false },
+  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix" },
   metrics_sum: {
     columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}, AggregationTemporality INTEGER, IsMonotonic BOOLEAN`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, BucketCounts UBIGINT[], ExplicitBounds DOUBLE[], Exemplars ${EXEMPLARS},
       Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_exponential_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, Scale INTEGER, ZeroCount UBIGINT,
       PositiveOffset INTEGER, PositiveBucketCounts UBIGINT[], NegativeOffset INTEGER, NegativeBucketCounts UBIGINT[],
       Exemplars ${EXEMPLARS}, Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_summary: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, ValueAtQuantiles STRUCT(Quantile DOUBLE, Value DOUBLE)[], Flags UINTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
 } as const;
 
@@ -136,21 +127,9 @@ export type TelemetryRow = Readonly<Record<string, DuckDBValue>>;
 export type TelemetryRows = Partial<Record<OtelTable, TelemetryRow[]>>;
 
 /**
- * The most rows one insert into a table of spans or log records inlines, into the
- * catalog, rather than writes as a Parquet file of its own: as many as the collector
- * batches them in at most, every 5 seconds, so they make no small files and are queried
- * at once. The intake flushes what is inlined to Parquet now and then (flushTelemetry),
- * so the catalog holds at most that long's telemetry. Metric points are never inlined:
- * they are nearly all of it, and measured on the stack, inlining them cost Neon some 25
- * to 45 KB of WAL a second, and the catalog 70 to 130 MB an hour until flushed; the
- * collector sends them a minute's at a time, which the lake writes as a file a kind.
- */
-export const INLINED_ROWS = 1000;
-
-/**
  * The size up to which the `otel` tables' files are merged, the lake's (TARGET_FILE_SIZE
  * in ./sync.ts) being for transcripts: a file this large is left as it is, so the
- * intake's hourly merge takes the files written since, not the whole day's again. At the
+ * hourly merge (mergeTelemetry) takes the files written since, not the whole day's again. At the
  * lake's 64 MB, a day's file of points (some 1.5 million, 14 MB, on the stack) was
  * rewritten every hour: measured on a day of the stack's sum points, the merge took
  * 0.6 s and 170 MB at 02:00, 4.8 s and 350 MB at 22:00; with this, 0.4-0.5 s and some
@@ -159,13 +138,24 @@ export const INLINED_ROWS = 1000;
 export const TELEMETRY_FILE_SIZE = "1MB";
 
 /**
+ * Where the intake has consumed each partition of the log's telemetry topics to: the
+ * offset of the next record it is to write, committed with the rows of those before it,
+ * so a batch written is never written again, whatever the log's consumer group says
+ * (./intake.ts). Its few rows, rewritten at each commit, are inlined in the catalog, as
+ * no telemetry is: they would make two files a commit otherwise.
+ */
+const OFFSETS = "intake_offsets";
+const OFFSETS_COLUMNS = "Topic VARCHAR, PartitionId INTEGER, NextOffset BIGINT";
+
+/**
  * Makes the `otel` schema's tables where they are missing, each partitioned by its
- * day, and sets how many rows of an insert into each it inlines, and the size up to
- * which their files are merged.
+ * day, and the intake's offsets; and sets that nothing of the telemetry is inlined in the
+ * catalog, the offsets alone, and the size up to which the telemetry's files are merged.
  */
 export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await transaction(db, async () => {
     await db.run(`create schema if not exists ${LAKE}.otel`);
+    await db.run(`create table if not exists ${LAKE}.otel.${OFFSETS} (${OFFSETS_COLUMNS})`);
     for (const [table, { columns, time }] of Object.entries(TABLES)) {
       const [exists] = (await db.runAndReadAll(
         `select 1 from duckdb_tables() where database_name = '${LAKE}' and schema_name = 'otel' and table_name = $1`,
@@ -178,10 +168,11 @@ export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   });
   // Once the schema is committed: DuckLake sets no option of a schema made in the same transaction.
   await serially(async () => {
-    for (const [table, { inlined }] of Object.entries(TABLES)) {
-      await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', ${inlined ? INLINED_ROWS : 0}, schema => 'otel', table_name => '${table}')`);
+    for (const table of OTEL_TABLES) {
+      await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 0, schema => 'otel', table_name => '${table}')`);
       await db.run(`call ${LAKE}.set_option('target_file_size', '${TELEMETRY_FILE_SIZE}', schema => 'otel', table_name => '${table}')`);
     }
+    await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 1000, schema => 'otel', table_name => '${OFFSETS}')`);
   });
 }
 
@@ -457,36 +448,92 @@ function append(appender: DuckDBAppender, columns: readonly string[], row: Telem
   appender.endRow();
 }
 
-/**
- * Writes `rows` (telemetryRows's) to the lake in one transaction, staged in DuckDB's
- * memory first, so the transaction is no longer than its inserts. Returns how many
- * rows each table was given.
- */
-export async function writeTelemetry(db: DuckDBConnection, rows: TelemetryRows): Promise<Partial<Record<OtelTable, number>>> {
-  const written: Partial<Record<OtelTable, number>> = {};
-  for (const table of OTEL_TABLES) {
-    const tableRows = rows[table] ?? [];
-    if (tableRows.length === 0) continue;
-    await db.run(`create or replace temp table ${staging(table)} (${TABLES[table].columns})`);
-    const columns = (await db.runAndReadAll(`from temp.${staging(table)} limit 0`)).columnNames();
-    const appender = await db.createAppender(staging(table), "main", "temp");
-    try {
-      for (const row of tableRows) append(appender, columns, row);
-      appender.flushSync();
-    } finally {
-      appender.closeSync();
-    }
-    written[table] = tableRows.length;
-  }
-  await transaction(db, async () => {
-    for (const table of Object.keys(written) as OtelTable[]) await db.run(`insert into ${LAKE}.otel.${table} from temp.${staging(table)}`);
-  });
-  return written;
+/** A record of the log's, at its offset in its topic's partition. */
+export interface Position {
+  readonly topic: string;
+  readonly partition: number;
+  readonly offset: bigint;
 }
 
-/** Moves the telemetry the catalog holds inlined to Parquet files. */
-export function flushTelemetry(db: DuckDBConnection): Promise<unknown> {
-  return serially(() => db.run(`call ducklake_flush_inlined_data('${LAKE}', schema_name => 'otel')`));
+/** A record the intake consumed: where it is in the log, and its rows, or null for one that does not decode, which is skipped. */
+export interface Consumed extends Position {
+  readonly rows: TelemetryRows | null;
+}
+
+/** What writeConsumed did: the rows each table was given, the records skipped as written before or undecodable, and where each partition is written to now. */
+export interface ConsumedWrite {
+  readonly written: Partial<Record<OtelTable, number>>;
+  readonly repeated: number;
+  readonly malformed: number;
+  /** For each partition of the batch, the offset of the next record to write. */
+  readonly next: readonly Position[];
+}
+
+const partitionKey = ({ topic, partition }: Pick<Position, "topic" | "partition">) => `${topic}\u0000${partition}`;
+
+/**
+ * Writes `consumed`, a batch the intake read from the log, in one transaction with the
+ * offset each of its partitions is written to: of each partition, the records at or past
+ * the offset the lake holds alone, so a batch written before, read again after a crash or
+ * a rebalance, is written once. Each table's rows are staged in DuckDB's memory first, so
+ * the transaction is no longer than its inserts.
+ */
+export function writeConsumed(db: DuckDBConnection, consumed: readonly Consumed[]): Promise<ConsumedWrite> {
+  return serially(async () => {
+    await db.run("begin transaction");
+    try {
+      const held = new Map<string, bigint>();
+      for (const row of await rows<{ Topic: string; PartitionId: number; NextOffset: bigint }>(db, `from ${LAKE}.otel.${OFFSETS}`)) {
+        held.set(partitionKey({ topic: row.Topic, partition: row.PartitionId }), BigInt(row.NextOffset));
+      }
+      const fresh = consumed.filter((record) => record.offset >= (held.get(partitionKey(record)) ?? 0n));
+      const tables: TelemetryRows = {};
+      for (const { rows: recordRows } of fresh) {
+        for (const [table, tableRows] of Object.entries(recordRows ?? {}) as [OtelTable, TelemetryRow[]][]) (tables[table] ??= []).push(...tableRows);
+      }
+      const written: Partial<Record<OtelTable, number>> = {};
+      for (const table of OTEL_TABLES) {
+        const tableRows = tables[table] ?? [];
+        if (tableRows.length === 0) continue;
+        await db.run(`create or replace temp table ${staging(table)} (${TABLES[table].columns})`);
+        const columns = (await db.runAndReadAll(`from temp.${staging(table)} limit 0`)).columnNames();
+        const appender = await db.createAppender(staging(table), "main", "temp");
+        try {
+          for (const row of tableRows) append(appender, columns, row);
+          appender.flushSync();
+        } finally {
+          appender.closeSync();
+        }
+        await db.run(`insert into ${LAKE}.otel.${table} from temp.${staging(table)}`);
+        written[table] = tableRows.length;
+      }
+      const next = new Map<string, Position>();
+      for (const record of fresh) {
+        const after = record.offset + 1n;
+        if ((next.get(partitionKey(record))?.offset ?? -1n) < after) next.set(partitionKey(record), { topic: record.topic, partition: record.partition, offset: after });
+      }
+      for (const { topic, partition, offset } of next.values()) {
+        await db.run(`delete from ${LAKE}.otel.${OFFSETS} where Topic = $1 and PartitionId = $2`, [topic, partition]);
+        await db.run(`insert into ${LAKE}.otel.${OFFSETS} values ($1, $2, $3)`, [topic, partition, offset]);
+      }
+      await db.run("commit");
+      const positions = new Map<string, Position>();
+      for (const record of consumed) {
+        const known = held.get(partitionKey(record)) ?? 0n;
+        const reached = next.get(partitionKey(record))?.offset ?? known;
+        positions.set(partitionKey(record), { topic: record.topic, partition: record.partition, offset: reached > known ? reached : known });
+      }
+      return {
+        written,
+        repeated: consumed.length - fresh.length,
+        malformed: fresh.filter(({ rows: recordRows }) => recordRows === null).length,
+        next: [...positions.values()],
+      };
+    } catch (error) {
+      await db.run("rollback").catch(() => {});
+      throw error;
+    }
+  });
 }
 
 /**

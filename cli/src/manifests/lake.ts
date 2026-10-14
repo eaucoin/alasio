@@ -1,12 +1,18 @@
 /**
  * The analytics lake (neon/lake/src/model.ts): every transcript entry and rollout line,
  * loaded from alasio's database into DuckLake, as role `lake`, which alasio makes, and
- * alasio's telemetry, which the stack's collector sends its intake (./collector.ts); its
- * catalog in Neon and its Parquet files in the object store.
+ * alasio's telemetry, which its intake reads from the log (./automq.ts); its catalog in
+ * Neon and its Parquet files in the object store.
  *
- * Its pod runs the lake service, which writes it, and beside it its query endpoint,
+ * Its pod runs the lake service, which loads it, and beside it its query endpoint,
  * through which Grafana and alasio lake read it (neon/lake/src/endpoint.ts), in a
  * container of its own, with resources of its own and only the reader's credentials.
+ *
+ * Its intake, main's alone, is a Deployment of its own, `lake-intake`, the log's consumer
+ * group of that name (neon/lake/src/intake-service.ts), which KEDA scales on how far the
+ * group is behind on the telemetry topics, as it reads that as a principal of its own
+ * that may read none of them: from none, while nothing is waiting, to lake.intake's most,
+ * as many as the topics have partitions.
  */
 import type { KubernetesObject, V1Container, V1Deployment, V1EnvVar, V1Service } from "@kubernetes/client-node";
 
@@ -16,6 +22,7 @@ import {
   type Environment,
   lakeRuns,
   MAIN_ENVIRONMENT,
+  NAMESPACE,
   neonName,
   ONE,
   otelEnv,
@@ -26,14 +33,27 @@ import {
   stackLabels,
   stackPodSpec,
 } from "./common.ts";
+import { replicaBudget, spread } from "./disruption.ts";
 import type { InstallConfig } from "./config.ts";
+import { INTAKE_GROUP, LOG_BROKERS, logPrincipalSecret, TELEMETRY_TOPICS } from "./automq.ts";
 import { priority } from "./priorities.ts";
+import { scaledObject, type Trigger, type TriggerAuthentication } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 
-/** The port its telemetry intake takes OTLP over HTTP on. */
-export const LAKE_INTAKE_PORT = 4318;
 /** The port its query endpoint takes queries on. */
 export const LAKE_QUERY_PORT = 8090;
+/** The port the lake service and its intake serve their health and metrics on. */
+const METRICS_PORT = 9464;
+/** The intake's component, its Deployment's name's end. */
+export const INTAKE_COMPONENT = "lake-intake";
+
+/**
+ * How far behind the intake's group may be on each partition, in records, before KEDA
+ * gives it another replica: half of what a replica writes in a batch at most
+ * (neon/lake/src/intake.ts's BATCH_RECORDS), a backlog, as after an outage, rather than
+ * the stack's ordinary minutes, which are some tens of records.
+ */
+const LAG_THRESHOLD = 1_000;
 
 /**
  * The lake's objects, when it runs, which is beside Neon. A branch environment's is the
@@ -52,7 +72,7 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
     metadata: { name, namespace: environment.namespace, labels: stackLabels("lake") },
     spec: {
       selector: selectorLabels("lake"),
-      ports: [{ name: "metrics", port: 9464 }, { name: "otlp-http", port: LAKE_INTAKE_PORT }, ...(main ? [{ name: "query", port: LAKE_QUERY_PORT }] : [])],
+      ports: [{ name: "metrics", port: METRICS_PORT }, ...(main ? [{ name: "query", port: LAKE_QUERY_PORT }] : [])],
     },
   };
   // Where the lake is, which both containers open it at.
@@ -79,14 +99,14 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
       { name: "OTEL_SERVICE_NAME", value: "alasio-lake-query" },
     ],
     ports: [{ name: "query", containerPort: LAKE_QUERY_PORT }],
-    // It serves whether or not the lake can be read, so the intake beside it is not held back.
+    // It serves whether or not the lake can be read, so the loader beside it is not held back.
     readinessProbe: { httpGet: { path: "/healthz", port: "query" }, periodSeconds: 10 },
     livenessProbe: { httpGet: { path: "/healthz", port: "query" }, periodSeconds: 30, failureThreshold: 3 },
     securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
     resources: config.lake.query.resources,
     volumeMounts: [{ name: "query-tmp", mountPath: "/tmp" }],
   };
-  // Live while its loads are not failing for long; ready once its intake has the lake open.
+  // Live while its loads are not failing for long; ready once its loader has the lake open.
   const probe = (path: string) => ({ httpGet: { path, port: "metrics" } });
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
@@ -117,7 +137,7 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
                 ...otelEnv(config, environment),
               ],
               envFrom: [{ secretRef: { name } }],
-              ports: [{ name: "metrics", containerPort: 9464 }, { name: "otlp-http", containerPort: LAKE_INTAKE_PORT }],
+              ports: [{ name: "metrics", containerPort: METRICS_PORT }],
               readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },
               livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
               securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
@@ -131,5 +151,85 @@ export function lakeObjects(config: InstallConfig, environment: Environment = MA
       },
     },
   };
-  return [service, deployment, verticalPodAutoscaler(deployment, "InPlace")];
+  return [service, deployment, verticalPodAutoscaler(deployment, "InPlace"), ...(main ? intakeObjects(config, lakeEnv) : [])];
+}
+
+/**
+ * The intake's objects: its Deployment, the ScaledObject that scales it, a trigger of
+ * each topic's lag, and what KEDA reads that as. A group that never committed on a
+ * partition is as far behind as the partition is long, so the first records written wake
+ * it.
+ */
+function intakeObjects(config: InstallConfig, lakeEnv: V1EnvVar[]): KubernetesObject[] {
+  const name = componentName(INTAKE_COMPONENT);
+  const { scaling, resources } = config.lake.intake;
+  const metadata = { name, namespace: NAMESPACE, labels: stackLabels(INTAKE_COMPONENT) };
+  const fromSecret = (variable: string, secret: string, key: string): V1EnvVar => ({ name: variable, valueFrom: { secretKeyRef: { name: secret, key } } });
+  const lake = componentName("lake");
+  const intake = logPrincipalSecret("intake");
+  const probe = (path: string) => ({ httpGet: { path, port: "metrics" } });
+  const deployment: V1Deployment = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata,
+    spec: {
+      ...replicasOf(scaling),
+      selector: { matchLabels: selectorLabels(INTAKE_COMPONENT) },
+      template: {
+        metadata: { labels: stackLabels(INTAKE_COMPONENT) },
+        spec: {
+          ...priority("component"),
+          ...stackPodSpec(config),
+          ...spread(INTAKE_COMPONENT, scaling),
+          // A batch being written is finished; one being gathered is read again by another.
+          terminationGracePeriodSeconds: 60,
+          containers: [{
+            name: "intake",
+            image: imageReference(config.images.lake),
+            imagePullPolicy: config.images.pullPolicy,
+            command: ["node", "src/intake-service.ts"],
+            env: [
+              ...lakeEnv,
+              fromSecret("LAKE_DATABASE_PASSWORD", lake, "LAKE_DATABASE_PASSWORD"),
+              fromSecret("LAKE_S3_KEY", lake, "LAKE_S3_KEY"),
+              fromSecret("LAKE_S3_SECRET", lake, "LAKE_S3_SECRET"),
+              { name: "LOG_BROKERS", value: LOG_BROKERS },
+              fromSecret("LOG_USERNAME", intake, "username"),
+              fromSecret("LOG_PASSWORD", intake, "password"),
+              ...otelEnv(config),
+              { name: "OTEL_SERVICE_NAME", value: "alasio-lake-intake" },
+            ],
+            ports: [{ name: "metrics", containerPort: METRICS_PORT }],
+            readinessProbe: { ...probe("/readyz"), periodSeconds: 10 },
+            livenessProbe: { ...probe("/healthz"), initialDelaySeconds: 60, periodSeconds: 30, failureThreshold: 3 },
+            securityContext: { ...restrictedContainer(), readOnlyRootFilesystem: true },
+            resources,
+            volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+          }],
+          volumes: [{ name: "tmp", emptyDir: { sizeLimit: "2Gi" } }],
+        },
+      },
+    },
+  };
+  const scaler = logPrincipalSecret("scaler");
+  const authentication: TriggerAuthentication = {
+    apiVersion: "keda.sh/v1alpha1",
+    kind: "TriggerAuthentication",
+    metadata,
+    spec: { secretTargetRef: ["sasl", "username", "password"].map((parameter) => ({ parameter, name: scaler, key: parameter })) },
+  };
+  const lag = (topic: string): Trigger => ({
+    type: "kafka",
+    metadata: {
+      bootstrapServers: LOG_BROKERS,
+      consumerGroup: INTAKE_GROUP,
+      topic,
+      lagThreshold: String(LAG_THRESHOLD),
+      activationLagThreshold: "0",
+      offsetResetPolicy: "earliest",
+    },
+    authenticationRef: { name },
+  });
+  const scaledObjects = scaledObject(deployment, scaling, Object.values(TELEMETRY_TOPICS).map(lag));
+  return [deployment, ...(scaledObjects.length > 0 ? [authentication, ...scaledObjects] : []), ...replicaBudget(INTAKE_COMPONENT, NAMESPACE, scaling), verticalPodAutoscaler(deployment, "InPlace")];
 }

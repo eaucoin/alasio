@@ -1,32 +1,49 @@
 /**
- * The telemetry intake: OTLP over HTTP, binary protobuf or JSON, gzipped or not, which
- * the stack's collector exports everything it receives to (cli/src/manifests/
- * collector.ts). Each request is decoded (./otlp.ts) into the `otel` schema's rows
- * (./otel.ts) and written in one transaction; the collector batches, so the intake
- * keeps nothing back. It is answered as OTLP's exporters expect: 200 once written, 400
- * for a request that does not decode, which is not sent again, and 503 while the lake
- * cannot be written, which is.
+ * The telemetry intake: a member of the log's consumer group `lake-intake`, consuming the
+ * telemetry topics the stack's collector writes (cli/src/manifests/collector.ts), each
+ * record an OTLP export request in binary protobuf, a topic a signal (TOPICS). It reads a
+ * batch at a time, as much as BATCH_MS's worth or BATCH_RECORDS records, decodes each
+ * record (./otlp.ts) into the `otel` schema's rows (./otel.ts), and writes the batch to
+ * the lake in one transaction with the offsets its partitions are written to
+ * (writeConsumed), straight to Parquet: a batch is a large commit, and nothing is inlined
+ * in the catalog. Only then does it commit the offsets to the group, which KEDA scales the
+ * intake's replicas on the lag of; a crash between the two re-reads a batch the lake has,
+ * which writeConsumed skips, so nothing is lost or written twice. A record that does not
+ * decode is skipped, and counted.
  *
- * The intake holds the lake open on a DuckDB of its own, apart from the loader's, from
- * its start: it opens it until that succeeds, and opens it anew whenever a write fails,
- * so it rides out the compute restarting as the loader does, and is ready whatever
- * becomes of the loader. Its requests are written one at a time, on its one
- * connection; and every hour what it wrote inlined in the catalog is flushed to
- * Parquet, and the small files it wrote are merged.
+ * It holds the lake and its member of the group from its start, opening them until that
+ * succeeds and anew whenever a write fails, so it rides out the compute or the log
+ * restarting: a batch not written is read again from what the group was last told.
  */
-import type { IncomingMessage, ServerResponse } from "node:http";
-import { promisify } from "node:util";
-import { gunzip } from "node:zlib";
-
 import type { DuckDBConnection } from "@duckdb/node-api";
 
-import { queue } from "./lake.ts";
 import type { Log } from "./loader.ts";
 import type { Metrics } from "./metrics.ts";
-import { flushTelemetry, mergeTelemetry, telemetryRows, writeTelemetry } from "./otel.ts";
-import { decodeRequest, type Encoding, MalformedRequest, SIGNALS } from "./otlp.ts";
+import { type Consumed, type Position, telemetryRows, writeConsumed } from "./otel.ts";
+import { decodeRequest, MalformedRequest, type Signal } from "./otlp.ts";
 
-const gunzipAsync = promisify(gunzip);
+/** The log's telemetry topics, and the signal each carries. */
+export const TOPICS: Readonly<Record<string, Signal>> = { "otel.spans": "traces", "otel.logs": "logs", "otel.metrics": "metrics" };
+
+/** A record as the intake reads it from the log. */
+export interface LogRecord extends Position {
+  readonly value: Buffer;
+}
+
+/** The intake's member of the consumer group: batches of records, and the offsets told the group once they are written. */
+export interface IntakeSource {
+  /**
+   * The next records, as many as `maxRecords`, those that came within `maxMs` of the first
+   * (or of the call, for none): a partition's in order, from where the group was last told.
+   * Those the lake has already, past that, writeConsumed skips.
+   */
+  next(maxMs: number, maxRecords: number): Promise<LogRecord[]>;
+  /** Tells the group that each partition is written up to its offset, the next record's. */
+  commit(offsets: readonly Position[]): Promise<void>;
+  /** How many records the group has yet to read of each topic. */
+  lag(): Promise<ReadonlyMap<string, number>>;
+  close(): Promise<void>;
+}
 
 /** The lake as the intake holds it, the `otel` schema ready. */
 export interface IntakeLake {
@@ -36,59 +53,56 @@ export interface IntakeLake {
 
 export interface IntakeOptions {
   open: () => Promise<IntakeLake>;
-  metrics: Pick<Metrics, "add">;
+  /** Joins the group. */
+  join: () => Promise<IntakeSource>;
+  metrics: Pick<Metrics, "add" | "set">;
   log: Log;
+  /** How long a batch gathers records, and how many it takes at most. */
+  batchMs?: number;
+  batchRecords?: number;
   /** How soon an open that failed is tried again. */
   retryMs?: number;
-  /** How often what is inlined is flushed to Parquet, and small files merged. */
-  tidyIntervalMs?: number;
 }
 
 export interface Intake {
-  /** Answers an HTTP request. */
-  handle(request: IncomingMessage, response: ServerResponse): void;
-  /** Whether the lake is open to be written. */
+  /** Whether it holds the lake and its member of the group. */
   ready(): boolean;
-  /** Ends the loop, once a write under way has ended, and closes the lake. */
+  /** Ends the loop, once a batch under way has been written, and leaves the group. */
   stop(): Promise<void>;
 }
 
-/** The most a request's body may be, sent or unzipped: well past the collector's batches. */
-export const MAX_BODY_BYTES = 16 * 1024 * 1024;
+/**
+ * How long a batch gathers records: a minute's telemetry, the collector scraping each
+ * minute, written as one commit, a file a table at most, some 1,440 a day each, which
+ * the lake's hourly merge tidies (mergeTelemetry); within the minutes Grafana's alerts
+ * want the stack's telemetry in.
+ */
+export const BATCH_MS = 60_000;
+/** The most records a batch takes: a burst, or a backlog after an outage, in commits of a bounded size. */
+export const BATCH_RECORDS = 2_000;
 const RETRY_MS = 10_000;
-/** How long the catalog holds the telemetry inlined in it, and the day's files stay small, at most. */
-const TIDY_INTERVAL_MS = 3_600_000;
-
-const MEDIA_TYPES: Readonly<Record<string, Encoding>> = { "application/x-protobuf": "protobuf", "application/json": "json" };
+/** How often a member asks the log how far behind the group is. */
+const LAG_EVERY_MS = 60_000;
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-/** A request's body, read whole, or null past `limit`. */
-async function readBody(request: IncomingMessage, limit: number): Promise<Buffer | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  // With no encoding set, a request reads as Buffers.
-  for await (const chunk of request as AsyncIterable<Buffer>) {
-    size += chunk.length;
-    if (size <= limit) chunks.push(chunk);
-  }
-  return size > limit ? null : Buffer.concat(chunks);
-}
-
-/** A gzipped body, unzipped; one that does not unzip, or unzips past MAX_BODY_BYTES, is malformed. */
-async function unzip(body: Buffer): Promise<Buffer> {
+/** `record`'s rows, or null where it is not an OTLP export request of its topic's signal. */
+function decode(record: LogRecord): Consumed {
+  const signal = TOPICS[record.topic];
   try {
-    return await gunzipAsync(body, { maxOutputLength: MAX_BODY_BYTES });
+    if (!signal) throw new MalformedRequest(`no signal is carried on ${record.topic}`);
+    return { ...record, rows: telemetryRows(signal, decodeRequest(signal, record.value)) };
   } catch (error) {
-    throw new MalformedRequest(`the body does not unzip: ${errorText(error)}`);
+    if (!(error instanceof MalformedRequest)) throw error;
+    return { ...record, rows: null };
   }
 }
 
-/** Starts the intake: it opens the lake now, and keeps it open until stopped. */
-export function startIntake({ open, metrics, log, retryMs = RETRY_MS, tidyIntervalMs = TIDY_INTERVAL_MS }: IntakeOptions): Intake {
+/** Starts the intake: it opens the lake and joins the group now, and consumes until stopped. */
+export function startIntake({ open, join, metrics, log, batchMs = BATCH_MS, batchRecords = BATCH_RECORDS, retryMs = RETRY_MS }: IntakeOptions): Intake {
   const stopped = new AbortController();
-  const writing = queue();
   let lake: IntakeLake | null = null;
+  let source: IntakeSource | null = null;
   let wake: (() => void) | null = null;
 
   const sleep = (ms: number) =>
@@ -100,110 +114,76 @@ export function startIntake({ open, metrics, log, retryMs = RETRY_MS, tidyInterv
       };
     });
 
-  /** Closes the lake after `error`, so the loop opens it anew. */
-  function drop(error: unknown) {
-    if (!lake) return;
-    log("telemetry intake lost the lake", { error: errorText(error) });
-    lake.close();
+  async function drop(error?: unknown) {
+    if (error !== undefined) log("telemetry intake lost the lake or the log", { error: errorText(error) });
+    const [held, member] = [lake, source];
     lake = null;
-    wake?.();
+    source = null;
+    held?.close();
+    await member?.close().catch(() => {});
   }
 
-  // Opens the lake whenever it is not open, and tidies it while it is.
+  /** Reads, decodes and writes one batch; true where it was a batch of any. */
+  async function batch(held: IntakeLake, member: IntakeSource): Promise<boolean> {
+    const records = await member.next(batchMs, batchRecords);
+    if (records.length === 0) return false;
+    const consumed = records.map(decode);
+    const started = performance.now();
+    const { written, repeated, malformed, next } = await writeConsumed(held.db, consumed);
+    metrics.set("lake_telemetry_commit_seconds", {}, (performance.now() - started) / 1000);
+    for (const [table, count] of Object.entries(written)) metrics.add("lake_telemetry_rows_total", { table: `otel.${table}` }, count);
+    for (const record of consumed) {
+      const outcome = record.rows === null ? "malformed" : "written";
+      metrics.add("lake_telemetry_records_total", { topic: record.topic, outcome });
+    }
+    if (repeated > 0) metrics.add("lake_telemetry_records_total", { topic: "", outcome: "repeated" }, repeated);
+    if (malformed > 0) log("telemetry intake skipped records that do not decode", { malformed });
+    await member.commit(next);
+    return true;
+  }
+
+  let lagAt = 0;
+  /** Says how far behind the group is, at most each LAG_EVERY_MS; a failure to ask is the log's, which the next batch meets. */
+  async function measureLag(member: IntakeSource): Promise<void> {
+    if (Date.now() - lagAt < LAG_EVERY_MS) return;
+    lagAt = Date.now();
+    const lag = await member.lag().catch(() => null);
+    for (const [topic, records] of lag ?? []) metrics.set("lake_telemetry_lag_records", { topic }, records);
+  }
+
   const done = (async () => {
     while (!stopped.signal.aborted) {
-      if (!lake) {
+      if (!lake || !source) {
         try {
-          lake = await open();
-          log("telemetry intake open");
+          lake ??= await open();
+          source ??= await join();
+          log("telemetry intake consuming");
         } catch (error) {
-          log("telemetry intake could not open the lake", { error: errorText(error) });
+          log("telemetry intake could not open the lake or join the group", { error: errorText(error) });
+          await drop();
           await sleep(retryMs);
           continue;
         }
       }
-      await sleep(tidyIntervalMs);
-      const held = lake;
-      if (stopped.signal.aborted || !held || held !== lake) continue;
-      await writing(async () => {
-        await flushTelemetry(held.db);
-        await mergeTelemetry(held.db);
-      }).catch(drop);
+      try {
+        await batch(lake, source);
+        await measureLag(source);
+      } catch (error) {
+        metrics.add("lake_telemetry_batches_total", { outcome: "failed" });
+        await drop(error);
+        if (!stopped.signal.aborted) await sleep(retryMs);
+      }
     }
-    await writing(async () => lake?.close());
-    lake = null;
+    await drop();
   })();
 
-  async function take(signal: (typeof SIGNALS)[number], encoding: Encoding, body: Buffer): Promise<number> {
-    let rows;
-    try {
-      rows = telemetryRows(signal, decodeRequest(signal, encoding, body));
-    } catch (error) {
-      metrics.add("lake_telemetry_requests_total", { signal, outcome: "malformed" });
-      throw error;
-    }
-    return writing(async () => {
-      const held = lake;
-      if (!held) return 503;
-      try {
-        const written = await writeTelemetry(held.db, rows);
-        for (const [table, count] of Object.entries(written)) metrics.add("lake_telemetry_rows_total", { table: `otel.${table}` }, count);
-        metrics.add("lake_telemetry_requests_total", { signal, outcome: "written" });
-        return 200;
-      } catch (error) {
-        metrics.add("lake_telemetry_requests_total", { signal, outcome: "failed" });
-        drop(error);
-        return 503;
-      }
-    });
-  }
-
-  async function answer(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const signal = SIGNALS.find((name) => request.url === `/v1/${name}`);
-    if (request.method !== "POST" || !signal) {
-      response.writeHead(404).end();
-      return;
-    }
-    const mediaType = (request.headers["content-type"] ?? "").split(";")[0]?.trim() ?? "";
-    const encoding = MEDIA_TYPES[mediaType];
-    const contentEncoding = request.headers["content-encoding"] ?? "identity";
-    if (!encoding || (contentEncoding !== "gzip" && contentEncoding !== "identity")) {
-      response.writeHead(415).end();
-      return;
-    }
-    const sent = await readBody(request, MAX_BODY_BYTES);
-    if (!sent) {
-      response.writeHead(413).end();
-      return;
-    }
-    let status: number;
-    try {
-      status = await take(signal, encoding, contentEncoding === "gzip" ? await unzip(sent) : sent);
-    } catch (error) {
-      if (!(error instanceof MalformedRequest)) throw error;
-      response.writeHead(400, { "content-type": "text/plain" }).end(`${error.message}\n`);
-      return;
-    }
-    if (status !== 200) {
-      response.writeHead(status).end();
-      return;
-    }
-    // A full success, in the request's own encoding: an empty message, or an empty object.
-    response.writeHead(200, { "content-type": mediaType }).end(encoding === "json" ? "{}" : "");
-  }
-
   return {
-    handle(request, response) {
-      answer(request, response).catch((error: unknown) => {
-        log("telemetry intake failed a request", { error: errorText(error) });
-        if (!response.headersSent) response.writeHead(500);
-        response.end();
-      });
-    },
-    ready: () => lake !== null,
+    ready: () => lake !== null && source !== null,
     async stop() {
       stopped.abort();
       wake?.();
+      // A batch being gathered ends with its member, unwritten, to be read again.
+      await source?.close().catch(() => {});
       await done;
     },
   };

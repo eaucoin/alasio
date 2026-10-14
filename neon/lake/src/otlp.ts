@@ -1,10 +1,10 @@
 /**
- * OTLP export requests, as the telemetry intake receives them over HTTP (./intake.ts):
- * binary protobuf, decoded by protobufjs from the messages below, or JSON, parsed. Both
- * come out as one shape, OTLP's JSON one, but for what JSON spells as text and protobuf
- * does not: an id is hex in JSON and bytes in protobuf, a 64-bit integer a string (or a
- * number) in JSON and a string here, and bytes base64 in JSON and bytes in protobuf.
- * Whoever reads a request reads those through `hexId`, `integer` and `base64`.
+ * OTLP export requests, as the telemetry intake consumes them from the log (./intake.ts),
+ * a record each: binary protobuf, decoded by protobufjs from the messages below into
+ * OTLP's JSON shape, but for what JSON spells as text and protobuf does not: an id is
+ * bytes, where JSON has hex, a 64-bit integer a string, and bytes bytes, where JSON has
+ * base64. Whoever reads a request reads those through `hexId`, `integer` and `base64`,
+ * which take either spelling.
  *
  * The messages are opentelemetry-proto's for the three signals' export requests, as of
  * its 1.5, which gave a log record its event name: enums as the integers they are on
@@ -13,13 +13,8 @@
  */
 import protobuf from "protobufjs";
 
-/** A signal the intake takes. */
+/** A signal of the telemetry's. */
 export type Signal = "traces" | "metrics" | "logs";
-
-export const SIGNALS: readonly Signal[] = ["traces", "metrics", "logs"];
-
-/** How a request is encoded. */
-export type Encoding = "protobuf" | "json";
 
 /** Thrown for a request that does not decode as its signal's. */
 export class MalformedRequest extends Error {
@@ -337,18 +332,18 @@ const REQUESTS: Readonly<Record<Signal, protobuf.Type>> = {
   logs: root.lookupType("ExportLogsServiceRequest"),
 };
 
+/** `request`, an export request for `signal`, in binary protobuf, as the collector writes each to the log. */
+export function encodeRequest<S extends Signal>(signal: S, request: Requests[S]): Uint8Array {
+  const type = REQUESTS[signal];
+  return type.encode(type.fromObject(request)).finish();
+}
+
 /**
- * `body`, an export request for `signal` in `encoding`, decoded. Throws
+ * `body`, an export request for `signal` in binary protobuf, decoded. Throws
  * MalformedRequest for one that does not decode.
  */
-export function decodeRequest<S extends Signal>(signal: S, encoding: Encoding, body: Uint8Array): Requests[S] {
+export function decodeRequest<S extends Signal>(signal: S, body: Uint8Array): Requests[S] {
   try {
-    if (encoding === "json") {
-      const request: unknown = JSON.parse(Buffer.from(body).toString("utf8"));
-      if (typeof request !== "object" || request === null || Array.isArray(request)) throw new MalformedRequest("the request is not an object");
-      // OTLP's JSON is the shape Requests describes; what a field holds is checked as it is read.
-      return request as Requests[S];
-    }
     const type = REQUESTS[signal];
     // The messages above are the shape Requests describes, 64-bit integers as text.
     return type.toObject(type.decode(body), { longs: String }) as Requests[S];

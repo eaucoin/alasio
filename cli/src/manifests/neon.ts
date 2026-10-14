@@ -122,6 +122,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
               { name: "S3_REGION", value: objectStore.external.region },
               { name: "S3_BUCKET_NEON", value: objectStore.buckets.neon },
               { name: "S3_BUCKET_LAKE", value: objectStore.buckets.lake },
+              { name: "S3_BUCKET_LOG", value: objectStore.buckets.log },
               ...(workspaceStorage.enabled
                 ? [
                   { name: "WORKSPACES_NAME", value: workspaceStorage.name },

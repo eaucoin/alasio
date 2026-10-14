@@ -3,7 +3,7 @@
  * for Grafana's dashboards and alert rules and for `alasio lake` (./query.ts). It runs
  * on the lake's image in a container of its own beside the lake service's, so a heavy
  * query is bounded by its own DuckDB's memory limit and its own container's, away from
- * the loader and the intake.
+ * the loader.
  *
  *   POST /query    a query in DuckDB's SQL, the request's body, with
  *                  `Authorization: Bearer <LAKE_QUERY_TOKEN>`: 200 with its rows, a JSON
@@ -13,7 +13,7 @@
  *                  is all Grafana's Infinity shows of an error, as it reads no body of a
  *                  status of 400 or more
  *   GET  /healthz  200 while it serves: its liveness, and its readiness, so its pod is
- *                  ready for the intake whether or not the lake can be read
+ *                  ready for the loader whether or not the lake can be read
  *
  * It opens the lake at the first query that finds it closed, and keeps it open: DuckDB
  * connects to the catalog anew by itself when the compute drops its connections, as it

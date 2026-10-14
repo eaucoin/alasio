@@ -1,7 +1,8 @@
 /**
  * The NetworkPolicies confining sessions, folder workspaces' bayma, alasio, Neon, the
- * object store's parts and its filer store, the telemetry collector, Grafana and workspace
- * storage, which need a cluster that enforces NetworkPolicy, as session filesystems do; and
+ * object store's parts and its filer store, the log, the telemetry collector, Grafana and
+ * workspace storage, which need a cluster that enforces NetworkPolicy, as session
+ * filesystems do; and
  * branch environments' (./branch.ts), whose namespaces main's policies admit by the label
  * each has, to what they share alone.
  */
@@ -9,6 +10,8 @@ import type { V1NetworkPolicy, V1NetworkPolicyIngressRule, V1NetworkPolicyPeer, 
 
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
 import { forksForBranches, sessionsNamespace } from "./alasio.ts";
+import { LOG, LOG_COMPONENT, LOG_CONTROLLER_PORT, LOG_METRICS_PORT, LOG_PORT } from "./automq.ts";
+import { GATEWAY_COMPONENT, SCRAPER_COMPONENT } from "./collector.ts";
 import {
   BRANCH_LABEL,
   COLLECTOR_PORT,
@@ -18,6 +21,7 @@ import {
   given,
   grafanaRuns,
   labels,
+  logRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   RELEASE,
@@ -26,7 +30,7 @@ import {
 import type { InstallConfig } from "./config.ts";
 import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
-import { LAKE_QUERY_PORT } from "./lake.ts";
+import { INTAKE_COMPONENT, LAKE_QUERY_PORT } from "./lake.ts";
 import {
   BACKUP_COMPONENT,
   COMPONENTS,
@@ -105,16 +109,19 @@ function sessionPolicies(config: InstallConfig, environment: Environment): Netwo
 /** The object store's parts, of the stack, to each of which partPolicies and gatewayPolicy admit what talks to it alone. */
 const PARTS = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
 
+/** The stack's pods that what talks to each of them alone reaches: the object store's parts, and the log. */
+const APART = [...PARTS, LOG_COMPONENT];
+
 /**
  * Neon's services, the lake and their jobs reach each other; alasio reaches the compute,
  * its database. In a branch environment, its compute and its lake reach each other, and
- * its alasio its compute, as main's do. The object store's parts, of the stack too, are
- * reached as partPolicies and gatewayPolicy say alone.
+ * its alasio its compute, as main's do. The object store's parts and the log, of the stack
+ * too, are reached as partPolicies, gatewayPolicy and logPolicy say alone.
  */
 function neonPolicies({ namespace }: Environment): NetworkPolicy[] {
   return [
     policy(componentName("neon"), namespace, "neon", {
-      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: PARTS }] },
+      podSelector: { matchLabels: STACK, matchExpressions: [{ key: "app.kubernetes.io/component", operator: "NotIn", values: APART }] },
       policyTypes: ["Ingress"],
       ingress: [{ from: [{ podSelector: { matchLabels: STACK } }] }],
     }),
@@ -148,7 +155,7 @@ function branchStoragePolicy(config: InstallConfig): NetworkPolicy {
  * Workspace storage's metadata and data are reached by JuiceFS's own pods alone (its
  * controller, its node service, the mount pods it runs and the Jobs that delete volumes'
  * directories, in the driver's namespace) and alasio's JuiceFS admin pods: Valkey takes no
- * other connection but the stack's collector's, which reads its metrics, and the bundled
+ * other connection but the collector's scraper's, which reads its metrics, and the bundled
  * object store takes theirs on its S3 port beside the stack's own, and Valkey's, whose pod
  * formats the file system. The driver's Jobs are told by no label of their own, so any
  * Job's pod in its namespace is admitted, which the credentials of each still guard.
@@ -168,7 +175,7 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
       policyTypes: ["Ingress"],
       ingress: [
         { from: juicefs, ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
-        { from: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
+        { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: VALKEY_PORT }] },
       ],
     }),
     ...(config.objectStore.bundled.enabled
@@ -184,7 +191,7 @@ function workspaceStoragePolicies(config: InstallConfig): NetworkPolicy[] {
 /**
  * The bundled object store's parts behind its gateways, each reached by what talks to it
  * alone, on its HTTP and gRPC ports (SeaweedFS's gRPC port is the HTTP port's plus 10000),
- * and by the collector on its metrics port:
+ * and by the collector's scraper on its metrics port:
  *
  * - the masters, by each other, in Raft, and by every part that asks them where volumes
  *   are, or registers: the volume servers, the filers, the gateways (whose sidecar makes
@@ -206,7 +213,7 @@ function partPolicies(): NetworkPolicy[] {
       policyTypes: ["Ingress"],
       ingress: [
         { from: from.map(of), ports: ports(http) },
-        { from: [of("collector")], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
+        { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
       ],
     });
   const { gateway, master, volumeServer, filer } = COMPONENTS;
@@ -221,7 +228,7 @@ function partPolicies(): NetworkPolicy[] {
  * The bundled object store's gateways take the stack's pods on their S3 port, the
  * store's endpoint (and branch environments' and workspace storage's, as their own
  * policies say); the lifecycle pass alone on their gRPC port, through which it deletes;
- * and the collector alone on their metrics port.
+ * and the collector's scraper alone on their metrics port.
  */
 function gatewayPolicy(): NetworkPolicy {
   return policy(GATEWAY, NAMESPACE, COMPONENTS.gateway, {
@@ -230,14 +237,14 @@ function gatewayPolicy(): NetworkPolicy {
     ingress: [
       { from: [{ podSelector: { matchLabels: STACK } }], ports: [{ protocol: "TCP", port: 8333 }] },
       { from: [{ podSelector: { matchLabels: selectorLabels(LIFECYCLE_COMPONENT) } }], ports: [{ protocol: "TCP", port: 18_333 }] },
-      { from: [{ podSelector: { matchLabels: selectorLabels("collector") } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
+      { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: METRICS_PORT }] },
     ],
   });
 }
 
 /**
  * The bundled object store's filer store takes no connection but its filers', the
- * collector's, which reads its metrics, and its backups': it is not of the data stack,
+ * collector's scraper's, which reads its metrics, and its backups': it is not of the data stack,
  * whose pods reach each other. As `alasio restore-filer-store` puts a backup back, the
  * Valkey that serves it is reached by the Job that loads it alone.
  */
@@ -250,20 +257,44 @@ function filerStorePolicies(): NetworkPolicy[] {
       ingress: [{ from: from.map(of), ports: [{ protocol: "TCP", port: VALKEY_PORT }] }],
     });
   return [
-    valkey(FILER_STORE, COMPONENTS.filerStore, [COMPONENTS.filer, "collector", BACKUP_COMPONENT]),
+    valkey(FILER_STORE, COMPONENTS.filerStore, [COMPONENTS.filer, SCRAPER_COMPONENT, BACKUP_COMPONENT]),
     valkey(RESTORE_SOURCE, RESTORE_COMPONENTS.source, [RESTORE_COMPONENTS.restore]),
   ];
 }
 
 /**
- * The telemetry collector takes OTLP from alasio and folder workspaces' bayma, beside the
- * stack's own pods (neonPolicies), and from branch environments' alasio, compute and
- * lake, and from nothing else: sessions' telemetry reaches it through their alasio's
- * receiver alone.
+ * The log takes its clients on their port from the collector's gateway, which writes to
+ * it, and the lake's intake and KEDA's operator, which read it, alone; its controllers'
+ * port, and its clients' as its brokers reach each other, from its own nodes; and its
+ * metrics port from the collector's scraper. KEDA's operator is alasio's, or, where the
+ * cluster's own KEDA scales alasio (autoscaling.keda.enabled false), the operator its
+ * release manifest labels, in any namespace.
+ */
+function logPolicy(config: InstallConfig): NetworkPolicy {
+  const of = (component: string): V1NetworkPolicyPeer => ({ podSelector: { matchLabels: selectorLabels(component) } });
+  const operator: V1NetworkPolicyPeer = config.autoscaling.keda.enabled
+    ? of("keda-operator")
+    : { namespaceSelector: {}, podSelector: { matchLabels: { "app.kubernetes.io/name": "keda-operator" } } };
+  return policy(LOG, NAMESPACE, LOG_COMPONENT, {
+    podSelector: { matchLabels: selectorLabels(LOG_COMPONENT) },
+    policyTypes: ["Ingress"],
+    ingress: [
+      { from: [of(LOG_COMPONENT)], ports: [LOG_PORT, LOG_CONTROLLER_PORT].map((port) => ({ protocol: "TCP", port })) },
+      { from: [of(GATEWAY_COMPONENT), of(INTAKE_COMPONENT), operator], ports: [{ protocol: "TCP", port: LOG_PORT }] },
+      { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_METRICS_PORT }] },
+    ],
+  });
+}
+
+/**
+ * The telemetry collector's gateway takes OTLP from alasio and folder workspaces' bayma,
+ * beside the stack's own pods (neonPolicies), its scraper among them, and from branch
+ * environments' alasio, compute and lake, and from nothing else: sessions' telemetry
+ * reaches it through their alasio's receiver alone.
  */
 function collectorPolicy({ host }: InstallConfig): NetworkPolicy {
-  return policy(componentName("collector"), NAMESPACE, "collector", {
-    podSelector: { matchLabels: selectorLabels("collector") },
+  return policy(componentName("collector"), NAMESPACE, GATEWAY_COMPONENT, {
+    podSelector: { matchLabels: selectorLabels(GATEWAY_COMPONENT) },
     policyTypes: ["Ingress"],
     ingress: [{
       from: [
@@ -364,6 +395,7 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     alasioPolicy(config, environment),
     ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
     ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
+    ...(logRuns(config) ? [logPolicy(config)] : []),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

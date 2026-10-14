@@ -82,6 +82,8 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(external.accessKey, "a");
   assert.equal(config.workspaces?.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
   assert.equal(setupConfig({ ...ENV, WORKSPACES_NAME: "" }).workspaces, null);
+  assert.equal(config.logBucket, "log");
+  assert.equal(setupConfig({ ...ENV, S3_BUCKET_LOG: "my-log" }).logBucket, "my-log");
   assert.throws(() => setupConfig({ ...ENV, WORKSPACES_BUCKET_URL: "" }), /WORKSPACES_BUCKET_URL must be set/);
 });
 
@@ -90,7 +92,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const config = setupConfig(ENV);
   await setupKube({ kube, config, log: () => {} });
   const names = secretNames("q");
-  assert.deepEqual([...kube.secrets.keys()].sort(), Object.values(names).sort());
+  // Every Secret's name, each log principal's among them.
+  const every = Object.values(names).flatMap((name) => (typeof name === "string" ? [name] : Object.values(name)));
+  assert.deepEqual([...kube.secrets.keys()].sort(), every.sort());
   const root: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   const publicKey = value(kube, names.root, "auth_public_key.pem");
 
@@ -110,7 +114,25 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces", "log"]);
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "log")?.actions, ["Read:log", "List:log", "Tagging:log", "Write:log"]);
+
+  // The log's: its object store identity, its cluster's id, its admin's password; every
+  // principal's for its access applier; and each principal's, KEDA's with its mechanism.
+  assert.equal(value(kube, names.log, "KAFKA_S3_ACCESS_KEY"), root.s3.log.accessKey);
+  assert.equal(value(kube, names.log, "KAFKA_S3_SECRET_KEY"), root.s3.log.secretKey);
+  assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
+  assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["gateway", "intake", "scaler"]);
+  assert.deepEqual(names.logPrincipals, { gateway: "q-log-gateway", intake: "q-log-intake", scaler: "q-log-scaler" });
+  for (const principal of ["gateway", "intake", "scaler"] as const) {
+    assert.equal(value(kube, names.logAccess, principal), root.log[principal]);
+    assert.equal(value(kube, names.logPrincipals[principal], "username"), principal);
+    assert.equal(value(kube, names.logPrincipals[principal], "password"), root.log[principal]);
+  }
+  assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
+  assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
+  assert.equal(new Set(Object.values(root.log)).size, 4);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -153,7 +175,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   await setupKube({ kube, config, log: () => {} });
   assert.deepEqual(JSON.parse(value(kube, names.root, "secrets.json")), root);
   assert.equal(value(kube, names.root, "auth_public_key.pem"), publicKey);
-  assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, Object.keys(names).length);
+  assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, every.length);
 });
 
 test("a root predating a secret gains it without losing the rest", async () => {
@@ -177,7 +199,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
   return {
     tenantId: "tenant",
     timelineId: "timeline",
-    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3 },
+    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3, log: s3 },
     controllerDbPassword: "c",
     alasioPassword: "q",
     lakePassword: "l",
@@ -192,6 +214,8 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreFilerPassword: "p",
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
+    logClusterId: "cluster",
+    log: { admin: "la", gateway: "lg", intake: "li", scaler: "ls" },
   };
 }
 
@@ -219,6 +243,8 @@ test("with an external object store, every service uses its credentials and no S
   assert.equal(rendered[names.filerStoreBackup], undefined);
   assert.equal(rendered[names.safekeeper]?.["AWS_ACCESS_KEY_ID"], "AK");
   assert.equal(rendered[names.lake]?.["LAKE_S3_SECRET"], "SK");
+  assert.equal(rendered[names.log]?.["KAFKA_S3_ACCESS_KEY"], "AK");
+  assert.equal(rendered[names.log]?.["KAFKA_S3_SECRET_KEY"], "SK");
   assert.match(rendered[names.safekeeper]?.["REMOTE_STORAGE"] ?? "",/bucket_name="my-neon", bucket_region="eu-west-1"/u);
   assert.equal(rendered[names.workspaces]?.["bucket"], "https://s3.example.com/my-workspaces");
   assert.equal(rendered[names.workspaces]?.["access-key"], "AK");
@@ -236,5 +262,5 @@ test("without workspace storage, neither its Secrets nor its identity are made",
   assert.equal(rendered[names.valkey], undefined);
   assert.equal(rendered[names.workspaces], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "log"]);
 });

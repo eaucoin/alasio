@@ -67,6 +67,7 @@ const KINDS = {
   CronJob: { apiVersion: "batch/v1", plural: "cronjobs", namespaced: true },
   Sandbox: { apiVersion: "agents.x-k8s.io/v1beta1", plural: "sandboxes", namespaced: true },
   ScaledObject: { apiVersion: "keda.sh/v1alpha1", plural: "scaledobjects", namespaced: true },
+  TriggerAuthentication: { apiVersion: "keda.sh/v1alpha1", plural: "triggerauthentications", namespaced: true },
   VerticalPodAutoscaler: { apiVersion: "autoscaling.k8s.io/v1", plural: "verticalpodautoscalers", namespaced: true },
   // What the cluster's metrics server measures its pods and nodes using now.
   PodMetrics: { apiVersion: "metrics.k8s.io/v1beta1", plural: "pods", namespaced: true },

@@ -15,8 +15,8 @@
  *   makes no volume's id again;
  * - S3 gateways, on the filers, the store's endpoint, under the name the stack reaches it
  *   by (alasio-seaweedfs:8333), scaled on their CPU where their scale is a range. Each makes
- *   the buckets, idempotently, as it starts: Neon's, the lake's, backups' and, when it is
- *   on, workspace storage's; and gives Neon's its lifecycle rules. It is ready, and the
+ *   the buckets, idempotently, as it starts: Neon's, the lake's, backups', and when they
+ *   run, workspace storage's and the log's; and gives Neon's its lifecycle rules. It is ready, and the
  *   stack's writers start, only once they are.
  *
  * And the periodic pass that applies the lifecycle rules, and copies again what has fewer
@@ -42,7 +42,7 @@ import type {
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, labels, logRuns, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -396,7 +396,7 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
 function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
-  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : [])];
+  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), ...(logRuns(config) ? [buckets.log] : [])];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {

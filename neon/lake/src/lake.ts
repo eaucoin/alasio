@@ -5,19 +5,21 @@
  * durable is in the catalog and the object store, so any process can open the lake
  * and none has to stay up for it.
  *
- * The lake service opens it twice, for the loader and for the telemetry intake, each
- * on a DuckDB of its own, so either can drop and reopen its connections without the
- * other's. Their writes still take turns: DuckLake 1.0 on Postgres mishandles commits
- * that race (duplicate snapshot ids, retries run out), so every write to the lake in
- * this process is made through `serially`, one at a time, and none ever races another.
- * The query endpoint opens it read-only, in a process of its own (./endpoint.ts).
+ * The lake service opens it for its loader, and each of the telemetry intake's replicas
+ * for itself (./intake.ts), each on a DuckDB of its own. Their writes take turns:
+ * DuckLake 1.0 on Postgres mishandles commits that race (duplicate snapshot ids, retries
+ * run out), so every write to the lake is made through `serially`, one at a time in a
+ * process and, once `writeLock` is set, under a Postgres advisory lock of the catalog's
+ * across processes, so none ever races another. The query endpoint opens it read-only,
+ * in a process of its own (./endpoint.ts).
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type DuckDBConnection, DuckDBInstance, type DuckDBValue, type JS } from "@duckdb/node-api";
+import pg from "pg";
 
-import type { LakeAccess } from "./config.ts";
+import type { DatabaseConfig, LakeAccess } from "./config.ts";
 import { EXTENSIONS } from "./extensions.ts";
 
 /** The names the lake and its source are attached under. */
@@ -138,8 +140,53 @@ export function queue(): Queue {
   };
 }
 
-/** Runs `work`, which writes to the lake, after every write given before it: this process's writes, one at a time. */
-export const serially: Queue = queue();
+/** Names the lock every writer of the lake holds while it writes, in the catalog's database. */
+const WRITE_LOCK = "alasio.lake.write";
+
+/** Runs `work` holding the lake's write lock across processes; unset, `work` alone. */
+let acrossProcesses: <T>(work: () => Promise<T>) => Promise<T> = (work) => work();
+
+/**
+ * Makes every write of this process's (`serially`) hold the lake's write lock, a session
+ * advisory lock of `catalog`'s database, on a connection of its own, made anew when lost:
+ * the loader's and the intake replicas' writes then take turns as one process's do.
+ */
+export function writeLock(catalog: DatabaseConfig): void {
+  let client: pg.Client | null = null;
+  const connected = async (): Promise<pg.Client> => {
+    if (client) return client;
+    const fresh = new pg.Client({ ...catalog, connectionTimeoutMillis: 30_000 });
+    fresh.on("error", () => {
+      if (client === fresh) client = null;
+    });
+    fresh.on("end", () => {
+      if (client === fresh) client = null;
+    });
+    await fresh.connect();
+    client = fresh;
+    return fresh;
+  };
+  // The lock's connection and the lake's are to one server: one that is lost with the
+  // server mid-write is lost with the write, which commits nothing.
+  acrossProcesses = async (work) => {
+    const held = await connected();
+    await held.query("select pg_advisory_lock(hashtext($1))", [WRITE_LOCK]);
+    try {
+      return await work();
+    } finally {
+      await held.query("select pg_advisory_unlock(hashtext($1))", [WRITE_LOCK]).catch(async () => {
+        // A connection that cannot unlock is ended, which unlocks.
+        if (client === held) client = null;
+        await held.end().catch(() => {});
+      });
+    }
+  };
+}
+
+const writes = queue();
+
+/** Runs `work`, which writes to the lake, after every write given before it, one at a time, and under the write lock where one is set (writeLock). */
+export const serially: Queue = (work) => writes(() => acrossProcesses(work));
 
 /** Runs `work` in one transaction on the lake, serially: all of it is committed, or none. */
 export function transaction<T>(db: DuckDBConnection, work: () => Promise<T>): Promise<T> {

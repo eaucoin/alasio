@@ -7,7 +7,7 @@
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
  * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
- * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
+ * S3_BUCKET_NEON, S3_BUCKET_LAKE and S3_BUCKET_LOG (neon, lake and log unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities, and its filers' store's users' passwords, are made here otherwise. With workspace
  * storage on, WORKSPACES_NAME (its JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
@@ -22,6 +22,8 @@ import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
   DATABASE,
+  LOG_PRINCIPALS,
+  type LogPrincipal,
   pageserverMetadata,
   pageserverToml,
   PAGESERVER_ID,
@@ -55,6 +57,10 @@ export interface SecretNames {
   branches: string;
   valkey: string;
   workspaces: string;
+  /** The log's own (its object store credentials, its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
+  log: string;
+  logAccess: string;
+  logPrincipals: Record<LogPrincipal, string>;
 }
 
 /** Workspace storage, as the setup makes its Secrets. */
@@ -85,6 +91,7 @@ interface SetupConfigBase {
   s3Region: string;
   neonBucket: string;
   lakeBucket: string;
+  logBucket: string;
   /** Null when workspace storage is off. */
   workspaces: WorkspacesConfig | null;
 }
@@ -134,6 +141,9 @@ export function secretNames(prefix: string): SecretNames {
     branches: `${prefix}-branches`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
+    log: `${prefix}-log`,
+    logAccess: `${prefix}-log-access`,
+    logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
   };
 }
 
@@ -213,6 +223,22 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       GF_SECURITY_SECRET_KEY: secrets.grafanaSecretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
     },
+    // The log's, which its nodes are formatted and run with, and which its access applier
+    // logs in as its admin with; that applier's, every principal's password, which it gives
+    // each principal; and each principal's, which what logs in as it is given (KEDA's with
+    // the SASL mechanism, as its Kafka scaler reads it).
+    [names.log]: {
+      KAFKA_S3_ACCESS_KEY: s3("log").accessKey,
+      KAFKA_S3_SECRET_KEY: s3("log").secretKey,
+      KAFKA_CLUSTER_ID: secrets.logClusterId,
+      LOG_ADMIN_PASSWORD: secrets.log.admin,
+    },
+    [names.logAccess]: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, secrets.log[principal]])),
+    ...Object.fromEntries(LOG_PRINCIPALS.map((principal) => [names.logPrincipals[principal], {
+      username: principal,
+      password: secrets.log[principal],
+      ...(principal === "scaler" ? { sasl: "scram_sha512" } : {}),
+    }])),
     // Branch environments': the token alasio's command line manages Neon's branches with,
     // and the key alasio signs each one's token to fork its sessions with.
     [names.branches]: {
@@ -237,7 +263,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     };
   }
   if (!config.external) {
-    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null };
+    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null, log: config.logBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
     // The filers' store's users', which its Valkey requires: the filers', each filer is
     // given, the collector's, which reads its metrics, and the backups'.
@@ -268,6 +294,7 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",
     neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
     lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
+    logBucket: env["S3_BUCKET_LOG"]?.trim() || "log",
     workspaces: env["WORKSPACES_NAME"]?.trim()
       ? {
         name: required("WORKSPACES_NAME"),

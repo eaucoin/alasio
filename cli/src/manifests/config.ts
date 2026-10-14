@@ -166,8 +166,8 @@ const Alasio = Schema.Struct({
 
 /**
  * alasio's telemetry: everything (alasio's, its harnesses', bayma's, the lake's and the
- * stack's) goes through the stack's collector to the lake, and to otlpEndpoint too when
- * one is set.
+ * stack's) goes through the stack's collector, by the log, to the lake, and to
+ * otlpEndpoint too when one is set.
  */
 const Telemetry = Schema.Struct({
   /** Where the collector also sends all it receives; empty sends it to the lake alone. */
@@ -181,7 +181,12 @@ const Telemetry = Schema.Struct({
   receiverPort: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65535 }, { message: "must be a port from 1024 to 65535" })), 4318),
   /** How many days of telemetry the lake keeps. */
   retentionDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 30),
-  /** The stack's collector, through which all of it goes. */
+  /**
+   * The stack's collector, through which all of it goes, in two parts on one image: its
+   * gateway, which every producer exports to and which writes it to the log, scaling on
+   * its CPU where min and max are apart; and its scraper, one replica, which scrapes the
+   * stack and exports what it scrapes to the gateway.
+   */
   collector: defaulted(
     Schema.Struct({
       image: Image({
@@ -189,10 +194,43 @@ const Telemetry = Schema.Struct({
         tag: "0.161.0",
         digest: "sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
       }),
-      resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
+      gateway: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
+          resources: Resources({ requests: { cpu: "50m", memory: "96Mi" }, limits: { memory: "512Mi" } }),
+        }),
+        {},
+      ),
+      scraper: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }) }), {}),
     }),
     {},
   ),
+});
+
+/** The image of AutoMQ the log runs. */
+const AUTOMQ_IMAGE = { repository: "automqinc/automq", tag: "1.7.4", digest: "sha256:68bf5df674ab9755da51f5200c152df391b0968aeeaf9ec4d12619517cd1234f" };
+
+/**
+ * The least memory the log's broker is given: AutoMQ's smallest documented tier, a heap
+ * of 1 GiB and 1.5 GiB of direct memory, which it is run at (./automq.ts), and the JVM's
+ * own beside them.
+ */
+export const LOG_MEMORY = "3Gi";
+
+/**
+ * The log (./automq.ts), beside Neon: AutoMQ, Kafka whose partitions are in the object
+ * store's bucket objectStore.buckets.log, its write-ahead log too; a small volume of each
+ * of its nodes keeps KRaft's metadata, which its principals and ACLs are in. Its nodes are
+ * brokers and KRaft's controllers both, 1, or 3 in a quorum, their count set as the log is
+ * made and never changed after, as KRaft's voters are fixed. It is a buffer, not a store:
+ * what it holds is kept for `retention`, the lake keeping what is read from it.
+ */
+const Log = Schema.Struct({
+  image: Image(AUTOMQ_IMAGE),
+  scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false, most: 3 }),
+  retention: defaulted(matching(/^[1-9][0-9]*h$/u, "must be a number of hours, such as 24h"), "24h"),
+  storage: Storage("1Gi"),
+  resources: Resources({ requests: { cpu: "100m", memory: "2Gi" }, limits: { memory: LOG_MEMORY } }),
 });
 
 const Sessions = Schema.Struct({
@@ -450,6 +488,8 @@ const ObjectStore = Schema.Struct({
       backups: defaulted(Bucket, "backups"),
       /** Workspace storage's data; an external store must have it already, as it must the others. */
       workspaces: defaulted(Bucket, "workspaces"),
+      /** The log's partitions and write-ahead log. */
+      log: defaulted(Bucket, "log"),
     }),
     {},
   ),
@@ -673,6 +713,10 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
       issue: `must be at least ${memoryText(2 * filerStoreMaxmemoryBytes(bundled.filerStore.entries))}, twice what its entries take, for the fork that writes its snapshots`,
     };
   }
+  if (config.log.scaling.min === 2) return { path: ["log", "scaling"], issue: "must be 1 or 3: two of KRaft's voters elect no leader once one is gone" };
+  if (memoryBytes(config.log.resources.limits["memory"] ?? "0") < memoryBytes(LOG_MEMORY)) {
+    return { path: ["log", "resources", "limits", "memory"], issue: `must be at least ${LOG_MEMORY}: AutoMQ's smallest tier, a heap of 1 GiB and 1.5 GiB of direct memory, and the JVM's own` };
+  }
   if (config.autoscaling.headroom.scaling.min > 0 && !config.autoscaling.preemption) {
     return { path: ["autoscaling", "headroom", "scaling"], issue: "must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then" };
   }
@@ -700,12 +744,25 @@ const InstallStruct = Schema.Struct({
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
-  /** The analytics lake, loaded from Neon into DuckLake, and its query endpoint, which Grafana and alasio lake read it through. */
+  log: defaulted(Log, {}),
+  /**
+   * The analytics lake, loaded from Neon into DuckLake; its query endpoint, which Grafana
+   * and alasio lake read it through; and its telemetry intake, which writes what the log
+   * holds of the stack's telemetry to it, scaled on how much is waiting there, to none
+   * while nothing is.
+   */
   lake: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
       query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
+      intake: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 0, max: 2 }, { floor: false, scaled: true }),
+          resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
     }),
     {},
   ),
