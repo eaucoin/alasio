@@ -11,6 +11,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -542,6 +543,9 @@ if (inShard("telemetry")) {
       }
       // The object store's volume servers', of their disks, labelled with their pods.
       await untilInLake("metric of the object store's volume servers' disks", metricRows("ServiceName = 'seaweedfs' and MetricName = 'SeaweedFS_volumeServer_resource' and Attributes['pod'] like '%-seaweedfs-volume-%'"));
+      // The log's, its brokers' among them, and its intake's, how far behind it is.
+      await untilInLake("metric of the log's", metricRows("ServiceName = 'log' and MetricName = 'kafka_broker_active_count'"));
+      await untilInLake("metric of the lake's intake's", metricRows("ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records'"));
     });
 
     describe("Grafana", () => {
@@ -568,7 +572,7 @@ if (inShard("telemetry")) {
         const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
         const queryOf = (panel: string) => stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`);
         const services = queryOf("Services now");
-        for (const panel of ["Services now", "The object store's volume servers"]) {
+        for (const panel of ["Services now", "The object store's volume servers", "The log's answers", "Telemetry waiting in the log"]) {
           let rows = 0;
           for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
             const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [queryOf(panel)] }) })).body as {
@@ -603,8 +607,11 @@ if (inShard("telemetry")) {
         const alerts = await untilAlerted();
         assert.deepEqual([...alerts.keys()].sort(), ["1001", String(OTHER_OPERATOR)]);
         for (const [text] of alerts.values()) assert.match(text ?? "", /conversation = telegram:1001/u);
-        const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string }[] }[] } };
-        assert.equal(rules.data.groups.flatMap((group) => group.rules).find(({ name }) => name === "Turns are failing")?.state, "firing");
+        const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string; health: string; lastError?: string }[] }[] } };
+        const evaluated = rules.data.groups.flatMap((group) => group.rules);
+        assert.equal(evaluated.find(({ name }) => name === "Turns are failing")?.state, "firing");
+        // Every rule's query answers: none fails on the lake.
+        assert.deepEqual(evaluated.filter(({ health }) => health === "error").map(({ name, lastError }) => `${name}: ${lastError}`), []);
       });
     });
 
@@ -615,6 +622,121 @@ if (inShard("telemetry")) {
       const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
       const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
       assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
+    });
+
+    describe("through the log", () => {
+      let gateway: Forward | undefined;
+
+      before(async () => {
+        gateway = await kube.forward(NAMESPACE, componentName("collector"), 4318);
+      });
+
+      after(() => {
+        gateway?.close();
+      });
+
+      /** Exports the span `seq` of the run `run` to the collector's gateway, as a producer does: whether it was answered as taken. */
+      const exported = async (run: string, seq: number): Promise<boolean> => {
+        const now = BigInt(Date.now()) * 1_000_000n;
+        const body = {
+          resourceSpans: [{
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "e2e-log" } }] },
+            scopeSpans: [{
+              spans: [{
+                traceId: randomBytes(16).toString("hex"),
+                spanId: randomBytes(8).toString("hex"),
+                name: "e2e.log",
+                kind: 1,
+                startTimeUnixNano: String(now),
+                endTimeUnixNano: String(now + 1000n),
+                attributes: [{ key: "e2e.run", value: { stringValue: run } }, { key: "e2e.seq", value: { intValue: String(seq) } }],
+              }],
+            }],
+          }],
+        };
+        const answered = await fetch(`${gateway?.base}/v1/traces`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) })
+          .then(({ status }) => status, () => 0);
+        return answered === 200;
+      };
+
+      /** Exports the run's spans `from` to `to`, `concurrency` at a time: those answered as taken. */
+      const exportAll = async (run: string, from: number, to: number, concurrency = 1): Promise<number[]> => {
+        const taken: number[] = [];
+        let next = from;
+        await Promise.all(Array.from({ length: concurrency }, async () => {
+          for (let seq = next++; seq < to; seq = next++) if (await exported(run, seq)) taken.push(seq);
+        }));
+        return taken;
+      };
+
+      /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each. */
+      const untilWritten = async (run: string, taken: readonly number[], timeoutMs = 600_000): Promise<Map<number, number>> => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const rows = await lakeQuery(`select SpanAttributes['e2e.seq'] as seq, count(*) as n from otel.traces where ServiceName = 'e2e-log' and SpanAttributes['e2e.run'] = '${run}' group by 1`).catch(() => []);
+          const written = new Map(rows.map((row) => [Number(row["seq"]), Number(row["n"])]));
+          if (taken.every((seq) => written.has(seq))) return written;
+          if (Date.now() > deadline) assert.fail(`of the ${taken.length} spans the gateway took, the lake has ${taken.filter((seq) => written.has(seq)).length}`);
+          await sleep(5000);
+        }
+      };
+
+      test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async () => {
+        const run = randomUUID();
+        const before = await exportAll(run, 0, 40);
+        assert.equal(before.length, 40, "the gateway took every span while the log ran");
+        await kube.kill(NAMESPACE, `${componentName("log")}-0`);
+        // Each export sent on until one is taken again, as a producer sends what was refused again.
+        const during: number[] = [];
+        for (let seq = 40, deadline = Date.now() + 600_000; during.length < 20; seq += 1) {
+          if (Date.now() > deadline) assert.fail("the gateway took no export again within ten minutes of the log's crash");
+          if (await exported(run, seq)) during.push(seq);
+        }
+        const written = await untilWritten(run, [...before, ...during]);
+        assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+      });
+
+      test("the intake's crash, as it gathers or writes a batch, loses nothing and writes nothing twice", async () => {
+        const run = randomUUID();
+        const first = await exportAll(run, 0, 100, 4);
+        // The intake killed as it gathers or writes a batch, whatever it had of the run read again by its successor.
+        await sleep(30_000);
+        await kube.kill(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-intake")));
+        const second = await exportAll(run, 100, 200, 4);
+        assert.equal(first.length + second.length, 200, "the gateway took every span");
+        const written = await untilWritten(run, [...first, ...second]);
+        assert.equal(written.size, 200);
+        assert.deepEqual([...written.entries()].filter(([, n]) => n > 1), [], "no span is written twice");
+      });
+
+      test("the intake wakes from none on what waits in the log, and scales out on a backlog, to as many as the topics have partitions", async (t) => {
+        const scaledObject = ref("ScaledObject", componentName("lake-intake"), NAMESPACE);
+        const intake = ref("Deployment", componentName("lake-intake"), NAMESPACE);
+        // What KEDA, and the HPA it makes, scale it to.
+        const replicas = async () => (await kube.get<V1Deployment>(intake))?.spec?.replicas ?? 0;
+        // Held at none, as while nothing waits.
+        await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
+        try {
+          for (const deadline = Date.now() + 300_000; (await kube.get<V1Deployment>(intake))?.status?.replicas; await sleep(2000)) {
+            if (Date.now() > deadline) assert.fail("the intake did not stop while paused at none");
+          }
+          const run = randomUUID();
+          // Some thousands a partition, as after an outage: KEDA gives it a replica a thousand.
+          const taken = await exportAll(run, 0, 6000, 16);
+          assert.equal(taken.length, 6000);
+          await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
+          let most = 0;
+          for (const deadline = Date.now() + 300_000; most < 2; await sleep(2000)) {
+            if (Date.now() > deadline) assert.fail(`the intake ran ${most} replica(s) at most, on a backlog of 6000 records`);
+            most = Math.max(most, await replicas());
+          }
+          t.diagnostic(`the intake ran ${most} replicas on the backlog`);
+          const written = await untilWritten(run, taken);
+          assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+        } finally {
+          await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
+        }
+      });
     });
   });
 }

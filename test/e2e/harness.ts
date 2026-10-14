@@ -481,7 +481,9 @@ function installation(): Record<string, unknown> {
       compute: { resources: { requests: { cpu: "50m", memory: "256Mi" } } },
       ...on("server-0"),
     },
-    telemetry: { collector: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } },
+    telemetry: { collector: { gateway: { resources: { requests: { cpu: "10m", memory: "64Mi" } } }, scraper: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } } },
+    // The log at its smallest tier, its memory requested below what it may use, so the whole of it schedules.
+    log: { resources: { requests: { cpu: "50m", memory: "1Gi" } } },
     objectStore: {
       bundled: {
         // On three nodes, three masters in Raft, each object kept twice on three volume
@@ -502,7 +504,11 @@ function installation(): Record<string, unknown> {
         filerStore: { resources: { requests: { cpu: "10m", memory: "16Mi" } } },
       },
     },
-    lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } },
+    lake: {
+      resources: { requests: { cpu: "20m", memory: "256Mi" } },
+      query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } },
+      intake: { resources: { requests: { cpu: "20m", memory: "128Mi" } } },
+    },
     // Two, where the run proves Grafana highly available.
     grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "20m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
