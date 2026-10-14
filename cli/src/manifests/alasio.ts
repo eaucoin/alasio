@@ -281,6 +281,13 @@ export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
  * `templates.json`, if it has one): the sessions' profile it ran, where their template
  * changes, or else the one it carried. A profile is carried for one change of the
  * template, and no more. Pure, for tests.
+ *
+ * What it carries is pinned whole into the Sandbox policy (./admission.ts) as a template
+ * alasio may make a Sandbox from, read back from the cluster rather than rendered from the
+ * config: the ConfigMap is the anchor of that trust. It is one as long as only the
+ * operator, by `alasio up`, writes it: alasio's ServiceAccount may write no ConfigMap
+ * (./alasio.ts identity). Were alasio given that, it could write any pod template into
+ * the ConfigMap, and the next `up` would let it make Sandboxes of it.
  */
 export function carriedFrom(config: InstallConfig, live: string | undefined, cpuBaseline: CpuBaseline): Carried {
   const nothing = { ...NOTHING_CARRIED, cpuBaseline };

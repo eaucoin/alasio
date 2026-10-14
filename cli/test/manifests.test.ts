@@ -1941,8 +1941,16 @@ describe("security", () => {
     assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
     assert.ok(sessionsRole(objects).some(({ apiGroups, resources, verbs }) => apiGroups?.join() === "networking.k8s.io" && resources?.join() === "networkpolicies" && verbs.join() === "list"));
-    // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record.
-    assert.ok(!sessionsRole(objects).some(({ resources }) => resources?.includes("configmaps")));
+    // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record: no role of its own lets it write a ConfigMap.
+    const bound = new Set(all<V1RoleBinding>(objects, "RoleBinding").filter(({ subjects }) => subjects?.some(({ kind, name, namespace }) => kind === "ServiceAccount" && name === "alasio" && namespace === "alasio")).map(({ metadata, roleRef }) => `${metadata?.namespace}/${roleRef.name}`));
+    const ofAlasio = ({ subjects }: V1RoleBinding) => subjects?.some(({ kind, name, namespace }) => kind === "ServiceAccount" && name === "alasio" && namespace === "alasio");
+    const clusterBound = new Set(all<V1RoleBinding>(objects, "ClusterRoleBinding").filter(ofAlasio).map(({ roleRef }) => roleRef.name));
+    const alasioRoles = [
+      ...all<V1Role>(objects, "Role").filter(({ metadata }) => bound.has(`${metadata?.namespace}/${metadata?.name}`)),
+      ...all<V1Role>(objects, "ClusterRole").filter(({ metadata }) => clusterBound.has(metadata?.name ?? "")),
+    ];
+    assert.ok(alasioRoles.length > 0);
+    assert.ok(!alasioRoles.some(({ rules }) => rules?.some(({ resources, verbs }) => resources?.includes("configmaps") && verbs.some((verb) => verb !== "get" && verb !== "list" && verb !== "watch"))));
     // Until alasio up records a CPU baseline, nothing is snapshotted, though the agents run to say what their nodes have.
     const unheld = install({}, null);
     assert.equal(sessions(unheld).snapshots, undefined);
