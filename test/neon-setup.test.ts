@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { X509Certificate } from "node:crypto";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
 
+import { makeCertificate, RENEW_DAYS, VALID_DAYS, webhookCertificate } from "../neon/control/certificate.ts";
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import type { SeaweedS3Config, StackSecrets, StoredSecrets } from "../neon/control/secrets.ts";
@@ -22,6 +24,7 @@ const ENV = {
   WORKSPACES_TRASH_DAYS: "1",
   VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
   WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
+  WEBHOOK_ADDRESS: "203.0.113.10",
 };
 
 /** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
@@ -75,7 +78,9 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.s3Region, "us-east-1");
   assert.equal(config.neonBucket, "neon");
   assert.equal(config.external, false);
-  assert.throws(() => setupConfig({ ...ENV, NEON_COMPUTE_HOST: "" }), /NEON_COMPUTE_HOST must be set/);
+  // Without Neon, none of its hosts; with it, every one.
+  assert.equal(setupConfig({ ...ENV, NEON_COMPUTE_HOST: "" }).neon, null);
+  assert.throws(() => setupConfig({ ...ENV, NEON_BROKER_URL: "" }), /NEON_BROKER_URL must be set/);
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
   const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" });
   assert.ok(external.external);
@@ -123,16 +128,16 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(value(kube, names.log, "KAFKA_S3_SECRET_KEY"), root.s3.log.secretKey);
   assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
   assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
-  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["gateway", "intake", "scaler"]);
-  assert.deepEqual(names.logPrincipals, { gateway: "q-log-gateway", intake: "q-log-intake", scaler: "q-log-scaler" });
-  for (const principal of ["gateway", "intake", "scaler"] as const) {
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "scaler", "webhook"]);
+  assert.deepEqual(names.logPrincipals, { "gateway": "q-log-gateway", "intake": "q-log-intake", "scaler": "q-log-scaler", "webhook": "q-log-webhook", "alasio-main": "q-log-alasio-main" });
+  for (const principal of ["gateway", "intake", "scaler", "webhook", "alasio-main"] as const) {
     assert.equal(value(kube, names.logAccess, principal), root.log[principal]);
     assert.equal(value(kube, names.logPrincipals[principal], "username"), principal);
     assert.equal(value(kube, names.logPrincipals[principal], "password"), root.log[principal]);
   }
   assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
   assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
-  assert.equal(new Set(Object.values(root.log)).size, 4);
+  assert.equal(new Set(Object.values(root.log)).size, 6);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -178,6 +183,32 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, every.length);
 });
 
+test("the webhook intake's certificate is made for its address, kept while it serves it, and made anew for another", async () => {
+  const kube = fakeKube();
+  const names = secretNames("q");
+  await setupKube({ kube, config: setupConfig(ENV), log: () => {} });
+  const first = value(kube, names.webhookTls, "tls.crt");
+  assert.equal(new X509Certificate(first).subjectAltName, "IP Address:203.0.113.10");
+  assert.match(value(kube, names.webhookTls, "tls.key"), /^-----BEGIN PRIVATE KEY-----/u);
+  await setupKube({ kube, config: setupConfig(ENV), log: () => {} });
+  assert.equal(value(kube, names.webhookTls, "tls.crt"), first);
+  await setupKube({ kube, config: setupConfig({ ...ENV, WEBHOOK_ADDRESS: "bot.example.com" }), log: () => {} });
+  assert.equal(new X509Certificate(value(kube, names.webhookTls, "tls.crt")).subjectAltName, "DNS:bot.example.com");
+});
+
+test("a certificate is made anew within its last days, and one that does not parse at once", () => {
+  const made = makeCertificate("203.0.113.10");
+  const certificate = new X509Certificate(made.cert);
+  assert.equal(certificate.subject, "CN=203.0.113.10");
+  assert.equal(Math.round((Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 86_400_000), VALID_DAYS);
+  const fresh = () => ({ cert: "new", key: "new" });
+  const at = (days: number) => new Date(Date.parse(certificate.validTo) - days * 86_400_000);
+  assert.equal(webhookCertificate("203.0.113.10", made, at(RENEW_DAYS + 1), fresh).made, false);
+  assert.equal(webhookCertificate("203.0.113.10", made, at(RENEW_DAYS - 1), fresh).made, true);
+  assert.equal(webhookCertificate("203.0.113.11", made, at(RENEW_DAYS + 1), fresh).made, true);
+  assert.deepEqual(webhookCertificate("203.0.113.10", { cert: "x", key: "y" }, new Date(), fresh), { certificate: fresh(), made: true });
+});
+
 test("a root predating a secret gains it without losing the rest", async () => {
   const kube = fakeKube();
   const config = setupConfig(ENV);
@@ -215,7 +246,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     filerStoreCollectorPassword: "c",
     filerStoreBackupPassword: "b",
     logClusterId: "cluster",
-    log: { admin: "la", gateway: "lg", intake: "li", scaler: "ls" },
+    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm" },
   };
 }
 
@@ -234,6 +265,7 @@ test("with an external object store, every service uses its credentials and no S
     secrets: stackSecrets({ accessKey: "bundled-key", secretKey: "bundled-secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
     config,
   });
   const names = secretNames("q");
@@ -251,11 +283,27 @@ test("with an external object store, every service uses its credentials and no S
   assert.equal(rendered[names.workspaces]?.["secret-key"], "SK");
 });
 
+test("without Neon, the object store's, the log's and workspace storage's Secrets are made, and none of Neon's", () => {
+  const rendered = renderSecrets({
+    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
+    privateKeyPem: generateKeyPair().privateKeyPem,
+    publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
+    config: setupConfig({ ...ENV, NEON_BROKER_URL: "", NEON_CONTROLLER_URL: "", NEON_PAGESERVER_HOST: "", NEON_COMPUTE_HOST: "", NEON_CONTROLLER_DB_HOST: "" }),
+  });
+  const names = secretNames("q");
+  assert.deepEqual(Object.keys(rendered).sort(), [
+    names.root, names.s3Admin, names.log, names.logAccess, ...Object.values(names.logPrincipals), names.valkey, names.workspaces, names.seaweedfs,
+    names.filerStoreFiler, names.filerStoreCollector, names.filerStoreBackup, names.webhookTls,
+  ].sort());
+});
+
 test("without workspace storage, neither its Secrets nor its identity are made", () => {
   const rendered = renderSecrets({
     secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
     config: setupConfig({ ...ENV, WORKSPACES_NAME: "" }),
   });
   const names = secretNames("q");

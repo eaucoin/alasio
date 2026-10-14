@@ -1,0 +1,10 @@
+{
+  "name": "alasio-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "alasio's webhook intake: Telegram's updates for each environment's bot, checked, into the log",
+  "dependencies": {
+    "@platformatic/kafka": "2.14.0"
+  }
+}

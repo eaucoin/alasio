@@ -22,6 +22,7 @@ import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/n
 import type { HostProfile, SessionsProfile } from "../../../src/kube/config.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { environmentAccess, environmentLogSecret, environmentName, LOG_BROKERS } from "./automq.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -277,6 +278,12 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_LAKE_PASSWORD_FILE", value: "/run/alasio/database/lake-password" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
+    // Its Telegram updates: its environment's topic, read in its group as its principal.
+    { name: "ALASIO_LOG_BROKERS", value: LOG_BROKERS },
+    { name: "ALASIO_LOG_USERNAME", valueFrom: { secretKeyRef: { name: environmentLogSecret(environment), key: "username" } } },
+    { name: "ALASIO_LOG_PASSWORD_FILE", value: "/run/alasio/log/password" },
+    { name: "ALASIO_TELEGRAM_TOPIC", value: environmentAccess(environmentName(environment)).topic.name },
+    { name: "ALASIO_TELEGRAM_GROUP", value: environmentAccess(environmentName(environment)).group },
     { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
     { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),
@@ -291,8 +298,9 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
 }
 
 /**
- * alasio's Deployment: one replica, as Telegram's updates have one poller, so an update
- * stops the old pod before the new one starts. It keeps no volume: its state is in Neon,
+ * alasio's Deployment: one replica, the one member of its group on its topic's one
+ * partition, which its turns run in, so an update stops the old pod before the new one
+ * starts. It keeps no volume: its state is in Neon,
  * and what it writes to disk (received files written for the agent, its home unless it
  * is the operator's) is written again as needed, on emptyDirs. Under the
  * host profile it runs as the operator, in their home, with the machine's mounts. A
@@ -344,6 +352,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
               ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
               { name: "templates", mountPath: "/etc/alasio", readOnly: true },
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
+              { name: "log", mountPath: "/run/alasio/log", readOnly: true },
               ...branchSecret.map(({ name }) => ({ name, mountPath: BRANCH_SECRETS, readOnly: true })),
               ...(host.enabled ? hostVolumeMounts(config) : []),
             ],
@@ -359,6 +368,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
                 items: ["url", "lake-password", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
+            { name: "log", secret: { secretName: environmentLogSecret(environment), items: [{ key: "password", path: "password" }] } },
             ...branchSecret,
             ...(host.enabled ? hostVolumes(config) : []),
           ],

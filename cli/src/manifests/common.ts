@@ -134,11 +134,6 @@ export function lakeRuns(config: InstallConfig): boolean {
   return config.lake.enabled && config.neon.enabled;
 }
 
-/** Whether the log runs (./automq.ts): beside the lake, whose telemetry it carries, on the object store. */
-export function logRuns(config: InstallConfig): boolean {
-  return lakeRuns(config);
-}
-
 /** Whether Grafana runs (./grafana.ts): when it is on, beside the lake, which it reads. */
 export function grafanaRuns(config: InstallConfig): boolean {
   return config.grafana.enabled && lakeRuns(config);

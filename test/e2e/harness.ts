@@ -53,6 +53,7 @@ import {
 } from "@kubernetes/client-node";
 import { type Duration, Effect, Stream } from "effect";
 
+import { subnetAddress } from "../../cli/src/cluster/docker.ts";
 import { kind, type KindName, KubeApi, type ListOptions, type ObjectRef } from "../../cli/src/kube/api.ts";
 import { awaitReady, podProblems, selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
@@ -73,6 +74,9 @@ export const AGENTS = Number(process.env["ALASIO_E2E_AGENTS"] ?? 0);
 export const KEEP = process.env["ALASIO_E2E_KEEP"] === "1";
 /** The cluster in Docker: one of its own for each number of agents, so runs of each can be kept side by side. */
 export const CLUSTER = `alasio-e2e-${AGENTS}`;
+
+/** The subnet of the cluster in Docker, its server node's address the second: where the Telegram stand-in delivers to the webhook intake. */
+const DOCKER_SUBNET = `172.31.${200 + AGENTS}.0/24`;
 /** The cluster, as alasio names it in what it says. */
 const THE_CLUSTER = TARGET === "host" ? "k3s on this machine" : `the cluster ${CLUSTER}`;
 /**
@@ -126,7 +130,7 @@ export const inShard = (shard: Shard): boolean => SHARD === undefined || SHARD =
  * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
  * (./codex-stand-in.Dockerfile), built on it.
  */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-webhook": "webhook", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
 
 /** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
 const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
@@ -459,7 +463,7 @@ function installation(): Record<string, unknown> {
   const pushed = (name: keyof typeof IMAGES) => ({ ...pulledOf(name), digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
-    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
+    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), webhook: pushed("alasio-webhook"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
@@ -481,6 +485,8 @@ function installation(): Record<string, unknown> {
       compute: { resources: { requests: { cpu: "50m", memory: "256Mi" } } },
       ...on("server-0"),
     },
+    // In Docker, the server node's address, where the intake is; on the machine, the one alasio init finds.
+    webhook: { ...(TARGET === "docker" ? { publicAddress: subnetAddress(DOCKER_SUBNET, 2) } : {}), resources: { requests: { cpu: "10m", memory: "32Mi" } } },
     telemetry: { collector: { gateway: { resources: { requests: { cpu: "10m", memory: "64Mi" } } }, scraper: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } } },
     // The log at its smallest tier, its memory requested below what it may use, so the whole of it schedules.
     log: { resources: { requests: { cpu: "50m", memory: "1Gi" } } },
@@ -550,6 +556,8 @@ export async function setUp(): Promise<void> {
         name: CLUSTER,
         apiPort: await freePort(),
         storagePath: storage,
+        // A subnet of the run's own, whose server node's address the webhook intake is reached at (DOCKER_SUBNET).
+        subnet: DOCKER_SUBNET,
         agents: AGENTS,
         image: NODE_IMAGE,
         ...(PUSHED ? {} : { registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } } }),
@@ -581,7 +589,7 @@ export async function setUp(): Promise<void> {
 
   if (!PUSHED) {
     const pushHost = await startRegistry();
-    for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana"] as const) await push(pushHost, name);
+    for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-webhook"] as const) await push(pushHost, name);
     // On alasio's image, which its build pulls back from the registry.
     await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }
@@ -594,6 +602,9 @@ export async function setUp(): Promise<void> {
     "5 minutes",
   );
 
+  // The command line asks the Telegram stand-in what it would ask Telegram: main's bot is registered with it as alasio up runs.
+  const botApi = await kube.forward(STAND_INS, TELEGRAM.service, TELEGRAM.port);
+  setup = { ...current(), env: { ...current().env, TELEGRAM_API_ROOT: botApi.base } };
   await alasioOk("up", "--timeout", "20m");
   await trustTelegramStandIn();
 }

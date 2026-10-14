@@ -12,8 +12,7 @@ import { Store } from "../src/persistence/store.ts";
 import { TelegramTransportError } from "../src/telegram/client.ts";
 import { ReceivedFiles } from "../src/telegram/files.ts";
 import { handleMessage, TELEGRAM_BOT_FILE_LIMIT_BYTES } from "../src/telegram/message-handler.ts";
-import { pollUpdates } from "../src/telegram/update-poller.ts";
-import { botApiLayer, paramsOf } from "./support/bot-api.ts";
+import { consumeUpdates, TelegramUpdates, type UpdateFeed } from "../src/telegram/update-consumer.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
@@ -92,30 +91,61 @@ test("a file a message carries is kept in the store, and written where its promp
   }
 });
 
-test("the poller advances past an update whose processing throws", async () => {
-  const store = await testStore();
+test("updates are taken from the topic in turn, the group told of each once it is handled, past one whose handling throws", async () => {
   const seen: number[] = [];
+  const committed: number[] = [];
   const errors: string[] = [];
-  const offsets: (number | undefined)[] = [];
-  const { promise: polledAgain, resolve: pollAgain } = Promise.withResolvers<void>();
-  const telegram = botApiLayer(async (call) => {
-    offsets.push(paramsOf(call, "getUpdates").offset);
-    if (offsets.length === 1) return [{ update_id: 100 }, { update_id: 101 }];
-    pollAgain();
-    return await new Promise<never>(() => {}); // a long poll that lasts until polling stops
-  });
+  const records = [{ update_id: 100 }, { update_id: 101 }, null].map((update, index) => ({
+    update,
+    position: `telegram.main/0/${index}`,
+    commit: async () => {
+      committed.push(index);
+    },
+  }));
+  const { promise: drained, resolve: drain } = Promise.withResolvers<void>();
+  const feed: UpdateFeed = {
+    next: async () => records.shift() ?? (drain(), await new Promise<never>(() => {})), // a wait that lasts until consuming stops
+    close: async () => {},
+  };
   const logged = Logger.layer([Logger.make(({ message }) => errors.push(Arr.ensure(message).join(" ")))]);
-  const poller = Effect.runFork(pollUpdates((update) =>
+  const consumer = Effect.runFork(consumeUpdates((update) =>
     Effect.suspend(() => {
       seen.push(update.update_id);
       return update.update_id === 100 ? Effect.die(new Error("poison")) : Effect.void;
     })
-  ).pipe(Effect.provide([telegram, Layer.succeed(Store, store), logged])));
-  await polledAgain;
-  await Effect.runPromise(Fiber.interrupt(poller));
-  assert.deepEqual(offsets, [undefined, 102]);
+  ).pipe(Effect.provide([Layer.succeed(TelegramUpdates, TelegramUpdates.of({ join: Effect.succeed(feed) })), logged])));
+  await drained;
+  await Effect.runPromise(Fiber.interrupt(consumer));
   assert.deepEqual(seen, [100, 101]);
-  assert.equal(await run(store.getTelegramOffset), 102);
-  assert.equal(errors.length, 1);
+  assert.deepEqual(committed, [0, 1, 2]);
+  assert.equal(errors.length, 2);
   assert.match(errors[0] ?? "", /Skipping update 100 after processing failure: Error: poison/);
+  assert.match(errors[1] ?? "", /Skipping telegram\.main\/0\/2, which is no update of Telegram's/);
+});
+
+test("a member of the group that fails is left, and the group joined again", async () => {
+  let joins = 0;
+  const { promise: rejoined, resolve: rejoin } = Promise.withResolvers<void>();
+  const consumer = Effect.runFork(consumeUpdates(() => Effect.void).pipe(Effect.provide([
+    Layer.succeed(TelegramUpdates, TelegramUpdates.of({
+      join: Effect.suspend(() => {
+        joins += 1;
+        if (joins === 2) rejoin();
+        return Effect.succeed({ next: async () => { throw new Error("the broker went away"); }, close: async () => {} } satisfies UpdateFeed);
+      }),
+    })),
+    Logger.layer([]),
+  ])));
+  await rejoined;
+  await Effect.runPromise(Fiber.interrupt(consumer));
+  assert.equal(joins, 2);
+});
+
+test("an update kept and processed before is known as such, and one kept but not processed is not", async () => {
+  const store = await testStore();
+  const update = { update_id: 77, message: { message_id: 1, date: 0, chat: CHAT, from: OPERATOR, text: "hi" } } as const;
+  assert.equal(await run(store.recordTelegramUpdate(update)), true);
+  assert.equal(await run(store.recordTelegramUpdate(update)), true);
+  await run(store.markTelegramUpdateProcessed(77));
+  assert.equal(await run(store.recordTelegramUpdate(update)), false);
 });

@@ -42,7 +42,7 @@ import type {
 
 import { HISTORY_DAYS } from "../../../neon/control/branches.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, labels, logRuns, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, labels, NAMESPACE, neonName, replicasOf, restrictedContainer, scaled, script, selectorLabels, stackLabels, stackPodSpec } from "./common.ts";
 import { filerStoreMaxmemoryBytes, type InstallConfig, type Scale } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -396,7 +396,7 @@ function filerStoreObjects(config: InstallConfig): KubernetesObject[] {
 function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { bundled, buckets } = config.objectStore;
   const { scaling } = bundled.gateways;
-  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), ...(logRuns(config) ? [buckets.log] : [])];
+  const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), buckets.log];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {
@@ -812,9 +812,9 @@ export function filerStoreRestore(config: InstallConfig, file: string): Kubernet
   return [service, source, restore];
 }
 
-/** The bundled object store's objects, when it runs, which is beside Neon. */
+/** The bundled object store's objects, when it runs, with Neon or without it. */
 export function objectStoreObjects(config: InstallConfig): KubernetesObject[] {
-  if (!config.neon.enabled || !config.objectStore.bundled.enabled) return [];
+  if (!config.objectStore.bundled.enabled) return [];
   return [
     ...masterObjects(config),
     ...volumeServerObjects(config),

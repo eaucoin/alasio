@@ -69,7 +69,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # All five at once, each line said with its image's name, the node image with its pins
+      # All six at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), and on alasio's, alasio-codex-stand-in, which the end-to-end
       # runs install (test/e2e/codex-stand-in.Dockerfile); the step fails if any did.
       - id: push
@@ -80,7 +80,7 @@ jobs:
           SOURCE: https://github.com/${{ github.repository }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-webhook:webhook" "alasio-node:cluster/node"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)

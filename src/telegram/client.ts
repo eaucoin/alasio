@@ -12,7 +12,6 @@ import type {
   MenuButton,
   Message,
   Opts,
-  Update,
 } from "@grammyjs/types";
 import { Clock, Config, Context, Effect, Layer, Schema, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
@@ -87,12 +86,6 @@ export interface Upload {
   readonly name: string;
   readonly fileName: string;
   readonly content: Uint8Array;
-}
-
-export interface GetUpdatesOptions {
-  readonly offset?: number | undefined;
-  readonly timeout?: number | undefined;
-  readonly allowedUpdates?: BotParams<"getUpdates">["allowed_updates"] | undefined;
 }
 
 /** A Telegram file downloaded, whole. */
@@ -239,14 +232,8 @@ export class TelegramClient extends Context.Service<TelegramClient, {
    */
   readonly callMultipart: <M extends BotMethod>(method: M, fields: BotParams<M>, files: readonly Upload[]) => Effect.Effect<BotResult<M>, TelegramError>;
   readonly getMe: Effect.Effect<BotResult<"getMe">, TelegramError>;
-  readonly deleteWebhook: (dropPendingUpdates?: boolean) => Effect.Effect<BotResult<"deleteWebhook">, TelegramError>;
   readonly setMyCommands: (commands: readonly BotCommand[]) => Effect.Effect<BotResult<"setMyCommands">, TelegramError>;
   readonly setChatMenuButton: (menuButton?: MenuButton) => Effect.Effect<BotResult<"setChatMenuButton">, TelegramError>;
-  /**
-   * A long poll: it lasts as long as Telegram has nothing to deliver, which says nothing
-   * of the Bot API's latency, so it is sent without a span or a duration.
-   */
-  readonly getUpdates: (options?: GetUpdatesOptions) => Effect.Effect<readonly Update[], TelegramError>;
   /**
    * Sends text, after the messages sent or edited before it. `format` is "markdown" (the
    * default: a Markdown subset as Telegram HTML), "plain", or "rich": Markdown as Telegram
@@ -427,11 +414,8 @@ const makeTelegramClient = Effect.fnUntraced(function*(token: string): Effect.fn
     call,
     callMultipart,
     getMe: call("getMe"),
-    deleteWebhook: (dropPendingUpdates = false) => call("deleteWebhook", { drop_pending_updates: dropPendingUpdates }),
     setMyCommands: (commands) => call("setMyCommands", { commands }),
     setChatMenuButton: (menuButton = { type: "commands" }) => call("setChatMenuButton", { menu_button: menuButton }),
-    getUpdates: ({ offset, timeout = 50, allowedUpdates = ["message", "callback_query"] } = {}) =>
-      send("getUpdates", () => jsonBody({ offset, timeout, allowed_updates: allowedUpdates }), { traced: false, rateLimitRetries: 3 }),
     sendMessage: (chatId, text, options = {}) =>
       outbound.withPermit(options.format === "rich" ? sendRichParts(chatId, text, options) : sendTextChunks(chatId, text, options)),
     editMessageText: (chatId, messageId, text, options = {}) => {

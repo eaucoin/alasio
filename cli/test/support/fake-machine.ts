@@ -27,6 +27,24 @@ export interface RanCommand {
 /** What k3s's install script makes, and its uninstall script removes, beside what alasio wrote. */
 const K3S_FILES = ["/usr/local/bin/k3s-killall.sh", "/usr/local/bin/k3s-uninstall.sh", "/etc/systemd/system/k3s.service"] as const;
 
+/** ufw's rule of `args`, `allow from N to any` or `route allow proto tcp from N to any port P`: N, or `N P/tcp`. */
+function ufwRule(args: readonly string[]): string {
+  const from = args[args.indexOf("from") + 1] ?? "";
+  return args.includes("port") ? `${from} ${args[args.indexOf("port") + 1]}/tcp` : from;
+}
+
+/** How `ufw show added` says `rule`, as it was added. */
+function shownUfwRule(rule: string): string {
+  const [network, port] = rule.split(" ");
+  return port ? `ufw route allow proto tcp from ${network} to any port ${port.replace("/tcp", "")}` : `ufw allow from ${network}`;
+}
+
+/** firewalld's rich rule of `arg`, `--<verb>-rich-rule=…` of a source to a port, a verb of `verbs`: the argument, its verb, and `N P/tcp`. */
+function richRule(arg: string, verbs: string): [string, string, string] | null {
+  const rule = new RegExp(`^--(${verbs})-rich-rule=rule family="ipv4" source address="([^"]+)" port port="(\\d+)" protocol="tcp" accept$`, "u").exec(arg);
+  return rule ? [arg, rule[1] ?? "", `${rule[2]} ${rule[3]}/tcp`] : null;
+}
+
 export class FakeMachine {
   /** The directory that stands for its root. */
   readonly root: string;
@@ -37,9 +55,9 @@ export class FakeMachine {
   unit: UnitState = { loaded: false, active: "inactive", enabled: false };
   /** firewalld's service. */
   firewalld: UnitState = { loaded: false, active: "inactive", enabled: false };
-  /** The networks ufw lets in, by a rule of its own, when it is enabled. */
+  /** What ufw lets in, by a rule of its own, when it is enabled: a network whole, or `<network> <port>/tcp`, routed to a pod's port. */
   readonly ufwRules = new Set<string>();
-  /** The sources of firewalld's trusted zone, permanent, and how many times it was reloaded. */
+  /** The sources of firewalld's trusted zone, and `<network> <port>/tcp` of its rich rules, permanent; and how many times it was reloaded. */
   readonly trusted = new Set<string>();
   reloads = 0;
   /** The kubeconfig k3s writes as it starts. */
@@ -112,11 +130,11 @@ export class FakeMachine {
   /** What `ran` does to k3s and the firewall, as k3s's scripts, systemd, ufw and firewalld would. */
   act({ command, args, env }: RanCommand): void {
     const [verb, ...rest] = args;
-    const source = /^--(add|remove)-source=(.+)$/u.exec(args.at(-1) ?? "");
-    if (command === "ufw" && verb === "allow") {
-      this.ufwRules.add(args[2] ?? "");
+    const source = /^--(add|remove)-source=(.+)$/u.exec(args.at(-1) ?? "") ?? richRule(args.at(-1) ?? "", "add|remove");
+    if (command === "ufw" && (verb === "allow" || verb === "route")) {
+      this.ufwRules.add(ufwRule(args));
     } else if (command === "ufw" && verb === "delete") {
-      this.ufwRules.delete(args[3] ?? "");
+      this.ufwRules.delete(ufwRule(rest));
     } else if (command === "firewall-cmd" && verb === "--reload") {
       this.reloads += 1;
     } else if (command === "firewall-cmd" && source) {
@@ -142,10 +160,10 @@ export class FakeMachine {
   /** What `command` answers: ufw's rules, or whether firewalld's trusted zone has a source. */
   private answer(command: string, args: readonly string[]): Answer {
     if (command === "ufw" && args.join(" ") === "show added") {
-      return { exitCode: 0, stdout: ["Added user rules (see 'ufw status' for running firewall):", ...[...this.ufwRules].map((network) => `ufw allow from ${network}`), ""].join("\n") };
+      return { exitCode: 0, stdout: ["Added user rules (see 'ufw status' for running firewall):", ...[...this.ufwRules].map(shownUfwRule), ""].join("\n") };
     }
-    const query = /^--query-source=(.+)$/u.exec(args.at(-1) ?? "");
-    if (command === "firewall-cmd" && query) return { exitCode: this.trusted.has(query[1] ?? "") ? 0 : 1, stdout: "" };
+    const query = /^--query-source=(.+)$/u.exec(args.at(-1) ?? "")?.[1] ?? richRule(args.at(-1) ?? "", "query")?.[2];
+    if (command === "firewall-cmd" && query) return { exitCode: this.trusted.has(query) ? 0 : 1, stdout: "" };
     return { exitCode: 1, stdout: "" };
   }
 

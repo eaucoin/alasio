@@ -3,12 +3,13 @@
  * Secrets alasio names as the cluster has them, made into its objects (its namespace,
  * which its Secrets are in before anything else of it is, and its manifests), checked
  * against the cluster's autoscalers and its object store's layout and scale, applied, and
- * waited for.
+ * waited for; main's route given the webhook intake before it starts, and main's bot
+ * registered with Telegram once it serves it (./webhook.ts).
  */
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
-import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
@@ -18,6 +19,8 @@ import { labels, NAMESPACE } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { manifests } from "./manifests/index.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
+import type { TelegramBotApi, WebhookError } from "./telegram.ts";
+import { ensureRoute, registerBot, type WebhookNotServing } from "./webhook.ts";
 
 /** alasio's namespace. */
 const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: NAMESPACE, labels: labels("alasio") } };
@@ -32,6 +35,13 @@ export const applyNamespace: Effect.Effect<void, KubeApiError, KubeApi> = Effect
   Effect.asVoid,
 );
 
+/** The configuration names no address for Telegram to deliver to. */
+export class PublicAddressNotSet extends Schema.TaggedError<PublicAddressNotSet>()("PublicAddressNotSet", {}) {
+  override get message(): string {
+    return "install.webhook.publicAddress is not set: the address Telegram delivers the bot's updates to, which the webhook intake's certificate is made for; alasio init asks for it";
+  }
+}
+
 /** The cluster has no bot's Secret: alasio has not been given its bot. */
 export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) {
   override get message(): string {
@@ -42,7 +52,7 @@ export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) 
 /** The install configuration of `config`, which names Claude Code's Secret when the cluster has it. */
 export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
-  const install = installConfigOf(config.install, { claude, shared: sharedCluster(config.target) });
+  const install = installConfigOf(config.install, { claude, target: targetKind(config.target) });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   return install.success;
 });
@@ -57,14 +67,21 @@ export interface Installed {
 export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
-): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
+): Effect.fn.Return<
+  Installed,
+  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | PublicAddressNotSet | OperatorConfigError | WebhookNotServing | WebhookError,
+  KubeApi | TelegramBotApi
+> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
+  if (!settings.webhook.publicAddress) return yield* new PublicAddressNotSet();
   const objects = installationObjects(settings);
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
+  const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
+  yield* registerBot(settings, "main", bot, route, options);
   return { bot, claude: settings.alasio.claude.existingSecret !== "" };
 });

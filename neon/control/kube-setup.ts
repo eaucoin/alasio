@@ -1,23 +1,27 @@
 /**
- * Prepares alasio's Neon on Kubernetes, as a Job that runs before the stack starts: the
- * secrets it runs on, made once and kept in one Secret, and what each service is given
- * from them, as a Secret of its own, rendered from them on every install and upgrade.
- * Idempotent, and never rotating.
+ * Prepares alasio's stack on Kubernetes, as a Job that runs before it starts: the secrets
+ * it runs on, made once and kept in one Secret, and what each service is given from them,
+ * as a Secret of its own, rendered from them on every install and upgrade: the object
+ * store's, the log's, workspace storage's, and Neon's where it runs. Idempotent, and never
+ * rotating.
  *
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
- * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
- * NEON_COMPUTE_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
+ * name begins with); where Neon runs, NEON_BROKER_URL, NEON_CONTROLLER_URL,
+ * NEON_PAGESERVER_HOST, NEON_COMPUTE_HOST and NEON_CONTROLLER_DB_HOST, without which Neon's
+ * Secrets are not made; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON, S3_BUCKET_LAKE and S3_BUCKET_LOG (neon, lake and log unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities, and its filers' store's users' passwords, are made here otherwise. With workspace
  * storage on, WORKSPACES_NAME (its JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
  * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
  * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
- * alasio keeps them while its volumes remain).
+ * alasio keeps them while its volumes remain). WEBHOOK_ADDRESS, the address Telegram
+ * delivers to, which the webhook intake's certificate is made for (./certificate.ts).
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 
 import { BRANCHES_SCOPE } from "./branches.ts";
+import { type Certificate, webhookCertificate } from "./certificate.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
 import {
   completeSecrets,
@@ -61,6 +65,8 @@ export interface SecretNames {
   log: string;
   logAccess: string;
   logPrincipals: Record<LogPrincipal, string>;
+  /** The webhook intake's certificate and key. */
+  webhookTls: string;
 }
 
 /** Workspace storage, as the setup makes its Secrets. */
@@ -79,14 +85,20 @@ export type SetupConfig = SetupConfigBase & (
   | { external: true; accessKey: string; secretKey: string }
 );
 
-interface SetupConfigBase {
-  namespace: string;
-  prefix: string;
+/** Where Neon's services are, as its Secrets are made for. */
+export interface NeonHosts {
   brokerUrl: string;
   controllerUrl: string;
   pageserverHost: string;
   computeHost: string;
   controllerDbHost: string;
+}
+
+interface SetupConfigBase {
+  namespace: string;
+  prefix: string;
+  /** Null when Neon does not run, alasio's database being the operator's. */
+  neon: NeonHosts | null;
   s3Endpoint: string;
   s3Region: string;
   neonBucket: string;
@@ -94,12 +106,16 @@ interface SetupConfigBase {
   logBucket: string;
   /** Null when workspace storage is off. */
   workspaces: WorkspacesConfig | null;
+  /** The address Telegram delivers to, which the webhook intake's certificate is made for. */
+  webhookAddress: string;
 }
 
 /** What renderSecrets renders from. */
 export interface RenderSecretsOptions extends KeyPair {
   secrets: StackSecrets;
   config: SetupConfig;
+  /** The webhook intake's certificate, which setupKube keeps or makes anew (./certificate.ts). */
+  webhookTls: Certificate;
 }
 
 /** Each Secret's string data, by the Secret's name. */
@@ -144,6 +160,7 @@ export function secretNames(prefix: string): SecretNames {
     log: `${prefix}-log`,
     logAccess: `${prefix}-log-access`,
     logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
+    webhookTls: `${prefix}-webhook-tls`,
   };
 }
 
@@ -151,7 +168,7 @@ export function secretNames(prefix: string): SecretNames {
  * What each service is given, by Secret name, from the stack's `secrets` and keys and
  * the deployment's `config` (the environment above, as an object). Pure, for tests.
  */
-export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: RenderSecretsOptions): RenderedSecrets {
+export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, webhookTls }: RenderSecretsOptions): RenderedSecrets {
   const names = secretNames(config.prefix);
   const token = (scope: string, tenantId?: string) => signToken(privateKeyPem, scope, tenantId);
   const s3 = (identity: S3Identity): S3Credentials => (config.external
@@ -159,12 +176,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     : secrets.s3[identity]);
   const aws = (identity: S3Identity) => ({ AWS_ACCESS_KEY_ID: s3(identity).accessKey, AWS_SECRET_ACCESS_KEY: s3(identity).secretKey });
   const storage = (prefix: string) => remoteStorage(prefix, { endpoint: config.s3Endpoint, bucket: config.neonBucket, region: config.s3Region });
-  const rendered: RenderedSecrets = {
-    [names.root]: {
-      "secrets.json": JSON.stringify(secrets, null, 2) + "\n",
-      "auth_private_key.pem": privateKeyPem,
-      [PUBLIC_KEY]: publicKeyPem,
-    },
+  /** Neon's services', the lake's, Grafana's and branch environments', where Neon runs. */
+  const neonSecrets = (neon: NeonHosts): RenderedSecrets => ({
     [names.safekeeper]: {
       ...aws("neon"),
       REMOTE_STORAGE: storage("safekeeper"),
@@ -177,10 +190,10 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       // What it presents to the safekeepers it streams WAL from.
       NEON_AUTH_TOKEN: token("safekeeperdata"),
       "identity.toml": `id=${PAGESERVER_ID}\n`,
-      "metadata.json": pageserverMetadata(config.pageserverHost),
+      "metadata.json": pageserverMetadata(neon.pageserverHost),
       "pageserver.toml": pageserverToml({
-        brokerUrl: config.brokerUrl,
-        controllerUrl: config.controllerUrl,
+        brokerUrl: neon.brokerUrl,
+        controllerUrl: neon.controllerUrl,
         token: token("generations_api"),
         publicKeyPath: `/data/.neon/${PUBLIC_KEY}`,
         storage: storage("pageserver"),
@@ -188,7 +201,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       [PUBLIC_KEY]: publicKeyPem,
     },
     [names.storageController]: {
-      DATABASE_URL: `postgresql://storage_controller:${encodeURIComponent(secrets.controllerDbPassword)}@${config.controllerDbHost}:5432/storage_controller`,
+      DATABASE_URL: `postgresql://storage_controller:${encodeURIComponent(secrets.controllerDbPassword)}@${neon.controllerDbHost}:5432/storage_controller`,
       PAGESERVER_JWT_TOKEN: token("pageserverapi"),
       SAFEKEEPER_JWT_TOKEN: token("safekeeperdata"),
       CONTROL_PLANE_JWT_TOKEN: token("admin"),
@@ -196,10 +209,9 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       [PUBLIC_KEY]: publicKeyPem,
     },
     [names.controllerDb]: { POSTGRES_PASSWORD: secrets.controllerDbPassword },
-    [names.s3Admin]: aws("admin"),
     [names.compute]: { NEON_CONTROL_PLANE_TOKEN: secrets.computeControlToken },
     [names.database]: {
-      url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${config.computeHost}:55433/${DATABASE}`,
+      url: `postgresql://${ROLE}:${encodeURIComponent(secrets.alasioPassword)}@${neon.computeHost}:55433/${DATABASE}`,
       password: secrets.alasioPassword,
       "lake-password": secrets.lakePassword,
       "lake-reader-password": secrets.lakeReaderPassword,
@@ -223,6 +235,20 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       GF_SECURITY_SECRET_KEY: secrets.grafanaSecretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
     },
+    // Branch environments': the token alasio's command line manages Neon's branches with,
+    // and the key alasio signs each one's token to fork its sessions with.
+    [names.branches]: {
+      "control-token": token("admin"),
+      "fork-key": secrets.branchForkKey,
+    },
+  });
+  const rendered: RenderedSecrets = {
+    [names.root]: {
+      "secrets.json": JSON.stringify(secrets, null, 2) + "\n",
+      "auth_private_key.pem": privateKeyPem,
+      [PUBLIC_KEY]: publicKeyPem,
+    },
+    [names.s3Admin]: aws("admin"),
     // The log's, which its nodes are formatted and run with, and which its access applier
     // logs in as its admin with; that applier's, every principal's password, which it gives
     // each principal; and each principal's, which what logs in as it is given (KEDA's with
@@ -239,12 +265,9 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       password: secrets.log[principal],
       ...(principal === "scaler" ? { sasl: "scram_sha512" } : {}),
     }])),
-    // Branch environments': the token alasio's command line manages Neon's branches with,
-    // and the key alasio signs each one's token to fork its sessions with.
-    [names.branches]: {
-      "control-token": token("admin"),
-      "fork-key": secrets.branchForkKey,
-    },
+    // The webhook intake's: its certificate, which Telegram is given too, and its key.
+    [names.webhookTls]: { "tls.crt": webhookTls.cert, "tls.key": webhookTls.key },
+    ...(config.neon ? neonSecrets(config.neon) : {}),
   };
   const { workspaces } = config;
   if (workspaces) {
@@ -285,16 +308,21 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
   const base: SetupConfigBase = {
     namespace: required("NAMESPACE"),
     prefix: required("SECRET_PREFIX"),
-    brokerUrl: required("NEON_BROKER_URL"),
-    controllerUrl: required("NEON_CONTROLLER_URL"),
-    pageserverHost: required("NEON_PAGESERVER_HOST"),
-    computeHost: required("NEON_COMPUTE_HOST"),
-    controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
+    neon: env["NEON_COMPUTE_HOST"]?.trim()
+      ? {
+        brokerUrl: required("NEON_BROKER_URL"),
+        controllerUrl: required("NEON_CONTROLLER_URL"),
+        pageserverHost: required("NEON_PAGESERVER_HOST"),
+        computeHost: required("NEON_COMPUTE_HOST"),
+        controllerDbHost: required("NEON_CONTROLLER_DB_HOST"),
+      }
+      : null,
     s3Endpoint: required("S3_ENDPOINT"),
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",
     neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
     lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
     logBucket: env["S3_BUCKET_LOG"]?.trim() || "log",
+    webhookAddress: required("WEBHOOK_ADDRESS"),
     workspaces: env["WORKSPACES_NAME"]?.trim()
       ? {
         name: required("WORKSPACES_NAME"),
@@ -335,8 +363,14 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
   const { secrets, changed } = completeSecrets(existing);
   log(root ? (changed ? "completing the stack's secrets" : "the stack's secrets are complete") : "making the stack's secrets");
 
+  // The webhook intake's certificate: kept while it serves its address, made anew near its end.
+  const tls = await readSecret(names.webhookTls);
+  const current = decode(tls, "tls.crt") && decode(tls, "tls.key") ? { cert: decode(tls, "tls.crt") ?? "", key: decode(tls, "tls.key") ?? "" } : null;
+  const { certificate: webhookTls, made } = webhookCertificate(config.webhookAddress, current);
+  if (made) log(`making the webhook intake's certificate for ${config.webhookAddress}`);
+
   const workspaceSecrets = new Set([names.valkey, names.workspaces]);
-  for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }))) {
+  for (const [name, stringData] of Object.entries(renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, webhookTls }))) {
     const object = {
       apiVersion: "v1",
       kind: "Secret",

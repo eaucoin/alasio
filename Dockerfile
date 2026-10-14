@@ -13,7 +13,7 @@ RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       acl bash-completion bind9-dnsutils build-essential ca-certificates cpio curl \
       diffutils dirmngr ed file findutils git gnupg htop iproute2 iputils-ping jq less \
-      locales lsb-release lsof nano net-tools netbase netcat-openbsd openssh-client \
+      locales lsb-release lsof nano net-tools netbase netcat-openbsd openssh-client openssl \
       patch procps psmisc python3 rsync screen strace sysstat time tini tmux tzdata \
       unzip uuid-runtime vim wget xz-utils zstd \
  && sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \

@@ -72,6 +72,25 @@ const CLUSTER_CIDR = "10.42.0.0/16";
 const SERVICE_CIDR = "10.43.0.0/16";
 /** What a firewall must let in to the machine from the cluster: its pods and its Services, as k3s's requirements say. */
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
+
+/**
+ * What a firewall lets in to the webhook intake: Telegram's ranges alone, to `port`,
+ * forwarded to the intake's pod. A rule of a firewall's is a network (let in whole) or a
+ * network and a port, `<network> <port>/tcp` (let in to the port of a pod alone).
+ */
+export const webhookRules = (ranges: readonly string[], port: number): string[] => ranges.map((range) => `${range} ${port}/tcp`);
+
+/** A rule's network, and its port where it is to one alone. */
+const ruleOf = (rule: string): { readonly network: string; readonly port: string | null } => {
+  const [network = "", port] = rule.split(" ");
+  return { network, port: port ? port.replace("/tcp", "") : null };
+};
+
+/** A rule, as alasio says it: its network, and the port it is to, where it is to one. */
+const describeRule = (rule: string): string => {
+  const { network, port } = ruleOf(rule);
+  return port === null ? network : `${network} to port ${port}`;
+};
 /** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
 const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;
 /** What alasio installs of gVisor's release, in BIN: runsc and its shim, and the binaries runsc runs beside it. */
@@ -195,7 +214,7 @@ const writeFile = Effect.fnUntraced(function*(path: string, content: string | Ui
   yield* fs.rename(written, path);
 });
 
-/** The step that lets `networks`, the cluster's, in to the machine through `firewall`, which is active. */
+/** The step that lets `networks` in through `firewall`, which is active: the cluster's, whole, and Telegram's ranges to the webhook intake's port (webhookRules). */
 export const OpenFirewall = Schema.TaggedStruct("OpenFirewall", { firewall: Firewall, networks: Schema.Array(Schema.String) });
 /** The step that writes the files that configure k3s and its containerd as a node of `config`. */
 export const ConfigureNode = Schema.TaggedStruct("ConfigureNode", { config: NodeConfig });
@@ -227,9 +246,13 @@ export type NodeStep = typeof NodeStep.Type;
 export function describeNodeStep(step: NodeStep): string {
   const replacing = (previous: string | undefined) => (previous ? `, in place of ${previous},` : "");
   switch (step._tag) {
-    case "OpenFirewall":
-      return `let the cluster's pods and Services, ${step.networks.join(" and ")}, in to this machine through ${step.firewall}, as k3s needs; ` +
-        "nothing else is opened, k3s's API server's port 6443 staying closed to the rest";
+    case "OpenFirewall": {
+      const whole = step.networks.filter((rule) => ruleOf(rule).port === null);
+      const ported = step.networks.filter((rule) => ruleOf(rule).port !== null);
+      return `let the cluster's pods and Services, ${whole.join(" and ")}, in to this machine through ${step.firewall}, as k3s needs` +
+        (ported.length > 0 ? `, and Telegram's addresses, ${ported.map((rule) => ruleOf(rule).network).join(" and ")}, to the webhook intake's port ${ruleOf(ported[0] ?? "").port}` : "") +
+        "; nothing else is opened, k3s's API server's port 6443 staying closed to the rest";
+    }
     case "ConfigureNode":
       return `write k3s's configuration in ${K3S_ETC}, and its containerd's, with gVisor as the runtime runsc, in ${CONTAINERD}`;
     case "InstallGvisor":
@@ -242,7 +265,7 @@ export function describeNodeStep(step: NodeStep): string {
       return `stop and disable the service ${SERVICE}, and stop the cluster's pods, gVisor's and those k3s-killall.sh stops`;
     case "RemoveNode":
       return `stop the cluster's gVisor pods, ` +
-        (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.join(" and ")}, ` : "") +
+        (step.firewall && step.firewall.added.length > 0 ? `remove the rules alasio added to ${step.firewall.tool} for ${step.firewall.added.map(describeRule).join(" and ")}, ` : "") +
         `uninstall k3s with k3s-uninstall.sh, which removes its service, ${K3S_ETC} and its data, ` +
         `and remove what it leaves, its node's password in ${NODE_PASSWORD}, gVisor from ${BIN}, and JuiceFS's mounts and directories, ` +
         JUICEFS.join(" and ");
@@ -298,26 +321,43 @@ const FIREWALLS: Readonly<Record<Firewall, {
   /** Makes what it was told hold now, after it was told it; nothing for one it holds at once. */
   readonly apply: Effect.Effect<void, RootCommandFailed, RootSystem>;
 }>> = {
-  // ufw's rules hold as they are added, and `ufw show added` says each as `ufw allow from NETWORK`.
-  ufw: {
-    lets: (network) =>
-      Effect.flatMap(RootSystem, (system) => system.ask("ufw", ["show", "added"])).pipe(
-        Effect.map(({ stdout }) => stdout.split("\n").some((line) => line.trim() === `ufw allow from ${network}`)),
-      ),
-    allow: (network) => Effect.flatMap(RootSystem, (system) => system.run("ufw", ["allow", "from", network, "to", "any"])),
-    remove: (network) => Effect.flatMap(RootSystem, (system) => system.run("ufw", ["delete", "allow", "from", network, "to", "any"])),
-    apply: Effect.void,
-  },
-  // firewalld's trusted zone lets its sources in, its permanent rules holding once reloaded.
-  firewalld: {
-    lets: (network) =>
-      Effect.flatMap(RootSystem, (system) => system.ask("firewall-cmd", ["--permanent", "--zone=trusted", `--query-source=${network}`])).pipe(
-        Effect.map(({ exitCode }) => exitCode === 0),
-      ),
-    allow: (network) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--permanent", "--zone=trusted", `--add-source=${network}`])),
-    remove: (network) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--permanent", "--zone=trusted", `--remove-source=${network}`])),
-    apply: Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--reload"])),
-  },
+  // ufw's rules hold as they are added, and `ufw show added` says each: a network's as
+  // `ufw allow from NETWORK`, a port's, forwarded to a pod, as the route it was added as.
+  ufw: (() => {
+    const args = (rule: string): string[] => {
+      const { network, port } = ruleOf(rule);
+      return port === null ? ["allow", "from", network, "to", "any"] : ["route", "allow", "proto", "tcp", "from", network, "to", "any", "port", port];
+    };
+    const shown = (rule: string): string => {
+      const { network, port } = ruleOf(rule);
+      return port === null ? `ufw allow from ${network}` : `ufw ${args(rule).join(" ")}`;
+    };
+    return {
+      lets: (rule) =>
+        Effect.flatMap(RootSystem, (system) => system.ask("ufw", ["show", "added"])).pipe(
+          Effect.map(({ stdout }) => stdout.split("\n").some((line) => line.trim() === shown(rule))),
+        ),
+      allow: (rule) => Effect.flatMap(RootSystem, (system) => system.run("ufw", args(rule))),
+      remove: (rule) => Effect.flatMap(RootSystem, (system) => system.run("ufw", ["delete", ...args(rule)])),
+      apply: Effect.void,
+    };
+  })(),
+  // firewalld's trusted zone lets a network in whole; a rich rule of its default zone a
+  // network to a port; its permanent rules holding once reloaded.
+  firewalld: (() => {
+    const args = (rule: string, verb: "query" | "add" | "remove"): string[] => {
+      const { network, port } = ruleOf(rule);
+      return port === null
+        ? ["--permanent", "--zone=trusted", `--${verb}-source=${network}`]
+        : ["--permanent", `--${verb}-rich-rule=rule family="ipv4" source address="${network}" port port="${port}" protocol="tcp" accept`];
+    };
+    return {
+      lets: (rule) => Effect.flatMap(RootSystem, (system) => system.ask("firewall-cmd", args(rule, "query"))).pipe(Effect.map(({ exitCode }) => exitCode === 0)),
+      allow: (rule) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", args(rule, "add"))),
+      remove: (rule) => Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", args(rule, "remove"))),
+      apply: Effect.flatMap(RootSystem, (system) => system.run("firewall-cmd", ["--reload"])),
+    };
+  })(),
 };
 
 /** Removes the rules for `added` from `tool`, those alasio added, and no other. */

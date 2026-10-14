@@ -13,7 +13,7 @@
  *   one is set, which alone is sent the configured headers, from a queue in its memory.
  *   It scales on its CPU where its scale's min and max are apart;
  * - its scraper, one replica, so nothing is scraped twice: every Neon service's, the
- *   lake's and its intake's, the log's, each of SeaweedFS's parts' and, with workspace
+ *   lake's and its intake's, the log's, the webhook intake's, each of SeaweedFS's parts' and, with workspace
  *   storage, JuiceFS's Prometheus metrics, each pod of each found among the pods of its
  *   namespace, which it may list, so a component's replicas are each scraped and one that
  *   sleeps is not; and it reads the Valkeys', the object store's filer store's and
@@ -26,7 +26,7 @@
 import type { KubernetesObject, V1ConfigMap, V1Container, V1Deployment, V1EnvVar, V1Role, V1RoleBinding, V1Service, V1ServiceAccount, V1Volume } from "@kubernetes/client-node";
 
 import { imageReference } from "../images.ts";
-import { COLLECTOR_PORT, collectorRuns, componentName, given, goJson, lakeRuns, logRuns, NAMESPACE, ONE, replicasOf, restrictedContainer, scaled, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import { COLLECTOR_PORT, collectorRuns, componentName, given, goJson, lakeRuns, NAMESPACE, ONE, replicasOf, restrictedContainer, scaled, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { LOG_BROKERS, LOG_METRICS_PORT, logPrincipalSecret, TELEMETRY_TOPICS } from "./automq.ts";
 import { replicaBudget, spread } from "./disruption.ts";
@@ -36,6 +36,7 @@ import { priority } from "./priorities.ts";
 import { cpuUtilization, scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
 import { VALKEY_PORT, valkeyPassword } from "./valkey.ts";
+import { WEBHOOK_HEALTH_PORT } from "./webhook.ts";
 import { VALKEY } from "./workspace-storage.ts";
 
 /** The gateway's name, its pods' component, and its Service's, which every producer exports to. */
@@ -65,7 +66,7 @@ const METRICS_BATCH = { send_batch_size: 10_000, send_batch_max_size: 10_000, ti
 const MAX_RECORD_BYTES = 8_388_608;
 
 /** Whether the bundled object store runs, whose parts it scrapes and whose filer store it reads. */
-const seaweedfsRuns = ({ neon, objectStore }: InstallConfig): boolean => neon.enabled && objectStore.bundled.enabled;
+const seaweedfsRuns = ({ objectStore }: InstallConfig): boolean => objectStore.bundled.enabled;
 
 /** The object store's parts it scrapes, by their pods' component: all but the filer store, which it reads as a Valkey. */
 const SEAWEEDFS_SCRAPED = [COMPONENTS.gateway, COMPONENTS.master, COMPONENTS.volumeServer, COMPONENTS.filer];
@@ -132,15 +133,19 @@ function juicefsJob(config: InstallConfig, job: string, name: string, port: numb
 /** What it scrapes, a job of each component's pods, by the job's name, which its metrics' service is named. */
 function scrapes(config: InstallConfig): object[] {
   const { neon, workspaceStorage } = config;
-  if (!neon.enabled) return [];
   const stack: Record<string, readonly [component: string, port: number]> = {
-    pageserver: ["neon-pageserver", 9898],
-    "storage-controller": ["neon-storage-controller", 1234],
-    "storage-broker": ["neon-storage-broker", 50051],
-    compute: ["neon-compute", 3080],
-    safekeeper: ["neon-safekeeper", 7676],
+    ...(neon.enabled
+      ? {
+        pageserver: ["neon-pageserver", 9898],
+        "storage-controller": ["neon-storage-controller", 1234],
+        "storage-broker": ["neon-storage-broker", 50051],
+        compute: ["neon-compute", 3080],
+        safekeeper: ["neon-safekeeper", 7676],
+      } as const
+      : {}),
     ...(lakeRuns(config) ? { lake: ["lake", LAKE_METRICS_PORT], "lake-intake": ["lake-intake", LAKE_METRICS_PORT] } as const : {}),
-    ...(logRuns(config) ? { log: ["log", LOG_METRICS_PORT] } as const : {}),
+    log: ["log", LOG_METRICS_PORT],
+    webhook: ["webhook", WEBHOOK_HEALTH_PORT],
   };
   return [
     ...Object.keys(stack).sort().map((job) => {

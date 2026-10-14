@@ -2,9 +2,6 @@ import { Effect } from "effect";
 
 import type { Sql, StoreError } from "./sql.ts";
 
-/** The key of bot_state that holds Telegram's update offset. */
-export const TELEGRAM_OFFSET = "telegram_update_offset";
-
 export class NeonStateRepository {
   readonly #sql: Sql;
   readonly #schema: string;
@@ -37,13 +34,5 @@ export class NeonStateRepository {
        returning value`,
       [key, value],
     ).pipe(Effect.map(([row]) => row!.value));
-  }
-
-  getTelegramOffset(): Effect.Effect<number | undefined, StoreError> {
-    return this.getState(TELEGRAM_OFFSET).pipe(Effect.map((value) => (value ? Number(value) : undefined)));
-  }
-
-  setTelegramOffset(offset: number): Effect.Effect<void, StoreError> {
-    return this.setState(TELEGRAM_OFFSET, offset);
   }
 }

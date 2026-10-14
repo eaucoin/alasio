@@ -32,7 +32,6 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   const conversationId = await run(main.upsertConversation({ chatId: 1001 }));
   await run(main.setActiveHarness(conversationId, "codex"));
   await run(main.setWorkingDirectory(conversationId, "sessionfs:fs-0123456789abcdef"));
-  await run(main.setTelegramOffset(41));
   await run(main.recordTelegramUpdate({ update_id: 41, message: { message_id: 7, date: 0, from: { id: 1001, is_bot: false, first_name: "Operator" }, chat: { id: 1001, type: "private", first_name: "Operator" }, text: "queued" } }));
   await run(main.enqueuePromptJob({ conversationId, chatId: 1001, messageId: 7, prompt: "queued", harness: "codex" }));
   const pending = await run(main.createPendingResponse(1001, 8));
@@ -45,7 +44,6 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
 
   const branch = await testStore({ schema, branch: "try-codex" });
   assert.deepEqual(await run(branch.getMount(conversationId)), { harness: "codex", workingDirectory: "sessionfs:fs-0123456789abcdef", sessionId: null });
-  assert.equal(await run(branch.getTelegramOffset), undefined);
   assert.deepEqual(await run(branch.listPendingPromptConversations), []);
   assert.equal(await run(branch.hasOpenPromptJobs(conversationId)), false);
   assert.deepEqual(await run(branch.getActiveTurns), []);
@@ -57,10 +55,10 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   assert.equal(await run(branch.getState("branch")), "try-codex");
 
   // Started once: what the branch does itself is kept when it starts again.
-  await run(branch.setTelegramOffset(3));
-  assert.equal(await run((await testStore({ schema, branch: "try-codex" })).getTelegramOffset), 3);
+  await run(branch.enqueuePromptJob({ conversationId, chatId: 1001, messageId: 9, prompt: "the branch's own", harness: "codex" }));
+  assert.equal(await run((await testStore({ schema, branch: "try-codex" })).hasOpenPromptJobs(conversationId)), true);
   // A branch of the branch is made its own in turn.
-  assert.equal(await run((await testStore({ schema, branch: "try-again" })).getTelegramOffset), undefined);
+  assert.equal(await run((await testStore({ schema, branch: "try-again" })).hasOpenPromptJobs(conversationId)), false);
 });
 
 test("an alasio forks a session one of its conversations knows for the branch whose token asks, into the branch's sessions, and none while a turn runs in it", async () => {
@@ -248,8 +246,9 @@ test("a session a branch inherited is recorded as one it made, keeping what its 
 
 test("main's state is never made a branch's", async () => {
   const schema = newSchema();
-  await run((await testStore({ schema })).setTelegramOffset(41));
+  const conversationId = await run((await testStore({ schema })).upsertConversation({ chatId: 1001 }));
+  await run((await testStore({ schema })).enqueuePromptJob({ conversationId, chatId: 1001, messageId: 7, prompt: "main's", harness: "codex" }));
   const main = await testStore({ schema });
-  assert.equal(await run(main.getTelegramOffset), 41);
+  assert.equal(await run(main.hasOpenPromptJobs(conversationId)), true);
   assert.equal(await run(main.getState("branch")), null);
 });

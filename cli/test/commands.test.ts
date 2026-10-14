@@ -20,6 +20,7 @@ import { forkToken } from "../../src/branch/names.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { downloads } from "../src/cluster/node.ts";
+import { ROUTES_SECRET, TLS_SECRET, WEBHOOK, WEBHOOK_HEALTH_PORT } from "../src/manifests/webhook.ts";
 import { type CliRun, runAlasio } from "./support/cli.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { serveK3sInDocker } from "./support/fake-k3s.ts";
@@ -32,6 +33,9 @@ import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.t
 const BOT_TOKEN = "123:valid";
 const BOT = "alasio_test_bot";
 const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
+/** The address Telegram delivers to, as init is told it. */
+const PUBLIC_ADDRESS = "203.0.113.10";
+const CERTIFICATE = "-----BEGIN CERTIFICATE-----\nintake\n-----END CERTIFICATE-----\n";
 
 interface Rig {
   readonly kube: FakeKube;
@@ -68,6 +72,16 @@ async function rig(t: TestContext): Promise<Rig> {
   machine.kubeconfig = kube.kubeconfig;
   machine.onStart = () => kube.put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { conditions: [{ type: "Ready", status: "True", lastHeartbeatTime: new Date().toISOString() }] } });
   kube.put("configmaps", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: "coredns", namespace: "kube-system", resourceVersion: "1" }, data: { NodeHosts: "10.0.0.5 machine" } });
+  // The webhook intake's pod, which routes what the routes Secret holds, and its certificate, as the stack's setup makes it.
+  const intake = createHttpServer((_request, response) => {
+    const routes = kube.get(`/api/v1/namespaces/alasio/secrets/${ROUTES_SECRET}`)?.["data"] as Record<string, string> | undefined;
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(Object.keys(routes ?? {}).map((environment) => ({ environment }))));
+  });
+  await new Promise<void>((resolve) => intake.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => intake.close(resolve)));
+  kube.forwarded.set(`${WEBHOOK}-0:${WEBHOOK_HEALTH_PORT}`, (intake.address() as AddressInfo).port);
+  kube.put("secrets", { apiVersion: "v1", kind: "Secret", metadata: { name: TLS_SECRET, namespace: "alasio" }, data: { "tls.crt": Buffer.from(CERTIFICATE).toString("base64"), "tls.key": Buffer.from("key").toString("base64") } });
   const kubeconfig = join(home, "kubeconfig");
   writeFileSync(kubeconfig, kube.kubeconfig);
   const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), DOCKER_HOST: docker.host, TELEGRAM_API_ROOT: telegram.root };
@@ -126,7 +140,7 @@ async function initialize({ alasio, home, kubeconfig }: Rig): Promise<void> {
   writeFileSync(tokenFile, `${BOT_TOKEN}\n`);
   const claudeFile = join(home, "claude-token");
   writeFileSync(claudeFile, "sk-ant-oat01-claude\n");
-  succeeded(await alasio(["init", "--non-interactive", "--kubeconfig", kubeconfig, "--bot-token-file", tokenFile, "--claude-token-file", claudeFile, "--allowed-user-ids", "42", "--no-up"]));
+  succeeded(await alasio(["init", "--non-interactive", "--kubeconfig", kubeconfig, "--bot-token-file", tokenFile, "--claude-token-file", claudeFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--no-up"]));
 }
 
 /** alasio initialized and up, in the cluster the kubeconfig reaches. */
@@ -155,6 +169,7 @@ test("init asks, checks the bot's token with Telegram, writes the config and the
     replaced("/home/op"),
     typed("/srv/code"),
     typed("http://collector.example.com:4318"),
+    typed(PUBLIC_ADDRESS),
     pressed("n"),
   ]);
   succeeded(first);
@@ -172,6 +187,7 @@ test("init asks, checks the bot's token with Telegram, writes the config and the
         mounts: [{ name: "home-op", hostPath: "/home/op", mountPath: "/home/op" }, { name: "srv-code", hostPath: "/srv/code", mountPath: "/srv/code" }],
       },
       telemetry: { otlpEndpoint: "http://collector.example.com:4318" },
+      webhook: { publicAddress: PUBLIC_ADDRESS },
     },
   };
   assert.deepEqual(config(), written);
@@ -183,7 +199,7 @@ test("init asks, checks the bot's token with Telegram, writes the config and the
   assert.equal(kube.get("/api/v1/namespaces/alasio")?.metadata.labels?.["alasio.dev/installation"], "alasio");
   assert.ok(first.printed.includes("alasio up starts it."));
 
-  const again = await alasio(["init"], [[ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], pressed("n")]);
+  const again = await alasio(["init"], [[ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], [ENTER], pressed("n")]);
   succeeded(again);
   assert.equal(again.unread, 0);
   assert.match(again.prompts, new RegExp(`empty keeps @${BOT}`, "u"));
@@ -206,7 +222,7 @@ test("init keeps the host profile's mounts as written, mounting only folders new
   setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } }, install: { host } });
   const tokenFile = join(setup.home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  const again = ["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--no-up"];
+  const again = ["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--no-up"];
   // The config as init wrote it.
   const written = () => (setup.config() as { install: { host: typeof host } }).install.host;
   succeeded(await setup.alasio(again));
@@ -219,19 +235,19 @@ test("init keeps the host profile's mounts as written, mounting only folders new
 
 test("init asks where alasio runs on a first run, and runs it in the cluster a kubeconfig reaches when told", async (t) => {
   const { alasio, config, kube, kubeconfig } = await rig(t);
-  const run = await alasio(["init"], [[DOWN, DOWN, ENTER], typed(kubeconfig), typed("fake"), typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], pressed("n")]);
+  const run = await alasio(["init"], [[DOWN, DOWN, ENTER], typed(kubeconfig), typed("fake"), typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], typed(PUBLIC_ADDRESS), pressed("n")]);
   succeeded(run);
-  assert.deepEqual(config(), { target: { kubeconfig: { path: kubeconfig, context: "fake" } }, install: {} });
+  assert.deepEqual(config(), { target: { kubeconfig: { path: kubeconfig, context: "fake" } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS } } });
   assert.equal(secretValue(kube, "alasio-telegram", "allowedUserIds"), "42");
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-claude"), undefined);
 });
 
 test("init installs k3s and gVisor here unless told otherwise, as root at once, after saying what, its volumes under XDG_DATA_HOME", async (t) => {
   const { alasio, config, configFile, env, kube, machine } = await rig(t);
-  const run = await alasio(["init", "--no-up"], [[ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER]]);
+  const run = await alasio(["init", "--no-up"], [[ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], replaced(PUBLIC_ADDRESS)]);
   succeeded(run);
   const storagePath = join(env.XDG_DATA_HOME, "alasio", "storage");
-  assert.deepEqual(config(), { target: { host: { storagePath } }, install: {} });
+  assert.deepEqual(config(), { target: { host: { storagePath } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS } } });
   assert.ok(run.progress.includes([
     "alasio changes this machine as root:",
     "  write k3s's configuration in /etc/rancher/k3s, and its containerd's, with gVisor as the runtime runsc, in /var/lib/rancher/k3s/agent/etc/containerd",
@@ -260,7 +276,7 @@ test("init installs k3s and gVisor here unless told otherwise, as root at once, 
 
 test("init --target docker makes the cluster in Docker, its API on a port it keeps, its volumes under XDG_DATA_HOME", async (t) => {
   const { alasio, config, docker, env } = await rig(t);
-  const run = await alasio(["init", "--no-up"], [[DOWN, ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER]]);
+  const run = await alasio(["init", "--no-up"], [[DOWN, ENTER], typed(BOT_TOKEN), typed("42"), [ENTER], pressed("n"), [ENTER], typed(PUBLIC_ADDRESS)]);
   // The node's kubeconfig names the port the config chose, where the fake API is not, so the Secrets are not written.
   assert.match(failure(run), /^Kubernetes could not be reached for PATCH \/api\/v1\/namespaces\/alasio/u);
   const { target } = config() as { target: { docker: { name: string; apiPort: number; storagePath: string } } };
@@ -276,12 +292,12 @@ test("init asks nothing with --non-interactive, takes tokens from files and the 
   configure({ target: { docker: { name: "dev", apiPort: kube.port, storagePath } } });
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, `${BOT_TOKEN}\n`);
-  const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], {
+  const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS], {
     env: { ...env, CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-env" },
     machine,
   });
   succeeded(run);
-  assert.deepEqual(config(), { target: { docker: { name: "dev", apiPort: kube.port, storagePath } }, install: {} });
+  assert.deepEqual(config(), { target: { docker: { name: "dev", apiPort: kube.port, storagePath } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS } } });
   assert.equal(docker.containers.get("dev-server-0")?.state, "running");
   assert.equal(statSync(join(configFile, "..", "kubeconfig")).mode & 0o777, 0o600);
   assert.equal(secretValue(kube, "alasio-telegram", "token"), BOT_TOKEN);
@@ -318,13 +334,39 @@ test("up applies alasio, waits until it runs, and says what to do next", async (
   const env = (setup.kube.get(DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string }[] }[] } } }).template.spec.containers[0]?.env;
   assert.ok(env?.some(({ name }) => name === "CLAUDE_CODE_OAUTH_TOKEN"));
   assert.ok(run.progress.some((line) => line.startsWith("applying ")));
+  // main's bot is delivered to its route, on the public address, with the intake's certificate.
+  const route = JSON.parse(secretValue(setup.kube, ROUTES_SECRET, "main") ?? "") as { path: string; secretToken: string; allowedUserIds: string[] };
+  assert.match(route.path, /^\/telegram\/main\/[\w-]{22}$/u);
+  assert.deepEqual(route.allowedUserIds, ["42"]);
+  assert.deepEqual(setup.telegram.webhooks.get(BOT_TOKEN), {
+    url: `https://${PUBLIC_ADDRESS}${route.path}`,
+    secretToken: route.secretToken,
+    certificate: CERTIFICATE,
+    allowedUpdates: ["message", "callback_query"],
+    ipAddress: PUBLIC_ADDRESS,
+  });
+  assert.ok(run.progress.includes(`Telegram delivers @${BOT}'s updates to the webhook intake, for main`));
+
+  // Run again, it keeps the route, and registers the bot again.
+  setup.telegram.webhooks.clear();
+  succeeded(await setup.alasio(["up"]));
+  assert.equal(secretValue(setup.kube, ROUTES_SECRET, "main"), JSON.stringify(route));
+  assert.equal(setup.telegram.webhooks.get(BOT_TOKEN)?.url, `https://${PUBLIC_ADDRESS}${route.path}`);
 });
 
-test("up without a bot says to run init; up past its timeout says what still waits, and why", async (t) => {
+test("up without a bot says to run init, and without the address Telegram delivers to that init asks it; up past its timeout says what still waits, and why", async (t) => {
   const setup = await rig(t);
   setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } } });
   assert.equal(failure(await setup.alasio(["up"])), "alasio has no Telegram bot in this cluster yet: alasio init gives it one");
   await initialize(setup);
+  const initialized = setup.config();
+  setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } } });
+  assert.equal(
+    failure(await setup.alasio(["up"])),
+    "install.webhook.publicAddress is not set: the address Telegram delivers the bot's updates to, which the webhook intake's certificate is made for; alasio init asks for it",
+  );
+  assert.equal(setup.kube.get(DEPLOYMENT), undefined);
+  setup.configure(initialized);
   setup.kube.stuck.add("alasio");
   const message = failure(await setup.alasio(["up", "--timeout", "1s"]));
   assert.match(message, /^not ready within 1s, still waiting for:\n {2}Deployment alasio\/alasio: 0 of 1 available\n/u);
@@ -347,6 +389,25 @@ test("status says each workload's state, and fails when one is not ready", async
   const unhealthy = await alasio(["status"]);
   assert.match(failure(unhealthy), /^1 of alasio's \d+ workloads are not ready$/u);
   assert.ok(unhealthy.printed.includes("  Deployment alasio/alasio: 0 of 1 available"));
+});
+
+test("status says how Telegram delivers each bot's updates, and fails when it does not, or failed to lately", async (t) => {
+  const { alasio, telegram } = await installed(t);
+  const delivered = await alasio(["status"]);
+  succeeded(delivered);
+  const line = (run: CliRun) => run.printed[run.printed.indexOf("Telegram's deliveries:") + 1];
+  assert.equal(line(delivered), `  main's bot @${BOT}: delivered, 0 updates waiting`);
+  telegram.lastErrors.set(BOT_TOKEN, { date: Math.floor(Date.now() / 1000) - 60, message: "Connection timed out" });
+  const failing = await alasio(["status"]);
+  assert.equal(failure(failing), "Telegram does not deliver to the webhook intake as it should: alasio up registers each bot again");
+  assert.equal(line(failing), `  main's bot @${BOT}: 0 updates waiting; Telegram's last delivery failed: Connection timed out`);
+  // A failure long past is not one now.
+  telegram.lastErrors.set(BOT_TOKEN, { date: Math.floor(Date.now() / 1000) - 3600, message: "Connection timed out" });
+  succeeded(await alasio(["status"]));
+  telegram.webhooks.delete(BOT_TOKEN);
+  const undelivered = await alasio(["status"]);
+  assert.equal(failure(undelivered), "Telegram does not deliver to the webhook intake as it should: alasio up registers each bot again");
+  assert.equal(line(undelivered), `  main's bot @${BOT}: not delivered: alasio up registers it`);
 });
 
 test("status says each workload's replicas and scale, its requests beside VPA's recommendation, and the cluster's memory, and where no metrics server measures them", async (t) => {
@@ -444,11 +505,13 @@ test("status with rights in alasio's namespace alone says what it sees there, an
   succeeded(run);
   assert.ok(run.printed.includes("  Deployment alasio/alasio: ready"));
   assert.ok(!run.printed.some((line) => line.includes("kube-system")), "nothing of kube-system's is listed");
-  // The object store's, in alasio's namespace, it sees; its volume server's metrics, here, say nothing.
-  assert.deepEqual(run.printed.slice(-5), [
+  // The object store's, in alasio's namespace, it sees; its volume server's metrics, here, say nothing; Telegram it asks.
+  assert.deepEqual(run.printed.slice(-7), [
     "  alasio's workloads outside its namespace, alasio: not seen, as this kubeconfig may list them there alone",
     "the object store: each object kept once (replication 000)",
     "  alasio-seaweedfs-volume-0: not measured, as its metrics do not say its disk",
+    "Telegram's deliveries:",
+    `  main's bot @${BOT}: delivered, 0 updates waiting`,
     "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods",
     "whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices",
   ]);
@@ -615,7 +678,7 @@ test("init and up raise inotify limits too low for the cluster here as root, now
   const shortfall = "fs.inotify.max_user_instances is 128, and the cluster needs at least 1024";
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  const init = await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]);
+  const init = await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]);
   succeeded(init);
   assert.ok(init.progress.includes([
     "alasio changes this machine as root:",
@@ -707,7 +770,7 @@ test("upgrade says what it installs, and which images change", async (t) => {
   assert.equal(fresh.printed[0], "alasio is not installed yet: installing 0.0.0-development");
   const same = await setup.alasio(["upgrade"]);
   assert.equal(same.printed[0], "alasio 0.0.0-development already runs this version's images; applying it again");
-  setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } }, install: { images: { lake: { tag: "9.9.9" } } } });
+  setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } }, install: { webhook: { publicAddress: PUBLIC_ADDRESS }, images: { lake: { tag: "9.9.9" } } } });
   const changed = await setup.alasio(["upgrade"]);
   succeeded(changed);
   assert.equal(changed.printed[0], [
@@ -805,7 +868,7 @@ test("uninstall --purge removes the cluster here whole: its nodes, volumes, stor
   machine.sysctl("fs.inotify.max_user_watches", 8192);
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]));
+  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
   assert.ok(existsSync(storagePath));
   assert.ok(machine.read(SYSCTL_FILE));
   const run = await alasio(["uninstall", "--purge"], [pressed("y")]);
@@ -824,7 +887,7 @@ test("uninstall --purge removes the cluster here whole: its nodes, volumes, stor
 async function upOnHost({ alasio, home }: Rig): Promise<CliRun> {
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  const run = await alasio(["init", "--non-interactive", "--target", "host", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]);
+  const run = await alasio(["init", "--non-interactive", "--target", "host", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]);
   succeeded(run);
   return run;
 }
@@ -889,7 +952,7 @@ test("a download that is not what alasio pins is refused before anything is done
   releases.served.set(downloads(releases.pins).gvisor.url, Buffer.from("not gVisor"));
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"], { env, machine, releases });
+  const run = await runAlasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS], { env, machine, releases });
   assert.match(
     failure(run),
     /^https:\/\/github\.com\/eaucoin\/gvisor\/releases\/download\/release-20990101\.0\/gvisor-x86_64\.tar\.zstd is not what alasio pins: its sha512 is [0-9a-f]{128}, not [0-9a-f]{128}$/u,
@@ -928,7 +991,7 @@ test("init leaves a k3s alasio did not install as it is", async (t) => {
   const tokenFile = join(home, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
   assert.equal(
-    failure(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42"])),
+    failure(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS])),
     "k3s is installed on this machine, but not by alasio, which leaves it as it is: run alasio in it with alasio init --kubeconfig /etc/rancher/k3s/k3s.yaml, or uninstall it first (k3s-uninstall.sh)",
   );
   assert.deepEqual(machine.ran, []);
@@ -939,7 +1002,7 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   machine.sysctl("fs.inotify.max_user_instances", 128);
   const tokenFile = join(env.HOME, "bot-token");
   writeFileSync(tokenFile, BOT_TOKEN);
-  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--up"]));
+  succeeded(await alasio(["init", "--non-interactive", "--bot-token-file", tokenFile, "--allowed-user-ids", "42", "--public-address", PUBLIC_ADDRESS, "--up"]));
   machine.write("/proc/self/mounts", "proc /proc proc rw 0 0\nJuiceFS:workspaces /var/lib/juicefs/volume/pvc\\040one fuse.juicefs rw 0 0\n");
   machine.write("/var/lib/juicefs/volume/pvc one/file", "data");
   const storagePath = join(env.XDG_DATA_HOME, "alasio", "storage");
@@ -964,37 +1027,48 @@ test("uninstall --purge removes k3s, gVisor, JuiceFS's directories, the storage,
   assert.deepEqual(status.printed, ["k3s on this machine:", "  not installed"]);
 });
 
-test("an active ufw lets the cluster's pods and Services in, by rules alasio adds only where it has none, and uninstall removes those alone", async (t) => {
+test("an active ufw lets the cluster's pods and Services in, and Telegram to the webhook intake's port, by rules alasio adds only where it has none, and uninstall removes those alone", async (t) => {
   const setup = await rig(t);
   const { alasio, machine } = setup;
   machine.enableUfw(["192.168.1.0/24", "10.43.0.0/16"]);
   const installed = await upOnHost(setup);
   assert.equal(
     rootSteps(installed)[0],
-    "let the cluster's pods and Services, 10.42.0.0/16 and 10.43.0.0/16, in to this machine through ufw, as k3s needs; nothing else is opened, k3s's API server's port 6443 staying closed to the rest",
+    "let the cluster's pods and Services, 10.42.0.0/16 and 10.43.0.0/16, in to this machine through ufw, as k3s needs, and Telegram's addresses, 149.154.160.0/20 and 91.108.4.0/22, to the webhook intake's port 443; nothing else is opened, k3s's API server's port 6443 staying closed to the rest",
   );
-  assert.deepEqual(machine.commands().filter((command) => command.startsWith("ufw")), ["ufw show added", "ufw allow from 10.42.0.0/16 to any", "ufw show added"]);
-  assert.deepEqual([...machine.ufwRules].sort(), ["10.42.0.0/16", "10.43.0.0/16", "192.168.1.0/24"]);
+  assert.deepEqual(machine.commands().filter((command) => command.startsWith("ufw") && !command.endsWith("show added")), [
+    "ufw allow from 10.42.0.0/16 to any",
+    "ufw route allow proto tcp from 149.154.160.0/20 to any port 443",
+    "ufw route allow proto tcp from 91.108.4.0/22 to any port 443",
+  ]);
+  assert.deepEqual([...machine.ufwRules].sort(), ["10.42.0.0/16", "10.43.0.0/16", "149.154.160.0/20 443/tcp", "192.168.1.0/24", "91.108.4.0/22 443/tcp"]);
   assert.deepEqual(rootSteps(await alasio(["up"])), []);
 
   const removed = await alasio(["uninstall", "--purge", "--yes"]);
   succeeded(removed);
-  assert.match(rootSteps(removed)[0] ?? "", /^stop the cluster's gVisor pods, remove the rules alasio added to ufw for 10\.42\.0\.0\/16, uninstall k3s /u);
+  assert.match(rootSteps(removed)[0] ?? "", /^stop the cluster's gVisor pods, remove the rules alasio added to ufw for 10\.42\.0\.0\/16 and 149\.154\.160\.0\/20 to port 443 and 91\.108\.4\.0\/22 to port 443, uninstall k3s /u);
   assert.deepEqual([...machine.ufwRules].sort(), ["10.43.0.0/16", "192.168.1.0/24"]);
+  assert.deepEqual(machine.commands().filter((command) => command.startsWith("ufw delete")), [
+    "ufw delete allow from 10.42.0.0/16 to any",
+    "ufw delete route allow proto tcp from 149.154.160.0/20 to any port 443",
+    "ufw delete route allow proto tcp from 91.108.4.0/22 to any port 443",
+  ]);
 });
 
-test("an active firewalld trusts the cluster's pods and Services, permanently and now, and uninstall takes them out again", async (t) => {
+test("an active firewalld trusts the cluster's pods and Services, and lets Telegram to the webhook intake's port, permanently and now, and uninstall takes them out again", async (t) => {
   const setup = await rig(t);
   const { alasio, machine } = setup;
   machine.enableFirewalld(["172.16.0.0/12"]);
   const installed = await upOnHost(setup);
   assert.match(rootSteps(installed)[0] ?? "", /^let the cluster's pods and Services, 10\.42\.0\.0\/16 and 10\.43\.0\.0\/16, in to this machine through firewalld, /u);
-  assert.deepEqual(machine.commands().filter((command) => command.includes("--add-source") || command.endsWith("--reload")), [
+  assert.deepEqual(machine.commands().filter((command) => /--add-|--reload$/u.test(command)), [
     "firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16",
     "firewall-cmd --permanent --zone=trusted --add-source=10.43.0.0/16",
+    'firewall-cmd --permanent --add-rich-rule=rule family="ipv4" source address="149.154.160.0/20" port port="443" protocol="tcp" accept',
+    'firewall-cmd --permanent --add-rich-rule=rule family="ipv4" source address="91.108.4.0/22" port port="443" protocol="tcp" accept',
     "firewall-cmd --reload",
   ]);
-  assert.deepEqual([...machine.trusted].sort(), ["10.42.0.0/16", "10.43.0.0/16", "172.16.0.0/12"]);
+  assert.deepEqual([...machine.trusted].sort(), ["10.42.0.0/16", "10.43.0.0/16", "149.154.160.0/20 443/tcp", "172.16.0.0/12", "91.108.4.0/22 443/tcp"]);
   succeeded(await alasio(["uninstall", "--purge", "--yes"]));
   assert.deepEqual([...machine.trusted], ["172.16.0.0/12"]);
   assert.equal(machine.reloads, 2);
@@ -1102,7 +1176,7 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.match(failure(await alasio(["branch", "create", "Try", "--bot-token-file", token("branch", "456:branch")])), /^Try is no branch's name: /u);
   assert.equal(
     failure(await alasio(["branch", "create", "try", "--bot-token-file", token("main", BOT_TOKEN)])),
-    "a branch's bot is its own: Telegram gives a bot's updates to one poller, and main's alasio polls main's bot",
+    "a branch's bot is its own: Telegram delivers a bot's updates to one webhook, and main's bot's to main",
   );
   assert.deepEqual(neon.asked, []);
 
@@ -1143,6 +1217,13 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);
+  // Its own principal and topic on the log, by the log's access applier; its own route, which Telegram delivers its bot's updates to.
+  assert.ok(kube.execs.some(({ pod, container, command }) => pod === "alasio-log-0" && container === "access" && command.join(" ") === "node /opt/alasio/src/log/access.ts environment"));
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-alasio", "username"), "alasio-try");
+  const route = JSON.parse(secretValue(kube, ROUTES_SECRET, "try") ?? "") as { path: string; secretToken: string; allowedUserIds: string[] };
+  assert.deepEqual(route.allowedUserIds, ["42"]);
+  assert.notEqual(route.path, (JSON.parse(secretValue(kube, ROUTES_SECRET, "main") ?? "") as { path: string }).path);
+  assert.deepEqual([telegram.webhooks.get("456:branch")?.url, telegram.webhooks.get("456:branch")?.secretToken], [`https://${PUBLIC_ADDRESS}${route.path}`, route.secretToken]);
   assert.equal(run.printed.at(-1), "The branch try runs, on a copy of alasio's data as it is now. Message @branch_bot on Telegram to talk to it; alasio branch delete try deletes it.");
   assert.equal(failure(await alasio(["branch", "create", "try", "--bot-token-file", token("branch", "456:branch")])), "there is a branch try already");
 });
@@ -1203,6 +1284,11 @@ test("branch delete refuses while the branch's alasio has a turn running unless 
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try"), undefined);
   assert.equal(kube.get("/api/v1/namespaces/alasio-branch-try-sessions"), undefined);
   assert.deepEqual([kube.get(policy), kube.get(binding)], [undefined, undefined]);
+  // Its bot delivered nowhere, its route gone, its principal and topic forgotten.
+  assert.equal(telegram.webhooks.get("456:branch"), undefined);
+  assert.equal(secretValue(kube, ROUTES_SECRET, "try"), undefined);
+  assert.ok(secretValue(kube, ROUTES_SECRET, "main"));
+  assert.ok(kube.execs.some(({ pod, container, command }) => pod === "alasio-log-0" && container === "access" && command.join(" ") === "node /opt/alasio/src/log/access.ts forget"));
   assert.equal(failure(await alasio(["branch", "delete", "try"])), "there is no branch try");
 });
 

@@ -21,7 +21,6 @@ import {
   given,
   grafanaRuns,
   labels,
-  logRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   RELEASE,
@@ -31,6 +30,7 @@ import type { InstallConfig } from "./config.ts";
 import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
 import { INTAKE_COMPONENT, LAKE_QUERY_PORT } from "./lake.ts";
+import { WEBHOOK, WEBHOOK_COMPONENT, WEBHOOK_HEALTH_PORT } from "./webhook.ts";
 import {
   BACKUP_COMPONENT,
   COMPONENTS,
@@ -263,8 +263,9 @@ function filerStorePolicies(): NetworkPolicy[] {
 }
 
 /**
- * The log takes its clients on their port from the collector's gateway, which writes to
- * it, and the lake's intake and KEDA's operator, which read it, alone; its controllers'
+ * The log takes its clients on their port from the collector's gateway and the webhook
+ * intake, which write to it, and the lake's intake, KEDA's operator, and each
+ * environment's alasio, main's and branch environments', which read it, alone; its controllers'
  * port, and its clients' as its brokers reach each other, from its own nodes; and its
  * metrics port from the collector's scraper. KEDA's operator is alasio's, or, where the
  * cluster's own KEDA scales alasio (autoscaling.keda.enabled false), the operator its
@@ -280,8 +281,41 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
     policyTypes: ["Ingress"],
     ingress: [
       { from: [of(LOG_COMPONENT)], ports: [LOG_PORT, LOG_CONTROLLER_PORT].map((port) => ({ protocol: "TCP", port })) },
-      { from: [of(GATEWAY_COMPONENT), of(INTAKE_COMPONENT), operator], ports: [{ protocol: "TCP", port: LOG_PORT }] },
+      {
+        from: [
+          of(GATEWAY_COMPONENT),
+          of(WEBHOOK_COMPONENT),
+          of(INTAKE_COMPONENT),
+          operator,
+          of("alasio"),
+          { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+        ],
+        ports: [{ protocol: "TCP", port: LOG_PORT }],
+      },
       { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_METRICS_PORT }] },
+    ],
+  });
+}
+
+/**
+ * The webhook intake takes its port from anywhere, as the internet reaches it, and its
+ * health's from the collector's scraper; it reaches the cluster's DNS and the log's
+ * brokers alone, so nothing it is sent can make it reach anything else.
+ */
+function webhookPolicy(config: InstallConfig): NetworkPolicy {
+  return policy(WEBHOOK, NAMESPACE, WEBHOOK_COMPONENT, {
+    podSelector: { matchLabels: selectorLabels(WEBHOOK_COMPONENT) },
+    policyTypes: ["Ingress", "Egress"],
+    ingress: [
+      { from: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: config.webhook.port }] },
+      { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: WEBHOOK_HEALTH_PORT }] },
+    ],
+    egress: [
+      {
+        to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
+        ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
+      },
+      { to: [{ podSelector: { matchLabels: selectorLabels(LOG_COMPONENT) } }], ports: [{ protocol: "TCP", port: LOG_PORT }] },
     ],
   });
 }
@@ -394,8 +428,9 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       : []),
     alasioPolicy(config, environment),
     ...(config.neon.enabled ? [...neonPolicies(environment), branchStoragePolicy(config)] : []),
-    ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
-    ...(logRuns(config) ? [logPolicy(config)] : []),
+    ...(config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
+    logPolicy(config),
+    webhookPolicy(config),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

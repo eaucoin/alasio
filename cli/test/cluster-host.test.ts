@@ -15,7 +15,7 @@ import { Effect, Layer, Logger } from "effect";
 
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
 import { Machine } from "../src/cluster/machine.ts";
-import { NODE_PINS } from "../src/cluster/node.ts";
+import { CLUSTER_NETWORKS, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
 import { CERTIFICATE, serveFakeKube } from "./support/fake-kube.ts";
 import { FakeMachine } from "./support/fake-machine.ts";
@@ -26,7 +26,7 @@ const RUNNING = { loaded: true, active: "active", enabled: true };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
   const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
-    planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, ...changes });
+    planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, rules: CLUSTER_NETWORKS, ...changes });
   const none = { firewall: null, configure: false, gvisor: false, k3s: null, kubeconfig: false, renew: false };
   assert.deepEqual(plan({}), none);
   assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), { firewall: null, configure: true, gvisor: true, k3s: "install", kubeconfig: true, renew: false });
@@ -112,7 +112,7 @@ async function rig(t: TestContext, ready: { since: boolean }) {
       Effect.flatMap(HostCluster, (cluster) => cluster.up(join(directory, "kubeconfig"))).pipe(
         Effect.match({ onFailure: (error) => error.message, onSuccess: () => null }),
         Effect.provide(
-          HostCluster.layer({ storagePath: join(directory, "storage"), readyTimeout: "300 millis", poll: "5 millis" }).pipe(
+          HostCluster.layer({ storagePath: join(directory, "storage"), webhookPort: 443, readyTimeout: "300 millis", poll: "5 millis" }).pipe(
             Layer.provide(Root.inProcess),
             Layer.provideMerge(Layer.mergeAll(Layer.succeed(Machine, { platform: "linux", arch: "x64", root: machine.root }), machine.layer, machine.systemd, fakeReleases().layer)),
             Layer.provideMerge(NodeServices.layer),

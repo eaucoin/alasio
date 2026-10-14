@@ -25,7 +25,7 @@ import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V
 
 import { LOG_PRINCIPALS, type LogPrincipal } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, logRuns, NAMESPACE, replicasOf, restrictedContainer, s3Endpoint, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, s3Endpoint, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -47,11 +47,46 @@ export const TELEMETRY_TOPICS = { traces: "otel.spans", logs: "otel.logs", metri
 /** The consumer group of the lake's intake. */
 export const INTAKE_GROUP = "lake-intake";
 
+/**
+ * How long an environment's Telegram updates are kept: a week, so an environment asleep
+ * for one still finds them, beyond the day Telegram itself keeps what it could not deliver.
+ */
+export const TELEGRAM_RETENTION_MS = 7 * 86_400_000;
+
+/** An environment's name, as its topic, group and principal are named: main's, or its branch's. */
+export const environmentName = ({ branch }: Environment): string => branch ?? "main";
+
+/** The topic of the Telegram updates of the environment `name`, which the webhook intake writes and its alasio reads. */
+export const telegramTopic = (name: string): string => `telegram.${name}`;
+
+/**
+ * What the log gives the environment `name`'s alasio: its principal, `alasio-<name>`,
+ * which reads its topic in its group, `alasio.<name>`, and nothing else; and its topic,
+ * of one partition, as one alasio reads it, a chat's updates in order.
+ */
+export function environmentAccess(name: string): { readonly principal: string; readonly group: string; readonly topic: LogAccess["topics"][number]; readonly acls: readonly LogAcl[] } {
+  const topic = telegramTopic(name);
+  const group = `alasio.${name}`;
+  return {
+    principal: `alasio-${name}`,
+    group,
+    topic: { name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS },
+    acls: [{ resource: "topic", name: topic, pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: group, pattern: "literal", operations: ["read"] }],
+  };
+}
+
 /** The log's brokers, as a client anywhere in the cluster bootstraps from them. */
 export const LOG_BROKERS = `${LOG}.${NAMESPACE}.svc:${LOG_PORT}`;
 
 /** The Secret of the principal `principal`'s name and password, which the stack's setup writes. */
 export const logPrincipalSecret = (principal: LogPrincipal): string => componentName(`log-${principal}`);
+
+/**
+ * The Secret of the principal the alasio of `environment` reads its topic as, in its
+ * namespace: main's, which the stack's setup writes; a branch environment's, which alasio's
+ * command line writes as it makes the branch's principal.
+ */
+export const environmentLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("alasio-main") : componentName("log-alasio"));
 
 /** A node's address, by its ordinal: its pod's name in the log's headless Service. */
 const nodeAddress = (ordinal: number | string): string => `${LOG}-${ordinal}.${LOG}.${NAMESPACE}.svc`;
@@ -77,19 +112,24 @@ const retentionMs = (retention: string): number => Number(retention.slice(0, -1)
  * What the log's access is: the telemetry topics, of as many partitions as the intake
  * runs replicas at most, so each has one to read; the gateway's writing them, the
  * intake's reading them in its group, and KEDA's reading how far the group is behind on
- * them, which asks to describe both and to read neither.
+ * them, which asks to describe both and to read neither; main's Telegram topic; the
+ * webhook intake's writing every environment's, a branch's among them, and nothing else;
+ * and main's alasio's reading its own (environmentAccess).
  */
 export function logAccess(config: InstallConfig): LogAccess {
   const partitions = Math.max(1, config.lake.intake.scaling.max);
   const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" } as const;
   const group = { resource: "group", name: INTAKE_GROUP, pattern: "literal" } as const;
+  const main = environmentAccess("main");
   const principals: Record<LogPrincipal, readonly LogAcl[]> = {
     gateway: [{ ...telemetry, operations: ["write", "describe"] }],
     intake: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }],
     scaler: [{ ...telemetry, operations: ["describe"] }, { ...group, operations: ["describe"] }],
+    webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
+    "alasio-main": main.acls,
   };
   return {
-    topics: Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, retentionMs: retentionMs(config.log.retention) })),
+    topics: [...Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, retentionMs: retentionMs(config.log.retention) })), main.topic],
     principals: LOG_PRINCIPALS.map((name) => ({ name, acls: principals[name] })),
   };
 }
@@ -168,9 +208,8 @@ const START = script(
   "esac",
 );
 
-/** The log's objects, when it runs. */
+/** The log's objects: it always runs, on the bundled object store or the operator's. */
 export function logObjects(config: InstallConfig): KubernetesObject[] {
-  if (!logRuns(config)) return [];
   const { log } = config;
   const metadata = { name: LOG, namespace: NAMESPACE, labels: stackLabels(LOG_COMPONENT) };
   const access = logAccess(config);

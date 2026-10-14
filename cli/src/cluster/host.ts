@@ -24,6 +24,7 @@ import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, 
 
 import type { Registries } from "../config.ts";
 import { kind, KubeApi, type KubeApiError, type KubeconfigUnusable } from "../kube/api.ts";
+import { TELEGRAM_RANGES } from "../manifests/webhook.ts";
 import {
   awaitReady,
   clusterKubeconfig,
@@ -42,6 +43,7 @@ import {
   type ChecksumMismatch,
   checked,
   CLUSTER_NETWORKS,
+  webhookRules,
   ConfigureNode,
   containerdTemplate,
   type Download,
@@ -162,6 +164,8 @@ export class ForeignK3s extends Schema.TaggedError<ForeignK3s>()("ForeignK3s", {
 export interface HostClusterOptions {
   /** The directory persistent volumes are made in (k3s's local-path). */
   readonly storagePath: string;
+  /** The webhook intake's port, which a firewall lets Telegram's ranges alone in to. */
+  readonly webhookPort: number;
   readonly hostAliases?: readonly HostAlias[];
   /** The registries the node pulls from; containerd's defaults unless given. */
   readonly registries?: typeof Registries.Type;
@@ -211,14 +215,16 @@ export interface NodePlan {
  * firewall active on the machine, which lets the cluster's networks in once alasio has
  * seen to it. Pure, for tests.
  */
-export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, firewall }: {
+export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, firewall, rules }: {
   readonly stamp: NodeStamp | null;
   readonly config: string;
   readonly unit: UnitState;
   readonly kubeconfig: KubeconfigState;
   readonly firewall: Firewall | null;
+  /** What the firewall lets in: the cluster's networks, and Telegram's ranges to the webhook intake. */
+  readonly rules: readonly string[];
 }): NodePlan {
-  const opened = stamp?.firewall?.tool === firewall && CLUSTER_NETWORKS.every((network) => stamp?.firewall?.networks.includes(network));
+  const opened = stamp?.firewall?.tool === firewall && rules.every((rule) => stamp?.firewall?.networks.includes(rule));
   const configure = stamp?.config !== config;
   const gvisor = stamp?.gvisor !== pins.gvisor.release;
   const k3s = stamp?.k3s !== pins.k3s.version || !unit.loaded
@@ -274,6 +280,7 @@ export class HostCluster extends Context.Service<HostCluster, {
 
 const makeHostCluster = Effect.fnUntraced(function*({
   storagePath,
+  webhookPort,
   hostAliases = [],
   registries,
   readyTimeout = WAITS.readyTimeout,
@@ -345,7 +352,12 @@ const makeHostCluster = Effect.fnUntraced(function*({
     yield* fs.makeDirectory(storagePath, { recursive: true });
     const files = nodeFiles(config, yield* onMachine(containerdTemplate));
     const copy = (yield* fs.exists(kubeconfig)) ? yield* fs.readFileString(kubeconfig) : null;
-    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall: yield* activeFirewall });
+    const firewall = yield* activeFirewall;
+    const rules = [...CLUSTER_NETWORKS, ...webhookRules(TELEGRAM_RANGES, webhookPort)];
+    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall, rules });
+    if (firewall === null) {
+      yield* Effect.logInfo(`no firewall is active on this machine: the webhook intake's port, ${webhookPort}, is open to every address, and only each route's secret token guards it`);
+    }
     const raise = yield* onMachine(inotifyStep);
     const started = plan.k3s === null && !plan.renew ? 0 : Date.now();
     const outcome = yield* Effect.scoped(Effect.gen(function*() {
@@ -357,7 +369,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
       const script = plan.k3s === "install" ? yield* fetched(directory, "install.sh", from.installScript) : null;
       const steps: RootStep[] = [
         ...(raise ? [raise] : []),
-        ...(plan.firewall ? [OpenFirewall.make({ firewall: plan.firewall, networks: CLUSTER_NETWORKS })] : []),
+        ...(plan.firewall ? [OpenFirewall.make({ firewall: plan.firewall, networks: rules })] : []),
         ...(plan.configure ? [ConfigureNode.make({ config })] : []),
         ...(archive ? [InstallGvisor.make({ release: pins.gvisor.release, ...(stamp?.gvisor ? { previous: stamp.gvisor } : {}), archive })] : []),
         ...(binary && script ? [InstallK3s.make({ version: pins.k3s.version, ...(stamp?.k3s ? { previous: stamp.k3s } : {}), role: config.role, binary, script })] : []),

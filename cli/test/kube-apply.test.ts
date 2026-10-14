@@ -27,7 +27,7 @@ const WAIT = { timeout: "2 seconds", poll: "10 millis" } as const;
 
 /** The objects of an installation of `install`. */
 function objectsOf(install: Record<string, unknown> = {}) {
-  const config = installConfigOf(install, { claude: false, shared: false });
+  const config = installConfigOf(install, { claude: false, target: "docker" });
   if (Result.isFailure(config)) throw new Error(config.failure);
   return installationObjects(config.success);
 }
@@ -421,7 +421,7 @@ test("KEDA and VPA are installed where the cluster has none, refused where it ha
   const { kube, run } = await rig(t);
   /** What checking the installation of `install`, with `objects` added, comes to. */
   const check = (install: Record<string, unknown>, objects: readonly KubernetesObject[] = []) => {
-    const config = installConfigOf(install, { claude: false, shared: false });
+    const config = installConfigOf(install, { claude: false, target: "docker" });
     if (Result.isFailure(config)) throw new Error(config.failure);
     return run(Effect.result(checkAutoscalers([...installationObjects(config.success), ...objects], config.success))).then((result) => (Result.isFailure(result) ? result.failure.message : "fits"));
   };

@@ -15,9 +15,11 @@ export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces"
 /**
  * The log's principals besides its admin, each with a password of its own: the collector's
  * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
- * and KEDA, which reads how much the intake has yet to.
+ * KEDA, which reads how much the intake has yet to; the webhook intake, which writes each
+ * environment's Telegram updates to it; and main's alasio, which reads its own. A branch
+ * environment's alasio has a principal of its own, which alasio's command line makes.
  */
-export const LOG_PRINCIPALS = ["gateway", "intake", "scaler"] as const;
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", "alasio-main"] as const;
 export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
 
 export interface S3Credentials {

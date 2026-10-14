@@ -8,8 +8,11 @@
  * password of alasio's role on its compute, which neon-control gives the role there, the
  * lake's role's, which its alasio gives it, and its compute's token, which fetches its
  * spec alone), none of which reaches main's compute or another branch's; its bot's;
- * Claude Code's token when main has one; the pull Secrets of its images; and its token to
- * ask main to fork with. Its lake has main's object store identity, as it reads main's
+ * Claude Code's token when main has one; the pull Secrets of its images; its token to
+ * ask main to fork with; and its principal on the log, which reads its own topic alone,
+ * made beside the log's node by its access applier. Its bot's updates are delivered to the
+ * webhook intake at a route of its own (./webhook.ts), which its bot is registered with
+ * once its alasio runs. Its lake has main's object store identity, as it reads main's
  * files where they are (one data path: DuckLake keeps every file's path relative to it),
  * and SeaweedFS's Write, which writing needs, deletes too. neon-control is called
  * in its own pod, as the API server's service proxy drops the Authorization header it
@@ -18,7 +21,8 @@
  * A branch is deleted in the order nothing of it outlives what it runs on: its alasio and
  * lake stopped, its Sandboxes and their claims deleted (JuiceFS keeps every chunk main
  * still uses), its compute stopped, its branch of Neon's deleted, and its namespaces with
- * all that is left in them.
+ * all that is left in them; its bot told to deliver nowhere first, its route, its topic and
+ * its principal gone last.
  */
 import { randomBytes } from "node:crypto";
 
@@ -29,16 +33,19 @@ import { type BranchView, nameProblem, tokenSha256 } from "../../neon/control/br
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
-import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
 import { awaitGone, awaitReclaimed, readiness, selectorOf, type WaitOptions } from "./kube/rollout.ts";
 import { sandboxPolicyName } from "./manifests/admission.ts";
+import { environmentAccess, environmentLogSecret, LOG } from "./manifests/automq.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
+import { TelegramBotApi } from "./telegram.ts";
+import { ensureRoute, registerBot, removeRoute } from "./webhook.ts";
 
 /** A branch environment alasio will not make or delete now, and why, as the operator is told. */
 export class BranchRefused extends Schema.TaggedError<BranchRefused>()("BranchRefused", {
@@ -179,7 +186,7 @@ function merged(base: Readonly<Record<string, unknown>>, overrides: Readonly<Rec
 export const branchConfig = Effect.fnUntraced(function*(config: OperatorConfig, overrides: Readonly<Record<string, unknown>>): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
   const install = merged(config.install, merged(overrides, { host: { enabled: false } }));
-  const decoded = installConfigOf(install, { claude, shared: sharedCluster(config.target) });
+  const decoded = installConfigOf(install, { claude, target: targetKind(config.target) });
   if (Result.isFailure(decoded)) return yield* new OperatorConfigError({ path: config.path, reason: `with the branch's overrides, ${decoded.failure}` });
   return decoded.success;
 });
@@ -228,7 +235,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   if (yield* kube.get({ ...NAMESPACE_KIND, name: branchNamespace(name) })) return yield* new BranchRefused({ message: `there is a branch ${name} already` });
   const main = yield* readTelegramBot;
   if (main && Redacted.value(main.token) === Redacted.value(bot.token)) {
-    return yield* new BranchRefused({ message: "a branch's bot is its own: Telegram gives a bot's updates to one poller, and main's alasio polls main's bot" });
+    return yield* new BranchRefused({ message: "a branch's bot is its own: Telegram delivers a bot's updates to one webhook, and main's bot's to main" });
   }
 
   const memory = yield* measureMemory;
@@ -239,7 +246,8 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
 
   // The branch's own, as the module says: none of main's passwords or tokens of its Neon.
   const own = () => randomBytes(24).toString("base64url");
-  const credentials = { alasio: own(), lake: own(), compute: own() };
+  const credentials = { alasio: own(), lake: own(), compute: own(), log: own() };
+  const access = environmentAccess(name);
   const url = new URL(yield* requiredSecret(componentName("database"), "url"));
   url.password = credentials.alasio;
   const lake = settings.lake.enabled ? yield* copiedSecret(name, componentName("lake"), ["LAKE_S3_KEY", "LAKE_S3_SECRET"]) : null;
@@ -252,6 +260,7 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     ...(yield* Effect.forEach(settings.imagePullSecrets, (secret) => copiedSecret(name, secret))),
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
+    branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: access.principal, password: credentials.log }),
   ];
 
   // At main's current WAL position, so the branch holds every commit main has made.
@@ -264,11 +273,22 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   });
   if (made.status !== 201 && made.status !== 200) return yield* new BranchRefused({ message: `neon-control did not make the branch ${name}: ${refusalOf(made)}` });
 
+  // Its principal on the log, its topic and their ACLs, made by the log's access applier.
+  yield* changeEnvironment("environment", { ...access, password: credentials.log });
+  const route = yield* ensureRoute(name, bot.allowedUserIds);
+
   const objects = branchObjects(settings, name);
   yield* Effect.forEach(objects.filter((object) => object.kind === "Namespace"), (namespace) => kube.apply(namespace), { discard: true });
   yield* Effect.forEach(secrets, (secret) => kube.apply(secret), { discard: true });
   yield* applyObjects(objects, options);
+  yield* registerBot(settings, name, bot, route, options);
 });
+
+/** Makes, or forgets, an environment's access on the log, by the access applier beside its first node (src/log/access.ts). */
+const changeEnvironment = (change: "environment" | "forget", access: ReturnType<typeof environmentAccess> & { readonly password?: string }) =>
+  runIn({ namespace: NAMESPACE, pod: `${LOG}-0`, container: "access" }, ["node", "/opt/alasio/src/log/access.ts", change], JSON.stringify(access)).pipe(
+    Effect.flatMap(succeeded(change === "environment" ? "making the branch's principal on the log" : "forgetting the branch's principal on the log")),
+  );
 
 /** A branch environment as `list` says it. */
 export interface ListedBranch {
@@ -360,6 +380,9 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
   }
 
   if (made) {
+    // Its bot's updates delivered nowhere: what Telegram holds of them it keeps, for no one.
+    const token = (yield* kube.get<V1Secret>({ ...SECRET, namespace, name: TELEGRAM_SECRET }))?.data?.["token"];
+    if (token) yield* Effect.flatMap(TelegramBotApi, (telegram) => telegram.deleteWebhook(Redacted.make(Buffer.from(token, "base64").toString("utf8"))));
     yield* stopped(namespace, [RELEASE, componentName("lake")], options);
     const sandboxes = yield* kube.list(kind("Sandbox"), { namespace: sessions }).pipe(Effect.catchIf(hasStatus(404), () => Effect.succeed([])));
     yield* removed(sandboxes.map(refOf), options);
@@ -380,7 +403,9 @@ export const deleteBranch = Effect.fnUntraced(function*(name: string, { force }:
     );
   }
   yield* removed([namespace, sessions].map((each) => ({ ...NAMESPACE_KIND, name: each })), options);
-  // What of its is the cluster's: its Sandboxes' admission policy.
+  // What of its is the cluster's: its Sandboxes' admission policy, its route, its topic and its principal.
   yield* removed([kind("ValidatingAdmissionPolicyBinding"), kind("ValidatingAdmissionPolicy")].map((each) => ({ ...each, name: sandboxPolicyName(namespace) })), options);
+  yield* removeRoute(name);
+  yield* changeEnvironment("forget", environmentAccess(name));
 });
 

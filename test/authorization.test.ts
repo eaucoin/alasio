@@ -2,18 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { CallbackQuery, Message } from "@grammyjs/types";
-import { Effect, Layer } from "effect";
+import { Effect } from "effect";
 
-import { Store } from "../src/persistence/store.ts";
 import { Authorizer } from "../src/telegram/authorizer.ts";
 import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { withServices } from "./support/turns.ts";
 
-/** The Authorizer for `allowedUserIds`, keeping its operator in `store`. */
-function authorizerOf(allowedUserIds: string, store: Store["Service"]): Authorizer["Service"] {
-  return Effect.runSync(Effect.provide(Authorizer, Authorizer.layer(allowedUserIds).pipe(Layer.provide(Layer.succeed(Store, store)))));
+/** The Authorizer for `allowedUserIds`. */
+function authorizerOf(allowedUserIds: string): Authorizer["Service"] {
+  return Effect.runSync(Effect.provide(Authorizer, Authorizer.layer(allowedUserIds)));
 }
 
 function privateMessage(userId: number, chatId = userId): Message {
@@ -40,7 +39,7 @@ function privateCallback(userId: number, chatId = userId, data = "action-1"): Ca
 }
 
 test("explicit allowlist owns private messages and callback queries", async () => {
-  const authorizer = authorizerOf("123", await testStore());
+  const authorizer = authorizerOf("123");
   const message = (m: Message) => run(authorizer.isAuthorizedMessage(m));
   const press = (q: CallbackQuery) => run(authorizer.isAuthorizedCallbackQuery(q));
 
@@ -58,26 +57,10 @@ test("explicit allowlist owns private messages and callback queries", async () =
   assert.equal(await press(privateCallback(123, 456)), false);
 });
 
-test("callback queries cannot claim an empty bootstrap allowlist", async () => {
-  const store = await testStore();
-  const authorizer = authorizerOf("", store);
-  const message = (m: Message) => run(authorizer.isAuthorizedMessage(m));
-  const press = (q: CallbackQuery) => run(authorizer.isAuthorizedCallbackQuery(q));
-
-  assert.equal(await press(privateCallback(123)), false);
-  assert.equal(await run(store.getState("telegram_bootstrap_user_id")), null);
-  assert.equal(await message(privateMessage(123)), true);
-  assert.equal(await press(privateCallback(123)), true);
-  assert.equal(await press(privateCallback(456)), false);
-});
-
-test("an empty allowlist's operator is the first user to message the bot, however many do at once", async () => {
-  const authorizer = authorizerOf("", await testStore());
-  const users = [123, 456, 789];
-  const authorized = await Promise.all(users.map((user) => run(authorizer.isAuthorizedMessage(privateMessage(user)))));
-  assert.equal(authorized.filter(Boolean).length, 1);
-  const operator = users[authorized.indexOf(true)]!;
-  assert.deepEqual(await Promise.all(users.map((user) => run(authorizer.isAuthorizedMessage(privateMessage(user))))), users.map((user) => user === operator));
+test("with no user allowed, no one is", async () => {
+  const authorizer = authorizerOf("");
+  assert.equal(await run(authorizer.isAuthorizedMessage(privateMessage(123))), false);
+  assert.equal(await run(authorizer.isAuthorizedCallbackQuery(privateCallback(123))), false);
 });
 
 test("unauthorized callback is rejected before consuming its action", async () => {

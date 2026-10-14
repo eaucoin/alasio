@@ -19,6 +19,12 @@
  * Environment: LOG_BROKERS (its node's address), LOG_ADMIN_PASSWORD, LOG_ACCESS (the file
  * of what it applies), LOG_PASSWORDS (the directory of each principal's password, a file
  * of its name), LOG_ACCESS_PORT.
+ *
+ * alasio's command line runs it in the applier's container for each branch environment it
+ * makes or deletes, with what it is given on its input (EnvironmentAccess):
+ *
+ *   node access.ts environment    makes the environment's principal, its topic and its ACLs
+ *   node access.ts forget         deletes them
  */
 import { pbkdf2Sync, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -46,10 +52,22 @@ const RETRY_MS = 5_000;
 /** SCRAM-SHA-512's iterations, as Kafka's own tools use by default. */
 const ITERATIONS = 4096;
 
+/** A branch environment's access, as alasio's command line gives it: its principal, its password where it is made, its topic and its ACLs. */
+export interface EnvironmentAccess {
+  readonly principal: string;
+  readonly password?: string;
+  readonly topic: LogAccess["topics"][number];
+  readonly acls: readonly LogAcl[];
+}
+
 /** What the applier does on the log, as its admin. */
 export interface LogAdmin {
   /** Sets the principal `name`'s credential to one of `password`. */
   credential(name: string, password: string): Promise<void>;
+  /** Deletes the principal `name`'s credential, where it has one. */
+  forgetCredential(name: string): Promise<void>;
+  deleteTopic(name: string): Promise<void>;
+  disallow(acls: readonly Acl[]): Promise<void>;
   /** The topics there are, and how many partitions each has. */
   topics(): Promise<ReadonlyMap<string, number>>;
   createTopic(name: string, partitions: number, retentionMs: number): Promise<void>;
@@ -94,26 +112,53 @@ export async function applyAccess(admin: LogAdmin, access: LogAccess, passwords:
   await admin.allow(access.principals.flatMap(({ name, acls }) => acls.flatMap((acl) => bindings(name, acl))));
 }
 
+/** Makes the branch environment's `access` on the log: its principal's credential, its topic and its ACLs. */
+export async function applyEnvironment(admin: LogAdmin, { principal, password, topic, acls }: EnvironmentAccess): Promise<void> {
+  if (!password) throw new Error(`the principal ${principal} has no password`);
+  await applyAccess(admin, { topics: [topic], principals: [] }, {});
+  await admin.credential(principal, password);
+  await admin.allow(acls.flatMap((acl) => bindings(principal, acl)));
+}
+
+/** Deletes the branch environment's `access` from the log: its ACLs, its topic, and its principal's credential. */
+export async function forgetEnvironment(admin: LogAdmin, { principal, topic, acls }: EnvironmentAccess): Promise<void> {
+  await admin.disallow(acls.flatMap((acl) => bindings(principal, acl)));
+  if ((await admin.topics()).has(topic.name)) await admin.deleteTopic(topic.name);
+  await admin.forgetCredential(principal);
+}
+
 /** The log's admin at `brokers`, as @platformatic/kafka reaches it. */
 export function logAdmin(brokers: readonly string[], password: string): LogAdmin {
   const sasl = { mechanism: "SCRAM-SHA-512" as const, username: "admin", password };
   const admin = new Admin({ clientId: "log-access", bootstrapBrokers: [...brokers], sasl });
+  /** Alters credentials, on a connection of its own, as the Admin does not wrap it; a deletion of none there is is none. */
+  const alterCredentials = async (...[deletions, upsertions]: Parameters<typeof alterUserScramCredentialsV0.api.async> extends [unknown, ...infer Rest] ? Rest : never) => {
+    const [host = "", port = ""] = (brokers[0] ?? "").split(":");
+    const connection = new Connection("log-access", { sasl });
+    try {
+      await connection.connect(host, Number(port));
+      const { results } = await alterUserScramCredentialsV0.api.async(connection, deletions, upsertions);
+      // 91: RESOURCE_NOT_FOUND, a credential to delete that there is not.
+      const failed = results.find(({ errorCode }) => errorCode !== 0 && !(deletions.length > 0 && errorCode === 91));
+      if (failed) throw new Error(`the credential of ${failed.user} was refused: ${failed.errorMessage ?? `error ${failed.errorCode}`}`);
+    } finally {
+      await connection.close();
+    }
+  };
   return {
     async credential(name, secret) {
-      const [host = "", port = ""] = (brokers[0] ?? "").split(":");
-      const connection = new Connection("log-access", { sasl });
-      try {
-        await connection.connect(host, Number(port));
-        const salt = randomBytes(32);
-        const saltedPassword = pbkdf2Sync(secret, salt, ITERATIONS, 64, "sha512");
-        const { results } = await alterUserScramCredentialsV0.api.async(connection, [], [
-          { name, mechanism: ScramMechanisms.SCRAM_SHA_512, iterations: ITERATIONS, salt, saltedPassword },
-        ]);
-        const failed = results.find(({ errorCode }) => errorCode !== 0);
-        if (failed) throw new Error(`the credential of ${name} was refused: ${failed.errorMessage ?? `error ${failed.errorCode}`}`);
-      } finally {
-        await connection.close();
-      }
+      const salt = randomBytes(32);
+      const saltedPassword = pbkdf2Sync(secret, salt, ITERATIONS, 64, "sha512");
+      await alterCredentials([], [{ name, mechanism: ScramMechanisms.SCRAM_SHA_512, iterations: ITERATIONS, salt, saltedPassword }]);
+    },
+    async forgetCredential(name) {
+      await alterCredentials([{ name, mechanism: ScramMechanisms.SCRAM_SHA_512 }], []);
+    },
+    async deleteTopic(name) {
+      await admin.deleteTopics({ topics: [name] });
+    },
+    async disallow(acls) {
+      await admin.deleteAcls({ filters: [...acls] });
     },
     async topics() {
       const names = await admin.listTopics();
@@ -149,12 +194,31 @@ function log(message: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const required = (key: string) => {
-    const value = process.env[key]?.trim();
-    if (!value) throw new Error(`${key} must be set`);
-    return value;
-  };
+const required = (key: string) => {
+  const value = process.env[key]?.trim();
+  if (!value) throw new Error(`${key} must be set`);
+  return value;
+};
+
+/** Makes, or forgets, the environment its input says, then exits: 0 once done, 1 saying why where it failed. */
+async function changeEnvironment(change: "environment" | "forget"): Promise<void> {
+  const access: EnvironmentAccess = JSON.parse(readFileSync(0, "utf8"));
+  const admin = logAdmin(required("LOG_BROKERS").split(","), required("LOG_ADMIN_PASSWORD"));
+  try {
+    await (change === "environment" ? applyEnvironment : forgetEnvironment)(admin, access);
+    log(change === "environment" ? "an environment's access made" : "an environment's access forgotten", { principal: access.principal, topic: access.topic.name });
+  } catch (error) {
+    console.error(errorText(error));
+    process.exitCode = 1;
+  } finally {
+    await admin.close().catch(() => {});
+  }
+}
+
+const [mode] = process.argv.slice(2);
+if (import.meta.url === `file://${process.argv[1]}` && (mode === "environment" || mode === "forget")) {
+  await changeEnvironment(mode);
+} else if (import.meta.url === `file://${process.argv[1]}`) {
   const brokers = required("LOG_BROKERS").split(",");
   const password = required("LOG_ADMIN_PASSWORD");
   const access: LogAccess = JSON.parse(readFileSync(required("LOG_ACCESS"), "utf8"));

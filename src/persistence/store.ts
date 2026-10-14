@@ -93,8 +93,6 @@ export class Store extends Context.Service<Store, {
   readonly getState: (key: string) => Stored<string | null>;
   /** The key's value: `value` if the key had none, which it then keeps. */
   readonly claimState: (key: string, value: string) => Stored<string>;
-  readonly getTelegramOffset: Stored<number | undefined>;
-  readonly setTelegramOffset: (offset: number) => Stored<void>;
 
   /** Makes the chat's conversation, or updates who it is with: its id. */
   readonly upsertConversation: (conversation: NewConversation) => Stored<string>;
@@ -132,7 +130,8 @@ export class Store extends Context.Service<Store, {
   /** The action of a button pressed for the first time; null for one pressed before, or unknown. */
   readonly consumeCallbackAction: (id: string) => Stored<CallbackAction | null>;
 
-  readonly recordTelegramUpdate: (update: Update) => Stored<void>;
+  /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
+  readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
   readonly insertMessage: (message: NewMessage) => Stored<string>;
   readonly insertFile: (file: NewFile) => Stored<string>;
@@ -231,8 +230,6 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
   return Store.of({
     getState: (key) => state.getState(key),
     claimState: (key, value) => state.claimState(key, value),
-    getTelegramOffset: state.getTelegramOffset(),
-    setTelegramOffset: (offset) => state.setTelegramOffset(offset),
 
     upsertConversation: (conversation) => conversations.upsertConversation(conversation),
     getConversation: (conversationId) => conversations.getConversation(conversationId),

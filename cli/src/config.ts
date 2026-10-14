@@ -136,8 +136,18 @@ export interface OperatorConfig {
   readonly install: Readonly<Record<string, unknown>>;
 }
 
-/** Whether alasio may share `target`'s cluster with others: one a kubeconfig reaches, rather than one it makes. */
-export const sharedCluster = (target: Target): boolean => "kubeconfig" in target;
+/** Which of the targets `target` is. */
+export type TargetKind = "host" | "docker" | "kubeconfig";
+
+/** The kind of `target`. */
+export const targetKind = (target: Target): TargetKind => ("host" in target ? "host" : "docker" in target ? "docker" : "kubeconfig");
+
+/**
+ * How Telegram reaches the webhook intake on a cluster of `kind`: on this machine's
+ * address, from k3s on it; on the node's, from the cluster in Docker, whose port the
+ * machine maps; through a LoadBalancer Service, on one a kubeconfig reaches.
+ */
+const EXPOSURES = { host: "hostAddress", docker: "node", kubeconfig: "loadBalancer" } as const;
 
 /** The config file is not what alasio runs from: where, and which key and why. */
 export class OperatorConfigError extends Schema.TaggedError<OperatorConfigError>()("OperatorConfigError", {
@@ -161,23 +171,28 @@ export class NotInitialized extends Schema.TaggedError<NotInitialized>()("NotIni
 /**
  * The install configuration of `install`, with the Secrets alasio names: the bot's,
  * and Claude Code's when `claude`, as alasio finds Claude Code's login in its home when
- * there is none. On a cluster alasio may share with others (`shared`, one a kubeconfig
- * reaches), its pods take no other's place unless autoscaling.preemption says.
+ * there is none; and with how the webhook intake is reached, as the cluster's `target`
+ * makes it. On a cluster alasio may share with others (one a kubeconfig reaches), its
+ * pods take no other's place unless autoscaling.preemption says.
  */
 export function installConfigOf(
   install: Readonly<Record<string, unknown>>,
-  { claude, shared }: { readonly claude: boolean; readonly shared: boolean },
+  { claude, target }: { readonly claude: boolean; readonly target: TargetKind },
 ): Result.Result<InstallConfig, string> {
   const alasio = Predicate.isObject(install["alasio"]) ? install["alasio"] : {};
   const own = ["telegram", "claude"].find((key) => Predicate.hasProperty(alasio, key));
   if (own) return Result.fail(`install.alasio.${own} is alasio's own to say: its Secret is the one alasio init writes`);
-  // Given as anything but a map, it is refused as it is.
+  if (Predicate.hasProperty(install["webhook"], "exposure")) return Result.fail("install.webhook.exposure is alasio's own to say: the target makes it");
+  // Given as anything but a map, each is refused as it is.
   const autoscaling = install["autoscaling"] ?? {};
+  const webhook = install["webhook"] ?? {};
+  const mapped = (value: unknown, defaults: Record<string, unknown>) => (Predicate.isObject(value) && !Array.isArray(value) ? { ...defaults, ...value } : value);
   return Result.mapBoth(
     decodeInstallConfig({
       ...install,
       alasio: { ...alasio, telegram: { existingSecret: TELEGRAM_SECRET }, claude: { existingSecret: claude ? CLAUDE_SECRET : "" } },
-      autoscaling: Predicate.isObject(autoscaling) && !Array.isArray(autoscaling) ? { preemption: !shared, ...autoscaling } : autoscaling,
+      autoscaling: mapped(autoscaling, { preemption: target !== "kubeconfig" }),
+      webhook: mapped(webhook, { exposure: EXPOSURES[target] }),
     }),
     { onFailure: (error) => `install.${error.message}`, onSuccess: (config) => config },
   );
@@ -198,7 +213,7 @@ export function decodeOperatorConfig(path: string, input: unknown): Result.Resul
     return Result.fail(new OperatorConfigError({ path, reason: describeIssue((Result.isFailure(precise) ? precise : decoded).failure.issue) }));
   }
   const { target, install } = decoded.success;
-  const checked = installConfigOf(install, { claude: true, shared: sharedCluster(target) });
+  const checked = installConfigOf(install, { claude: true, target: targetKind(target) });
   if (Result.isFailure(checked)) return Result.fail(new OperatorConfigError({ path, reason: checked.failure }));
   return Result.succeed({ path, file: input as OperatorConfigFile, target, install });
 }

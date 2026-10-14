@@ -22,6 +22,7 @@ import { TelegramApiError } from "../src/telegram/client.ts";
 import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
 import { newSchema, run, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
+import { stubUpdates } from "./support/stub-updates.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
 import { noWorkflowHooks, withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
@@ -289,6 +290,8 @@ test("alasio's services wire the durable outbox into final response delivery", a
       defaultHarness: null,
       branch: null,
       branchForkKeyFile: null,
+      // No update comes: the stand-in is refused as Telegram is.
+      updates: stubUpdates("http://127.0.0.1:9"),
     };
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const store = yield* Store;

@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { type Acl, AclOperations, AclPermissionTypes, ResourcePatternTypes, ResourceTypes } from "@platformatic/kafka";
 
 import type { LogAccess } from "../cli/src/manifests/automq.ts";
-import { applyAccess, bindings, type LogAdmin } from "../src/log/access.ts";
+import { applyAccess, applyEnvironment, bindings, type EnvironmentAccess, forgetEnvironment, type LogAdmin } from "../src/log/access.ts";
 
 const ACCESS: LogAccess = {
   topics: [{ name: "otel.spans", partitions: 2, retentionMs: 86_400_000 }, { name: "otel.logs", partitions: 2, retentionMs: 86_400_000 }],
@@ -43,6 +43,15 @@ function fakeLog(topics: Record<string, number> = {}): LogAdmin & { readonly ask
     async allow(given) {
       acls.push(...given);
     },
+    async forgetCredential(name) {
+      asked.push(`forget ${name}`);
+    },
+    async deleteTopic(name) {
+      asked.push(`delete ${name}`);
+    },
+    async disallow(given) {
+      asked.push(...given.map(({ principal, resourceName, operation }) => `disallow ${principal} ${resourceName} ${operation}`));
+    },
     async close() {},
   };
 }
@@ -75,4 +84,26 @@ test("stops where a principal has no password, before any topic or ACL", async (
   await assert.rejects(applyAccess(log, ACCESS, { gateway: "g" }), /the principal intake has no password/u);
   assert.deepEqual(log.acls, []);
   assert.ok(!log.asked.some((asked) => asked.startsWith("create")));
+});
+
+const BRANCH: EnvironmentAccess = {
+  principal: "alasio-try",
+  password: "p",
+  topic: { name: "telegram.try", partitions: 1, retentionMs: 604_800_000 },
+  acls: [{ resource: "topic", name: "telegram.try", pattern: "literal", operations: ["read"] }],
+};
+
+test("a branch environment's access is made: its topic, its principal, its ACLs; and forgotten whole", async () => {
+  const log = fakeLog();
+  await applyEnvironment(log, BRANCH);
+  assert.deepEqual(log.asked, ["create telegram.try 1 604800000", "credential alasio-try p"]);
+  assert.deepEqual(log.acls, bindings("alasio-try", BRANCH.acls[0] ?? assert.fail()));
+  await assert.rejects(applyEnvironment(fakeLog(), { ...BRANCH, password: "" }), /the principal alasio-try has no password/u);
+  const made = fakeLog({ "telegram.try": 1 });
+  await forgetEnvironment(made, BRANCH);
+  assert.deepEqual(made.asked, [`disallow User:alasio-try telegram.try ${AclOperations.READ}`, "delete telegram.try", "forget alasio-try"]);
+  // A topic there is not is not deleted.
+  const gone = fakeLog();
+  await forgetEnvironment(gone, BRANCH);
+  assert.ok(!gone.asked.includes("delete telegram.try"));
 });

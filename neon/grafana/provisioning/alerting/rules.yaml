@@ -302,3 +302,43 @@ groups:
               type: threshold
               expression: waiting
               conditions: [{evaluator: {type: gt, params: [8000]}}]
+
+      - uid: alasio-webhook-certificate-expiring
+        title: The webhook's certificate nears its end
+        condition: expiring
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "The certificate Telegram trusts for the webhook intake ends in {{ $values.days }} days, after which no bot's updates reach alasio: run alasio up, which renews it and registers each bot with the new one."
+        data:
+          - refId: days
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: days
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select round((arg_max(Value, TimeUnix) - epoch(now())) / 86400, 1) as days
+                  from otel.metrics_gauge
+                  where ServiceName = 'webhook' and MetricName = 'webhook_certificate_expiry_timestamp_seconds' and TimeUnix > now()::timestamp - interval 10 minute
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: days, text: days, type: number}
+          - refId: expiring
+            datasourceUid: __expr__
+            model:
+              refId: expiring
+              type: threshold
+              expression: days
+              conditions: [{evaluator: {type: lt, params: [21]}}]

@@ -19,6 +19,7 @@ import { networkPolicyObjects } from "./network-policies.ts";
 import { objectStoreObjects } from "./object-store.ts";
 import { priorityClassObjects } from "./priorities.ts";
 import { vpaObjects } from "./vpa.ts";
+import { webhookObjects } from "./webhook.ts";
 import { workspaceStorageObjects } from "./workspace-storage.ts";
 
 export { decodeInstallConfig, InstallConfig, InstallConfigError, type InstallConfigFile } from "./config.ts";
@@ -27,7 +28,7 @@ export { NAMESPACE } from "./common.ts";
 /**
  * The objects of the installation `config` describes: the PriorityClasses its pods run
  * under, agent-sandbox's, KEDA's, VPA's, alasio's, Neon's, the object store's, the log's,
- * the lake's, Grafana's, the telemetry collector's, workspace storage's, the
+ * the webhook intake's, the lake's, Grafana's, the telemetry collector's, workspace storage's, the
  * NetworkPolicies, and the headroom's.
  */
 export function manifests(config: InstallConfig): readonly KubernetesObject[] {
@@ -40,6 +41,7 @@ export function manifests(config: InstallConfig): readonly KubernetesObject[] {
     ...neonObjects(config),
     ...objectStoreObjects(config),
     ...logObjects(config),
+    ...webhookObjects(config),
     ...lakeObjects(config),
     ...grafanaObjects(config),
     ...collectorObjects(config),

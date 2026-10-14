@@ -29,10 +29,13 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
   const kubeconfig = { path: clusterKubeconfigPath(config) };
   if ("host" in target) {
     const { host } = target;
+    const install = installConfigOf(config.install, { claude: false, target: "host" });
+    if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
     return {
       _tag: "Host",
       cluster: {
         storagePath: host.storagePath ?? (yield* defaultStoragePath),
+        webhookPort: install.success.webhook.port,
         hostAliases: host.hostAliases,
         ...(host.registries ? { registries: host.registries } : {}),
       },
@@ -40,7 +43,7 @@ export const resolveTarget = Effect.fnUntraced(function*(config: OperatorConfig)
     };
   }
   const { docker } = target;
-  const install = installConfigOf(config.install, { claude: false, shared: false });
+  const install = installConfigOf(config.install, { claude: false, target: "docker" });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   const hostProfile = install.success.host;
   const hostPaths = hostProfile.enabled ? hostProfile.mounts.map(({ hostPath, readOnly }) => ({ source: hostPath, target: hostPath, readOnly })) : [];

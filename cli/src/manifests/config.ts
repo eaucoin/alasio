@@ -207,6 +207,27 @@ const Telemetry = Schema.Struct({
   ),
 });
 
+/**
+ * The webhook intake (./webhook.ts), the one thing of alasio's the internet reaches,
+ * which Telegram delivers each environment's bot's updates to, on `port` of
+ * `publicAddress`, over HTTPS with a certificate of its own that alasio uploads to
+ * Telegram as it registers each bot. How it is reached its target makes (`exposure`,
+ * alasio's own to say): on this machine's address, from k3s on it, which then needs
+ * `publicAddress` to be that address, and binds it alone, leaving the machine's other
+ * addresses' port to whatever has it; on its node's, in Docker, whose port the machine
+ * maps; or through a LoadBalancer Service. `publicAddress` is the address Telegram is told,
+ * which its certificate is made for: the machine's, or the LoadBalancer's, or a name of
+ * either. On a machine's or a node's address it runs one replica.
+ */
+const Webhook = Schema.Struct({
+  publicAddress: defaulted(matching(/^(|(\d{1,3}\.){3}\d{1,3}|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)$/u, "must be an IPv4 address or a host name, or empty"), ""),
+  /** One of the ports Telegram delivers to. */
+  port: defaulted(Schema.Literals([443, 80, 88, 8443]), 443),
+  exposure: defaulted(Schema.Literals(["hostAddress", "node", "loadBalancer"]), "node"),
+  scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+  resources: Resources({ requests: { cpu: "10m", memory: "48Mi" }, limits: { memory: "192Mi" } }),
+});
+
 /** The image of AutoMQ the log runs. */
 const AUTOMQ_IMAGE = { repository: "automqinc/automq", tag: "1.7.4", digest: "sha256:68bf5df674ab9755da51f5200c152df391b0968aeeaf9ec4d12619517cd1234f" };
 
@@ -691,15 +712,21 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (!config.neon.enabled && !config.neon.external.existingSecret) {
     return { path: ["neon", "external", "existingSecret"], issue: "is required when neon.enabled is false" };
   }
-  if (config.neon.enabled && !config.objectStore.bundled.enabled) {
-    if (!config.objectStore.external.endpoint) return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false" };
+  const { webhook } = config;
+  if (webhook.exposure === "hostAddress" && webhook.publicAddress && !/^(\d{1,3}\.){3}\d{1,3}$/u.test(webhook.publicAddress)) {
+    return { path: ["webhook", "publicAddress"], issue: "must be this machine's public IPv4 address, which Telegram delivers to and the webhook intake binds alone: alasio init finds it" };
+  }
+  if (webhook.exposure !== "loadBalancer" && webhook.scaling.min > 1) {
+    return { path: ["webhook", "scaling"], issue: "must be 1 where the webhook intake binds its node's port, which one pod holds" };
+  }
+  if (!config.objectStore.bundled.enabled) {
+    if (!config.objectStore.external.endpoint) {
+      return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false: the log keeps Telegram's updates and the stack's telemetry in an object store" };
+    }
     if (!config.objectStore.external.existingSecret) return { path: ["objectStore", "external", "existingSecret"], issue: "is required with an external object store" };
   }
   if (config.workspaceStorage.enabled && !config.sessions.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when sessions.enabled is false, as its volumes are sessions' workspaces" };
-  }
-  if (config.workspaceStorage.enabled && !config.neon.enabled) {
-    return { path: ["workspaceStorage", "enabled"], issue: "must be false when neon.enabled is false, as its data is in the object store that runs with Neon" };
   }
   const { bundled } = config.objectStore;
   if (bundled.masters.scaling.min === 2) return { path: ["objectStore", "bundled", "masters", "scaling"], issue: "must be 1 or 3: two masters elect no leader once one is gone" };
@@ -730,6 +757,7 @@ const InstallStruct = Schema.Struct({
       agent: Image(IMAGES.agent),
       lake: Image(IMAGES.lake),
       grafana: Image(IMAGES.grafana),
+      webhook: Image(IMAGES.webhook),
       pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
     }),
     {},
@@ -745,6 +773,7 @@ const InstallStruct = Schema.Struct({
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
   log: defaulted(Log, {}),
+  webhook: defaulted(Webhook, {}),
   /**
    * The analytics lake, loaded from Neon into DuckLake; its query endpoint, which Grafana
    * and alasio lake read it through; and its telemetry intake, which writes what the log
