@@ -135,6 +135,8 @@ export const ResumeRequest = Schema.Struct({
   podIPs: Schema.Array(Schema.String.check(Schema.makeFilter((ip) => isIP(ip) !== 0 || "must be an IP address"))).check(Schema.isMinLength(1)),
   /** The pod's containers, each resumed, by the release that runs it. */
   containerIds: Schema.Array(ContainerId).check(Schema.isMinLength(1)),
+  /** The network policies of its namespace that select the pod, by name, which its rules must run what it sends through. */
+  policies: Schema.Array(PodName).check(Schema.isMaxLength(64)),
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
 
@@ -640,11 +642,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     onNode(host, [isIPv6(address.ip) ? "ip6tables-save" : "iptables-save", "-t", "filter"]).pipe(Effect.map(({ stdout }) => egressGap(stdout, address)));
 
   /** Waits for every address of the pod's to have its rules, POLICY_WAIT_MS at most: how long it waited, in milliseconds. */
-  const policiesInForce = ({ namespace, pod, podIPs }: ResumeRequest): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
+  const policiesInForce = ({ namespace, pod, podIPs, policies }: ResumeRequest): Effect.Effect<number, PoliciesNotInForce | HostCommandError> =>
     Effect.gen(function*() {
       const start = yield* Clock.currentTimeMillis;
       for (;;) {
-        const gaps = yield* Effect.forEach(podIPs, (ip) => policyGap({ namespace, pod, ip }).pipe(Effect.map((reason) => (reason === null ? [] : [{ ip, reason }]))));
+        const gaps = yield* Effect.forEach(podIPs, (ip) => policyGap({ namespace, pod, ip, policies }).pipe(Effect.map((reason) => (reason === null ? [] : [{ ip, reason }]))));
         const [gap] = gaps.flat();
         const waited = (yield* Clock.currentTimeMillis) - start;
         if (gap === undefined) return waited;

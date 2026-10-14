@@ -62,6 +62,9 @@ const sha256 = (data: string | Buffer): string => createHash("sha256").update(da
 const POD_IP = "10.42.0.15";
 const POD_IPV6 = "fd00:42::f";
 
+/** The network policies that select a session's pod, as sessionPod's rules run it through them. */
+const SESSION_POLICIES = ["default-deny", "bayma-from-alasio", "telemetry-to-alasio"];
+
 const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
   environment: "main",
   workspace: "fs-abc",
@@ -69,6 +72,7 @@ const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: reado
   pod: POD,
   podIPs,
   containerIds,
+  policies: SESSION_POLICIES,
 });
 
 /** What conntrack says where it deleted no connection, as it exits 1. */
@@ -563,7 +567,7 @@ test("the node's cache keeps within its budget, evicting the least recently used
 });
 
 test("a pod's address has kube-router's rules once a jump of what it sends, commented as the pod's, reaches a chain running it through a policy and rejecting the rest", () => {
-  const address = { namespace: SESSIONS, pod: POD, ip: POD_IP };
+  const address = { namespace: SESSIONS, pod: POD, ip: POD_IP, policies: SESSION_POLICIES };
   const gap = (table: string, of = address) => egressGap(table, of);
   const noJump = `KUBE-ROUTER-FORWARD has no jump of what it sends to the chain of ${SESSIONS}/${POD}`;
   const programmed = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-other", "10.42.0.9"), sessionPod(POD, POD_IP)]);
@@ -580,10 +584,19 @@ test("a pod's address has kube-router's rules once a jump of what it sends, comm
 
   // A chain that runs what the pod sends through no policy of its own lets it all through.
   const chain = /KUBE-POD-FW-[A-Z2-7]{16}/u;
-  const unselected = gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [] }]));
+  const unselected = gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [] }]), { ...address, policies: [] });
   assert.match(unselected ?? "", new RegExp(`^the chain of ${SESSIONS}/${POD}, ${chain.source}, runs what it sends through no network policy$`, "u"));
-  assert.match(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "bayma-from-alasio", type: "ingress" }] }])) ?? "", /runs what it sends through no network policy$/u);
-  assert.equal(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "telemetry-to-alasio", type: "egress" }] }])), null);
+  const ingressOnly = { ...address, policies: ["bayma-from-alasio"] };
+  assert.match(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "bayma-from-alasio", type: "ingress" }] }]), ingressOnly) ?? "", /runs what it sends through no network policy$/u);
+  assert.equal(gap(filterTable([{ namespace: SESSIONS, pod: POD, ip: POD_IP, policies: [{ name: "telemetry-to-alasio", type: "egress" }] }]), { ...address, policies: ["telemetry-to-alasio"] }), null);
+
+  // The rules of a pod of its name before it, at its address, run through the policies that selected that one: until a sync, none of this one's.
+  const before = filterTable([{ ...sessionPod(POD, POD_IP), policies: [...sessionPod(POD, POD_IP).policies, { name: "internet-from-full", type: "egress" }] }]);
+  assert.match(
+    gap(before) ?? "",
+    new RegExp(`^the chain of ${SESSIONS}/${POD}, ${chain.source}, runs it through the network policies bayma-from-alasio, default-deny, internet-from-full, telemetry-to-alasio, not bayma-from-alasio, default-deny, telemetry-to-alasio, as a pod of its name before it was$`, "u"),
+  );
+  assert.match(gap(programmed, { ...address, policies: [...SESSION_POLICIES, "internet-from-full"] }) ?? "", /, as a pod of its name before it was$/u);
 
   // A jump commented as a policy's, to a chain that is none.
   const unpoliced = programmed.replace(/(nw policy [a-z-]+" -j )KUBE-NWPLCY-[A-Z2-7]{16}/gu, (_jump, kept: string) => `${kept}ACCEPT`);

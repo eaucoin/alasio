@@ -23,6 +23,13 @@
  * Until a sync writes them, no rule matches a pod's new address, and what it sends goes
  * through. A sync writes the table whole (iptables-restore), so a save holds all of a
  * sync's rules or none.
+ *
+ * Nothing of the rules names the pod but its name and namespace, which a pod before it of
+ * the same Sandbox shares, and its address, which that pod may have had: until a sync
+ * after the new pod has its address, the old one's rules hold it, run through the network
+ * policies that selected the old one. They are the new one's only where the same
+ * policies select it, which the jumps' comments name: a pod's are held to name those
+ * that select it now, no more and no fewer.
  */
 
 /** The chain FORWARD sends every forwarded packet through first. */
@@ -33,12 +40,14 @@ const POLICY_CHAIN_PREFIX = "KUBE-NWPLCY-";
 /** The mark a network policy's chain sets on what it lets through. */
 const POLICY_MARK = "0x10000/0x10000";
 
-/** An address of a pod's, as the rules name it. */
+/** An address of a pod's, as the rules name it, and the network policies that select the pod. */
 export interface PodAddress {
   readonly namespace: string;
   readonly pod: string;
   /** In its canonical form, as Kubernetes gives it and iptables-save prints it. */
   readonly ip: string;
+  /** The network policies of its namespace that select it, by name, as the API server has them. */
+  readonly policies: readonly string[];
 }
 
 /** A rule of a chain: its chain, and its words after it, a quoted one unquoted. */
@@ -78,9 +87,10 @@ function rejectsUnmarked(rule: Rule): boolean {
  * What of kube-router's rules holding what a pod's address sends to its network policies
  * the filter table `saved` lacks, as the module says, said as a sentence ends; null when
  * it holds them all. A jump of another pod's from the address, as one the address had
- * before, is none of this pod's.
+ * before, is none of this pod's, nor are the rules of a pod of the same name run through
+ * other policies.
  */
-export function egressGap(saved: string, { namespace, pod, ip }: PodAddress): string | null {
+export function egressGap(saved: string, { namespace, pod, ip, policies }: PodAddress): string | null {
   const rules = rulesOf(saved);
   const source = `${ip}/${ip.includes(":") ? 128 : 32}`;
   const jump = rules.find((rule) => {
@@ -99,6 +109,14 @@ export function egressGap(saved: string, { namespace, pod, ip }: PodAddress): st
     option(rule, "-d") === undefined
   );
   if (!policed) return `the chain of ${namespace}/${pod}, ${chain}, runs what it sends through no network policy`;
+  const named = [...new Set(own.flatMap((rule) => {
+    const comment = option(rule, "--comment") ?? "";
+    return (option(rule, "-j") ?? "").startsWith(POLICY_CHAIN_PREFIX) && comment.startsWith("run through nw policy ") ? [comment.slice("run through nw policy ".length)] : [];
+  }))].sort();
+  const expected = [...new Set(policies)].sort();
+  if (named.join(",") !== expected.join(",")) {
+    return `the chain of ${namespace}/${pod}, ${chain}, runs it through the network policies ${named.join(", ")}, not ${expected.join(", ")}, as a pod of its name before it was`;
+  }
   const rejection = `rule to REJECT traffic destined for POD name:${pod} namespace: ${namespace}`;
   if (!own.some((rule) => rejectsUnmarked(rule) && option(rule, "--comment") === rejection)) {
     return `the chain of ${namespace}/${pod}, ${chain}, does not reject what its network policies do not let through`;

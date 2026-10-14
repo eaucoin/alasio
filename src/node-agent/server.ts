@@ -28,10 +28,10 @@
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
  *   when `from` has none; 502 when the bucket failed, which leaves `to` without a snapshot.
- * - `POST /resume`, `{ environment, workspace, release, namespace, pod, podIPs,
- *   containerIds }`: resumes the workspace's sandbox, restored paused under the gVisor
- *   `release` in the pod `namespace`/`pod` on this node, once the pod's network policies
- *   are in force here for each of its addresses `podIPs`: the connections tracked from
+ * - `POST /resume`, `{ environment, workspace, namespace, pod, podIPs, containerIds,
+ *   policies }`: resumes the workspace's sandbox, restored paused in the pod
+ *   `namespace`/`pod` on this node, once the pod's network policies, `policies`, are in
+ *   force here for each of its addresses `podIPs` (./kube-router.ts): the connections tracked from
  *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
  *   (204). 504 when its policies were not in force within the agent's wait, saying for
  *   which address what was missing, its sandbox left paused; 500 when a command failed.

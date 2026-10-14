@@ -599,8 +599,10 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
           { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "patch"] },
           { apiGroups: [""], resources: ["pods/exec"], verbs: ["create", "get"] },
           ...(forked ? [{ apiGroups: [""], resources: ["persistentvolumeclaims"], verbs: ["get"] }] : []),
-          // A restored session's readiness, once its sandbox is let run (src/sandbox/snapshots.ts).
-          ...(snapshotted ? [{ apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] }] : []),
+          // A restored session's readiness, once its sandbox is let run, and the network policies that must hold it first (src/sandbox/snapshots.ts).
+          ...(snapshotted
+            ? [{ apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] }, { apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], verbs: ["list"] }]
+            : []),
         ],
       };
       return [role, binding(metadata)];

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { KubernetesObject, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { KubernetesObject, V1LabelSelector, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
@@ -109,7 +109,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
     resume: (node, request) =>
       Effect.suspend(() => {
-        asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}`);
+        asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}${request.policies.length > 0 ? ` through ${request.policies.join(",")}` : ""}`);
         return resumed === null ? Effect.void : Effect.fail(new NodeAgentError({ node, call: "resume alasio-sessions/fs-abc123", status: 504, reason: resumed }));
       }),
     holdings: (node) => Effect.succeed(holdings.find((holding) => holding.node === node) as Holdings),
@@ -230,7 +230,7 @@ test("a restored pod is let run once its containers run, by its node's agent, th
   const restoredPod = (state: "running" | "terminated" | "waiting"): V1Pod => ({
     apiVersion: "v1",
     kind: "Pod",
-    metadata: { name: "fs-abc123", namespace: "alasio-sessions" },
+    metadata: { name: "fs-abc123", namespace: "alasio-sessions", labels: { "alasio.dev/workload": "session", "alasio.dev/net-mode": "none" } },
     spec: { nodeName: "node-a", containers: [] },
     status: {
       podIPs: [{ ip: "10.42.0.7" }],
@@ -246,7 +246,19 @@ test("a restored pod is let run once its containers run, by its node's agent, th
     },
   });
   const resume = async (pod: V1Pod, resumed: string | null = null) => {
-    const kube = fakeKube(new Map<string, KubernetesObject>([["Pod/alasio-sessions/fs-abc123", pod]]));
+    // The policies of its namespace, of which those that select it: all of its pods', its workload's, and none of full mode's or of another namespace.
+    const policy = (name: string, podSelector: V1LabelSelector, namespace = "alasio-sessions"): [string, KubernetesObject] => [
+      `NetworkPolicy/${namespace}/${name}`,
+      { apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: { name, namespace }, spec: { podSelector } } as KubernetesObject,
+    ];
+    const kube = fakeKube(new Map<string, KubernetesObject>([
+      ["Pod/alasio-sessions/fs-abc123", pod],
+      policy("default-deny", {}),
+      policy("sessions", { matchLabels: { "alasio.dev/workload": "session" } }),
+      policy("full-egress", { matchLabels: { "alasio.dev/workload": "session", "alasio.dev/net-mode": "full" } }),
+      policy("not-folders", { matchExpressions: [{ key: "alasio.dev/workload", operator: "NotIn", values: ["folder"] }] }),
+      policy("elsewhere", {}, "alasio"),
+    ]));
     const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], resumed });
     const outcome = await run(kube, Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
@@ -260,7 +272,7 @@ test("a restored pod is let run once its containers run, by its node's agent, th
   };
   const ran = await resume(restoredPod("running"));
   assert.equal(ran.outcome, "resumed");
-  assert.deepEqual(ran.asked.slice(1), [`resume on node-a 10.42.0.7 1`]);
+  assert.deepEqual(ran.asked.slice(1), [`resume on node-a 10.42.0.7 1 through default-deny,sessions,not-folders`]);
   assert.match(ran.writes.at(-1) ?? "", /^patch Pod\/fs-abc123's status .*"type":"alasio.dev\/resumed","status":"True"/u);
   assert.equal((await resume(restoredPod("terminated"))).outcome, "its pod ended before it ran (terminated)");
   const unconfined = await resume(restoredPod("running"), "kube-router has not programmed 10.42.0.7 within 30s");

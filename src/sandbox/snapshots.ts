@@ -22,7 +22,7 @@
  * without a snapshot, from bayma's checkpoints of its sessions, which bayma tells its next
  * exec of, and why it was not restored is logged and counted, the snapshot forgotten.
  */
-import type { V1Container, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope } from "effect";
 import { FetchHttpClient } from "effect/http";
 
@@ -118,6 +118,24 @@ export function hookOf(bayma: V1Container): string[] | null {
   const args = bayma.args ?? [];
   const stateDir = args[args.indexOf("--state-dir") + 1];
   return program.length > 0 && args.includes("--state-dir") && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
+}
+
+/**
+ * Whether the label selector `selector` selects what has `labels`, as Kubernetes matches
+ * one: every label it names, and every expression of it; none selects nothing, an empty one
+ * everything.
+ */
+export function selects(selector: V1LabelSelector | undefined, labels: Readonly<Record<string, string>>): boolean {
+  if (!selector) return false;
+  const named = Object.entries(selector.matchLabels ?? {}).every(([key, value]) => labels[key] === value);
+  return named && (selector.matchExpressions ?? []).every(({ key, operator, values = [] }) => {
+    const value = labels[key];
+    if (operator === "In") return value !== undefined && values.includes(value);
+    if (operator === "NotIn") return value === undefined || !values.includes(value);
+    if (operator === "Exists") return value !== undefined;
+    if (operator === "DoesNotExist") return value === undefined;
+    return false;
+  });
 }
 
 /** What a session's snapshots are given. */
@@ -248,8 +266,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       );
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^containerd:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
+      // The policies that select it, which its node's rules for it must name, not those of a pod of its name before it.
+      const policies = yield* kube.list("networking.k8s.io/v1", "NetworkPolicy", profile.namespace, "").pipe(
+        Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, running.metadata?.labels ?? {})).flatMap(({ metadata }) => metadata?.name ?? [])),
+        Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: false })),
+      );
       // Its agent leaves it paused where its network policies are not in force (504); of any other failure, its sandbox may have run.
-      yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds }).pipe(
+      yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds, policies }).pipe(
         Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: !(error._tag === "NodeAgentError" && error.status === 504) })),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();

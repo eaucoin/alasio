@@ -1940,6 +1940,7 @@ describe("security", () => {
     });
     assert.deepEqual(tokenOf(objects), { name: "ALASIO_NODE_AGENT_TOKEN", valueFrom: { secretKeyRef: { name: "alasio-node-agent", key: "token" } } });
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
+    assert.ok(sessionsRole(objects).some(({ apiGroups, resources, verbs }) => apiGroups?.join() === "networking.k8s.io" && resources?.join() === "networkpolicies" && verbs.join() === "list"));
     // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record.
     assert.ok(!sessionsRole(objects).some(({ resources }) => resources?.includes("configmaps")));
     // Until alasio up records a CPU baseline, nothing is snapshotted, though the agents run to say what their nodes have.
@@ -1952,7 +1953,7 @@ describe("security", () => {
     const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
     assert.equal(sessions(unsnapshotted).snapshots, undefined);
     assert.equal(tokenOf(unsnapshotted), undefined);
-    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("pods/status")));
+    assert.ok(!sessionsRole(unsnapshotted).some(({ resources }) => resources?.includes("pods/status") || resources?.includes("networkpolicies")));
   });
 
   test("lets the host profile's agents restart alasio's own Deployment and nothing else", () => {
