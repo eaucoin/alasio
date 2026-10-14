@@ -14,6 +14,8 @@ import { join } from "node:path";
 
 import { Clock, Effect, Schema } from "effect";
 
+import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
+
 /** What the cache is given: its directory, its byte budget, and how long a snapshot used is kept regardless. */
 export interface CacheOptions {
   readonly root: string;
@@ -62,6 +64,19 @@ export interface SnapshotCache {
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
+const SNAPSHOT = new RegExp(`^${SNAPSHOT_ID}$`, "u");
+
+/**
+ * `names`, each the name the agent gives what it is: the cache's paths are built from
+ * nothing else, whatever asks for one. Any other is a bug, as the agent checks what it is
+ * given first.
+ */
+function checked(environment: string, workspace: string, snapshot: string | null = null): void {
+  if (!NAME.test(environment) || !NAME.test(workspace) || (snapshot !== null && !SNAPSHOT.test(snapshot))) {
+    throw new Error(`the snapshot cache names no ${JSON.stringify([environment, workspace, snapshot])}`);
+  }
+}
+
 /** The directory a snapshot is written in until it is whole. */
 const staged = (snapshot: string): string => `.${snapshot}`;
 
@@ -88,9 +103,18 @@ export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): Snap
   const attempt = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
     Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
-  const workspaceDir = (environment: string, workspace: string): string => join(root, environment, workspace);
-  const path = (environment: string, workspace: string, snapshot: string): string => join(workspaceDir(environment, workspace), snapshot);
-  const stagePath = (environment: string, workspace: string, snapshot: string): string => join(workspaceDir(environment, workspace), staged(snapshot));
+  const workspaceDir = (environment: string, workspace: string): string => {
+    checked(environment, workspace);
+    return join(root, environment, workspace);
+  };
+  const path = (environment: string, workspace: string, snapshot: string): string => {
+    checked(environment, workspace, snapshot);
+    return join(workspaceDir(environment, workspace), snapshot);
+  };
+  const stagePath = (environment: string, workspace: string, snapshot: string): string => {
+    checked(environment, workspace, snapshot);
+    return join(workspaceDir(environment, workspace), staged(snapshot));
+  };
 
   const use = (environment: string, workspace: string, snapshot: string): Effect.Effect<void, CacheError> =>
     Clock.currentTimeMillis.pipe(
@@ -99,9 +123,10 @@ export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): Snap
 
   const list = attempt(async () => {
     const found: CachedSnapshot[] = [];
-    for (const environment of await directories(root)) {
-      for (const workspace of await directories(join(root, environment))) {
-        for (const snapshot of await directories(workspaceDir(environment, workspace))) {
+    // What else is there is no snapshot of the agent's.
+    for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
+      for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
+        for (const snapshot of (await directories(workspaceDir(environment, workspace))).filter((name) => SNAPSHOT.test(name))) {
           const directory = path(environment, workspace, snapshot);
           found.push({ environment, workspace, snapshot, bytes: await size(directory), usedAt: (await stat(directory)).mtimeMs });
         }
@@ -157,8 +182,8 @@ export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): Snap
     }),
 
     clean: attempt(async () => {
-      for (const environment of await directories(root)) {
-        for (const workspace of await directories(join(root, environment))) {
+      for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
+        for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
           const directory = workspaceDir(environment, workspace);
           const entries = await readdir(directory);
           await Promise.all(entries.filter((name) => name.startsWith(".")).map((name) => rm(join(directory, name), { recursive: true, force: true })));

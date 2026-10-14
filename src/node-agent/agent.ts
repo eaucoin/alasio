@@ -34,6 +34,7 @@ import { pipeline } from "node:stream/promises";
 import type { BatchObservableResult } from "@opentelemetry/api";
 import { Clock, Effect, RcMap, Schema, type Scope, Semaphore } from "effect";
 
+import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
 import { CacheError, type SnapshotCache } from "./cache.ts";
@@ -44,19 +45,40 @@ import type { ReleaseNotInstalled, Runsc, RunscError } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
 
 /** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
-const Name = Schema.String.check(Schema.isPattern(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u));
+const Name = Schema.String.check(Schema.isPattern(NAME));
+
+/** A snapshot's id, as snapshotId makes one. */
+const SnapshotId = Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u")));
+
+/** A gVisor release. */
+const Release = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u));
+
+/**
+ * A file's path in a snapshot's image, as imageFiles gives it: relative, of names that
+ * neither begin with a dot nor hold a separator, so it is under the image's directory
+ * however a bucket's manifest writes it.
+ */
+const ImagePath = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u), Schema.isMaxLength(1024));
+
+/** A count of bytes, or of milliseconds. */
+const Count = Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0));
 
 /** A file of a snapshot's image: its path in the image, its size and its SHA-256, in hex. */
-const SnapshotFile = Schema.Struct({ path: Schema.String, bytes: Schema.Number, sha256: Schema.String });
+const SnapshotFile = Schema.Struct({ path: ImagePath, bytes: Count, sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)) });
 export type SnapshotFile = typeof SnapshotFile.Type;
 
-/** What a snapshot is, as the bucket and the cache keep it beside its image. */
+/**
+ * What a snapshot is, as the bucket and the cache keep it beside its image. Whatever can
+ * write the bucket writes it, so what names a place on a node is held to the names the
+ * agent makes, the workspace it names to the one asked about (current), and its size, which
+ * the node's disk is made room for, to its files'.
+ */
 export const Manifest = Schema.Struct({
-  environment: Schema.String,
-  workspace: Schema.String,
-  snapshot: Schema.String,
+  environment: Name,
+  workspace: Name,
+  snapshot: SnapshotId,
   /** The gVisor release that saved it, the only one that restores it. */
-  release: Schema.String,
+  release: Release,
   /** The image's identity, as runsc gives it. */
   image: Schema.String,
   /** The CPU features the sandbox was saved with, which a node restoring it must have. */
@@ -64,13 +86,13 @@ export const Manifest = Schema.Struct({
   /** The pod template the sandbox ran, as alasio gave it, which its restore runs again. */
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
   files: Schema.Array(SnapshotFile),
-  bytes: Schema.Number,
+  bytes: Count,
   takenAt: Schema.String,
   /** How long runsc took to checkpoint the sandbox: its hook run in it, then its state saved, the sandbox paused. */
-  pauseMs: Schema.Number,
+  pauseMs: Count,
   /** How long its files took to upload. */
-  uploadMs: Schema.Number,
-});
+  uploadMs: Count,
+}).check(Schema.makeFilter((manifest) => manifest.bytes === manifest.files.reduce((sum, { bytes }) => sum + bytes, 0) || "its bytes must be its files' together"));
 export type Manifest = typeof Manifest.Type;
 
 /** A workspace, as each request names it. */
@@ -80,9 +102,6 @@ export type WorkspaceRef = typeof WorkspaceRef.Type;
 /** A request to copy a workspace's current snapshot to another. */
 export const CopyRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef });
 export type CopyRequest = typeof CopyRequest.Type;
-
-/** A gVisor release. */
-const Release = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u));
 
 /** A container, by containerd's id. */
 const ContainerId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u));
@@ -356,6 +375,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       return (yield* Clock.currentTimeMillis) - start;
     });
 
+  /** The workspace's current snapshot, as its `current.json` says: one of another workspace's is no snapshot of it. */
   const current = (ref: WorkspaceRef): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
     bucket.getJson(`${prefixOf(ref)}/${CURRENT_FILE}`).pipe(
       Effect.flatMap((found) =>
@@ -363,6 +383,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
           ? Effect.succeed(null)
           : Schema.decodeUnknownEffect(Manifest)(found).pipe(
             Effect.mapError((error) => new SnapshotCorrupt({ ...ref, reason: `its ${CURRENT_FILE} is not a manifest: ${error.message}` })),
+            Effect.filterOrFail(
+              (manifest) => prefixOf(manifest) === prefixOf(ref),
+              (manifest) => new SnapshotCorrupt({ ...ref, reason: `its ${CURRENT_FILE} names ${prefixOf(manifest)}` }),
+            ),
           )
       ),
     );

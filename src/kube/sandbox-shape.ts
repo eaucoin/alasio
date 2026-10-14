@@ -71,6 +71,8 @@ export const RESUMED_CONDITION = "alasio.dev/resumed";
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
 /** A snapshot's id, as a node agent names it: when it was taken, then 32 random bits. */
 export const SNAPSHOT_ID = "[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}";
+/** A DNS label: an environment's name (its sessions' namespace) and a workspace's (its Sandbox's), as the snapshot cache's directories are named. */
+export const NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
 
 /** The init container that holds a session's pod until its egress is confined: its name, and its resources. */
 export const EGRESS_GATE = { name: "egress-gate", resources: { requests: { cpu: "10m", memory: "32Mi" }, limits: { memory: "64Mi" } } } as const;

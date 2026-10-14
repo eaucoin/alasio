@@ -515,6 +515,7 @@ test("the node's cache keeps within its budget, evicting the least recently used
   const root = mkdtempSync(join(tmpdir(), "alasio-node-cache-"));
   try {
     const now = Date.now();
+    const [S1, S2] = ["20261013T000000Z-00000001", "20261013T000000Z-00000002"];
     const put = (cache: SnapshotCache, workspace: string, snapshot: string, minutesAgo: number) =>
       Effect.gen(function*() {
         const directory = yield* cache.stage("main", workspace, snapshot);
@@ -526,25 +527,25 @@ test("the node's cache keeps within its budget, evicting the least recently used
     const names = (cached: readonly { readonly workspace: string }[]) => cached.map(({ workspace }) => workspace).sort();
     await Effect.runPromise(Effect.gen(function*() {
       const cache = makeSnapshotCache({ root, budget: 2500, graceMs: 5 * 60_000 });
-      yield* put(cache, "fs-old", "s1", 60);
-      yield* put(cache, "fs-older", "s1", 90);
-      yield* put(cache, "fs-new", "s1", 1);
+      yield* put(cache, "fs-old", S1, 60);
+      yield* put(cache, "fs-older", S1, 90);
+      yield* put(cache, "fs-new", S1, 1);
       // A snapshot being written counts for nothing, and is never evicted.
-      mkdirSync(join(root, "main", "fs-new", ".s2"));
-      writeFileSync(join(root, "main", "fs-new", ".s2", "pages.img"), Buffer.alloc(5000));
+      mkdirSync(join(root, "main", "fs-new", `.${S2}`));
+      writeFileSync(join(root, "main", "fs-new", `.${S2}`, "pages.img"), Buffer.alloc(5000));
       assert.equal((yield* cache.list).reduce((sum, { bytes }) => sum + bytes, 0), 3000);
       assert.deepEqual(names(yield* cache.evict), ["fs-older"]);
       assert.deepEqual(names(yield* cache.list), ["fs-new", "fs-old"]);
       // Used just now, the older is kept, and the newer one goes.
-      yield* cache.use("main", "fs-old", "s1");
+      yield* cache.use("main", "fs-old", S1);
       const tighter = makeSnapshotCache({ root, budget: 500, graceMs: 5 * 60_000 });
       assert.deepEqual(names(yield* tighter.evict), []);
-      utimesSync(cache.path("main", "fs-new", "s1"), (now - 10 * 60_000) / 1000, (now - 10 * 60_000) / 1000);
+      utimesSync(cache.path("main", "fs-new", S1), (now - 10 * 60_000) / 1000, (now - 10 * 60_000) / 1000);
       assert.deepEqual(names(yield* tighter.evict), ["fs-new"]);
       assert.deepEqual(names(yield* tighter.list), ["fs-old"]);
       // What a stopped agent left half written goes as the next starts.
       yield* tighter.clean;
-      assert.equal(existsSync(join(root, "main", "fs-new", ".s2")), false);
+      assert.equal(existsSync(join(root, "main", "fs-new", `.${S2}`)), false);
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -872,5 +873,41 @@ test("the agent runs as its own process from its environment, and stops when tol
     assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, its cache within 5368709120 bytes/u);
   } finally {
     await s3.close();
+  }
+});
+
+test("a manifest whose names, or files' paths, are not the agent's, whose size is not its files', or which names another workspace, is no snapshot, and nothing is written outside the cache", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const taken = yield* here.agent.checkpoint(request("fs-abc"));
+      const outside = join(here.cacheDir, "..", "escaped");
+      const corrupted = (manifest: Record<string, unknown>) =>
+        Effect.gen(function*() {
+          s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify(manifest)));
+          rmSync(join(here.cacheDir, "main", "fs-abc"), { recursive: true, force: true });
+          return failure(yield* Effect.exit(here.agent.prepare({ environment: "main", workspace: "fs-abc" })));
+        });
+      for (const manifest of [
+        { ...taken, files: [{ ...taken.files[0], path: "../../escaped" }] },
+        { ...taken, files: [{ ...taken.files[0], path: "/etc/escaped" }] },
+        { ...taken, snapshot: "../../escaped" },
+        { ...taken, environment: "../escaped" },
+        // Smaller than its files, so the disk would be made too little room for them.
+        { ...taken, bytes: 1 },
+      ]) {
+        assert.match(yield* corrupted(manifest), /is not a manifest/u);
+      }
+      assert.match(yield* corrupted({ ...taken, workspace: "fs-other" }), /names main\/fs-other/u);
+      assert.equal(existsSync(outside), false);
+      assert.equal(existsSync("/etc/escaped"), false);
+    })
+  ));
+
+test("the node's cache builds no path but of the names the agent gives", () => {
+  const cache = makeSnapshotCache({ root: "/var/lib/alasio/snapshots", budget: 1, graceMs: 0 });
+  assert.equal(cache.path("main", "fs-abc", "20261013T000000Z-00000001"), "/var/lib/alasio/snapshots/main/fs-abc/20261013T000000Z-00000001");
+  for (const [environment, workspace, snapshot] of [["..", "fs-abc", "20261013T000000Z-00000001"], ["main", "../x", "20261013T000000Z-00000001"], ["main", "fs-abc", "../../x"], ["main", "fs-abc", ".x"]] as const) {
+    assert.throws(() => cache.path(environment, workspace, snapshot), /names no/u);
   }
 });
