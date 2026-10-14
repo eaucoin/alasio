@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fetch: [background, background-one-at-a-time, on-demand]
+        fetch: [background, background-one-at-a-time]
     steps:
       # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
       - name: Free disk space

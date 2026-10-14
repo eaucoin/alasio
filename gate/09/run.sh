@@ -12,6 +12,7 @@
 #   fork's restore annotations, onto a rootfs pulled lazily anew.
 # - G5: the daemon's caches against the content store, and its and containerd's memory.
 # - G6: the caches once the images are removed from the node, and once the daemon restarted.
+# - G7: the sandbox image with a prefetch list, recorded by ctr-remote image optimize.
 #
 # Needs root through sudo, Docker and buildx. Measurements go to $OUT. STARGZ_OPTIONS,
 # when set, are top-level lines of the daemon's configuration besides, as G5 compares.
@@ -241,21 +242,35 @@ kubectl -n gate exec lazy-nodirectfs -- md5sum /blob >"$OUT/blob-nodirectfs.txt"
 cmp "$OUT/blob-directfs.txt" "$OUT/blob-nodirectfs.txt" || fail "the two read the image's file differently"
 log "  remote layer mounts: $(remote_layers)"
 sudo k3s ctr -n k8s.io snapshots --snapshotter "$SNAPSHOTTER" ls >"$OUT/snapshots.txt"
-# The eStargz one three times, each on a node it is gone from again, its caches with it
-# once its resolved layers expire (120 s), the last left running for what follows.
-for run in plain 1 2 3; do
-  image=sandbox:estargz name=start-estargz-$run
-  [ "$run" != plain ] || image=sandbox:plain name=start-plain
-  pod "$name" "$REGISTRY/$image" gvisor
-  ms=$(started "$name")
-  log "  a sandbox image ($image), not on the node, started under gVisor after $ms ms"
-  echo "$image $ms" >>"$OUT/start-times.txt"
-  if [ "$run" = 1 ] || [ "$run" = 2 ]; then
-    kubectl -n gate delete pod "$name" --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
-    sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null
+# start <image> <name>: starts the sandbox image, not on the node, and says how long it took.
+start() {
+  pod "$2" "$REGISTRY/$1" gvisor
+  ms=$(started "$2")
+  log "  a sandbox image ($1), not on the node, started under gVisor after $ms ms"
+  echo "$1 $ms" >>"$OUT/start-times.txt"
+}
+# starts <image>: starts it three times, each on a node it is gone from again, its caches
+# with it once its resolved layers expire (120 s); the last is left running.
+starts() {
+  for run in 1 2 3; do
+    start "$1" "start-${1#*:}-$run"
+    [ "$run" = 3 ] && break
+    kubectl -n gate delete pod "start-${1#*:}-$run" --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
+    sudo k3s crictl rmi "$REGISTRY/$1" >/dev/null
     sleep 150
-  fi
-done
+  done
+}
+start sandbox:plain start-plain
+starts sandbox:estargz
+
+log "G7: the sandbox image optimized by ctr-remote, with a prefetch list of what it read in its first 15 s"
+ctr_remote() { sudo env PATH="$PATH:/var/lib/rancher/k3s/data/current/bin" ctr-remote --address /run/k3s/containerd/containerd.sock --namespace gate-optimize "$@"; }
+ctr_remote image pull --plain-http "$REGISTRY/sandbox:plain" >/dev/null
+ctr_remote image optimize --oci --period=15 "$REGISTRY/sandbox:plain" "$REGISTRY/sandbox:optimized" >"$OUT/optimize.log" 2>&1 ||
+  { tail -40 "$OUT/optimize.log"; fail "ctr-remote did not optimize the sandbox image"; }
+ctr_remote image push --plain-http "$REGISTRY/sandbox:optimized" >/dev/null
+ctr_remote image rm "$REGISTRY/sandbox:plain" "$REGISTRY/sandbox:optimized" >/dev/null
+starts sandbox:optimized
 
 log "G2: a k3s restart, lazily pulled pods running"
 pod survivor-runc "$REGISTRY/counter:estargz" ""
@@ -317,7 +332,7 @@ ps -o rss=,comm= -C containerd-stargz-grpc,stargz-fuse-manager,containerd | tee 
 # snapshot mounts it and its resolved entry has expired (resolve_result_entry_ttl_sec, 120 s).
 log "G6: the caches once the images are gone from the node"
 kubectl -n gate delete pods --all --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
-for image in sandbox:plain sandbox:estargz counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
+for image in sandbox:plain sandbox:estargz sandbox:optimized counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
 sleep 180
 sudo sh -c "du -shx $STARGZ_ROOT/snapshotter $STARGZ_ROOT/stargz/*; true" | tee "$OUT/disk-after-rmi.txt"
 log "G6: and once the daemon restarted"
