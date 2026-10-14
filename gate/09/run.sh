@@ -256,7 +256,8 @@ starts() {
     start "$1" "start-${1#*:}-$run"
     [ "$run" = 3 ] && break
     kubectl -n gate delete pod "start-${1#*:}-$run" --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
-    sudo k3s crictl rmi "$REGISTRY/$1" >/dev/null
+    # Its layers unmounted as it goes, which can take longer than crictl's 2 s.
+    sudo k3s crictl --timeout=120s rmi "$REGISTRY/$1" >/dev/null
     sleep 150
   done
 }
