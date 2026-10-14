@@ -97,6 +97,11 @@ export function gvisorRuntimeFiles(releases: readonly string[], { systemd }: { r
     "",
     "[runsc_config]",
     `  restore-validate-files = "all"`,
+    "  # A checkpoint ends every TCP connection as it saves it, sending nothing, as the save takes the sandbox's",
+    "  # network first; so a sandbox restored from it holds none whose timers would send while it is left paused,",
+    "  # before its pod's network policies are in force (src/node-agent/agent.ts resume). One restored keeps none",
+    "  # anyway, as its pod has another address.",
+    `  allow-live-tcp-migration = "false"`,
     ...(systemd ? ["  # Where systemd runs the machine, kubelet's cgroups are systemd's, and runsc places its sandboxes' through it too.", `  systemd-cgroup = "true"`] : []),
   ];
   const file = (lines: readonly string[]) => `${lines.join("\n")}\n`;

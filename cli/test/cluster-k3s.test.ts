@@ -77,7 +77,7 @@ test("each gVisor release kept is a runtime of containerd's, after k3s's own con
   assert.ok(template.endsWith(`${runtime("20260921-0-eaucoin-4", "20260921.0-eaucoin.4")}\n${runtime("20260921-0-eaucoin-3", "20260921.0-eaucoin.3")}\n`), template);
   const options = files.get(`${CONTAINERD}/runsc-20260921-0-eaucoin-3.toml`) ?? "";
   assert.match(options, /^# runsc's options for gVisor 20260921\.0-eaucoin\.3, /u);
-  assert.ok(options.endsWith(`\nbinary_name = "/usr/local/lib/alasio/gvisor/20260921.0-eaucoin.3/runsc"\nrestore_direct = true\n\n[runsc_config]\n  restore-validate-files = "all"\n`), options);
+  assert.match(options, /\nbinary_name = "\/usr\/local\/lib\/alasio\/gvisor\/20260921\.0-eaucoin\.3\/runsc"\nrestore_direct = true\n\n\[runsc_config\]\n {2}restore-validate-files = "all"\n(?: {2}# [^\n]*\n)+ {2}allow-live-tcp-migration = "false"\n$/u);
 });
 
 test("a single release kept is one runtime of containerd's, and nothing is rendered for a release before it", () => {
@@ -91,7 +91,7 @@ test("a single release kept is one runtime of containerd's, and nothing is rende
 
 test("where systemd runs the machine, runsc places its sandboxes' cgroups through it, and only there", () => {
   const options = (systemd: boolean) => gvisorRuntimeFiles(["20990101.0"], { systemd }).get(`${CONTAINERD}/runsc-20990101-0.toml`) ?? "";
-  assert.match(options(true), /\n {2}restore-validate-files = "all"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
+  assert.match(options(true), /\n {2}allow-live-tcp-migration = "false"\n {2}# [^\n]*\n {2}systemd-cgroup = "true"\n$/u);
   assert.doesNotMatch(options(false), /systemd/u);
 });
 
