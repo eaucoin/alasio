@@ -6,9 +6,10 @@ import type { Sql, StoreError } from "./sql.ts";
 
 /**
  * Where a prompt job is: waiting its turn (or for the operator to say what to do with
- * it, while another runs), running, or done one way or another.
+ * it, while another runs), being handed to the running turn to steer it (steering, until
+ * it is known whether the turn took it), running, or done one way or another.
  */
-export type PromptJobState = "pending" | "awaiting_choice" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
+export type PromptJobState = "pending" | "awaiting_choice" | "steering" | "running" | "completed" | "cancelled" | "failed" | "interrupted";
 
 /** A row of `prompt_jobs`: a prompt queued for its conversation's harness. */
 export interface PromptJob {
@@ -17,6 +18,8 @@ export interface PromptJob {
   readonly chat_id: string;
   readonly message_id: string;
   readonly prompt: string;
+  /** What the operator wrote, which the prompt is made from, as a question about it quotes it. */
+  readonly visible_text: string;
   /** The files sent with the prompt, which its text names where they are written. */
   readonly file_ids: readonly string[];
   readonly harness: HarnessName;
@@ -40,6 +43,8 @@ export interface NewPromptJob {
   readonly chatId: number | string;
   readonly messageId: number | string;
   readonly prompt: string;
+  /** What the operator wrote, which the prompt is made from; the prompt itself unless given. */
+  readonly visibleText?: string | undefined;
   readonly fileIds?: readonly string[] | undefined;
   readonly state?: PromptJobState | undefined;
   readonly priority?: number | undefined;
@@ -59,14 +64,14 @@ export class NeonPromptJobRepository {
   }
 
   /** Queues a prompt: the job queued, or the one already queued for its message. */
-  enqueue({ conversationId, chatId, messageId, prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
+  enqueue({ conversationId, chatId, messageId, prompt, visibleText = prompt, fileIds = [], state = "pending", priority = 0, harness, traceparent = null }: NewPromptJob): Effect.Effect<PromptJob, StoreError> {
     // The no-op update makes the job already queued the one returned.
     return this.#sql.query<PromptJob>(
-      `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, file_ids, harness, state, priority, traceparent)
-       select $1, id, $3, $4, $5, $6, coalesce($7, active_harness), $8, $9, $10 from ${this.#schema}.conversations where id = $2
+      `insert into ${this.#schema}.prompt_jobs (id, conversation_id, chat_id, message_id, prompt, visible_text, file_ids, harness, state, priority, traceparent)
+       select $1, id, $3, $4, $5, $11, $6, coalesce($7, active_harness), $8, $9, $10 from ${this.#schema}.conversations where id = $2
        on conflict (conversation_id, message_id) do update set conversation_id = excluded.conversation_id
        returning *`,
-      [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent],
+      [newId(), conversationId, String(chatId), String(messageId), prompt, fileIds, harness ?? null, state, priority, traceparent, visibleText],
     ).pipe(Effect.map(([row]) => row!));
   }
 
@@ -103,6 +108,20 @@ export class NeonPromptJobRepository {
     ));
   }
 
+  /**
+   * Settles a job held for the operator's choice as `state` says: the job, or null where it
+   * is held no longer (settled already, by another of its buttons), when nothing changes.
+   */
+  settleHeld(id: string, state: PromptJobState, priority = 0): Effect.Effect<PromptJob | null, StoreError> {
+    return this.#sql.query<PromptJob>(
+      `update ${this.#schema}.prompt_jobs
+       set state = $2, priority = $3, completed_at = case when $2 in ('completed', 'cancelled') then now() end
+       where id = $1 and state = 'awaiting_choice'
+       returning *`,
+      [id, state, priority],
+    ).pipe(Effect.map(([row]) => row ?? null));
+  }
+
   /** Records that the job's prompt was sent to the agent, which may act on it from then on. */
   markDispatched(id: string): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(`update ${this.#schema}.prompt_jobs set upstream_dispatched_at = now() where id = $1`, [id]));
@@ -135,16 +154,35 @@ export class NeonPromptJobRepository {
   hasOpenJobs(conversationId: string): Effect.Effect<boolean, StoreError> {
     return this.#sql.query<{ open: boolean }>(
       `select exists (
-         select 1 from ${this.#schema}.prompt_jobs where conversation_id = $1 and state in ('pending', 'running', 'awaiting_choice')
+         select 1 from ${this.#schema}.prompt_jobs where conversation_id = $1 and state in ('pending', 'running', 'awaiting_choice', 'steering')
        ) as open`,
       [conversationId],
     ).pipe(Effect.map(([row]) => row!.open));
   }
 
-  listPendingConversations(): Effect.Effect<string[], StoreError> {
+  /** The conversation's jobs held for the operator's choice, in the order queued. */
+  listHeld(conversationId: string): Effect.Effect<PromptJob[], StoreError> {
+    return this.#sql.query<PromptJob>(
+      `select * from ${this.#schema}.prompt_jobs where conversation_id = $1 and state = 'awaiting_choice' order by seq`,
+      [conversationId],
+    );
+  }
+
+  /** The conversations with jobs waiting: to run, or for the operator's choice. */
+  listWaitingConversations(): Effect.Effect<string[], StoreError> {
     return this.#sql.query<{ conversation_id: string }>(
-      `select distinct conversation_id from ${this.#schema}.prompt_jobs where state = 'pending' order by conversation_id`,
+      `select distinct conversation_id from ${this.#schema}.prompt_jobs where state in ('pending', 'awaiting_choice') order by conversation_id`,
     ).pipe(Effect.map((rows) => rows.map((row) => row.conversation_id)));
+  }
+
+  /**
+   * Holds again for the operator's choice the jobs a restart found being handed to a turn
+   * to steer it, which it may or may not have taken: the jobs, to be asked about.
+   */
+  holdUnsteeredAfterRestart(): Effect.Effect<PromptJob[], StoreError> {
+    return this.#sql.query<PromptJob>(
+      `update ${this.#schema}.prompt_jobs set state = 'awaiting_choice', completed_at = null where state = 'steering' returning *`,
+    );
   }
 
   /**

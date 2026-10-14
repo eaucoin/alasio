@@ -308,6 +308,60 @@ test("Discard drops the concurrent message: the running turn finishes and nothin
   assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Next");
 });
 
+test("a concurrent message is settled by the first of its buttons pressed alone: the others then do nothing", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  // The conversation's first turn: its panel's buttons hold for it all the same.
+  await runningTurn(alasio);
+  await concurrentPrompt(alasio, "Never mind this");
+
+  let mark = telegram.mark();
+  telegram.press("Discard");
+  assert.deepEqual(await telegram.waitForShown(2, { mark }), [
+    { method: "answerCallbackQuery", text: "Discarded." },
+    { method: "editMessageText", text: "Discarded." },
+  ]);
+  mark = telegram.mark();
+  telegram.press("Queue");
+  assert.deepEqual(await telegram.waitForShown(1, { mark }), [{ method: "answerCallbackQuery", text: "This action is no longer available." }]);
+  telegram.press("Swerve");
+  assert.deepEqual(await telegram.waitForShown(2, { mark }), [
+    { method: "answerCallbackQuery", text: "This action is no longer available." },
+    { method: "answerCallbackQuery", text: "This action is no longer available." },
+  ]);
+  answerTurn(codex, "thread-1", "turn-1", "Fixed.");
+  await telegram.waitFor("sendRichMessage", () => true, { mark });
+
+  telegram.say("Next");
+  await answerLoadedThreads(codex, ["thread-1"]);
+  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Next");
+});
+
+test("a concurrent message left unsettled as its turn ends is asked about again, and runs once the operator says", async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await runningTurn(alasio);
+  await concurrentPrompt(alasio, "Also update the docs");
+
+  let mark = telegram.mark();
+  answerTurn(codex, "thread-1", "turn-1", "Fixed.");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("The turn has ended."), { mark });
+  assert.deepEqual(timeless(telegram.shown(mark)).filter(({ method }) => method === "sendMessage"), [{
+    method: "sendMessage",
+    text: "The turn has ended. What should I do with this message?\n\nAlso update the docs",
+    buttons: [["Run it", "Discard"]],
+  }]);
+
+  mark = telegram.mark();
+  telegram.press("Run it");
+  assert.deepEqual(await telegram.waitForShown(2, { mark }), [
+    { method: "answerCallbackQuery", text: "Running." },
+    { method: "editMessageText", text: "Codex is running this now." },
+  ]);
+  await answerLoadedThreads(codex, ["thread-1"]);
+  assert.equal(inputText(await answerTurnStart(codex, "thread-1", "turn-2")), "Also update the docs");
+});
+
 test("/stop interrupts the running turn, which ends as stopped, and the next prompt runs", async (t) => {
   const alasio = await alasioFor(t, { folders: ["alpha"] });
   const { telegram, codex } = alasio;

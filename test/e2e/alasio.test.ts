@@ -104,11 +104,14 @@ async function forward(standIn: StandIn): Promise<Forward> {
 /** The operator, through the Telegram stand-in: says things, presses buttons, reads replies. */
 function operator(base: string) {
   let seen = 0;
+  /** Every call read, in the order alasio made them. */
+  const read: RecordedCall[] = [];
   const post = async (path: string, body: ControlMessage | ControlCallback) => (await fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json();
   const calls = async () => {
     // The stand-in answers what it was called with.
     const listed = (await (await fetch(`${base}/control/calls?since=${seen}`)).json()) as CallsListing;
     seen = listed.total;
+    read.push(...listed.calls);
     return listed.calls;
   };
   const buttons = (call: RecordedCall): InlineKeyboardButton[] => {
@@ -121,10 +124,18 @@ function operator(base: string) {
     say: (text: string, user?: number) => post("/control/message", { text, ...(user === undefined ? {} : { chatId: user, userId: user }) }),
     press: (data: string | undefined) => post("/control/callback", { data }),
     calls,
-    /** What alasio sends until `predicate` holds for one, which is returned. */
-    async waitFor(predicate: (call: RecordedCall) => boolean, timeoutMs = 300_000): Promise<RecordedCall> {
+    /** Where the calls alasio makes from now on start, for waitFor: every call alasio made so far read. */
+    mark: async (): Promise<number> => {
+      await calls();
+      return read.length;
+    },
+    /**
+     * What alasio sends until `predicate` holds for one, which is returned: from now on, or
+     * from `from`, a mark, those read since included.
+     */
+    async waitFor(predicate: (call: RecordedCall) => boolean, timeoutMs = 300_000, from?: number): Promise<RecordedCall> {
       const deadline = Date.now() + timeoutMs;
-      const got: RecordedCall[] = [];
+      const got: RecordedCall[] = from === undefined ? [] : read.slice(from);
       while (Date.now() < deadline) {
         got.push(...(await calls()));
         const hit = got.find(predicate);
@@ -187,12 +198,16 @@ if (inShard("upgrade")) {
       return (deployment?.spec?.replicas ?? 0) > 0 && deployment?.status?.readyReplicas === deployment?.spec?.replicas;
     };
 
+    /** Where the calls alasio made from the cut-over on start, as the operator read them. */
+    let cutOverFrom: number;
     let volumeId: string;
     /** The folder mounted in the other chat, and what it holds. */
     let folder: string;
     let messages: number;
     /** The StatefulSets of main's that keep their data on claims. */
     let held: string[];
+    /** A prompt held across the upgrade. */
+    const HELD_PROMPT = "held across the upgrade";
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -250,6 +265,25 @@ if (inShard("upgrade")) {
           assert.deepEqual(container?.env?.filter(({ name }) => name === "ALASIO_HOOK_PORT"), []);
         },
       },
+      {
+        seeds: "a prompt held as a turn ran, its question unanswered",
+        seed: async () => {
+          await tg.calls();
+          await tg.say("wait 20");
+          await tg.waitFor((call) => /^Codex is working/u.test(call.payload.text ?? ""));
+          await tg.say(HELD_PROMPT);
+          await tg.waitFor((call) => /^Codex is currently working\. What should I do with this message\?/u.test(call.payload.text ?? "") && (call.payload.text ?? "").endsWith(HELD_PROMPT));
+          await tg.waitFor((call) => answered(call));
+        },
+        keeps: "the held prompt is asked about again, as the operator wrote it, once alasio is upgraded, and runs when told to",
+        check: async () => {
+          const asked = await tg.waitFor((call) => call.payload.text === `The turn has ended. What should I do with this message?\n\n${HELD_PROMPT}`, 300_000, cutOverFrom);
+          const run = tg.buttons(asked).find((button) => button.text === "Run it");
+          assert.ok(run && "callback_data" in run, "the question has a Run it button");
+          await tg.press(run.callback_data);
+          await tg.waitFor((call) => answered(call));
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -277,6 +311,7 @@ if (inShard("upgrade")) {
     });
 
     test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after that failure, through`, { timeout: 60 * 60_000 }, async () => {
+      cutOverFrom = await tg.mark();
       const ran = await cutOver();
       assert.equal(ran.code, 0, ran.stdout);
     });

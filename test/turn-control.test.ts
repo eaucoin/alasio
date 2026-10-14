@@ -1,7 +1,8 @@
 /**
  * alasio's turns, as Turns runs them on a harness a test scripts: when a turn may start,
- * what it ends, what a harness's own turn claims, what its status message says, and what a
- * start does with what the last alasio left.
+ * what it ends, what a harness's own turn claims, what its status message says, what
+ * becomes of the prompts held while a turn ran and of the buttons that settle them, and
+ * what a start does with what the last alasio left.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -13,6 +14,7 @@ import { createCommandEventPolicy } from "../src/codex/command-event-policy.ts";
 import { makeStatusReporter } from "../src/codex/status-reporter.ts";
 import { Turns } from "../src/codex/turns.ts";
 import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { discardHeld, queueHeld, steerWithHeld, swerveTo } from "../src/harness/commands.ts";
 import type { Harness, OwnTurns, TurnParams, TurnResult } from "../src/harness/index.ts";
 import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
@@ -150,6 +152,98 @@ test("a turn a harness starts on its own claims the conversation, as alasio's tu
   });
 });
 
+/** The conversation's prompt held for the operator's choice, as one sent while a turn ran is, and its four buttons. */
+async function heldPrompt(store: Store["Service"], conversationId: string, prompt: string, visibleText = prompt) {
+  const job = await run(store.enqueuePromptJob({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: prompt, prompt, visibleText, state: "awaiting_choice" }));
+  const payload = { jobId: job.id, prompt };
+  const buttons = await run(store.createCallbackActions(conversationId, ["steer", "queue", "swerve", "discard"].map((kind) => ({ kind, payload }))));
+  return { job, buttons };
+}
+
+test("a held prompt is settled by the first of its buttons pressed alone: the others find it gone, and are forgotten", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  await withTurns(store, harness, async (alasio) => {
+    const discarded = await heldPrompt(store, conversationId, "never mind");
+    assert.equal(await alasio.runPromise(discardHeld(discarded.job.id)), true);
+    assert.equal((await run(store.getPromptJob(discarded.job.id)))?.state, "cancelled");
+    assert.equal(await alasio.runPromise(discardHeld(discarded.job.id)), false);
+    assert.equal(await alasio.runPromise(queueHeld(discarded.job.id)), false);
+    assert.equal(await alasio.runPromise(swerveTo(conversationId, discarded.job.id)), false);
+    assert.deepEqual(await alasio.runPromise(steerWithHeld(conversationId, discarded.job.id)), { outcome: "gone" });
+    for (const id of discarded.buttons) assert.equal(await run(store.consumeCallbackAction(id)), null, "a button of a settled prompt is kept");
+    assert.equal((await run(store.getPromptJob(discarded.job.id)))?.state, "cancelled");
+
+    // Queued, it runs once: a swerve, a steer or a queue after finds it gone, and runs it no more.
+    const queued = await heldPrompt(store, conversationId, "run me once");
+    assert.equal(await alasio.runPromise(queueHeld(queued.job.id)), true);
+    await until("the queued prompt to run", async () => (await run(store.getPromptJob(queued.job.id)))?.state === "completed");
+    assert.equal(await alasio.runPromise(swerveTo(conversationId, queued.job.id)), false);
+    assert.deepEqual(await alasio.runPromise(steerWithHeld(conversationId, queued.job.id)), { outcome: "gone" });
+    assert.equal(await alasio.runPromise(queueHeld(queued.job.id)), false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(ran, ["run me once"]);
+
+    // A steer with no turn running takes it as queued, and it runs after.
+    const steered = await heldPrompt(store, conversationId, "steer me");
+    assert.deepEqual(await alasio.runPromise(steerWithHeld(conversationId, steered.job.id)), { outcome: "queued", reason: "idle" });
+    await until("the steered prompt to run", async () => (await run(store.getPromptJob(steered.job.id)))?.state === "completed");
+    assert.deepEqual(ran, ["run me once", "steer me"]);
+  });
+});
+
+test("the prompts held while a turn ran are asked about again once the conversation is free, each once, and run as the operator says", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  await withTurns(store, harness, async (alasio, queued) => {
+    // Sent with a file, which its prompt names: the question quotes what the operator wrote.
+    const { job } = await heldPrompt(store, conversationId, "held while it ran\n\n[The operator sent the file /state/files/notes.txt]", "held while it ran");
+    const schedule = () => alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.schedule(conversationId)));
+    await schedule();
+    await until("the held prompt to be asked about again", () => queued.texts.length > 0);
+    await schedule();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(queued.texts.map(({ text }) => text), ["The turn has ended. What should I do with this message?\n\nheld while it ran"]);
+    const keyboard = queued.texts[0]?.options?.reply_markup;
+    assert.ok(keyboard && "inline_keyboard" in keyboard);
+    assert.deepEqual(keyboard.inline_keyboard.map((row) => row.map(({ text }) => text)), [["Run it", "Discard"]]);
+    const [runIt] = keyboard.inline_keyboard[0] ?? [];
+    const action = await run(store.consumeCallbackAction(runIt && "callback_data" in runIt ? runIt.callback_data ?? "" : ""));
+    assert.deepEqual([action?.kind, action?.payload["jobId"]], ["queue", job.id]);
+    assert.equal(await alasio.runPromise(queueHeld(job.id)), true);
+    await until("the held prompt to run", () => ran.length === 1);
+    assert.deepEqual(ran, ["held while it ran\n\n[The operator sent the file /state/files/notes.txt]"]);
+  });
+});
+
+test("a prompt the last alasio was handing to a turn to steer as it stopped is asked about, quoted, once, and run only as the operator says", async () => {
+  const { store, conversationId } = await conversation();
+  const ran: string[] = [];
+  const harness = scriptedHarness((params) => Effect.sync(() => ran.push(params.prompt)).pipe(Effect.andThen(answered(params, "Done."))));
+  // Left steering: taken from being held, and handed to the turn, which may or may not have taken it, as alasio stopped.
+  const { job } = await heldPrompt(store, conversationId, "steer this");
+  assert.equal((await run(store.settleHeldPromptJob(job.id, "steering")))?.state, "steering");
+  await withTurns(store, harness, async (alasio, queued) => {
+    await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.resumePendingPrompts)));
+    await until("the steer to be asked about", () => queued.texts.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Neither run again nor asked about as an ordinary held prompt.
+    assert.deepEqual(ran, []);
+    assert.deepEqual(queued.texts.map(({ text }) => text), [
+      "alasio restarted as it sent this message to steer the running turn, which may not have taken it. What should I do with it?\n\nsteer this",
+    ]);
+    assert.equal((await run(store.getPromptJob(job.id)))?.state, "awaiting_choice");
+    const keyboard = queued.texts[0]?.options?.reply_markup;
+    assert.ok(keyboard && "inline_keyboard" in keyboard);
+    assert.deepEqual(keyboard.inline_keyboard.map((row) => row.map(({ text }) => text)), [["Run it", "Discard"]]);
+    assert.equal(await alasio.runPromise(queueHeld(job.id)), true);
+    await until("the steer to run, once", () => ran.length === 1);
+    assert.deepEqual(ran, ["steer this"]);
+  });
+});
+
 test("alasio starting lets go of the holds the last one left, and ends each turn it left running, its status message saying how", async () => {
   const { store, schema, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
@@ -216,6 +310,31 @@ test("a turn's status message says what its row says it does, as the row changes
     yield* settle;
     assert.equal(outbox.queued.edits.length, 2);
   })).pipe(Effect.provide(Layer.mergeAll(Layer.succeed(Store, store), outbox.layer, TestClock.layer()))));
+});
+
+test("a held prompt sent to steer is done only once the turn took it, and queued, as it was, where it did not", async () => {
+  const { store, conversationId } = await conversation();
+  const harness = scriptedHarness((params) => answered(params, "Done."));
+  await withTurns(store, harness, async (alasio) => {
+    let answer = Effect.runSync(Deferred.make<boolean>());
+    const scope = await alasio.runPromise(Scope.make());
+    // A turn runs, which answers each steer as the test says.
+    await alasio.runPromise(Effect.flatMap(ActiveTurns, (turns) =>
+      turns.register(conversationId, { stop: () => Effect.void, steer: () => Deferred.await(answer), cliInitiated: false })
+    ).pipe(Scope.provide(scope)));
+    const steer = async (prompt: string, took: boolean) => {
+      answer = Effect.runSync(Deferred.make<boolean>());
+      const { job } = await heldPrompt(store, conversationId, prompt);
+      const steering = alasio.runPromise(steerWithHeld(conversationId, job.id));
+      // Taken from being held as the turn is asked, and not yet done.
+      await until("the steer to reach the turn", async () => (await run(store.getPromptJob(job.id)))?.state === "steering");
+      await alasio.runPromise(Deferred.succeed(answer, took));
+      return { steered: await steering, state: (await run(store.getPromptJob(job.id)))?.state };
+    };
+    assert.deepEqual(await steer("not taken", false), { steered: { outcome: "queued", reason: "not ready" }, state: "pending" });
+    assert.deepEqual(await steer("taken", true), { steered: { outcome: "steered" }, state: "completed" });
+    await alasio.runPromise(Scope.close(scope, Exit.void));
+  });
 });
 
 test("a job made pending again keeps its place in line unless told another", async () => {

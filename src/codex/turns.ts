@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
+import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, Ref, Schema, Semaphore } from "effect";
 
 import {
   type AttachedTurn,
@@ -152,7 +152,10 @@ export class Turns extends Context.Service<Turns, {
   readonly flushCompletedResponses: Effect.Effect<void, StoreError>;
   /** Continues, or lets go of, the turns the last alasio was running when it stopped. */
   readonly recoverInterruptedTurns: Effect.Effect<void, StoreError>;
-  /** Schedules every conversation with prompt jobs waiting. */
+  /**
+   * Schedules every conversation with prompt jobs waiting: to run, or, held for the
+   * operator's choice, to be asked about again.
+   */
   readonly resumePendingPrompts: Effect.Effect<void, StoreError>;
 }>()("alasio/codex/Turns") {
   static readonly layer = (): Layer.Layer<
@@ -403,7 +406,11 @@ const makeTurns = Effect.fnUntraced(function*() {
   const runDirect = (turn: Effect.Effect<boolean, TurnError>): Effect.Effect<boolean, TurnError> =>
     Effect.flatMap(FiberSet.run(directTurns, turn), Fiber.join);
 
-  /** The conversation's prompt jobs, one at a time, for as long as it is free and has any. */
+  /**
+   * The conversation's prompt jobs, one at a time, for as long as it is free and has any;
+   * once it is free with none, the prompts still held from while a turn ran are asked
+   * about again.
+   */
   const drain = Effect.fnUntraced(function*(conversationId: string): Effect.fn.Return<void, StoreError> {
     /** Whatever a job's turn failed with, the job fails with it and the operator is told why. */
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
@@ -414,6 +421,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     while (!(yield* activeTurns.isBusy(conversationId))) {
       const job = yield* store.claimNextPromptJob(conversationId);
       if (!job) {
+        yield* askAgainOfHeld(conversationId);
         return;
       }
       // A mount no harness serves (none, or one the deployment cannot serve) fails the job, saying why.
@@ -476,14 +484,21 @@ const makeTurns = Effect.fnUntraced(function*() {
         Effect.flatMap((start) => start ? FiberSet.run(workers, worker(conversationId)).pipe(Effect.exit, Effect.asVoid) : Effect.void),
       );
 
-  const askHowToHandleConcurrentPrompt = Effect.fnUntraced(function*({ conversationId, chatId, job, visibleText }: ConversationChat & {
-    readonly job: Pick<PromptJob, "id" | "prompt">;
-    readonly visibleText: string;
+  /**
+   * The prompts held, and the questions about them, decided one at a time: whether a prompt
+   * is held, and asked about, as a turn runs, and which held ones are asked about again as
+   * it ends, so neither question comes after the other out of turn.
+   */
+  const asking = yield* Semaphore.make(1);
+
+  /** Asks the operator what to do with the prompt held as `job` while a turn runs, quoting what they wrote. */
+  const askHowToHandleConcurrentPrompt = Effect.fnUntraced(function*({ conversationId, chatId, job }: ConversationChat & {
+    readonly job: Pick<PromptJob, "id" | "prompt" | "visible_text">;
   }): Effect.fn.Return<void, StoreError> {
     const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
     const mount = yield* store.getMount(conversationId);
     const question = yield* keepPanel(conversationId, {
-      text: `${harnessLabelOf(mount)} is currently working. What should I do with this message?\n\n${truncateText(visibleText, 220)}`,
+      text: `${harnessLabelOf(mount)} is currently working. What should I do with this message?\n\n${truncateText(job.visible_text, 220)}`,
       keyboard: [
         [{ text: "Steer", kind: "steer", payload }, { text: "Queue", kind: "queue", payload }],
         [{ text: "Swerve", kind: "swerve", payload }, { text: "Discard", kind: "discard", payload }],
@@ -491,6 +506,49 @@ const makeTurns = Effect.fnUntraced(function*() {
     }).pipe(Effect.provideService(Store, store));
     yield* outbox.enqueueText({ chatId, text: question.text, options: { reply_markup: question.options.reply_markup } });
   });
+
+  /** The held prompt jobs asked about again, by conversation, while each is held. */
+  const askedAgain = new Map<string, ReadonlySet<string>>();
+
+  /**
+   * Asks again, once the conversation is free, what to do with each prompt still held
+   * from while a turn ran, which the operator has not settled: run it now, or discard it.
+   * The buttons first sent for it settle it as well. Each is asked about again once while
+   * this alasio runs.
+   */
+  const askAgainOfHeld = (conversationId: string): Effect.Effect<void> =>
+    asking.withPermit(Effect.gen(function*() {
+      if (yield* activeTurns.isBusy(conversationId)) return;
+      const held = yield* store.listHeldPromptJobs(conversationId);
+      const asked = askedAgain.get(conversationId) ?? new Set<string>();
+      askedAgain.set(conversationId, new Set(held.flatMap(({ id }) => (asked.has(id) ? [id] : []))));
+      for (const job of held.filter(({ id }) => !asked.has(id))) {
+        const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
+        const question = yield* keepPanel(conversationId, {
+          text: `The turn has ended. What should I do with this message?\n\n${truncateText(job.visible_text, 220)}`,
+          keyboard: [[{ text: "Run it", kind: "queue", payload }, { text: "Discard", kind: "discard", payload }]],
+        }).pipe(Effect.provideService(Store, store));
+        yield* outbox.enqueueText({ chatId: job.chat_id, text: question.text, options: { reply_markup: question.options.reply_markup } });
+        askedAgain.set(conversationId, new Set([...askedAgain.get(conversationId) ?? [], job.id]));
+      }
+      if (askedAgain.get(conversationId)?.size === 0) askedAgain.delete(conversationId);
+    })).pipe(Effect.catch((error) => Effect.logWarning(`Could not ask again what to do with ${conversationId}'s held prompts: ${error.message}`)));
+
+  /**
+   * Asks what to do with a prompt the last alasio was handing to the running turn to steer
+   * it as it stopped, which that turn may or may not have taken: run it now, or discard it,
+   * so it is neither run twice nor lost unsaid. Its question stands for its asking again.
+   */
+  const askAboutUnsteered = (job: PromptJob): Effect.Effect<void, StoreError> =>
+    Effect.gen(function*() {
+      const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
+      const question = yield* keepPanel(job.conversation_id, {
+        text: `alasio restarted as it sent this message to steer the running turn, which may not have taken it. What should I do with it?\n\n${truncateText(job.visible_text, 220)}`,
+        keyboard: [[{ text: "Run it", kind: "queue", payload }, { text: "Discard", kind: "discard", payload }]],
+      }).pipe(Effect.provideService(Store, store));
+      yield* outbox.enqueueText({ chatId: job.chat_id, text: question.text, options: { reply_markup: question.options.reply_markup } });
+      askedAgain.set(job.conversation_id, new Set([...askedAgain.get(job.conversation_id) ?? [], job.id]));
+    });
 
   /** Says `text` on the status message of a turn the last alasio left running, where it has one. */
   const editLeftStatus = (turn: Turn, text: string): Effect.Effect<void> =>
@@ -503,20 +561,22 @@ const makeTurns = Effect.fnUntraced(function*() {
 
   return Turns.of({
     submit: Effect.fnUntraced(function*({ conversationId, chatId, messageId, prompt, fileIds, visibleText }: QueuedPrompt) {
-      const job = yield* store.enqueuePromptJob({
-        conversationId,
-        chatId,
-        messageId,
-        prompt,
-        fileIds,
-        state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
-        traceparent: currentTraceparent(),
-      });
-      if (job.state === "awaiting_choice") {
-        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText });
-        return;
-      }
-      yield* schedule(conversationId);
+      const traceparent = currentTraceparent();
+      const job = yield* asking.withPermit(Effect.gen(function*() {
+        const queued = yield* store.enqueuePromptJob({
+          conversationId,
+          chatId,
+          messageId,
+          prompt,
+          visibleText,
+          fileIds,
+          state: (yield* activeTurns.isBusy(conversationId)) ? "awaiting_choice" : "pending",
+          traceparent,
+        });
+        if (queued.state === "awaiting_choice") yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job: queued });
+        return queued;
+      }));
+      if (job.state === "pending") yield* schedule(conversationId);
     }),
     schedule,
     setPromptDisposition: Effect.fnUntraced(function*(jobId, state, priority) {
@@ -530,9 +590,13 @@ const makeTurns = Effect.fnUntraced(function*() {
     // The trace a turn asked for without one is the asker's, read before the turn is forked.
     run: (request) => Effect.suspend(() => runDirect(run({ ...request, traceparent: request.traceparent === undefined ? currentTraceparent() : request.traceparent }))),
     runGoalTurn: Effect.fnUntraced(function*({ conversationId, chatId, messageId, sessionId, turnId, prompt }) {
-      if (yield* activeTurns.isBusy(conversationId)) {
+      const held = yield* asking.withPermit(Effect.gen(function*() {
+        if (!(yield* activeTurns.isBusy(conversationId))) return false;
         const job = yield* store.enqueuePromptJob({ conversationId, chatId, messageId, prompt, state: "awaiting_choice" });
-        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job, visibleText: prompt });
+        yield* askHowToHandleConcurrentPrompt({ conversationId, chatId, job });
+        return true;
+      }));
+      if (held) {
         return true;
       }
       yield* store.setSessionId(conversationId, sessionId);
@@ -572,9 +636,11 @@ const makeTurns = Effect.fnUntraced(function*() {
           yield* editLeftStatus(turn, `${harnessDisplayName(turn.harness)} finished this turn as alasio stopped.`);
         }
       }
+      // A steer the last alasio was handing over as it stopped is asked about, not run again.
+      yield* Effect.forEach(yield* store.holdUnsteeredPromptJobsAfterRestart, askAboutUnsteered, { discard: true });
     }),
     flushCompletedResponses,
     recoverInterruptedTurns: recoverInterruptedTurns(store, editLeftStatus),
-    resumePendingPrompts: Effect.flatMap(store.listPendingPromptConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
+    resumePendingPrompts: Effect.flatMap(store.listWaitingPromptConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
   });
 }, withLogScope(LOG_SCOPE));

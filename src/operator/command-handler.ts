@@ -6,6 +6,7 @@ import { Effect, Option } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { isBusy, stopTurn } from "../harness/commands.ts";
 import { type HarnessError, harnessLabelOf, Harnesses, type HarnessUnavailable } from "../harness/index.ts";
 import { Store } from "../persistence/store.ts";
 import type { ReceivedFileError, ReceivedFiles } from "../telegram/files.ts";
@@ -55,19 +56,18 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
 > {
   const store = yield* Store;
   const client = yield* TelegramClient;
-  const activeTurns = yield* ActiveTurns;
   const turns = yield* Turns;
   const conversation = { conversationId, chatId };
   const mount = yield* store.getMount(conversationId);
   // What changes the mount, or stops a turn, needs no harness, which the mount may have none of.
   if (cmd.type === "stop") {
-    if (!(yield* activeTurns.isBusy(conversationId))) {
+    if (!(yield* isBusy(conversationId))) {
       yield* client.sendMessage(chatId, "No active query to stop.");
       return true;
     }
     const label = harnessLabelOf(mount);
     const [status] = yield* client.sendMessage(chatId, `Stopping ${label}...`);
-    const interrupted = yield* activeTurns.stop(conversationId, "interrupt");
+    const interrupted = yield* stopTurn(conversationId, "interrupt");
     const text = interrupted ? `${label} stopped.` : "No active query to stop.";
     if (status?.message_id) {
       yield* client.editMessageText(chatId, status.message_id, text, { format: "plain" }).pipe(Effect.ignore);
@@ -123,7 +123,7 @@ const handleCommand = Effect.fnUntraced(function*({ cmd, conversationId, chatId,
     return true;
   }
   if (cmd.type === "sessions_new") {
-    if (yield* activeTurns.isBusy(conversationId)) {
+    if (yield* isBusy(conversationId)) {
       yield* client.sendMessage(chatId, `${harness.displayName} is currently working. Use /stop first, then /sessions new.`);
       return true;
     }

@@ -3,6 +3,7 @@ import { Effect } from "effect";
 
 import { type TurnError, Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { isBusy, stopTurn } from "../harness/commands.ts";
 import type { HarnessError, HarnessGoals } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -368,9 +369,8 @@ export const handleGoalTextCommand = Effect.fnUntraced(function*({ conversationI
 > {
   const store = yield* Store;
   const client = yield* TelegramClient;
-  const activeTurns = yield* ActiveTurns;
-  const isTurnActive = yield* activeTurns.isBusy(conversationId);
-  const stopActiveTurn = activeTurns.stop(conversationId, "interrupt");
+  const isTurnActive = yield* isBusy(conversationId);
+  const stopActiveTurn = stopTurn(conversationId, "interrupt");
   const trimmed = String(args ?? "").trim();
   if (!trimmed) {
     return yield* sendGoalPanel({ conversationId, chatId, isTurnActive, goals });
@@ -444,10 +444,9 @@ export const handleGoalControlCallback = Effect.fnUntraced(function*({
 }: GoalControlCallback): Effect.fn.Return<void, TelegramError | StoreError, GoalServices> {
   const store = yield* Store;
   const client = yield* TelegramClient;
-  const activeTurns = yield* ActiveTurns;
   const { conversationId } = action;
-  const isTurnActive = yield* activeTurns.isBusy(conversationId);
-  const stopActiveTurn = activeTurns.stop(conversationId, "interrupt");
+  const isTurnActive = yield* isBusy(conversationId);
+  const stopActiveTurn = stopTurn(conversationId, "interrupt");
   const kind = action.kind.slice(GOAL_KIND_PREFIX.length);
   const payload = action.payload ?? {};
   const edit = (draft: PanelDraft) => Effect.flatMap(keepPanel(conversationId, draft), (panel) => editPanel(chatId, messageId, panel));

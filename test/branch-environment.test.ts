@@ -47,7 +47,7 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   const branch = await testStore({ schema, branch: "try-codex" });
   assert.deepEqual(await run(branch.getMount(conversationId)), { harness: "codex", workingDirectory: "sessionfs:fs-0123456789abcdef", sessionId: null });
   assert.equal(await run(branch.getTelegramOffset), undefined);
-  assert.deepEqual(await run(branch.listPendingPromptConversations), []);
+  assert.deepEqual(await run(branch.listWaitingPromptConversations), []);
   assert.equal(await run(branch.hasOpenPromptJobs(conversationId)), false);
   assert.deepEqual(await run(branch.getActiveTurns), []);
   assert.deepEqual(await run(branch.getCompletedResponsesPendingDelivery), []);

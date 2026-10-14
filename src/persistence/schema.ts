@@ -259,6 +259,9 @@ create table if not exists ${SCHEMA}.prompt_jobs (
   chat_id text not null,
   message_id text not null,
   prompt text not null,
+  -- what the operator wrote, which the prompt is made from (with notes of the files sent
+  -- with it), as a question about the prompt quotes it
+  visible_text text not null,
   -- the files the prompt was sent with, as the files table keeps them
   file_ids text[] not null default '{}',
   harness text not null,
