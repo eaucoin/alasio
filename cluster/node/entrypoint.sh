@@ -46,14 +46,15 @@ mount --make-rshared /
 # (ALASIO_STARGZ_CONFIG), which containerd pulls images through once its socket is there:
 # started again whenever it exits, as the host target's systemd does, its FUSE manager
 # keeping the mounts meanwhile, for as long as the container lives, which k3s does too.
-# Its pid is in daemon.pid, which alasio status reads.
+# Its pid is in daemon.pid, which alasio status reads. Go's soft limit on its heap, and its
+# FUSE manager's, is the node's (ALASIO_STARGZ_MEMORY_LIMIT), for the daemon alone.
 mkdir -p /etc/containerd-stargz-grpc /run/containerd-stargz-grpc
 printf '%s\n' "$ALASIO_STARGZ_CONFIG" >/etc/containerd-stargz-grpc/config.toml
 # A socket left from the container's last start is no daemon listening.
 rm -f /run/containerd-stargz-grpc/containerd-stargz-grpc.sock
 (
   while :; do
-    /usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
+    GOMEMLIMIT="$ALASIO_STARGZ_MEMORY_LIMIT" /usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock \
       --config=/etc/containerd-stargz-grpc/config.toml --root=/var/lib/containerd-stargz-grpc &
     echo $! >/run/containerd-stargz-grpc/daemon.pid
     wait $! && exited=0 || exited=$?

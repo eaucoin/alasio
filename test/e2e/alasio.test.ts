@@ -367,6 +367,10 @@ if (inShard("sessions")) {
         [SESSIONS, none],
       ];
       for (const [namespace, name] of pods) assert.ok(await onRemoteSnapshot(namespace, name), `${namespace}/${name} runs on no remote snapshot`);
+      // Its FUSE manager under Go's soft memory limit, inherited from the daemon.
+      const node = (await kube.get<V1Pod>(ref("Pod", none, SESSIONS)))?.spec?.nodeName ?? "";
+      const limits = await onNode(node, `for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = stargz-fuse-man ] && tr '\\0' '\\n' <"$p/environ" | grep '^GOMEMLIMIT='; done; true`);
+      assert.match(limits, /^GOMEMLIMIT=128MiB$/mu);
       // The agent's image was on no node before the first session: kubelet says how long it took.
       const events = await kube.list<CoreV1Event>("Event", { namespace: SESSIONS, fieldSelector: `involvedObject.name=${none},reason=Pulled` });
       const pulled = events.map(({ message }) => /^Successfully pulled image "[^"]*alasio-agent[^"]*" in (\S+) /u.exec(message ?? "")?.[1]).find((took) => took !== undefined);

@@ -50,7 +50,7 @@ import {
   writeKubeconfig,
 } from "./k3s.ts";
 import { gvisorReleases, NODE_PINS } from "./node.ts";
-import { STARGZ_ROOT, stargzConfig } from "./stargz.ts";
+import { STARGZ_MEMORY_LIMIT, STARGZ_ROOT, stargzConfig } from "./stargz.ts";
 import { tarArchive, type TarEntry } from "./tar.ts";
 
 /** A path of this machine mounted in every node, at `target`. */
@@ -184,6 +184,8 @@ const K3S_TOKEN = "/var/lib/rancher/k3s/server/token";
 const REGISTRIES_ENV = "ALASIO_REGISTRIES";
 /** The variable the node image's entrypoint writes stargz-snapshotter's daemon's configuration from, before it starts it. */
 const STARGZ_CONFIG_ENV = "ALASIO_STARGZ_CONFIG";
+/** The variable the node image's entrypoint gives the daemon, and its FUSE manager, as Go's soft limit on their heaps (./stargz.ts's STARGZ_MEMORY_LIMIT). */
+const STARGZ_MEMORY_ENV = "ALASIO_STARGZ_MEMORY_LIMIT";
 /** Where the node image's entrypoint writes the pid of stargz-snapshotter's daemon, at each of the daemon's starts. */
 const STARGZ_PID = "/run/containerd-stargz-grpc/daemon.pid";
 
@@ -301,7 +303,7 @@ const makeDockerCluster = Effect.fnUntraced(function*({
     Image: image,
     Hostname: node,
     Cmd: command,
-    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : []), `${STARGZ_CONFIG_ENV}=${stargzConfig(registries)}`],
+    Env: [...env, ...(registries ? [`${REGISTRIES_ENV}=${registriesYaml(registries)}`] : []), `${STARGZ_CONFIG_ENV}=${stargzConfig(registries)}`, `${STARGZ_MEMORY_ENV}=${STARGZ_MEMORY_LIMIT}`],
     Labels: { ...labels, [ROLE_LABEL]: role },
     ...(role === "server" ? { ExposedPorts: { [API_PORT]: {} } } : {}),
     HostConfig: {

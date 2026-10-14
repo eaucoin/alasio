@@ -72,6 +72,7 @@ test("a server's files: k3s's config, without traefik, its volumes where the con
   const unit = files.get("/etc/systemd/system/stargz-snapshotter.service") ?? "";
   assert.match(unit, /^PartOf=k3s\.service$/mu);
   assert.match(unit, /^KillMode=process$/mu);
+  assert.match(unit, /^Environment=GOMEMLIMIT=128MiB$/mu, "Go's soft limit on the daemon's heap and its FUSE manager's");
   assert.match(unit, new RegExp(`^ExecStart=/usr/local/bin/containerd-stargz-grpc --address=${STARGZ_SOCKET} --config=/etc/containerd-stargz-grpc/config\\.toml --root=${STARGZ_ROOT}$`, "mu"));
   assert.match(files.get("/etc/systemd/system/k3s.service.d/alasio-stargz.conf") ?? "", /^\[Unit\]\nWants=stargz-snapshotter\.service\nAfter=stargz-snapshotter\.service\n$/mu);
   const registries = { mirrors: { "docker.io": { endpoint: ["https://mirror.lan"] } }, configs: {} };
