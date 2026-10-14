@@ -19,7 +19,7 @@ import type { PromptJob, PromptJobState } from "../persistence/prompt-job-reposi
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
-import { type ChatId, TelegramClient, type TelegramError } from "../telegram/client.ts";
+import type { ChatId } from "../telegram/client.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { WorkflowHooks } from "../workflow/hook-server.ts";
@@ -85,11 +85,11 @@ type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
 
 /**
  * What a concurrent prompt's buttons (steer, queue, swerve, discard) carry: its prompt
- * job, when one was queued, and its prompt. A type rather than an interface, so that it
- * is a CallbackPayload.
+ * job, held for the operator's choice, and its prompt. A type rather than an interface,
+ * so that it is a CallbackPayload.
  */
 export type ConcurrentPromptPayload = {
-  readonly jobId: string | null;
+  readonly jobId: string;
   readonly prompt: string;
 };
 
@@ -120,8 +120,8 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
 
 /**
  * alasio's turns: each conversation's prompt jobs drained one at a time by a worker of its
- * own, each turn from its status message to its reply, a turn's queued messages as the
- * turn after it, and what a restart left (interrupted turns, undelivered responses).
+ * own, each turn from its status message to its reply, and what a restart left
+ * (interrupted turns, undelivered responses).
  * Stopping alasio interrupts every running turn while the store and Telegram are still
  * open: the restart is recorded for the turn to continue after it, and its status
  * message says so.
@@ -131,17 +131,15 @@ export class Turns extends Context.Service<Turns, {
    * Queues an operator's prompt as a prompt job: run as soon as the conversation is free,
    * or, while a turn runs in it, held for the operator to say what to do with it.
    */
-  readonly submit: (prompt: QueuedPrompt) => Effect.Effect<void, TelegramError | StoreError>;
-  /** Keeps a message (a concurrent prompt's, steered or swerved without a job) for the turn after the current one. */
-  readonly enqueueMessage: (conversationId: string, prompt: string, front?: boolean) => Effect.Effect<void>;
+  readonly submit: (prompt: QueuedPrompt) => Effect.Effect<void, StoreError>;
   /** Makes sure the conversation's worker is draining its prompt jobs. */
   readonly schedule: (conversationId: string) => Effect.Effect<void>;
   /** Settles what becomes of a prompt job; a job made pending again is scheduled. The job as it is now. */
   readonly setPromptDisposition: (jobId: string, state: PromptJobState, priority?: number) => Effect.Effect<PromptJob | null, StoreError>;
-  /** Runs a turn on the conversation's mounted session now, then its queued messages: whether its response completed. */
+  /** Runs a turn on the conversation's mounted session now: whether its response completed. */
   readonly run: (request: TurnRequest) => Effect.Effect<boolean, TurnError>;
   /** Runs a goal's turn on its session, or asks what to do with it while a turn runs. */
-  readonly runGoalTurn: (request: GoalTurnRequest) => Effect.Effect<boolean, TurnError | TelegramError>;
+  readonly runGoalTurn: (request: GoalTurnRequest) => Effect.Effect<boolean, TurnError>;
   /** A new, empty session of the mounted service, mounted on the conversation: its id. */
   readonly startNewSession: (conversationId: string) => Effect.Effect<string, NoServiceMounted | HarnessUnavailable | ConversationBusy | HarnessError | StoreError>;
   /** Settles, as alasio starts, the prompt jobs the last alasio left running. */
@@ -156,13 +154,13 @@ export class Turns extends Context.Service<Turns, {
   static readonly layer = (): Layer.Layer<
     Turns,
     never,
-    Store | TelegramClient | Outbox | WorkflowHooks | Harnesses | ActiveTurns | ReceivedFiles
+    Store | Outbox | WorkflowHooks | Harnesses | ActiveTurns | ReceivedFiles
   > => Layer.effect(Turns, makeTurns());
 }
 
 const makeTurns = Effect.fnUntraced(function*() {
   const store = yield* Store;
-  const client = yield* TelegramClient;
+  const outbox = yield* Outbox;
   const harnesses = yield* Harnesses;
   const activeTurns = yield* ActiveTurns;
   const receivedFiles = yield* ReceivedFiles;
@@ -184,7 +182,6 @@ const makeTurns = Effect.fnUntraced(function*() {
    */
   const draining = yield* Ref.make(HashMap.empty<string, "draining" | "again">());
   const directTurns = yield* FiberSet.make<boolean, TurnError>();
-  const queuedMessages = yield* Ref.make(HashMap.empty<string, readonly string[]>());
 
   const flushCompletedResponses = status.flushCompletedResponses.pipe(withLogScope(LOG_SCOPE));
 
@@ -316,8 +313,7 @@ const makeTurns = Effect.fnUntraced(function*() {
   });
 
   /**
-   * Runs a turn on the conversation's mount, then the messages queued while it ran, as a
-   * turn of their own. The turn is the span `alasio.turn`, continuing `traceparent` when
+   * Runs a turn on the conversation's mount. The turn is the span `alasio.turn`, continuing `traceparent` when
    * given (a queued prompt's; null for a trace of its own) and the active span otherwise;
    * its outcome labels it and its duration.
    */
@@ -350,16 +346,6 @@ const makeTurns = Effect.fnUntraced(function*() {
         turnDuration.record(((yield* Clock.currentTimeMillis) - startedAt) / 1000, { ...labels, "alasio.turn.outcome": outcome });
       })),
     );
-    const queued = yield* Ref.modify(queuedMessages, (all) => [Option.getOrElse(HashMap.get(all, turn.conversationId), () => []), HashMap.remove(all, turn.conversationId)]);
-    if (queued.length > 0) {
-      yield* run({
-        conversationId: turn.conversationId,
-        chatId: turn.chatId,
-        messageId: turn.messageId,
-        prompt: queued.join("\n\n---\n\n"),
-        traceparent: null,
-      });
-    }
     return completed;
   }, withLogScope(LOG_SCOPE));
 
@@ -379,7 +365,7 @@ const makeTurns = Effect.fnUntraced(function*() {
     const failJob = Effect.fnUntraced(function*(job: PromptJob, error: unknown) {
       yield* store.failPromptJob(job.id, error);
       const mount = yield* store.getMount(conversationId);
-      yield* client.sendMessage(job.chat_id, `${harnessLabelOf(mount)} hit an error: ${errorText(error)}`).pipe(Effect.ignore);
+      yield* outbox.enqueueText({ chatId: job.chat_id, text: `${harnessLabelOf(mount)} hit an error: ${errorText(error)}` }).pipe(Effect.ignore);
     });
     while (!(yield* activeTurns.isBusy(conversationId))) {
       const job = yield* store.claimNextPromptJob(conversationId);
@@ -447,7 +433,7 @@ const makeTurns = Effect.fnUntraced(function*() {
   const askHowToHandleConcurrentPrompt = Effect.fnUntraced(function*({ conversationId, chatId, job, visibleText }: ConversationChat & {
     readonly job: Pick<PromptJob, "id" | "prompt">;
     readonly visibleText: string;
-  }): Effect.fn.Return<void, TelegramError | StoreError> {
+  }): Effect.fn.Return<void, StoreError> {
     const payload: ConcurrentPromptPayload = { jobId: job.id, prompt: job.prompt };
     const mount = yield* store.getMount(conversationId);
     const question = yield* keepPanel(conversationId, {
@@ -457,7 +443,7 @@ const makeTurns = Effect.fnUntraced(function*() {
         [{ text: "Swerve", kind: "swerve", payload }, { text: "Discard", kind: "discard", payload }],
       ],
     }).pipe(Effect.provideService(Store, store));
-    yield* client.sendMessage(chatId, question.text, { reply_markup: question.options.reply_markup });
+    yield* outbox.enqueueText({ chatId, text: question.text, options: { reply_markup: question.options.reply_markup } });
   });
 
   return Turns.of({
@@ -477,11 +463,6 @@ const makeTurns = Effect.fnUntraced(function*() {
       }
       yield* schedule(conversationId);
     }),
-    enqueueMessage: (conversationId, prompt, front = false) =>
-      Ref.update(queuedMessages, (all) => {
-        const queue = Option.getOrElse(HashMap.get(all, conversationId), () => []);
-        return HashMap.set(all, conversationId, front ? [prompt, ...queue] : [...queue, prompt]);
-      }),
     schedule,
     setPromptDisposition: Effect.fnUntraced(function*(jobId, state, priority = 0) {
       yield* store.setPromptJobDisposition(jobId, state, priority);

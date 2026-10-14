@@ -20,7 +20,7 @@ import {
 import type { Store } from "../src/persistence/store.ts";
 import { run, testStore } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
-import { type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
+import { recordingOutbox, type TestAlasio, turnsStub, withServices } from "./support/turns.ts";
 
 /** A thread goal as Codex reports it, with what a test does not care about filled in. */
 function threadGoal(fields: Partial<v2.ThreadGoal>): v2.ThreadGoal {
@@ -354,8 +354,8 @@ test("a goal that cannot be changed says why on its panel", async () => {
 
 test("goal turns use normal concurrent-message decision panel when Codex is already working", async () => {
   const store = await codexConversation();
-  const { calls, layer } = recordingTelegram();
-  const handled = await withServices({ store, telegram: layer }, (alasio) =>
+  const outbox = recordingOutbox();
+  const handled = await withServices({ store, outbox: outbox.layer }, (alasio) =>
     // Codex is working: a turn of the conversation is running.
     alasio.runPromise(Effect.scoped(Effect.gen(function*() {
       const activeTurns = yield* ActiveTurns;
@@ -372,9 +372,10 @@ test("goal turns use normal concurrent-message decision panel when Codex is alre
     }))));
 
   assert.equal(handled, true);
-  assert.match(calls.sendMessage[0]?.[1] ?? "", /Codex is currently working/);
-  assert.deepEqual(
-    calls.sendMessage[0]?.[2]?.reply_markup?.inline_keyboard.map((row) => row.map((button) => button.text)),
-    [["Steer", "Queue"], ["Swerve", "Discard"]],
-  );
+  // The question is queued to the outbox, in the chat's order.
+  const [question] = outbox.queued.texts;
+  assert.match(question?.text ?? "", /Codex is currently working/);
+  const keyboard = question?.options?.reply_markup;
+  assert.ok(keyboard && "inline_keyboard" in keyboard);
+  assert.deepEqual(keyboard.inline_keyboard.map((row) => row.map((button) => button.text)), [["Steer", "Queue"], ["Swerve", "Discard"]]);
 });
