@@ -8,8 +8,8 @@
  * finds the sandboxes the shim made and tears them down as the shim would.
  */
 import { execFile } from "node:child_process";
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readdir, readFile, readlink } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
 
 import { Effect, Schema } from "effect";
 
@@ -23,6 +23,8 @@ export interface RunscOptions {
   readonly containerdDir: string;
   /** The root the shims run runsc with, holding their sandboxes' state. */
   readonly root: string;
+  /** The node's processes, as the agent sees them in its PID namespace: /proc unless told. */
+  readonly procRoot?: string;
 }
 
 /** What runsc was asked to do and could not, and what it said. */
@@ -50,6 +52,18 @@ const ImageInspection = Schema.Struct({
   digest: Schema.NonEmptyString,
   state: Schema.Struct({ metadata: Schema.Record(Schema.String, Schema.String) }),
 });
+
+/** What `runsc state` says of a container, as far as the agent reads it: its sandbox's process, and its spec's annotations. */
+const ContainerState = Schema.Struct({
+  pid: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+});
+
+/** A container as the node runs it: the release whose runsc runs its sandbox, and its spec's annotations. */
+export interface RunningContainer {
+  readonly release: string;
+  readonly annotations: Readonly<Record<string, string>>;
+}
 
 /** An image, as runsc describes it: its identity, the version of the runsc that saved it, and the CPU features it was saved with. */
 export interface InspectedImage {
@@ -83,6 +97,12 @@ export interface Runsc {
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
   /** The CPU features of this node, by the names `release` gives them. */
   readonly cpuFeatures: (release: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
+  /**
+   * The container, by its runtime's id, as the node runs it: which release runs its
+   * sandbox, from the program its sandbox's process runs (whatever a pod's RuntimeClass
+   * names now, it ran what it named as it started), and its annotations.
+   */
+  readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError>;
 }
 
 /** An entry of a TOML table whose value is a basic string, its key bare or quoted. */
@@ -129,7 +149,7 @@ interface Ran {
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 /** The node's releases and their runsc, at `options`' paths. */
-export function makeRunsc({ releasesDir, containerdDir, root }: RunscOptions): Runsc {
+export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc" }: RunscOptions): Runsc {
   const releases = Effect.promise(async () => {
     const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
     const found = await Promise.all(
@@ -195,6 +215,20 @@ export function makeRunsc({ releasesDir, containerdDir, root }: RunscOptions): R
           cpuFeatures: (metadata["cpu_features"] ?? "").split(",").filter(Boolean),
         })),
       ),
+
+    container: (containerId) =>
+      Effect.gen(function*() {
+        const failed = (reason: string) => new RunscError({ release: "the node's", command: `state ${containerId}`, reason });
+        // Any release reads the state every shim keeps under the one root.
+        const [any] = yield* releases;
+        if (any === undefined) return yield* failed("no gVisor release is installed here");
+        const { stdout } = yield* run(any, ["state"], [containerId]).pipe(Effect.mapError((error) => (error._tag === "RunscError" ? error : failed(error.message))));
+        const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(ContainerState)(JSON.parse(stdout)), catch: (cause) => failed(`its state is not one: ${String(cause)}`) });
+        const program = yield* Effect.tryPromise({ try: () => readlink(join(procRoot, String(state.pid), "exe")), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
+        const [release = "", ...under] = relative(releasesDir, program).split(sep);
+        if (under.length === 0 || release === ".." || !(yield* releases).includes(release)) return yield* failed(`its sandbox runs ${program}, of no release installed here`);
+        return { release, annotations: state.annotations ?? {} };
+      }),
 
     cpuFeatures: (release) => {
       const known = features.get(release);

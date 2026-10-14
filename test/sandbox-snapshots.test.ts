@@ -92,7 +92,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
     checkpoint: (node, request) =>
       Effect.sync(() => {
         checkpoints.push([node, request]);
-        return manifestOf(request.podTemplate as V1PodTemplateSpec, request.release);
+        return manifestOf(request.podTemplate as V1PodTemplateSpec);
       }),
     prepare: (node) =>
       Effect.suspend(() => {
@@ -470,7 +470,8 @@ test("an idle session is released, its sandbox snapshotted by its node's agent, 
   assert.deepEqual(checkpoints, [["node-a", {
     environment: "alasio-sessions",
     workspace: "fs-abc123",
-    release: CURRENT,
+    namespace: "alasio-sessions",
+    pod: "fs-abc123",
     containerId: "a".repeat(64),
     hook: ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"],
     podTemplate: sandbox.spec.podTemplate,

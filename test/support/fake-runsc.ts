@@ -12,9 +12,13 @@
  *   release's runsc, whose version is `release-RELEASE` (or what a file `saved-by` beside it
  *   says), with the CPU features of `image-cpu-features`;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
- * - `cpu-features`: the node's, from `cpu-features`, comma-separated.
+ * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
+ * - `state ID`: the container's sandbox's process and its pod's annotations, as
+ *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
+ *   does not hold; that process's program, in the stand-in's /proc, is the runsc of the
+ *   release that runs it.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { gvisorHandler } from "../../src/node-agent/names.ts";
@@ -49,6 +53,11 @@ if (rest[0] === "checkpoint") {
   }, null, 2) + "\\n");
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
+} else if (rest[0] === "state") {
+  const containers = existsSync(join(here, "..", "containers.json")) ? JSON.parse(readFileSync(join(here, "..", "containers.json"), "utf8")) : {};
+  const running = containers[rest[rest.length - 1]];
+  if (!running) { process.stderr.write("container does not exist\\n"); process.exit(1); }
+  process.stdout.write(JSON.stringify({ id: rest[rest.length - 1], pid: running.pid, annotations: running.annotations }) + "\\n");
 } else if (rest[0] === "cpu-features") {
   process.stdout.write(read("cpu-features", "sse,avx,avx2") + "\\n");
 } else {
@@ -63,8 +72,12 @@ export interface FakeReleases {
   readonly containerdDir: string;
   /** The directory of a release's runsc, where its files of the stand-in go. */
   readonly dirOf: (release: string) => string;
-  /** The arguments of each run of a release's runsc, in order. */
+  /** The arguments of each run of a release's runsc, in order, but its reads of containers' state. */
   readonly calls: (release: string) => string[][];
+  /** The node's processes, as the agent reads them: each container's sandbox's, of its release's runsc. */
+  readonly procRoot: string;
+  /** Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state says. */
+  readonly runs: (containerId: string, release: string, namespace: string, pod: string) => void;
 }
 
 /** Installs `releases` under `root`, each with an options file giving runsc systemd's cgroups. */
@@ -79,13 +92,27 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     chmodSync(join(dirOf(release), "runsc"), 0o755);
     writeFileSync(join(containerdDir, `${gvisorHandler(release)}.toml`), 'restore_direct = true\n\n[runsc_config]\n  systemd-cgroup = "true"\n');
   }
+  const procRoot = join(root, "proc");
+  const containers = join(releasesDir, "containers.json");
+  let pid = 4000;
+  const runs = (containerId: string, release: string, namespace: string, pod: string) => {
+    const held = existsSync(containers) ? JSON.parse(readFileSync(containers, "utf8")) as Record<string, unknown> : {};
+    pid += 1;
+    mkdirSync(join(procRoot, String(pid)), { recursive: true });
+    symlinkSync(join(dirOf(release), "runsc"), join(procRoot, String(pid), "exe"));
+    held[containerId] = { pid, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
+    writeFileSync(containers, JSON.stringify(held));
+  };
   return {
     releasesDir,
     containerdDir,
+    procRoot,
+    runs,
     dirOf,
     calls: (release) => {
       const log = join(dirOf(release), "calls.jsonl");
-      return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]) : [];
+      const runs = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]) : [];
+      return runs.filter((args) => !args.includes("state"));
     },
   };
 }

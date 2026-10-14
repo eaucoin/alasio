@@ -74,6 +74,7 @@ export interface NodeAgentServerOptions {
 const STATUS: Readonly<Record<string, number>> = {
   NoSnapshot: 404,
   Unrestorable: 409,
+  ContainerElsewhere: 409,
   SnapshotCorrupt: 422,
   S3Error: 502,
   PoliciesNotInForce: 504,

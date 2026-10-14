@@ -106,13 +106,17 @@ export type CopyRequest = typeof CopyRequest.Type;
 /** A container, by containerd's id. */
 const ContainerId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u));
 
+/** A pod's name: a DNS subdomain. */
+const PodName = Schema.String.check(Schema.isPattern(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/u), Schema.isMaxLength(253));
+
 /** A request to checkpoint a workspace's sandbox. */
 export const CheckpointRequest = Schema.Struct({
   environment: Name,
   workspace: Name,
-  /** The gVisor release the sandbox runs under. */
-  release: Release,
-  /** The container whose sandbox is saved, in which the hook runs. */
+  /** The pod whose sandbox is saved, which the container must be of. */
+  namespace: Name,
+  pod: PodName,
+  /** The container whose sandbox is saved, in which the hook runs: the release that runs it is the one that saves it. */
   containerId: ContainerId,
   /** The program run in the container before the save: its arguments, none holding whitespace, as runsc splits them at spaces. */
   hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)),
@@ -124,14 +128,12 @@ export type CheckpointRequest = typeof CheckpointRequest.Type;
 export const ResumeRequest = Schema.Struct({
   environment: Name,
   workspace: Name,
-  /** The gVisor release the sandbox was restored under. */
-  release: Release,
-  /** The pod's namespace and name, as its network policies' rules name it. */
+  /** The pod's namespace and name, as its network policies' rules name it, which its containers must be of. */
   namespace: Name,
-  pod: Schema.String.check(Schema.isPattern(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/u), Schema.isMaxLength(253)),
+  pod: PodName,
   /** The pod's addresses, one of each family it has, in their canonical form, as Kubernetes gives them. */
   podIPs: Schema.Array(Schema.String.check(Schema.makeFilter((ip) => isIP(ip) !== 0 || "must be an IP address"))).check(Schema.isMinLength(1)),
-  /** The pod's containers, each resumed. */
+  /** The pod's containers, each resumed, by the release that runs it. */
   containerIds: Schema.Array(ContainerId).check(Schema.isMinLength(1)),
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
@@ -214,11 +216,23 @@ export class PoliciesNotInForce extends Schema.TaggedError<PoliciesNotInForce>()
   }
 }
 
+/** A container is not the named pod's: whose it is. */
+export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()("ContainerElsewhere", {
+  containerId: Schema.String,
+  namespace: Schema.String,
+  pod: Schema.String,
+  found: Schema.String,
+}) {
+  override get message(): string {
+    return `the container ${this.containerId} is not of the pod ${this.namespace}/${this.pod}, but of ${this.found}`;
+  }
+}
+
 /** How preparing a snapshot fails. */
 export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
-export type ResumeError = PoliciesNotInForce | HostCommandError | RunscError | ReleaseNotInstalled;
+export type ResumeError = PoliciesNotInForce | ContainerElsewhere | HostCommandError | RunscError | ReleaseNotInstalled;
 
 /** What a node agent does; see makeNodeAgent. */
 export interface NodeAgent {
@@ -404,10 +418,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       yield* Effect.forEach(yield* bucket.list(`${prefix}/`), bucket.remove, { discard: true });
     });
 
+  /**
+   * The release that runs the container, which must be of the pod `namespace`/`pod`, as
+   * the annotations containerd gives its spec say: a request names no container of
+   * another's.
+   */
+  const ofPod = (containerId: string, namespace: string, pod: string): Effect.Effect<string, RunscError | ContainerElsewhere> =>
+    runsc.container(containerId).pipe(
+      Effect.flatMap(({ release, annotations }) => {
+        const found = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+        return found === `${namespace}/${pod}` ? Effect.succeed(release) : Effect.fail(new ContainerElsewhere({ containerId, namespace, pod, found }));
+      }),
+    );
+
   /** Takes the snapshot and commits it, as the module says: its manifest. */
-  const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+  const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
-      const { environment, workspace, release, containerId, hook, podTemplate } = request;
+      const { environment, workspace, containerId, hook, podTemplate } = request;
+      const release = yield* ofPod(containerId, request.namespace, request.pod);
       const takenAt = yield* Clock.currentTimeMillis;
       const snapshot = snapshotId(takenAt);
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
@@ -643,8 +671,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     Effect.gen(function*() {
       const waited = yield* policiesInForce(request);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
+      const releases = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
-      yield* Effect.forEach(request.containerIds, (id) => runsc.resume(request.release, id), { discard: true });
+      yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(releases[index] ?? "", id), { discard: true });
       return waited;
     }).pipe(
       Effect.tap((waited) =>

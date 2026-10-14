@@ -46,23 +46,24 @@ const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" 
 const request = (workspace: string, containerId = CONTAINER): CheckpointRequest => ({
   environment: "main",
   workspace,
-  release: RELEASE,
+  namespace: SESSIONS,
+  pod: POD,
   containerId,
   hook: HOOK,
   podTemplate: POD_TEMPLATE,
 });
 
-const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
-
 const SESSIONS = "alasio-sessions";
 const POD = "fs-abc123";
+
+const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
+
 const POD_IP = "10.42.0.15";
 const POD_IPV6 = "fd00:42::f";
 
 const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
   environment: "main",
   workspace: "fs-abc",
-  release: RELEASE,
   namespace: SESSIONS,
   pod: POD,
   podIPs,
@@ -130,7 +131,10 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
       const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
-      const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT });
+      const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot });
+      // The pod's containers run under the node's first release.
+      const [running] = installed;
+      if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
       return { releases, cacheDir, cache, host, agent: yield* makeNodeAgent({ node: name, runsc, cache, bucket, host: host.host }) };
     });
@@ -926,3 +930,22 @@ test("the node's cache builds no path but of the names the agent gives", () => {
     assert.throws(() => cache.path(environment, workspace, snapshot), /names no/u);
   }
 });
+
+test("a checkpoint is taken under the release that runs the container, whatever runs its pod's RuntimeClass now, and of no container but the named pod's", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const older = "20260801.0-eaucoin.1";
+      const here = yield* node("node-1", { releases: [RELEASE, older] });
+      // Started before the release was bumped, the pod's sandbox runs the release before.
+      here.releases.runs(CONTAINER, older, SESSIONS, POD);
+      const taken = yield* here.agent.checkpoint(request("fs-abc"));
+      assert.equal(taken.release, older);
+      assert.equal(here.releases.calls(older).filter(([, , command]) => command === "checkpoint").length, 1);
+      assert.deepEqual(here.releases.calls(RELEASE).filter(([, , command]) => command === "checkpoint"), []);
+      // Another pod's container is refused, as is one no release runs.
+      here.releases.runs(OTHER_CONTAINER, RELEASE, SESSIONS, "fs-other");
+      assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER)))), /is not of the pod alasio-sessions\/fs-abc123, but of alasio-sessions\/fs-other/u);
+      assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), /is not of the pod alasio-sessions\/fs-abc123/u);
+      assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", "c".repeat(64))))), /container does not exist/u);
+    })
+  ));

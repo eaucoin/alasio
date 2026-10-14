@@ -178,15 +178,8 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const kube = yield* KubeClient;
   const fetch = yield* FetchHttpClient.Fetch;
   const environment = profile.namespace;
-  const [current] = snapshots.releases;
   const releaseAfterMs = snapshots.releaseAfterSeconds * 1000;
   const ref = (name: string) => ({ environment, workspace: name });
-
-  /** The gVisor release a pod of `runtimeClassName` runs: the current one's for the profile's own, as its template names it. */
-  const releaseOf = (runtimeClassName: string | undefined): string | null => {
-    if (runtimeClassName !== undefined && runtimeClassName === profile.podTemplate.spec?.runtimeClassName) return current?.release ?? null;
-    return snapshots.releases.find((kept) => kept.runtimeClassName === runtimeClassName)?.release ?? null;
-  };
 
   /** Forgets the session's snapshot, saying why; one that cannot be forgotten is said so too. */
   const forget = (name: string, why: string): Effect.Effect<void> =>
@@ -225,7 +218,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
    * pod is then ready, by its readiness gate. A pod that ends meanwhile, whose sandbox
    * the agent does not resume, or whose readiness cannot be set, is refused.
    */
-  const resumeRestored = (name: string, node: string, release: string): Effect.Effect<void, SandboxRestoreRefused> =>
+  const resumeRestored = (name: string, node: string): Effect.Effect<void, SandboxRestoreRefused> =>
     Effect.gen(function*() {
       const running = yield* kube.read("v1", "Pod", profile.namespace, name).pipe(
         Effect.flatMap((read): Effect.Effect<V1Pod, PodNotRunning | SandboxRestoreRefused> => {
@@ -244,7 +237,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       );
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^containerd:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
-      yield* agents.resume(node, { ...ref(name), release, namespace: profile.namespace, pod: name, podIPs, containerIds }).pipe(
+      yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds }).pipe(
         Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message })),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
@@ -310,7 +303,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         return {
           podTemplate: restoring,
           kept: base,
-          resume: resumeRestored(name, node, kept.release),
+          resume: resumeRestored(name, node),
           // The session moves on from it.
           restored: Clock.currentTimeMillis.pipe(
             Effect.map((now) => {
@@ -337,16 +330,17 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       // A core Pod, as the API server returns one.
       const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
       const containerId = pod?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.containerID?.replace(/^containerd:\/\//u, "");
-      const release = releaseOf(pod?.spec?.runtimeClassName);
+      // Which release runs it is the node agent's to tell, from its sandbox: a pod started before a release was bumped runs the one before.
+      const gvisor = pod?.spec?.runtimeClassName !== undefined;
       const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
       const hook = bayma ? hookOf(bayma) : null;
       const node = pod?.spec?.nodeName;
-      if (!node || !containerId || !release || !hook) {
-        yield* Effect.logWarning(`session ${name} is not snapshotted: its pod runs no bayma under a gVisor release alasio keeps`);
+      if (!node || !containerId || !gvisor || !hook) {
+        yield* Effect.logWarning(`session ${name} is not snapshotted: its pod runs no bayma under gVisor`);
         yield* counted("kept");
         return "keep" as const;
       }
-      const taken = yield* agents.checkpoint(node, { ...ref(name), release, containerId, hook, podTemplate: { ...sandbox.spec.podTemplate } }).pipe(Effect.result);
+      const taken = yield* agents.checkpoint(node, { ...ref(name), namespace: profile.namespace, pod: name, containerId, hook, podTemplate: { ...sandbox.spec.podTemplate } }).pipe(Effect.result);
       if (taken._tag === "Success") {
         const { snapshot, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted session ${name} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
