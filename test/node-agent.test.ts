@@ -543,6 +543,11 @@ test("the node's cache keeps within its budget, evicting the least recently used
       utimesSync(cache.path("main", "fs-new", S1), (now - 10 * 60_000) / 1000, (now - 10 * 60_000) / 1000);
       assert.deepEqual(names(yield* tighter.evict), ["fs-new"]);
       assert.deepEqual(names(yield* tighter.list), ["fs-old"]);
+      // Discarded, but what was used within its grace, which a restore may be reading.
+      assert.deepEqual(names(yield* tighter.discard("main", "fs-old", null)), []);
+      utimesSync(cache.path("main", "fs-old", S1), (now - 10 * 60_000) / 1000, (now - 10 * 60_000) / 1000);
+      assert.deepEqual(names(yield* tighter.discard("main", "fs-old", S1)), []);
+      assert.deepEqual(names(yield* tighter.discard("main", "fs-old", null)), ["fs-old"]);
       // What a stopped agent left half written goes as the next starts.
       yield* tighter.clean;
       assert.equal(existsSync(join(root, "main", "fs-new", `.${S2}`)), false);
@@ -766,6 +771,16 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
       error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: fork }));
       s3.refuse = () => null;
+
+      // The workspaces the bucket holds anything of; a node's cache discards what it is told, but its own snapshot kept.
+      assert.deepEqual(yield* call("GET", "/snapshots/main"), { status: 200, body: { workspaces: ["fs-abc", "fs-fork"] } });
+      error(400, /./u)(yield* call("GET", "/snapshots/Main"));
+      error(400, /./u)(yield* call("DELETE", `/cache/main/fs-abc?keep=..%2F..%2Fx`));
+      assert.deepEqual(yield* call("DELETE", `/cache/main/fs-abc?keep=${manifest.snapshot}`), { status: 200, body: { discarded: [] } });
+      assert.deepEqual(cachedOf(here, "fs-abc"), [manifest.snapshot]);
+      assert.deepEqual(yield* call("DELETE", "/cache/main/fs-abc?keep="), { status: 200, body: { discarded: [manifest.snapshot] } });
+      assert.deepEqual(cachedOf(here, "fs-abc"), []);
+      error(400, /workspace/u)(yield* call("DELETE", "/cache/main/fs_abc?keep="));
 
       assert.deepEqual(yield* call("DELETE", "/snapshots/main/fs-abc"), { status: 204, body: null });
       assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);

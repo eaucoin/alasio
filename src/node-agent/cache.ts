@@ -56,6 +56,8 @@ export interface SnapshotCache {
   readonly use: (environment: string, workspace: string, snapshot: string) => Effect.Effect<void, CacheError>;
   /** Removes everything of the workspace but `keep`, staged or whole; all of it for null. */
   readonly clear: (environment: string, workspace: string, keep: string | null) => Effect.Effect<void, CacheError>;
+  /** Removes the whole snapshots of the workspace but `keep` that were not used within the grace, which a restore may still be reading: those removed. */
+  readonly discard: (environment: string, workspace: string, keep: string | null) => Effect.Effect<readonly CachedSnapshot[], CacheError>;
   /** The whole snapshots the cache holds. */
   readonly list: Effect.Effect<readonly CachedSnapshot[], CacheError>;
   /** Evicts snapshots, least recently used first, until the cache is within its budget: those evicted. */
@@ -165,6 +167,16 @@ export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): Snap
       }),
 
     list,
+
+    discard: (environment, workspace, keep) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        const unused = (yield* list).filter((cached) =>
+          cached.environment === environment && cached.workspace === workspace && cached.snapshot !== keep && now - cached.usedAt >= graceMs
+        );
+        for (const cached of unused) yield* attempt(() => rm(path(cached.environment, cached.workspace, cached.snapshot), { recursive: true, force: true }));
+        return unused;
+      }),
 
     evict: Effect.gen(function*() {
       const now = yield* Clock.currentTimeMillis;

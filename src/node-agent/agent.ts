@@ -232,6 +232,10 @@ export interface NodeAgent {
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError>;
   /** Forgets the workspace's snapshot, in the bucket and in the cache. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error | CacheError>;
+  /** The workspaces of `environment` the bucket holds anything of. */
+  readonly workspaces: (environment: string) => Effect.Effect<readonly string[], S3Error>;
+  /** Removes from this node's cache the workspace's snapshots but `keep` that no restore may still be reading: their ids. */
+  readonly discard: (workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], CacheError>;
   /** Resumes the workspace's sandbox, restored paused, once its pod's network policies are in force on this node, as the module says. */
   readonly resume: (request: ResumeRequest) => Effect.Effect<void, ResumeError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
@@ -674,6 +678,19 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       ),
     resume: (request) => resume(request).pipe(withLogScope("node-agent")),
     holdings,
+    workspaces: (environment) =>
+      bucket.list(`${environment}/`).pipe(
+        // What else the bucket holds under it is no workspace's of the agent's.
+        Effect.map((keys) => [...new Set(keys.map((key) => key.slice(environment.length + 1).split("/")[0] ?? ""))].filter((name) => NAME.test(name)).sort()),
+      ),
+    discard: (ref, keep) =>
+      exclusive([ref], cache.discard(ref.environment, ref.workspace, keep)).pipe(
+        Effect.tap((discarded) =>
+          Effect.forEach(discarded, ({ snapshot, bytes }) => Effect.logInfo(`discarded the snapshot ${snapshot} of ${prefixOf(ref)} (${bytes} bytes) from the node's cache`), { discard: true })
+        ),
+        Effect.map((discarded) => discarded.map(({ snapshot }) => snapshot)),
+        withLogScope("node-agent"),
+      ),
   };
 });
 

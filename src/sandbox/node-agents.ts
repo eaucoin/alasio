@@ -45,6 +45,10 @@ export type Prepared = typeof Prepared.Type;
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
+/** What an agent answers a listing of an environment's snapshots, and a discard, with. */
+const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
+const Discarded = Schema.Struct({ discarded: Schema.Array(Schema.String) });
+
 /** The node agents; see makeNodeAgents. */
 export interface NodeAgents {
   /** The nodes with a ready agent on them. */
@@ -67,6 +71,10 @@ export interface NodeAgents {
   readonly resume: (node: string, request: ResumeRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** What `node` holds. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
+  /** The workspaces of `environment` the bucket holds anything of. */
+  readonly workspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** Has `node`'s cache discard the workspace's snapshots but `keep` that no restore there may be reading: their ids. */
+  readonly discard: (node: string, workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
 }
 
 /** How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store, both ways, or within it. */
@@ -176,5 +184,17 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     resume: (node, request) =>
       send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: RESUME_CALL }).pipe(Effect.asVoid),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
+    workspaces: (environment) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(node, `list ${environment}'s snapshots`, { method: "GET", path: `/snapshots/${encodeURIComponent(environment)}`, timeout: SHORT_CALL }, Listed)).pipe(
+          Effect.map(({ workspaces }) => workspaces),
+        ),
+    discard: (node, workspace, keep) =>
+      ask(
+        node,
+        `discard ${workspace.environment}/${workspace.workspace}'s cached snapshots`,
+        { method: "DELETE", path: `/cache/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}?keep=${encodeURIComponent(keep ?? "")}`, timeout: SHORT_CALL },
+        Discarded,
+      ).pipe(Effect.map(({ discarded }) => discarded)),
   };
 });

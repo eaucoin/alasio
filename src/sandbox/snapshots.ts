@@ -56,7 +56,7 @@ import {
 import type { Manifest } from "../node-agent/agent.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import type { NodeAgents } from "./node-agents.ts";
+import type { NodeAgentError, NodeAgents } from "./node-agents.ts";
 
 /** How sessions are snapshotted, as the profile says. */
 export type SnapshotsProfile = NonNullable<SessionsProfile["snapshots"]>;
@@ -65,6 +65,8 @@ export type SnapshotsProfile = NonNullable<SessionsProfile["snapshots"]>;
 const POD_RUNNING_TIMEOUT = "3 minutes";
 /** How often running sessions are looked at for one to release. */
 const RELEASE_POLL: Duration.Input = "15 seconds";
+/** How often what no Sandbox has a use for is collected: snapshots of sessions that are gone, and images nodes cache that no restore will read. */
+const COLLECT_POLL: Duration.Input = "10 minutes";
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
 /** How long alasio waits, as it starts, for a node agent to tell the CPU baseline by. */
@@ -165,6 +167,8 @@ export interface SessionSnapshots {
   readonly watch: (sandboxes: Sandboxes, lastTurn: (name: string) => number | null) => Effect.Effect<void, never, Scope.Scope>;
   /** Releases the running session now, idle or not, as a fork of it does: whether it was suspended. */
   readonly release: (sandboxes: Sandboxes, name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
+  /** Forgets the session's snapshot, as it is deleted, in the bucket and in every node's cache; one that cannot be is said so, and collected later. */
+  readonly forget: (name: string) => Effect.Effect<void>;
   /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one: its id; null for none, one that cannot be copied said so. */
   readonly copy: (from: string, to: string) => Effect.Effect<string | null>;
 }
@@ -411,7 +415,39 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         }
       }).pipe(Effect.catch((error) => Effect.logWarning(`could not look at sessions to release: ${error.message}`)));
       yield* look.pipe(Effect.repeat(Schedule.spaced(RELEASE_POLL)), Effect.forkScoped);
+      yield* collect.pipe(Effect.repeat(Schedule.spaced(COLLECT_POLL)), Effect.forkScoped);
     }).pipe(withLogScope("snapshots"));
+
+  /** Forgets the session's snapshot in the bucket and in every node's cache that holds it. */
+  const forgetEverywhere = (name: string): Effect.Effect<void, NodeAgentError | KubeApiError> =>
+    Effect.gen(function*() {
+      yield* agents.forget(ref(name));
+      for (const node of yield* agents.nodes) yield* agents.discard(node, ref(name), null);
+    });
+
+  /**
+   * Collects what no Sandbox has a use for, whose images hold what the sessions held,
+   * secrets among it: the snapshots in the bucket of sessions that are gone, which a
+   * deletion that could not forget them left, and the images a node caches but the one its
+   * Sandbox is released into (one restored, or stale), but those a restore may be reading.
+   */
+  const collect: Effect.Effect<void> = Effect.gen(function*() {
+    const listed = (yield* kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, "alasio.dev/workload=session")) as readonly StoredSandbox[];
+    const bound = new Map(listed.map((sandbox) => [sandbox.metadata.name, sandbox.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? null]));
+    for (const workspace of yield* agents.workspaces(environment)) {
+      if (!bound.has(workspace)) {
+        yield* agents.forget(ref(workspace));
+        yield* Effect.logInfo(`forgot the snapshot of session ${workspace}, which is gone`);
+      }
+    }
+    for (const node of yield* agents.nodes) {
+      const cached = (yield* agents.holdings(node)).cached.filter((held) => held.environment === environment);
+      for (const workspace of new Set(cached.map((held) => held.workspace))) {
+        const keep = bound.get(workspace) ?? null;
+        if (cached.some((held) => held.workspace === workspace && held.snapshot !== keep)) yield* agents.discard(node, ref(workspace), keep);
+      }
+    }
+  }).pipe(Effect.catch((error) => Effect.logWarning(`could not collect sessions' snapshots: ${error.message}`)));
 
   return {
     // Never one running a restore's template, which only a restore alasio stopped in the middle of leaves.
@@ -422,6 +458,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     },
     restore,
     watch,
+    forget: (name) =>
+      forgetEverywhere(name).pipe(
+        Effect.catch((error) => Effect.logWarning(`could not forget the snapshot of session ${name}, which is collected later: ${error.message}`)),
+        withLogScope("snapshots"),
+      ),
     release: (sandboxes, name) => sandboxes.release(name, save).pipe(withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }), withLogScope("snapshots")),
     copy: (from, to) =>
       agents.copy(ref(from), ref(to)).pipe(

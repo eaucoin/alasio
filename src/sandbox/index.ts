@@ -690,6 +690,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       Effect.onError(() =>
         kube.remove(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId).pipe(
           Effect.catch((error) => Effect.logWarning(`could not delete the failed fork ${namespace}/${volumeId}: ${error.message}`)),
+          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.forget(volumeId) : Effect.void),
         )
       ),
     );
@@ -706,7 +707,11 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
           withLogScope("sandbox"),
         ),
       fork: (sourceVolumeId, volumeId, namespace = profile.namespace) => forking.withPermit(fork(sourceVolumeId, volumeId, namespace)).pipe(withLogScope("sandbox")),
-      destroy: (volumeId) => Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))),
+      // Its snapshot goes with it: an image of what it held.
+      destroy: (volumeId) =>
+        Effect.suspend(() => sandboxes.remove(assertValidVolumeId(volumeId))).pipe(
+          Effect.andThen(snapshots ? snapshots.forget(volumeId) : Effect.void),
+        ),
       forks: kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, `${WORKLOAD_LABEL}=session`).pipe(
         Effect.map((listed) => listed.filter(({ metadata }) => metadata?.annotations?.[FORKED_FROM_ANNOTATION] !== undefined).map(({ metadata }) => metadata?.name ?? "")),
       ),

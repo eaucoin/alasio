@@ -75,7 +75,9 @@ const manifestOf = (podTemplate: V1PodTemplateSpec, release = CURRENT, cpuFeatur
 });
 
 /** Node agents in memory: the current snapshot, each node's holdings, and how a prepare goes on each; what they were asked. */
-function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null }: {
+function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null, held = [] }: {
+  /** The workspaces the bucket holds anything of. */
+  readonly held?: readonly string[];
   readonly current?: Manifest | null;
   readonly holdings?: readonly Holdings[];
   readonly prepare?: (node: string) => string | null;
@@ -108,7 +110,13 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
         asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}`);
         return resumed === null ? Effect.void : Effect.fail(new NodeAgentError({ node, call: "resume alasio-sessions/fs-abc123", status: 504, reason: resumed }));
       }),
-    holdings: (node) => Effect.succeed(holdings.find((held) => held.node === node) as Holdings),
+    holdings: (node) => Effect.succeed(holdings.find((holding) => holding.node === node) as Holdings),
+    workspaces: () => Effect.succeed(held),
+    discard: (node, workspace, keep) =>
+      Effect.sync(() => {
+        asked.push(`discard ${workspace.environment}/${workspace.workspace} on ${node} but ${keep}`);
+        return [];
+      }),
   };
   return { agents, asked, checkpoints };
 }
@@ -354,6 +362,38 @@ test("a session is restored only from the snapshot its Sandbox was released into
   assert.equal(snapshotted.keeps(older), true);
   older.spec.podTemplate.metadata = { ...older.spec.podTemplate.metadata, annotations: { ...older.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.host-image-path": "/var/lib/alasio/snapshots/x" } };
   assert.equal(snapshotted.keeps(older), false);
+});
+
+test("what no Sandbox has a use for is collected: snapshots of sessions that are gone, and images nodes cache but the one each Sandbox is released into", async () => {
+  const kept = stored(sessionOf(profile(), "fs-kept"), "Suspended", "s-2");
+  const restored = stored(sessionOf(profile(), "fs-restored"), "Running");
+  const kube = fakeKube(new Map<string, KubernetesObject>([["Sandbox/alasio-sessions/fs-kept", kept], ["Sandbox/alasio-sessions/fs-restored", restored]]));
+  const cachedOn = (name: string, entries: readonly (readonly [string, string])[]): Holdings => ({
+    ...node(name, [CURRENT]),
+    cached: entries.map(([workspace, snapshot]) => ({ environment: "alasio-sessions", workspace, snapshot, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" })),
+  });
+  const { agents, asked } = fakeAgents({
+    held: ["fs-gone", "fs-kept", "fs-restored"],
+    holdings: [cachedOn("node-a", [["fs-kept", "s-2"], ["fs-restored", "s-1"]]), cachedOn("node-b", [["fs-kept", "s-1"], ["fs-gone", "s-9"]])],
+  });
+  await run(kube, Effect.scoped(Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+    yield* snapshotted.watch({ token: () => Effect.succeed(null) } as unknown as Sandboxes, () => null);
+    yield* Effect.sleep("50 millis");
+  })));
+  assert.deepEqual(asked, [
+    "forget alasio-sessions/fs-gone",
+    "discard alasio-sessions/fs-restored on node-a but null",
+    "discard alasio-sessions/fs-kept on node-b but s-2",
+    "discard alasio-sessions/fs-gone on node-b but null",
+  ]);
+  // A session deleted takes its snapshot with it, from the bucket and every node's cache.
+  const deleted = fakeAgents({ holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])] });
+  await run(fakeKube(), Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents: deleted.agents, templates: templates(profile()) });
+    yield* snapshotted.forget("fs-abc123");
+  }));
+  assert.deepEqual(deleted.asked, ["forget alasio-sessions/fs-abc123", "discard alasio-sessions/fs-abc123 on node-a but null", "discard alasio-sessions/fs-abc123 on node-b but null"]);
 });
 
 test("where one release is kept, a snapshot is restored under it alone, and one taken under the release before falls back", async () => {

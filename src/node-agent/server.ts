@@ -44,6 +44,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
+import { SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import { CheckpointRequest, CopyRequest, makeNodeAgent, type NodeAgent, ResumeRequest, WorkspaceRef } from "./agent.ts";
@@ -79,6 +80,8 @@ const STATUS: Readonly<Record<string, number>> = {
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
+const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
+const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -125,6 +128,23 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "DELETE" && snapshot) return workspaceOf(snapshot).pipe(Effect.flatMap(agent.forget), Effect.as(HttpServerResponse.empty({ status: 204 })));
     if (method === "GET" && url === "/holdings") return agent.holdings.pipe(Effect.map((holdings) => answer(200, holdings)));
+    const environment = ENVIRONMENT.exec(url);
+    if (method === "GET" && environment) {
+      return Schema.decodeUnknownEffect(WorkspaceRef.fields.environment)(decodeURIComponent(environment[1] ?? "")).pipe(
+        Effect.mapError((error) => new BadRequest({ message: error.message })),
+        Effect.flatMap(agent.workspaces),
+        Effect.map((workspaces) => answer(200, { workspaces })),
+      );
+    }
+    const cached = CACHED.exec(url);
+    if (method === "DELETE" && cached) {
+      const keep = decodeURIComponent(cached[3] ?? "");
+      if (keep !== "" && !new RegExp(`^${SNAPSHOT_ID}$`, "u").test(keep)) return Effect.fail(new BadRequest({ message: `${keep} is no snapshot's id` }));
+      return workspaceOf(cached).pipe(
+        Effect.flatMap((ref) => agent.discard(ref, keep === "" ? null : keep)),
+        Effect.map((discarded) => answer(200, { discarded })),
+      );
+    }
     return Effect.succeed(answer(404, { error: `there is no ${method} ${url}` }));
   };
 
