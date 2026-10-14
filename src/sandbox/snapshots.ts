@@ -44,6 +44,8 @@ import {
   type Sandbox,
   type SandboxRestore,
   SandboxRestoreRefused,
+  type Saved,
+  SNAPSHOT_ANNOTATION,
   type SandboxGone,
   type SandboxNotReady,
   type SandboxPodEnded,
@@ -80,7 +82,7 @@ const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration",
 });
 
 /** Why a session with a snapshot was resumed without it. */
-export type Fallback = "release" | "template" | "node" | "prepare" | "restore" | "unreadable";
+export type Fallback = "release" | "template" | "stale" | "node" | "prepare" | "restore" | "unreadable";
 
 /** The profile's templates a snapshot restores into, by their hashes: the current one, and the one before it, if any. */
 export interface KeptTemplates {
@@ -163,8 +165,8 @@ export interface SessionSnapshots {
   readonly watch: (sandboxes: Sandboxes, lastTurn: (name: string) => number | null) => Effect.Effect<void, never, Scope.Scope>;
   /** Releases the running session now, idle or not, as a fork of it does: whether it was suspended. */
   readonly release: (sandboxes: Sandboxes, name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
-  /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one; one that cannot is said so, and has none. */
-  readonly copy: (from: string, to: string) => Effect.Effect<void>;
+  /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one: its id; null for none, one that cannot be copied said so. */
+  readonly copy: (from: string, to: string) => Effect.Effect<string | null>;
 }
 
 /** A session's snapshots, as the module says, on the KubeClient. */
@@ -255,6 +257,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       if (read._tag === "Failure") return yield* fallBack(name, "unreadable", read.failure.message);
       const manifest = read.success;
       if (!manifest) return null;
+      // Only the snapshot its Sandbox was released into: one it has moved on from since,
+      // as a restore alasio stopped in the middle of, is stale.
+      const bound = sandbox.metadata.annotations?.[SNAPSHOT_ANNOTATION];
+      if (bound !== manifest.snapshot) {
+        return yield* fallBack(name, "stale", `its snapshot ${manifest.snapshot} is not the one its Sandbox was released into (${bound ?? "none"})`);
+      }
       const kept = snapshots.releases.find(({ release }) => release === manifest.release);
       if (!kept) return yield* fallBack(name, "release", `gVisor ${manifest.release}, which took it, is no longer kept`);
       const recorded = manifest.podTemplate as V1PodTemplateSpec;
@@ -318,7 +326,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
    * Saves the session's sandbox by its node's agent: suspended once it is saved, or once
    * a save that failed has ended it anyway; left running otherwise, said why.
    */
-  const save = (sandbox: StoredSandbox): Effect.Effect<"suspend" | "keep", KubeApiError> => {
+  const save = (sandbox: StoredSandbox): Effect.Effect<Saved, KubeApiError> => {
     const name = sandbox.metadata.name;
     const counted = (outcome: string) => Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": outcome }));
     return Effect.gen(function*() {
@@ -339,14 +347,14 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         const { snapshot, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted session ${name} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
         yield* counted("snapshotted");
-        return "suspend" as const;
+        return { snapshot };
       }
       yield* counted("failed");
       // A core Pod, as the API server returns one.
       const after = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
       const ended = after?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated !== undefined;
       yield* Effect.logWarning(`could not snapshot session ${name}: ${taken.failure.message}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`);
-      return ended ? ("suspend" as const) : ("keep" as const);
+      return ended ? { snapshot: null } : ("keep" as const);
     });
   };
 
@@ -382,10 +390,18 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           const turned = lastTurn(name);
           if (turned !== null && now - turned < releaseAfterMs) continue;
           if (!(yield* idle(sandboxes, sandbox, now))) continue;
+          // Looked at again once nothing else may bring it up: a turn may have begun meanwhile.
+          const stillIdle = (held: StoredSandbox): Effect.Effect<Saved, KubeApiError> =>
+            Effect.gen(function*() {
+              const at = yield* Clock.currentTimeMillis;
+              const since = lastTurn(name);
+              if ((since !== null && at - since < releaseAfterMs) || !(yield* idle(sandboxes, held, at))) return "keep" as const;
+              return yield* save(held);
+            });
           yield* FiberMap.run(
             releasing,
             name,
-            sandboxes.release(name, save).pipe(
+            sandboxes.release(name, stillIdle).pipe(
               Effect.tap((released) => (released ? Effect.logInfo(`released session ${name}`) : Effect.void)),
               Effect.catch((error) => Effect.logWarning(`could not release session ${name}: ${error.message}`)),
               withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }),
@@ -398,9 +414,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     }).pipe(withLogScope("snapshots"));
 
   return {
+    // Never one running a restore's template, which only a restore alasio stopped in the middle of leaves.
     keeps: (sandbox) => {
       const template = sessionTemplateOf(sandbox.spec.podTemplate);
-      return template !== undefined && template !== templates.current && template === templates.previous;
+      const restoring = sandbox.spec.podTemplate.metadata?.annotations?.[RESTORE_ANNOTATION] !== undefined;
+      return !restoring && template !== undefined && template !== templates.current && template === templates.previous;
     },
     restore,
     watch,
@@ -408,12 +426,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     copy: (from, to) =>
       agents.copy(ref(from), ref(to)).pipe(
         Effect.tap(({ snapshot }) => Effect.logInfo(`gave the fork ${to} of session ${from} its snapshot ${snapshot}`)),
+        Effect.map(({ snapshot }): string | null => snapshot),
         Effect.catch((error) =>
           error._tag === "NodeAgentError" && error.status === 404
-            ? Effect.void
-            : Effect.logWarning(`the fork ${to} of session ${from} carries no snapshot: ${error.message}`)
+            ? Effect.succeed(null)
+            : Effect.logWarning(`the fork ${to} of session ${from} carries no snapshot: ${error.message}`).pipe(Effect.as(null))
         ),
-        Effect.asVoid,
         withLogScope("snapshots"),
       ),
   };

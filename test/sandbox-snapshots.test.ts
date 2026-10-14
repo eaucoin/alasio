@@ -10,7 +10,7 @@ import { TestClock } from "effect/testing";
 import { added } from "./support/metrics.ts";
 import { KubeApiError, KubeClient } from "../src/kube/client.ts";
 import type { SessionsProfile } from "../src/kube/config.ts";
-import type { Sandbox, Sandboxes, StoredSandbox } from "../src/kube/sandboxes.ts";
+import { type Sandbox, type Sandboxes, type Saved, SNAPSHOT_ANNOTATION, type StoredSandbox } from "../src/kube/sandboxes.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
@@ -47,10 +47,14 @@ const profile = (image = "agent@sha256:1"): SessionsProfile => ({
 /** The Sandbox of session `name` alasio makes from `of`. */
 const sessionOf = (of: SessionsProfile, name = "fs-abc123"): Sandbox => sessionSandboxManifest({ volumeId: name, netMode: "none", profile: of, telemetry: null });
 
-/** `sandbox` as the API server holds it, suspended. */
-const stored = (sandbox: Sandbox, operatingMode: "Running" | "Suspended" = "Suspended"): StoredSandbox => ({
+/** `sandbox` as the API server holds it, suspended, released into the snapshot `s-1` (or `bound`), or running. */
+const stored = (sandbox: Sandbox, operatingMode: "Running" | "Suspended" = "Suspended", bound: string | null = "s-1"): StoredSandbox => ({
   ...sandbox,
-  metadata: { ...sandbox.metadata, uid: "uid-1" },
+  metadata: {
+    ...sandbox.metadata,
+    uid: "uid-1",
+    ...(operatingMode === "Suspended" && bound !== null ? { annotations: { ...sandbox.metadata.annotations, [SNAPSHOT_ANNOTATION]: bound } } : {}),
+  },
   spec: { ...sandbox.spec, operatingMode },
 });
 
@@ -326,6 +330,32 @@ test("a session without a snapshot is resumed as it is, and one whose snapshot c
   );
 });
 
+test("a session is restored only from the snapshot its Sandbox was released into: one it moved on from is stale, and forgotten", async () => {
+  const desired = sessionOf(profile());
+  const restore = (bound: string | null) => {
+    const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])] });
+    return run(fakeKube(), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      return { plan: yield* snapshotted.restore(stored(desired, "Suspended", bound), desired), asked };
+    }));
+  };
+  assert.ok((await restore("s-1")).plan);
+  for (const bound of [null, "s-0"]) {
+    const fallbacks = await added("alasio.sandbox.restores", async () => {
+      const { plan, asked } = await restore(bound);
+      assert.equal(plan, null);
+      assert.deepEqual(asked, ["forget alasio-sessions/fs-abc123"]);
+    });
+    assert.deepEqual(fallbacks, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 });
+  }
+  // A Sandbox left on a restore's template, by a restore alasio stopped in the middle of, is never kept on it.
+  const snapshotted = await run(fakeKube(), makeSessionSnapshots({ profile: profile(), snapshots, agents: fakeAgents().agents, templates: templates(profile(), profile("agent@sha256:0")) }));
+  const older = stored(sessionOf(profile("agent@sha256:0")), "Running");
+  assert.equal(snapshotted.keeps(older), true);
+  older.spec.podTemplate.metadata = { ...older.spec.podTemplate.metadata, annotations: { ...older.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.host-image-path": "/var/lib/alasio/snapshots/x" } };
+  assert.equal(snapshotted.keeps(older), false);
+});
+
 test("where one release is kept, a snapshot is restored under it alone, and one taken under the release before falls back", async () => {
   const desired = sessionOf(profile());
   const one = { ...snapshots, releases: [{ release: CURRENT, runtimeClassName: "gvisor-20260921-0-eaucoin-4" }] };
@@ -355,29 +385,47 @@ test("an idle session is released, its sandbox snapshotted by its node's agent, 
   const kube = fakeKube(new Map<string, KubernetesObject>([["Sandbox/alasio-sessions/fs-abc123", sandbox], ["Pod/alasio-sessions/fs-abc123", pod]]));
   const { agents, checkpoints } = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
   const saved: string[] = [];
+  // What happens once the release holds the session, before it saves it: a turn beginning, as one may.
+  let meanwhile = () => {};
   const sandboxes = {
     token: () => Effect.succeed("fs-abc123.token"),
-    release: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<"suspend" | "keep", unknown>) =>
-      Effect.map(save(sandbox), (outcome) => {
-        saved.push(`${name}: ${outcome}`);
-        return outcome === "suspend";
-      }),
+    release: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<Saved, unknown>) =>
+      Effect.sync(() => meanwhile()).pipe(
+        Effect.andThen(save(sandbox)),
+        Effect.map((outcome) => {
+          saved.push(`${name}: ${JSON.stringify(outcome)}`);
+          return outcome !== "keep";
+        }),
+      ),
   } as unknown as Sandboxes;
-  const look = (lastTurn: number | null, status: unknown) =>
-    run(kube, Effect.scoped(Effect.gen(function*() {
+  const look = (lastTurn: number | null, status: unknown) => {
+    let turned = lastTurn;
+    return run(kube, Effect.scoped(Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
-      yield* snapshotted.watch(sandboxes, () => lastTurn);
+      meanwhile = () => {
+        if (beginsMeanwhile) turned = Infinity;
+      };
+      yield* snapshotted.watch(sandboxes, () => turned);
       yield* Effect.sleep("50 millis");
     })), () => status);
+  };
+  let beginsMeanwhile = false;
   // Busy, or turned on lately: not released.
   await look(null, { execsRunning: 1, execsQueued: 0, idleSinceMs: null });
   await look(Infinity, { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 });
   await look(Date.now(), { execsRunning: 0, execsQueued: 0, idleSinceMs: 0 });
   await look(null, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() });
   assert.deepEqual(saved, []);
+  // A turn that begins once the release was decided on, before it holds the session, keeps it running.
+  beginsMeanwhile = true;
+  await look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 });
+  assert.deepEqual(saved, ['fs-abc123: "keep"']);
+  assert.deepEqual(checkpoints, []);
+  saved.length = 0;
+  beginsMeanwhile = false;
   // Idle for five minutes, with no turn since.
   const released = await added("alasio.sandbox.releases", () => look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 }));
-  assert.deepEqual(saved, ["fs-abc123: suspend"]);
+  assert.deepEqual(saved, ['fs-abc123: {"snapshot":"s-1"}']);
   assert.deepEqual(released, { "alasio.sandbox.release.outcome=snapshotted": 1 });
   assert.deepEqual(checkpoints, [["node-a", {
     environment: "alasio-sessions",

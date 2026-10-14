@@ -303,8 +303,9 @@ groups:
               conditions: [{evaluator: {type: gt, params: [0]}}]
 
       # Of the sessions restored from their snapshots in the last hour, or meant to be, the
-      # share that fell back to bayma's checkpoints for a failure: no node to restore on, its
-      # image not prepared, its restore failing, or its snapshot unreadable. One whose
+      # share that fell back to bayma's checkpoints for a failure: its snapshot stale (a
+      # restore cut short), no node to restore on, its image not prepared, its restore
+      # failing, or its snapshot unreadable. One whose
       # template or gVisor release is no longer kept falls back as designed, after an
       # upgrade, and counts neither way. A session is restored at most once each time it
       # comes back from idle, so restores are few, and the window an hour: one failure among
@@ -337,7 +338,7 @@ groups:
                 body_type: raw
                 body_content_type: text/plain
                 data: |
-                  select coalesce(sum(added) filter (where fallback in ('node', 'prepare', 'restore', 'unreadable')), 0) / sum(added) as failed
+                  select coalesce(sum(added) filter (where fallback in ('stale', 'node', 'prepare', 'restore', 'unreadable')), 0) / sum(added) as failed
                   from (
                     select TimeUnix, Attributes['alasio.sandbox.restore.fallback'] as fallback,
                       Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added

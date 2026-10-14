@@ -63,6 +63,7 @@ import {
   type SandboxFault,
   type SandboxOperatingMode,
   sandboxManifest,
+  SNAPSHOT_ANNOTATION,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
 import { sameToken } from "../shared/tokens.ts";
@@ -677,8 +678,13 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
         netMode,
         source.spec.operatingMode !== "Suspended",
         runClone(clone.job, claimOf(profile.namespace, sourceVolumeId), destination).pipe(
-          // Its files and its snapshot from the same moment, which it restores from as its source does.
-          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.copy(sourceVolumeId, volumeId) : Effect.void),
+          // Its files and its snapshot from the same moment, which it restores from as its source does, bound to it.
+          Effect.andThen(snapshots && namespace === profile.namespace ? snapshots.copy(sourceVolumeId, volumeId) : Effect.succeed(null)),
+          Effect.tap((snapshot) =>
+            snapshot === null
+              ? Effect.void
+              : kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId, { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: snapshot } } })
+          ),
         ),
       )),
       Effect.onError(() =>
