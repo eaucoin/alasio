@@ -1407,8 +1407,11 @@ export function neonStack(): void {
     describe("Neon's proxy", () => {
       const COMPUTE_DEPLOYMENT = ref("Deployment", neonName("compute"), NAMESPACE);
       const CONTROL = ref("Deployment", neonName("control"), NAMESPACE);
-      /** Main's clients, which hold sessions on its compute, its lake's loader always. */
-      const CLIENTS = [RELEASE, componentName("lake"), componentName("grafana")].map((name) => ref("Deployment", name, NAMESPACE));
+      /** Main's clients, which hold sessions on its compute, its lake's loader and intake always. */
+      const CLIENTS = [RELEASE, componentName("lake"), componentName("lake-intake"), componentName("grafana")].map((name) => ref("Deployment", name, NAMESPACE));
+      /** What scales the intake by what it has yet to read of the log, which would start it again while it is stopped: held at none meanwhile. */
+      const INTAKE_SCALER = ref("ScaledObject", componentName("lake-intake"), NAMESPACE);
+      const PAUSED_REPLICAS = "autoscaling.keda.sh/paused-replicas";
 
       /** The Deployment scaled to none, and its pods gone, a terminating one too. */
       async function stopped(workload: ObjectRef) {
@@ -1471,6 +1474,7 @@ export function neonStack(): void {
 
       after(async () => {
         if (installedSuspend !== undefined) await kube.patch(COMPUTE_DEPLOYMENT, { metadata: { annotations: { [SUSPEND_AFTER]: installedSuspend } } });
+        await kube.patch(INTAKE_SCALER, { metadata: { annotations: { [PAUSED_REPLICAS]: null } } });
         for (const workload of [CONTROL, ...CLIENTS]) await kube.patch(workload, { spec: { replicas: 1 } });
         await up();
         await kube.awaitReady(CLIENTS, "5 minutes");
@@ -1491,6 +1495,7 @@ export function neonStack(): void {
 
       test("wakes a compute that sleeps on the first connection to it, within alasio's patience, warm and with the pageserver just restarted", async () => {
         // Main's clients stopped, which would wake it again at once, a terminating one's last reconnection too.
+        await kube.patch(INTAKE_SCALER, { metadata: { annotations: { [PAUSED_REPLICAS]: "0" } } });
         for (const workload of CLIENTS) await stopped(workload);
         const warm: number[] = [];
         for (let wake = 0; wake < 3; wake++) {

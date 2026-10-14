@@ -1,10 +1,10 @@
 /**
- * OTLP export requests, as the telemetry intake receives them over HTTP (./intake.ts):
- * binary protobuf, decoded by protobufjs from the messages below, or JSON, parsed. Both
- * come out as one shape, OTLP's JSON one, but for what JSON spells as text and protobuf
- * does not: an id is hex in JSON and bytes in protobuf, a 64-bit integer a string (or a
- * number) in JSON and a string here, and bytes base64 in JSON and bytes in protobuf.
- * Whoever reads a request reads those through `hexId`, `integer` and `base64`.
+ * OTLP export requests, as the telemetry intake consumes them from the log (./intake.ts),
+ * a record each: binary protobuf, decoded by protobufjs from the messages below into
+ * OTLP's JSON shape, but for what JSON spells as text and protobuf does not: an id is
+ * bytes, where JSON has hex, a 64-bit integer a string, and bytes bytes, where JSON has
+ * base64. Whoever reads a request reads those through `hexId`, `integer` and `base64`,
+ * which take either spelling.
  *
  * The messages are opentelemetry-proto's for the three signals' export requests, as of
  * its 1.5, which gave a log record its event name: enums as the integers they are on
@@ -13,13 +13,8 @@
  */
 import protobuf from "protobufjs";
 
-/** A signal the intake takes. */
+/** A signal of the telemetry's. */
 export type Signal = "traces" | "metrics" | "logs";
-
-export const SIGNALS: readonly Signal[] = ["traces", "metrics", "logs"];
-
-/** How a request is encoded. */
-export type Encoding = "protobuf" | "json";
 
 /** Thrown for a request that does not decode as its signal's. */
 export class MalformedRequest extends Error {
@@ -337,24 +332,142 @@ const REQUESTS: Readonly<Record<Signal, protobuf.Type>> = {
   logs: root.lookupType("ExportLogsServiceRequest"),
 };
 
+/** `request`, an export request for `signal`, in binary protobuf, as the collector writes each to the log. */
+export function encodeRequest<S extends Signal>(signal: S, request: Requests[S]): Uint8Array {
+  const type = REQUESTS[signal];
+  return type.encode(type.fromObject(request)).finish();
+}
+
 /**
- * `body`, an export request for `signal` in `encoding`, decoded. Throws
- * MalformedRequest for one that does not decode.
+ * The fields of each level of a signal's request, down to its items: a request's resources,
+ * a resource's scopes, a scope's spans, log records or metrics, and of a metric, its kind's
+ * message (whichever of the oneof it has) and that message's points. A part is a request
+ * of one item's way down, with as many of its items as PART_ITEMS.
  */
-export function decodeRequest<S extends Signal>(signal: S, encoding: Encoding, body: Uint8Array): Requests[S] {
-  try {
-    if (encoding === "json") {
-      const request: unknown = JSON.parse(Buffer.from(body).toString("utf8"));
-      if (typeof request !== "object" || request === null || Array.isArray(request)) throw new MalformedRequest("the request is not an object");
-      // OTLP's JSON is the shape Requests describes; what a field holds is checked as it is read.
-      return request as Requests[S];
+const LEVELS: Readonly<Record<Signal, readonly (readonly string[])[]>> = {
+  traces: [["resourceSpans"], ["scopeSpans"], ["spans"]],
+  logs: [["resourceLogs"], ["scopeLogs"], ["logRecords"]],
+  metrics: [["resourceMetrics"], ["scopeMetrics"], ["metrics"], ["gauge", "sum", "histogram", "exponentialHistogram", "summary"], ["dataPoints"]],
+};
+
+/**
+ * The most items a part has: a request's rows come a few thousand at a time at most,
+ * however large the request, as a record of the log's may be as large as the log takes.
+ */
+export const PART_ITEMS = 1024;
+
+/**
+ * The most rows a request makes, and the most bytes its rows come to, each with what it
+ * repeats of the levels above it (its resource's attributes, its scope's, its metric's
+ * name): past either, a request is refused (MalformedRequest), as one record's rows would
+ * outgrow what the lake stages of a batch. The largest record of a scrape's points makes
+ * some 53,000 rows of some 16 MB; a resource's attributes of a MB on a thousand spans,
+ * a GB.
+ */
+export const REQUEST_ROWS = 200_000;
+export const REQUEST_ROW_BYTES = 64 * 1024 * 1024;
+
+/** A message of a level, decoded as Requests spells it, 64-bit integers as text. */
+const plain = (type: protobuf.Type, bytes: Uint8Array): Record<string, unknown> => type.toObject(type.decode(bytes), { longs: String });
+
+/**
+ * The parts of `bytes`, a message of `type` at level `depth` of `levels`, each given to
+ * `within`, which puts it in the levels above, whose own fields come to `above` bytes. The
+ * message is read for where its fields are, nothing decoded: of the level below, each one's
+ * bytes, taken one at a time; of the rest, the message's own fields, decoded alone, which a
+ * part repeats. What its items' rows come to is counted in `made`, against REQUEST_ROWS and
+ * REQUEST_ROW_BYTES, before they are decoded.
+ */
+/**
+ * Where the fields of `bytes`, a message of `type` at level `depth` of `levels`, are, nothing
+ * decoded: its own fields' bytes, and of the level below, each one's field and span.
+ */
+function fieldsOf(type: protobuf.Type, bytes: Uint8Array, levels: readonly (readonly string[])[], depth: number) {
+  const below = new Map((levels[depth] ?? []).map((name) => [type.fields[name]!.id, type.fields[name]!]));
+  const reader = protobuf.Reader.create(bytes);
+  const own: Uint8Array[] = [];
+  const children: { field: protobuf.Field; start: number; end: number }[] = [];
+  while (reader.pos < reader.len) {
+    const start = reader.pos;
+    const tag = reader.uint32();
+    const field = below.get(tag >>> 3);
+    if (field && (tag & 7) === 2) {
+      const length = reader.uint32();
+      children.push({ field, start: reader.pos, end: reader.pos + length });
+      reader.skip(length);
+    } else {
+      reader.skipType(tag & 7);
+      own.push(bytes.subarray(start, reader.pos));
     }
-    const type = REQUESTS[signal];
-    // The messages above are the shape Requests describes, 64-bit integers as text.
-    return type.toObject(type.decode(body), { longs: String }) as Requests[S];
+  }
+  return { own, children };
+}
+
+function* partsOf(
+  type: protobuf.Type,
+  bytes: Uint8Array,
+  levels: readonly (readonly string[])[],
+  depth: number,
+  within: (part: object) => object,
+  above: number,
+  made: { rows: number; bytes: number },
+): Generator<object> {
+  const { own, children } = fieldsOf(type, bytes, levels, depth);
+  const header = plain(type, Buffer.concat(own));
+  const repeated = above + own.reduce((sum, field) => sum + field.length, 0);
+  const of = (field: protobuf.Field, value: object) => within({ ...header, [field.name]: field.repeated ? [value] : value });
+  if (depth < levels.length - 1) {
+    for (const { field, start, end } of children) yield* partsOf(field.resolvedType as protobuf.Type, bytes.subarray(start, end), levels, depth + 1, (part) => of(field, part), repeated, made);
+    return;
+  }
+  // The items, PART_ITEMS at a time, each decoded as its part is made.
+  for (let at = 0; at < children.length; at += PART_ITEMS) {
+    const items = children.slice(at, at + PART_ITEMS);
+    made.rows += items.length;
+    made.bytes += items.reduce((sum, { start, end }) => sum + end - start + repeated, 0);
+    if (made.rows > REQUEST_ROWS) throw new MalformedRequest(`the request makes more than ${REQUEST_ROWS} rows`);
+    if (made.bytes > REQUEST_ROW_BYTES) throw new MalformedRequest(`the request's rows come to more than ${REQUEST_ROW_BYTES} bytes`);
+    const field = items[0]!.field;
+    yield within({ ...header, [field.name]: items.map(({ start, end }) => plain(field.resolvedType as protobuf.Type, bytes.subarray(start, end))) });
+  }
+}
+
+/**
+ * `body`, an export request for `signal` in binary protobuf, a part at a time: each a request
+ * of its own of one resource's one scope's items (of a metric's points, one metric's), as
+ * many as PART_ITEMS, decoded only as it is taken, so that what a request holds decoded at
+ * once is a part's, however large the request. Their rows are the request's (telemetryRows,
+ * ./otel.ts). Throws MalformedRequest, as it reaches it, where the request does not decode,
+ * or its rows would be more than REQUEST_ROWS, or come to more than REQUEST_ROW_BYTES.
+ */
+export function* requestParts<S extends Signal>(signal: S, body: Uint8Array): Generator<Requests[S]> {
+  try {
+    // The messages above are the shape Requests describes.
+    yield* partsOf(REQUESTS[signal], body, LEVELS[signal], 0, (part) => part, 0, { rows: 0, bytes: 0 }) as Generator<Requests[S]>;
   } catch (error) {
     if (error instanceof MalformedRequest) throw error;
     throw new MalformedRequest(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** What the rows of `bytes` come to, as partsOf counts them, read for where its fields are alone. */
+function rowBytesOf(type: protobuf.Type, bytes: Uint8Array, levels: readonly (readonly string[])[], depth: number, above: number): number {
+  const { own, children } = fieldsOf(type, bytes, levels, depth);
+  const repeated = above + own.reduce((sum, field) => sum + field.length, 0);
+  if (depth < levels.length - 1) return children.reduce((sum, { field, start, end }) => sum + rowBytesOf(field.resolvedType as protobuf.Type, bytes.subarray(start, end), levels, depth + 1, repeated), 0);
+  return children.reduce((sum, { start, end }) => sum + end - start + repeated, 0);
+}
+
+/**
+ * What the rows of `body`, an export request for `signal` in binary protobuf, come to in
+ * bytes, as requestParts counts them against REQUEST_ROW_BYTES, nothing decoded: what
+ * writing it stages; 0 where it does not read as one, as it is refused as it is written.
+ */
+export function requestRowBytes(signal: Signal, body: Uint8Array): number {
+  try {
+    return rowBytesOf(REQUESTS[signal], body, LEVELS[signal], 0, 0);
+  } catch {
+    return 0;
   }
 }
 

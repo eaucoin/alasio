@@ -10,11 +10,17 @@ import type { KubernetesObject, V1Deployment, V1StatefulSet } from "@kubernetes/
 import { scaled } from "./common.ts";
 import type { Scale } from "./config.ts";
 
-/** A trigger of KEDA's: its type and what it is given, as its scaler's documentation says. */
+/** A trigger of KEDA's: its type, what it is given, as its scaler's documentation says, and the TriggerAuthentication it authenticates with, if any. */
 export interface Trigger {
   readonly type: string;
   readonly metricType?: "Utilization";
   readonly metadata: Readonly<Record<string, string>>;
+  readonly authenticationRef?: { readonly name: string };
+}
+
+/** A TriggerAuthentication, as far as alasio writes one: each parameter of its scalers', from a key of a Secret of its namespace. */
+export interface TriggerAuthentication extends KubernetesObject {
+  readonly spec: { readonly secretTargetRef: readonly { readonly parameter: string; readonly name: string; readonly key: string }[] };
 }
 
 /** A ScaledObject, as far as alasio writes and reads one. */

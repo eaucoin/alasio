@@ -31,7 +31,14 @@
  *   LAKE_EXTENSION_DIRECTORY                the extensions the image installed; with it
  *                                           set, none is ever downloaded
  *   LAKE_HTTP_PORT                          health and Prometheus metrics (default 9464)
- *   LAKE_INTAKE_PORT                        the telemetry intake, OTLP over HTTP (default 4318)
+ *
+ * The telemetry intake (./intake-service.ts), which writes the lake's `otel` schema alone:
+ *
+ *   LAKE_DATABASE_HOST, LAKE_DATABASE_PORT, LAKE_DATABASE_PASSWORD, LAKE_CATALOG_DATABASE,
+ *   LAKE_DATA_PATH, LAKE_S3_*, LAKE_THREADS, LAKE_EXTENSION_DIRECTORY, LAKE_HTTP_PORT
+ *                                           as above
+ *   LOG_BROKERS                             the log's brokers, comma-separated host:port
+ *   LOG_USERNAME, LOG_PASSWORD              its principal on the log, `intake`
  *
  * The lake's query endpoint (./endpoint.ts), which only reads it, as its reader:
  *
@@ -98,7 +105,11 @@ export interface LakeConfig extends LakeAccess {
   branches: BranchesSource | null;
   retentionDays: number;
   httpPort: number;
-  intakePort: number;
+}
+
+export interface IntakeConfig extends LakeAccess {
+  httpPort: number;
+  log: { brokers: string[]; username: string; password: string };
 }
 
 export interface EndpointConfig extends LakeAccess {
@@ -176,7 +187,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): LakeConfig {
     branches: branchesUrl ? { url: branchesUrl, token: required(env, "LAKE_BRANCHES_TOKEN") } : null,
     retentionDays: positive(env, "LAKE_RETENTION_DAYS", 30),
     httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
-    intakePort: positive(env, "LAKE_INTAKE_PORT", 4318),
+  };
+}
+
+/** The telemetry intake's configuration. */
+export function loadIntakeConfig(env: NodeJS.ProcessEnv = process.env): IntakeConfig {
+  return {
+    ...access(env, ROLE, { password: "LAKE_DATABASE_PASSWORD", s3Key: "LAKE_S3_KEY", s3Secret: "LAKE_S3_SECRET" }, "256MB"),
+    httpPort: positive(env, "LAKE_HTTP_PORT", 9464),
+    log: {
+      brokers: required(env, "LOG_BROKERS").split(",").map((broker) => broker.trim()).filter(Boolean),
+      username: required(env, "LOG_USERNAME"),
+      password: required(env, "LOG_PASSWORD"),
+    },
   };
 }
 

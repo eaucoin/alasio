@@ -108,7 +108,8 @@ function operator(config: InstallConfig): KubernetesObject[] {
       { name: "WATCH_LABEL_SELECTOR", value: "" },
       { name: "WATCH_LABEL_SELECTOR_FOR_TRIGGERAUTH", value: "" },
       // The Secrets it reads are of its own namespace alone: alasio's ScaledObjects
-      // authenticate to nothing, and another's that does reads its Secret from there,
+      // authenticate with TriggerAuthentications there, of Secrets there (the lake's
+      // intake's, as KEDA reads the log), and another's reads its Secret from there,
       // through a ClusterTriggerAuthentication.
       { name: "KEDA_RESTRICT_SECRET_ACCESS", value: "true" },
     ],

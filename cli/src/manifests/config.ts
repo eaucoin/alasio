@@ -167,8 +167,8 @@ const Alasio = Schema.Struct({
 
 /**
  * alasio's telemetry: everything (alasio's, its harnesses', bayma's, the lake's and the
- * stack's) goes through the stack's collector to the lake, and to otlpEndpoint too when
- * one is set.
+ * stack's) goes through the stack's collector, by the log, to the lake, and to
+ * otlpEndpoint too when one is set.
  */
 const Telemetry = Schema.Struct({
   /** Where the collector also sends all it receives; empty sends it to the lake alone. */
@@ -182,15 +182,22 @@ const Telemetry = Schema.Struct({
   receiverPort: defaulted(Schema.Int.check(Schema.isBetween({ minimum: 1024, maximum: 65535 }, { message: "must be a port from 1024 to 65535" })), 4318),
   /** How many days of telemetry the lake keeps. */
   retentionDays: defaulted(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1, { message: "must be at least 1" })), 30),
-  /** The stack's collector, through which all of it goes. */
+  /**
+   * The stack's collector, through which all of it goes, in two parts on one image
+   * (images.collector): its gateway, which every producer exports to and which writes it to
+   * the log, scaling on its CPU where min and max are apart; and its scraper, one replica,
+   * which scrapes the stack and exports what it scrapes to the gateway.
+   */
   collector: defaulted(
     Schema.Struct({
-      image: Image({
-        repository: "otel/opentelemetry-collector-contrib",
-        tag: "0.161.0",
-        digest: "sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
-      }),
-      resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }),
+      gateway: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: true }),
+          resources: Resources({ requests: { cpu: "50m", memory: "96Mi" }, limits: { memory: "512Mi" } }),
+        }),
+        {},
+      ),
+      scraper: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } }) }), {}),
     }),
     {},
   ),
@@ -213,6 +220,43 @@ const Snapshots = Schema.Struct({
    * reads through, which the kernel reclaims under it.
    */
   nodeAgent: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } }) }), {}),
+});
+
+/**
+ * The least memory the log's broker is given: the heap of 512 MiB it is run at (./log.ts),
+ * and the JVM's own beside it.
+ */
+export const LOG_MEMORY = "768Mi";
+
+/** A segment of the log's partitions at most: what its retention deletes at once, a closed one. */
+export const LOG_SEGMENT_BYTES = 64 * 1024 * 1024;
+
+/** How many partitions the log's telemetry topics have together: three topics, of as many as the lake's intake runs replicas at most. */
+const telemetryPartitions = (config: Pick<InstallConfig, "lake">): number => 3 * Math.max(1, config.lake.intake.scaling.max);
+
+/**
+ * How many bytes each partition of the log's telemetry topics keeps at most: three
+ * quarters of a node's volume shared among them, the rest Telegram's topics' and KRaft's,
+ * less the segment each writes beside those it keeps, as retention deletes closed segments
+ * alone.
+ */
+export function telemetryRetentionBytes(config: Pick<InstallConfig, "log" | "lake">): number {
+  return Math.floor((memoryBytes(config.log.storage.size) * 3) / 4 / telemetryPartitions(config)) - LOG_SEGMENT_BYTES;
+}
+
+/**
+ * The log (./log.ts), beside Neon: Apache Kafka in KRaft, its partitions' segments on a
+ * volume of each of its nodes, which KRaft's metadata, its principals and ACLs among it,
+ * is on too. Its nodes are brokers and KRaft's controllers both, 1, or 3 in a quorum, their
+ * count set as the log is made and never changed after, as KRaft's voters are fixed. It is
+ * a buffer, not a store: what it holds is kept for `retention`, within its volume, the lake
+ * keeping what is read from it.
+ */
+const Log = Schema.Struct({
+  scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false, most: 3 }),
+  retention: defaulted(matching(/^[1-9][0-9]*h$/u, "must be a number of hours, such as 24h"), "24h"),
+  storage: Storage("4Gi"),
+  resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1Gi" } }),
 });
 
 const Sessions = Schema.Struct({
@@ -763,6 +807,17 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
       issue: `must be at least ${memoryText(NODE_AGENT_MEMORY_FLOOR)}: the node agent's own memory, and what a restore holds written and not yet on the disk`,
     };
   }
+  if (config.log.scaling.min === 2) return { path: ["log", "scaling"], issue: "must be 1 or 3: two of KRaft's voters elect no leader once one is gone" };
+  if (memoryBytes(config.log.resources.limits["memory"] ?? "0") < memoryBytes(LOG_MEMORY)) {
+    return { path: ["log", "resources", "limits", "memory"], issue: `must be at least ${LOG_MEMORY}: a heap of 512 MiB, and the JVM's own` };
+  }
+  if (telemetryRetentionBytes(config) < LOG_SEGMENT_BYTES) {
+    const least = Math.ceil((telemetryPartitions(config) * 2 * LOG_SEGMENT_BYTES * 4) / 3);
+    return {
+      path: ["log", "storage", "size"],
+      issue: `must be at least ${memoryText(least)}: each of the telemetry topics' ${telemetryPartitions(config)} partitions keeps a segment of ${memoryText(LOG_SEGMENT_BYTES)} at least beside the one it writes, in three quarters of it`,
+    };
+  }
   if (config.autoscaling.headroom.scaling.min > 0 && !config.autoscaling.preemption) {
     return { path: ["autoscaling", "headroom", "scaling"], issue: "must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then" };
   }
@@ -776,6 +831,8 @@ const InstallStruct = Schema.Struct({
       agent: Image(IMAGES.agent),
       lake: Image(IMAGES.lake),
       grafana: Image(IMAGES.grafana),
+      log: Image(IMAGES.log),
+      collector: Image(IMAGES.collector),
       pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
     }),
     {},
@@ -790,12 +847,25 @@ const InstallStruct = Schema.Struct({
   neon: defaulted(Neon, {}),
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
-  /** The analytics lake, loaded from Neon into DuckLake, and its query endpoint, which Grafana and alasio lake read it through. */
+  log: defaulted(Log, {}),
+  /**
+   * The analytics lake, loaded from Neon into DuckLake; its query endpoint, which Grafana
+   * and alasio lake read it through; and its telemetry intake, which writes what the log
+   * holds of the stack's telemetry to it, scaled on how much is waiting there, to none
+   * while nothing is.
+   */
   lake: defaulted(
     Schema.Struct({
       enabled: defaulted(Schema.Boolean, true),
       resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1536Mi" } }),
       query: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } }) }), {}),
+      intake: defaulted(
+        Schema.Struct({
+          scaling: Scaling({ min: 0, max: 2 }, { floor: false, scaled: true }),
+          resources: Resources({ requests: { cpu: "50m", memory: "256Mi" }, limits: { memory: "1Gi" } }),
+        }),
+        {},
+      ),
     }),
     {},
   ),

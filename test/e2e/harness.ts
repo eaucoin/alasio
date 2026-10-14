@@ -147,7 +147,7 @@ export const BIG_REPL_MEBIBYTES = 1024;
  * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
  * (./codex-stand-in.Dockerfile), built on it.
  */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-log": "neon/log", "alasio-collector": "neon/collector", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
 
 /** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
 const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
@@ -517,7 +517,7 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
   return {
     images: of === "previous"
       ? { alasio: { repository: `${PUSHED}/alasio-codex-stand-in-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
-      : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
+      : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), log: pushed("alasio-log"), collector: pushed("alasio-collector"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: {
         TELEGRAM_API_ROOT: urlOf(TELEGRAM),
@@ -554,7 +554,11 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       compute: { resources: { requests: { cpu: "50m", memory: "256Mi" } } },
       ...on("server-0"),
     },
-    telemetry: { collector: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } },
+    telemetry: {
+      collector: of === "previous"
+        ? { resources: { requests: { cpu: "10m", memory: "64Mi" } } }
+        : { gateway: { resources: { requests: { cpu: "10m", memory: "64Mi" } } }, scraper: { resources: { requests: { cpu: "10m", memory: "64Mi" } } } },
+    },
     objectStore: {
       bundled: {
         // On three nodes, three masters in Raft, each object kept twice on three volume
@@ -575,7 +579,11 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
         filerStore: { resources: { requests: { cpu: "10m", memory: "16Mi" } } },
       },
     },
-    lake: { resources: { requests: { cpu: "20m", memory: "256Mi" } }, query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } } },
+    lake: {
+      resources: { requests: { cpu: "20m", memory: "256Mi" } },
+      query: { resources: { requests: { cpu: "10m", memory: "128Mi" } } },
+      ...(of === "release" ? { intake: { resources: { requests: { cpu: "20m", memory: "128Mi" } } } } : {}),
+    },
     // Two, where the run proves Grafana highly available.
     grafana: { ...(inShard("scaling") ? { scaling: { min: 2, max: 2 } } : {}), resources: { requests: { cpu: "20m", memory: "192Mi" } } },
     // JuiceFS's metadata dumped as often as it allows, so one lands within the run.
@@ -654,7 +662,7 @@ export async function setUp(): Promise<void> {
 
   if (!PUSHED) {
     const pushHost = await startRegistry();
-    for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana"] as const) await push(pushHost, name);
+    for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-log", "alasio-collector"] as const) await push(pushHost, name);
     // On alasio's image, which its build pulls back from the registry.
     await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }

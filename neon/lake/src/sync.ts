@@ -7,7 +7,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 
 import { type ClaudeLoad, type ClaudeSyncOptions, syncClaude } from "./claude.ts";
 import { type CodexLoad, type CodexSyncOptions, syncCodex } from "./codex.ts";
-import { LAKE, literal, rows, serially, transaction } from "./lake.ts";
+import { LAKE, literal, rows, transaction } from "./lake.ts";
 import { ensureModel, type RebuildOptions } from "./model.ts";
 import { deleteExpiredTelemetry, ensureOtel } from "./otel.ts";
 
@@ -96,7 +96,7 @@ export async function maintainLake(db: DuckDBConnection, { retentionDays, keepFi
   await deleteExpiredTelemetry(db, retentionDays);
   for (const step of MAINTENANCE) {
     if (keepFiles && DELETING.has(step)) continue;
-    await serially(() => db.run(`call ${step}('${LAKE}')`));
+    await transaction(db, () => db.run(`call ${step}('${LAKE}')`));
   }
   await transaction(db, async () => {
     await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);

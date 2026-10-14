@@ -35,6 +35,14 @@ export type ClientRole = (typeof CLIENT_ROLES)[number];
  */
 export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | "workspaces" | "snapshots";
 
+/**
+ * The log's principals besides its admin, each with a password of its own: the collector's
+ * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
+ * and KEDA, which reads how much the intake has yet to.
+ */
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler"] as const;
+export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
+
 export interface S3Credentials {
   accessKey: string;
   secretKey: string;
@@ -79,12 +87,16 @@ export interface StackSecrets {
   verifiers: Record<ClientRole, string>;
   /** What alasio presents to the node agents, which keep session sandboxes' snapshots, and they check. */
   nodeAgentToken: string;
+  /** The log's: the id KRaft formats its nodes with, and each principal's password, its admin's among them. */
+  logClusterId: string;
+  log: Record<"admin" | LogPrincipal, string>;
 }
 
 /** The stack's secrets as an earlier release may have kept them: any may be absent. */
-export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "verifiers">> & {
+export type StoredSecrets = Partial<Omit<StackSecrets, "s3" | "verifiers" | "log">> & {
   s3?: Partial<Record<S3Identity, S3Credentials>>;
   verifiers?: Partial<Record<ClientRole, string>>;
+  log?: Partial<StackSecrets["log"]>;
 };
 
 /** Where Neon keeps its files: an S3 bucket at an endpoint. */
@@ -133,6 +145,18 @@ function secret(): string {
 }
 
 /**
+ * A KRaft cluster's id, as Kafka makes one (Uuid.randomUuid): 16 random bytes, in base64url,
+ * never beginning with "-", which kafka-storage's command line takes for an option, so that a
+ * node formatted with it fails to start.
+ */
+export function clusterId(): string {
+  for (;;) {
+    const id = randomBytes(16).toString("base64url");
+    if (!id.startsWith("-")) return id;
+  }
+}
+
+/**
  * The stack's secrets, `existing` completed: made on first run and then only added to,
  * never rotated. Each secret has a maker, and any absent is filled in, so a deployment
  * that predates a new secret gains it on the next install or upgrade without disturbing
@@ -155,6 +179,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     lakeReaderPassword: kept(stored.lakeReaderPassword, () => secret()),
     grafanaPassword: kept(stored.grafanaPassword, () => secret()),
   };
+  const log: Partial<StackSecrets["log"]> = kept(stored.log, () => ({}));
   const secrets: StackSecrets = {
     ...stored,
     tenantId: kept(stored.tenantId, () => hexId()),
@@ -193,6 +218,12 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       [GRAFANA_ROLE]: kept(verifiers[GRAFANA_ROLE], () => scramVerifier(passwords.grafanaPassword)),
     },
     nodeAgentToken: kept(stored.nodeAgentToken, () => secret()),
+    logClusterId: kept(stored.logClusterId, () => clusterId()),
+    log: {
+      ...log,
+      admin: kept(log.admin, () => secret()),
+      ...Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, kept(log[principal], () => secret())])) as Record<LogPrincipal, string>,
+    },
   };
   return { secrets, changed };
 }

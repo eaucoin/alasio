@@ -46,16 +46,30 @@ export async function ensureLakeRole(pool: Pool, verifier: string): Promise<void
 }
 
 /**
+ * What the lake's reader may hold of its catalog's database, on every connection DuckDB
+ * makes there: a statement, a wait for a lock, a transaction left idle, each within the
+ * reader's own bound on a query (neon/lake/src/reader.ts's QUERY_TIMEOUT_MS, 30 s), which
+ * interrupts DuckDB but not a statement DuckDB has sent Postgres. So a query that meets a
+ * writer's lock on the catalog fails, rather than holding the query endpoint's one
+ * connection for as long as the lock is held.
+ */
+export const LAKE_READER_LIMITS = { statement_timeout: "25s", lock_timeout: "5s", idle_in_transaction_session_timeout: "60s" } as const;
+
+/**
  * Makes the lake's reader's role, a login that is a member of no other role, its password
- * stored as `verifier`, which may connect to the catalog's database and nothing more:
- * the lake's role, which owns the catalog, lets it read that (neon/lake/src/reader.ts's
- * grantReads). Idempotent; after ensureLakeRole, which makes the database.
+ * stored as `verifier`, which may connect to the catalog's database and nothing more,
+ * within LAKE_READER_LIMITS there: the lake's role, which owns the catalog, lets it read
+ * that (neon/lake/src/reader.ts's grantReads). Idempotent; after ensureLakeRole, which
+ * makes the database.
  */
 export async function ensureLakeReaderRole(pool: Pool, verifier: string): Promise<void> {
   const role = await pool.query("select 1 from pg_roles where rolname = $1", [LAKE_READER_ROLE]);
   if (role.rows.length === 0) await pool.query(`create role ${LAKE_READER_ROLE} login`);
   await pool.query(`alter role ${LAKE_READER_ROLE} with login password ${escapeLiteral(verifier)}`);
   await pool.query(`grant connect on database ${LAKE_DATABASE} to ${LAKE_READER_ROLE}`);
+  for (const [setting, value] of Object.entries(LAKE_READER_LIMITS)) {
+    await pool.query(`alter role ${LAKE_READER_ROLE} in database ${LAKE_DATABASE} set ${setting} = ${escapeLiteral(value)}`);
+  }
 }
 
 /**

@@ -1,6 +1,6 @@
 /**
  * The lake's `otel` schema: alasio's traces, metrics and logs, as the telemetry intake
- * receives them from the stack's collector (./intake.ts). Its tables are those of
+ * consumes them from the log's topics, which the stack's collector writes (./intake.ts). Its tables are those of
  * OpenTelemetry's ClickHouse exporter, by name and column, so its queries carry over:
  *
  *   otel.traces                          a span a row
@@ -42,9 +42,9 @@
  * The rest join through these: alasio's logs within a turn carry its span's TraceId,
  * and Claude Code's own telemetry its `session.id`, the session's id.
  */
-import { type DuckDBAppender, type DuckDBConnection, type DuckDBValue, listValue, mapValue, structValue, timestampNanosValue } from "@duckdb/node-api";
+import { type DuckDBAppender, type DuckDBConnection, DuckDBDataChunk, type DuckDBType, type DuckDBValue, listValue, mapValue, structValue, timestampNanosValue } from "@duckdb/node-api";
 
-import { LAKE, serially, transaction } from "./lake.ts";
+import { LAKE, rows, transaction } from "./lake.ts";
 import {
   type AnyValue,
   base64,
@@ -73,10 +73,7 @@ const METRIC = `
   MetricName VARCHAR, MetricDescription VARCHAR, MetricUnit VARCHAR, Attributes ${MAP},
   StartTimeUnix TIMESTAMP_NS, TimeUnix TIMESTAMP_NS`;
 
-/**
- * Each table: its columns, the time it is partitioned and retained by, and whether an
- * insert into it is inlined in the catalog (INLINED_ROWS).
- */
+/** Each table: its columns, and the time it is partitioned and retained by. */
 const TABLES = {
   traces: {
     columns: `
@@ -87,7 +84,6 @@ const TABLES = {
       Events STRUCT(Timestamp TIMESTAMP_NS, Name VARCHAR, Attributes ${MAP})[],
       Links STRUCT(TraceId VARCHAR, SpanId VARCHAR, TraceState VARCHAR, Attributes ${MAP})[]`,
     time: "Timestamp",
-    inlined: true,
   },
   logs: {
     columns: `
@@ -96,31 +92,26 @@ const TABLES = {
       ResourceAttributes ${MAP}, ScopeSchemaUrl VARCHAR, ScopeName VARCHAR, ScopeVersion VARCHAR,
       ScopeAttributes ${MAP}, LogAttributes ${MAP}, EventName VARCHAR`,
     time: "Timestamp",
-    inlined: true,
   },
-  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix", inlined: false },
+  metrics_gauge: { columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}`, time: "TimeUnix" },
   metrics_sum: {
     columns: `${METRIC}, Value DOUBLE, Flags UINTEGER, Exemplars ${EXEMPLARS}, AggregationTemporality INTEGER, IsMonotonic BOOLEAN`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, BucketCounts UBIGINT[], ExplicitBounds DOUBLE[], Exemplars ${EXEMPLARS},
       Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_exponential_histogram: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, Scale INTEGER, ZeroCount UBIGINT,
       PositiveOffset INTEGER, PositiveBucketCounts UBIGINT[], NegativeOffset INTEGER, NegativeBucketCounts UBIGINT[],
       Exemplars ${EXEMPLARS}, Flags UINTEGER, Min DOUBLE, Max DOUBLE, AggregationTemporality INTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
   metrics_summary: {
     columns: `${METRIC}, Count UBIGINT, Sum DOUBLE, ValueAtQuantiles STRUCT(Quantile DOUBLE, Value DOUBLE)[], Flags UINTEGER`,
     time: "TimeUnix",
-    inlined: false,
   },
 } as const;
 
@@ -136,21 +127,9 @@ export type TelemetryRow = Readonly<Record<string, DuckDBValue>>;
 export type TelemetryRows = Partial<Record<OtelTable, TelemetryRow[]>>;
 
 /**
- * The most rows one insert into a table of spans or log records inlines, into the
- * catalog, rather than writes as a Parquet file of its own: as many as the collector
- * batches them in at most, every 5 seconds, so they make no small files and are queried
- * at once. The intake flushes what is inlined to Parquet now and then (flushTelemetry),
- * so the catalog holds at most that long's telemetry. Metric points are never inlined:
- * they are nearly all of it, and measured on the stack, inlining them cost Neon some 25
- * to 45 KB of WAL a second, and the catalog 70 to 130 MB an hour until flushed; the
- * collector sends them a minute's at a time, which the lake writes as a file a kind.
- */
-export const INLINED_ROWS = 1000;
-
-/**
  * The size up to which the `otel` tables' files are merged, the lake's (TARGET_FILE_SIZE
  * in ./sync.ts) being for transcripts: a file this large is left as it is, so the
- * intake's hourly merge takes the files written since, not the whole day's again. At the
+ * hourly merge (mergeTelemetry) takes the files written since, not the whole day's again. At the
  * lake's 64 MB, a day's file of points (some 1.5 million, 14 MB, on the stack) was
  * rewritten every hour: measured on a day of the stack's sum points, the merge took
  * 0.6 s and 170 MB at 02:00, 4.8 s and 350 MB at 22:00; with this, 0.4-0.5 s and some
@@ -159,13 +138,26 @@ export const INLINED_ROWS = 1000;
 export const TELEMETRY_FILE_SIZE = "1MB";
 
 /**
+ * Where the intake has consumed each partition of the log's telemetry topics to: the
+ * offset of the next record it is to write, committed with the rows of those before it,
+ * so a batch written is never written again, whatever the log's consumer group says
+ * (./intake.ts); of the topic by its id, as a topic made anew (the log's, on volumes made
+ * anew under a lake that was kept) numbers its records from its start again. Its few rows,
+ * rewritten at each commit, are inlined in the catalog, as no telemetry is: they would
+ * make two files a commit otherwise.
+ */
+const OFFSETS = "intake_offsets";
+const OFFSETS_COLUMNS = "Topic VARCHAR, TopicId VARCHAR, PartitionId INTEGER, NextOffset BIGINT";
+
+/**
  * Makes the `otel` schema's tables where they are missing, each partitioned by its
- * day, and sets how many rows of an insert into each it inlines, and the size up to
- * which their files are merged.
+ * day, and the intake's offsets; and sets that nothing of the telemetry is inlined in the
+ * catalog, the offsets alone, and the size up to which the telemetry's files are merged.
  */
 export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await transaction(db, async () => {
     await db.run(`create schema if not exists ${LAKE}.otel`);
+    await db.run(`create table if not exists ${LAKE}.otel.${OFFSETS} (${OFFSETS_COLUMNS})`);
     for (const [table, { columns, time }] of Object.entries(TABLES)) {
       const [exists] = (await db.runAndReadAll(
         `select 1 from duckdb_tables() where database_name = '${LAKE}' and schema_name = 'otel' and table_name = $1`,
@@ -177,11 +169,12 @@ export async function ensureOtel(db: DuckDBConnection): Promise<void> {
     }
   });
   // Once the schema is committed: DuckLake sets no option of a schema made in the same transaction.
-  await serially(async () => {
-    for (const [table, { inlined }] of Object.entries(TABLES)) {
-      await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', ${inlined ? INLINED_ROWS : 0}, schema => 'otel', table_name => '${table}')`);
+  await transaction(db, async () => {
+    for (const table of OTEL_TABLES) {
+      await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 0, schema => 'otel', table_name => '${table}')`);
       await db.run(`call ${LAKE}.set_option('target_file_size', '${TELEMETRY_FILE_SIZE}', schema => 'otel', table_name => '${table}')`);
     }
+    await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 1000, schema => 'otel', table_name => '${OFFSETS}')`);
   });
 }
 
@@ -226,8 +219,18 @@ function serviceName(resource: Resource | undefined): string {
   return text(resource?.attributes?.findLast(({ key }) => key === "service.name")?.value);
 }
 
+/** The latest time a TIMESTAMP_NS holds, 2^63 - 1 nanoseconds since the epoch, in 2262; and the earliest. */
+const LATEST_NANOS = 2n ** 63n - 1n;
+const EARLIEST_NANOS = -(2n ** 63n);
+
+/** `nanos`, nanoseconds since the epoch, as a time; MalformedRequest for one no TIMESTAMP_NS holds, as a fixed64 may be. */
+function at(nanos: bigint): DuckDBValue {
+  if (nanos > LATEST_NANOS || nanos < EARLIEST_NANOS) throw new MalformedRequest(`${nanos} ns since the epoch is no time the lake keeps`);
+  return timestampNanosValue(nanos);
+}
+
 /** A time, in nanoseconds since the epoch. */
-const time = (nanos: Integer | undefined): DuckDBValue => timestampNanosValue(integer(nanos));
+const time = (nanos: Integer | undefined): DuckDBValue => at(integer(nanos));
 
 const unsigned = (value: Integer | undefined): bigint => {
   const whole = integer(value);
@@ -287,7 +290,7 @@ function traceRows(request: TracesRequest): TelemetryRows {
         const start = integer(span.startTimeUnixNano);
         const end = integer(span.endTimeUnixNano);
         traces.push({
-          Timestamp: timestampNanosValue(start),
+          Timestamp: at(start),
           TraceId: hexId(span.traceId),
           SpanId: hexId(span.spanId),
           ParentSpanId: hexId(span.parentSpanId),
@@ -321,10 +324,10 @@ function logRows(request: LogsRequest): TelemetryRows {
     for (const { scope, schemaUrl, logRecords } of list(part.scopeLogs, "scopeLogs")) {
       const origin = { ScopeSchemaUrl: schemaUrl ?? "", ScopeName: scope?.name ?? "", ScopeVersion: scope?.version ?? "", ScopeAttributes: attributes(scope?.attributes) };
       for (const record of list(logRecords, "logRecords")) {
-        const at = integer(record.timeUnixNano);
+        const when = integer(record.timeUnixNano);
         logs.push({
           // Where a record has no time of its own, the time it was seen.
-          Timestamp: timestampNanosValue(at === 0n ? integer(record.observedTimeUnixNano) : at),
+          Timestamp: at(when === 0n ? integer(record.observedTimeUnixNano) : when),
           TraceId: hexId(record.traceId),
           SpanId: hexId(record.spanId),
           TraceFlags: (record.flags ?? 0) & 0xff,
@@ -444,49 +447,195 @@ export function telemetryRows<S extends Signal>(signal: S, request: Requests[S])
 
 // --- Writing ------------------------------------------------------------------------
 
-/** The temporary table a table's rows are staged in, in DuckDB's own memory. */
-const staging = (table: OtelTable) => `otel_${table}`;
+/** The temporary table a batch's rows of a table are staged in, in DuckDB's own memory. */
+const batchStaging = (table: OtelTable) => `otel_${table}`;
 
-/** Appends `row` with the appender, in its table's column order. */
-function append(appender: DuckDBAppender, columns: readonly string[], row: TelemetryRow): void {
-  columns.forEach((column, index) => {
-    const value = row[column];
-    if (value === null || value === undefined) appender.appendNull();
-    else appender.appendValue(value, appender.columnType(index));
-  });
-  appender.endRow();
+/** The rows a staging table is given at once: a vector's, DuckDB's own size of a data chunk. */
+const CHUNK_ROWS = 2048;
+
+/** The temporary table a record's rows of a table are staged in, before they join the batch's. */
+const recordStaging = (table: OtelTable) => `otel_record_${table}`;
+
+/**
+ * Rows that DuckDB would not take, as they were staged or written: their values, or their
+ * conversion, refused. Those of the records written, not the lake's to fail.
+ */
+export class UnwritableRows extends Error {
+  override readonly name = "UnwritableRows";
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
+/** DuckDB's refusals of values, as it writes them: their conversion, a constraint, or their range. */
+const VALUE_REFUSED = /^(Conversion|Constraint|Invalid Input|Out of Range|Mismatch Type) Error: /u;
+
+/** An error of DuckDB's own, its kind first, as "Out of Memory Error: ...". */
+export const DUCKDB_ERROR = /^[A-Z][A-Za-z]*( [A-Za-z]+)* Error: /u;
+
+/**
+ * `error`, raised staging or writing rows, as the rows' (UnwritableRows) where it is theirs:
+ * DuckDB's refusal of their values, or the Node API's of them before DuckDB has them; as it
+ * is otherwise, DuckDB's own failing, as of its memory or its disk, being the lake's.
+ */
+const ofRows = (error: unknown): unknown =>
+  error instanceof Error && (VALUE_REFUSED.test(error.message) || !DUCKDB_ERROR.test(error.message)) ? new UnwritableRows(error) : error;
+
+/**
+ * A batch's staging, a record at a time (writeConsumed): each record's rows, as its parts
+ * come (./otlp.ts requestParts), staged a data chunk of CHUNK_ROWS at a time, written into
+ * DuckDB's own vectors, in a table of the record's own, which joins the batch's once the
+ * record is whole, or is emptied where the record turns out not to decode, so that none of
+ * its rows is written. What the intake holds of a batch is then a part's rows and a chunk's
+ * of each table, however large its records: the batch itself is in DuckDB's memory, which
+ * spills past its limit. A value made a DuckDB value of its own, as the appender's
+ * appendValue makes it, is freed only once JavaScript's collector finalizes it, which a
+ * batch's thousands of points, each with its maps' entries, outran: 40,000 of a scrape's
+ * points took 1.8 GB and 13 s so, 0.5 GB and 0.8 s a chunk at a time (measured).
+ */
+function staging(db: DuckDBConnection) {
+  const tables = new Map<OtelTable, { readonly columns: readonly string[]; readonly types: readonly DuckDBType[]; rows: number }>();
+  const opened = async (table: OtelTable) => {
+    const known = tables.get(table);
+    if (known) return known;
+    await db.run(`create or replace temp table ${batchStaging(table)} (${TABLES[table].columns})`);
+    await db.run(`create or replace temp table ${recordStaging(table)} (${TABLES[table].columns})`);
+    const empty = await db.runAndReadAll(`from temp.${recordStaging(table)} limit 0`);
+    const made = { columns: empty.columnNames(), types: empty.columnTypes(), rows: 0 };
+    tables.set(table, made);
+    return made;
+  };
+  return {
+    /** The batch's tables that rows were staged for, with how many. */
+    tables: () => [...tables].filter(([, { rows }]) => rows > 0).map(([table, { rows }]) => ({ table, rows })),
+    /** Stages `parts`' rows, a record's, as a whole: false where they do not decode, and none of them is staged. */
+    async record(parts: Iterable<TelemetryRows>): Promise<boolean> {
+      const pending = new Map<OtelTable, TelemetryRow[]>();
+      const appenders = new Map<OtelTable, DuckDBAppender>();
+      const append = async (table: OtelTable, chunkRows: readonly TelemetryRow[]) => {
+        const { columns, types } = await opened(table);
+        const appender = appenders.get(table) ?? await db.createAppender(recordStaging(table), "main", "temp");
+        appenders.set(table, appender);
+        const chunk = DuckDBDataChunk.create(types, chunkRows.length);
+        chunk.setRows(chunkRows.map((row) => columns.map((column) => row[column] ?? null)));
+        appender.appendDataChunk(chunk);
+      };
+      let whole = true;
+      try {
+        for (const part of parts) {
+          for (const [table, tableRows] of Object.entries(part) as [OtelTable, TelemetryRow[]][]) {
+            const waiting = [...(pending.get(table) ?? []), ...tableRows];
+            for (; waiting.length >= CHUNK_ROWS; waiting.splice(0, CHUNK_ROWS)) await append(table, waiting.slice(0, CHUNK_ROWS));
+            pending.set(table, waiting);
+          }
+        }
+        for (const [table, waiting] of pending) if (waiting.length > 0) await append(table, waiting);
+      } catch (error) {
+        if (!(error instanceof MalformedRequest)) throw ofRows(error);
+        whole = false;
+      } finally {
+        for (const appender of appenders.values()) appender.closeSync();
+      }
+      for (const table of appenders.keys()) {
+        if (whole) {
+          const moved = await db.run(`insert into temp.${batchStaging(table)} from temp.${recordStaging(table)}`);
+          tables.get(table)!.rows += Number(moved.rowsChanged);
+        }
+        await db.run(`delete from temp.${recordStaging(table)}`);
+      }
+      return whole;
+    },
+  };
+}
+
+/** A record of the log's, at its offset in its topic's partition. */
+export interface Position {
+  readonly topic: string;
+  readonly partition: number;
+  readonly offset: bigint;
 }
 
 /**
- * Writes `rows` (telemetryRows's) to the lake in one transaction, staged in DuckDB's
- * memory first, so the transaction is no longer than its inserts. Returns how many
- * rows each table was given.
+ * A record the intake consumed: where it is in the log, of its topic by the topic's id, and
+ * its rows, a part's at a time, as they are taken, which throw MalformedRequest for a record
+ * that does not decode, which is skipped.
  */
-export async function writeTelemetry(db: DuckDBConnection, rows: TelemetryRows): Promise<Partial<Record<OtelTable, number>>> {
-  const written: Partial<Record<OtelTable, number>> = {};
-  for (const table of OTEL_TABLES) {
-    const tableRows = rows[table] ?? [];
-    if (tableRows.length === 0) continue;
-    await db.run(`create or replace temp table ${staging(table)} (${TABLES[table].columns})`);
-    const columns = (await db.runAndReadAll(`from temp.${staging(table)} limit 0`)).columnNames();
-    const appender = await db.createAppender(staging(table), "main", "temp");
-    try {
-      for (const row of tableRows) append(appender, columns, row);
-      appender.flushSync();
-    } finally {
-      appender.closeSync();
-    }
-    written[table] = tableRows.length;
-  }
-  await transaction(db, async () => {
-    for (const table of Object.keys(written) as OtelTable[]) await db.run(`insert into ${LAKE}.otel.${table} from temp.${staging(table)}`);
-  });
-  return written;
+export interface Consumed extends Position {
+  readonly topicId: string;
+  readonly rows: Iterable<TelemetryRows>;
 }
 
-/** Moves the telemetry the catalog holds inlined to Parquet files. */
-export function flushTelemetry(db: DuckDBConnection): Promise<unknown> {
-  return serially(() => db.run(`call ducklake_flush_inlined_data('${LAKE}', schema_name => 'otel')`));
+/** What writeConsumed did: the rows each table was given, the records skipped as written before or undecodable, and where each partition is written to now. */
+export interface ConsumedWrite {
+  readonly written: Partial<Record<OtelTable, number>>;
+  readonly repeated: number;
+  /** The records skipped as they do not decode. */
+  readonly malformed: readonly Position[];
+  /** For each partition of the batch, the offset of the next record to write. */
+  readonly next: readonly Position[];
+}
+
+/** Where the lake is written to of a partition of a topic of the log's, of the topic by its id: the offset of the next record. */
+export interface Held extends Position {
+  readonly topicId: string;
+}
+
+/** Where the lake is written to of each partition it has written of. */
+export async function heldOffsets(db: DuckDBConnection): Promise<Held[]> {
+  return (await rows<{ Topic: string; TopicId: string; PartitionId: number; NextOffset: bigint }>(db, `from ${LAKE}.otel.${OFFSETS}`))
+    .map((row) => ({ topic: row.Topic, topicId: row.TopicId, partition: row.PartitionId, offset: BigInt(row.NextOffset) }));
+}
+
+const partitionKey = ({ topic, partition }: Pick<Position, "topic" | "partition">) => `${topic}\u0000${partition}`;
+
+/**
+ * Writes `consumed`, a batch the intake read from the log, in one transaction with the
+ * offset each of its partitions is written to: of each partition, the records at or past
+ * the offset the lake holds alone, so a batch written before, read again after a crash or
+ * a rebalance, is written once; every record of a topic other than the one the lake holds
+ * an offset of, by its id, as one made anew is. Each record's rows are staged in DuckDB's
+ * memory first, a record at a time (staging).
+ */
+export function writeConsumed(db: DuckDBConnection, consumed: readonly Consumed[]): Promise<ConsumedWrite> {
+  return transaction(db, async () => {
+    const held = new Map((await heldOffsets(db)).map((offset) => [partitionKey(offset), { topicId: offset.topicId, next: offset.offset }]));
+    const heldOf = (record: Consumed) => {
+      const offset = held.get(partitionKey(record));
+      return offset?.topicId === record.topicId ? offset.next : 0n;
+    };
+    const fresh = consumed.filter((record) => record.offset >= heldOf(record));
+    const staged = staging(db);
+    const malformed: Position[] = [];
+    for (const record of fresh) if (!(await staged.record(record.rows))) malformed.push(record);
+    const written: Partial<Record<OtelTable, number>> = {};
+    for (const { table, rows: stagedRows } of staged.tables()) {
+      await db.run(`insert into ${LAKE}.otel.${table} from temp.${batchStaging(table)}`).catch((error: unknown) =>
+        Promise.reject(error instanceof Error && VALUE_REFUSED.test(error.message) ? new UnwritableRows(error) : error)
+      );
+      written[table] = stagedRows;
+    }
+    const next = new Map<string, Position & { readonly topicId: string }>();
+    for (const record of fresh) {
+      const after = record.offset + 1n;
+      if ((next.get(partitionKey(record))?.offset ?? -1n) < after) next.set(partitionKey(record), { topic: record.topic, topicId: record.topicId, partition: record.partition, offset: after });
+    }
+    for (const { topic, topicId, partition, offset } of next.values()) {
+      await db.run(`delete from ${LAKE}.otel.${OFFSETS} where Topic = $1 and PartitionId = $2`, [topic, partition]);
+      await db.run(`insert into ${LAKE}.otel.${OFFSETS} values ($1, $2, $3, $4)`, [topic, topicId, partition, offset]);
+    }
+    const positions = new Map<string, Position>();
+    for (const record of consumed) {
+      const known = heldOf(record);
+      const reached = next.get(partitionKey(record))?.offset ?? known;
+      positions.set(partitionKey(record), { topic: record.topic, partition: record.partition, offset: reached > known ? reached : known });
+    }
+    return {
+      written,
+      repeated: consumed.length - fresh.length,
+      malformed,
+      next: [...positions.values()],
+    };
+  });
 }
 
 /**
@@ -498,7 +647,7 @@ export function flushTelemetry(db: DuckDBConnection): Promise<unknown> {
  * so a branch that still names them keeps them.
  */
 export function mergeTelemetry(db: DuckDBConnection): Promise<unknown> {
-  return serially(async () => {
+  return transaction(db, async () => {
     for (const table of OTEL_TABLES) await db.run(`call ducklake_merge_adjacent_files('${LAKE}', '${table}', schema => 'otel')`);
   });
 }

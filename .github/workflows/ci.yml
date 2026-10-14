@@ -38,6 +38,9 @@ jobs:
           node-version: 24.14.0
           cache: npm
       - run: npm ci
+      # The lake's package installed too, as a checkout that builds its image has it: its
+      # modules then resolve its own copies, which the root's tests must work beside.
+      - run: npm ci --prefix neon/lake
       - run: npm run typecheck
       - run: npm test
 
@@ -99,7 +102,7 @@ jobs:
           PREVIOUS: ${{ steps.previous.outputs.previous }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node" "alasio-codex-stand-in-previous:test"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-log:neon/log" "alasio-collector:neon/collector" "alasio-node:cluster/node" "alasio-codex-stand-in-previous:test"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
@@ -259,7 +262,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node alasio-codex-stand-in alasio-codex-stand-in-previous; do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-log alasio-collector alasio-node alasio-codex-stand-in alasio-codex-stand-in-previous; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then

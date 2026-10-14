@@ -6,7 +6,7 @@ import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
-import type { SeaweedS3Config, StackSecrets, StoredSecrets } from "../neon/control/secrets.ts";
+import { clusterId, type SeaweedS3Config, type StackSecrets, type StoredSecrets } from "../neon/control/secrets.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
 
@@ -106,7 +106,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const config = setupConfig(ENV);
   await setupKube({ kube, config, log: () => {} });
   const names = secretNames("q");
-  assert.deepEqual([...kube.secrets.keys()].sort(), Object.values(names).sort());
+  // Every Secret's name, each log principal's among them.
+  const every = Object.values(names).flatMap((name) => (typeof name === "string" ? [name] : Object.values(name)));
+  assert.deepEqual([...kube.secrets.keys()].sort(), every.sort());
   const root: StackSecrets = JSON.parse(value(kube, names.root, "secrets.json"));
   const publicKey = value(kube, names.root, "auth_public_key.pem");
 
@@ -133,6 +135,21 @@ test("the stack's secrets are made once, and every service's rendered from them 
   assert.ok(!pageserverKeys.includes("identity.toml") && !pageserverKeys.includes("metadata.json"), pageserverKeys.join(", "));
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
   assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces", "snapshots"]);
+
+  // The log's: its cluster's id and its admin's password; every principal's for its
+  // access applier; and each principal's, KEDA's with its mechanism.
+  assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
+  assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["gateway", "intake", "scaler"]);
+  assert.deepEqual(names.logPrincipals, { gateway: "q-log-gateway", intake: "q-log-intake", scaler: "q-log-scaler" });
+  for (const principal of ["gateway", "intake", "scaler"] as const) {
+    assert.equal(value(kube, names.logAccess, principal), root.log[principal]);
+    assert.equal(value(kube, names.logPrincipals[principal], "username"), principal);
+    assert.equal(value(kube, names.logPrincipals[principal], "password"), root.log[principal]);
+  }
+  assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
+  assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
+  assert.equal(new Set(Object.values(root.log)).size, 4);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -219,7 +236,13 @@ test("the stack's secrets are made once, and every service's rendered from them 
   await setupKube({ kube, config, log: () => {} });
   assert.deepEqual(JSON.parse(value(kube, names.root, "secrets.json")), root);
   assert.equal(value(kube, names.root, "auth_public_key.pem"), publicKey);
-  assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, Object.keys(names).length);
+  assert.equal(kube.writes.filter(([verb]) => verb === "replace").length, every.length);
+});
+
+test("the log's cluster id is Kafka's kind, and never begins with what its command line takes for an option", () => {
+  // One in 64 would begin with "-" drawn alone.
+  const ids = Array.from({ length: 10_000 }, clusterId);
+  assert.deepEqual(ids.filter((id) => !/^[A-Za-z0-9_][A-Za-z0-9_-]{21}$/u.test(id)), []);
 });
 
 test("a root predating a secret gains it without losing the rest", async () => {
@@ -284,6 +307,8 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
     nodeAgentToken: "n",
+    logClusterId: "cluster",
+    log: { admin: "la", gateway: "lg", intake: "li", scaler: "ls" },
   };
 }
 

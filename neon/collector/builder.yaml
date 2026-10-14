@@ -1,0 +1,27 @@
+# The collector alasio builds (./Dockerfile): the components its gateway's and its scraper's
+# configurations name (cli/src/manifests/collector.ts), of the contrib release 0.161.0, with
+# franz-go v1.22.2 for the kafka exporter's v1.21.6.
+dist:
+  name: otelcol
+  description: alasio's collector
+  version: 0.161.0
+  output_path: ./otelcol
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.161.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver v0.161.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver v0.161.0
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.161.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor v0.161.0
+exporters:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter v0.161.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.161.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.161.0
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.161.0
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.67.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.67.0
+replaces:
+  - github.com/twmb/franz-go => github.com/twmb/franz-go v1.22.2
+  - github.com/twmb/franz-go/pkg/kmsg => github.com/twmb/franz-go/pkg/kmsg v1.15.0

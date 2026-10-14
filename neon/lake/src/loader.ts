@@ -3,7 +3,8 @@
  * whenever the last is older than its interval (it is recorded in the lake, so a
  * restart neither repeats nor skips one), which deletes the telemetry past its
  * retention too, and deletes no file while Neon has branches; a branch environment's
- * lake is never maintained.
+ * lake is never maintained. Every hour too, the telemetry's files of the hour, which the
+ * intake writes a commit a minute, are merged (mergeTelemetry), so a day's are a few.
  *
  * The loop opens the lake itself and keeps it open between loads. A load that fails
  * is logged and counted, its connections are dropped, and it is tried again sooner
@@ -14,6 +15,7 @@
 import type { DuckDBConnection } from "@duckdb/node-api";
 
 import type { Metrics } from "./metrics.ts";
+import { mergeTelemetry } from "./otel.ts";
 import { type LakeLoad, lastMaintained, maintainLake, syncLake } from "./sync.ts";
 
 /** The lake as the loader holds it: open for loading, under the loader's lock. */
@@ -43,6 +45,9 @@ export interface LoaderOptions {
   branches?: () => Promise<readonly string[]>;
   retryMs?: number;
   sync?: (db: DuckDBConnection) => Promise<LakeLoad>;
+  /** How often the telemetry's files are merged; null for never, as a branch environment's lake, which holds none of it. */
+  mergeIntervalMs?: number | null;
+  merge?: (db: DuckDBConnection) => Promise<unknown>;
 }
 
 /** Whether the loader is well (unhealthy once loads have failed long enough), and why. */
@@ -58,6 +63,8 @@ export interface Loader {
 
 /** How soon a failed load is tried again, at most. */
 export const RETRY_MS = 30_000;
+/** How often the telemetry's files are merged. */
+export const MERGE_INTERVAL_MS = 3_600_000;
 /** How many intervals of failing loads make the loader unhealthy. */
 const UNHEALTHY_AFTER_INTERVALS = 3;
 
@@ -81,12 +88,15 @@ export function startLoader({
   branches = async () => [],
   retryMs = RETRY_MS,
   sync = syncLake,
+  mergeIntervalMs = MERGE_INTERVAL_MS,
+  merge = mergeTelemetry,
 }: LoaderOptions): Loader {
   const stopped = new AbortController();
   let lake: LoaderLake | null = null;
   let wake: (() => void) | null = null;
   let detail = "starting";
   let failingSince: number | null = null;
+  let mergedAt = Date.now();
 
   async function drop() {
     const closing = lake;
@@ -153,11 +163,25 @@ export function startLoader({
     }
   }
 
+  /** Merges the telemetry's files, if the last merge is older than `every`. */
+  async function mergeIfDue(every: number) {
+    if (Date.now() - mergedAt < every) return;
+    mergedAt = Date.now();
+    try {
+      await merge(lake!.db);
+      metrics.add("lake_telemetry_merges_total", { outcome: "success" });
+    } catch (error) {
+      metrics.add("lake_telemetry_merges_total", { outcome: "failure" });
+      log("merging the telemetry's files failed", { error: errorText(error) });
+    }
+  }
+
   const done = (async () => {
     while (!stopped.signal.aborted) {
       const loaded = await cycle();
       if (stopped.signal.aborted) break;
       if (loaded && maintenanceIntervalMs !== null) await maintainIfDue(maintenanceIntervalMs);
+      if (loaded && mergeIntervalMs !== null) await mergeIfDue(mergeIntervalMs);
       if (stopped.signal.aborted) break;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, loaded ? intervalMs : Math.min(intervalMs, retryMs));

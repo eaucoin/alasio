@@ -20,7 +20,7 @@
  */
 import type { DuckDBConnection } from "@duckdb/node-api";
 
-import { LAKE, rows, serially, transaction } from "./lake.ts";
+import { LAKE, rows, transaction } from "./lake.ts";
 
 export interface RebuildOptions {
   /** Drop the lake whatever its model version, to be loaded again from its source. */
@@ -181,7 +181,7 @@ export async function ensureModel(db: DuckDBConnection, { rebuild = false }: Reb
     await db.run(`insert into ${LAKE}.loader.meta values ('model_version', '${MODEL_VERSION}')`);
   });
   // Once the schemas are committed: DuckLake sets no option of a schema made in the same transaction.
-  await serially(async () => {
+  await transaction(db, async () => {
     for (const schema of ["claude", "codex"]) {
       await db.run(`call ${LAKE}.set_option('parquet_row_group_size', ${ROW_GROUP_ROWS}, schema => '${schema}')`);
     }

@@ -2,8 +2,8 @@
  * The PriorityClasses every pod of alasio's runs under. Highest, the floor's pods that
  * their volumes hold to a node: the StatefulSets of what never sleeps that keep their
  * data on claims (Neon's safekeepers, pageserver and storage controller's database, the
- * object store's masters and volume servers, and the Valkeys, the filer store's and
- * alasio's), whose claims a local disk binds to its node. Then, two classes of one value:
+ * object store's masters and volume servers, the Valkeys, the filer store's and alasio's,
+ * and the log), whose claims a local disk binds to its node. Then, two classes of one value:
  * the rest of the floor, what never sleeps (Neon's proxy and neon-control, and main's
  * compute while it runs, the object store's filers and gateways, workspace storage's
  * metadata, main's lake, Grafana, the collector and the controllers); and the pods that

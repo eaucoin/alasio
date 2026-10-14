@@ -808,7 +808,7 @@ test("logs prints a component's log, each line with its pod's name when it has s
   const lake = await alasio(["logs", "lake"]);
   succeeded(lake);
   assert.deepEqual(lake.stdout.split("\n").filter(Boolean).sort(), ["[lake] loaded", "[query] taking queries"]);
-  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake, /u);
+  assert.match(failure(await alasio(["logs", "nothing"])), /^alasio has no component nothing; it has agent-sandbox-controller, alasio, collector, collector-scraper, grafana, keda-admission-webhooks, keda-metrics-apiserver, keda-operator, lake, lake-intake, log, /u);
 });
 
 test("restart rolls alasio's pod out again as a manager of its own, and waits until it runs", async (t) => {
@@ -834,7 +834,11 @@ test("upgrade says what it installs, and which images change", async (t) => {
   setup.configure({ target: { kubeconfig: { path: setup.kubeconfig } }, install: { images: { lake: { tag: "9.9.9" } } } });
   const changed = await setup.alasio(["upgrade"]);
   succeeded(changed);
-  assert.equal(changed.printed[0], "alasio 0.0.0-development, with other images:\n  alasio-lake: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9");
+  assert.equal(changed.printed[0], [
+    "alasio 0.0.0-development, with other images:",
+    "  alasio-lake: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9",
+    "  alasio-lake-intake: ghcr.io/eaucoin/alasio-lake:0.0.0-development → ghcr.io/eaucoin/alasio-lake:9.9.9",
+  ].join("\n"));
 });
 
 test("login codex runs Codex's device login in alasio's pod, and fails as it does", async (t) => {

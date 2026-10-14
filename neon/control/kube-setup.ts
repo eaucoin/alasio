@@ -32,6 +32,8 @@ import {
   GRAFANA_ROLE,
   LAKE_READER_ROLE,
   LAKE_ROLE,
+  LOG_PRINCIPALS,
+  type LogPrincipal,
   pageserverToml,
   remoteStorage,
   ROLE,
@@ -67,6 +69,10 @@ export interface SecretNames {
   workspaces: string;
   snapshots: string;
   nodeAgent: string;
+  /** The log's own (its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
+  log: string;
+  logAccess: string;
+  logPrincipals: Record<LogPrincipal, string>;
 }
 
 /** Workspace storage, as the setup makes its Secrets. */
@@ -166,6 +172,9 @@ export function secretNames(prefix: string): SecretNames {
     workspaces: `${prefix}-workspaces-juicefs`,
     snapshots: `${prefix}-snapshots`,
     nodeAgent: `${prefix}-node-agent`,
+    log: `${prefix}-log`,
+    logAccess: `${prefix}-log-access`,
+    logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
   };
 }
 
@@ -254,6 +263,20 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
       GF_SECURITY_SECRET_KEY: secrets.grafanaSecretKey,
       LAKE_QUERY_TOKEN: secrets.lakeQueryToken,
     },
+    // The log's, which its nodes are formatted and run with, and which its access applier
+    // logs in as its admin with; that applier's, every principal's password, which it gives
+    // each principal; and each principal's, which what logs in as it is given (KEDA's with
+    // the SASL mechanism, as its Kafka scaler reads it).
+    [names.log]: {
+      KAFKA_CLUSTER_ID: secrets.logClusterId,
+      LOG_ADMIN_PASSWORD: secrets.log.admin,
+    },
+    [names.logAccess]: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, secrets.log[principal]])),
+    ...Object.fromEntries(LOG_PRINCIPALS.map((principal) => [names.logPrincipals[principal], {
+      username: principal,
+      password: secrets.log[principal],
+      ...(principal === "scaler" ? { sasl: "scram_sha512" } : {}),
+    }])),
     // Branch environments': the token alasio's command line manages Neon's branches with,
     // and the key alasio signs each one's token to fork its sessions with.
     [names.branches]: {

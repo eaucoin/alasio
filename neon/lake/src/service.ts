@@ -1,18 +1,17 @@
 /**
  * The lake service: the stack's container that keeps the analytics lake loaded from
- * alasio's Neon (model.ts), and takes alasio's telemetry into it (intake.ts). One loads
- * at a time, which a Postgres advisory lock on the catalog makes sure of; DuckDB keeps
- * nothing of its own, so the container is replaceable at any moment, and the loader and
- * the intake each open their connections again whenever they fail, as when the compute
- * restarts.
+ * alasio's Neon (model.ts), maintains it, and merges the telemetry's files hourly, which
+ * the telemetry intake writes (intake-service.ts, a Deployment of its own). One loads at a
+ * time, which a Postgres advisory lock on the catalog makes sure of, and its writes take
+ * turns with the intake's under the lake's write lock (lake.ts); DuckDB keeps nothing of
+ * its own, so the container is replaceable at any moment, and the loader opens its
+ * connections again whenever they fail, as when the compute restarts.
  *
- * It serves /healthz (its pod's liveness: loads are not failing for long), /readyz (its
- * readiness: the intake has the lake open, so telemetry can be taken and the lake
- * queried) and /metrics (Prometheus, for the stack's telemetry collector) on
- * LAKE_HTTP_PORT, and the intake, OTLP over HTTP, on LAKE_INTAKE_PORT, from the moment
- * it starts. It logs a JSON line per event, and exports each as telemetry too
- * (telemetry.ts). The lake is read through the query endpoint (endpoint.ts), a
- * process of its own beside this one.
+ * It serves /healthz and /readyz (its pod's liveness and readiness: loads are not failing
+ * for long) and /metrics (Prometheus, for the stack's telemetry collector) on
+ * LAKE_HTTP_PORT. It logs a JSON line per event, and exports each as telemetry too
+ * (telemetry.ts). The lake is read through the query endpoint (endpoint.ts), a process of
+ * its own beside this one.
  */
 import { createServer } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -21,22 +20,15 @@ import pg from "pg";
 
 import { branchesBesideMain } from "./branches.ts";
 import { type DatabaseConfig, loadConfig } from "./config.ts";
-import { type IntakeLake, startIntake } from "./intake.ts";
-import { type Lake, openLake } from "./lake.ts";
+import { CONNECT_TIMEOUT_MS, type Lake, openLake, writeLock } from "./lake.ts";
 import { type LoaderLake, startLoader } from "./loader.ts";
 import { createMetrics, sampleMemory } from "./metrics.ts";
-import { ensureOtel } from "./otel.ts";
-import { grantReads } from "./reader.ts";
 import { prepareLake } from "./sync.ts";
 import { startTelemetry } from "./telemetry.ts";
 
 /** Names the one loader's advisory lock, in the catalog database. */
 const LOCK = "alasio.lake.loader";
 const LOCK_RETRY_MS = 10_000;
-/** The intake's DuckDB's memory limit: a request's rows, staged, are all it holds. */
-const INTAKE_MEMORY_LIMIT = "256MB";
-/** How long a connection may take: Neon's proxy holds it while it wakes a compute that sleeps, which has taken half a minute. */
-const CONNECT_TIMEOUT_MS = 60_000;
 
 /** The loader's lock: the connection holding it, and whether that has since been lost. */
 interface LoaderLock {
@@ -82,9 +74,10 @@ async function takeLock(catalog: DatabaseConfig, signal: AbortSignal): Promise<L
 }
 
 const config = loadConfig();
+writeLock(config.catalog);
 
-/** The lake as the loader and the intake each have it open now, whose DuckDBs' memory /metrics reports. */
-const opened: Record<"loader" | "intake", Lake | null> = { loader: null, intake: null };
+/** The lake as the loader has it open now, whose DuckDB's memory /metrics reports. */
+const opened: Record<"loader", Lake | null> = { loader: null };
 
 /** Opens the lake for loading, under the lock, its model made ready. */
 async function open(signal: AbortSignal): Promise<LoaderLake> {
@@ -111,33 +104,6 @@ async function open(signal: AbortSignal): Promise<LoaderLake> {
   };
 }
 
-/**
- * Opens the lake for the intake: no source, the telemetry's schema made ready, and the
- * catalog, which the intake's first open makes, readable by the query endpoint's reader.
- */
-async function openForIntake(): Promise<IntakeLake> {
-  const lake = await openLake(config, { memoryLimit: INTAKE_MEMORY_LIMIT });
-  const catalog = new pg.Client({ ...config.catalog, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
-  try {
-    await ensureOtel(lake.db);
-    await catalog.connect();
-    await grantReads(catalog);
-  } catch (error) {
-    lake.close();
-    throw error;
-  } finally {
-    await catalog.end().catch(() => {});
-  }
-  opened.intake = lake;
-  return {
-    db: lake.db,
-    close() {
-      opened.intake = null;
-      lake.close();
-    },
-  };
-}
-
 const metrics = createMetrics();
 const { branches } = config;
 const loader = startLoader({
@@ -148,15 +114,14 @@ const loader = startLoader({
   maintenanceIntervalMs: config.maintenanceIntervalMs,
   retentionDays: config.retentionDays,
   ...(branches ? { branches: () => branchesBesideMain(branches) } : {}),
+  // A branch environment's lake, never maintained, holds no telemetry to merge.
+  ...(config.maintenanceIntervalMs === null ? { mergeIntervalMs: null } : {}),
 });
-const intake = startIntake({ open: openForIntake, metrics, log });
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && (request.url === "/healthz" || request.url === "/readyz")) {
     const { ok, detail } = loader.health();
-    const well = request.url === "/healthz" ? ok : intake.ready();
-    const said = `loader: ${detail}; intake: ${intake.ready() ? "open" : "opening the lake"}`;
-    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`${said}\n`);
+    response.writeHead(ok ? 200 : 503, { "content-type": "text/plain" }).end(`loader: ${detail}\n`);
     return;
   }
   if (request.method === "GET" && request.url === "/metrics") {
@@ -169,18 +134,14 @@ const server = createServer((request, response) => {
   response.writeHead(404).end();
 });
 server.listen(config.httpPort, "0.0.0.0", () => log("listening", { port: config.httpPort }));
-const intakeServer = createServer(intake.handle);
-intakeServer.listen(config.intakePort, "0.0.0.0", () => log("taking telemetry", { port: config.intakePort }));
 
 // As PID 1 in its container, Node would otherwise ignore docker stop's SIGTERM. A
-// load or a write under way finishes first; being transactional, one cut short by the
-// kill that follows the grace period loses nothing either, and the collector sends
-// again what it was not told was written.
+// load under way finishes first; being transactional, one cut short by the kill that
+// follows the grace period loses nothing either.
 process.on("SIGTERM", async () => {
   log("stopping");
   server.close();
-  intakeServer.close();
-  await Promise.all([loader.stop(), intake.stop()]);
+  await loader.stop();
   await telemetry?.shutdown();
   process.exit(0);
 });

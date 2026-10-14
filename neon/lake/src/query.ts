@@ -10,6 +10,7 @@
  * otel.ts).
  */
 import { loadEndpointConfig } from "./config.ts";
+import { ANSWER_WITHIN_MS } from "./endpoint.ts";
 import type { AnsweredRow } from "./reader.ts";
 
 const FORMATS = ["table", "csv", "json"] as const;
@@ -59,7 +60,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   try {
     const { output, sql } = parseArguments(process.argv.slice(2));
     const { port, token } = loadEndpointConfig();
-    const response = await fetch(`http://127.0.0.1:${port}/query`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: sql });
+    // The endpoint answers within ANSWER_WITHIN_MS, whatever holds the lake; past that, it is not answering at all.
+    const response = await fetch(`http://127.0.0.1:${port}/query`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: sql, signal: AbortSignal.timeout(ANSWER_WITHIN_MS + 15_000) })
+      .catch((error: unknown) => Promise.reject(new Error(`the lake's query endpoint did not answer: ${error instanceof Error ? error.message : String(error)}`)));
     if (!response.ok) throw new Error((await response.text()).trim());
     // The endpoint answers rows.
     console.log(format((await response.json()) as AnsweredRow[], output));

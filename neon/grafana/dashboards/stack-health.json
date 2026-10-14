@@ -264,7 +264,7 @@
         "w": 12,
         "h": 8
       },
-      "description": "Spans, log records and metric points written to the lake, by when they happened. None at all is the intake, or the collector, down.",
+      "description": "Spans, log records and metric points written to the lake, by when they happened. None at all is the intake, the log, or the collector, down.",
       "datasource": {
         "type": "yesoreyeram-infinity-datasource",
         "uid": "lake"
@@ -501,13 +501,167 @@
       }
     },
     {
+      "id": 16,
+      "type": "timeseries",
+      "title": "The log's answers",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "description": "How long the log takes to answer what writes to it (p99 of its Produce requests), the gateway answering an export only once the log has it; and what its partitions hold on the fullest of its nodes' volumes, which its retention keeps within three quarters of it for the telemetry.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, 'produce, p99 (ms)' as measure, max(Value) as value from otel.metrics_gauge\nwhere ServiceName = 'log' and MetricName = 'kafka_request_total_time_ms' and Attributes['request'] = 'Produce' and Attributes['percentile'] = '99' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all\nunion all select time, 'held on the fullest volume (MiB)', max(held) / 1048576 from (\nselect time, node, sum(bytes) as held from (\nselect time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, ResourceAttributes['service.instance.id'] as node, Attributes['topic'], Attributes['partition'], max(Value) as bytes from otel.metrics_gauge\nwhere ServiceName = 'log' and MetricName = 'kafka_log_size_bytes' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all)\ngroup by all)\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "measure",
+              "text": "measure",
+              "type": "string"
+            },
+            {
+              "selector": "value",
+              "text": "value",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.measure}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Telemetry waiting in the log",
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Records of the stack's telemetry the lake's intake has yet to read, by topic, as it last asked the log: KEDA gives it another replica past 1,000 a partition, and it sleeps while none waits.",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource",
+        "uid": "lake"
+      },
+      "interval": "5m",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "yesoreyeram-infinity-datasource",
+            "uid": "lake"
+          },
+          "type": "json",
+          "source": "url",
+          "parser": "backend",
+          "format": "timeseries",
+          "url": "/query",
+          "url_options": {
+            "method": "POST",
+            "body_type": "raw",
+            "body_content_type": "text/plain",
+            "data": "select time_bucket(to_milliseconds(${__interval_ms}), TimeUnix) as time, Attributes['topic'] as topic, max(Value) as value from otel.metrics_gauge\nwhere ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records' and TimeUnix >= epoch_ms(${__from}) and TimeUnix < epoch_ms(${__to})\ngroup by all order by 1"
+          },
+          "root_selector": "",
+          "columns": [
+            {
+              "selector": "time",
+              "text": "time",
+              "type": "timestamp"
+            },
+            {
+              "selector": "topic",
+              "text": "topic",
+              "type": "string"
+            },
+            {
+              "selector": "value",
+              "text": "value",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "displayName": "${__field.labels.topic}",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
       "id": 8,
       "type": "row",
       "title": "Storage",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 27,
+        "y": 35,
         "w": 24,
         "h": 1
       },
@@ -519,7 +673,7 @@
       "title": "Neon's pageserver",
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 36,
         "w": 8,
         "h": 8
       },
@@ -599,7 +753,7 @@
       "title": "Workspaces' JuiceFS",
       "gridPos": {
         "x": 8,
-        "y": 28,
+        "y": 36,
         "w": 8,
         "h": 8
       },
@@ -679,7 +833,7 @@
       "title": "The Valkeys' memory",
       "gridPos": {
         "x": 16,
-        "y": 28,
+        "y": 36,
         "w": 8,
         "h": 8
       },
@@ -759,7 +913,7 @@
       "title": "The lake's tables",
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 44,
         "w": 16,
         "h": 8
       },
@@ -858,7 +1012,7 @@
       "title": "The lake's memory",
       "gridPos": {
         "x": 16,
-        "y": 36,
+        "y": 44,
         "w": 8,
         "h": 8
       },
@@ -938,7 +1092,7 @@
       "title": "The object store's disk",
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 52,
         "w": 12,
         "h": 8
       },
@@ -1018,7 +1172,7 @@
       "title": "The object store's volume servers",
       "gridPos": {
         "x": 12,
-        "y": 44,
+        "y": 52,
         "w": 12,
         "h": 8
       },

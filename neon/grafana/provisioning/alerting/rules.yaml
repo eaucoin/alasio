@@ -102,7 +102,7 @@ groups:
         execErrState: Error
         labels: {severity: critical}
         annotations:
-          summary: "No metric has reached the lake for five minutes: its intake, or the stack's collector, is down."
+          summary: "No metric has reached the lake for five minutes: its intake, the log, or the stack's collector, is down."
         data:
           - refId: points
             relativeTimeRange: {from: 300, to: 0}
@@ -452,3 +452,48 @@ groups:
               type: threshold
               expression: bytes
               conditions: [{evaluator: {type: gt, params: [268435456]}}]
+
+      # What of the stack's telemetry waits in the log for the lake's intake, as the intake
+      # reports it by topic (lake_telemetry_lag_records): over four of its batches for ten
+      # minutes, it does not keep up.
+      - uid: alasio-telemetry-waiting
+        title: Telemetry waits in the log
+        condition: behind
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $values.waiting }} records of the stack's telemetry wait in the log for the lake's intake, more than four of its batches: it does not keep up. Let it run more replicas, lake.intake.scaling's max, which the log's topics take as many partitions as."
+        data:
+          - refId: waiting
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: lake
+            model:
+              refId: waiting
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select sum(waiting) as waiting from (
+                    select Attributes['topic'] as topic, arg_max(Value, TimeUnix) as waiting
+                    from otel.metrics_gauge
+                    where ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records' and TimeUnix > now()::timestamp - interval 5 minute
+                    group by 1)
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: waiting, text: waiting, type: number}
+          - refId: behind
+            datasourceUid: __expr__
+            model:
+              refId: behind
+              type: threshold
+              expression: waiting
+              conditions: [{evaluator: {type: gt, params: [8000]}}]
