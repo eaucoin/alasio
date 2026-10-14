@@ -94,16 +94,16 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     return yield* closes ? control : afterAcknowledging(callbackQuery.id, control);
   }
   if (action.kind === "steer") {
-    const payload = concurrentPromptPayload(action);
-    const promptJob = payload.jobId ? yield* store.getPromptJob(payload.jobId) : null;
-    const prompt = promptJob?.prompt ?? payload.prompt;
-    // The files the prompt names, written again if a restart came since.
-    if (promptJob) {
-      yield* Effect.flatMap(ReceivedFiles, (files) => files.materialize(promptJob.file_ids));
+    const promptJob = yield* store.getPromptJob(concurrentPromptPayload(action).jobId);
+    if (!promptJob) {
+      yield* client.answerCallbackQuery(callbackQuery.id, "That message is no longer held.");
+      return;
     }
-    /** Keeps the message for after the running turn instead: its job made pending again, or a queued message. */
-    const queueInstead = promptJob ? turns.setPromptDisposition(promptJob.id, "pending") : turns.enqueueMessage(conversationId, prompt);
-    const steered = yield* activeTurns.steer(conversationId, prompt).pipe(Effect.result);
+    // The files the prompt names, written again if a restart came since.
+    yield* Effect.flatMap(ReceivedFiles, (files) => files.materialize(promptJob.file_ids));
+    /** Keeps the message for after the running turn instead: its job made pending again. */
+    const queueInstead = turns.setPromptDisposition(promptJob.id, "pending");
+    const steered = yield* activeTurns.steer(conversationId, promptJob.prompt).pipe(Effect.result);
     if (Result.isFailure(steered)) {
       yield* queueInstead;
       yield* client.answerCallbackQuery(callbackQuery.id, "Queued.");
@@ -111,9 +111,7 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
       return;
     }
     if (Option.getOrElse(steered.success, () => false)) {
-      if (promptJob) {
-        yield* turns.setPromptDisposition(promptJob.id, "completed");
-      }
+      yield* turns.setPromptDisposition(promptJob.id, "completed");
       yield* client.answerCallbackQuery(callbackQuery.id, "Steered.");
       yield* client.editMessageText(chatId, messageId, `Sent as guidance to the active ${harness.displayName} turn.`);
       return;
@@ -133,33 +131,22 @@ export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: Ca
     return yield* closes ? control : afterAcknowledging(callbackQuery.id, control);
   }
   if (action.kind === "queue") {
-    const payload = concurrentPromptPayload(action);
-    yield* payload.jobId ? turns.setPromptDisposition(payload.jobId, "pending") : turns.enqueueMessage(conversationId, payload.prompt);
+    yield* turns.setPromptDisposition(concurrentPromptPayload(action).jobId, "pending");
     yield* client.answerCallbackQuery(callbackQuery.id, "Queued.");
     yield* client.editMessageText(chatId, messageId, `Queued. ${harness.displayName} will process this after the current task.`);
     return;
   }
   if (action.kind === "discard") {
-    const payload = concurrentPromptPayload(action);
-    if (payload.jobId) {
-      yield* turns.setPromptDisposition(payload.jobId, "cancelled");
-    }
+    yield* turns.setPromptDisposition(concurrentPromptPayload(action).jobId, "cancelled");
     yield* client.answerCallbackQuery(callbackQuery.id, "Discarded.");
     yield* client.editMessageText(chatId, messageId, "Discarded.");
     return;
   }
   if (action.kind === "swerve") {
-    const payload = concurrentPromptPayload(action);
-    if (payload.jobId) {
-      // First in line, scheduled once the running turn has let go.
-      yield* store.setPromptJobDisposition(payload.jobId, "pending", 1);
-    } else {
-      yield* turns.enqueueMessage(conversationId, payload.prompt, true);
-    }
+    // First in line, scheduled once the running turn has let go.
+    yield* store.setPromptJobDisposition(concurrentPromptPayload(action).jobId, "pending", 1);
     yield* activeTurns.stop(conversationId, "swerve");
-    if (payload.jobId) {
-      yield* turns.schedule(conversationId);
-    }
+    yield* turns.schedule(conversationId);
     yield* client.answerCallbackQuery(callbackQuery.id, "Swerving.");
     yield* client.editMessageText(chatId, messageId, `Swerving ${harness.displayName} to this message.`);
     return;

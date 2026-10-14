@@ -24,7 +24,7 @@ import { SessionForkError, SessionSandboxes } from "../src/sandbox/index.ts";
 import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
 import { newSchema, run, testStore } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
-import { turnsStub, withServices } from "./support/turns.ts";
+import { recordingOutbox, turnsStub, withServices } from "./support/turns.ts";
 
 test("a branch's state, as it first starts, keeps its conversations and loses what was in flight where it was branched from, once", async () => {
   const schema = newSchema();
@@ -164,12 +164,12 @@ test("a branch environment runs no turn in a folder, which it cannot copy, and s
   const conversationId = await run(store.upsertConversation({ chatId: 1001 }));
   await run(store.setActiveHarness(conversationId, "codex"));
   await run(store.setWorkingDirectory(conversationId, "/home/operator/project"));
-  const telegram = recordingTelegram();
-  await withServices({ store, telegram: telegram.layer, branch: "try" }, async (alasio) => {
+  const outbox = recordingOutbox();
+  await withServices({ store, outbox: outbox.layer, branch: "try" }, async (alasio) => {
     await alasio.runPromise(Effect.flatMap(Turns, (turns) => turns.submit({ conversationId, chatId: 1001, messageId: 7, prompt: "hi", fileIds: [], visibleText: "hi" })));
-    for (let waited = 0; telegram.calls.sendMessage.length === 0 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
-    const [[chatId, text] = []] = telegram.calls.sendMessage;
-    assert.equal(chatId, "1001");
+    for (let waited = 0; outbox.queued.texts.length === 0 && waited < 5000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+    const [{ chatId, text } = { chatId: undefined, text: undefined }] = outbox.queued.texts;
+    assert.equal(String(chatId), "1001");
     assert.match(String(text), /^Codex hit an error: This is the branch environment try, .* A folder is this machine's own files, which cannot be copied on write, so a branch never works in one: use \/workspace for a session workspace\.$/u);
     assert.equal(await run(store.hasOpenPromptJobs(conversationId)), false);
     // A session workspace is the branch's to work in, where its deployment has them.

@@ -19,7 +19,7 @@ import { Authorizer } from "../../src/telegram/authorizer.ts";
 import { ReceivedFiles } from "../../src/telegram/files.ts";
 import type { TelegramClient } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
-import { Outbox } from "../../src/telegram/outbox.ts";
+import { Outbox, type OutboxStatus, type OutboxText } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
 import { WorkflowHooks } from "../../src/workflow/hook-server.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
@@ -32,6 +32,29 @@ const unusedOutbox: Layer.Layer<Outbox> = Layer.succeed(Outbox, Outbox.of({
   deliverDue: Effect.void,
 }));
 
+/** What a recording outbox was given to queue: replies, status messages, and edits of them, each with the id it answered. */
+export interface QueuedToOutbox {
+  readonly texts: (OutboxText & { readonly id: string })[];
+  readonly statuses: (OutboxStatus & { readonly id: string })[];
+  readonly edits: (OutboxStatus & { readonly edits: string })[];
+}
+
+/** An outbox that delivers nothing and records what it is given to queue, in `queued`. */
+export function recordingOutbox(): { readonly layer: Layer.Layer<Outbox>; readonly queued: QueuedToOutbox } {
+  const queued: QueuedToOutbox = { texts: [], statuses: [], edits: [] };
+  let ids = 0;
+  const id = () => `outbox-${(ids += 1)}`;
+  return {
+    queued,
+    layer: Layer.succeed(Outbox, Outbox.of({
+      enqueueText: (text) => Effect.sync(() => queued.texts[queued.texts.push({ ...text, id: id() }) - 1]!.id),
+      enqueueStatus: (status) => Effect.sync(() => queued.statuses[queued.statuses.push({ ...status, id: id() }) - 1]!.id),
+      enqueueEdit: (edits, edit) => Effect.sync(() => (queued.edits.push({ ...edit, edits }), id())),
+      deliverDue: Effect.void,
+    })),
+  };
+}
+
 /** No workflow hook server: no workflow waits are reported. */
 export const noWorkflowHooks: Layer.Layer<WorkflowHooks> = Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map() }));
 
@@ -40,7 +63,6 @@ export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
   const unused = (name: string) => Effect.die(new Error(`the test's turns run no ${name}`));
   return Turns.of({
     submit: () => unused("submit"),
-    enqueueMessage: () => unused("enqueueMessage"),
     schedule: () => unused("schedule"),
     setPromptDisposition: () => unused("setPromptDisposition"),
     run: () => unused("run"),
