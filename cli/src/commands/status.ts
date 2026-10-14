@@ -9,11 +9,12 @@ import { readySince } from "../cluster/k3s.ts";
 import { describeShortfall, InotifyLimitsTooLow, inotifyShortfalls, requireLocalMachine } from "../cluster/machine.ts";
 import { SERVICE } from "../cluster/node.ts";
 import { loadConfig } from "../config.ts";
+import { describeBaseline, recordedBaseline, standingOf, surveyCpu } from "../cpu-baseline.ts";
 import { describeMemory, describeScale, describeSizing, memoryBytes, type ScaledWorkload } from "../capacity.ts";
 import { describeRef, hasStatus, type Kind, kind, KubeApi, type KubeApiError, refOf } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR, WORKLOADS } from "../kube/apply.ts";
 import { diagnose, readiness, selectorOf } from "../kube/rollout.ts";
-import { NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
+import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
@@ -192,6 +193,15 @@ export const status = Command.make("status", {}, () =>
           yield* Console.log(sizing);
           for (const line of yield* diagnose(refOf(workload))) yield* Console.log(`    ${line}`);
         }
+        // Where the node agents run, the CPU baseline sessions are held to, and the nodes that fall short of it.
+        if (workloads.some((workload) => workload.kind === "DaemonSet" && workload.metadata?.name === componentName("node-agent"))) {
+          const standing = yield* seen(Effect.all([recordedBaseline, surveyCpu]));
+          const lines = Option.match(standing, {
+            onNone: () => ["the CPU baseline: not seen, as this kubeconfig may not read alasio's templates and node agents"],
+            onSome: ([{ baseline }, survey]) => describeBaseline(standingOf(survey, baseline)),
+          });
+          for (const line of lines) yield* Console.log(`  ${line}`);
+        }
         if (listed.some(({ whole }) => !whole)) {
           yield* Console.log(`  alasio's workloads outside its namespace, ${NAMESPACE}: not seen, as this kubeconfig may list them there alone`);
         }
@@ -217,7 +227,7 @@ export const status = Command.make("status", {}, () =>
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
-        "what VPA recommends once it has measured them. Of the bundled object store, the copies it keeps of each object, and of each " +
+        "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it. Of the bundled object store, the copies it keeps of each object, and of each " +
         "volume server, as its metrics say: what it may still fill of its disk before it takes no more writes, what it keeps " +
         "free (minFreeSpace), its volumes, and what they take, deleted and not yet compacted away. Then the memory the cluster's pods request and use, of what its nodes have " +
         "for pods, and whether a metrics server measures them, which VPA and what scales on CPU need; of these, what the kubeconfig's " +

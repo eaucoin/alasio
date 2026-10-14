@@ -43,6 +43,19 @@ export const RUNSC_ROOT = "/run/containerd/runsc/k8s.io";
 /** The node's snapshot cache, where its sandboxes are restored from, as the admission policy holds a restore to. */
 export { SNAPSHOT_CACHE_DIR } from "../kube/sandbox-shape.ts";
 
+/**
+ * The node agent's container that says, as its pod starts, the CPU features its node has
+ * under the current gVisor release (./cpu-features.ts), as its termination message, which
+ * Kubernetes keeps up to 4 KiB of: a CpuFeaturesReport, as JSON.
+ */
+export const CPU_FEATURES_CONTAINER = "cpu-features";
+
+/** What a node agent's CPU_FEATURES_CONTAINER says: the release, and the features runsc of it says the node has. */
+export interface CpuFeaturesReport {
+  readonly release: string;
+  readonly cpuFeatures: readonly string[];
+}
+
 /** The variable holding the token alasio presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";
 

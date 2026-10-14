@@ -109,9 +109,12 @@ function configOf(file: Record<string, unknown> = {}): InstallConfig {
   return decoded.success;
 }
 
-/** The objects of the configuration `file` and the Telegram Secret every configuration names. */
-function install(file: Record<string, unknown> = {}): readonly KubernetesObject[] {
-  return manifests(configOf(file));
+/** The CPU baseline the node agents' pods say, as alasio up records it. */
+const BASELINE = ["avx", "avx2", "sse"];
+
+/** The objects of the configuration `file` and the Telegram Secret every configuration names, holding sessions to `cpuBaseline`. */
+function install(file: Record<string, unknown> = {}, cpuBaseline: readonly string[] | null = BASELINE): readonly KubernetesObject[] {
+  return manifests(configOf(file), { ...NOTHING_CARRIED, cpuBaseline });
 }
 
 /** The objects of `kind`, as that kind. */
@@ -353,13 +356,14 @@ describe("alasio", () => {
     assert.doesNotMatch(json, /"host":/u);
   });
 
-  test("renders sessions' pods never restarted, their /tmp a tmpfs of gVisor's own", () => {
+  test("renders sessions' pods never restarted, their /tmp a tmpfs of gVisor's own, held to the CPU baseline", () => {
     const { podTemplate } = JSON.parse(templates(install())).sessions as SessionsProfile;
     assert.equal(podTemplate.spec?.restartPolicy, "Never");
     assert.deepEqual(podTemplate.metadata?.annotations, {
       "dev.gvisor.spec.mount.tmp.share": "container",
       "dev.gvisor.spec.mount.tmp.type": "tmpfs",
       "dev.gvisor.spec.mount.tmp.options": "rw",
+      "dev.gvisor.internal.cpufeatures": "avx,avx2,sse",
     });
     assert.deepEqual(podTemplate.spec?.volumes, [{ name: "tmp", emptyDir: { sizeLimit: "2Gi" } }]);
   });
@@ -1747,6 +1751,14 @@ describe("node agents", () => {
     assert.deepEqual(container?.ports, [{ name: "api", containerPort: 8484 }]);
     assert.deepEqual(container?.readinessProbe, { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 });
     assert.deepEqual(container?.resources, { requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "512Mi" } });
+    // First, as the pod starts, it says the node's CPU features under the current release, as runsc does, with the paths runsc reads.
+    const [features, ...others] = pod?.initContainers ?? [];
+    assert.deepEqual(others, []);
+    assert.equal(features?.name, "cpu-features");
+    assert.equal(features?.image, container?.image);
+    assert.deepEqual(features?.command, ["node", "/opt/alasio/src/node-agent/cpu-features.ts", NODE_PINS.gvisor.releases[0]?.release]);
+    assert.deepEqual(features?.securityContext, { privileged: true, runAsUser: 0 });
+    assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
   test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their cache's budget in bytes", () => {
@@ -1927,6 +1939,12 @@ describe("security", () => {
     assert.ok(sessionsRole(objects).some(({ resources, verbs }) => resources?.includes("pods/status") && verbs.join() === "patch"));
     // The templates its snapshots restore into are alasio up's to carry forward, not alasio's to record.
     assert.ok(!sessionsRole(objects).some(({ resources }) => resources?.includes("configmaps")));
+    // Until alasio up records a CPU baseline, nothing is snapshotted, though the agents run to say what their nodes have.
+    const unheld = install({}, null);
+    assert.equal(sessions(unheld).snapshots, undefined);
+    assert.equal(sessions(unheld).podTemplate.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], undefined);
+    assert.ok(!JSON.stringify(one(unheld, "ValidatingAdmissionPolicy", "alasio-sandboxes")).includes("dev.gvisor.internal"));
+    assert.equal(all(unheld, "DaemonSet").filter(({ metadata }) => metadata?.name === "alasio-node-agent").length, 1);
     // Under the cluster's default runtime, nothing is snapshotted.
     const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
     assert.equal(sessions(unsnapshotted).snapshots, undefined);
@@ -2463,12 +2481,15 @@ describe("admission", () => {
   test("lets a session's Sandbox carry what its snapshots add, and be restored from one with no more than a restore adds, each as alasio adds it", () => {
     const session = variableOf(install(), "alasio-sandboxes", "sessions");
     const annotation = (key: string) => `object.spec["podTemplate"]["metadata"]["annotations"][${JSON.stringify(key)}]`;
-    // Each may be left out: a session's template hash, the CPU features it is held to, and the restore's two.
-    for (const key of ["alasio.dev/session-template", "dev.gvisor.internal.cpufeatures", "dev.gvisor.internal.restore.host-image-path", "dev.gvisor.internal.restore.paused"]) {
+    // Each may be left out: a session's template hash, and the restore's two.
+    for (const key of ["alasio.dev/session-template", "dev.gvisor.internal.restore.host-image-path", "dev.gvisor.internal.restore.paused"]) {
       assert.ok(session.includes(`(!(${JSON.stringify(key)} in object.spec["podTemplate"]["metadata"]["annotations"]) || `), key);
     }
     assert.ok(session.includes(`${annotation("alasio.dev/session-template")}.matches("^([0-9a-f]{64})$")`));
     assert.ok(session.includes(`${annotation("dev.gvisor.internal.restore.paused")} == "true"`));
+    // The CPU features it is held to are the template's, as alasio up recorded them: no fewer, no others.
+    assert.ok(session.includes(`${annotation("dev.gvisor.internal.cpufeatures")} == "avx,avx2,sse"`));
+    assert.ok(!session.includes(`(!("dev.gvisor.internal.cpufeatures" in `));
     // The image is the Sandbox's own, of a snapshot its node prepared in its cache.
     const image = annotation("dev.gvisor.internal.restore.host-image-path");
     const own = '"/var/lib/alasio/snapshots/alasio-sessions/" + object.metadata.name + "/"';
@@ -2489,11 +2510,11 @@ describe("admission", () => {
     const cpu = (cpu: string) => ({ sessions: { resources: { requests: { cpu } } } });
     // Installed first, nothing is carried.
     const first = install(cpu("101m"));
-    assert.deepEqual(carriedFrom(configOf(cpu("101m")), undefined), NOTHING_CARRIED);
+    assert.deepEqual(carriedFrom(configOf(cpu("101m")), undefined, BASELINE), { ...NOTHING_CARRIED, cpuBaseline: BASELINE });
     assert.equal(JSON.parse(templatesOf(first) ?? "{}").previousSessions, undefined);
     assert.equal(variableOf(first, "alasio-sandboxes", "previousSessions"), "");
     // The template changed: what ran before is carried, its own image and resources pinned whole beside the current one.
-    const carried = carriedFrom(configOf(cpu("102m")), templatesOf(first));
+    const carried = carriedFrom(configOf(cpu("102m")), templatesOf(first), BASELINE);
     assert.deepEqual(carried.previousSessions, JSON.parse(templatesOf(first) ?? "{}").sessions);
     const second = manifests(configOf(cpu("102m")), carried);
     assert.deepEqual(JSON.parse(templatesOf(second) ?? "{}").previousSessions, carried.previousSessions);
@@ -2502,12 +2523,12 @@ describe("admission", () => {
     assert.ok(variableOf(second, "alasio-sandboxes", "sessions").includes('== "102m"'));
     assert.ok(one<Policy>(second, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[0]?.expression.endsWith(" || (variables.sessions || variables.previousSessions)"));
     // Brought up again on the same template, it is still carried; changed again, the one after it is, and it is gone.
-    assert.deepEqual(carriedFrom(configOf(cpu("102m")), templatesOf(second)), carried);
-    const third = carriedFrom(configOf(cpu("103m")), templatesOf(second));
+    assert.deepEqual(carriedFrom(configOf(cpu("102m")), templatesOf(second), BASELINE), carried);
+    const third = carriedFrom(configOf(cpu("103m")), templatesOf(second), BASELINE);
     assert.deepEqual(third.previousSessions, JSON.parse(templatesOf(second) ?? "{}").sessions);
     assert.ok(!JSON.stringify(third).includes('"101m"'));
     // Templates it cannot read carry nothing, nor does an installation without sessions.
-    assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON"), NOTHING_CARRIED);
-    assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first)), NOTHING_CARRIED);
+    assert.deepEqual(carriedFrom(configOf(cpu("102m")), "{ not JSON", BASELINE).previousSessions, null);
+    assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first), BASELINE).previousSessions, null);
   });
 });

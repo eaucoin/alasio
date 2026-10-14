@@ -108,6 +108,8 @@ export interface FakeKube {
   readonly changes: KubeChange[];
   /** Names of workloads whose pods never run, and of volumes whose data cannot be deleted; and of Jobs that fail. */
   readonly stuck: Set<string>;
+  /** What a workload's pod's init container says as it ends, its termination message, by `<workload>/<container>`; one it says nothing of has not ended. */
+  readonly said: Map<string, string>;
   readonly failing: Set<string>;
   /** What a pod logs, by its name, or a container of it, by `<pod>/<container>`. */
   readonly logs: Map<string, string>;
@@ -239,6 +241,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const objects = new Map<string, KubeObject>();
   const changes: KubeChange[] = [];
   const stuck = new Set<string>();
+  const said = new Map<string, string>();
   const failing = new Set<string>();
   const logs = new Map<string, string>();
   const finalizers = new Map<string, string>();
@@ -293,17 +296,24 @@ export async function serveFakeKube(): Promise<FakeKube> {
         availableReplicas: blocked ? 0 : replicas,
         readyReplicas: blocked ? 0 : replicas,
       };
-    const template = object.spec?.["template"] as { metadata?: { labels?: Record<string, string> }; spec?: { containers?: { name: string; image: string }[] } } | undefined;
+    const template = object.spec?.["template"] as
+      | { metadata?: { labels?: Record<string, string> }; spec?: { containers?: { name: string; image: string }[]; initContainers?: { name: string; image: string }[] } }
+      | undefined;
     const container = template?.spec?.containers?.[0];
     const pod = `${name}-0`;
     // Of no replicas, it has no pod.
     if (replicas === 0 && object.kind !== "DaemonSet") return void objects.delete(pathOf("/api/v1", "pods", namespace, pod));
+    // Its init containers ended as the test says they do.
+    const initContainerStatuses = (template?.spec?.initContainers ?? []).flatMap(({ name: initName, image }) => {
+      const message = said.get(`${name}/${initName}`);
+      return message === undefined ? [] : [{ name: initName, ready: false, restartCount: 0, image, imageID: "", state: { terminated: { exitCode: 0, reason: "Completed", message } } }];
+    });
     put("pods", {
       apiVersion: "v1",
       kind: "Pod",
       metadata: { name: pod, ...(namespace ? { namespace } : {}), labels: template?.metadata?.labels ?? {}, creationTimestamp: new Date().toISOString() },
-      // A pod stuck pulling its image is on the node, as one that runs is.
-      spec: { nodeName: "node-0" },
+      // On the cluster's one node, a pod stuck pulling its image as one that runs is.
+      spec: { nodeName: "machine" },
       status: blocked
         ? {
           phase: "Pending",
@@ -313,6 +323,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
         : {
           phase: "Running",
           conditions: [{ type: "Ready", status: "True" }],
+          ...(initContainerStatuses.length > 0 ? { initContainerStatuses } : {}),
           containerStatuses: [{ name: container?.name ?? "main", ready: true, restartCount: 0, image: container?.image ?? "", imageID: "", state: { running: {} } }],
         },
     });
@@ -536,6 +547,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     objects,
     changes,
     stuck,
+    said,
     failing,
     logs,
     finalizers,

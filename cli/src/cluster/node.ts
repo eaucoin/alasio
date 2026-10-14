@@ -43,6 +43,13 @@ export const NODE_PINS: NodePins = pins;
 /** The gVisor releases `pins` pins, the current first. */
 export const gvisorReleases = ({ gvisor }: NodePins): string[] => gvisor.releases.map(({ release }) => release);
 
+/** The gVisor release `pins` pins as current, which new sandboxes run: the first; pins of none are no pins. */
+export function currentGvisorRelease(pins: NodePins = NODE_PINS): string {
+  const [current] = gvisorReleases(pins);
+  if (current === undefined) throw new Error("cluster/node/pins.json pins no gVisor release");
+  return current;
+}
+
 /** A file to download, and the digest it must have. */
 export interface Download {
   readonly url: string;
@@ -72,7 +79,12 @@ const BIN = "/usr/local/bin";
 const K3S_ETC = "/etc/rancher/k3s";
 const CONFIG_YAML = `${K3S_ETC}/config.yaml`;
 const REGISTRIES_YAML = `${K3S_ETC}/registries.yaml`;
-/** What alasio installed, and the digest of the files that configure the node. */
+/**
+ * What alasio installed, and the digest of the files that configure the node. Not the
+ * CPU baseline sessions are held to, which is the cluster's, of every node of it, and
+ * recorded in it (../cpu-baseline.ts): a cluster in Docker or of a kubeconfig has no
+ * stamp, and the other nodes of a cluster on this machine are not described by its stamp.
+ */
 const STAMP = `${K3S_ETC}/alasio.json`;
 /** The kubeconfig k3s writes, root's alone. */
 const K3S_KUBECONFIG = `${K3S_ETC}/k3s.yaml`;

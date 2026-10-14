@@ -24,6 +24,7 @@ import { Result } from "effect";
 
 import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/names.ts";
 import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
+import { CPU_FEATURES_ANNOTATION } from "../../../src/kube/sandbox-shape.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
@@ -82,9 +83,11 @@ function workspaceNamespaces(config: InstallConfig, environment: Environment): s
  * session (its parent does, src/branch/fork.ts) nor removes JuiceFS's mount pods, which
  * are main's to drive.
  */
-function sessionsProfile(config: InstallConfig, environment: Environment): SessionsProfile {
+function sessionsProfile(config: InstallConfig, environment: Environment, cpuBaseline: CpuBaseline): SessionsProfile {
   const { sessions, workspaceStorage } = config;
   const main = environment.branch === null;
+  // Snapshotted once every node's CPU features are known, its sandboxes held to those all have.
+  const snapshotted = main && nodeAgentRuns(config) && cpuBaseline !== null;
   const agent = imageReference(config.images.agent);
   const storageClassName = sessions.storage.storageClassName || (workspaceStorage.enabled ? workspaceStorage.storageClassName : "");
   // On workspace storage, the volume's mounts follow its mount pod's, as upstream's
@@ -106,7 +109,12 @@ function sessionsProfile(config: InstallConfig, environment: Environment): Sessi
         // Under gVisor, /tmp is a tmpfs of the sandbox's own, by gVisor's mount hints, rather
         // than the emptyDir's directory on the node: a snapshot of the sandbox holds it, as it
         // holds the files that bayma's runtimes keep open there.
-        annotations: { "dev.gvisor.spec.mount.tmp.share": "container", "dev.gvisor.spec.mount.tmp.type": "tmpfs", "dev.gvisor.spec.mount.tmp.options": "rw" },
+        annotations: {
+          "dev.gvisor.spec.mount.tmp.share": "container",
+          "dev.gvisor.spec.mount.tmp.type": "tmpfs",
+          "dev.gvisor.spec.mount.tmp.options": "rw",
+          ...(snapshotted ? { [CPU_FEATURES_ANNOTATION]: cpuBaseline.join(",") } : {}),
+        },
       },
       spec: {
         ...(sessions.runtimeClassName ? { runtimeClassName: sessions.runtimeClassName } : {}),
@@ -168,7 +176,7 @@ function sessionsProfile(config: InstallConfig, environment: Environment): Sessi
       },
     }],
     ...(main && sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
-    ...(main && nodeAgentRuns(config) ? { snapshots: sessionSnapshots(config) } : {}),
+    ...(snapshotted ? { snapshots: sessionSnapshots(config) } : {}),
   };
 }
 
@@ -243,36 +251,58 @@ function hostProfile(config: InstallConfig): HostProfile {
 }
 
 /**
+ * The CPU features sessions' sandboxes are held to, so that a snapshot of one restores on
+ * any node (gVisor's names, as runsc's cpu-features says them, none empty); null where
+ * none is known yet, when sessions are not snapshotted (../cpu-baseline.ts).
+ */
+export type CpuBaseline = readonly string[] | null;
+
+/**
  * What `alasio up` carries forward from the installation it replaces: the sessions'
  * profile before the current one, whose template their snapshots may still restore onto
  * (src/sandbox/snapshots.ts), and the Sandbox policy pins beside the current one
- * (./admission.ts), until the template changes again.
+ * (./admission.ts), until the template changes again; and the CPU baseline the current
+ * one holds sessions to, which up keeps while every node it surveys has it.
  */
 export interface Carried {
   readonly previousSessions: SessionsProfile | null;
+  readonly cpuBaseline: CpuBaseline;
 }
 
 /** Nothing carried forward: a first installation's, and a branch environment's. */
-export const NOTHING_CARRIED: Carried = { previousSessions: null };
+export const NOTHING_CARRIED: Carried = { previousSessions: null, cpuBaseline: null };
 
 /** The ConfigMap of the templates, by its name. */
 export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
 
 /**
- * What the installation `config` describes carries forward from `live`, the templates
- * of the installation it replaces (its ConfigMap's `templates.json`, if it has one): the
- * sessions' profile it ran, where their template changes, or else the one it carried. A
- * profile is carried for one change of the template, and no more. Pure, for tests.
+ * What the installation `config` describes, holding sessions to `cpuBaseline`, carries
+ * forward from `live`, the templates of the installation it replaces (its ConfigMap's
+ * `templates.json`, if it has one): the sessions' profile it ran, where their template
+ * changes, or else the one it carried. A profile is carried for one change of the
+ * template, and no more. Pure, for tests.
  */
-export function carriedFrom(config: InstallConfig, live: string | undefined): Carried {
-  if (!config.sessions.enabled || live === undefined) return NOTHING_CARRIED;
+export function carriedFrom(config: InstallConfig, live: string | undefined, cpuBaseline: CpuBaseline): Carried {
+  const nothing = { ...NOTHING_CARRIED, cpuBaseline };
+  if (!config.sessions.enabled || live === undefined) return nothing;
   // Carried as the ConfigMap held them, which alasio read as they are: the profile a snapshot recorded the hash of.
-  if (Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return NOTHING_CARRIED;
+  if (Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return nothing;
   const held = JSON.parse(live) as { readonly sessions?: SessionsProfile | null; readonly previousSessions?: SessionsProfile | null };
-  if (!held.sessions) return NOTHING_CARRIED;
+  if (!held.sessions) return nothing;
   // The current profile as the ConfigMap holds it, to compare with what it held.
-  const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT), "")) as SessionsProfile;
-  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions };
+  const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT, cpuBaseline), "")) as SessionsProfile;
+  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions, cpuBaseline };
+}
+
+/**
+ * The CPU baseline the installation whose templates are `live` (as carriedFrom takes
+ * them) holds sessions to: what its sessions' template sets, if anything.
+ */
+export function recordedCpuBaseline(live: string | undefined): CpuBaseline {
+  if (live === undefined || Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return null;
+  const held = JSON.parse(live) as { readonly sessions?: SessionsProfile | null };
+  const recorded = held.sessions?.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION];
+  return recorded ? recorded.split(",") : null;
 }
 
 /** The ConfigMap of the templates, and their checksum, which alasio's pod carries so it is replaced when they change. */
@@ -280,7 +310,7 @@ function sandboxTemplates(config: InstallConfig, environment: Environment, carri
   const name = SANDBOX_TEMPLATES;
   const templates = goJson(
     {
-      ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment) } : {}),
+      ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment, carried.cpuBaseline) } : {}),
       ...(config.sessions.enabled && carried.previousSessions ? { previousSessions: carried.previousSessions } : {}),
       ...(config.host.enabled ? { host: hostProfile(config) } : {}),
     },
@@ -636,7 +666,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
       sandboxPolicyName(environment.namespace),
       alasioAccount(environment.namespace),
       {
-        sessions: config.sessions.enabled ? sessionsProfile(config, environment) : null,
+        sessions: config.sessions.enabled ? sessionsProfile(config, environment, carried.cpuBaseline) : null,
         previousSessions: config.sessions.enabled ? carried.previousSessions : null,
         host: config.host.enabled ? hostProfile(config) : null,
       },

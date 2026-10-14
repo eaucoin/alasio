@@ -673,6 +673,22 @@ if (inShard("snapshots")) {
       t.diagnostic(`released ${(waited / 1000).toFixed(1)}s after its last exec: ${saved.bytes} bytes, its sandbox paused ${saved.pauseMs} ms, uploaded in ${saved.uploadMs} ms`);
     });
 
+    test("the session's pod was held to the CPU features every node's agent said, which alasio up recorded in the sessions' template, as alasio status says", async () => {
+      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=node-agent" });
+      const said = agents.map((pod) => {
+        const message = pod.status?.initContainerStatuses?.find(({ name }) => name === "cpu-features")?.state?.terminated?.message;
+        return (JSON.parse(message ?? "{}") as { readonly cpuFeatures?: readonly string[] }).cpuFeatures ?? [];
+      });
+      const [first = []] = said;
+      const baseline = first.filter((feature) => said.every((features) => features.includes(feature))).toSorted().join(",");
+      assert.notEqual(baseline, "", JSON.stringify(said));
+      const templates = JSON.parse((await kube.get<V1ConfigMap>(ref("ConfigMap", componentName("sandbox-templates"), NAMESPACE)))?.data?.["templates.json"] ?? "{}");
+      assert.equal(templates.sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], baseline);
+      assert.equal(ran?.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], baseline);
+      const status = await alasioOk("status");
+      assert.ok(status.includes(`\n  sessions are held to ${baseline.split(",").length} CPU features, those every node had as alasio up last surveyed them\n`), status);
+    });
+
     test("the session's next turn restores it from its snapshot, which is spent, and its REPL is whole, as bayma tells the next exec", async (t) => {
       const answered = await turn("hello again");
       const pod = await kube.get<V1Pod>(ref("Pod", session, SESSIONS));

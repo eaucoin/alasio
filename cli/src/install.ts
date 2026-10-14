@@ -5,18 +5,20 @@
  * against the cluster's autoscalers and its object store's layout and scale, applied, and
  * waited for.
  */
-import type { KubernetesObject, V1ConfigMap, V1Namespace } from "@kubernetes/client-node";
+import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
-import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
+import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
+import { KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
-import { labels, NAMESPACE } from "./manifests/common.ts";
+import type { CpuBaseline } from "./manifests/alasio.ts";
+import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
-import { type Carried, carriedFrom, manifests, NOTHING_CARRIED, SANDBOX_TEMPLATES } from "./manifests/index.ts";
+import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
 
 /** alasio's namespace. */
@@ -26,12 +28,6 @@ const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", met
 export function installationObjects(config: InstallConfig, carried: Carried = NOTHING_CARRIED): readonly KubernetesObject[] {
   return [NAMESPACE_OBJECT, ...manifests(config, carried)];
 }
-
-/** What the installation `config` describes carries forward from the one the cluster runs, as its templates' ConfigMap says. */
-export const carried = Effect.fnUntraced(function*(config: InstallConfig): Effect.fn.Return<Carried, KubeApiError, KubeApi> {
-  const live = yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: SANDBOX_TEMPLATES });
-  return carriedFrom(config, live?.data?.["templates.json"]);
-});
 
 /** alasio's namespace, applied as the installation's, so its Secrets can be written before the rest of it is. */
 export const applyNamespace: Effect.Effect<void, KubeApiError, KubeApi> = Effect.flatMap(KubeApi, (kube) => kube.apply(labelled(NAMESPACE_OBJECT))).pipe(
@@ -53,39 +49,58 @@ export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig)
   return install.success;
 });
 
-/** What an installation came to: its bot, and whether Claude Code has a token. */
+/** What an installation came to: its bot, whether Claude Code has a token, and, where sessions are snapshotted, their CPU baseline. */
 export interface Installed {
   readonly bot: TelegramBot;
   readonly claude: boolean;
+  readonly cpuBaseline: BaselineDecision | null;
+}
+
+/** The installation `config` describes, as checkInstallation finds it, with what its objects carry forward. */
+interface Checked {
+  readonly bot: TelegramBot;
+  readonly settings: InstallConfig;
+  readonly objects: readonly KubernetesObject[];
+  /** The templates the cluster runs, as their ConfigMap records them, and the CPU baseline they hold sessions to. */
+  readonly live: string | undefined;
+  readonly recorded: CpuBaseline;
 }
 
 /**
  * The installation `config` describes, with its bot, refused where applying it would not do:
- * with no bot set, against the cluster's own autoscalers, or its object store's layout and scale.
+ * with no bot set, against the cluster's own autoscalers, or its object store's layout and
+ * scale. Its objects carry forward what the installation they replace recorded.
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
-): Effect.fn.Return<
-  { readonly bot: TelegramBot; readonly settings: InstallConfig; readonly objects: readonly KubernetesObject[] },
-  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError,
-  KubeApi
-> {
+): Effect.fn.Return<Checked, KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
-  const objects = installationObjects(settings, yield* carried(settings));
+  const { live, baseline: recorded } = yield* recordedBaseline;
+  const objects = installationObjects(settings, carriedFrom(settings, live, recorded));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
-  return { bot, settings, objects };
+  return { bot, settings, objects, live, recorded };
 });
 
-/** Applies the installation `config` describes, once its bot is set, and waits until it runs. */
+/**
+ * Applies the installation `config` describes, once its bot is set, and waits until it
+ * runs. Where sessions are snapshotted, it holds them to the CPU baseline it recorded
+ * before, then to the one the node agents' pods then say (./cpu-baseline.ts), applied
+ * again where that differs.
+ */
 export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
 ): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
-  const { bot, settings, objects } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, recorded } = yield* checkInstallation(config);
   yield* applyInstallation(objects, options);
-  return { bot, claude: settings.alasio.claude.existingSecret !== "" };
+  const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };
+  if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
+  const decision = decideCpuBaseline(yield* surveyCpu, recorded);
+  // Carried from the installation before this one, as the first apply carried it.
+  if (!sameBaseline(decision.baseline, recorded)) yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, decision.baseline)), options);
+  return { ...installed, cpuBaseline: decision };
 });

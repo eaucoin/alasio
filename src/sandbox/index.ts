@@ -71,7 +71,7 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import { cpuBaseline, makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, withCpuBaseline } from "./snapshots.ts";
+import { makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -368,25 +368,20 @@ export class SessionSandboxes extends Context.Service<SessionSandboxes, {
 }
 
 /**
- * How the sessions of `given` are snapshotted (./snapshots.ts), where they are: with the
- * node agents, their pods held to the nodes' CPU baseline, onto `given`'s template and
- * `previous`'s, the one `alasio up` carried forward, each as the baseline holds it; and
- * the profile, with that baseline.
+ * How the sessions of `profile` are snapshotted (./snapshots.ts), where they are: with the
+ * node agents, onto `profile`'s template and `previous`'s, the one `alasio up` carried
+ * forward.
  */
-const sessionSnapshots = Effect.fnUntraced(function*(given: SessionsProfile, previous: SessionsProfile | null): Effect.fn.Return<{ readonly profile: SessionsProfile; readonly snapshots: SessionSnapshots | null }, Config.ConfigError, KubeClient> {
-  const { snapshots } = given;
-  const [current] = snapshots?.releases ?? [];
-  if (!snapshots || !current) return { profile: given, snapshots: null };
+const sessionSnapshots = Effect.fnUntraced(function*(profile: SessionsProfile, previous: SessionsProfile | null): Effect.fn.Return<SessionSnapshots | null, Config.ConfigError, KubeClient> {
+  const { snapshots } = profile;
+  if (!snapshots) return null;
   const agents = yield* makeNodeAgents(snapshots.agents);
-  const baseline = yield* cpuBaseline(agents, current.release);
-  const held = (profile: SessionsProfile) => (baseline ? withCpuBaseline(profile, baseline) : profile);
-  const profile = held(given);
-  const templates = { current: sessionTemplateHash(profile), previous: previous ? sessionTemplateHash(held(previous)) : null };
-  return { profile, snapshots: yield* makeSessionSnapshots({ profile, snapshots, agents, templates }) };
+  const templates = { current: sessionTemplateHash(profile), previous: previous ? sessionTemplateHash(previous) : null };
+  return yield* makeSessionSnapshots({ profile, snapshots, agents, templates });
 });
 
 const makeSessionSandboxes = Effect.fnUntraced(function*({
-  profile: given,
+  profile,
   previous = null,
   stateDir,
   env = process.env,
@@ -395,7 +390,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
   inherit,
 }: SessionSandboxesOptions) {
   const kube = yield* KubeClient;
-  const { profile, snapshots } = yield* sessionSnapshots(given, previous);
+  const snapshots = yield* sessionSnapshots(profile, previous);
 
   /**
    * The ids of the volumes JuiceFS's mount pods in `mountPodNamespace` serve `pod`, as

@@ -2,9 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
-import { Effect, Fiber, Layer } from "effect";
+import { Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
-import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
 import { added } from "./support/metrics.ts";
@@ -15,7 +14,7 @@ import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { CPU_FEATURES_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../src/kube/sandbox-shape.ts";
-import { cpuBaseline, hookOf, makeSessionSnapshots, sessionTemplateHash, withCpuBaseline } from "../src/sandbox/snapshots.ts";
+import { hookOf, makeSessionSnapshots, sessionTemplateHash } from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";
@@ -183,21 +182,14 @@ test("a session's pod template records the profile's template it is made from", 
   assert.notEqual(sessionTemplateHash(profile()), sessionTemplateHash(profile("agent@sha256:2")));
 });
 
-test("sessions are held to the CPU features every node has under the current release, which their template records", async () => {
-  const { agents } = fakeAgents({ holdings: [node("node-a", [CURRENT, PREVIOUS], ["sse", "avx", "avx2"]), { ...node("node-b", [CURRENT], ["sse", "avx2", "fma"]) }] });
-  const baseline = await Effect.runPromise(cpuBaseline(agents, CURRENT));
-  assert.deepEqual(baseline, ["sse", "avx2"]);
-  const held = withCpuBaseline(profile(), baseline ?? []);
-  assert.equal(held.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "sse,avx2");
-  assert.notEqual(sessionTemplateHash(held), sessionTemplateHash(profile()));
-  assert.equal(sessionOf(held).spec.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "sse,avx2");
-  // With no agent to tell, none.
-  const none = await Effect.runPromise(Effect.gen(function*() {
-    const telling = yield* Effect.forkChild(cpuBaseline(fakeAgents().agents, CURRENT));
-    while (telling.pollUnsafe() === undefined) yield* TestClock.adjust("2 seconds");
-    return yield* Fiber.join(telling);
-  }).pipe(Effect.provide(TestClock.layer())));
-  assert.equal(none, null);
+test("the CPU baseline alasio up holds sessions to is part of their template, as its hash records it", () => {
+  const given = profile();
+  const held: SessionsProfile = {
+    ...given,
+    podTemplate: { ...given.podTemplate, metadata: { ...given.podTemplate.metadata, annotations: { ...given.podTemplate.metadata?.annotations, [CPU_FEATURES_ANNOTATION]: "avx2,sse" } } },
+  };
+  assert.notEqual(sessionTemplateHash(held), sessionTemplateHash(given));
+  assert.equal(sessionOf(held).spec.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "avx2,sse");
 });
 
 test("a session with a snapshot on the current template is restored on a node that can, the one holding it first, into what it is now", async () => {

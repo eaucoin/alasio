@@ -13,8 +13,8 @@
  * (ALASIO_KUBE_TEMPLATES `previousSessions`), the admission policy pinning both whole
  * (cli/src/manifests/admission.ts); so a snapshot outlives one change of the template, as
  * it outlives one of the gVisor release (the profile's kept releases), and no more. Both
- * are the templates as the sessions' CPU baseline holds them, so a change of the baseline
- * is one of the template. A session restored onto the template before the current one
+ * hold sessions to the CPU baseline `alasio up` records in them (cli/src/cpu-baseline.ts),
+ * so a change of the baseline is one of the template. A session restored onto the template before the current one
  * stays on it while its pod runs, and is moved onto the current one as it is resumed
  * without a snapshot.
  *
@@ -30,7 +30,6 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { SessionsProfile } from "../kube/config.ts";
 import {
   BAYMA_CONTAINER,
-  CPU_FEATURES_ANNOTATION,
   RESTORE_ANNOTATION,
   RESTORE_PAUSED_ANNOTATION,
   RESUMED_CONDITION,
@@ -69,8 +68,6 @@ const RELEASE_POLL: Duration.Input = "15 seconds";
 const COLLECT_POLL: Duration.Input = "10 minutes";
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
-/** How long alasio waits, as it starts, for a node agent to tell the CPU baseline by. */
-const BASELINE_WAIT: Duration.Input = "1 minute";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description: "Session sandboxes released, by outcome: snapshotted and suspended, kept running, or failed",
@@ -114,35 +111,6 @@ export function hookOf(bayma: V1Container): string[] | null {
   const stateDir = args[args.indexOf("--state-dir") + 1];
   return program.length > 0 && args.includes("--state-dir") && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
 }
-
-/**
- * The CPU features every node with an agent has under gVisor's `release`, which sessions'
- * sandboxes are held to, so that a snapshot of one restores on any of those nodes; null
- * when no agent tells within BASELINE_WAIT, said so. A node that joins later widens
- * nothing, and narrows the baseline as alasio next starts.
- */
-export const cpuBaseline = (agents: NodeAgents, release: string): Effect.Effect<readonly string[] | null> =>
-  Effect.gen(function*() {
-    const nodes = yield* agents.nodes.pipe(
-      Effect.filterOrFail((found) => found.length > 0, () => new Error("no node agent is ready")),
-      Effect.retry(Schedule.max([Schedule.spaced("2 seconds"), Schedule.during(BASELINE_WAIT)])),
-    );
-    const held = yield* Effect.forEach(nodes, (node) => agents.holdings(node));
-    const features = held.map(({ releases: installed }) => installed.find((kept) => kept.release === release)?.cpuFeatures ?? []);
-    const [first = [], ...others] = features;
-    return first.filter((feature) => others.every((other) => other.includes(feature)));
-  }).pipe(
-    Effect.catch((error) => Effect.logWarning(`sessions' sandboxes are held to no CPU baseline: ${error.message}`).pipe(Effect.as(null))),
-  );
-
-/** `profile`, its pods held to the CPU features `baseline` names, as part of the template its snapshots record. */
-export const withCpuBaseline = (profile: SessionsProfile, baseline: readonly string[]): SessionsProfile => ({
-  ...profile,
-  podTemplate: {
-    ...profile.podTemplate,
-    metadata: { ...profile.podTemplate.metadata, annotations: { ...profile.podTemplate.metadata?.annotations, [CPU_FEATURES_ANNOTATION]: baseline.join(",") } },
-  },
-});
 
 /** What a session's snapshots are given. */
 export interface SessionSnapshotsOptions {

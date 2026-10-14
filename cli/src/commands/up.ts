@@ -7,6 +7,7 @@ import { HostCluster } from "../cluster/host.ts";
 import { inotifyStep, requireLocalMachine } from "../cluster/machine.ts";
 import { Root } from "../cluster/root.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
+import { baselineShortfalls } from "../cpu-baseline.ts";
 import { checkInstallation, install, type Installed } from "../install.ts";
 import { kind, KubeApi } from "../kube/api.ts";
 import { NAMESPACE } from "../manifests/common.ts";
@@ -67,10 +68,12 @@ export const refuseFirst = <E>(target: ResolvedTarget, check: Effect.Effect<void
   });
 
 /** Where alasio runs, and what the operator does next. */
-export const announce = (target: ResolvedTarget, { bot, claude }: Installed): Effect.Effect<void> =>
+export const announce = (target: ResolvedTarget, { bot, claude, cpuBaseline }: Installed): Effect.Effect<void> =>
   Console.log(
     [
       `alasio ${VERSION} runs in ${describeTarget(target)}.`,
+      // What keeps sessions from being snapshotted, or restored on a node, if anything.
+      ...(cpuBaseline ? baselineShortfalls(cpuBaseline) : []),
       "",
       `Message ${bot.username ? `@${bot.username}` : "your bot"} on Telegram to talk to it.`,
       ...(claude ? [] : ["Claude Code has no token yet: alasio init asks for one, which `claude setup-token` makes."]),

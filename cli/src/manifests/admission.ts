@@ -30,7 +30,6 @@ import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
   BAYMA_CONTAINER,
-  CPU_FEATURES_ANNOTATION,
   DEFAULT_FULL_MODE_NAMESERVERS,
   EGRESS_GATE,
   EGRESS_GATE_SCRIPT,
@@ -274,9 +273,6 @@ const NODE_NAME = "[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?";
 /** A pod template's hash, as podTemplateHash makes one (src/kube/sandboxes.ts). */
 const TEMPLATE_HASH = "[0-9a-f]{64}";
 
-/** CPU features, as cpuBaseline names those a sandbox is held to: gVisor's names, separated by commas, if any. */
-const CPU_FEATURES = "([a-z0-9_.]+(,[a-z0-9_.]+)*)?";
-
 /**
  * Where a node agent prepares a snapshot of the Sandbox asked about, of the sessions of
  * `namespace`, for its pod to be restored from: under the snapshot cache, in its
@@ -301,8 +297,7 @@ interface SessionWorkspace {
  * sessionSandboxManifest or hostBaymaManifest make it.
  *
  * Of a session's, what its snapshots add (src/sandbox/snapshots.ts): the hash of the
- * template its pod is made from, which they record; where it is snapshotted, the CPU
- * features it is held to; and, restored from one, the image of the Sandbox's own that its
+ * template its pod is made from, which they record; and, restored from one, the image of the Sandbox's own that its
  * node prepared, left paused until it is resumed, under a release `current` keeps, on
  * that node, and ready once resumed.
  */
@@ -351,7 +346,6 @@ function sandboxOf(template: SessionsProfile | HostProfile, workspace: SessionWo
       [SESSION_TEMPLATE_ANNOTATION]: optional(matching(TEMPLATE_HASH)),
       ...(snapshots && session
         ? {
-          [CPU_FEATURES_ANNOTATION]: optional(matching(CPU_FEATURES)),
           [RESTORE_ANNOTATION]: optional(restoredFrom(session.namespace)),
           [RESTORE_PAUSED_ANNOTATION]: optional("true"),
         }

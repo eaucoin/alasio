@@ -19,7 +19,7 @@ import { scramVerifier } from "../../neon/control/scram.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
-import { downloads } from "../src/cluster/node.ts";
+import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
 import { type CliRun, runAlasio } from "./support/cli.ts";
 import type { FakeDocker } from "./support/fake-docker.ts";
 import { serveK3sInDocker } from "./support/fake-k3s.ts";
@@ -32,6 +32,13 @@ import { DOWN, ENTER, pressed, replaced, typed } from "./support/fake-terminal.t
 const BOT_TOKEN = "123:valid";
 const BOT = "alasio_test_bot";
 const DEPLOYMENT = "/apis/apps/v1/namespaces/alasio/deployments/alasio";
+const TEMPLATES = "/api/v1/namespaces/alasio/configmaps/alasio-sandbox-templates";
+
+/** Where the node agent's pod says its node's CPU features, as the fake API keeps what it says. */
+const CPU_FEATURES = "alasio-node-agent/cpu-features";
+
+/** What a node agent's pod says of a node with `features`, under the current gVisor release. */
+const cpuReport = (features: readonly string[], release = currentGvisorRelease()): string => JSON.stringify({ release, cpuFeatures: features });
 
 interface Rig {
   readonly kube: FakeKube;
@@ -68,6 +75,8 @@ async function rig(t: TestContext): Promise<Rig> {
   machine.kubeconfig = kube.kubeconfig;
   machine.onStart = () => kube.put("nodes", { apiVersion: "v1", kind: "Node", metadata: { name: "machine" }, status: { conditions: [{ type: "Ready", status: "True", lastHeartbeatTime: new Date().toISOString() }] } });
   kube.put("configmaps", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: "coredns", namespace: "kube-system", resourceVersion: "1" }, data: { NodeHosts: "10.0.0.5 machine" } });
+  // Its node agent says what its node's CPU has, as it starts.
+  kube.said.set(CPU_FEATURES, cpuReport(["sse", "avx2", "avx"]));
   const kubeconfig = join(home, "kubeconfig");
   writeFileSync(kubeconfig, kube.kubeconfig);
   const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), DOCKER_HOST: docker.host, TELEGRAM_API_ROOT: telegram.root };
@@ -319,6 +328,58 @@ test("up applies alasio, waits until it runs, and says what to do next", async (
   const env = (setup.kube.get(DEPLOYMENT)?.spec as { template: { spec: { containers: { env: { name: string }[] }[] } } }).template.spec.containers[0]?.env;
   assert.ok(env?.some(({ name }) => name === "CLAUDE_CODE_OAUTH_TOKEN"));
   assert.ok(run.progress.some((line) => line.startsWith("applying ")));
+});
+
+test("up holds sessions to the CPU features every node agent says its node has, recorded in their template, and to none, unsnapshotted, until each has", async (t) => {
+  const setup = await rig(t);
+  await initialize(setup);
+  const sessions = () => JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
+    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
+    readonly previousSessions?: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } } };
+  };
+  const applied = () => setup.kube.changes.filter(({ path }) => path === TEMPLATES).length;
+  const cpuFeatures = () => sessions().sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"];
+  // Installed first, sessions are held to none until the agents have said: then up records what they said, applying it again.
+  succeeded(await setup.alasio(["up"]));
+  assert.equal(cpuFeatures(), "avx,avx2,sse");
+  assert.ok(sessions().sessions.snapshots);
+  assert.equal(applied(), 2);
+  // The same again changes nothing.
+  succeeded(await setup.alasio(["up"]));
+  assert.equal(applied(), 3);
+  const status = await setup.alasio(["status"]);
+  assert.ok(status.printed.includes("  sessions are held to 3 CPU features, those every node had as alasio up last surveyed them"), status.printed.join("\n"));
+  // A node whose agent has not said keeps the baseline as it was, and up says so.
+  setup.kube.said.delete(CPU_FEATURES);
+  const unsaid = await setup.alasio(["up"]);
+  succeeded(unsaid);
+  assert.equal(cpuFeatures(), "avx,avx2,sse");
+  assert.ok(unsaid.printed[0]?.includes("\nnode machine: its node agent has not said its CPU features yet\n"), unsaid.printed[0]);
+  // A narrower node narrows it, and the template before is carried, so a snapshot taken on it still restores.
+  setup.kube.said.set(CPU_FEATURES, cpuReport(["sse", "avx"]));
+  succeeded(await setup.alasio(["up"]));
+  assert.equal(cpuFeatures(), "avx,sse");
+  assert.equal(sessions().previousSessions?.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], "avx,avx2,sse");
+  // Features said under another release are not the current one's: the baseline stays.
+  setup.kube.said.set(CPU_FEATURES, cpuReport(["sse"], "20000101.0"));
+  const stale = await setup.alasio(["up"]);
+  succeeded(stale);
+  assert.ok(stale.printed[0]?.includes(`\nnode machine: its node agent said its CPU features under gVisor 20000101.0, not ${currentGvisorRelease()}\n`), stale.printed[0]);
+  assert.equal(cpuFeatures(), "avx,sse");
+});
+
+test("up records no CPU baseline the nodes do not share: sessions are not snapshotted, and it says why", async (t) => {
+  const setup = await rig(t);
+  await initialize(setup);
+  setup.kube.said.set(CPU_FEATURES, cpuReport([]));
+  const run = await setup.alasio(["up"]);
+  succeeded(run);
+  assert.ok(run.printed[0]?.includes("\nsessions are not snapshotted: they are held to no CPU baseline, as the nodes share no CPU feature under gVisor\n"), run.printed[0]);
+  const { sessions } = JSON.parse(String((setup.kube.get(TEMPLATES)?.["data"] as Record<string, string>)["templates.json"])) as {
+    readonly sessions: { readonly podTemplate: { readonly metadata: { readonly annotations: Record<string, string> } }; readonly snapshots?: unknown };
+  };
+  assert.equal(sessions.podTemplate.metadata.annotations["dev.gvisor.internal.cpufeatures"], undefined);
+  assert.equal(sessions.snapshots, undefined);
 });
 
 test("up without a bot says to run init; up past its timeout says what still waits, and why", async (t) => {

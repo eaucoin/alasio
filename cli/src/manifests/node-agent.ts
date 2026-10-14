@@ -23,12 +23,14 @@ import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@ku
 
 import {
   CONTAINERD,
+  CPU_FEATURES_CONTAINER,
   GVISOR_RELEASES,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "../../../src/node-agent/names.ts";
+import { currentGvisorRelease } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRuns, otelEnv, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
@@ -88,6 +90,17 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
           ...imagePullSecrets(config),
           ...given("nodeSelector", { ...sessions.nodeSelector }),
           ...given("tolerations", [...sessions.tolerations]),
+          // What the node's CPU has under the current release, said in the pod's status
+          // before the agent starts, for alasio up to hold sessions to (../cpu-baseline.ts).
+          initContainers: [{
+            name: CPU_FEATURES_CONTAINER,
+            image: imageReference(config.images.alasio),
+            imagePullPolicy: config.images.pullPolicy,
+            command: ["node", "/opt/alasio/src/node-agent/cpu-features.ts", currentGvisorRelease()],
+            securityContext: { privileged: true, runAsUser: 0 },
+            resources: sessions.snapshots.nodeAgent.resources,
+            volumeMounts: volumeMounts.filter(({ name }) => name !== "snapshots"),
+          }],
           containers: [{
             name: "node-agent",
             image: imageReference(config.images.alasio),
