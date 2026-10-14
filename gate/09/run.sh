@@ -12,12 +12,16 @@
 #   fork's restore annotations, onto a rootfs pulled lazily anew.
 # - G5: the daemon's caches against the content store, and its and containerd's memory.
 # - G6: the caches once the images are removed from the node, and once the daemon restarted.
-# - G7: the sandbox image with a prefetch list, recorded by ctr-remote image optimize.
+# - G7: what the FUSE manager's memory is, at each stage: its own heap, or files it maps,
+#   as /proc and its service's cgroup count them.
 #
 # Needs root through sudo, Docker and buildx. Measurements go to $OUT. STARGZ_OPTIONS,
 # when set, are top-level lines of the daemon's configuration besides, as G5 compares.
 #
 #   OUT=/tmp/gate-09 STARGZ_OPTIONS='no_background_fetch = true' gate/09/run.sh
+#
+# STARGZ_ENVIRONMENT, when set, is the daemon's service's Environment= besides, which the
+# FUSE manager it starts inherits (GOMEMLIMIT=..., say).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -59,6 +63,7 @@ Description=stargz snapshotter, beside k3s's containerd
 Before=k3s.service
 
 [Service]
+${STARGZ_ENVIRONMENT:+Environment=$STARGZ_ENVIRONMENT}
 ExecStart=/usr/local/bin/containerd-stargz-grpc --address=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock --config=/etc/containerd-stargz-grpc/config.toml --root=$STARGZ_ROOT --log-level=info
 Restart=always
 # Its FUSE mounts stay with the FUSE manager when it stops.
@@ -227,11 +232,28 @@ started() { # <name>: waits until its container has started, whatever it does th
 }
 remote_layers() { mount | grep -c "$STARGZ_ROOT" || true; }
 count() { kubectl -n gate exec "$1" -- cat /count; }
+# memory <stage>: the FUSE manager's memory now, as /proc and its service's cgroup count it,
+# to memory-stages.txt: its resident set, anonymous (its heap) and of files, and its
+# proportional share of each; and the cgroup's anon and file pages.
+memory() {
+  local pid
+  pid=$(pgrep -x stargz-fuse-man | head -1 || true)
+  [ -n "$pid" ] || { echo "$1 no FUSE manager runs" | tee -a "$OUT/memory-stages.txt"; return; }
+  {
+    printf '%s ' "$1"
+    sudo awk '/^(VmRSS|RssAnon|RssFile|RssShmem):/ { printf "%s %s kB, ", $1, $2 }' "/proc/$pid/status"
+    sudo awk '/^(Pss_Anon|Pss_File):/ { printf "%s %s kB, ", $1, $2 }' "/proc/$pid/smaps_rollup"
+    cgroup=$(awk -F: '{ print $3 }' "/proc/$pid/cgroup")
+    sudo awk '/^(anon|file) / { printf "cgroup %s %d MB, ", $1, $2 / 1048576 }' "/sys/fs/cgroup$cgroup/memory.stat"
+    printf 'GOMEMLIMIT=%s\n' "$(sudo tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^GOMEMLIMIT=//p')"
+  } | tee -a "$OUT/memory-stages.txt"
+}
 counting() { # <name>: waits until it has counted for a second
   until count "$1" >/dev/null 2>&1; do sleep 0.2; done
   sleep 1
 }
 
+memory started
 log "G1: gVisor pods from eStargz images, directfs on and off"
 pod lazy-directfs "$REGISTRY/counter:estargz" gvisor
 log "  directfs on: running after $(running lazy-directfs) ms"
@@ -241,6 +263,7 @@ kubectl -n gate exec lazy-directfs -- md5sum /blob >"$OUT/blob-directfs.txt"
 kubectl -n gate exec lazy-nodirectfs -- md5sum /blob >"$OUT/blob-nodirectfs.txt"
 cmp "$OUT/blob-directfs.txt" "$OUT/blob-nodirectfs.txt" || fail "the two read the image's file differently"
 log "  remote layer mounts: $(remote_layers)"
+memory counters-mounted
 sudo k3s ctr -n k8s.io snapshots --snapshotter "$SNAPSHOTTER" ls >"$OUT/snapshots.txt"
 # start <image> <name>: starts the sandbox image, not on the node, and says how long it took.
 start() {
@@ -263,15 +286,7 @@ starts() {
 }
 start sandbox:plain start-plain
 starts sandbox:estargz
-
-log "G7: the sandbox image optimized by ctr-remote, with a prefetch list of what it read in its first 15 s"
-ctr_remote() { sudo env PATH="$PATH:/var/lib/rancher/k3s/data/current/bin" ctr-remote --address /run/k3s/containerd/containerd.sock --namespace gate-optimize "$@"; }
-ctr_remote image pull --plain-http "$REGISTRY/sandbox:plain" >/dev/null
-ctr_remote image optimize --oci --period=15 "$REGISTRY/sandbox:plain" "$REGISTRY/sandbox:optimized" >"$OUT/optimize.log" 2>&1 ||
-  { tail -40 "$OUT/optimize.log"; fail "ctr-remote did not optimize the sandbox image"; }
-ctr_remote image push --plain-http "$REGISTRY/sandbox:optimized" >/dev/null
-ctr_remote image rm "$REGISTRY/sandbox:plain" "$REGISTRY/sandbox:optimized" >/dev/null
-starts sandbox:optimized
+memory sandbox-started
 
 log "G2: a k3s restart, lazily pulled pods running"
 pod survivor-runc "$REGISTRY/counter:estargz" ""
@@ -327,13 +342,14 @@ sleep 120
 # On their own file systems only (-x): the snapshots' FUSE mounts, read, would fetch.
 sudo sh -c "du -shx $STARGZ_ROOT/* $STARGZ_ROOT/stargz/* /var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.overlayfs; true" | tee "$OUT/disk.txt"
 ps -o rss=,comm= -C containerd-stargz-grpc,stargz-fuse-manager,containerd | tee "$OUT/memory.txt"
+memory background-fetched
 
 # The caches are a directory of each layer's, under httpcache/ and fscache/, which the
 # daemon removes when it closes the layer (cache/cache.go's directoryCache.Close): once no
 # snapshot mounts it and its resolved entry has expired (resolve_result_entry_ttl_sec, 120 s).
 log "G6: the caches once the images are gone from the node"
 kubectl -n gate delete pods --all --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
-for image in sandbox:plain sandbox:estargz sandbox:optimized counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
+for image in sandbox:plain sandbox:estargz counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
 sleep 180
 sudo sh -c "du -shx $STARGZ_ROOT/snapshotter $STARGZ_ROOT/stargz/*; true" | tee "$OUT/disk-after-rmi.txt"
 log "G6: and once the daemon restarted"

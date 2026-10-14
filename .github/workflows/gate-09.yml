@@ -1,8 +1,8 @@
 name: gate-09
 
 # 09's gate (gate/09/run.sh), on its tracks' branches alone, whenever what it runs changes:
-# k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon; with
-# its background fetch on, as by default, one layer at a time, and off, which G5 compares.
+# k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon, in
+# legs that G5 and G7 compare.
 on:
   push:
     branches: [track/wave0-gates, track/lazy-pulling-gate]
@@ -18,8 +18,25 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      # One layer at a time in the background, as alasio sets it; and each with what may
+      # bound the FUSE manager's memory: a soft limit of Go's, the TOC metadata on disk
+      # rather than in memory, the fetched files' page cache dropped.
       matrix:
-        fetch: [background, background-one-at-a-time]
+        include:
+          - leg: one-at-a-time
+            options: "max_concurrency = 1"
+          - leg: gomemlimit
+            options: "max_concurrency = 1"
+            environment: GOMEMLIMIT=200MiB
+          - leg: metadata-on-disk
+            options: |
+              max_concurrency = 1
+              metadata_store = "db"
+          - leg: fadv-dontneed
+            options: |
+              max_concurrency = 1
+              [directory_cache]
+              fadv_dontneed = true
     steps:
       # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
       - name: Free disk space
@@ -31,7 +48,8 @@ jobs:
       - run: gate/09/run.sh
         env:
           OUT: ${{ runner.temp }}/gate-09
-          STARGZ_OPTIONS: ${{ matrix.fetch == 'on-demand' && 'no_background_fetch = true' || matrix.fetch == 'background-one-at-a-time' && 'max_concurrency = 1' || '' }}
+          STARGZ_OPTIONS: ${{ matrix.options }}
+          STARGZ_ENVIRONMENT: ${{ matrix.environment }}
       - name: The node, when something failed
         if: failure()
         run: |
@@ -42,7 +60,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-09-${{ matrix.fetch }}
+          name: gate-09-${{ matrix.leg }}
           path: ${{ runner.temp }}/gate-09
 
   # The box's cut-over from overlayfs (gate/09/cutover.sh), rehearsed.
