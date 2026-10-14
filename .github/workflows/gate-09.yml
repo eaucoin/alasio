@@ -2,7 +2,7 @@ name: gate-09
 
 # 09's gate (gate/09/run.sh), on its tracks' branches alone, whenever what it runs changes:
 # k3s on the runner, gVisor from alasio's fork, stargz-snapshotter's standalone daemon; with
-# its background fetch on, as by default, and off, which G5's disk compares.
+# its background fetch on, as by default, one layer at a time, and off, which G5 compares.
 on:
   push:
     branches: [track/wave0-gates, track/lazy-pulling-gate]
@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fetch: [background, on-demand]
+        fetch: [background, background-one-at-a-time, on-demand]
     steps:
       # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
       - name: Free disk space
@@ -31,7 +31,7 @@ jobs:
       - run: gate/09/run.sh
         env:
           OUT: ${{ runner.temp }}/gate-09
-          STARGZ_OPTIONS: ${{ matrix.fetch == 'on-demand' && 'no_background_fetch = true' || '' }}
+          STARGZ_OPTIONS: ${{ matrix.fetch == 'on-demand' && 'no_background_fetch = true' || matrix.fetch == 'background-one-at-a-time' && 'max_concurrency = 1' || '' }}
       - name: The node, when something failed
         if: failure()
         run: |

@@ -11,6 +11,7 @@
 # - G4: a gVisor pod checkpointed, its image removed from the node, and restored, by the
 #   fork's restore annotations, onto a rootfs pulled lazily anew.
 # - G5: the daemon's caches against the content store, and its and containerd's memory.
+# - G6: the caches once the images are removed from the node, and once the daemon restarted.
 #
 # Needs root through sudo, Docker and buildx. Measurements go to $OUT. STARGZ_OPTIONS,
 # when set, are top-level lines of the daemon's configuration besides, as G5 compares.
@@ -302,4 +303,17 @@ sleep 120
 # On their own file systems only (-x): the snapshots' FUSE mounts, read, would fetch.
 sudo sh -c "du -shx $STARGZ_ROOT/* $STARGZ_ROOT/stargz/* /var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.overlayfs; true" | tee "$OUT/disk.txt"
 ps -o rss=,comm= -C containerd-stargz-grpc,stargz-fuse-manager,containerd | tee "$OUT/memory.txt"
+
+# The caches are a directory of each layer's, under httpcache/ and fscache/, which the
+# daemon removes when it closes the layer (cache/cache.go's directoryCache.Close): once no
+# snapshot mounts it and its resolved entry has expired (resolve_result_entry_ttl_sec, 120 s).
+log "G6: the caches once the images are gone from the node"
+kubectl -n gate delete pods --all --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
+for image in sandbox:plain sandbox:estargz counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
+sleep 180
+sudo sh -c "du -shx $STARGZ_ROOT/snapshotter $STARGZ_ROOT/stargz/*; true" | tee "$OUT/disk-after-rmi.txt"
+log "G6: and once the daemon restarted"
+sudo systemctl restart stargz-snapshotter
+sleep 10
+sudo sh -c "du -shx $STARGZ_ROOT/snapshotter $STARGZ_ROOT/stargz/*; true" | tee "$OUT/disk-after-restart.txt"
 log "gate done"
