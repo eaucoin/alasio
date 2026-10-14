@@ -241,12 +241,20 @@ kubectl -n gate exec lazy-nodirectfs -- md5sum /blob >"$OUT/blob-nodirectfs.txt"
 cmp "$OUT/blob-directfs.txt" "$OUT/blob-nodirectfs.txt" || fail "the two read the image's file differently"
 log "  remote layer mounts: $(remote_layers)"
 sudo k3s ctr -n k8s.io snapshots --snapshotter "$SNAPSHOTTER" ls >"$OUT/snapshots.txt"
-for image in sandbox:plain sandbox:estargz; do
-  name=start-${image/:/-}
+# The eStargz one three times, each on a node it is gone from again, its caches with it
+# once its resolved layers expire (120 s), the last left running for what follows.
+for run in plain 1 2 3; do
+  image=sandbox:estargz name=start-estargz-$run
+  [ "$run" != plain ] || image=sandbox:plain name=start-plain
   pod "$name" "$REGISTRY/$image" gvisor
   ms=$(started "$name")
   log "  a sandbox image ($image), not on the node, started under gVisor after $ms ms"
   echo "$image $ms" >>"$OUT/start-times.txt"
+  if [ "$run" = 1 ] || [ "$run" = 2 ]; then
+    kubectl -n gate delete pod "$name" --grace-period=0 --force --wait=true >/dev/null 2>&1 || true
+    sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null
+    sleep 150
+  fi
 done
 
 log "G2: a k3s restart, lazily pulled pods running"
