@@ -98,7 +98,7 @@ test("the status line carries a relative start time the app keeps current", () =
   const waiting = workingStatusHtml({
     harnessName: "Codex",
     startedAtMs: 1_790_000_000_000,
-    workflowWait: { runId: "wf_<1>", waitType: "watch" },
+    waitingOn: "workflow run wf_<1> (watch)",
   });
-  assert.match(waiting, /^Codex is watching workflow wf_&lt;1&gt; \(watch\) · started <tg-time/);
+  assert.match(waiting, /^Codex is waiting on workflow run wf_&lt;1&gt; \(watch\) · started <tg-time/);
 });

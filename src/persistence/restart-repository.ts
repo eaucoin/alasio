@@ -42,15 +42,18 @@ export class NeonRestartRepository {
   }
 
   /**
-   * Records that the conversation's active turn was cut short by a restart alasio cannot
-   * attribute, unless it has no active turn or a restart of it is already recorded.
+   * Records that the conversation's active turn of `epoch` was cut short by a restart
+   * alasio cannot attribute, unless another turn has claimed the conversation since, the
+   * turn has ended, or a restart of it is already recorded.
    */
-  recordExternalRestartEvent(threadKey: string): Effect.Effect<void, StoreError> {
+  recordExternalRestartEvent(threadKey: string, epoch: number): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
       `insert into ${this.#schema}.restart_events (thread_key, cause, channel, thread_ts, session_id)
-       select thread_key, 'external_or_unknown', channel, thread_ts, session_id from ${this.#schema}.turns where id = $1 and state = 'active'
+       select thread_key, 'external_or_unknown', channel, thread_ts, session_id from ${this.#schema}.turns
+       where id = $1 and epoch = $2 and state = 'active'
+       for share
        on conflict (thread_key) do nothing`,
-      [threadKey],
+      [threadKey, epoch],
     ));
   }
 

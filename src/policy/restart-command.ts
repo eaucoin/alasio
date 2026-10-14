@@ -4,10 +4,7 @@
  * restarted by rolling it out again: `kubectl rollout restart` of `ALASIO_DEPLOYMENT`
  * (alasio unless set), which the host profile lets folder workspaces' agents do.
  */
-import type { Effect } from "effect";
-
-import type { StoreError } from "../persistence/sql.ts";
-import type { Store } from "../persistence/store.ts";
+import type { TurnPersistence, TurnWrite } from "../persistence/store.ts";
 import { resolveCommandTokens, tokenizeShellCommand, unwrapShellCommandOnce } from "./shell-command.ts";
 
 /** Where the restart detectors read ALASIO_DEPLOYMENT from; the process's environment unless given. */
@@ -16,7 +13,7 @@ export interface RestartCommandOptions {
 }
 
 /** Where a self-restart is recorded: alasio's store. */
-export type RestartEventRecorder = Pick<Store["Service"], "recordRestartEvent">;
+export type RestartEventRecorder = Pick<TurnPersistence, "recordRestartEvent">;
 
 // kubectl's global flags that take a value, which may come before or after the verb.
 const KUBECTL_VALUE_FLAGS = new Set(["-n", "--namespace", "--context", "--kubeconfig", "--cluster", "--user", "-s", "--server"]);
@@ -75,17 +72,16 @@ export function looksLikeSelfRestartNearMiss(command: string, { env = process.en
   ));
 }
 
+/** Records, under the turn `persistence` writes for, that its `command` restarts alasio. */
 export function recordSelfRestartEvent(
   persistence: RestartEventRecorder,
   sessionId: string | null | undefined,
-  threadKey: string,
   chatId: string,
   messageId: string,
   command: string,
-): Effect.Effect<void, StoreError> {
+): TurnWrite<void> {
   return persistence.recordRestartEvent({
     cause: "self_induced",
-    thread_key: threadKey,
     channel: chatId,
     thread_ts: messageId,
     session_id: sessionId ?? null,

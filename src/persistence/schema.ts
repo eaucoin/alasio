@@ -129,6 +129,16 @@ create table if not exists ${SCHEMA}.turns (
   pending_response_id text,
   prompt text,
   state text not null,
+  -- how many turns have claimed the conversation: each turn's writes, and its harness's,
+  -- hold only while no turn has claimed it since
+  epoch bigint not null default 0,
+  -- what the turn's harness says it does: working, waiting (on waiting_on), interrupted, ended
+  status text not null default 'working',
+  waiting_on text,
+  -- how it ended: completed, incomplete, interrupted, stopped, failed
+  outcome text,
+  -- its status message's outbox entry, which edits name, so a start after a crash can say how it ended
+  status_outbox_id text,
   started_at timestamptz not null,
   completed_at timestamptz
 );
@@ -137,6 +147,10 @@ create table if not exists ${SCHEMA}.responses (
   id text primary key,
   chat_id text not null,
   message_id text not null,
+  -- the conversation whose turn writes it, and that turn's epoch: written to only while
+  -- no turn has claimed the conversation since
+  thread_key text,
+  epoch bigint,
   session_id text,
   completed boolean not null default false,
   posted boolean not null default false,

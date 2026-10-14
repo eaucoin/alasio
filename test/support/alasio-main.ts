@@ -57,7 +57,6 @@ if (import.meta.main) {
       pool,
       stateSchema: config.stateSchema,
       keepCodexLogin: false,
-      hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
       branch: config.branch ?? null,

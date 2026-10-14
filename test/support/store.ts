@@ -9,7 +9,8 @@ import { Effect } from "effect";
 import pg from "pg";
 
 import type { StoreError } from "../../src/persistence/sql.ts";
-import { Store } from "../../src/persistence/store.ts";
+import { Store, type TurnFenced, type TurnPersistence } from "../../src/persistence/store.ts";
+import { CODEX_HARNESS } from "../../src/harness/names.ts";
 import { startPostgres, type TestPostgres } from "./postgres.ts";
 
 /** The test file's Postgres, and the pool its stores share. */
@@ -57,5 +58,15 @@ export async function testStore({ schema = newSchema(), workingDirectory = null,
   return Effect.runPromise(Effect.provide(Store, Store.layer({ pool, schema, workingDirectory, branch })));
 }
 
-/** Runs what a test asks of a store: its value. */
-export const run = <A>(effect: Effect.Effect<A, StoreError>): Promise<A> => Effect.runPromise(effect);
+/** Runs what a test asks of a store, or of a turn's writes to it: its value. */
+export const run = <A>(effect: Effect.Effect<A, StoreError | TurnFenced>): Promise<A> => Effect.runPromise(effect);
+
+/**
+ * What the conversation's turn writes, as a harness running in it would: under the epoch
+ * of its active turn, or of one claimed now (on the chat `chatId`) when none is active.
+ */
+export async function writerOf(store: Store["Service"], conversationId: string, chatId = "123"): Promise<TurnPersistence> {
+  const active = await run(store.getActiveTurn(conversationId));
+  const epoch = active ? Number(active.epoch) : await run(store.claimTurn({ conversationId, chatId, messageId: "writer", harness: CODEX_HARNESS }));
+  return store.turnPersistence(conversationId, epoch);
+}

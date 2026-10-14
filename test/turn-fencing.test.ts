@@ -1,0 +1,160 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { Effect, Exit } from "effect";
+
+import { CODEX_HARNESS } from "../src/harness/names.ts";
+import { TurnFenced } from "../src/persistence/store.ts";
+import { newSchema, run, testPool, testStore } from "./support/store.ts";
+
+/** A conversation of Codex's in a new store, in `schema`, and a turn claim of it. */
+async function conversation() {
+  const schema = newSchema();
+  const store = await testStore({ schema });
+  const conversationId = await run(store.upsertConversation({ chatId: "7", user: { id: 7 } }));
+  await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
+  const claim = (messageId: string) => run(store.claimTurn({ conversationId, chatId: "7", messageId, harness: CODEX_HARNESS, prompt: messageId }));
+  return { store, schema, conversationId, claim };
+}
+
+/** That `effect` failed as a write of the turn of `epoch` refused, its conversation claimed since: with TurnFenced, not as the store fails. */
+async function refused(effect: Effect.Effect<unknown, unknown>, epoch: number): Promise<void> {
+  const exit = await Effect.runPromiseExit(effect);
+  assert.ok(Exit.isFailure(exit), "the write was made");
+  const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail");
+  assert.ok(failure && failure._tag === "Fail");
+  assert.ok(failure.error instanceof TurnFenced, String(failure.error));
+  assert.equal(failure.error.epoch, epoch);
+}
+
+test("each turn claims its conversation under an epoch one more than the turn's before it, working, its outcome cleared, and ends under its own", async () => {
+  const { store, conversationId, claim } = await conversation();
+  assert.equal(await claim("1"), 1);
+  assert.equal(await run(store.endTurn(conversationId, 1, "completed")), true);
+  const ended = await run(store.getTurn(conversationId));
+  assert.deepEqual([ended?.state, ended?.status, ended?.outcome], ["completed", "ended", "completed"]);
+  assert.equal(await run(store.getActiveTurn(conversationId)), null);
+  // An ended turn ends no more.
+  assert.equal(await run(store.endTurn(conversationId, 1, "failed")), false);
+  assert.equal((await run(store.getTurn(conversationId)))?.outcome, "completed");
+  assert.equal(await claim("2"), 2);
+  const turn = await run(store.getActiveTurn(conversationId));
+  assert.deepEqual([turn?.epoch, turn?.status, turn?.outcome, turn?.waiting_on, turn?.status_outbox_id], ["2", "working", null, null, null]);
+});
+
+test("a turn's writes, and its harness's, hold until another turn claims the conversation, and are refused after", async () => {
+  const { store, conversationId, claim } = await conversation();
+  const first = store.turnPersistence(conversationId, await claim("1"));
+  const response = await run(first.createPendingResponse("7", "1", null));
+  await run(first.updateActiveTurnPendingResponseId(response));
+  await run(first.updateActiveTurnSessionId("session-1"));
+  await run(first.appendBlocksToPending(response, [{ type: "text", content: "Working.", phase: "commentary" }]));
+  await run(first.updatePendingSessionId(response, "session-1"));
+  assert.equal((await run(store.getActiveTurn(conversationId)))?.session_id, "session-1");
+  assert.equal((await run(store.getMount(conversationId))).sessionId, "session-1");
+
+  // Another turn claims it: the first's every write is refused, and changes nothing.
+  const second = store.turnPersistence(conversationId, await claim("2"));
+  await refused(first.createPendingResponse("7", "1", null), 1);
+  await refused(first.updateActiveTurnPendingResponseId(response), 1);
+  await refused(first.updateActiveTurnSessionId("session-stale"), 1);
+  await refused(first.appendBlocksToPending(response, [{ type: "text", content: "Stale.", phase: "final_answer" }]), 1);
+  await refused(first.markPendingResponseComplete(response), 1);
+  await refused(first.updatePendingSessionId(response, "session-stale"), 1);
+  await refused(first.markPendingAsPosted(response), 1);
+  await refused(first.updateSessionUsage("session-1", { cacheReadInputTokens: 10 }), 1);
+  await refused(first.setWaiting("workflow run 1 (watch)"), 1);
+  await refused(first.recordRestartEvent({ cause: "self_induced", channel: "7", thread_ts: "1", session_id: null }), 1);
+  assert.equal((await run(store.getMount(conversationId))).sessionId, "session-1");
+  assert.equal(await run(store.getRestartEvent(conversationId)), null);
+  assert.equal(await run(store.getSessionTokens("session-1")), 0);
+  assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
+  assert.equal((await run(store.getActiveTurn(conversationId)))?.status, "working");
+
+  // The second's hold, its response its own.
+  const own = await run(second.createPendingResponse("7", "2", null));
+  await run(second.appendBlocksToPending(own, [{ type: "text", content: "Done.", phase: "final_answer" }]));
+  await run(second.markPendingResponseComplete(own));
+  await run(second.updateSessionUsage("session-2", { cacheReadInputTokens: 10 }));
+  assert.deepEqual((await run(store.getCompletedResponsesPendingDelivery)).map(({ id }) => id), [own]);
+  assert.equal(await run(store.getSessionTokens("session-2")), 10);
+  // Its writes hold on after it ended, until another claims the conversation.
+  assert.equal(await run(store.endTurn(conversationId, 2, "completed")), true);
+  await run(second.markPendingAsPosted(own));
+});
+
+test("what alasio does with a turn holds only under the turn's epoch: a turn superseded ends, interrupts, records and names nothing of the one after it", async () => {
+  const { store, conversationId, claim } = await conversation();
+  const first = await claim("1");
+  const second = await claim("2");
+  assert.equal(await run(store.endTurn(conversationId, first, "failed")), false);
+  assert.equal(await run(store.setTurnStatus(conversationId, first, "interrupted")), false);
+  assert.equal(await run(store.setTurnStatusMessage(conversationId, first, "status-of-the-first")), false);
+  await run(store.recordExternalRestartEvent(conversationId, first));
+  const turn = await run(store.getActiveTurn(conversationId));
+  assert.deepEqual([turn?.epoch, turn?.state, turn?.status, turn?.status_outbox_id], [String(second), "active", "working", null]);
+  assert.equal(await run(store.getRestartEvent(conversationId)), null);
+
+  // The second's own: a restart recorded under it is let go of as it ends.
+  assert.equal(await run(store.setTurnStatusMessage(conversationId, second, "status-of-the-second")), true);
+  await run(store.recordExternalRestartEvent(conversationId, second));
+  assert.equal((await run(store.getRestartEvent(conversationId)))?.cause, "external_or_unknown");
+  assert.equal(await run(store.endTurn(conversationId, second, "stopped")), true);
+  assert.equal(await run(store.getRestartEvent(conversationId)), null);
+  const ended = await run(store.getTurn(conversationId));
+  assert.deepEqual([ended?.outcome, ended?.status_outbox_id], ["stopped", "status-of-the-second"]);
+});
+
+test("a write racing a claim waits for it, and is refused once it commits", async () => {
+  const { store, schema, conversationId, claim } = await conversation();
+  const first = store.turnPersistence(conversationId, await claim("1"));
+  const response = await run(first.createPendingResponse("7", "1", null));
+  const client = await (await testPool()).connect();
+  try {
+    // A claim, in a transaction of its own, not yet committed.
+    await client.query("begin");
+    await client.query(`update ${schema}.turns set epoch = epoch + 1 where id = $1`, [conversationId]);
+    let settled = 0;
+    const writes = [
+      first.appendBlocksToPending(response, [{ type: "text", content: "Late.", phase: "final_answer" }]),
+      first.updateSessionUsage("session-1", { cacheReadInputTokens: 5 }),
+      first.recordRestartEvent({ cause: "self_induced", channel: "7", thread_ts: "1", session_id: null }),
+    ].map((write) => Effect.runPromiseExit(write).finally(() => void (settled += 1)));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(settled, 0, "a write did not wait for the claim");
+    await client.query("commit");
+    for (const exit of await Promise.all(writes)) {
+      assert.ok(Exit.isFailure(exit));
+      const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail");
+      assert.ok(failure?._tag === "Fail" && failure.error instanceof TurnFenced, String(exit));
+    }
+  } finally {
+    client.release();
+  }
+  assert.equal(await run(store.getSessionTokens("session-1")), 0);
+  assert.equal(await run(store.getRestartEvent(conversationId)), null);
+});
+
+test("a turn says what it waits on while it works, and works again once it is past it; one left for a restart, or ended, says what it said", async () => {
+  const { store, conversationId, claim } = await conversation();
+  const epoch = await claim("1");
+  const writer = store.turnPersistence(conversationId, epoch);
+  await run(writer.setWaiting("workflow run 42 (watch)"));
+  assert.deepEqual(await statusOf(store, conversationId), ["waiting", "workflow run 42 (watch)", null]);
+  await run(writer.setWaiting(null));
+  assert.deepEqual(await statusOf(store, conversationId), ["working", null, null]);
+  assert.equal(await run(store.setTurnStatus(conversationId, epoch, "interrupted")), true);
+  await run(writer.setWaiting("workflow run 43 (poll)"));
+  assert.deepEqual(await statusOf(store, conversationId), ["interrupted", null, null]);
+  assert.equal(await run(store.endTurn(conversationId, epoch, "incomplete")), true);
+  await run(writer.setWaiting("workflow run 44 (poll)"));
+  const ended = await run(store.getTurn(conversationId));
+  assert.deepEqual([ended?.status, ended?.waiting_on, ended?.outcome], ["ended", null, "incomplete"]);
+  assert.equal(await claim("2"), epoch + 1);
+});
+
+/** The conversation's active turn's status, what it waits on, and its outcome. */
+async function statusOf(store: Awaited<ReturnType<typeof testStore>>, conversationId: string) {
+  const turn = await run(store.getActiveTurn(conversationId));
+  return [turn?.status, turn?.waiting_on, turn?.outcome];
+}

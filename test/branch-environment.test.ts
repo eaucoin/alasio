@@ -35,12 +35,13 @@ test("a branch's state, as it first starts, keeps its conversations and loses wh
   await run(main.setTelegramOffset(41));
   await run(main.recordTelegramUpdate({ update_id: 41, message: { message_id: 7, date: 0, from: { id: 1001, is_bot: false, first_name: "Operator" }, chat: { id: 1001, type: "private", first_name: "Operator" }, text: "queued" } }));
   await run(main.enqueuePromptJob({ conversationId, chatId: 1001, messageId: 7, prompt: "queued", harness: "codex" }));
-  const pending = await run(main.createPendingResponse(1001, 8));
-  await run(main.upsertActiveTurn({ conversationId, chatId: "1001", messageId: "8", harness: "codex", pendingResponseId: pending }));
-  await run(main.markPendingResponseComplete(pending));
+  const writer = main.turnPersistence(conversationId, await run(main.claimTurn({ conversationId, chatId: "1001", messageId: "8", harness: "codex" })));
+  const pending = await run(writer.createPendingResponse(1001, 8));
+  await run(writer.updateActiveTurnPendingResponseId(pending));
+  await run(writer.markPendingResponseComplete(pending));
   await run(main.enqueueOutboxText({ chatId: 1001, text: "on its way" }));
   const [button] = await run(main.createCallbackActions(conversationId, [{ kind: "refresh" }]));
-  await run(main.recordRestartEvent({ cause: "operator_induced", thread_key: conversationId, channel: "1001", thread_ts: "8", session_id: null }));
+  await run(writer.recordRestartEvent({ cause: "operator_induced", channel: "1001", thread_ts: "8", session_id: null }));
   await run(main.setCodexLogin('{"tokens":{"refresh_token":"once"}}'));
 
   const branch = await testStore({ schema, branch: "try-codex" });

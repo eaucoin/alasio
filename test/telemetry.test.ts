@@ -13,7 +13,7 @@ import { NodeSDK } from "@opentelemetry/sdk-node";
 import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
 import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
-import type { Harness, TurnPersistence } from "../src/harness/index.ts";
+import type { Harness } from "../src/harness/index.ts";
 import type { HarnessName } from "../src/harness/names.ts";
 import type { HostProfile } from "../src/kube/config.ts";
 import type { Store as StoreService } from "../src/persistence/store.ts";
@@ -21,6 +21,7 @@ import type { Store as StoreService } from "../src/persistence/store.ts";
 import type { Effect as EffectTypes } from "effect";
 import type { Outbox as OutboxService } from "../src/telegram/outbox.ts";
 import type { BotAnswer } from "./support/bot-api.ts";
+import { forgetfulPersistence, ownTurnsOn } from "./support/persistence.ts";
 
 // alasio records through the OpenTelemetry API; an SDK registered before alasio's modules
 // load (as src/index.ts does) receives it. Here it keeps everything in memory.
@@ -460,19 +461,6 @@ test("an effect's call is a call of alasio's: a client span and a duration label
   assert.equal(points[0]?.attributes["error.type"], "EffectProbeError");
 });
 
-/** A turn's persistence that keeps nothing: what the turn stores is not what this test looks at. */
-const forgetful: TurnPersistence = {
-  createPendingResponse: () => Effect.succeed("pending-1"),
-  updateActiveTurnPendingResponseId: () => Effect.void,
-  updatePendingSessionId: () => Effect.void,
-  updateActiveTurnSessionId: () => Effect.void,
-  appendBlocksToPending: () => Effect.void,
-  markPendingResponseComplete: () => Effect.void,
-  markPendingAsPosted: () => Effect.void,
-  updateSessionUsage: () => Effect.void,
-  recordRestartEvent: () => Effect.void,
-};
-
 test("Claude Code's process does not join the turn's trace, and its hooks and replies still run on alasio's logger and tracer", async () => {
   const handedOn: { atStart?: string | undefined; whileRead?: string | undefined } = {};
   const queryFactory: ClaudeQueryFactory = ({ prompt, options }) => {
@@ -518,7 +506,8 @@ test("Claude Code's process does not join the turn's trace, and its hooks and re
         messageId: "9",
         workingDirectory: "/work",
         modelChoice: null,
-        persistence: forgetful,
+        persistence: forgetfulPersistence,
+        ownTurns: ownTurnsOn(forgetfulPersistence),
         onBackgroundResponse: Deferred.succeed(replied, undefined).pipe(Effect.asVoid, withAlasioSpan("test.background-reply")),
       });
       assert.equal(result.responseCompleted, true);

@@ -16,11 +16,11 @@ import { makeClaudeHarness } from "../src/harness/claude/index.ts";
 import type { ClaudeQueryFactory } from "../src/harness/claude/runtime.ts";
 import { SESSION_FS_CLAUDE_TOOLS } from "../src/harness/claude/sessionfs.ts";
 import { createClaudeSessionApi } from "../src/harness/claude/sessions.ts";
-import type { TurnPersistence } from "../src/harness/index.ts";
 import type { BaymaEndpoint } from "../src/kube/sandboxes.ts";
 import { noFolderBayma } from "../src/mcp/bayma.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
 import { fakeQuery, initMessage, stamped, successResult } from "./support/claude-sdk.ts";
+import { forgetfulPersistence, ownTurnsOn } from "./support/persistence.ts";
 
 // Both harnesses on a session filesystem, over a fake sandbox: what they run in, what they
 // are given, and which calls start the session's host.
@@ -226,21 +226,11 @@ test("Claude Code on a session filesystem runs in the harness directory, confine
     Effect.provide(ActiveTurns.layer),
     Scope.provide(scope),
   ));
-  const persistence: TurnPersistence = {
-    createPendingResponse: () => Effect.succeed("pending-1"),
-    markPendingAsPosted: () => Effect.void,
-    updateActiveTurnPendingResponseId: () => Effect.void,
-    updatePendingSessionId: () => Effect.void,
-    updateActiveTurnSessionId: () => Effect.void,
-    appendBlocksToPending: () => Effect.void,
-    markPendingResponseComplete: () => Effect.void,
-    updateSessionUsage: () => Effect.void,
-    recordRestartEvent: () => Effect.void,
-  };
+  const persistence = forgetfulPersistence;
   try {
     for (const prompt of ["hi", "again"]) {
       const result = await Effect.runPromise(harness.runTurn({
-        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, modelChoice: null, persistence,
+        prompt, resumeSession: "s1", threadKey: "telegram:1", chatId: "1", messageId: "2", workingDirectory: WORKSPACE, modelChoice: null, persistence, ownTurns: ownTurnsOn(persistence),
       }));
       assert.equal(result.responseCompleted, true);
     }

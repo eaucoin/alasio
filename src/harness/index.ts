@@ -11,7 +11,8 @@ import type { PodRef } from "../kube/busy.ts";
 import { type FolderBayma, folderBayma as hostFolderBayma, HostBayma } from "../mcp/bayma.ts";
 import type { ModelChoice, Mount } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import type { Store } from "../persistence/store.ts";
+import type { TurnFenced, TurnPersistence } from "../persistence/store.ts";
+import type { TurnOutcome } from "../persistence/turn-repository.ts";
 import { type SessionFilesystemsDisabled, SessionSandboxes } from "../sandbox/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import type { ActiveTurns } from "./active-turns.ts";
@@ -53,19 +54,25 @@ export interface TransportTurn {
   readonly turnId: string | null | undefined;
 }
 
-/** What a turn records in alasio's store as it runs: its response, its session and usage, and any restart it causes. */
-export type TurnPersistence = Pick<
-  Store["Service"],
-  | "createPendingResponse"
-  | "updateActiveTurnPendingResponseId"
-  | "updatePendingSessionId"
-  | "updateActiveTurnSessionId"
-  | "appendBlocksToPending"
-  | "markPendingResponseComplete"
-  | "markPendingAsPosted"
-  | "updateSessionUsage"
-  | "recordRestartEvent"
->;
+/** What a turn records in alasio's store as it runs (../persistence/store.ts). */
+export type { TurnPersistence };
+
+/** A turn a harness started on its own in a conversation, claimed as every turn is: what it writes, and its end. */
+export interface OwnTurn {
+  readonly persistence: TurnPersistence;
+  /** Ends the turn as `outcome` says it ended. */
+  readonly end: (outcome: TurnOutcome) => Effect.Effect<void, StoreError>;
+}
+
+/**
+ * How a harness that runs on between prompts (Claude Code reporting on its background
+ * work) starts a turn of its own: claiming the conversation, as the turns alasio starts
+ * do, once it holds it busy (ActiveTurns), so its writes hold until the next turn claims it.
+ */
+export interface OwnTurns {
+  /** Claims the conversation for a turn its harness started on its own, as of the message `messageId`, in the session `sessionId`. */
+  readonly claim: (messageId: string, sessionId: string | null) => Effect.Effect<OwnTurn, StoreError>;
+}
 
 /** A turn to run: the operator's prompt, the session it resumes, and where it reports. */
 export interface TurnParams {
@@ -78,6 +85,8 @@ export interface TurnParams {
   /** The model the conversation chose for the harness with /model, read as the turn starts; null for its default. */
   readonly modelChoice: ModelChoice | null;
   readonly persistence: TurnPersistence;
+  /** How the harness claims the conversation for a turn it starts on its own, after this one. */
+  readonly ownTurns: OwnTurns;
   readonly attachedTurn?: AttachedTurn | null | undefined;
   /** Run just before the prompt is sent, after which the agent may act on it. */
   readonly onPromptDispatched?: Effect.Effect<void> | undefined;
@@ -164,11 +173,12 @@ export interface Harness {
   /** Loads a session ahead of its next turn: whether it did. */
   readonly warmSession: (params: WarmSessionParams) => Effect.Effect<boolean, HarnessError>;
   /**
-   * Runs a turn to its end. It fails only as alasio's store does: what else goes wrong
-   * ends up in its response. While it runs, it is its conversation's running turn in
-   * ActiveTurns, which stops and steers it.
+   * Runs a turn to its end. It fails only as alasio's store does, or with TurnFenced where
+   * another turn has claimed the conversation since: what else goes wrong ends up in its
+   * response. While it runs, it is its conversation's running turn in ActiveTurns, which
+   * stops and steers it.
    */
-  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError>;
+  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>;
   readonly listModels: () => Effect.Effect<ModelOption[], HarnessError>;
   /** What a turn runs on when no /model choice is stored. */
   readonly defaultModelChoice: () => ModelChoice;

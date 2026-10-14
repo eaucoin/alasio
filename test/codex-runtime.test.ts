@@ -11,6 +11,7 @@ import { ActiveTurns } from "../src/harness/active-turns.ts";
 import type { TurnPersistence } from "../src/harness/index.ts";
 import type { PodRef } from "../src/kube/busy.ts";
 import { type Hold, recordingBusyPods } from "./support/busy-pods.ts";
+import { ownTurnsOn } from "./support/persistence.ts";
 
 /** A Codex whose every thread runs one turn that edits three files, answers, and completes. */
 function codexFactory(): CodexExecClient {
@@ -73,6 +74,7 @@ const runTurn = (
       messageId: "2",
       workingDirectory: process.cwd(),
       modelChoice: null,
+      ownTurns: ownTurnsOn(persistence),
       persistence,
       appServer,
       codexFactory,

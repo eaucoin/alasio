@@ -6,7 +6,7 @@
  * span them, each in one transaction.
  */
 import type { Update } from "@grammyjs/types";
-import { Context, Duration, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer, Schema } from "effect";
 import type { Pool } from "pg";
 
 import type { HarnessName } from "../harness/names.ts";
@@ -31,7 +31,7 @@ import { type CompletedResponse, NeonResponseRepository, type ResponseBlock } fr
 import { NeonRestartRepository, type NewRestartEvent, type RestartEvent } from "./restart-repository.ts";
 import { ensureSchema } from "./schema.ts";
 import { type NewSessionWorkspace, NeonSessionWorkspaceRepository, type SessionWorkspace, type SessionWorkspaceNetMode } from "./session-workspace-repository.ts";
-import { poolDatabase, type Sql, type StoreError } from "./sql.ts";
+import { poolDatabase, type Sql, StoreError } from "./sql.ts";
 import { NeonStateRepository } from "./state-repository.ts";
 import {
   type FileContent,
@@ -43,7 +43,7 @@ import {
   type StoredFile,
   type StoredMessage,
 } from "./telegram-content-repository.ts";
-import { type ActiveTurn, NeonTurnRepository, type Turn } from "./turn-repository.ts";
+import { type ActiveTurn, NeonTurnRepository, type Turn, type TurnOutcome, type TurnStatus } from "./turn-repository.ts";
 import { NeonUsageRepository, type SessionUsage } from "./usage-repository.ts";
 
 /**
@@ -88,6 +88,51 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
 
 /** What alasio does with its store; each of it fails as Neon does. */
 type Stored<A> = Effect.Effect<A, StoreError>;
+
+/**
+ * A turn's write refused, as another turn has claimed its conversation since
+ * (./turn-repository.ts): a write of a turn superseded, not a failure of the store's.
+ */
+export class TurnFenced extends Schema.TaggedError<TurnFenced>()("TurnFenced", {
+  threadKey: Schema.String,
+  epoch: Schema.Number,
+}) {
+  override get message(): string {
+    return `the turn of epoch ${this.epoch} no longer holds conversation ${this.threadKey}: another turn has claimed it since`;
+  }
+}
+
+/** A turn's write: failing as the store does, or with TurnFenced where the turn no longer holds its conversation. */
+export type TurnWrite<A> = Effect.Effect<A, StoreError | TurnFenced>;
+
+/**
+ * What a turn, and its harness, write in alasio's store as it runs, all of the
+ * conversation's turn it was made for: its response, its session and usage, what it
+ * waits on, and any restart it causes. Each write holds only while no turn has claimed
+ * the conversation since the turn did (Store.turnPersistence), and fails otherwise, with
+ * TurnFenced; the turn's epoch is checked in the statement, or the transaction, that
+ * writes.
+ */
+export interface TurnPersistence {
+  /** The epoch of the turn it writes for, which TurnFenced names where it no longer holds. */
+  readonly epoch: number;
+  /** A response to the chat's message as the harness begins it: its id. */
+  readonly createPendingResponse: (chatId: number | string, messageId: number | string, sessionId?: string | null) => TurnWrite<string>;
+  /** Records the response the turn writes. */
+  readonly updateActiveTurnPendingResponseId: (pendingResponseId: string | null) => TurnWrite<void>;
+  readonly updatePendingSessionId: (pendingResponseId: string, sessionId: string | null) => TurnWrite<void>;
+  /** Records the session the turn runs in, there and as its harness's session in the conversation. */
+  readonly updateActiveTurnSessionId: (sessionId: string | null) => TurnWrite<void>;
+  /** Adds blocks to a response, after those it has. */
+  readonly appendBlocksToPending: (pendingResponseId: string, blocks: readonly ResponseBlock[]) => TurnWrite<void>;
+  readonly markPendingResponseComplete: (pendingResponseId: string) => TurnWrite<void>;
+  readonly markPendingAsPosted: (pendingResponseId: string) => TurnWrite<void>;
+  readonly updateSessionUsage: (sessionId: string | null | undefined, usage: SessionUsage | null | undefined) => TurnWrite<void>;
+  /** Says the turn waits on `waitingOn` (a workflow run), or works again, for null, while it works. */
+  readonly setWaiting: (waitingOn: string | null) => TurnWrite<void>;
+  /** Records a restart the turn causes, of its conversation. */
+  readonly recordRestartEvent: (event: Omit<NewRestartEvent, "thread_key">) => TurnWrite<void>;
+}
 
 export class Store extends Context.Service<Store, {
   readonly getState: (key: string) => Stored<string | null>;
@@ -144,21 +189,25 @@ export class Store extends Context.Service<Store, {
   readonly getFilesForMessages: (messageIds: readonly string[]) => Stored<StoredFile[]>;
   readonly getPendingMediaGroupsDue: (ageMs: number) => Stored<MediaGroup[]>;
 
-  readonly upsertActiveTurn: (turn: ActiveTurn) => Stored<void>;
-  /** Records the session the conversation's active turn runs in, there and as its harness's session. */
-  readonly updateActiveTurnSessionId: (conversationId: string, sessionId: string | null) => Stored<void>;
-  readonly updateActiveTurnPendingResponseId: (conversationId: string, pendingResponseId: string | null) => Stored<void>;
-  /** Completes the conversation's active turn; given a pending response, only the turn of that response. */
-  readonly clearActiveTurn: (conversationId: string, pendingResponseId?: string | null) => Stored<void>;
+  /** Claims the conversation for a turn starting: the turn's epoch, which its writes hold under (turnPersistence). */
+  readonly claimTurn: (turn: ActiveTurn) => Stored<number>;
+  /** What the turn of `epoch`, and its harness, write as it runs, each write holding while no turn has claimed the conversation since. */
+  readonly turnPersistence: (conversationId: string, epoch: number) => TurnPersistence;
+  /** Says what the conversation's active turn of `epoch` is doing: whether it still holds the conversation. */
+  readonly setTurnStatus: (conversationId: string, epoch: number, status: TurnStatus) => Stored<boolean>;
+  /** Records the status message the conversation's turn of `epoch` queued: whether it still holds the conversation. */
+  readonly setTurnStatusMessage: (conversationId: string, epoch: number, outboxId: string) => Stored<boolean>;
+  /**
+   * Ends the conversation's active turn of `epoch`, as `outcome` says it ended, and lets go
+   * of any restart recorded under it: whether it was that turn, and active.
+   */
+  readonly endTurn: (conversationId: string, epoch: number, outcome: TurnOutcome) => Stored<boolean>;
   readonly getActiveTurns: Stored<Turn[]>;
   readonly getActiveTurn: (conversationId: string) => Stored<Turn | null>;
+  /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
+  readonly getTurn: (conversationId: string) => Stored<Turn | null>;
 
-  /** A response to the chat's message as its harness begins it: its id. */
-  readonly createPendingResponse: (chatId: number | string, messageId: number | string, sessionId?: string | null) => Stored<string>;
-  /** Adds blocks to a response, after those it has. */
-  readonly appendBlocksToPending: (pendingResponseId: string, blocks: readonly ResponseBlock[]) => Stored<void>;
-  readonly markPendingResponseComplete: (pendingResponseId: string) => Stored<void>;
-  readonly updatePendingSessionId: (pendingResponseId: string, sessionId: string | null) => Stored<void>;
+  /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
   readonly getCompletedResponsesPendingDelivery: Stored<CompletedResponse[]>;
 
@@ -182,6 +231,7 @@ export class Store extends Context.Service<Store, {
   readonly getPromptJob: (id: string) => Stored<PromptJob | null>;
   /** Starts the conversation's next pending job: the job, or null when none waits. */
   readonly claimNextPromptJob: (conversationId: string) => Stored<PromptJob | null>;
+  /** Settles what becomes of a job, its priority kept unless given. */
   readonly setPromptJobDisposition: (id: string, state: PromptJobState, priority?: number) => Stored<void>;
   readonly markPromptJobDispatched: (id: string) => Stored<void>;
   readonly markPromptJobUpstreamStarted: (id: string, sessionId: string | null | undefined, turnId: string | null | undefined) => Stored<void>;
@@ -197,13 +247,10 @@ export class Store extends Context.Service<Store, {
    * job queued, or null when no restart was recorded.
    */
   readonly stageRestartRecovery: (recovery: RestartRecovery) => Stored<PromptJob | null>;
-  readonly recordRestartEvent: (event: NewRestartEvent) => Stored<void>;
-  /** Records a restart alasio cannot attribute under the conversation's active turn, unless one is recorded. */
-  readonly recordExternalRestartEvent: (conversationId: string) => Stored<void>;
+  /** Records a restart alasio cannot attribute under the conversation's active turn of `epoch`, unless one is recorded. */
+  readonly recordExternalRestartEvent: (conversationId: string, epoch: number) => Stored<void>;
   readonly getRestartEvent: (conversationId: string) => Stored<RestartEvent | null>;
-  readonly clearRestartEvent: (conversationId: string) => Stored<void>;
 
-  readonly updateSessionUsage: (sessionId: string | null | undefined, usage: SessionUsage | null | undefined) => Stored<void>;
   readonly getSessionTokens: (sessionId: string) => Stored<number>;
 
   /** The text of Codex's auth.json as last kept, or null when none is. */
@@ -227,11 +274,9 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
   if (branch && (yield* startBranch(database, schema, branch))) {
     yield* Effect.logInfo(`made the state the branch ${branch}'s: what was in flight where it was branched from is gone`);
   }
-  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces } = repositories(
-    database,
-    schema,
-    workingDirectory,
-  );
+  /** The repositories on `sql`: a transaction's. */
+  const repositoriesOn = (sql: Sql) => repositories(sql, schema, workingDirectory);
+  const { state, conversations, callbacks, telegramContent, turns, responses, outbox, promptJobs, restarts, usage, codexLogin, sessionWorkspaces } = repositoriesOn(database);
 
   return Store.of({
     getState: (key) => state.getState(key),
@@ -273,18 +318,47 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     getFilesForMessages: (messageIds) => telegramContent.getFilesForMessages(messageIds),
     getPendingMediaGroupsDue: (ageMs) => telegramContent.getPendingMediaGroupsDue(ageMs),
 
-    upsertActiveTurn: (turn) => turns.upsertActiveTurn(turn),
-    updateActiveTurnSessionId: (conversationId, sessionId) => turns.updateActiveTurnSessionId(conversationId, sessionId),
-    updateActiveTurnPendingResponseId: (conversationId, pendingResponseId) => turns.updateActiveTurnPendingResponseId(conversationId, pendingResponseId),
-    clearActiveTurn: (conversationId, pendingResponseId) => turns.clearActiveTurn(conversationId, pendingResponseId),
+    claimTurn: (turn) => turns.claim(turn),
+    turnPersistence: (conversationId, epoch) => {
+      const fenced = () => new TurnFenced({ threadKey: conversationId, epoch });
+      /** `write`, failing with TurnFenced where it did not hold. */
+      const held = (write: Stored<boolean>): TurnWrite<void> => Effect.flatMap(write, (holds) => (holds ? Effect.void : Effect.fail(fenced())));
+      /**
+       * `write`, of a table that names no turn, in one transaction with the turn's row
+       * locked for share once it is seen to hold the conversation.
+       */
+      const holding = (write: (repositories: ReturnType<typeof repositoriesOn>) => Stored<void>): TurnWrite<void> =>
+        database.transaction((sql) => {
+          const on = repositoriesOn(sql);
+          return Effect.flatMap(on.turns.lockAt(conversationId, epoch), (holds): TurnWrite<void> => (holds ? write(on) : Effect.fail(fenced())));
+        });
+      return {
+        epoch,
+        createPendingResponse: (chatId, messageId, sessionId) =>
+          Effect.flatMap(responses.createPendingResponse(conversationId, epoch, chatId, messageId, sessionId), (id) => (id === null ? Effect.fail(fenced()) : Effect.succeed(id))),
+        updateActiveTurnPendingResponseId: (pendingResponseId) => held(turns.updatePendingResponseIdAt(conversationId, epoch, pendingResponseId)),
+        updatePendingSessionId: (pendingResponseId, sessionId) => held(responses.updatePendingSessionId(pendingResponseId, sessionId)),
+        updateActiveTurnSessionId: (sessionId) => held(turns.updateSessionIdAt(conversationId, epoch, sessionId)),
+        appendBlocksToPending: (pendingResponseId, blocks) => held(responses.appendBlocks(pendingResponseId, blocks)),
+        markPendingResponseComplete: (pendingResponseId) => held(responses.markPendingComplete(pendingResponseId)),
+        markPendingAsPosted: (pendingResponseId) => held(responses.markPendingAsPosted(pendingResponseId, true)),
+        updateSessionUsage: (sessionId, sessionUsage) => holding((on) => on.usage.updateSessionUsage(sessionId, sessionUsage)),
+        setWaiting: (waitingOn) => held(turns.setWaitingAt(conversationId, epoch, waitingOn)),
+        recordRestartEvent: (event) => holding((on) => on.restarts.recordRestartEvent({ ...event, thread_key: conversationId })),
+      };
+    },
+    setTurnStatus: (conversationId, epoch, status) => turns.setStatus(conversationId, epoch, status),
+    setTurnStatusMessage: (conversationId, epoch, outboxId) => turns.setStatusMessageAt(conversationId, epoch, outboxId),
+    endTurn: (conversationId, epoch, outcome) =>
+      database.transaction((sql) => {
+        const on = repositoriesOn(sql);
+        return Effect.tap(on.turns.end(conversationId, epoch, outcome), (ended) => (ended ? on.restarts.clearRestartEvent(conversationId) : Effect.void));
+      }),
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
+    getTurn: (conversationId) => turns.getTurn(conversationId),
 
-    createPendingResponse: (chatId, messageId, sessionId) => responses.createPendingResponse(chatId, messageId, sessionId),
-    appendBlocksToPending: (pendingResponseId, blocks) => responses.appendBlocks(pendingResponseId, blocks),
-    markPendingResponseComplete: (pendingResponseId) => responses.markPendingComplete(pendingResponseId),
-    updatePendingSessionId: (pendingResponseId, sessionId) => responses.updatePendingSessionId(pendingResponseId, sessionId),
-    markPendingAsPosted: (pendingResponseId) => responses.markPendingAsPosted(pendingResponseId),
+    markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
 
     enqueueOutboxText: (text) => outbox.enqueueText(text),
@@ -310,7 +384,7 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
 
     stageRestartRecovery: ({ turn, prompt }) =>
       database.transaction(Effect.fnUntraced(function*(sql) {
-        const { conversations, promptJobs, responses, turns, restarts } = repositories(sql, schema, workingDirectory);
+        const { conversations, promptJobs, responses, turns, restarts } = repositoriesOn(sql);
         const restartEvent = yield* restarts.getRestartEvent(turn.thread_key);
         if (!restartEvent) {
           return null;
@@ -330,16 +404,13 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
         if (turn.pending_response_id) {
           yield* responses.markPendingAsPosted(turn.pending_response_id);
         }
-        yield* turns.clearActiveTurn(turn.thread_key);
+        yield* turns.end(turn.thread_key, Number(turn.epoch), "stopped");
         yield* restarts.clearRestartEvent(turn.thread_key);
         return job;
       })),
-    recordRestartEvent: (event) => restarts.recordRestartEvent(event),
-    recordExternalRestartEvent: (conversationId) => restarts.recordExternalRestartEvent(conversationId),
+    recordExternalRestartEvent: (conversationId, epoch) => restarts.recordExternalRestartEvent(conversationId, epoch),
     getRestartEvent: (conversationId) => restarts.getRestartEvent(conversationId),
-    clearRestartEvent: (conversationId) => restarts.clearRestartEvent(conversationId),
 
-    updateSessionUsage: (sessionId, sessionUsage) => usage.updateSessionUsage(sessionId, sessionUsage),
     getSessionTokens: (sessionId) => usage.getSessionTokens(sessionId),
 
     getCodexLogin: codexLogin.getCodexLogin(),
