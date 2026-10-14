@@ -148,7 +148,8 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
 
   # alasio's state, in main's database, given what this release keeps that 6.0.0 did not,
   # with alasio stopped, so that nothing writes to the tables as they change, until the
-  # upgrade starts this release's alasio.
+  # upgrade starts this release's alasio. Each change adds what 6.0.0's alasio writes nothing
+  # to, so that started again, should the cut-over fail before the upgrade, it runs on them.
   log "stopping alasio, so nothing writes to its state as it changes"
   stop alasio
   log "changing alasio's state for this release"
@@ -160,6 +161,10 @@ alter table state.turns add column if not exists epoch bigint not null default 0
   add column if not exists waiting_on text, add column if not exists outcome text, add column if not exists status_outbox_id text;
 update state.turns set status = 'ended' where state = 'completed';
 alter table state.responses add column if not exists thread_key text, add column if not exists epoch bigint;
+-- A prompt job keeps what the operator wrote, which a question about it quotes: of a job of
+-- 6.0.0's, its prompt.
+alter table state.prompt_jobs add column if not exists visible_text text;
+update state.prompt_jobs set visible_text = prompt where visible_text is null;
 SQL
 
   # The workflow hook server is gone, and with it what ALASIO_HOOK_PORT set.
@@ -181,6 +186,12 @@ log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): ala
 printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
 bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
   fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it; or, to run 6.0.0 as it was instead, scale each Deployment it stopped back to the replicas OUT/replicas-<name> holds (kubectl -n $NS scale deploy/<name> --replicas=<n>)"
+
+# What every prompt job has now, as this release writes it, required.
+k exec -i deploy/alasio-neon-compute -c compute -- psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -v ON_ERROR_STOP=1 -q <<'SQL'
+update state.prompt_jobs set visible_text = prompt where visible_text is null;
+alter table state.prompt_jobs alter column visible_text set not null;
+SQL
 
 # The upgraded neon-control serves the record moved, before the volume that held it goes.
 token=$(k get secret alasio-branches -o jsonpath='{.data.control-token}' | base64 -d)

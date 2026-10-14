@@ -3,6 +3,7 @@ import { Effect } from "effect";
 import { type ConversationBusy, Turns } from "../codex/turns.ts";
 import type { ListedSession } from "../harness/claude/sessions.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { isBusy, stopTurn } from "../harness/commands.ts";
 import type { Harness, HarnessError, HarnessUnavailable, NoServiceMounted } from "../harness/index.ts";
 import type { CallbackPayload } from "../persistence/callback-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -169,7 +170,7 @@ const buildCurrentSessionPanel = Effect.fnUntraced(function*({ harness, conversa
   }
   const lastMessage = yield* harness.sessions.getSessionLastMessage(sessionId);
   const tokens = yield* sessionTokens(sessionId);
-  const active = yield* Effect.flatMap(ActiveTurns, (activeTurns) => activeTurns.isBusy(conversationId));
+  const active = yield* isBusy(conversationId);
   const lines = [
     `Current Session (${harness.displayName})`,
     "",
@@ -338,7 +339,6 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   messageId,
 }: SessionControlCallback): Effect.fn.Return<void, NewSessionError | TelegramError, Store | ActiveTurns | Turns | TelegramClient> {
   const store = yield* Store;
-  const activeTurns = yield* ActiveTurns;
   const client = yield* TelegramClient;
   const { conversationId } = action;
   const kind = action.kind.slice(CONTROL_KIND_PREFIX.length);
@@ -354,7 +354,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
   } else if (kind === "current") {
     panel = yield* current;
   } else if (kind === "new") {
-    if (yield* activeTurns.isBusy(conversationId)) {
+    if (yield* isBusy(conversationId)) {
       notice = `${harness.displayName} is currently working.`;
     } else {
       const sessionId = yield* Effect.flatMap(Turns, (turns) => turns.startNewSession(conversationId));
@@ -391,7 +391,7 @@ export const handleSessionControlCallback = Effect.fnUntraced(function*({
       panel = yield* buildRewindPanel({ harness, conversationId, sessionId: payloadSessionId, page: 1 });
     }
   } else if (kind === "stop") {
-    const interrupted = yield* activeTurns.stop(conversationId, "interrupt");
+    const interrupted = yield* stopTurn(conversationId, "interrupt");
     notice = interrupted ? "Interrupted." : "No active turn.";
     panel = yield* current;
   } else if (kind === "close") {

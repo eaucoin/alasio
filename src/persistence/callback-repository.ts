@@ -60,6 +60,11 @@ export class NeonCallbackRepository {
     ).pipe(Effect.as(ids));
   }
 
+  /** Forgets the actions of the buttons that settle the held prompt job `jobId`, one of which has. */
+  forgetActionsOfJob(jobId: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(`delete from ${this.#schema}.callback_actions where payload->>'jobId' = $1`, [jobId]));
+  }
+
   /** The action of a button pressed for the first time, deleted as it acts once; null for one pressed before, or never made. */
   consumeCallbackAction(id: string): Effect.Effect<CallbackAction | null, StoreError> {
     return this.#sql.query<CallbackActionRow>(

@@ -237,13 +237,23 @@ export class Store extends Context.Service<Store, {
   readonly claimNextPromptJob: (conversationId: string) => Stored<PromptJob | null>;
   /** Settles what becomes of a job, its priority kept unless given. */
   readonly setPromptJobDisposition: (id: string, state: PromptJobState, priority?: number) => Stored<void>;
+  /**
+   * Settles a job held for the operator's choice, the buttons that would settle it
+   * forgotten: the job, or null where it is held no longer, when nothing changes.
+   */
+  readonly settleHeldPromptJob: (id: string, state: PromptJobState, priority?: number) => Stored<PromptJob | null>;
+  /** The conversation's jobs held for the operator's choice, in the order queued. */
+  readonly listHeldPromptJobs: (conversationId: string) => Stored<PromptJob[]>;
   readonly markPromptJobDispatched: (id: string) => Stored<void>;
   readonly markPromptJobUpstreamStarted: (id: string, sessionId: string | null | undefined, turnId: string | null | undefined) => Stored<void>;
   readonly markPromptJobUpstreamCompleted: (id: string, sessionId: string | null | undefined, turnId: string | null | undefined) => Stored<void>;
   readonly failPromptJob: (id: string, error: unknown) => Stored<void>;
-  readonly listPendingPromptConversations: Stored<string[]>;
+  /** The conversations with prompt jobs waiting: to run, or for the operator's choice. */
+  readonly listWaitingPromptConversations: Stored<string[]>;
   /** Settles the jobs a restart found running: the conversations whose turn the agent finished. */
   readonly recoverPromptJobsAfterRestart: Stored<string[]>;
+  /** Holds again the jobs a restart found handed to a turn to steer it (prompt-job-repository.ts holdUnsteeredAfterRestart). */
+  readonly holdUnsteeredPromptJobsAfterRestart: Stored<PromptJob[]>;
 
   /**
    * Continues a turn a restart cut short, if its restart was recorded: its session
@@ -381,12 +391,19 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     getPromptJob: (id) => promptJobs.get(id),
     claimNextPromptJob: (conversationId) => promptJobs.claimNext(conversationId),
     setPromptJobDisposition: (id, state, priority) => promptJobs.setDisposition(id, state, priority),
+    listHeldPromptJobs: (conversationId) => promptJobs.listHeld(conversationId),
+    settleHeldPromptJob: (id, state, priority) =>
+      database.transaction((sql) => {
+        const { promptJobs, callbacks } = repositoriesOn(sql);
+        return Effect.tap(promptJobs.settleHeld(id, state, priority), (job) => (job ? callbacks.forgetActionsOfJob(id) : Effect.void));
+      }),
     markPromptJobDispatched: (id) => promptJobs.markDispatched(id),
     markPromptJobUpstreamStarted: (id, sessionId, turnId) => promptJobs.markUpstreamStarted(id, sessionId, turnId),
     markPromptJobUpstreamCompleted: (id, sessionId, turnId) => promptJobs.markUpstreamCompleted(id, sessionId, turnId),
     failPromptJob: (id, error) => promptJobs.fail(id, error),
-    listPendingPromptConversations: promptJobs.listPendingConversations(),
+    listWaitingPromptConversations: promptJobs.listWaitingConversations(),
     recoverPromptJobsAfterRestart: promptJobs.recoverAfterRestart(),
+    holdUnsteeredPromptJobsAfterRestart: promptJobs.holdUnsteeredAfterRestart(),
 
     stageRestartRecovery: ({ turn, prompt }) =>
       database.transaction(Effect.fnUntraced(function*(sql) {
