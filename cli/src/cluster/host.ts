@@ -24,6 +24,7 @@ import { KubeConfig, type V1ConfigMap, type V1Node, type V1RuntimeClass } from "
 import { Context, type Duration, Effect, FileSystem, Layer, type PlatformError, Schema } from "effect";
 
 import type { Registries } from "../config.ts";
+import { keptReleases, snapshotReleases } from "../kept-releases.ts";
 import { kind, KubeApi, type KubeApiError, type KubeconfigUnusable } from "../kube/api.ts";
 import {
   awaitReady,
@@ -213,20 +214,21 @@ export interface NodePlan {
  * configure it (by their digest), its service, the operator's kubeconfig, and the
  * firewall active on the machine, which lets the cluster's networks in once alasio has
  * seen to it: the gVisor releases pinned and not installed are installed, and those
- * installed and no longer pinned removed. Pure, for tests.
+ * installed and not `kept` (../kept-releases.ts) removed. Pure, for tests.
  */
-export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, firewall }: {
+export function planNode(pins: NodePins, { stamp, config, unit, kubeconfig, firewall, kept }: {
   readonly stamp: NodeStamp | null;
   readonly config: string;
   readonly unit: UnitState;
   readonly kubeconfig: KubeconfigState;
   readonly firewall: Firewall | null;
+  readonly kept: readonly string[];
 }): NodePlan {
   const opened = stamp?.firewall?.tool === firewall && CLUSTER_NETWORKS.every((network) => stamp?.firewall?.networks.includes(network));
   const configure = stamp?.config !== config;
   const pinned = gvisorReleases(pins);
   const installed = stamp?.gvisor ?? [];
-  const gvisor = { install: pinned.filter((release) => !installed.includes(release)), remove: installed.filter((release) => !pinned.includes(release)) };
+  const gvisor = { install: pinned.filter((release) => !installed.includes(release)), remove: installed.filter((release) => !kept.includes(release)) };
   const k3s = stamp?.k3s !== pins.k3s.version || !unit.loaded
     ? "install"
     : configure || gvisor.install.length > 0 || gvisor.remove.length > 0
@@ -292,7 +294,8 @@ const makeHostCluster = Effect.fnUntraced(function*({
   const { pins, fetch } = yield* NodeReleases;
   const onMachine = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | Machine>) =>
     effect.pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(Machine, machine));
-  const config: NodeConfig = { role: "server", storagePath, ...(registries ? { registries } : {}), gvisor: gvisorReleases(pins) };
+  /** The node's configuration, its containerd's runtimes those of the gVisor releases `kept`. */
+  const configOf = (kept: readonly string[]): NodeConfig => ({ role: "server", storagePath, ...(registries ? { registries } : {}), gvisor: [...kept] });
   const waitFor = awaitReady(CLUSTER, { readyTimeout, poll });
 
   /** The firewall active on this machine, which lets in only what it is told to: ufw, as its config says, or firewalld, as its service is; none. */
@@ -345,10 +348,10 @@ const makeHostCluster = Effect.fnUntraced(function*({
       );
     });
 
-  /** gVisor's RuntimeClasses applied, those of releases no longer kept, or with another handler, deleted first. */
-  const applyRuntimeClasses: Effect.Effect<void, KubeApiError, KubeApi> = Effect.gen(function*() {
+  /** gVisor's RuntimeClasses of the releases `kept` applied, those of releases no longer kept, or with another handler, deleted first. */
+  const applyRuntimeClasses = (kept: readonly string[]): Effect.Effect<void, KubeApiError, KubeApi> => Effect.gen(function*() {
     const kube = yield* KubeApi;
-    const desired = gvisorRuntimeClasses(config.gvisor);
+    const desired = gvisorRuntimeClasses(kept);
     for (const name of staleRuntimeClasses(yield* kube.list<V1RuntimeClass>(kind("RuntimeClass")), desired)) {
       yield* kube.remove({ ...kind("RuntimeClass"), name });
       yield* Effect.logInfo(`deleted RuntimeClass ${name}`);
@@ -360,9 +363,18 @@ const makeHostCluster = Effect.fnUntraced(function*({
     const { unit, stamp } = yield* installed;
     // Made by the operator, whose it stays, though k3s makes the volumes in it as root.
     yield* fs.makeDirectory(storagePath, { recursive: true });
-    const files = nodeFiles(config);
     const copy = (yield* fs.exists(kubeconfig)) ? yield* fs.readFileString(kubeconfig) : null;
-    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall: yield* activeFirewall });
+    // What the snapshots name, of a cluster that runs, read before anything of it changes.
+    const installedReleases = stamp?.gvisor ?? [];
+    const named = installedReleases.length === 0
+      ? new Map<string, readonly string[]>()
+      : unit.active === "active" && copy !== null
+      ? yield* snapshotReleases.pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })), Effect.catch(() => Effect.succeed(null)))
+      : null;
+    const kept = keptReleases(gvisorReleases(pins), installedReleases, named);
+    const config = configOf(kept);
+    const files = nodeFiles(config);
+    const plan = planNode(pins, { stamp, config: filesDigest(files), unit, kubeconfig: kubeconfigState(copy, new Date()), firewall: yield* activeFirewall, kept });
     const raise = yield* onMachine(inotifyStep);
     const started = plan.k3s === null && !plan.renew ? 0 : Date.now();
     const outcome = yield* Effect.scoped(Effect.gen(function*() {
@@ -395,7 +407,7 @@ const makeHostCluster = Effect.fnUntraced(function*({
     yield* Effect.gen(function*() {
       const nodes = yield* waitFor("its node", nodeReady(started));
       yield* waitFor("CoreDNS's NodeHosts", applyHostAliases(nodes));
-      yield* waitFor("gVisor's RuntimeClasses", applyRuntimeClasses);
+      yield* waitFor("gVisor's RuntimeClasses", applyRuntimeClasses(kept));
     }).pipe(Effect.provide(KubeApi.layer({ path: kubeconfig })));
     yield* Effect.logInfo(`${CLUSTER} is up`);
   });

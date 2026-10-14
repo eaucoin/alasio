@@ -414,7 +414,7 @@ test("ensure resumes a suspended Sandbox and gives one left without a token its 
   // Made from its current template, it is resumed and nothing else.
   assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch" || verb === "create").map(([verb, kind, , change]) => [verb, kind, change]), [
     ["create", "Secret", undefined],
-    ["patch", "Sandbox", { metadata: { annotations: { "alasio.dev/snapshot": null } }, spec: { operatingMode: "Running" } }],
+    ["patch", "Sandbox", { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } }],
   ]);
 });
 
@@ -507,7 +507,7 @@ test("ensure moves a Sandbox made from another pod template onto alasio's, endin
       metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: current.metadata.annotations?.[POD_TEMPLATE_ANNOTATION] } },
       spec: { operatingMode: "Suspended", podTemplate: mergePatch(older.spec.podTemplate, current.spec.podTemplate) },
     },
-    { metadata: { annotations: { "alasio.dev/snapshot": null } }, spec: { operatingMode: "Running" } },
+    { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } },
   ]);
   assert.deepEqual(controller.pods, ["agent@sha256:2"]);
   const moved = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
@@ -537,7 +537,7 @@ test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never r
   })).finally(controller.stop);
   assert.deepEqual(kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change), [
     { spec: { operatingMode: "Suspended" } },
-    { metadata: { annotations: { "alasio.dev/snapshot": null } }, spec: { operatingMode: "Running" } },
+    { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } },
   ]);
   assert.equal(controller.pods.length, 1);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
@@ -573,7 +573,7 @@ test("ensure restarts a running Sandbox whose pod has a fault only a new pod men
     yield* sandboxes.ensure("fs-abc123", manifest);
     return restarted;
   })).finally(controller.stop);
-  assert.deepEqual(patches, [{ spec: { operatingMode: "Suspended" } }, { metadata: { annotations: { "alasio.dev/snapshot": null } }, spec: { operatingMode: "Running" } }]);
+  assert.deepEqual(patches, [{ spec: { operatingMode: "Suspended" } }, { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } }]);
   assert.deepEqual(doneWhile, ["Suspended"]);
   assert.deepEqual(looked, ["fs-abc123", "fs-abc123"]);
   assert.equal(controller.pods.length, 3);
@@ -604,7 +604,7 @@ const RESTORING = "test.dev/restore-from";
  * or deferred where `defers` says so.
  */
 const restoreOf = (older: Sandbox, told: string[], refused?: { readonly reason: string; readonly resumed: boolean }, defers = false): SandboxRestore => ({
-  snapshot: "s-1",
+  snapshot: { snapshot: "s-1", release: "20990101.0" },
   podTemplate: { ...older.spec.podTemplate, metadata: { ...older.spec.podTemplate.metadata, annotations: { [RESTORING]: "/snapshots/fs-abc123" } } },
   kept: older.spec.podTemplate,
   resume: refused === undefined ? Effect.sync(() => void told.push("resumed")) : Effect.fail(new SandboxRestoreRefused(refused)),
@@ -748,6 +748,7 @@ test("a Sandbox whose restore is deferred, before it or as its pod's sandbox nev
   const left = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
   assert.equal(left?.spec?.operatingMode, "Suspended");
   assert.equal(left?.metadata.annotations?.[SNAPSHOT_ANNOTATION], "s-1");
+  assert.equal(left?.metadata.annotations?.["alasio.dev/snapshot-release"], "20990101.0");
 });
 
 test("a running Sandbox on another template is moved onto alasio's unless its caller keeps it, and a pod that ends as it is waited for fails the bring-up at once", async () => {
@@ -798,7 +799,7 @@ test("release gives a ready, running Sandbox to be saved, then suspends it or le
         happened.push(`saving ${sandbox.metadata.name}`);
         yield* Effect.sleep("50 millis");
         happened.push("saved");
-        return { snapshot: "s-1" };
+        return { saved: { snapshot: "s-1", release: "20990101.0" } };
       });
     const releasing = yield* Effect.forkChild(sandboxes.release("fs-abc123", save));
     yield* Effect.sleep("10 millis");
@@ -813,8 +814,9 @@ test("release gives a ready, running Sandbox to be saved, then suspends it or le
   assert.deepEqual(happened, ["saving fs-abc123", "saved", "brought up"]);
   // Released into a snapshot, the Sandbox was bound to it, and its resume let go of it.
   const patches = kube.calls.filter(([verb, kind]) => verb === "patch" && kind === "Sandbox").map(([, , , change]) => change);
-  assert.ok(patches.some((change) => JSON.stringify(change) === JSON.stringify({ metadata: { annotations: { "alasio.dev/snapshot": "s-1" } }, spec: { operatingMode: "Suspended" } })));
+  assert.ok(patches.some((change) => JSON.stringify(change) === JSON.stringify({ metadata: { annotations: { "alasio.dev/snapshot": "s-1", "alasio.dev/snapshot-release": "20990101.0" } }, spec: { operatingMode: "Suspended" } })));
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.annotations?.["alasio.dev/snapshot"], undefined);
+  assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.annotations?.["alasio.dev/snapshot-release"], undefined);
   // Released, then resumed by the bring-up, each with a pod of its own.
   assert.equal(controller.pods.length, 2);
 });
@@ -1101,7 +1103,7 @@ test("a fork is made suspended, its claim bound, then cloned from its source, su
     ["patch", "Sandbox", "fs-abc123", { spec: { operatingMode: "Suspended" } }],
     ["create", "Job", job, undefined],
     ["remove", "Job", job, undefined],
-    ["patch", "Sandbox", "fs-abc123", { metadata: { annotations: { "alasio.dev/snapshot": null } }, spec: { operatingMode: "Running" } }],
+    ["patch", "Sandbox", "fs-abc123", { metadata: { annotations: { "alasio.dev/snapshot": null, "alasio.dev/snapshot-release": null } }, spec: { operatingMode: "Running" } }],
   ]);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
   assert.ok(kube.peek("Pod", "alasio-sessions", "fs-abc123"), "the source runs again");

@@ -120,6 +120,9 @@ export function gvisorRuntimeFiles(releases: readonly string[], { systemd }: { r
 /** The labels of the RuntimeClasses alasio makes, which tell them from others'. */
 const GVISOR_RUNTIME_CLASS_LABELS = { "app.kubernetes.io/managed-by": "alasio", "app.kubernetes.io/component": "gvisor" };
 
+/** The annotation of a RuntimeClass of alasio's naming the gVisor release it runs, as `alasio up` reads what the cluster keeps (../kept-releases.ts). */
+export const GVISOR_RELEASE_ANNOTATION = "alasio.dev/gvisor-release";
+
 /**
  * The RuntimeClasses of gVisor's `releases`, the current first: `gvisor`, which new
  * sandboxes run with, the current release's, and `gvisor-RELEASE` (as a DNS label) for
@@ -129,7 +132,7 @@ export function gvisorRuntimeClasses(releases: readonly string[]): V1RuntimeClas
   const runtimeClass = (name: string, release: string): V1RuntimeClass => ({
     apiVersion: "node.k8s.io/v1",
     kind: "RuntimeClass",
-    metadata: { name, labels: GVISOR_RUNTIME_CLASS_LABELS },
+    metadata: { name, labels: GVISOR_RUNTIME_CLASS_LABELS, annotations: { [GVISOR_RELEASE_ANNOTATION]: release } },
     handler: gvisorHandler(release),
   });
   return [

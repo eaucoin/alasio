@@ -40,7 +40,19 @@ import { FetchHttpClient } from "effect/http";
 import { withLogScope } from "../shared/log.ts";
 import { withAlasioSpan } from "../telemetry/index.ts";
 import { hasStatus, type KubeApiError, KubeClient, mergePatch } from "./client.ts";
-import { BAYMA_CONTAINER, MANAGED_BY, SANDBOX_LABEL, TOKEN_DIR, TOKEN_FILE_ARGS, TOKEN_KEY, TOKEN_MODE, TOKEN_VOLUME, tokenSecretName } from "./sandbox-shape.ts";
+import {
+  BAYMA_CONTAINER,
+  MANAGED_BY,
+  SANDBOX_LABEL,
+  SNAPSHOT_ANNOTATION,
+  SNAPSHOT_RELEASE_ANNOTATION,
+  TOKEN_DIR,
+  TOKEN_FILE_ARGS,
+  TOKEN_KEY,
+  TOKEN_MODE,
+  TOKEN_VOLUME,
+  tokenSecretName,
+} from "./sandbox-shape.ts";
 
 export const SANDBOX_API_VERSION = "agents.x-k8s.io/v1beta1";
 export const SANDBOX_KIND = "Sandbox";
@@ -189,7 +201,7 @@ export interface SandboxFault {
  * released into the snapshot, for the next bring-up to restore ("deferred").
  */
 export interface SandboxRestore {
-  readonly snapshot: string;
+  readonly snapshot: SavedSnapshot;
   readonly podTemplate: V1PodTemplateSpec;
   readonly kept: V1PodTemplateSpec;
   readonly resume: Effect.Effect<void, SandboxRestoreRefused>;
@@ -208,15 +220,22 @@ export interface RestoreDeferred {
   readonly deferred: string;
 }
 
-/** What a release's save came to: the Sandbox left running, or suspended, saved into the snapshot named, or into none. */
-export type Saved = "keep" | { readonly snapshot: string | null };
+/** A snapshot a Sandbox is released into: its id, and the gVisor release that took it. */
+export interface SavedSnapshot {
+  readonly snapshot: string;
+  readonly release: string;
+}
 
-/**
- * The annotation of a suspended Sandbox naming the snapshot its pod was saved into, which
- * alone it may be restored from: set as it is suspended, removed as it is next resumed,
- * from that snapshot or not, so a snapshot outlives no resume of its Sandbox's.
- */
-export const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
+/** What a release's save came to: the Sandbox left running, or suspended, saved into the snapshot it gives, or into none. */
+export type Saved = "keep" | { readonly saved: SavedSnapshot | null };
+
+export { SNAPSHOT_ANNOTATION, SNAPSHOT_RELEASE_ANNOTATION } from "./sandbox-shape.ts";
+
+/** The annotations binding a Sandbox to `snapshot`, or to none. */
+export const snapshotBinding = (snapshot: SavedSnapshot | null): Record<string, string | null> => ({
+  [SNAPSHOT_ANNOTATION]: snapshot?.snapshot ?? null,
+  [SNAPSHOT_RELEASE_ANNOTATION]: snapshot?.release ?? null,
+});
 
 /** A Sandbox restored from a snapshot of its pod is not let run: why, and whether its sandbox ran all the same. */
 export class SandboxRestoreRefused extends Schema.TaggedError<SandboxRestoreRefused>()("SandboxRestoreRefused", {
@@ -604,7 +623,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     // one alasio finds so, as it starts again in the middle of this, is moved onto its own.
     // Its snapshot is spent as of now, whatever comes of it.
     const restoring = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
-      metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: podTemplateHash(plan.podTemplate), [SNAPSHOT_ANNOTATION]: null } },
+      metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: podTemplateHash(plan.podTemplate), ...snapshotBinding(null) } },
       spec: { operatingMode: "Running", podTemplate: mergePatch(sandbox.spec.podTemplate, plan.podTemplate) },
     }));
     // Once resumed, its sandbox has run: what fails after is the session's, which has moved on.
@@ -623,7 +642,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       const came = yield* plan.failed(back.failure);
       // Ended, its pod's sandbox never having run, the Sandbox is released into its snapshot again.
       const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
-        ...(came === "deferred" ? { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: plan.snapshot } } } : {}),
+        ...(came === "deferred" ? { metadata: { annotations: snapshotBinding(plan.snapshot) } } : {}),
         spec: { operatingMode: "Suspended" },
       }));
       const suspended = yield* awaitCondition(suspending, "Suspended");
@@ -667,7 +686,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
         // One whose restore failed leaves the restore's template behind.
         if (outcome || !current(sandbox)) sandbox = yield* moveOnto(sandbox, desired);
         sandbox = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
-          metadata: { annotations: { [SNAPSHOT_ANNOTATION]: null } },
+          metadata: { annotations: snapshotBinding(null) },
           spec: { operatingMode: "Running" },
         }));
         yield* Effect.logInfo(`resumed Sandbox ${namespace}/${name}`);
@@ -731,7 +750,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
           const saved = yield* save(sandbox);
           if (saved === "keep") return false;
           const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
-            metadata: { annotations: { [SNAPSHOT_ANNOTATION]: saved.snapshot } },
+            metadata: { annotations: snapshotBinding(saved.saved) },
             spec: { operatingMode: "Suspended" },
           }));
           yield* awaitCondition(suspending, "Suspended");

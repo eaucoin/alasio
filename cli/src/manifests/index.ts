@@ -22,7 +22,7 @@ import { priorityClassObjects } from "./priorities.ts";
 import { vpaObjects } from "./vpa.ts";
 import { workspaceStorageObjects } from "./workspace-storage.ts";
 
-export { type Carried, carriedFrom, NOTHING_CARRIED, SANDBOX_TEMPLATES } from "./alasio.ts";
+export { type Carried, carriedFrom, type Kept, NOTHING_CARRIED, NOTHING_KEPT, SANDBOX_TEMPLATES } from "./alasio.ts";
 export { decodeInstallConfig, InstallConfig, InstallConfigError, type InstallConfigFile } from "./config.ts";
 export { NAMESPACE } from "./common.ts";
 

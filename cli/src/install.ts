@@ -8,8 +8,10 @@
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
+import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
+import { clusterReleases } from "./kept-releases.ts";
 import { KubeApi, type KubeApiError } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
@@ -64,6 +66,8 @@ interface Checked {
   /** The templates the cluster runs, as their ConfigMap records them, and the CPU baseline they hold sessions to. */
   readonly live: string | undefined;
   readonly recorded: CpuBaseline;
+  /** The releases the cluster keeps, as its RuntimeClasses say, which the sessions' snapshots restore with. */
+  readonly gvisorReleases: readonly string[];
 }
 
 /**
@@ -78,11 +82,12 @@ export const checkInstallation = Effect.fnUntraced(function*(
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
   const { live, baseline: recorded } = yield* recordedBaseline;
-  const objects = installationObjects(settings, carriedFrom(settings, live, recorded));
+  const gvisorReleases = yield* clusterReleases(gvisorReleasesOf(NODE_PINS));
+  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases }));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
-  return { bot, settings, objects, live, recorded };
+  return { bot, settings, objects, live, recorded, gvisorReleases };
 });
 
 /**
@@ -95,12 +100,14 @@ export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
 ): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
-  const { bot, settings, objects, live, recorded } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, recorded, gvisorReleases } = yield* checkInstallation(config);
   yield* applyInstallation(objects, options);
   const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };
   if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
-  if (!sameBaseline(decision.baseline, recorded)) yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, decision.baseline)), options);
+  if (!sameBaseline(decision.baseline, recorded)) {
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases })), options);
+  }
   return { ...installed, cpuBaseline: decision };
 });

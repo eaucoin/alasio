@@ -63,7 +63,7 @@ import {
   type SandboxFault,
   type SandboxOperatingMode,
   sandboxManifest,
-  SNAPSHOT_ANNOTATION,
+  snapshotBinding,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
 import { sameToken } from "../shared/tokens.ts";
@@ -678,7 +678,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
           Effect.tap((snapshot) =>
             snapshot === null
               ? Effect.void
-              : kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId, { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: snapshot } } })
+              : kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, volumeId, { metadata: { annotations: snapshotBinding(snapshot) } })
           ),
         ),
       )),

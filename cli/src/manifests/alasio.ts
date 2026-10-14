@@ -26,7 +26,7 @@ import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/n
 import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import { CPU_FEATURES_ANNOTATION } from "../../../src/kube/sandbox-shape.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
-import { NODE_PINS } from "../cluster/node.ts";
+import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
 import {
@@ -83,7 +83,7 @@ function workspaceNamespaces(config: InstallConfig, environment: Environment): s
  * session (its parent does, src/branch/fork.ts) nor removes JuiceFS's mount pods, which
  * are main's to drive.
  */
-function sessionsProfile(config: InstallConfig, environment: Environment, cpuBaseline: CpuBaseline): SessionsProfile {
+function sessionsProfile(config: InstallConfig, environment: Environment, { cpuBaseline, gvisorReleases }: Kept): SessionsProfile {
   const { sessions, workspaceStorage } = config;
   const main = environment.branch === null;
   // Snapshotted once every node's CPU features are known, its sandboxes held to those all have.
@@ -176,21 +176,22 @@ function sessionsProfile(config: InstallConfig, environment: Environment, cpuBas
       },
     }],
     ...(main && sessionsForked(config) ? { clone: { claimTemplate: "data", job: cloneJob(config) } } : {}),
-    ...(snapshotted ? { snapshots: sessionSnapshots(config) } : {}),
+    ...(snapshotted ? { snapshots: sessionSnapshots(config, gvisorReleases) } : {}),
   };
 }
 
 /**
  * How session sandboxes are snapshotted as they are released (src/sandbox/snapshots.ts),
  * where the node agents run: once sessions.snapshots.releaseAfter has passed without an
- * exec or a turn, under the gVisor releases alasio keeps, the current one first, each
- * restored with a RuntimeClass of its own, by the agents in alasio's namespace.
+ * exec or a turn, under the gVisor `releases` alasio keeps (../kept-releases.ts), the
+ * current one first, each restored with a RuntimeClass of its own, by the agents in
+ * alasio's namespace.
  */
-function sessionSnapshots(config: InstallConfig): NonNullable<SessionsProfile["snapshots"]> {
+function sessionSnapshots(config: InstallConfig, releases: readonly string[]): NonNullable<SessionsProfile["snapshots"]> {
   return {
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
-    releases: NODE_PINS.gvisor.releases.map(({ release }) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
+    releases: releases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
     agents: {
       namespace: NAMESPACE,
       selector: Object.entries(selectorLabels("node-agent")).map(([label, value]) => `${label}=${value}`).join(","),
@@ -258,25 +259,36 @@ function hostProfile(config: InstallConfig): HostProfile {
 export type CpuBaseline = readonly string[] | null;
 
 /**
+ * What `alasio up` finds the cluster keeps for the sessions' snapshots: the CPU baseline
+ * it holds them to, which up keeps while every node it surveys has it (../cpu-baseline.ts),
+ * and the gVisor releases it keeps, the current one first (../kept-releases.ts).
+ */
+export interface Kept {
+  readonly cpuBaseline: CpuBaseline;
+  readonly gvisorReleases: readonly string[];
+}
+
+/** What a cluster keeps where up has found nothing of it yet: no baseline, and the releases pinned. */
+export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS) };
+
+/**
  * What `alasio up` carries forward from the installation it replaces: the sessions'
  * profile before the current one, whose template their snapshots may still restore onto
  * (src/sandbox/snapshots.ts), and the Sandbox policy pins beside the current one
- * (./admission.ts), until the template changes again; and the CPU baseline the current
- * one holds sessions to, which up keeps while every node it surveys has it.
+ * (./admission.ts), until the template changes again; and what the cluster keeps.
  */
-export interface Carried {
+export interface Carried extends Kept {
   readonly previousSessions: SessionsProfile | null;
-  readonly cpuBaseline: CpuBaseline;
 }
 
 /** Nothing carried forward: a first installation's, and a branch environment's. */
-export const NOTHING_CARRIED: Carried = { previousSessions: null, cpuBaseline: null };
+export const NOTHING_CARRIED: Carried = { previousSessions: null, ...NOTHING_KEPT };
 
 /** The ConfigMap of the templates, by its name. */
 export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
 
 /**
- * What the installation `config` describes, holding sessions to `cpuBaseline`, carries
+ * What the installation `config` describes, with what the cluster keeps, `kept`, carries
  * forward from `live`, the templates of the installation it replaces (its ConfigMap's
  * `templates.json`, if it has one): the sessions' profile it ran, where their template
  * changes, or else the one it carried. A profile is carried for one change of the
@@ -289,16 +301,16 @@ export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
  * (./alasio.ts identity). Were alasio given that, it could write any pod template into
  * the ConfigMap, and the next `up` would let it make Sandboxes of it.
  */
-export function carriedFrom(config: InstallConfig, live: string | undefined, cpuBaseline: CpuBaseline): Carried {
-  const nothing = { ...NOTHING_CARRIED, cpuBaseline };
+export function carriedFrom(config: InstallConfig, live: string | undefined, kept: Kept): Carried {
+  const nothing = { ...NOTHING_CARRIED, ...kept };
   if (!config.sessions.enabled || live === undefined) return nothing;
   // Carried as the ConfigMap held them, which alasio read as they are: the profile a snapshot recorded the hash of.
   if (Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return nothing;
   const held = JSON.parse(live) as { readonly sessions?: SessionsProfile | null; readonly previousSessions?: SessionsProfile | null };
   if (!held.sessions) return nothing;
   // The current profile as the ConfigMap holds it, to compare with what it held.
-  const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT, cpuBaseline), "")) as SessionsProfile;
-  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions, cpuBaseline };
+  const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT, kept), "")) as SessionsProfile;
+  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions, ...kept };
 }
 
 /**
@@ -317,7 +329,7 @@ function sandboxTemplates(config: InstallConfig, environment: Environment, carri
   const name = SANDBOX_TEMPLATES;
   const templates = goJson(
     {
-      ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment, carried.cpuBaseline) } : {}),
+      ...(config.sessions.enabled ? { sessions: sessionsProfile(config, environment, carried) } : {}),
       ...(config.sessions.enabled && carried.previousSessions ? { previousSessions: carried.previousSessions } : {}),
       ...(config.host.enabled ? { host: hostProfile(config) } : {}),
     },
@@ -679,7 +691,7 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
       sandboxPolicyName(environment.namespace),
       alasioAccount(environment.namespace),
       {
-        sessions: config.sessions.enabled ? sessionsProfile(config, environment, carried.cpuBaseline) : null,
+        sessions: config.sessions.enabled ? sessionsProfile(config, environment, carried) : null,
         previousSessions: config.sessions.enabled ? carried.previousSessions : null,
         host: config.host.enabled ? hostProfile(config) : null,
       },

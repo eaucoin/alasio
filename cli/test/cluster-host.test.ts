@@ -14,6 +14,7 @@ import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer, Logger } from "effect";
 
 import { HostCluster, kubeconfigState, planNode } from "../src/cluster/host.ts";
+import { describeKept, keptReleases, type SnapshotReleases, snapshotReleasesOf } from "../src/kept-releases.ts";
 import { Machine } from "../src/cluster/machine.ts";
 import { gvisorReleases, NODE_PINS } from "../src/cluster/node.ts";
 import { Root } from "../src/cluster/root.ts";
@@ -26,7 +27,7 @@ const RUNNING = { loaded: true, active: "active", enabled: true };
 
 test("planNode asks for nothing once all is as alasio installed it, and for what is not", () => {
   const plan = (changes: Partial<Parameters<typeof planNode>[1]>) =>
-    planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, ...changes });
+    planNode(NODE_PINS, { stamp: INSTALLED, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null, kept: gvisorReleases(NODE_PINS), ...changes });
   const none = { firewall: null, configure: false, gvisor: { install: [], remove: [] }, k3s: null, kubeconfig: false, renew: false };
   assert.deepEqual(plan({}), none);
   assert.deepEqual(plan({ stamp: null, unit: { loaded: false, active: "inactive", enabled: false } }), {
@@ -57,13 +58,42 @@ test("planNode asks for nothing once all is as alasio installed it, and for what
   assert.deepEqual(plan({ kubeconfig: "expiring", config: "another" }), { ...none, configure: true, k3s: "restart", kubeconfig: true });
 });
 
-test("planNode installs a newly pinned gVisor release beside the one before it, and removes that once it is no longer pinned", () => {
-  const plan = (releases: readonly string[], installed: readonly string[]) =>
-    planNode(fakeReleases({ gvisor: releases }).pins, { stamp: { ...INSTALLED, k3s: "v1.99.0+k3s1", gvisor: installed }, config: "digest", unit: RUNNING, kubeconfig: "current", firewall: null });
+test("planNode installs a newly pinned gVisor release beside the one before it, and removes that once it is neither pinned nor named by a snapshot", () => {
+  const plan = (releases: readonly string[], installed: readonly string[], named: SnapshotReleases | null = new Map()) =>
+    planNode(fakeReleases({ gvisor: releases }).pins, {
+      stamp: { ...INSTALLED, k3s: "v1.99.0+k3s1", gvisor: installed },
+      config: "digest",
+      unit: RUNNING,
+      kubeconfig: "current",
+      firewall: null,
+      kept: keptReleases(releases, installed, named),
+    });
   assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0"]).gvisor, { install: ["21000101.0"], remove: [] });
   assert.deepEqual(plan(["21000101.0", "20990101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: [], remove: [] });
   assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"]).gvisor, { install: ["21010101.0"], remove: ["20990101.0"] });
   assert.equal(plan(["21000101.0"], ["20990101.0", "21000101.0"]).k3s, "restart");
+  // A release a snapshot names is kept, and every one where what they name is not known.
+  assert.deepEqual(plan(["21010101.0", "21000101.0"], ["20990101.0", "21000101.0"], new Map([["20990101.0", ["alasio-sessions/fs-abc"]]])).gvisor, { install: ["21010101.0"], remove: [] });
+  assert.deepEqual(plan(["21010101.0"], ["20990101.0", "21000101.0"], null).gvisor, { install: ["21010101.0"], remove: [] });
+});
+
+test("the releases kept are the pinned ones first, then those installed that a snapshot names, as the cluster's Sandboxes say", () => {
+  const bound = (name: string, snapshot?: string, release?: string) => ({
+    metadata: { namespace: "alasio-sessions", name, annotations: { ...(snapshot ? { "alasio.dev/snapshot": snapshot } : {}), ...(release ? { "alasio.dev/snapshot-release": release } : {}) } },
+  });
+  const named = snapshotReleasesOf([bound("fs-a", "s-1", "20990101.0"), bound("fs-b"), bound("fs-c", "s-2", "20990101.0"), bound("fs-d", "s-3", "21000101.0")]);
+  assert.deepEqual(named, new Map([["20990101.0", ["alasio-sessions/fs-a", "alasio-sessions/fs-c"]], ["21000101.0", ["alasio-sessions/fs-d"]]]));
+  // One bound before its release was recorded makes what they name unknown.
+  assert.equal(snapshotReleasesOf([bound("fs-a", "s-1")]), null);
+  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0", "21010101.0"], named), ["21010101.0", "20990101.0"]);
+  assert.deepEqual(keptReleases(["21010101.0"], ["20980101.0", "20990101.0"], null), ["21010101.0", "20980101.0", "20990101.0"]);
+  // As status says them: each kept, with the snapshots naming it, then those named and not kept.
+  assert.deepEqual(describeKept(["21010101.0", "20990101.0"], named), [
+    "gVisor 21010101.0, kept, which new sessions run: 0 snapshots name it",
+    "gVisor 20990101.0, kept: 2 snapshots name it",
+    "gVisor 21000101.0, not kept: 1 snapshot names it, restored from bayma's checkpoints instead",
+  ]);
+  assert.deepEqual(describeKept(["21010101.0"], null), ["gVisor 21010101.0, kept, which new sessions run: what snapshots name it is not seen"]);
 });
 
 /** A kubeconfig whose client certificate is `certificate`. */

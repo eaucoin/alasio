@@ -46,6 +46,7 @@ import {
   type SandboxRestore,
   SandboxRestoreRefused,
   type Saved,
+  type SavedSnapshot,
   SNAPSHOT_ANNOTATION,
   type SandboxGone,
   type SandboxNotReady,
@@ -169,8 +170,8 @@ export interface SessionSnapshots {
   readonly release: (sandboxes: Sandboxes, name: string) => Effect.Effect<boolean, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
   /** Forgets the session's snapshot, as it is deleted, in the bucket and in every node's cache; one that cannot be is said so, and collected later. */
   readonly forget: (name: string) => Effect.Effect<void>;
-  /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one: its id; null for none, one that cannot be copied said so. */
-  readonly copy: (from: string, to: string) => Effect.Effect<string | null>;
+  /** Gives the session `to`, a fork of `from`, a copy of `from`'s snapshot, if it has one: which; null for none, one that cannot be copied said so. */
+  readonly copy: (from: string, to: string) => Effect.Effect<SavedSnapshot | null>;
 }
 
 /** A session's snapshots, as the module says, on the KubeClient. */
@@ -343,7 +344,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           },
         };
         return {
-          snapshot: manifest.snapshot,
+          snapshot: { snapshot: manifest.snapshot, release: manifest.release },
           podTemplate: restoring,
           kept: base,
           resume: resumeRestored(name, node),
@@ -391,10 +392,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       }
       const taken = yield* agents.checkpoint(node, { ...ref(name), namespace: profile.namespace, pod: name, containerId, hook, podTemplate: { ...sandbox.spec.podTemplate } }).pipe(Effect.result);
       if (taken._tag === "Success") {
-        const { snapshot, bytes, pauseMs, uploadMs } = taken.success;
+        const { snapshot, release, bytes, pauseMs, uploadMs } = taken.success;
         yield* Effect.logInfo(`snapshotted session ${name} as ${snapshot} on ${node}: ${bytes} bytes, paused ${pauseMs} ms, uploaded in ${uploadMs} ms`);
         yield* counted("snapshotted");
-        return { snapshot };
+        return { saved: { snapshot, release } };
       }
       // A core Pod, as the API server returns one.
       const after = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
@@ -402,7 +403,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       // One that ended its sandbox lost what ran in it but bayma's checkpoints keep.
       yield* counted(ended ? "lost" : "failed");
       yield* Effect.logWarning(`could not snapshot session ${name}: ${taken.failure.message}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`);
-      return ended ? { snapshot: null } : ("keep" as const);
+      return ended ? { saved: null } : ("keep" as const);
     });
   };
 
@@ -524,7 +525,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     copy: (from, to) =>
       agents.copy(ref(from), ref(to)).pipe(
         Effect.tap(({ snapshot }) => Effect.logInfo(`gave the fork ${to} of session ${from} its snapshot ${snapshot}`)),
-        Effect.map(({ snapshot }): string | null => snapshot),
+        Effect.map(({ snapshot, release }): SavedSnapshot | null => ({ snapshot, release })),
         Effect.catch((error) =>
           error._tag === "NodeAgentError" && error.status === 404
             ? Effect.succeed(null)

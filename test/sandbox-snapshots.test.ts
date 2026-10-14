@@ -369,7 +369,7 @@ test("a restore that fails for what may pass is deferred, its snapshot kept, as 
       // Prepared, its pod does not come back, its sandbox never having run: deferred; having run, it falls back.
       const plan = yield* restore;
       assert.ok(plan && "podTemplate" in plan);
-      assert.equal(plan.snapshot, "s-1");
+      assert.deepEqual(plan.snapshot, { snapshot: "s-1", release: CURRENT });
       assert.equal(yield* plan.failed({ why: "its pod did not run within 3 minutes", resumed: false }), "deferred");
       assert.deepEqual(base.asked.filter((each) => each.startsWith("forget")), []);
       assert.equal(yield* plan.failed({ why: "Sandbox did not become ready", resumed: true }), "fallen back");
@@ -518,7 +518,7 @@ test("an idle session is released, its sandbox snapshotted by its node's agent, 
   beginsMeanwhile = false;
   // Idle for five minutes, with no turn since.
   const released = await added("alasio.sandbox.releases", () => look(Date.now() - 301_000, { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 301_000 }));
-  assert.deepEqual(saved, ['fs-abc123: {"snapshot":"s-1"}']);
+  assert.deepEqual(saved, [`fs-abc123: {"saved":{"snapshot":"s-1","release":"${CURRENT}"}}`]);
   assert.deepEqual(released, { "alasio.sandbox.release.outcome=snapshotted": 1 });
   assert.deepEqual(checkpoints, [["node-a", {
     environment: "alasio-sessions",
@@ -584,7 +584,7 @@ test("a release whose checkpoint fails is counted failed while its sandbox runs 
       yield* snapshotted.watch(sandboxes, () => null);
       yield* Effect.sleep("50 millis");
     })), () => ({ execsRunning: 0, execsQueued: 0, idleSinceMs: 0 })));
-  assert.deepEqual(saved.toSorted(), ['fs-ended: {"snapshot":null}', 'fs-runs: "keep"']);
+  assert.deepEqual(saved.toSorted(), ['fs-ended: {"saved":null}', 'fs-runs: "keep"']);
   assert.deepEqual(counted, {
     "alasio.sandbox.release.outcome=failed": 1,
     "alasio.sandbox.release.outcome=lost": 1,

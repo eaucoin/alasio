@@ -69,7 +69,7 @@ import {
 import type { ListedExport } from "./otlp-sink.ts";
 import type { ReplFilled, ReplSeen, ReplSet, ReplSummed } from "./session-repl.ts";
 import type { RoundtripSeen } from "./session-roundtrip.ts";
-import type { Corrupted } from "./snapshot-bucket.ts";
+import type { Corrupted, Released } from "./snapshot-bucket.ts";
 import { OTLP, STAND_INS, type StandIn, TELEGRAM, TELEGRAM_BRANCH, urlOf } from "./stand-ins.ts";
 import type { CallsListing, ControlCallback, ControlMessage, RecordedCall } from "./telegram-stub.ts";
 import { workspaceStorage } from "./workspace-storage.ts";
@@ -784,6 +784,32 @@ if (inShard("snapshots")) {
         assert.ok(Date.now() < deadline, "no alert on restores falling back reached Telegram");
         await sleep(5_000);
       }
+    });
+
+    test("a session whose snapshot was taken by a gVisor release no longer kept comes back from bayma's checkpoints, said so, as status says it will", async () => {
+      const unkept = await newSession("none");
+      const { sessionId: kept } = await repl.set(unkept, `checkpointed by ${unkept}`);
+      await untilReleased(unkept, Date.now());
+      // Taken, as far as anything says, by a release alasio up no longer keeps.
+      const removed = "20990101.0-removed";
+      const [node = ""] = (await nodeAgents()).keys();
+      const released = await inNodeAgent<Released>(node, "./snapshot-bucket.ts", "release", SESSIONS, unkept, removed);
+      await kube.patch(ref("Sandbox", unkept, SESSIONS), { metadata: { annotations: { "alasio.dev/snapshot-release": removed } } });
+      const status = await alasioOk("status");
+      assert.ok(status.includes(`\n  gVisor ${removed}, not kept: 1 snapshot names it, restored from bayma's checkpoints instead\n`), status);
+      // Restored from no snapshot, as alasio logs, counting it a fallback by design, which pages no one.
+      const fallbacks = await turn("hello after the release went").then(async () =>
+        (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
+          .split("\n")
+          .find((line) => line.includes(`session ${unkept} is resumed from bayma's checkpoints, not from its snapshot: gVisor ${removed}, which took it, is no longer kept`))
+      );
+      assert.ok(fallbacks, `alasio logged no fallback of ${unkept}'s snapshot ${released.snapshot} for its release`);
+      const seen = await repl.read(unkept, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${unkept}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(unkept), null);
+      const after = await kube.get<Sandbox>(ref("Sandbox", unkept, SESSIONS));
+      assert.equal(after?.metadata?.annotations?.["alasio.dev/snapshot-release"], undefined);
     });
 
     test("a fork of a released session restores its source's REPL", async () => {
