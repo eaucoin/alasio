@@ -22,8 +22,8 @@ import { TestClock } from "effect/testing";
 import { added, collected } from "./support/metrics.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
-import { type CheckpointRequest, makeNodeAgent, type Manifest, type NodeAgent, PoliciesNotInForce, type ResumeRequest } from "../src/node-agent/agent.ts";
-import { makeSnapshotCache, type SnapshotCache } from "../src/node-agent/cache.ts";
+import { type CheckpointRequest, makeNodeAgent, type Manifest, memoryLimitOf, type NodeAgent, PoliciesNotInForce, type ResumeRequest } from "../src/node-agent/agent.ts";
+import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
@@ -355,6 +355,11 @@ test("a snapshot is prepared from the node's cache, or from the bucket, checked 
       assert.deepEqual(JSON.parse(readFileSync(join(prepared.imagePath, "manifest.json"), "utf8")), manifest);
       yield* other.agent.prepare(workspace);
       assert.deepEqual(downloads(), files(manifest));
+      // A cached copy that is no longer what its manifest says, as a disk may change it, is read again from the bucket.
+      writeFileSync(join(prepared.imagePath, "pages_meta.img"), "changed on the disk");
+      assert.deepEqual(yield* other.agent.prepare(workspace), prepared);
+      assert.deepEqual(downloads(), [...files(manifest), ...files(manifest)]);
+      assert.equal(sha256(readFileSync(join(prepared.imagePath, "pages_meta.img"))), manifest.files.find(({ path }) => path === "pages_meta.img")?.sha256);
 
       // A newer snapshot replaces the older one in its cache as it is prepared.
       const newer = yield* taker.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
@@ -560,6 +565,49 @@ test("the node's cache keeps within its budget, evicting the least recently used
       // What a stopped agent left half written goes as the next starts.
       yield* tighter.clean;
       assert.equal(existsSync(join(root, "main", "fs-new", `.${S2}`)), false);
+    }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a checkpoint makes room for as much as its pod may hold in memory, as its containers' limits say", () => {
+  const limits = (...memory: (string | undefined)[]) => ({ spec: { containers: memory.map((each) => ({ resources: each === undefined ? {} : { limits: { memory: each } } })) } });
+  assert.equal(memoryLimitOf(limits("3Gi")), 3 * 1024 ** 3);
+  assert.equal(memoryLimitOf(limits("512Mi", "1.5G", undefined)), 512 * 1024 ** 2 + 1.5e9);
+  assert.equal(memoryLimitOf(limits("1000", "lots")), 1000);
+  assert.equal(memoryLimitOf({}), 0);
+});
+
+test("the node's cache makes room on its disk for what it writes, its reserve kept free, evicting as it would over its budget, or refuses", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-node-room-"));
+  try {
+    const now = Date.now();
+    const S1 = "20261013T000000Z-00000001";
+    // A disk of the reserve and 3500 bytes, less what the cache holds, in files of 1000 bytes.
+    const held = () => readdirSync(root, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile()).length * 1000;
+    const cache = makeSnapshotCache({ root, budget: 1024 ** 3, graceMs: 5 * 60_000, free: () => Promise.resolve(RESERVE_BYTES + 3500 - held()) });
+    const put = (workspace: string, snapshot: string, minutesAgo: number) =>
+      Effect.gen(function*() {
+        const directory = yield* cache.stage("main", workspace, snapshot);
+        writeFileSync(join(directory, "pages.img"), Buffer.alloc(1000));
+        yield* cache.commit("main", workspace, snapshot);
+        const at = (now - minutesAgo * 60_000) / 1000;
+        utimesSync(cache.path("main", workspace, snapshot), at, at);
+      });
+    const names = (cached: readonly { readonly workspace: string }[]) => cached.map(({ workspace }) => workspace).sort();
+    await Effect.runPromise(Effect.gen(function*() {
+      yield* put("fs-a", S1, 60);
+      yield* put("fs-b", S1, 90);
+      yield* put("fs-c", S1, 1);
+      // 500 bytes free besides the reserve: room for 400 as it is; for 1200, the least recently used goes, but not one used within the grace.
+      assert.deepEqual(names(yield* cache.room(400, { environment: "main", workspace: "fs-d" })), []);
+      assert.deepEqual(names(yield* cache.room(1200, { environment: "main", workspace: "fs-d" })), ["fs-b"]);
+      // Nor one of the workspace written to.
+      const refused = yield* Effect.flip(cache.room(2000, { environment: "main", workspace: "fs-a" }));
+      assert.equal(refused.message, `the node's snapshot cache failed: its disk has ${RESERVE_BYTES + 1500} bytes free, and 2000 more would leave less than the ${RESERVE_BYTES} it keeps free`);
+      assert.deepEqual(names(yield* cache.list), ["fs-a", "fs-c"]);
+      assert.deepEqual(names(yield* cache.room(2000, { environment: "main", workspace: "fs-d" })), ["fs-a"]);
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -32,7 +32,7 @@ import { dirname, join, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
-import { Clock, Effect, RcMap, Schema, type Scope, Semaphore } from "effect";
+import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
@@ -272,6 +272,8 @@ export const MANIFEST_FILE = "manifest.json";
 export const CURRENT_FILE = "current.json";
 /** How long the hook may take to ready the sandbox for its save. */
 const HOOK_TIMEOUT = "30s";
+/** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
+const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
 const POLICY_POLL = "250 millis";
 
@@ -335,6 +337,24 @@ async function imageFiles(directory: string): Promise<SnapshotFile[]> {
     const file = join(directory, path);
     return { path, bytes: (await stat(file)).size, sha256: await fileSha256(file) };
   }));
+}
+
+/** What each suffix of a Kubernetes quantity multiplies it by. */
+const QUANTITY_UNITS: Readonly<Record<string, number>> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
+
+/**
+ * The most memory the pod of `podTemplate` may hold, as its containers' limits say, which
+ * bounds its sandbox's image: what a checkpoint makes room for in the cache. A container of
+ * no limit, or of one not read, adds nothing.
+ */
+export function memoryLimitOf(podTemplate: Readonly<Record<string, unknown>>): number {
+  const spec = podTemplate["spec"] as { readonly containers?: readonly { readonly resources?: { readonly limits?: Readonly<Record<string, unknown>> } }[] } | undefined;
+  return (spec?.containers ?? []).reduce((sum, { resources }) => {
+    const limit = resources?.limits?.["memory"];
+    const [, amount = "", unit = ""] = /^([0-9]+(?:\.[0-9]+)?)([A-Za-z]*)$/u.exec(typeof limit === "string" ? limit : String(limit ?? "")) ?? [];
+    const bytes = Number(amount) * (unit === "" ? 1 : QUANTITY_UNITS[unit] ?? Number.NaN);
+    return sum + (Number.isFinite(bytes) ? Math.ceil(bytes) : 0);
+  }, 0);
 }
 
 /** `run`, on the node's disk, failing as the cache does. */
@@ -441,6 +461,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       const takenAt = yield* Clock.currentTimeMillis;
       const snapshot = snapshotId(takenAt);
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
+      yield* cache.room(memoryLimitOf(podTemplate), request).pipe(Effect.flatMap(logEvicted));
       const directory = yield* cache.stage(environment, workspace, snapshot);
       const pauseMs = yield* timed(runsc.checkpoint(release, { containerId, imagePath: directory, hook, hookTimeout: HOOK_TIMEOUT }));
       const image = yield* runsc.inspect(release, directory);
@@ -484,12 +505,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       yield* cached;
     }).pipe(Effect.catch((error) => Effect.logWarning(`the snapshot ${manifest.snapshot} of ${prefixOf(manifest)} is committed, but ${error.message}`)));
 
-  const evict: Effect.Effect<void, CacheError> = cache.evict.pipe(
-    Effect.flatMap((evicted) =>
-      Effect.forEach(evicted, ({ environment, workspace, snapshot, bytes }) =>
-        Effect.logInfo(`evicted the snapshot ${snapshot} of ${environment}/${workspace} (${bytes} bytes) from the node's cache`), { discard: true })
-    ),
-  );
+  /** Says which snapshots were evicted from the node's cache. */
+  const logEvicted = (evicted: readonly { readonly environment: string; readonly workspace: string; readonly snapshot: string; readonly bytes: number }[]) =>
+    Effect.forEach(evicted, ({ environment, workspace, snapshot, bytes }) =>
+      Effect.logInfo(`evicted the snapshot ${snapshot} of ${environment}/${workspace} (${bytes} bytes) from the node's cache`), { discard: true });
+
+  const evict: Effect.Effect<void, CacheError> = cache.evict.pipe(Effect.flatMap(logEvicted));
 
   const checkpoint = (request: CheckpointRequest): Effect.Effect<Manifest, CheckpointFailed> => {
     const failed = (reason: string) => new CheckpointFailed({ environment: request.environment, workspace: request.workspace, reason });
@@ -580,6 +601,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   const download = (manifest: Manifest): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace, snapshot } = manifest;
+      yield* cache.room(manifest.bytes, manifest).pipe(Effect.flatMap(logEvicted));
       const directory = yield* cache.stage(environment, workspace, snapshot);
       for (const file of manifest.files) {
         const target = join(directory, file.path);
@@ -596,6 +618,18 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       yield* onDisk(() => writeFile(join(directory, MANIFEST_FILE), JSON.stringify(manifest)));
       yield* cache.commit(environment, workspace, snapshot);
     }).pipe(Effect.onError(() => cache.clear(manifest.environment, manifest.workspace, null).pipe(Effect.ignore)));
+
+  /** Whether the cache's copy of `manifest`'s image is what the manifest says, file by file; one that is not is removed, said so. */
+  const intact = (manifest: Manifest): Effect.Effect<boolean, CacheError> =>
+    Effect.gen(function*() {
+      const { environment, workspace, snapshot } = manifest;
+      const directory = cache.path(environment, workspace, snapshot);
+      const found = (yield* onDisk(() => imageFiles(directory))).filter(({ path }) => path !== MANIFEST_FILE);
+      if (JSON.stringify(found) === JSON.stringify(manifest.files)) return true;
+      yield* Effect.logWarning(`the node's cached copy of the snapshot ${snapshot} of ${prefixOf(manifest)} is not what its manifest says: it is read again from the bucket`);
+      yield* cache.clear(environment, workspace, null);
+      return false;
+    });
 
   /** Why this node cannot restore `manifest`, or null when it can. */
   const unrestorable = (manifest: Manifest): Effect.Effect<string | null, RunscError> =>
@@ -619,8 +653,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
         const why = yield* unrestorable(manifest);
         if (why !== null) return yield* new Unrestorable({ environment, workspace, snapshot, reason: why });
-        const cached = yield* cache.holds(environment, workspace, snapshot);
         const started = yield* Clock.currentTimeMillis;
+        // A copy the cache holds is read again against its manifest: what the disk keeps may have changed since it was written.
+        const cached = (yield* cache.holds(environment, workspace, snapshot)) && (yield* intact(manifest));
         if (cached) yield* cache.use(environment, workspace, snapshot);
         else yield* download(manifest);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
@@ -695,6 +730,14 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     const cached = (yield* cache.list).map(({ usedAt, ...rest }) => ({ ...rest, usedAt: new Date(usedAt).toISOString() }));
     return { node, releases, cached };
   });
+
+  // The cache returns within its budget on its own too, as what was used within the grace passes it, though no checkpoint or prepare runs.
+  yield* evict.pipe(
+    Effect.catch((error) => Effect.logWarning(error.message)),
+    Effect.repeat(Schedule.spaced(EVICT_POLL)),
+    withLogScope("node-agent"),
+    Effect.forkScoped,
+  );
 
   return {
     checkpoint: (request) => checkpoint(request).pipe(withLogScope("node-agent")),

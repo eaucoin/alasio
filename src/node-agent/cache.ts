@@ -8,19 +8,34 @@
  * The cache holds at most `budget` bytes, its least recently used snapshots evicted
  * first, but for any used within `grace`, which a restore may still be reading. When a
  * snapshot was last used is its directory's modification time, so it outlasts the agent.
+ * Whatever the budget, nothing is written to it that would leave the node's disk with
+ * less than RESERVE_BYTES free: room is made first, snapshots evicted as they would be
+ * over the budget, and what it cannot be made for is refused.
  */
-import { mkdir, readdir, rename, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, statfs, utimes } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Clock, Effect, Schema } from "effect";
 
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 
-/** What the cache is given: its directory, its byte budget, and how long a snapshot used is kept regardless. */
+/** What the cache is given: its directory, its byte budget, how long a snapshot used is kept regardless, and how many bytes its disk has free. */
 export interface CacheOptions {
   readonly root: string;
   readonly budget: number;
   readonly graceMs: number;
+  /** The bytes free on the cache's disk, as statfs says unless told. */
+  readonly free?: (root: string) => Promise<number>;
+}
+
+/** What the cache leaves free on the node's disk whatever it writes: the node's own room to run. */
+export const RESERVE_BYTES = 2 * 1024 ** 3;
+
+/** The bytes free on the disk of `directory`, to anyone. */
+async function freeOnDisk(directory: string): Promise<number> {
+  await mkdir(directory, { recursive: true });
+  const { bavail, bsize } = await statfs(directory);
+  return bavail * bsize;
 }
 
 /** A snapshot the cache holds. */
@@ -62,6 +77,12 @@ export interface SnapshotCache {
   readonly list: Effect.Effect<readonly CachedSnapshot[], CacheError>;
   /** Evicts snapshots, least recently used first, until the cache is within its budget: those evicted. */
   readonly evict: Effect.Effect<readonly CachedSnapshot[], CacheError>;
+  /**
+   * Makes room on the disk for `bytes` more, RESERVE_BYTES left beside them, evicting
+   * snapshots as `evict` does but for any of `keep`'s workspace's: those evicted. Fails,
+   * saying so, where it cannot.
+   */
+  readonly room: (bytes: number, keep: { readonly environment: string; readonly workspace: string }) => Effect.Effect<readonly CachedSnapshot[], CacheError>;
   /** Removes what was left half written. */
   readonly clean: Effect.Effect<void, CacheError>;
 }
@@ -101,7 +122,7 @@ async function size(directory: string): Promise<number> {
 }
 
 /** The node's snapshot cache in `root`, as the module says. */
-export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): SnapshotCache {
+export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: CacheOptions): SnapshotCache {
   const attempt = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
     Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
@@ -192,6 +213,27 @@ export function makeSnapshotCache({ root, budget, graceMs }: CacheOptions): Snap
       }
       return evicted;
     }),
+
+    room: (bytes, keep) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        let available = yield* attempt(() => free(root));
+        const evicted: CachedSnapshot[] = [];
+        const evictable = [...(yield* list)]
+          .filter((cached) => (cached.environment !== keep.environment || cached.workspace !== keep.workspace) && now - cached.usedAt >= graceMs)
+          .sort((a, b) => a.usedAt - b.usedAt);
+        for (const cached of evictable) {
+          if (available >= bytes + RESERVE_BYTES) break;
+          yield* attempt(() => rm(path(cached.environment, cached.workspace, cached.snapshot), { recursive: true, force: true }));
+          available += cached.bytes;
+          evicted.push(cached);
+        }
+        if (evicted.length > 0) available = yield* attempt(() => free(root));
+        if (available < bytes + RESERVE_BYTES) {
+          return yield* new CacheError({ reason: `its disk has ${available} bytes free, and ${bytes} more would leave less than the ${RESERVE_BYTES} it keeps free` });
+        }
+        return evicted;
+      }),
 
     clean: attempt(async () => {
       for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {

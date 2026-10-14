@@ -530,3 +530,26 @@ test("an idle session is released, its sandbox snapshotted by its node's agent, 
     podTemplate: sandbox.spec.podTemplate,
   }]]);
 });
+
+test("a node's idle sessions are released two at a time, the others left for a later look", async () => {
+  const objects = new Map<string, KubernetesObject>();
+  for (const [name, on] of [["fs-a1", "node-a"], ["fs-a2", "node-a"], ["fs-a3", "node-a"], ["fs-b1", "node-b"]] as const) {
+    const sandbox = stored(sessionOf(profile(), name), "Running");
+    sandbox.status = { serviceFQDN: `${name}.alasio-sessions.svc.cluster.local`, conditions: [{ type: "Ready", status: "True", reason: "Ready", message: "", lastTransitionTime: new Date(0), observedGeneration: 0 }] };
+    objects.set(`Sandbox/alasio-sessions/${name}`, sandbox);
+    objects.set(`Pod/alasio-sessions/${name}`, { apiVersion: "v1", kind: "Pod", metadata: { name, namespace: "alasio-sessions" }, spec: { nodeName: on, containers: [] } } as V1Pod);
+  }
+  const { agents } = fakeAgents({ holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])] });
+  const releasing: string[] = [];
+  // Each release holds on, as a checkpoint of a large sandbox does.
+  const sandboxes = {
+    token: () => Effect.succeed("token"),
+    release: (name: string) => Effect.sync(() => releasing.push(name)).pipe(Effect.andThen(Effect.never)),
+  } as unknown as Sandboxes;
+  await run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+    yield* snapshotted.watch(sandboxes, () => null);
+    yield* Effect.sleep("50 millis");
+  })), () => ({ execsRunning: 0, execsQueued: 0, idleSinceMs: 0 }));
+  assert.deepEqual(releasing.toSorted(), ["fs-a1", "fs-a2", "fs-b1"]);
+});

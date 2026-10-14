@@ -68,6 +68,8 @@ const POD_RUNNING_TIMEOUT = "3 minutes";
 const RELEASE_POLL: Duration.Input = "15 seconds";
 /** How often what no Sandbox has a use for is collected: snapshots of sessions that are gone, and images nodes cache that no restore will read. */
 const COLLECT_POLL: Duration.Input = "10 minutes";
+/** How many sessions of one node are released at a time. */
+const RELEASES_PER_NODE = 2;
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
 /**
@@ -425,6 +427,8 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const watch = (sandboxes: Sandboxes, lastTurn: (name: string) => number | null): Effect.Effect<void, never, Scope.Scope> =>
     Effect.gen(function*() {
       const releasing = yield* FiberMap.make<string>();
+      // How many releases run on each node, which its agent checkpoints one beside the other.
+      const onNode = new Map<string, number>();
       const look = Effect.gen(function*() {
         const listed = yield* kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, "alasio.dev/workload=session");
         const now = yield* Clock.currentTimeMillis;
@@ -434,6 +438,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           const turned = lastTurn(name);
           if (turned !== null && now - turned < releaseAfterMs) continue;
           if (!(yield* idle(sandboxes, sandbox, now))) continue;
+          // A node runs RELEASES_PER_NODE at a time, its disk, CPU and uplink shared: the others wait for a later look.
+          const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
+          const node = pod?.spec?.nodeName;
+          if (!node || (onNode.get(node) ?? 0) >= RELEASES_PER_NODE) continue;
+          onNode.set(node, (onNode.get(node) ?? 0) + 1);
+          const done = Effect.sync(() => onNode.set(node, (onNode.get(node) ?? 1) - 1));
           // Looked at again once nothing else may bring it up: a turn may have begun meanwhile.
           const stillIdle = (held: StoredSandbox): Effect.Effect<Saved, KubeApiError> =>
             Effect.gen(function*() {
@@ -449,6 +459,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               Effect.tap((released) => (released ? Effect.logInfo(`released session ${name}`) : Effect.void)),
               Effect.catch((error) => Effect.logWarning(`could not release session ${name}: ${error.message}`)),
               withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }),
+              Effect.ensuring(done),
             ),
             { onlyIfMissing: true },
           );
