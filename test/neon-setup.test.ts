@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { X509Certificate } from "node:crypto";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
 
+import { makeCertificate, RENEW_DAYS, VALID_DAYS, webhookCertificate } from "../neon/control/certificate.ts";
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
@@ -31,6 +33,7 @@ const ENV = {
   VALKEY_ADDRESS: "q-valkey.alasio.svc.cluster.local:6379",
   WORKSPACES_SECRET_LABELS: '{"alasio.dev/volume-driver":"csi.juicefs.com"}',
   SNAPSHOTS_BUCKET: "snapshots",
+  WEBHOOK_ADDRESS: "203.0.113.10",
 };
 
 /** Secrets in memory, as the API server keeps them: stringData becomes base64 data. */
@@ -84,7 +87,9 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.s3Region, "us-east-1");
   assert.equal(config.neonBucket, "neon");
   assert.equal(config.external, false);
-  assert.throws(() => setupConfig({ ...ENV, NEON_PROXY_HOST: "" }), /NEON_PROXY_HOST must be set/);
+  // Without Neon, none of its hosts; with it, every one.
+  assert.equal(setupConfig({ ...ENV, NEON_PROXY_HOST: "" }).neon, null);
+  assert.throws(() => setupConfig({ ...ENV, NEON_BROKER_URL: "" }), /NEON_BROKER_URL must be set/);
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
   // Where sessions are snapshotted, the external store's key for the snapshots bucket alone is required.
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" }), /S3_SNAPSHOTS_ACCESS_KEY must be set/);
@@ -140,16 +145,16 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // access applier; and each principal's, KEDA's with its mechanism.
   assert.match(value(kube, names.log, "KAFKA_CLUSTER_ID"), /^[\w-]{22}$/u);
   assert.equal(value(kube, names.log, "LOG_ADMIN_PASSWORD"), root.log.admin);
-  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["gateway", "intake", "scaler"]);
-  assert.deepEqual(names.logPrincipals, { gateway: "q-log-gateway", intake: "q-log-intake", scaler: "q-log-scaler" });
-  for (const principal of ["gateway", "intake", "scaler"] as const) {
+  assert.deepEqual(Object.keys(kube.secrets.get(names.logAccess)?.data ?? {}).sort(), ["alasio-main", "gateway", "intake", "scaler", "webhook"]);
+  assert.deepEqual(names.logPrincipals, { "gateway": "q-log-gateway", "intake": "q-log-intake", "scaler": "q-log-scaler", "webhook": "q-log-webhook", "alasio-main": "q-log-alasio-main" });
+  for (const principal of ["gateway", "intake", "scaler", "webhook", "alasio-main"] as const) {
     assert.equal(value(kube, names.logAccess, principal), root.log[principal]);
     assert.equal(value(kube, names.logPrincipals[principal], "username"), principal);
     assert.equal(value(kube, names.logPrincipals[principal], "password"), root.log[principal]);
   }
   assert.equal(value(kube, names.logPrincipals.scaler, "sasl"), "scram_sha512");
   assert.equal(kube.secrets.get(names.logPrincipals.gateway)?.data?.["sasl"], undefined);
-  assert.equal(new Set(Object.values(root.log)).size, 4);
+  assert.equal(new Set(Object.values(root.log)).size, 6);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -245,6 +250,32 @@ test("the log's cluster id is Kafka's kind, and never begins with what its comma
   assert.deepEqual(ids.filter((id) => !/^[A-Za-z0-9_][A-Za-z0-9_-]{21}$/u.test(id)), []);
 });
 
+test("the webhook intake's certificate is made for its address, kept while it serves it, and made anew for another", async () => {
+  const kube = fakeKube();
+  const names = secretNames("q");
+  await setupKube({ kube, config: setupConfig(ENV), log: () => {} });
+  const first = value(kube, names.webhookTls, "tls.crt");
+  assert.equal(new X509Certificate(first).subjectAltName, "IP Address:203.0.113.10");
+  assert.match(value(kube, names.webhookTls, "tls.key"), /^-----BEGIN PRIVATE KEY-----/u);
+  await setupKube({ kube, config: setupConfig(ENV), log: () => {} });
+  assert.equal(value(kube, names.webhookTls, "tls.crt"), first);
+  await setupKube({ kube, config: setupConfig({ ...ENV, WEBHOOK_ADDRESS: "bot.example.com" }), log: () => {} });
+  assert.equal(new X509Certificate(value(kube, names.webhookTls, "tls.crt")).subjectAltName, "DNS:bot.example.com");
+});
+
+test("a certificate is made anew within its last days, and one that does not parse at once", () => {
+  const made = makeCertificate("203.0.113.10");
+  const certificate = new X509Certificate(made.cert);
+  assert.equal(certificate.subject, "CN=203.0.113.10");
+  assert.equal(Math.round((Date.parse(certificate.validTo) - Date.parse(certificate.validFrom)) / 86_400_000), VALID_DAYS);
+  const fresh = () => ({ cert: "new", key: "new" });
+  const at = (days: number) => new Date(Date.parse(certificate.validTo) - days * 86_400_000);
+  assert.equal(webhookCertificate("203.0.113.10", made, at(RENEW_DAYS + 1), fresh).made, false);
+  assert.equal(webhookCertificate("203.0.113.10", made, at(RENEW_DAYS - 1), fresh).made, true);
+  assert.equal(webhookCertificate("203.0.113.11", made, at(RENEW_DAYS + 1), fresh).made, true);
+  assert.deepEqual(webhookCertificate("203.0.113.10", { cert: "x", key: "y" }, new Date(), fresh), { certificate: fresh(), made: true });
+});
+
 test("a root predating a secret gains it without losing the rest", async () => {
   const kube = fakeKube();
   const config = setupConfig(ENV);
@@ -308,7 +339,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
     nodeAgentToken: "n",
     logClusterId: "cluster",
-    log: { admin: "la", gateway: "lg", intake: "li", scaler: "ls" },
+    log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm" },
   };
 }
 
@@ -329,6 +360,7 @@ test("with an external object store, every service uses its credentials, but the
     secrets: stackSecrets({ accessKey: "bundled-key", secretKey: "bundled-secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
     config,
   });
   const names = secretNames("q");
@@ -355,11 +387,24 @@ test("with an external object store, every service uses its credentials, but the
   }
 });
 
+test("without Neon, the log's and the webhook intake's Secrets are made, and none of Neon's, the object store's or workspace storage's", () => {
+  const rendered = renderSecrets({
+    secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
+    privateKeyPem: generateKeyPair().privateKeyPem,
+    publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
+    config: setupConfig({ ...ENV, NEON_BROKER_URL: "", NEON_CONTROLLER_URL: "", NEON_PAGESERVER_HOST: "", NEON_PROXY_HOST: "", NEON_CONTROLLER_DB_HOST: "" }),
+  });
+  const names = secretNames("q");
+  assert.deepEqual(Object.keys(rendered).sort(), [names.root, names.log, names.logAccess, ...Object.values(names.logPrincipals), names.webhookTls].sort());
+});
+
 test("without workspace storage, neither its Secrets nor its identity are made", () => {
   const rendered = renderSecrets({
     secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
     config: setupConfig({ ...ENV, WORKSPACES_NAME: "" }),
   });
   const names = secretNames("q");
@@ -374,6 +419,7 @@ test("without session sandboxes snapshotted, neither the snapshots' Secret, thei
     secrets: stackSecrets({ accessKey: "key", secretKey: "secret" }),
     privateKeyPem: generateKeyPair().privateKeyPem,
     publicKeyPem: "pk",
+    webhookTls: { cert: "c", key: "k" },
     config: setupConfig({ ...ENV, SNAPSHOTS_BUCKET: "" }),
   });
   const names = secretNames("q");

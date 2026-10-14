@@ -3,7 +3,6 @@ import { Effect } from "effect";
 import { loadAlasioConfig } from "../config.ts";
 import { TelegramClient } from "./client.ts";
 
-const args = new Set(process.argv.slice(2));
 const config = loadAlasioConfig();
 
 const doctor = Effect.gen(function*() {
@@ -24,11 +23,6 @@ const doctor = Effect.gen(function*() {
       pending_update_count: webhookInfo.pending_update_count ?? null,
     },
   }, null, 2));
-
-  if (args.has("--delete-webhook")) {
-    yield* client.deleteWebhook(false);
-    console.log("Deleted webhook without dropping pending updates.");
-  }
 });
 
 await Effect.runPromise(doctor.pipe(Effect.provide(TelegramClient.layer(config.telegramBotToken))));

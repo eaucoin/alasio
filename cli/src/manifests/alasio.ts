@@ -29,6 +29,7 @@ import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { alasioGroup, environmentLogSecret, environmentName, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -259,17 +260,20 @@ function hostProfile(config: InstallConfig): HostProfile {
 export type CpuBaseline = readonly string[] | null;
 
 /**
- * What `alasio up` finds the cluster keeps for the sessions' snapshots: the CPU baseline
+ * What `alasio up` finds the cluster keeps: for the sessions' snapshots, the CPU baseline
  * it holds them to, which up keeps while every node it surveys has it (../cpu-baseline.ts),
- * and the gVisor releases it keeps, the current one first (../kept-releases.ts).
+ * and the gVisor releases it keeps, the current one first (../kept-releases.ts); and the
+ * checksum of the bot's Secret (../secrets.ts botChecksum), which alasio reads only as it
+ * starts, so its pod carries it, and is replaced when the bot or its users change.
  */
 export interface Kept {
   readonly cpuBaseline: CpuBaseline;
   readonly gvisorReleases: readonly string[];
+  readonly botChecksum: string | null;
 }
 
-/** What a cluster keeps where up has found nothing of it yet: no baseline, and the releases pinned. */
-export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS) };
+/** What a cluster keeps where up has found nothing of it yet: no baseline, the releases pinned, and no bot. */
+export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null };
 
 /**
  * What `alasio up` carries forward from the installation it replaces: the sessions'
@@ -399,6 +403,12 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
     { name: "ALASIO_LAKE_VERIFIER_FILE", value: "/run/alasio/database/lake-verifier" },
     ...readerRoles(config, environment).map(({ key, variable }) => ({ name: variable, value: `/run/alasio/database/${key}` })),
     { name: "ALASIO_LAKE_ENABLED", value: config.lake.enabled && config.neon.enabled ? "1" : "0" },
+    // Its Telegram updates: its environment's topic, read in its group as its principal.
+    { name: "ALASIO_LOG_BROKERS", value: LOG_BROKERS },
+    { name: "ALASIO_LOG_USERNAME", valueFrom: { secretKeyRef: { name: environmentLogSecret(environment), key: "username" } } },
+    { name: "ALASIO_LOG_PASSWORD_FILE", value: "/run/alasio/log/password" },
+    { name: "ALASIO_TELEGRAM_TOPIC", value: telegramTopic(environmentName(environment)) },
+    { name: "ALASIO_TELEGRAM_GROUP", value: alasioGroup(environmentName(environment)) },
     { name: "ALASIO_TELEMETRY_RECEIVER_SERVICE", value: `${componentName("telemetry")}.${environment.namespace}.svc` },
     { name: "ALASIO_TELEMETRY_RECEIVER_PORT", value: String(config.telemetry.receiverPort) },
     ...(alasio.defaultHarness ? [{ name: "ALASIO_DEFAULT_HARNESS", value: alasio.defaultHarness }] : []),
@@ -417,16 +427,19 @@ function alasioEnv(config: InstallConfig, home: string, operatorHome: boolean, e
 }
 
 /**
- * alasio's Deployment: one replica, as Telegram's updates have one poller, so an update
- * stops the old pod before the new one starts. It keeps no volume: its state is in Neon,
+ * alasio's Deployment: one replica, the one member of its group on its topic's one
+ * partition, which its turns run in, so an update stops the old pod before the new one
+ * starts. It keeps no volume: its state is in Neon,
  * and what it writes to disk (received files written for the agent, its home unless it
  * is the operator's) is written again as needed, on emptyDirs. Under the
  * host profile it runs as the operator, in their home, with the machine's mounts. A
  * branch environment's runs in its namespace on the branch's database, told it is the
  * branch, with its token to ask main to fork the sessions it inherited; main's is given
- * the key branch environments' tokens are signed with, where it forks sessions.
+ * the key branch environments' tokens are signed with, where it forks sessions. Its pod
+ * carries the checksums of its templates and, where up read it, of its bot's Secret, so
+ * it is replaced when either changes.
  */
-function deployment(config: InstallConfig, templatesChecksum: string, environment: Environment): V1Deployment {
+function deployment(config: InstallConfig, templatesChecksum: string, botChecksum: string | null, environment: Environment): V1Deployment {
   const { alasio, host } = config;
   const operatorHome = host.enabled && host.alasioHome;
   const home = operatorHome ? host.home : "/var/lib/alasio/home";
@@ -444,7 +457,10 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
       strategy: { type: "Recreate" },
       selector: { matchLabels: selectorLabels("alasio") },
       template: {
-        metadata: { labels: labels("alasio"), annotations: { "checksum/sandbox-templates": templatesChecksum } },
+        metadata: {
+          labels: labels("alasio"),
+          annotations: { "checksum/sandbox-templates": templatesChecksum, ...(botChecksum === null ? {} : { "checksum/telegram": botChecksum }) },
+        },
         spec: {
           serviceAccountName: RELEASE,
           ...priority("turn"),
@@ -470,6 +486,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
               ...(operatorHome ? [] : [{ name: "alasio-home", mountPath: home }]),
               { name: "templates", mountPath: "/etc/alasio", readOnly: true },
               { name: "database", mountPath: "/run/alasio/database", readOnly: true },
+              { name: "log", mountPath: "/run/alasio/log", readOnly: true },
               ...branchSecret.map(({ name }) => ({ name, mountPath: BRANCH_SECRETS, readOnly: true })),
               ...(host.enabled ? hostVolumeMounts(config) : []),
             ],
@@ -485,6 +502,7 @@ function deployment(config: InstallConfig, templatesChecksum: string, environmen
                 items: ["url", "lake-verifier", ...readerRoles(config, environment).map(({ key }) => key)].map((key) => ({ key, path: key })),
               },
             },
+            { name: "log", secret: { secretName: environmentLogSecret(environment), items: [{ key: "password", path: "password" }] } },
             ...branchSecret,
             ...(host.enabled ? hostVolumes(config) : []),
           ],
@@ -668,7 +686,7 @@ function hostAgentIdentity(config: InstallConfig): KubernetesObject[] {
 /** The objects of the alasio of `environment`, main's unless a branch environment's, with what main's carries forward. */
 export function alasioObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, carried: Carried = NOTHING_CARRIED): KubernetesObject[] {
   const templates = sandboxTemplates(config, environment, carried);
-  const alasio = deployment(config, templates.checksum, environment);
+  const alasio = deployment(config, templates.checksum, carried.botChecksum, environment);
   return [
     ...namespaces(config, environment),
     ...identity(config, environment),

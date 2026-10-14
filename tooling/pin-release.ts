@@ -3,12 +3,12 @@
  * of the images the release published, into cli/src/release.ts, which holds nothing
  * else. The release workflow runs it before it builds the package:
  *
- *   node tooling/pin-release.ts <version> alasio=<digest> alasio-agent=<digest> alasio-lake=<digest> alasio-grafana=<digest> alasio-log=<digest> alasio-collector=<digest> alasio-node=<digest>
+ *   node tooling/pin-release.ts <version> alasio=<digest> alasio-agent=<digest> alasio-lake=<digest> alasio-grafana=<digest> alasio-log=<digest> alasio-collector=<digest> alasio-webhook=<digest> alasio-node=<digest>
  */
 import { writeFileSync } from "node:fs";
 
 /** The images a release publishes, by the name of their repository under ghcr.io/eaucoin. */
-export const RELEASED_IMAGES = ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-log", "alasio-collector", "alasio-node"] as const;
+export const RELEASED_IMAGES = ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-log", "alasio-collector", "alasio-webhook", "alasio-node"] as const;
 
 export type ReleasedImage = (typeof RELEASED_IMAGES)[number];
 
@@ -21,7 +21,7 @@ export interface ReleasePin {
 /** What the repository's release.ts holds between releases: a development version, no image pinned. */
 export const DEVELOPMENT: ReleasePin = {
   version: "0.0.0-development",
-  digests: { "alasio": "", "alasio-agent": "", "alasio-lake": "", "alasio-grafana": "", "alasio-log": "", "alasio-collector": "", "alasio-node": "" },
+  digests: { "alasio": "", "alasio-agent": "", "alasio-lake": "", "alasio-grafana": "", "alasio-log": "", "alasio-collector": "", "alasio-webhook": "", "alasio-node": "" },
 };
 
 const VERSION = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/u;
@@ -50,6 +50,7 @@ export function parsePin(args: readonly string[]): ReleasePin {
       "alasio-grafana": digest("alasio-grafana"),
       "alasio-log": digest("alasio-log"),
       "alasio-collector": digest("alasio-collector"),
+      "alasio-webhook": digest("alasio-webhook"),
       "alasio-node": digest("alasio-node"),
     },
   };
@@ -73,6 +74,7 @@ export const IMAGES = {
   grafana: ${image("alasio-grafana")},
   log: ${image("alasio-log")},
   collector: ${image("alasio-collector")},
+  webhook: ${image("alasio-webhook")},
 };
 
 /** The node image of the cluster in Docker: k3s with gVisor (cluster/node), pinned like the others. */

@@ -244,7 +244,6 @@ test("Bot API calls are client spans that never carry the bot token", async () =
   const responses: { status: number; body: object }[] = [
     { status: 429, body: { ok: false, parameters: { retry_after: 0.001 } } },
     { status: 200, body: { ok: true, result: { message_id: 5 } } },
-    { status: 200, body: { ok: true, result: [] } },
   ];
   const fetch = async (): Promise<Response> => {
     const next = responses.shift();
@@ -255,13 +254,12 @@ test("Bot API calls are client spans that never carry the bot token", async () =
   await Effect.runPromise(Effect.gen(function*() {
     const client = yield* TelegramClient;
     yield* client.sendMessage(1, "hi", { format: "plain" });
-    yield* client.getUpdates({ offset: 1 });
   }).pipe(
     Effect.provide(TelegramClient.layer("123:SECRET-TOKEN").pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetch)))),
     Effect.provide(TracingLayer),
   ));
   const [call] = spans.getFinishedSpans();
-  assert.equal(spans.getFinishedSpans().length, 1, "the long poll is not a span");
+  assert.equal(spans.getFinishedSpans().length, 1);
   assert.ok(call);
   assert.equal(call.name, "telegram/sendMessage");
   assert.equal(call.kind, SpanKind.CLIENT);

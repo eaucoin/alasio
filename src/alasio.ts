@@ -30,9 +30,12 @@ import { TelegramClient } from "./telegram/client.ts";
 import { ReceivedFiles } from "./telegram/files.ts";
 import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
+import type { TelegramUpdates } from "./telegram/update-consumer.ts";
 
-/** What alasio is made with: its configuration, its Neon and what main keeps there, and what the deployment's templates offer. */
-export interface AlasioOptions extends AlasioConfig, TelegramAppConfig {
+/** What alasio is made with: its configuration, its Neon and what main keeps there, what the deployment's templates offer, and where its updates come from. */
+export interface AlasioOptions extends Omit<AlasioConfig, "telegramLog">, TelegramAppConfig {
+  /** Telegram's updates: its environment's topic in the log (TelegramUpdates.layer), or a stand-in's in alasio's tests. */
+  readonly updates: Layer.Layer<TelegramUpdates>;
   /** The pool of alasio's Neon database, which its state is kept in. */
   readonly pool: Pool;
   /** The schema alasio's state is kept in: `state`, unless a test gives one of its own. */
@@ -179,7 +182,7 @@ function codexServices({ kubeTemplates, stateDir }: AlasioOptions): Layer.Layer<
  * reverse of the order it was made in.
  */
 export const serveAlasio = Effect.fnUntraced(function*(options: AlasioOptions): Effect.fn.Return<void, TelegramAppError | CodexLoginError, Scope.Scope> {
-  yield* Layer.build(serveTelegram(options).pipe(Layer.provide(alasioServices(options))));
+  yield* Layer.build(serveTelegram(options).pipe(Layer.provide(Layer.merge(alasioServices(options), options.updates))));
   // Added last, so the first thing a stop does.
   yield* Effect.addFinalizer(() => Effect.logInfo("Shutting down..."));
 });

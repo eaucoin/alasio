@@ -44,7 +44,11 @@ export const urlOf = ({ service, port }: StandIn): string => `http://${service}.
 /** Node, which the scripts need and nothing else. */
 const NODE_IMAGE = "node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8";
 
-/** `standIn`'s objects: its script's ConfigMap, its Service, and its Deployment, run unprivileged. */
+/**
+ * `standIn`'s objects: its script's ConfigMap, its Service, and its Deployment, run
+ * unprivileged, with a volume of the pod's own it keeps what it holds in (STATE), which its
+ * container, started again, reads again.
+ */
 function objectsOf({ name, container, service, port, script, ready, tlsPort }: StandIn): KubernetesObject[] {
   const labels = { app: name };
   const configMap: V1ConfigMap = {
@@ -76,10 +80,11 @@ function objectsOf({ name, container, service, port, script, ready, tlsPort }: S
             command: ["node", `/stand-in/${script}`, String(port), ...(tlsPort ? [String(tlsPort)] : [])],
             ports: [{ containerPort: port }, ...(tlsPort ? [{ containerPort: tlsPort }] : [])],
             readinessProbe: { httpGet: { path: ready, port } },
+            env: [{ name: "STATE", value: "/state/held.json" }],
             securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
-            volumeMounts: [{ name: "stand-in", mountPath: "/stand-in" }],
+            volumeMounts: [{ name: "stand-in", mountPath: "/stand-in" }, { name: "state", mountPath: "/state" }],
           }],
-          volumes: [{ name: "stand-in", configMap: { name } }],
+          volumes: [{ name: "stand-in", configMap: { name } }, { name: "state", emptyDir: {} }],
         },
       },
     },

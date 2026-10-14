@@ -21,6 +21,7 @@ import { nodeAgentObjects } from "./node-agent.ts";
 import { objectStoreObjects } from "./object-store.ts";
 import { priorityClassObjects } from "./priorities.ts";
 import { vpaObjects } from "./vpa.ts";
+import { webhookObjects } from "./webhook.ts";
 import { workspaceStorageObjects } from "./workspace-storage.ts";
 
 export { type Carried, carriedFrom, type Kept, NOTHING_CARRIED, NOTHING_KEPT, SANDBOX_TEMPLATES } from "./alasio.ts";
@@ -30,9 +31,9 @@ export { NAMESPACE } from "./common.ts";
 /**
  * The objects of the installation `config` describes: the PriorityClasses its pods run
  * under, agent-sandbox's, KEDA's, VPA's, alasio's, Neon's, the object store's, the log's,
- * the lake's, Grafana's, the telemetry collector's, workspace storage's, the node agents',
- * the NetworkPolicies, and the headroom's; with what alasio carries forward from the
- * installation it replaces (./alasio.ts carriedFrom).
+ * the webhook intake's, the lake's, Grafana's, the telemetry collector's, workspace
+ * storage's, the node agents', the NetworkPolicies, and the headroom's; with what alasio
+ * carries forward from the installation it replaces (./alasio.ts carriedFrom).
  */
 export function manifests(config: InstallConfig, carried: Carried = NOTHING_CARRIED): readonly KubernetesObject[] {
   return [
@@ -44,6 +45,7 @@ export function manifests(config: InstallConfig, carried: Carried = NOTHING_CARR
     ...neonObjects(config),
     ...objectStoreObjects(config),
     ...logObjects(config),
+    ...webhookObjects(config),
     ...lakeObjects(config),
     ...grafanaObjects(config),
     ...collectorObjects(config),

@@ -11,6 +11,8 @@ import { handleServiceControlCallback, isServiceControlAction } from "../operato
 import { handleSessionControlCallback, isSessionControlAction } from "../operator/session-control.ts";
 import { handleWorkspaceControlCallback, isWorkspaceControlAction } from "../operator/workspace-control.ts";
 import type { CallbackAction } from "../persistence/callback-repository.ts";
+import type { Mount } from "../persistence/conversation-repository.ts";
+import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { Authorizer } from "./authorizer.ts";
 import { TelegramClient } from "./client.ts";
@@ -34,28 +36,44 @@ const afterAcknowledging = <A, E, R>(callbackQueryId: string, control: Effect.Ef
     )),
   );
 
-/** Handles a press of one of alasio's buttons. */
-export const handleCallbackQuery = Effect.fnUntraced(function*(callbackQuery: CallbackQuery): Effect.fn.Return<
-  void,
-  CommandError,
-  Authorizer | OperatorServices
+/** What a press does once taken (takeCallbackQuery): its answer, and the control it runs. */
+export type PressHandling = Effect.Effect<void, CommandError, OperatorServices>;
+
+/** Answers the press `callbackQueryId` with `text`, and does nothing more. */
+const answering = (callbackQueryId: string, text: string): PressHandling =>
+  Effect.asVoid(Effect.flatMap(TelegramClient, (client) => client.answerCallbackQuery(callbackQueryId, text)));
+
+/**
+ * Takes a press of one of alasio's buttons from the store: whether its user may press it,
+ * its action, consumed, and the conversation's mount; and gives what it then does, its answer
+ * and its control, to run apart (handlePress). The store failing fails it, and the press is
+ * taken again; its action is consumed only where the store answers.
+ */
+export const takeCallbackQuery = Effect.fnUntraced(function*(callbackQuery: CallbackQuery): Effect.fn.Return<
+  PressHandling,
+  StoreError,
+  Authorizer | Store
 > {
   const store = yield* Store;
-  const client = yield* TelegramClient;
   if (!(yield* Effect.flatMap(Authorizer, (authorizer) => authorizer.isAuthorizedCallbackQuery(callbackQuery)))) {
-    yield* client.answerCallbackQuery(callbackQuery.id, "This action is not authorized for this Telegram user.");
-    return;
+    return answering(callbackQuery.id, "This action is not authorized for this Telegram user.");
   }
   // Every button alasio sends carries callback_data; a query without it is no action of alasio's.
   const action = callbackQuery.data === undefined ? null : yield* store.consumeCallbackAction(callbackQuery.data);
-  if (!action) {
-    yield* client.answerCallbackQuery(callbackQuery.id, "This action is no longer available.");
-    return;
-  }
+  if (!action) return answering(callbackQuery.id, "This action is no longer available.");
+  return handlePress(callbackQuery, action, yield* store.getMount(action.conversationId));
+});
+
+/** Handles a press taken from the store (takeCallbackQuery): its action, of the conversation `mount` is the mount of. */
+const handlePress = Effect.fnUntraced(function*(callbackQuery: CallbackQuery, action: CallbackAction, mount: Mount): Effect.fn.Return<
+  void,
+  CommandError,
+  OperatorServices
+> {
+  const client = yield* TelegramClient;
   const { conversationId } = action;
   const closes = action.kind.endsWith(":close");
   const heldPrompt = HELD_PROMPT_ACTIONS.has(action.kind);
-  const mount = yield* store.getMount(conversationId);
   if (!closes && !heldPrompt && mount.sessionId !== action.payload["expectedSessionId"]) {
     yield* client.answerCallbackQuery(callbackQuery.id, "This panel is stale. Open it again.");
     return;

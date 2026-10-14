@@ -1,6 +1,6 @@
 /** `alasio status`: what runs, and whether it is healthy; how it is scaled and sized, and the cluster's memory. */
-import type { KubernetesObject, V1Node, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
-import { Console, Effect, Option, Schema } from "effect";
+import type { KubernetesObject, V1Node, V1Pod, V1Secret, V1StatefulSet } from "@kubernetes/client-node";
+import { Console, Effect, Option, Redacted, Schema } from "effect";
 import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
@@ -23,6 +23,11 @@ import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
 import { type ComputeTimes, computeTimes, type TenantView, tenantView } from "../branches.ts";
 import { describeTarget, dockerCluster, kubeApi, resolveTarget } from "../target.ts";
+import { branchNamespaces } from "../branches.ts";
+import { installConfig } from "../install.ts";
+import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
+import { describeBots, type EnvironmentBot } from "../webhook.ts";
+import { branchNamespace } from "../../../src/branch/names.ts";
 import { notRunning, runIn } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
@@ -34,6 +39,15 @@ export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
     return this.of === 0
       ? "alasio is not installed in this cluster: alasio up installs it"
       : `${this.notReady} of alasio's ${this.of} workloads are not ready`;
+  }
+}
+
+/** Telegram cannot deliver to an environment's bot, or its deliveries fail: their fixes, each once. */
+export class DeliveriesFailing extends Schema.TaggedError<DeliveriesFailing>()("DeliveriesFailing", {
+  fixes: Schema.Array(Schema.String),
+}) {
+  override get message(): string {
+    return `Telegram does not deliver to the webhook intake as it should: ${this.fixes.join("; ")}`;
   }
 }
 
@@ -153,6 +167,24 @@ function describeTenant({ shards, pageservers }: TenantView): string[] {
   ];
 }
 
+/** How main's bot's and each branch environment's deliveries fare, as Telegram says. */
+const deliveries = (config: Parameters<typeof installConfig>[0]) =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const main = yield* readTelegramBot;
+    const branches = yield* branchNamespaces.pipe(Effect.catchIf(hasStatus(403), () => Effect.succeed([])));
+    const branchBots = yield* Effect.forEach(branches, (name) =>
+      kube.get<V1Secret>({ ...kind("Secret"), namespace: branchNamespace(name), name: TELEGRAM_SECRET }).pipe(
+        Effect.map((found): EnvironmentBot[] => {
+          const token = found?.data?.["token"];
+          const bot: TelegramBot = { token: Redacted.make(token ? Buffer.from(token, "base64").toString("utf8") : ""), allowedUserIds: [], username: "" };
+          return token ? [{ environment: name, bot }] : [];
+        }),
+        Effect.catchIf(hasStatus(403), () => Effect.succeed([])),
+      ));
+    return yield* describeBots(yield* installConfig(config), [...(main ? [{ environment: "main", bot: main }] : []), ...branchBots.flat()]);
+  });
+
 /** Whether `scaledObject` scales on what the metrics server measures: its pods' CPU. */
 const onResources = (scaledObject: ScaledObject): boolean => scaledObject.spec.triggers.some(({ type }) => type === "cpu");
 
@@ -228,6 +260,8 @@ export const status = Command.make("status", {}, () =>
           yield* Console.log(`  alasio's workloads outside its namespace, ${NAMESPACE}: not seen, as this kubeconfig may list them there alone`);
         }
         for (const line of yield* objectStore(workloads)) yield* Console.log(line);
+        const telegram = workloads.length > 0 ? yield* deliveries(config) : { lines: [], fixes: [] };
+        for (const line of telegram.lines) yield* Console.log(line);
         const cluster = yield* memory;
         yield* Console.log(cluster.memory ? describeMemory(cluster.memory) : "memory: not seen, as this kubeconfig may not list the cluster's nodes and pods");
         if (cluster.measures === null) yield* Console.log("whether the cluster has a metrics server: not seen, as this kubeconfig may not read its APIServices");
@@ -238,6 +272,7 @@ export const status = Command.make("status", {}, () =>
           );
         }
         if (workloads.length === 0 || notReady > 0) return yield* new Unhealthy({ notReady, of: workloads.length });
+        if (telegram.fixes.length > 0) return yield* new DeliveriesFailing({ fixes: telegram.fixes });
       }),
       kubeApi(target),
     );

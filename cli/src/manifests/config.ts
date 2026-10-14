@@ -223,6 +223,36 @@ const Snapshots = Schema.Struct({
 });
 
 /**
+ * The webhook intake (./webhook.ts), the one thing of alasio's the internet reaches,
+ * which Telegram delivers each environment's bot's updates to, on `port` of
+ * `publicAddress`, over HTTPS with a certificate of its own that alasio uploads to
+ * Telegram as it registers each bot. How it is reached its target makes (`exposure`,
+ * alasio's own to say): on this machine's address, from k3s on it, which then needs
+ * `publicAddress` to be that address, and binds it alone, leaving the machine's other
+ * addresses' port to whatever has it; on its node's, in Docker, whose port the machine
+ * maps; or through a LoadBalancer Service. `publicAddress` is the address Telegram is told,
+ * which its certificate is made for: the machine's, or the LoadBalancer's, or a name of
+ * either. On a machine's or a node's address it runs one replica. `sources` are the
+ * networks it takes its port from on this machine's address or a LoadBalancer's, its
+ * NetworkPolicy's and the LoadBalancer's: Telegram's, as its Bot API's guide to webhooks
+ * lists them (core.telegram.org/bots/webhooks), which Telegram may change; a change shows
+ * in each bot's getWebhookInfo as a last error, which alasio logs and alasio status says,
+ * each pointing here, where it is set.
+ */
+const Webhook = Schema.Struct({
+  publicAddress: defaulted(matching(/^(|(\d{1,3}\.){3}\d{1,3}|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)$/u, "must be an IPv4 address or a host name, or empty"), ""),
+  /** One of the ports Telegram delivers to. */
+  port: defaulted(Schema.Literals([443, 80, 88, 8443]), 443),
+  exposure: defaulted(Schema.Literals(["hostAddress", "node", "loadBalancer"]), "node"),
+  sources: defaulted(
+    Schema.Array(matching(/^[0-9.]+\/[0-9]{1,2}$/u, "must be an IPv4 CIDR")).check(Schema.isMinLength(1, { message: "must list a network at least" })),
+    ["149.154.160.0/20", "91.108.4.0/22"],
+  ),
+  scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false }),
+  resources: Resources({ requests: { cpu: "10m", memory: "48Mi" }, limits: { memory: "192Mi" } }),
+});
+
+/**
  * The least memory the log's broker is given: the heap of 512 MiB it is run at (./log.ts),
  * and the JVM's own beside it.
  */
@@ -793,6 +823,13 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (!config.neon.enabled && !config.neon.external.existingSecret) {
     return { path: ["neon", "external", "existingSecret"], issue: "is required when neon.enabled is false" };
   }
+  const { webhook } = config;
+  if (webhook.exposure === "hostAddress" && webhook.publicAddress && !/^(\d{1,3}\.){3}\d{1,3}$/u.test(webhook.publicAddress)) {
+    return { path: ["webhook", "publicAddress"], issue: "must be this machine's public IPv4 address, which Telegram delivers to and the webhook intake binds alone: alasio init finds it" };
+  }
+  if (webhook.exposure !== "loadBalancer" && webhook.scaling.min > 1) {
+    return { path: ["webhook", "scaling"], issue: "must be 1 where the webhook intake binds its node's port, which one pod holds" };
+  }
   if (config.neon.enabled && !config.objectStore.bundled.enabled) {
     if (!config.objectStore.external.endpoint) return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false" };
     if (!config.objectStore.external.existingSecret) return { path: ["objectStore", "external", "existingSecret"], issue: "is required with an external object store" };
@@ -859,6 +896,7 @@ const InstallStruct = Schema.Struct({
       grafana: Image(IMAGES.grafana),
       log: Image(IMAGES.log),
       collector: Image(IMAGES.collector),
+      webhook: Image(IMAGES.webhook),
       pullPolicy: defaulted(PullPolicy, "IfNotPresent"),
     }),
     {},
@@ -874,6 +912,7 @@ const InstallStruct = Schema.Struct({
   objectStore: defaulted(ObjectStore, {}),
   workspaceStorage: defaulted(WorkspaceStorage, {}),
   log: defaulted(Log, {}),
+  webhook: defaulted(Webhook, {}),
   /**
    * The analytics lake, loaded from Neon into DuckLake; its query endpoint, which Grafana
    * and alasio lake read it through; and its telemetry intake, which writes what the log

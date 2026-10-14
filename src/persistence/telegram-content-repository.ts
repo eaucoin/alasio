@@ -100,11 +100,15 @@ export class NeonTelegramContentRepository {
     this.#schema = schema;
   }
 
-  recordTelegramUpdate(update: Update): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `insert into ${this.#schema}.telegram_updates (update_id, payload) values ($1, $2) on conflict (update_id) do nothing`,
+  /** Keeps `update`, unless it is kept already: whether it is yet to be processed. */
+  recordTelegramUpdate(update: Update): Effect.Effect<boolean, StoreError> {
+    // The no-op update makes the conflicting row the one returned.
+    return this.#sql.query<{ processed: boolean }>(
+      `insert into ${this.#schema}.telegram_updates (update_id, payload) values ($1, $2)
+       on conflict (update_id) do update set update_id = excluded.update_id
+       returning processed_at is not null as processed`,
       [update.update_id, JSON.stringify(update)],
-    ));
+    ).pipe(Effect.map(([row]) => !row?.processed));
   }
 
   markTelegramUpdateProcessed(updateId: number): Effect.Effect<void, StoreError> {

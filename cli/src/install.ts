@@ -3,13 +3,15 @@
  * Secrets alasio names as the cluster has them, made into its objects (its namespace,
  * which its Secrets are in before anything else of it is, and its manifests), checked
  * against the cluster's autoscalers, its object store's layout and scale, Neon's storage
- * (./neon-storage.ts), and the objects the cluster has, applied, and waited for.
+ * (./neon-storage.ts), and the objects the cluster has, applied, and waited for; main's route
+ * given the webhook intake before it starts, and main's bot registered with Telegram once it
+ * serves it (./webhook.ts).
  */
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
 import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts";
-import { installConfigOf, type OperatorConfig, OperatorConfigError, sharedCluster } from "./config.ts";
+import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
 import { clusterReleases } from "./kept-releases.ts";
 import { describeRef, hasStatus, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
@@ -22,7 +24,9 @@ import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.t
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
-import { readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
+import { botChecksum, ensureBotChecksumKey, readBotChecksumKey, readClaudeToken, readTelegramBot, type TelegramBot } from "./secrets.ts";
+import type { TelegramBotApi, WebhookError } from "./telegram.ts";
+import { ensureRoute, registerBot, type WebhookNotServing } from "./webhook.ts";
 
 /** alasio's namespace. */
 const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: NAMESPACE, labels: labels("alasio") } };
@@ -37,6 +41,20 @@ export const applyNamespace: Effect.Effect<void, KubeApiError, KubeApi> = Effect
   Effect.asVoid,
 );
 
+/** The configuration names no address for Telegram to deliver to. */
+export class PublicAddressNotSet extends Schema.TaggedError<PublicAddressNotSet>()("PublicAddressNotSet", {}) {
+  override get message(): string {
+    return "install.webhook.publicAddress is not set: the address Telegram delivers the bot's updates to, which the webhook intake's certificate is made for; alasio init asks for it";
+  }
+}
+
+/** The bot's Secret allows no user: alasio would answer no one, as it admits no one by default. */
+export class NoUserAllowed extends Schema.TaggedError<NoUserAllowed>()("NoUserAllowed", {}) {
+  override get message(): string {
+    return "the bot allows no Telegram user (alasio-telegram's allowedUserIds is empty), and alasio admits no one but those it allows: alasio init --allowed-user-ids gives it them";
+  }
+}
+
 /** The cluster has no bot's Secret: alasio has not been given its bot. */
 export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) {
   override get message(): string {
@@ -47,7 +65,7 @@ export class BotNotSet extends Schema.TaggedError<BotNotSet>()("BotNotSet", {}) 
 /** The install configuration of `config`, which names Claude Code's Secret when the cluster has it. */
 export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig): Effect.fn.Return<InstallConfig, KubeApiError | OperatorConfigError, KubeApi> {
   const claude = (yield* readClaudeToken) !== null;
-  const install = installConfigOf(config.install, { claude, shared: sharedCluster(config.target) });
+  const install = installConfigOf(config.install, { claude, target: targetKind(config.target) });
   if (Result.isFailure(install)) return yield* new OperatorConfigError({ path: config.path, reason: install.failure });
   return install.success;
 });
@@ -104,50 +122,68 @@ interface Checked {
   readonly recorded: CpuBaseline;
   /** The releases the cluster keeps, as its RuntimeClasses say, which the sessions' snapshots restore with. */
   readonly gvisorReleases: readonly string[];
+  /** The checksum of the bot's Secret alasio's pod carries (../secrets.ts botChecksum), null where the Secret has no key for it yet. */
+  readonly checksum: string | null;
 }
 
 /**
  * The installation `config` describes, with its bot, refused where applying it would not do:
- * with no bot set, against the cluster's own autoscalers, its object store's layout and
- * scale, or Neon's storage (./neon-storage.ts), or where an object the cluster has cannot
- * take this release's of it. Its objects carry forward what the installation they replace
- * recorded.
+ * with no bot set, or one that allows no user, with no address for Telegram to deliver to,
+ * against the cluster's own autoscalers, its object store's layout and scale, or Neon's
+ * storage (./neon-storage.ts), or where an object the cluster has cannot take this release's
+ * of it. Its objects carry forward what the installation they replace recorded.
  */
 export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
-): Effect.fn.Return<Checked, KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused, KubeApi> {
+): Effect.fn.Return<
+  Checked,
+  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused,
+  KubeApi
+> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
+  if (bot.allowedUserIds.length === 0) return yield* new NoUserAllowed();
   const settings = yield* installConfig(config);
+  if (!settings.webhook.publicAddress) return yield* new PublicAddressNotSet();
   const { live, baseline: recorded } = yield* recordedBaseline;
   const gvisorReleases = yield* clusterReleases(gvisorReleasesOf(NODE_PINS));
-  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases }));
+  // None where the bot's Secret has no key for it yet, as up gives it one before it checks (ensureBotChecksumKey).
+  const key = yield* readBotChecksumKey;
+  const checksum = key === null ? null : botChecksum(bot, key);
+  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum }));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings);
   yield* checkApplicable(objects);
-  return { bot, settings, objects, live, recorded, gvisorReleases };
+  return { bot, settings, objects, live, recorded, gvisorReleases, checksum };
 });
 
 /**
- * Applies the installation `config` describes, once its bot is set, and waits until it
- * runs. Where sessions are snapshotted, it holds them to the CPU baseline it recorded
- * before, then to the one the node agents' pods then say (./cpu-baseline.ts), applied
- * again where that differs.
+ * Applies the installation `config` describes, once its bot is set, waits until it runs,
+ * and has Telegram deliver main's bot's updates to it. Where sessions are snapshotted, it
+ * holds them to the CPU baseline it recorded before, then to the one the node agents' pods
+ * then say (./cpu-baseline.ts), applied again where that differs.
  */
 export const install = Effect.fnUntraced(function*(
   config: OperatorConfig,
   options: WaitOptions,
-): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused, KubeApi> {
-  const { bot, settings, objects, live, recorded, gvisorReleases } = yield* checkInstallation(config);
+): Effect.fn.Return<
+  Installed,
+  ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | NoUserAllowed | PublicAddressNotSet | OperatorConfigError | PageserversLowered | ShardsLowered | StorageDatabaseUnread | StorageUnverified | ObjectRefused | WebhookNotServing | WebhookError,
+  KubeApi | TelegramBotApi
+> {
+  yield* ensureBotChecksumKey;
+  const { bot, settings, objects, live, recorded, gvisorReleases, checksum } = yield* checkInstallation(config);
+  const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
+  yield* registerBot(settings, "main", bot, route, options);
   const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };
   if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {
-    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases })), options);
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum })), options);
   }
   return { ...installed, cpuBaseline: decision };
 });

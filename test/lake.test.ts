@@ -2292,6 +2292,29 @@ describe("the lake's reader", () => {
     }
   });
 
+  test("the deliveries alert says whether main's alasio last found Telegram's deliveries failing, not a branch environment's", async () => {
+    const point = (branch: string | null, minutesAgo: number, value: number) => ({
+      resource: { attributes: [{ key: "service.name", value: { stringValue: "alasio" } }, ...(branch ? [{ key: "alasio.branch", value: { stringValue: branch } }] : [])] },
+      scopeMetrics: [{ metrics: [{ name: "alasio.telegram.deliveries.failing", gauge: { dataPoints: [{ timeUnixNano: String(BigInt(Date.now() - minutesAgo * 60_000) * 1_000_000n), asDouble: value }] } }] }],
+    });
+    const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
+    const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf("title: Telegram's deliveries are failing"))) ?? [];
+    const query = block.replaceAll(`\n${indent}  `, "\n").trim();
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeTelemetry(db, telemetryRows("metrics", { resourceMetrics: [point(null, 3, 1), point("try", 2, 0)] }));
+    });
+    const reader = await openReader(readerConfig);
+    try {
+      assert.deepEqual(await answer(reader.db, query), [{ failing: 1 }]);
+      // Delivering again, as main's next ask found; a branch's failing pages no one.
+      await withLake((db) => writeTelemetry(db, telemetryRows("metrics", { resourceMetrics: [point(null, 1, 0), point("try", 0, 1)] })));
+      assert.deepEqual(await answer(reader.db, query), [{ failing: 0 }]);
+    } finally {
+      reader.close();
+    }
+  });
+
   test("the query endpoint answers 503 while it cannot open the lake", async () => {
     const endpoint = startEndpoint({ open: () => Promise.reject(new Error("the compute is restarting")), token: QUERY_TOKEN, log: () => {} });
     const server = createServer(endpoint.handle);

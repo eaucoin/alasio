@@ -98,7 +98,14 @@ const UNINSTALL = `${BIN}/k3s-uninstall.sh`;
 /** The networks of the cluster's pods and Services, as k3s is set with them: k3s's own. */
 const CLUSTER_CIDR = "10.42.0.0/16";
 const SERVICE_CIDR = "10.43.0.0/16";
-/** What a firewall must let in to the machine from the cluster: its pods and its Services, as k3s's requirements say. */
+/**
+ * What a firewall must let in to the machine from the cluster: its pods and its Services,
+ * as k3s's requirements say; and nothing more. The webhook intake's port is no rule of a
+ * firewall's: what reaches a pod's host port kube-router's NetworkPolicy chain accepts in
+ * FORWARD ahead of ufw's or firewalld's rules, which never see it, so the intake's
+ * NetworkPolicy, admitting webhook.sources alone, is what guards it
+ * (cli/src/manifests/network-policies.ts).
+ */
 export const CLUSTER_NETWORKS: readonly string[] = [CLUSTER_CIDR, SERVICE_CIDR];
 /** The directories JuiceFS's CSI driver keeps on the node, its mounts in them, which nothing of k3s's removes. */
 const JUICEFS = ["/var/lib/juicefs", "/run/juicefs-csi"] as const;

@@ -497,3 +497,88 @@ groups:
               type: threshold
               expression: waiting
               conditions: [{evaluator: {type: gt, params: [8000]}}]
+
+      - uid: alasio-webhook-certificate-expiring
+        title: The webhook's certificate nears its end
+        condition: expiring
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "The certificate Telegram trusts for the webhook intake ends in {{ $values.days }} days, after which no bot's updates reach alasio: run alasio up, which renews it and registers each bot with the new one."
+        data:
+          - refId: days
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: days
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select round((arg_max(Value, TimeUnix) - epoch(now())) / 86400, 1) as days
+                  from otel.metrics_gauge
+                  where ServiceName = 'webhook' and MetricName = 'webhook_certificate_expiry_timestamp_seconds' and TimeUnix > now()::timestamp - interval 10 minute
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: days, text: days, type: number}
+          - refId: expiring
+            datasourceUid: __expr__
+            model:
+              refId: expiring
+              type: threshold
+              expression: days
+              conditions: [{evaluator: {type: lt, params: [21]}}]
+
+      # Whether Telegram's deliveries to the webhook intake fail, as alasio asks Telegram
+      # every five minutes (src/telegram/delivery-watch.ts): updates wait, and its last
+      # delivery failed lately. Telegram says so in getWebhookInfo alone, and no update
+      # reaches alasio meanwhile. Five minutes of it are two asks that found it so.
+      - uid: alasio-deliveries-failing
+        title: Telegram's deliveries are failing
+        condition: failing
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "Telegram has not delivered the bot's updates to the webhook intake for five minutes: they wait at Telegram. alasio's log says Telegram's error, as alasio status does, with its fix; where Telegram cannot connect, its networks may have changed from those install.webhook.sources lists (core.telegram.org/bots/webhooks)."
+        data:
+          - refId: deliveries
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: deliveries
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select arg_max(Value, TimeUnix) as failing
+                  from otel.metrics_gauge
+                  where MetricName = 'alasio.telegram.deliveries.failing' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                    and TimeUnix > now()::timestamp - interval 10 minute
+                  having count(*) > 0
+              root_selector: ""
+              columns:
+                - {selector: failing, text: failing, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: deliveries
+              conditions: [{evaluator: {type: gt, params: [0]}}]

@@ -12,7 +12,7 @@ import type { Sql, StoreError } from "./sql.ts";
 const ddl = (SCHEMA: string): string => `
 create schema if not exists ${SCHEMA};
 
--- What alasio keeps by name: Telegram's update offset, the operator it bootstrapped.
+-- What alasio keeps by name: the branch environment its state is of (./branch-start.ts).
 create table if not exists ${SCHEMA}.bot_state (
   key text primary key,
   value text not null,

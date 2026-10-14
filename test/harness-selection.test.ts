@@ -37,13 +37,16 @@ import {
 import { harnessSessionOf } from "../src/persistence/conversation-repository.ts";
 import type { Store } from "../src/persistence/store.ts";
 import type { SessionSandboxes } from "../src/sandbox/index.ts";
-import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
+import { takeCallbackQuery } from "../src/telegram/callback-handler.ts";
 import type { TextMessageOptions } from "../src/telegram/client.ts";
 import { handleMessage } from "../src/telegram/message-handler.ts";
 import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
 import { run, testStore, writerOf } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
+
+/** A press taken from the store, then handled, as alasio handles one, its handling run in turn. */
+const handleCallbackQuery = (query: Parameters<typeof takeCallbackQuery>[0]) => Effect.flatten(takeCallbackQuery(query));
 
 /** Where a test's workspace root and its folders are. */
 interface WorkspacePaths {

@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { request as httpsRequest } from "node:https";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
@@ -27,6 +29,7 @@ import { memoryBytes } from "../../cli/src/capacity.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { PAGESERVERS_NAME, pageserverName } from "../../cli/src/manifests/neon.ts";
+import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
@@ -678,6 +681,164 @@ if (inShard("sessions")) {
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+  });
+
+  describe("Telegram's deliveries, through the webhook intake", () => {
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      tg = operator(telegram.base);
+    });
+
+    after(() => {
+      telegram?.close();
+    });
+
+    /** main's route, as the command line wrote it, and the address and certificate Telegram is told. */
+    const delivery = async () => {
+      const route = JSON.parse(await kube.secret(NAMESPACE, componentName("webhook-routes"), "main")) as { path: string; secretToken: string };
+      const install = (JSON.parse(readFileSync(paths().configFile, "utf8")) as { install: { webhook: { publicAddress: string } } }).install;
+      return { route, address: install.webhook.publicAddress, ca: await kube.secret(NAMESPACE, componentName("webhook-tls"), "tls.crt") };
+    };
+
+    /** POSTs `body` to the intake at `path`, as Telegram does, with `headers`: its answer's status, 0 where it answered nothing. */
+    const post = async (path: string, headers: Record<string, string>, body: string | null, declared?: number): Promise<number> => {
+      const { address, ca } = await delivery();
+      return await new Promise((resolve) => {
+        const sent = httpsRequest({ host: address, port: 443, path, method: "POST", ca, timeout: 15_000, headers: { "content-type": "application/json", ...(declared === undefined ? {} : { "content-length": String(declared) }), ...headers } }, (answer) => {
+          answer.resume();
+          resolve(answer.statusCode ?? 0);
+          // A request whose body never comes is never ended: its socket is closed once answered, or it holds the run open.
+          if (body === null) sent.destroy();
+        });
+        sent.on("timeout", () => sent.destroy());
+        sent.on("error", () => resolve(0));
+        if (body === null) sent.flushHeaders();
+        else sent.end(body);
+      });
+    };
+
+    const update = (id: number, from: number, text: string) =>
+      JSON.stringify({ update_id: id, message: { message_id: id, date: Math.floor(Date.now() / 1000), from: { id: from, is_bot: false, first_name: "Someone" }, chat: { id: from, type: "private" }, text } });
+
+    test("the bot is registered with Telegram at main's route, on the intake's address, with its certificate and a secret of its own", async () => {
+      const { route, address, ca } = await delivery();
+      const listed = (await (await fetch(`${telegram?.base}/control/calls`)).json()) as CallsListing;
+      const setWebhook = listed.calls.filter(({ method }) => method === "setWebhook").at(-1);
+      assert.ok(setWebhook, "alasio up registered the bot");
+      const payload = setWebhook.payload as Record<string, unknown>;
+      assert.equal(payload["url"], `https://${address}${route.path}`);
+      assert.equal(payload["secret_token"], route.secretToken);
+      assert.equal(payload["certificate"], ca);
+      assert.equal(payload["allowed_updates"], JSON.stringify(["message", "callback_query"]));
+      assert.ok(!listed.calls.some(({ method }) => method === "getUpdates" || method === "deleteWebhook"), "alasio neither polls nor unregisters");
+    });
+
+    test("a request without the route's secret, or with another, is refused before its body is read, and one to no route finds nothing", async () => {
+      const { route } = await delivery();
+      assert.equal(await post(route.path, {}, update(9_000_001, 1001, "hi")), 401);
+      assert.equal(await post(route.path, { "x-telegram-bot-api-secret-token": `${route.secretToken.slice(0, -1)}x` }, update(9_000_002, 1001, "hi")), 401);
+      // Answered at once, though the megabyte it says follows never comes.
+      const began = Date.now();
+      assert.equal(await post(route.path, { "x-telegram-bot-api-secret-token": "forged" }, null, 1_000_000), 401);
+      assert.ok(Date.now() - began < 10_000, "the forged request was answered without its body");
+      assert.equal(await post("/telegram/main/nothing-here", { "x-telegram-bot-api-secret-token": route.secretToken }, update(9_000_003, 1001, "hi")), 404);
+    });
+
+    test("the intake's health, its routes and its metrics are the cluster's alone, not on its public address", async () => {
+      const { address } = await delivery();
+      const connected = await new Promise<boolean>((resolve) => {
+        const socket = connect({ host: address, port: WEBHOOK_HEALTH_PORT, timeout: 5_000 }, () => {
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on("timeout", () => {
+          socket.destroy();
+          resolve(false);
+        });
+        socket.on("error", () => resolve(false));
+      });
+      assert.equal(connected, false, `port ${WEBHOOK_HEALTH_PORT} of ${address} took a connection`);
+    });
+
+    /**
+     * Behind ufw, on the host target's machine, which never sees what is forwarded to the
+     * intake: its port, open to Telegram's ranges alone by its NetworkPolicy
+     * (cli/src/manifests/network-policies.ts), reached from a network namespace of this machine
+     * that has an address in one of them and an address in none, each its source in turn; and
+     * 443 of another address of the machine, on a dummy interface, answered by what listens
+     * there, as the intake's port is its public address's alone.
+     */
+    test("behind ufw, the intake's port takes Telegram's ranges alone, by its policy, and another address's 443 is left to what listens there", async (t) => {
+      if (TARGET !== "host" || !/^Status: active$/mu.test(await onNode("", "ufw status"))) {
+        t.skip("ufw guards no host target here");
+        return;
+      }
+      const { address } = await delivery();
+      const reach = (source: string) =>
+        onNode("", `ip netns exec alasio-e2e-telegram curl --interface ${source} --silent --insecure --max-time 10 --output /dev/null --write-out '%{http_code}' https://${address}:443/ || true`);
+      // One command a line, as `set -e` passes over a failure ahead of `&&`; an interface's
+      // name is of 15 characters at most.
+      await onNode("", [
+        "set -e",
+        "ip netns add alasio-e2e-telegram",
+        "ip link add alasio-e2e-tg type veth peer name alasio-e2e-tgn",
+        "ip link set alasio-e2e-tgn netns alasio-e2e-telegram",
+        // The machine's end of the link, the namespace's gateway, in both networks.
+        "ip addr add 149.154.167.1/24 dev alasio-e2e-tg",
+        "ip addr add 198.51.100.1/24 dev alasio-e2e-tg",
+        "ip link set alasio-e2e-tg up",
+        "ip netns exec alasio-e2e-telegram sh -ec 'ip link set lo up; ip addr add 149.154.167.50/24 dev alasio-e2e-tgn; ip addr add 198.51.100.50/24 dev alasio-e2e-tgn; ip link set alasio-e2e-tgn up; ip route add default via 149.154.167.1'",
+        "ip link add alasio-e2e-oth type dummy",
+        "ip addr add 10.253.0.1/32 dev alasio-e2e-oth",
+        "ip link set alasio-e2e-oth up",
+        "mkdir -p /tmp/alasio-e2e-other",
+        "echo another > /tmp/alasio-e2e-other/index.html",
+        // A unit of its own, as a process of the command's own ends with it.
+        "systemd-run --quiet --unit=alasio-e2e-other python3 -m http.server 443 --bind 10.253.0.1 --directory /tmp/alasio-e2e-other",
+      ].join("\n"));
+      // How the machine forwards to the intake, for a failure's message.
+      const forwarding = () => onNode("", "ufw status verbose; iptables -t nat -S | grep -E '443|HOSTPORT'; iptables -S FORWARD | head -20; ip netns exec alasio-e2e-telegram ip route");
+      try {
+        // The intake answers a request to no route of its own: it was reached.
+        const telegramSource = await reach("149.154.167.50");
+        if (telegramSource !== "404") assert.fail(`a source in Telegram's ranges is answered ${telegramSource}, not the intake's 404\n${await forwarding()}`);
+        const otherSource = await reach("198.51.100.50");
+        if (otherSource !== "000") assert.fail(`a source in none of Telegram's ranges is answered ${otherSource}, not refused\n${await forwarding()}`);
+        let other = "";
+        for (const deadline = Date.now() + 30_000; other !== "another" && Date.now() < deadline; await sleep(1000)) {
+          other = (await onNode("", "curl --silent --max-time 5 http://10.253.0.1:443/ || true")).trim();
+        }
+        assert.equal(other, "another", `another address's 443 is answered by what listens there\n${await onNode("", "systemctl status alasio-e2e-other --no-pager --lines 20 || true")}`);
+      } finally {
+        await onNode("", [
+          "systemctl stop alasio-e2e-other 2>/dev/null || true",
+          "rm -rf /tmp/alasio-e2e-other",
+          "ip link del alasio-e2e-oth 2>/dev/null || true",
+          "ip link del alasio-e2e-tg 2>/dev/null || true",
+          "ip netns del alasio-e2e-telegram 2>/dev/null || true",
+        ].join("\n"));
+      }
+    });
+
+    test("an update from a user the bot does not allow is answered, and reaches nothing", async () => {
+      const { route } = await delivery();
+      const mark = (await (await fetch(`${telegram?.base}/control/calls`)).json() as CallsListing).total;
+      assert.equal(await post(route.path, { "x-telegram-bot-api-secret-token": route.secretToken }, update(9_000_004, 5_555, "/service")), 200);
+      await sleep(20_000);
+      const since = (await (await fetch(`${telegram?.base}/control/calls?since=${mark}`)).json()) as CallsListing;
+      assert.deepEqual(since.calls.filter(({ payload }) => String(payload.chat_id) === "5555").map(({ method }) => method), []);
+    });
+
+    test("an update Telegram delivers twice is handled once", async () => {
+      const { route } = await delivery();
+      const mark = (await (await fetch(`${telegram?.base}/control/calls`)).json() as CallsListing).total;
+      const twice = update(9_000_005, 1001, "/service codex");
+      for (let delivered = 0; delivered < 2; delivered += 1) assert.equal(await post(route.path, { "x-telegram-bot-api-secret-token": route.secretToken }, twice), 200);
+      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+      await sleep(15_000);
+      const since = (await (await fetch(`${telegram?.base}/control/calls?since=${mark}`)).json()) as CallsListing;
+      assert.equal(since.calls.filter(({ payload }) => /^Active: Codex$/mu.test(payload.text ?? "")).length, 1);
     });
   });
 }
@@ -2333,7 +2494,8 @@ if (inShard("branches")) {
       const { branches } = JSON.parse(await neonControl("/branches")) as { branches: { name: string; timelineId: string }[] };
       const timeline = branches.find(({ name }) => name === BRANCH)?.timelineId;
       assert.ok(timeline);
-      await alasioOk("branch", "delete", BRANCH);
+      // Its bot told to deliver nowhere, as the branch's stand-in is told.
+      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "delete", BRANCH);
       assert.equal(await alasioOk("branch", "list"), "alasio has no branch environments.\n");
       for (const namespace of [BRANCH_NAMESPACE, BRANCH_SESSIONS]) assert.equal(await kube.get(ref("Namespace", namespace)), null);
       const volumes = await kube.list<V1PersistentVolume>("PersistentVolume");

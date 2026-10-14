@@ -1,7 +1,7 @@
 /**
  * `alasio init`: asks for what alasio needs (its bot's token and who may use it, Claude
  * Code's token, whether agents work in this machine's folders, where telemetry goes
- * beside the lake),
+ * beside the lake, the address Telegram delivers the bot's updates to),
  * writes the config, makes the cluster on this machine when that is where alasio runs,
  * writes the Secrets there, and offers to start alasio.
  *
@@ -10,12 +10,14 @@
  * Secrets are never flags, as a command's arguments are visible to every user of the
  * machine: they are read from a file, or from the environment.
  */
-import { createServer } from "node:net";
+import { createSocket } from "node:dgram";
+import { createServer, isIPv4 } from "node:net";
 import { homedir } from "node:os";
 
 import { Config, Console, Effect, FileSystem, Option, Predicate, Redacted, Result, Schema } from "effect";
 import { Command, Flag, Prompt } from "effect/cli";
 
+import { subnetAddress } from "../cluster/docker.ts";
 import { requireLocalMachine } from "../cluster/machine.ts";
 import { configPath, decodeOperatorConfig, defaultStoragePath, type OperatorConfigFile, readConfig, writeConfig } from "../config.ts";
 import { applyNamespace } from "../install.ts";
@@ -178,6 +180,11 @@ const flags = {
     Flag.optional,
     Flag.withMetavar("paths"),
     Flag.withDescription("The other folders they see, comma-separated absolute paths"),
+  ),
+  publicAddress: Flag.String("public-address").pipe(
+    Flag.optional,
+    Flag.withMetavar("address"),
+    Flag.withDescription("The address Telegram delivers the bot's updates to: this machine's public IPv4 for a cluster here, which alasio finds unless given"),
   ),
   telemetryEndpoint: Flag.String("telemetry-endpoint").pipe(
     Flag.optional,
@@ -355,6 +362,57 @@ const chooseFolderAccess = Effect.fnUntraced(function*(given: Flags, ask: boolea
   return { uid: Number(user[1]), gid: Number(user[2]), home, folders } satisfies FolderAccess;
 });
 
+/**
+ * This machine's address on its default route, as the kernel picks it for a connection to
+ * the internet: a socket connected, which sends nothing; null where there is no route.
+ */
+const routeAddress = Effect.callback<string | null>((resume) => {
+  const socket = createSocket("udp4");
+  socket.on("error", () => {
+    socket.close();
+    resume(Effect.succeed(null));
+  });
+  socket.connect(53, "1.1.1.1", () => {
+    const { address } = socket.address();
+    socket.close();
+    resume(Effect.succeed(address));
+  });
+});
+
+/**
+ * The address Telegram delivers to: as given, else as the config says, else as the
+ * operator answers; offered, and taken where nothing is asked, this machine's on its
+ * default route for k3s on it, and the server node's for the cluster in Docker, where its
+ * subnet is set, whose port is its node's alone (for development: Telegram reaches it only
+ * where this machine forwards it).
+ */
+const choosePublicAddress = Effect.fnUntraced(function*(given: Flags, ask: boolean, current: string, target: OperatorConfigFile["target"]) {
+  const subnet = "docker" in target ? target.docker.subnet : undefined;
+  const offered = "host" in target ? (yield* routeAddress) ?? "" : subnet ? subnetAddress(subnet, 2) ?? "" : "";
+  const found = current || offered;
+  const here = !("kubeconfig" in target);
+  const check = (value: string) =>
+    (here ? (isIPv4(value) ? null : "must be an IPv4 address") : /^[a-z0-9.-]+$/u.test(value) ? null : "must be the LoadBalancer's address, or a name of it");
+  const address = yield* answer(
+    given.publicAddress,
+    ask,
+    () =>
+      Prompt.String({
+        message: "host" in target
+          ? "This machine's public IPv4 address, which Telegram delivers the bot's updates to, the intake bound to it alone"
+          : here
+          ? "The address of the cluster's server node, which the bot's updates are delivered to"
+          : "The address Telegram delivers the bot's updates to: the webhook intake's LoadBalancer's, or a name of it",
+        default: found,
+        validate: validating(check),
+      }),
+    () => (found ? Effect.succeed(found) : Effect.fail(new SettingMissing({ setting: "the address Telegram delivers to", give: "--public-address" }))),
+  );
+  const refused = check(address);
+  if (refused) return yield* new SettingInvalid({ setting: "--public-address", reason: refused });
+  return address;
+});
+
 /** Where telemetry goes beside the lake: an OTLP/HTTP endpoint, or empty for nowhere else. */
 const chooseTelemetryEndpoint = Effect.fnUntraced(function*(given: Flags, ask: boolean, current: string) {
   const check = (value: string) => (Result.isSuccess(Schema.decodeUnknownResult(OptionalUrl)(value)) ? null : "must be an http(s) URL, or empty");
@@ -388,14 +446,17 @@ export const init = Command.make("init", flags, (given) =>
     const access = yield* chooseFolderAccess(given, ask, host);
     const telemetry = record(install, "telemetry");
     const endpoint = yield* chooseTelemetryEndpoint(given, ask, Predicate.isString(telemetry["otlpEndpoint"]) ? telemetry["otlpEndpoint"] : "");
+    const webhook = record(install, "webhook");
+    const publicAddress = yield* choosePublicAddress(given, ask, Predicate.isString(webhook["publicAddress"]) ? webhook["publicAddress"] : "", target);
 
     const telemetrySettings = endpoint ? { ...telemetry, otlpEndpoint: endpoint } : without(telemetry, "otlpEndpoint");
     const config = yield* writeConfig(path, {
       target,
       install: {
-        ...without(without(install, "host"), "telemetry"),
+        ...without(without(without(install, "host"), "telemetry"), "webhook"),
         ...(access || Object.keys(host).length > 0 ? { host: hostSettings(host, access) } : {}),
         ...(Object.keys(telemetrySettings).length > 0 ? { telemetry: telemetrySettings } : {}),
+        webhook: { ...webhook, publicAddress },
       },
     });
     yield* Console.log(`wrote ${path}`);
@@ -420,7 +481,8 @@ export const init = Command.make("init", flags, (given) =>
     Command.withShortDescription("Set alasio up: its bot, its tokens, and where it runs"),
     Command.withDescription(
       "Asks for the bot's token (checked with Telegram) and who may use it, Claude Code's token, whether agents may work in this " +
-        "machine's folders and as whom, and where telemetry goes beside the lake; writes the config, which holds no secret; makes the cluster on " +
+        "machine's folders and as whom, where telemetry goes beside the lake, and the address Telegram delivers the bot's updates " +
+        "to, this machine's public IPv4 for a cluster here, which it finds; writes the config, which holds no secret; makes the cluster on " +
         "this machine, k3s on the machine itself unless --target docker makes it in Docker, or --kubeconfig names another " +
         "cluster, once this machine is one it runs on, Linux on x86-64, doing what it must as root through sudo, as alasio up " +
         "does; writes the tokens there, as Secrets; and offers to start alasio. Run it " +

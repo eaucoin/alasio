@@ -36,11 +36,20 @@ export type ClientRole = (typeof CLIENT_ROLES)[number];
 export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | "workspaces" | "snapshots";
 
 /**
+ * Main's environment's principals on the log, as cli/src/manifests/log.ts's
+ * environmentAccess("main") names them: its alasio's, which reads its Telegram updates. A
+ * branch environment's are its own, which alasio's command line makes with it.
+ */
+export const MAIN_ENVIRONMENT_PRINCIPALS = ["alasio-main"] as const;
+export type MainEnvironmentPrincipal = (typeof MAIN_ENVIRONMENT_PRINCIPALS)[number];
+
+/**
  * The log's principals besides its admin, each with a password of its own: the collector's
  * gateway, which writes the stack's telemetry to it; the lake's intake, which reads that;
- * and KEDA, which reads how much the intake has yet to.
+ * KEDA, which reads how much the intake has yet to; the webhook intake, which writes each
+ * environment's Telegram updates to it; and main's environment's (MAIN_ENVIRONMENT_PRINCIPALS).
  */
-export const LOG_PRINCIPALS = ["gateway", "intake", "scaler"] as const;
+export const LOG_PRINCIPALS = ["gateway", "intake", "scaler", "webhook", ...MAIN_ENVIRONMENT_PRINCIPALS] as const;
 export type LogPrincipal = (typeof LOG_PRINCIPALS)[number];
 
 export interface S3Credentials {

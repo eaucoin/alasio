@@ -5,7 +5,10 @@
  * stand-in's reading of what is sent it as a form, as Grafana sends its alerts.
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { runsShard, shardOf, SHARDS, targetOf } from "./e2e/harness.ts";
@@ -77,5 +80,62 @@ test("the Telegram stand-in records a form's fields as text, and its files by th
     ]);
   } finally {
     stub.server.close();
+  }
+});
+
+test("the Telegram stand-in hands a release before the webhook's its updates by getUpdates, and refuses that once a webhook is registered, as Telegram does", async () => {
+  const stub = createTelegramStub();
+  await new Promise<void>((resolve) => stub.server.listen(0, "127.0.0.1", resolve));
+  try {
+    // A server listening on a TCP port has an address of its own.
+    const base = `http://127.0.0.1:${(stub.server.address() as AddressInfo).port}`;
+    const call = async (method: string, body: object) => {
+      const answer = await fetch(`${base}/bot123:token/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      return { status: answer.status, body: (await answer.json()) as { result?: { update_id: number; message?: { text?: string } }[]; description?: string } };
+    };
+    await fetch(`${base}/control/message`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "polled" }) });
+    const polled = await call("getUpdates", { offset: 0, timeout: 1 });
+    assert.deepEqual(polled.body.result?.map(({ message }) => message?.text), ["polled"]);
+    // Confirmed by the next offset, and gone.
+    assert.deepEqual((await call("getUpdates", { offset: (polled.body.result?.[0]?.update_id ?? 0) + 1, timeout: 0 })).body.result, []);
+    // Unrecorded, as alasio's calls are what the tests read.
+    assert.deepEqual(stub.calls().calls.map(({ method }) => method), []);
+    assert.equal((await call("setWebhook", { url: "https://127.0.0.1:9/telegram/main/route", secret_token: "s" })).status, 200);
+    const refused = await call("getUpdates", { offset: 0, timeout: 0 });
+    assert.deepEqual([refused.status, refused.body.description], [409, "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first"]);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test("the Telegram stand-in, started again on what it kept, has the webhook, the updates and the calls it had, as Telegram forgets nothing of a bot's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "telegram-stub-"));
+  const state = join(dir, "held.json");
+  const started = async () => {
+    const stub = createTelegramStub({ state });
+    await new Promise<void>((resolve) => stub.server.listen(0, "127.0.0.1", resolve));
+    // A server listening on a TCP port has an address of its own.
+    const base = `http://127.0.0.1:${(stub.server.address() as AddressInfo).port}`;
+    const call = async (method: string, body: object) => (await (await fetch(`${base}/bot123:token/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json()) as { result: { url?: string; pending_update_count?: number } };
+    const queued = async (text: string) => ((await (await fetch(`${base}/control/message`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text }) })).json()) as { message: { message_id: number } }).message;
+    return { stub, call, queued };
+  };
+  try {
+    const first = await started();
+    // A webhook no one answers at, so what is queued waits.
+    await first.call("setWebhook", { url: "https://127.0.0.1:9/telegram/main/route", secret_token: "s" });
+    const before = await first.queued("before");
+    first.stub.server.close();
+    const again = await started();
+    try {
+      const info = await again.call("getWebhookInfo", {});
+      assert.deepEqual([info.result.url, info.result.pending_update_count], ["https://127.0.0.1:9/telegram/main/route", 1]);
+      assert.deepEqual(again.stub.calls().calls.map(({ method }) => method), ["setWebhook", "getWebhookInfo"]);
+      assert.ok((await again.queued("after")).message_id > before.message_id);
+    } finally {
+      again.stub.server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

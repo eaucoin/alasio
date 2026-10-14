@@ -114,7 +114,8 @@ const backups = Effect.fnUntraced(function*(config: InstallConfig, options: Wait
  * The workloads that write to the store, through it: alasio and the data stack, main's and
  * each branch environment's, but the log, whose segments are on its own volumes, so it
  * keeps what it holds and what reaches it meanwhile for its consumers to read once they run
- * again; and its filers and gateways, which write to the filer store.
+ * again, and the webhook intake, which writes Telegram's updates to the log alone; and its
+ * filers and gateways, which write to the filer store.
  */
 const writers = Effect.map(listed<Workload>(WORKLOADS), (workloads) => {
   const component = (workload: Workload) => workload.metadata?.labels?.["app.kubernetes.io/component"] ?? "";
@@ -266,7 +267,7 @@ const restore = Effect.fnUntraced(function*(settings: InstallConfig, stamp: stri
 const ROLLS_BACK = "The store's namespace, every bucket, object, version and tag, goes back to when the backup was taken: what was written since is lost, " +
   "and what was deleted since is listed again with its data gone. Neon's own files in the store go back with it while its pageserver's and safekeepers' volumes do not: " +
   "what the database wrote since is likely lost, and Neon may not start on them at all, when the database's dumps in the backups bucket, of before the backup, are what restores it. " +
-  "Workspace storage's files written since lose their data. The log, on its own volumes, keeps what it holds.";
+  "Workspace storage's files written since lose their data. The log, on its own volumes, keeps what it holds, and the webhook intake goes on taking Telegram's updates into it.";
 
 export const restoreFilerStore = Command.make(
   "restore-filer-store",
@@ -316,7 +317,7 @@ export const restoreFilerStore = Command.make(
       "The filer store keeps the store's namespace: a store whose filer store is lost has its data on its volumes with nothing to find it by, which " +
       "the gateways refuse to start on. " +
       `${ROLLS_BACK} ` +
-      "It stops alasio, Neon and the lake (main's and branch environments'), but not the log, then the object store's gateways and filers, and the installation's CronJobs, " +
+      "It stops alasio, Neon and the lake (main's and branch environments'), but not the log nor the webhook intake, then the object store's gateways and filers, and the installation's CronJobs, " +
       "waiting for their running Jobs to end; sessions keep running, their workspace storage failing to write until the store is back. " +
       "It loads the backup onto the filer store's volume, checks the filer store holds as many keys as the backup, and starts everything again as it was: " +
       "its replicas, and its ScaledObjects and CronJobs paused or suspended only where they were before. " +

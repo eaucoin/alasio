@@ -3,13 +3,33 @@
  * talks to Telegram, and a test drives it as the operator would, by sending messages and
  * pressing buttons, and reads what alasio sent.
  *
- *   POST|GET /bot<token>/<method>    the Bot API: getUpdates long-polls what the test
- *                                    queued; every other method succeeds and is recorded,
- *                                    unless the test made it fail
+ *   POST|GET /bot<token>/<method>    the Bot API: every method succeeds and is recorded,
+ *                                    unless the test made it fail; setWebhook registers
+ *                                    where the stand-in delivers, with the secret token and
+ *                                    the certificate it was given, deleteWebhook forgets
+ *                                    it, and getWebhookInfo says it, as Telegram does; and
+ *                                    getUpdates long-polls what the test queued, unrecorded,
+ *                                    while no webhook is registered, as a release before
+ *                                    the webhook's takes its updates, and is refused while
+ *                                    one is
  *   GET  /file/bot<token>/<path>     a file the test gave, as getFile names it
  *   POST /control/message            { text, chatId?, userId? } queues a message
  *   POST /control/callback           { data, chatId?, userId?, messageId? } queues a press
  *   GET  /control/calls?since=<n>    what alasio has called since the nth call
+ *   GET  /control/updates?after=<id> the queued updates after update <id>, waiting a while
+ *                                    for one: alasio's tests' alasio takes them so, as it
+ *                                    takes its topic's (test/support/stub-updates.ts)
+ *   POST /control/commit             { updateId }: those updates are handled
+ *   GET  /control/committed          { updateId }: up to where they are
+ *
+ * Once a webhook is registered, it delivers every update queued, in order, as Telegram
+ * does: each POSTed to the webhook's URL with its secret token, over HTTPS trusting the
+ * uploaded certificate alone, sent again after a failure or an answer other than 200.
+ *
+ * What it holds, the updates queued and handled, the webhook registered and what alasio
+ * called, it keeps in the file STATE names where it is given, read again as it starts, so
+ * a restart of its container forgets nothing, as Telegram forgets nothing of a bot's as it
+ * restarts its own.
  *
  * The end-to-end tests run it on its own in the cluster, `node telegram-stub.ts [port]
  * [tls-port]`, and so it is dependency-free, for any Node: with a TLS port, it serves the
@@ -18,9 +38,9 @@
  * telegram-tls.ts). alasio's own tests run one in their process through
  * createTelegramStub (test/support/telegram.ts).
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
-import { createServer as createTlsServer } from "node:https";
+import { createServer as createTlsServer, request as httpsRequest } from "node:https";
 import type { CallbackQuery, Chat, Message, Opts, PhotoSize, Update, User, WebhookInfo } from "@grammyjs/types";
 
 /** The parameters of a Bot API method; files go up as multipart, hence `never`. */
@@ -34,12 +54,17 @@ type BotParams<M extends keyof Opts<never>> = Opts<never>[M];
 export interface BotApiPayload
   extends Partial<
     Pick<BotParams<"getUpdates">, "offset" | "timeout">
+      & Pick<BotParams<"setWebhook">, "url" | "secret_token" | "ip_address" | "max_connections">
       & Pick<BotParams<"sendMessage">, "chat_id" | "text" | "reply_markup">
       & Pick<BotParams<"editMessageText">, "message_id">
       & Pick<BotParams<"sendRichMessage">, "rich_message">
       & Pick<BotParams<"getFile">, "file_id">
   > {
   readonly multipartBytes?: number;
+  /** setWebhook's certificate, as the PEM uploaded. */
+  readonly certificate?: string;
+  /** setWebhook's allowed updates, as the JSON array sent. */
+  readonly allowed_updates?: string;
 }
 
 /** A Bot API call alasio made, as /control/calls lists it, with Telegram's answer: its HTTP status and result. */
@@ -133,8 +158,11 @@ export function multipartFields(body: Buffer, boundary: string): Record<string, 
     const headers = part.subarray(0, split).toString("utf8");
     const content = part.subarray(split + 4);
     const name = /name="([^"]*)"/u.exec(headers)?.[1];
-    if (/filename=/u.test(headers)) files += content.length;
-    else if (name !== undefined) fields[name] = content.toString("utf8");
+    if (/filename=/u.test(headers)) {
+      files += content.length;
+      // setWebhook's certificate, which the stand-in trusts as Telegram does.
+      if (name === "certificate") fields[name] = content.toString("utf8");
+    } else if (name !== undefined) fields[name] = content.toString("utf8");
     at = next;
   }
   return files > 0 ? { ...fields, multipartBytes: files } : fields;
@@ -154,19 +182,100 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   return { multipartBytes: body.length };
 }
 
-export function createTelegramStub(): TelegramStub {
-  const updates: (QueuedUpdate & Pick<Update, "update_id">)[] = [];
-  const recorded: RecordedCall[] = [];
+/** What a stand-in holds, as it keeps it in its STATE file. */
+interface Held {
+  readonly updates: (QueuedUpdate & Pick<Update, "update_id">)[];
+  readonly recorded: RecordedCall[];
+  readonly files: [string, string][];
+  readonly updateId: number;
+  readonly messageId: number;
+  readonly callbackId: number;
+  readonly committed: number;
+  readonly webhook: { readonly url: string; readonly secret: string; readonly ca: string } | null;
+  readonly lastError: { readonly at: number; readonly message: string } | null;
+}
+
+/** A Bot API stand-in, keeping what it holds in `state` where given (see above). */
+export function createTelegramStub({ state }: { readonly state?: string } = {}): TelegramStub {
+  const held: Held | null = state && existsSync(state) ? JSON.parse(readFileSync(state, "utf8")) : null;
+  const updates: (QueuedUpdate & Pick<Update, "update_id">)[] = held?.updates ?? [];
+  const recorded: RecordedCall[] = held?.recorded ?? [];
   const waiters = new Set<() => void>();
-  const files = new Map<string, Buffer>();
+  const files = new Map<string, Buffer>((held?.files ?? []).map(([id, content]) => [id, Buffer.from(content, "base64")]));
   const failures = new Map<string, StubFailure[]>();
-  let updateId = 0;
-  let messageId = 100;
-  let callbackId = 0;
+  let updateId = held?.updateId ?? 0;
+  let messageId = held?.messageId ?? 100;
+  let callbackId = held?.callbackId ?? 0;
+  /** Up to where the updates are handled, by alasio's group or the webhook's answers. */
+  let committed = held?.committed ?? 0;
+  /** Where updates are delivered, once a webhook is registered. */
+  let webhook: Held["webhook"] = held?.webhook ?? null;
+  let lastError: Held["lastError"] = held?.lastError ?? null;
+  let delivering = false;
+  /** Whether its server is closed, after which it delivers nothing and keeps nothing more. */
+  let closed = false;
+
+  /** Writes what it holds to `state`, whole, where it is given. */
+  function save() {
+    if (!state || closed) return;
+    const kept: Held = { updates, recorded, files: [...files].map(([id, content]) => [id, content.toString("base64")]), updateId, messageId, callbackId, committed, webhook, lastError };
+    writeFileSync(`${state}.part`, JSON.stringify(kept));
+    renameSync(`${state}.part`, state);
+  }
+
+  /** Forgets the updates up to `id`, handled. */
+  function commit(id: number) {
+    committed = Math.max(committed, id);
+    while (updates.length > 0 && updates[0]!.update_id <= committed) updates.shift(); // length > 0: there is a first
+  }
+
+  /** POSTs `update` to the webhook: its answer's status, or 0 where it was not reached. */
+  function post(target: NonNullable<typeof webhook>, update: object): Promise<number> {
+    return new Promise((resolve) => {
+      const body = JSON.stringify(update);
+      const sent = httpsRequest(target.url, {
+        method: "POST",
+        ca: target.ca,
+        timeout: 15_000,
+        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body), "x-telegram-bot-api-secret-token": target.secret },
+      }, (answer) => {
+        answer.resume();
+        answer.on("end", () => resolve(answer.statusCode ?? 0));
+      });
+      sent.on("timeout", () => sent.destroy(new Error("timed out")));
+      sent.on("error", (error) => {
+        lastError = { at: Math.floor(Date.now() / 1000), message: error.message };
+        resolve(0);
+      });
+      sent.end(body);
+    });
+  }
+
+  /** Delivers what is queued to the webhook, in order, each until it is answered 200. */
+  async function deliver() {
+    if (delivering) return;
+    delivering = true;
+    try {
+      for (let next = updates[0]; webhook && next && !closed; next = updates[0]) {
+        const status = await post(webhook, next);
+        if (status === 200) {
+          commit(next.update_id);
+          save();
+          continue;
+        }
+        if (status !== 0) lastError = { at: Math.floor(Date.now() / 1000), message: `Wrong response from the webhook: ${status}` };
+        save();
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    } finally {
+      delivering = false;
+    }
+  }
 
   function queue(update: QueuedUpdate) {
     updates.push({ update_id: ++updateId, ...update });
     for (const wake of waiters) wake();
+    void deliver();
   }
 
   function message({ text, chatId = CHAT, userId = USER, photo, mediaGroupId }: ControlMessage): OperatorMessage {
@@ -206,9 +315,8 @@ export function createTelegramStub(): TelegramStub {
       case "getMe":
         return { id: 42, is_bot: true, first_name: "alasio", username: "alasio_test_bot" };
       case "getUpdates": {
-        const offset = Number(payload.offset ?? 0);
         // Updates before the offset are confirmed, and forgotten.
-        while (updates.length > 0 && updates[0]!.update_id < offset) updates.shift(); // length > 0: there is a first
+        commit(Number(payload.offset ?? 0) - 1);
         if (updates.length === 0) {
           const timeout = Math.min(Number(payload.timeout ?? 0), 25) * 1000;
           await new Promise<void>((resolve) => {
@@ -219,8 +327,21 @@ export function createTelegramStub(): TelegramStub {
         }
         return updates.slice();
       }
+      case "setWebhook":
+        webhook = { url: String(payload.url ?? ""), secret: String(payload.secret_token ?? ""), ca: String(payload.certificate ?? "") };
+        lastError = null;
+        void deliver();
+        return true;
+      case "deleteWebhook":
+        webhook = null;
+        return true;
       case "getWebhookInfo":
-        return { url: "", has_custom_certificate: false, pending_update_count: 0 } satisfies WebhookInfo;
+        return {
+          url: webhook?.url ?? "",
+          has_custom_certificate: Boolean(webhook?.ca),
+          pending_update_count: updates.length,
+          ...(lastError ? { last_error_date: lastError.at, last_error_message: lastError.message } : {}),
+        } satisfies WebhookInfo;
       case "sendMessage":
       case "sendRichMessage":
       case "sendDocument":
@@ -248,6 +369,10 @@ export function createTelegramStub(): TelegramStub {
       if (bot?.[1] !== undefined && (request.method === "POST" || request.method === "GET")) {
         const method = bot[1];
         const payload = (request.method === "GET" ? Object.fromEntries(url.searchParams) : await readJson(request)) as BotApiPayload; // alasio calls the Bot API
+        // As Telegram, which delivers to a webhook alone while one is registered.
+        if (method === "getUpdates" && webhook) {
+          return reply(409, { ok: false, error_code: 409, description: "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first" });
+        }
         const failure = failures.get(method)?.shift();
         if (failure) {
           recorded.push({ method, payload, at: Date.now(), status: failure.status });
@@ -276,17 +401,39 @@ export function createTelegramStub(): TelegramStub {
         const press = callback((await readJson(request)) as ControlCallback); // the test posts one
         return reply(200, { ok: true, callback_query: press });
       }
+      if (url.pathname === "/control/updates" && request.method === "GET") {
+        const after = Number(url.searchParams.get("after") ?? 0);
+        const waiting = () => updates.filter(({ update_id }) => update_id > after);
+        if (waiting().length === 0) {
+          await new Promise<void>((resolve) => {
+            const wake = () => { waiters.delete(wake); clearTimeout(timer); resolve(); };
+            const timer = setTimeout(wake, 25_000);
+            waiters.add(wake);
+          });
+        }
+        return reply(200, waiting());
+      }
+      if (url.pathname === "/control/commit" && request.method === "POST") {
+        commit(Number(((await readJson(request)) as { updateId?: number }).updateId ?? 0)); // the test's alasio posts it
+        return reply(200, { ok: true });
+      }
+      if (url.pathname === "/control/committed" && request.method === "GET") {
+        return reply(200, { updateId: committed });
+      }
       if (url.pathname === "/control/calls" && request.method === "GET") {
         return reply(200, calls(Number(url.searchParams.get("since") ?? 0)) satisfies CallsListing);
       }
       return reply(404, { ok: false, description: "Not Found" });
     } catch (error) {
       return reply(500, { ok: false, description: error instanceof Error ? error.message : undefined });
+    } finally {
+      save();
     }
   });
 
-  // A closed stand-in answers its long polls at once, rather than holding its process open.
+  // A closed stand-in answers its waits at once, rather than holding its process open.
   server.on("close", () => {
+    closed = true;
     for (const wake of waiters) wake();
   });
 
@@ -306,6 +453,9 @@ export function createTelegramStub(): TelegramStub {
     return { calls: recorded.slice(since), total: recorded.length };
   }
 
+  // What it held queued, delivered on to the webhook it held, as Telegram goes on once it is back.
+  void deliver();
+
   return {
     server,
     message(sentMessage) {
@@ -317,6 +467,7 @@ export function createTelegramStub(): TelegramStub {
     calls,
     file(fileId, content) {
       files.set(fileId, content);
+      save();
     },
     fail(method, failure) {
       failures.set(method, [...(failures.get(method) ?? []), failure]);
@@ -327,7 +478,7 @@ export function createTelegramStub(): TelegramStub {
 if (import.meta.main) {
   const port = Number(process.argv[2] ?? process.env["PORT"] ?? 8081);
   const tlsPort = process.argv[3];
-  const { server } = createTelegramStub();
+  const { server } = createTelegramStub({ ...(process.env["STATE"] ? { state: process.env["STATE"] } : {}) });
   server.listen(port, "0.0.0.0", () => console.log(`telegram stub on ${port}`));
   if (tlsPort) {
     const here = new URL(".", import.meta.url);

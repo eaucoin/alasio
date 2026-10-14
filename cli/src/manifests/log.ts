@@ -23,9 +23,9 @@
  */
 import type { KubernetesObject, V1ConfigMap, V1Container, V1EnvVar, V1Service, V1StatefulSet } from "@kubernetes/client-node";
 
-import { LOG_PRINCIPALS, type LogPrincipal } from "../../../neon/control/secrets.ts";
+import type { LogPrincipal, MainEnvironmentPrincipal } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { claimSpec, componentName, logRuns, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
+import { claimSpec, componentName, type Environment, NAMESPACE, replicasOf, restrictedContainer, script, selectorLabels, sha256, stackLabels, stackPodSpec } from "./common.ts";
 import { type InstallConfig, LOG_SEGMENT_BYTES, telemetryRetentionBytes } from "./config.ts";
 import { replicaBudget, spread } from "./disruption.ts";
 import { priority } from "./priorities.ts";
@@ -54,11 +54,54 @@ export const LOG_RECORD_BYTES = 8 * 1024 * 1024;
 /** The consumer group of the lake's intake. */
 export const INTAKE_GROUP = "lake-intake";
 
+/**
+ * How long an environment's Telegram updates are kept: a week, so an environment asleep
+ * for one still finds them, beyond the day Telegram itself keeps what it could not deliver.
+ */
+export const TELEGRAM_RETENTION_MS = 7 * 86_400_000;
+
+/** An environment's name, as its topic, group and principal are named: main's, or its branch's. */
+export const environmentName = ({ branch }: Environment): string => branch ?? "main";
+
+/** The topic of the Telegram updates of the environment `name`, which the webhook intake writes and its alasio reads. */
+export const telegramTopic = (name: string): string => `telegram.${name}`;
+/** The principal the environment `name`'s alasio reaches the log as. */
+export const alasioPrincipal = (name: string): string => `alasio-${name}`;
+/** The consumer group the environment `name`'s alasio reads its Telegram topic in. */
+export const alasioGroup = (name: string): string => `alasio.${name}`;
+
+/**
+ * What the log gives the environment `name`: a principal for each of its components that
+ * reaches the log, each with what it may do alone, and the topics they use, made and
+ * forgotten with the environment. Now its alasio's, `alasio-<name>`, reading its Telegram
+ * topic in its group, `alasio.<name>`; that topic, of one partition, as one alasio reads it,
+ * a chat's updates in order, keeping a segment beside the one it writes at most (a week of
+ * a bot's updates is kilobytes), each flushed to the volume as it is written.
+ */
+export function environmentAccess(name: string): EnvironmentLogAccess {
+  const topic = telegramTopic(name);
+  return {
+    principals: [{
+      name: alasioPrincipal(name),
+      acls: [{ resource: "topic", name: topic, pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: alasioGroup(name), pattern: "literal", operations: ["read"] }],
+    }],
+    // Each update flushed to the volume as it is written: Telegram, answered once the log has it, sends it no more.
+    topics: [{ name: topic, partitions: 1, retentionMs: TELEGRAM_RETENTION_MS, retentionBytes: LOG_SEGMENT_BYTES, configs: { "flush.messages": "1" } }],
+  };
+}
+
 /** The log's brokers, as a client anywhere in the cluster bootstraps from them. */
 export const LOG_BROKERS = `${LOG}.${NAMESPACE}.svc:${LOG_PORT}`;
 
 /** The Secret of the principal `principal`'s name and password, which the stack's setup writes. */
 export const logPrincipalSecret = (principal: LogPrincipal): string => componentName(`log-${principal}`);
+
+/**
+ * The Secret of the principal the alasio of `environment` reads its topic as, in its
+ * namespace: main's, which the stack's setup writes; a branch environment's, which alasio's
+ * command line writes as it makes the branch's principal.
+ */
+export const environmentLogSecret = ({ branch }: Environment): string => (branch === null ? logPrincipalSecret("alasio-main") : componentName("log-alasio"));
 
 /** A node's address, by its ordinal: its pod's name in the log's headless Service. */
 const nodeAddress = (ordinal: number | string): string => `${LOG}-${ordinal}.${LOG}.${NAMESPACE}.svc`;
@@ -80,10 +123,28 @@ export interface LogTopic {
   readonly configs: Readonly<Record<string, string>>;
 }
 
-/** What the access applier applies: the topics, and each principal's ACLs, its password read from the access Secret by its name. */
+/** A principal of the log, and what it may do. */
+export interface LogPrincipalAccess {
+  readonly name: string;
+  readonly acls: readonly LogAcl[];
+}
+
+/**
+ * What the log gives an environment (environmentAccess): its principals, each with, where
+ * alasio's command line makes it for a branch (src/log/access.ts), its password; and its topics.
+ */
+export interface EnvironmentLogAccess {
+  readonly principals: readonly (LogPrincipalAccess & { readonly password?: string })[];
+  readonly topics: readonly LogTopic[];
+}
+
+/**
+ * What the access applier applies: the topics, and each principal's ACLs, its password read
+ * from the access Secret by its name, one of LOG_PRINCIPALS.
+ */
 export interface LogAccess {
   readonly topics: readonly LogTopic[];
-  readonly principals: readonly { readonly name: LogPrincipal; readonly acls: readonly LogAcl[] }[];
+  readonly principals: readonly LogPrincipalAccess[];
 }
 
 /** The hours of a retention as log.retention says it. */
@@ -95,29 +156,35 @@ const retentionMs = (retention: string): number => Number(retention.slice(0, -1)
  * volume at most (telemetryRetentionBytes), each flushed to its volume within a second
  * (flush.ms); the gateway's writing them, the intake's reading them in its group, and
  * KEDA's reading how far the group is behind on them, which asks to describe both and to
- * read neither.
+ * read neither; main's Telegram topic; the webhook intake's writing every environment's, a
+ * branch's among them, and nothing else; and main's environment's principals and topics
+ * (environmentAccess).
  *
  * A write is acknowledged once a majority of the nodes have it in their page caches, not
  * on their volumes. On one node, the volume outlives the pod, so a restart of the pod loses
  * nothing acknowledged, but a crash of its host loses what the node had not flushed: up
  * to a second of acknowledged telemetry, as its log flusher looks each second for what is
  * older than flush.ms (log.flush.scheduler.interval.ms, serverProperties), and a flush a
- * second costs next to nothing at the rate the stack writes it. On three, each record is
- * on two hosts before it is acknowledged, so a host's crash loses none.
+ * second costs next to nothing at the rate the stack writes it; and nothing of Telegram's
+ * updates, each flushed as it is written (flush.messages), as Telegram has had its answer.
+ * On three, each record is on two hosts before it is acknowledged, so a host's crash loses
+ * none.
  */
 export function logAccess(config: InstallConfig): LogAccess {
   const partitions = Math.max(1, config.lake.intake.scaling.max);
   const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" } as const;
   const group = { resource: "group", name: INTAKE_GROUP, pattern: "literal" } as const;
-  const principals: Record<LogPrincipal, readonly LogAcl[]> = {
+  const main = environmentAccess("main");
+  const services: Record<Exclude<LogPrincipal, MainEnvironmentPrincipal>, readonly LogAcl[]> = {
     gateway: [{ ...telemetry, operations: ["write", "describe"] }],
     intake: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }],
     scaler: [{ ...telemetry, operations: ["describe"] }, { ...group, operations: ["describe"] }],
+    webhook: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }],
   };
   const retention = { retentionMs: retentionMs(config.log.retention), retentionBytes: telemetryRetentionBytes(config) };
   return {
-    topics: Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, ...retention, configs: { "flush.ms": "1000" } })),
-    principals: LOG_PRINCIPALS.map((name) => ({ name, acls: principals[name] })),
+    topics: [...Object.values(TELEMETRY_TOPICS).map((name) => ({ name, partitions, ...retention, configs: { "flush.ms": "1000" } })), ...main.topics],
+    principals: [...Object.entries(services).map(([name, acls]) => ({ name, acls })), ...main.principals],
   };
 }
 
@@ -222,9 +289,8 @@ const START = script(
   "esac",
 );
 
-/** The log's objects, when it runs. */
+/** The log's objects: it always runs, Telegram's updates coming through it. */
 export function logObjects(config: InstallConfig): KubernetesObject[] {
-  if (!logRuns(config)) return [];
   const { log } = config;
   const metadata = { name: LOG, namespace: NAMESPACE, labels: stackLabels(LOG_COMPONENT) };
   const access = logAccess(config);

@@ -15,6 +15,7 @@ import { Neon } from "./neon/connect.ts";
 import { serveAlasio } from "./alasio.ts";
 import { withLogScope } from "./shared/log.ts";
 import { runAlasio } from "./shared/run.ts";
+import { TelegramUpdates } from "./telegram/update-consumer.ts";
 
 const alasio = Effect.gen(function*() {
   const config = loadAlasioConfig();
@@ -33,6 +34,7 @@ const alasio = Effect.gen(function*() {
     : null;
   yield* serveAlasio({
     ...config,
+    updates: TelegramUpdates.layer(config.telegramLog),
     pool: neon.pool,
     sessionStore: neon.sessionStore,
     codexRollouts,

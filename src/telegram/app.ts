@@ -1,10 +1,13 @@
 /**
  * alasio serving Telegram: as it starts, what the last alasio left is settled (prompt jobs,
  * undelivered responses, albums, interrupted turns) and what turns resume is brought
- * back (Claude Code's transcripts, Codex's rollouts); then Telegram's updates are polled
- * and processed, undelivered responses are looked for every thirty seconds, what the
- * store keeps only in flight is pruned daily, and linked sessions are warmed. All of it
- * stops as its scope closes, polling first.
+ * back (Claude Code's transcripts, Codex's rollouts); then Telegram's updates are taken
+ * from the environment's topic in the log (./update-consumer.ts) and processed, each
+ * once, undelivered responses are looked for every thirty seconds, what the store keeps
+ * only in flight is pruned daily, linked sessions are warmed, and Telegram is asked how its
+ * deliveries fare every five minutes (./delivery-watch.ts). All of it stops as its scope
+ * closes, consuming first. Telegram is told where to deliver by alasio's command line,
+ * never by alasio.
  */
 import type { Update } from "@grammyjs/types";
 import { Effect, FiberSet, Layer, Option, Schedule, type Scope } from "effect";
@@ -26,11 +29,12 @@ import { withLogScope } from "../shared/log.ts";
 import { SpanKind, withAlasioSpan } from "../telemetry/index.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { Authorizer } from "./authorizer.ts";
-import { handleCallbackQuery } from "./callback-handler.ts";
+import { takeCallbackQuery } from "./callback-handler.ts";
 import { TelegramClient, type TelegramError } from "./client.ts";
+import { watchDeliveries } from "./delivery-watch.ts";
 import { MediaGroups } from "./media-group-buffer.ts";
 import { handleMessage, processIncomingPrompt } from "./message-handler.ts";
-import { pollUpdates } from "./update-poller.ts";
+import { consumeUpdates, type TelegramUpdates } from "./update-consumer.ts";
 
 /** How often completed responses that were never delivered are looked for. */
 const COMPLETED_RESPONSE_RECOVERY = "30 seconds";
@@ -67,7 +71,7 @@ export interface TelegramAppConfig
 }
 
 /** What the app runs on. */
-export type TelegramAppServices = Authorizer | MediaGroups | OperatorServices;
+export type TelegramAppServices = Authorizer | MediaGroups | TelegramUpdates | OperatorServices;
 
 /** How the app fails to start. */
 export type TelegramAppError = TelegramError | CommandError | TranscriptAdoptionError | RolloutRestoreError | StoreError;
@@ -165,29 +169,43 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   /**
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
-   * What it leads to runs on after it, so that polling goes on meanwhile.
+   * What it leads to runs on after it, so that consuming goes on meanwhile. One the store
+   * has as processed already, handed over again after a restart, is skipped; one kept but
+   * not processed is handled again. It fails where the store failed, keeping it, handling
+   * it or marking it processed, so that it is taken again; Telegram failing its handling
+   * is a defect, and the update is skipped (./update-consumer.ts).
    */
-  const processUpdate = (update: Update): Effect.Effect<void, TelegramError | StoreError> =>
+  const processUpdate = (update: Update): Effect.Effect<void, StoreError> =>
     Effect.suspend(() => {
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
       return Effect.gen(function*() {
-        yield* store.recordTelegramUpdate(update);
+        if (!(yield* store.recordTelegramUpdate(update))) {
+          return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
+        }
         const callbackQuery = update.callback_query;
         if (callbackQuery) {
-          yield* FiberSet.run(handling, handleCallbackQuery(callbackQuery).pipe(
+          // Taken from the store before the update is marked processed, as a message is: the
+          // store failing that fails the update, taken again. What the press then does runs on
+          // after it, as a prompt's turn does, so that a control that takes a while, a steer
+          // or a workspace's, holds back no later update; its failing is said.
+          const press = yield* takeCallbackQuery(callbackQuery).pipe(Effect.provideContext(services));
+          yield* FiberSet.run(handling, press.pipe(
             Effect.catch((error) => Effect.logError(`Failed to process callback ${callbackQuery.id}: ${error.message}`)),
             Effect.provideContext(services),
             Effect.interruptible,
           ));
         } else if (update.message) {
-          const prompt = yield* handleMessage(update.message, update.update_id).pipe(Effect.provideContext(services));
+          const prompt = yield* handleMessage(update.message, update.update_id).pipe(
+            Effect.provideContext(services),
+            Effect.catchTag(["TelegramApiError", "TelegramTransportError"], Effect.die),
+          );
           if (prompt) {
             yield* FiberSet.run(handling, processIncomingPrompt(prompt).pipe(Effect.provideContext(services), Effect.interruptible));
           }
         }
         yield* store.markTelegramUpdateProcessed(update.update_id);
       }).pipe(
-        Effect.tapError((error) => Effect.logError(`Failed to process update ${update.update_id}: ${error}`)),
+        Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,
           parent: null,
@@ -206,7 +224,6 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
-  yield* client.deleteWebhook(false);
   yield* client.setMyCommands(NATIVE_COMMANDS).pipe(
     Effect.andThen(client.setChatMenuButton({ type: "commands" })),
     Effect.catch((error) => Effect.logWarning(`Failed to configure Telegram native commands: ${error.message}`)),
@@ -222,7 +239,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* restoreCodexRollouts();
   yield* turns.recoverInterruptedTurns;
   yield* turns.resumePendingPrompts;
-  yield* pollUpdates(processUpdate).pipe(Effect.forkScoped);
+  yield* consumeUpdates(processUpdate).pipe(Effect.forkScoped);
   // Responses completed but never delivered (their delivery failed, or alasio stopped first) go out.
   yield* turns.flushCompletedResponses.pipe(
     Effect.catch((error) => Effect.logWarning(`Completed response recovery failed: ${error.message}`)),
@@ -237,4 +254,5 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
     Effect.forkScoped,
   );
   yield* Effect.forkScoped(warmLinkedSessions);
+  yield* watchDeliveries;
 }, withLogScope("telegram-app"));

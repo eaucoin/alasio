@@ -21,7 +21,6 @@ import {
   given,
   grafanaRuns,
   labels,
-  logRuns,
   MAIN_ENVIRONMENT,
   NAMESPACE,
   nodeAgentRuns,
@@ -33,6 +32,7 @@ import { replicated } from "./disruption.ts";
 import { GOSSIP_PORT } from "./grafana.ts";
 import { INTAKE_COMPONENT, LAKE_QUERY_PORT } from "./lake.ts";
 import { LOG, LOG_COMPONENT, LOG_CONTROLLER_PORT, LOG_METRICS_PORT, LOG_PORT } from "./log.ts";
+import { WEBHOOK, WEBHOOK_COMPONENT, WEBHOOK_HEALTH_PORT } from "./webhook.ts";
 import {
   BACKUP_COMPONENT,
   COMPONENTS,
@@ -311,8 +311,9 @@ function filerStorePolicies(): NetworkPolicy[] {
 }
 
 /**
- * The log takes its clients on their port from the collector's gateway, which writes to
- * it, and the lake's intake and KEDA's operator, which read it, alone; its controllers'
+ * The log takes its clients on their port from the collector's gateway and the webhook
+ * intake, which write to it, and the lake's intake, KEDA's operator, and each
+ * environment's alasio, main's and branch environments', which read it, alone; its controllers'
  * port, and its clients' as its brokers reach each other, from its own nodes; and its
  * metrics port from the collector's scraper. KEDA's operator is alasio's, or, where the
  * cluster's own KEDA scales alasio (autoscaling.keda.enabled false), the operator its
@@ -328,8 +329,47 @@ function logPolicy(config: InstallConfig): NetworkPolicy {
     policyTypes: ["Ingress"],
     ingress: [
       { from: [of(LOG_COMPONENT)], ports: [LOG_PORT, LOG_CONTROLLER_PORT].map((port) => ({ protocol: "TCP", port })) },
-      { from: [of(GATEWAY_COMPONENT), of(INTAKE_COMPONENT), operator], ports: [{ protocol: "TCP", port: LOG_PORT }] },
+      {
+        from: [
+          of(GATEWAY_COMPONENT),
+          of(WEBHOOK_COMPONENT),
+          of(INTAKE_COMPONENT),
+          operator,
+          of("alasio"),
+          { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
+        ],
+        ports: [{ protocol: "TCP", port: LOG_PORT }],
+      },
       { from: [of(SCRAPER_COMPONENT)], ports: [{ protocol: "TCP", port: LOG_METRICS_PORT }] },
+    ],
+  });
+}
+
+/**
+ * The webhook intake takes its port from webhook.sources alone, Telegram's ranges, where it
+ * is on this machine's public address, and from anywhere else: a LoadBalancer Service takes
+ * those alone, and the cluster in Docker is reached from this machine. On the machine, the
+ * policy is what guards the port: what is forwarded to a pod, the policy's controller
+ * accepts ahead of the machine's firewall, which never sees it (cli/src/cluster/node.ts);
+ * the machine itself is admitted to its own pods all the same. It takes its health's port
+ * from the collector's scraper; it reaches the cluster's DNS and the log's brokers alone,
+ * so nothing it is sent can make it reach anything else.
+ */
+function webhookPolicy(config: InstallConfig): NetworkPolicy {
+  const sources = config.webhook.exposure === "hostAddress" ? config.webhook.sources : ["0.0.0.0/0"];
+  return policy(WEBHOOK, NAMESPACE, WEBHOOK_COMPONENT, {
+    podSelector: { matchLabels: selectorLabels(WEBHOOK_COMPONENT) },
+    policyTypes: ["Ingress", "Egress"],
+    ingress: [
+      { from: sources.map((cidr) => ({ ipBlock: { cidr } })), ports: [{ protocol: "TCP", port: config.webhook.port }] },
+      { from: [{ podSelector: { matchLabels: selectorLabels(SCRAPER_COMPONENT) } }], ports: [{ protocol: "TCP", port: WEBHOOK_HEALTH_PORT }] },
+    ],
+    egress: [
+      {
+        to: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } }, podSelector: { matchLabels: { "k8s-app": "kube-dns" } } }],
+        ports: [{ protocol: "UDP", port: 53 }, { protocol: "TCP", port: 53 }],
+      },
+      { to: [{ podSelector: { matchLabels: selectorLabels(LOG_COMPONENT) } }], ports: [{ protocol: "TCP", port: LOG_PORT }] },
     ],
   });
 }
@@ -475,8 +515,9 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
       : []),
     alasioPolicy(config, environment),
     ...(config.neon.enabled ? [...neonPolicies(environment), proxyPolicy(), branchStoragePolicy(config)] : []),
-    ...(config.neon.enabled && config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
-    ...(logRuns(config) ? [logPolicy(config)] : []),
+    ...(config.objectStore.bundled.enabled ? [gatewayPolicy(), ...partPolicies(), ...filerStorePolicies()] : []),
+    logPolicy(config),
+    webhookPolicy(config),
     ...(collectorRuns(config) ? [collectorPolicy(config)] : []),
     ...(grafanaRuns(config) ? grafanaPolicies(config) : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),

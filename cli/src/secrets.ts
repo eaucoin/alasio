@@ -5,13 +5,18 @@
  * allowed to use it, and Claude Code's token. In memory the tokens are Redacted, and only
  * the API server is sent them.
  */
+import { createHmac, randomBytes } from "node:crypto";
+
 import type { V1Secret } from "@kubernetes/client-node";
 import { Effect, Redacted } from "effect";
 
-import { kind, KubeApi, type KubeApiError } from "./kube/api.ts";
+import { FIELD_MANAGER, kind, KubeApi, type KubeApiError } from "./kube/api.ts";
 import { NAMESPACE } from "./manifests/common.ts";
 
-/** The bot's Secret: its token (`token`) and the users allowed to use it (`allowedUserIds`, comma-separated). */
+/**
+ * The bot's Secret: its token (`token`), the users allowed to use it (`allowedUserIds`,
+ * comma-separated), and the key its checksum is an HMAC with (`checksumKey`, botChecksum).
+ */
 export const TELEGRAM_SECRET = "alasio-telegram";
 /** Claude Code's Secret: its token (`token`), from `claude setup-token`. */
 export const CLAUDE_SECRET = "alasio-claude";
@@ -45,12 +50,41 @@ const valueOf = (found: V1Secret | null, key: string): string | null => {
   return encoded === undefined ? null : Buffer.from(encoded, "base64").toString("utf8");
 };
 
-/** Writes the bot's Secret. */
+/**
+ * The checksum of the bot's Secret as alasio reads it, its token and the users it allows,
+ * which alasio's pod carries (./manifests/alasio.ts Kept): an HMAC with the Secret's own
+ * key, so that what anyone reading alasio's Deployment reads of it says nothing of either.
+ */
+export function botChecksum(bot: TelegramBot, key: Redacted.Redacted): string {
+  return createHmac("sha256", Redacted.value(key)).update(JSON.stringify([Redacted.value(bot.token), bot.allowedUserIds.join(",")])).digest("hex");
+}
+
+/** A key for botChecksum, made anew. */
+const newChecksumKey = (): string => randomBytes(32).toString("base64url");
+
+/** Writes the bot's Secret, keeping its checksum's key, or making one where it has none. */
 export const writeTelegramBot = (bot: TelegramBot): Effect.Effect<void, KubeApiError, KubeApi> =>
-  Effect.flatMap(KubeApi, (kube) =>
-    kube.apply(secret(TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }, { [BOT_ANNOTATION]: bot.username }))).pipe(
-      Effect.asVoid,
-    );
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const checksumKey = valueOf(yield* kube.get<V1Secret>({ ...SECRET, namespace: NAMESPACE, name: TELEGRAM_SECRET }), "checksumKey") ?? newChecksumKey();
+    yield* kube.apply(secret(TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(","), checksumKey }, { [BOT_ANNOTATION]: bot.username }));
+  });
+
+/** The key of the bot's Secret's checksum (botChecksum), or null where it has none, as one alasio init wrote before it had one has not. */
+export const readBotChecksumKey: Effect.Effect<Redacted.Redacted | null, KubeApiError, KubeApi> = Effect.gen(function*() {
+  const kube = yield* KubeApi;
+  const key = valueOf(yield* kube.get<V1Secret>({ ...SECRET, namespace: NAMESPACE, name: TELEGRAM_SECRET }), "checksumKey");
+  return key === null ? null : Redacted.make(key);
+});
+
+/** Gives the bot's Secret its checksum's key where it has none, beside what it holds, as up does before it renders alasio's pod. */
+export const ensureBotChecksumKey: Effect.Effect<void, KubeApiError, KubeApi> = Effect.gen(function*() {
+  if ((yield* readBotChecksumKey) !== null) return;
+  const kube = yield* KubeApi;
+  const found = yield* kube.get<V1Secret>({ ...SECRET, namespace: NAMESPACE, name: TELEGRAM_SECRET });
+  if (!found) return;
+  yield* kube.patch({ ...SECRET, namespace: NAMESPACE, name: TELEGRAM_SECRET }, { data: { checksumKey: Buffer.from(newChecksumKey(), "utf8").toString("base64") } }, FIELD_MANAGER);
+});
 
 /** Writes Claude Code's Secret. */
 export const writeClaudeToken = (token: Redacted.Redacted): Effect.Effect<void, KubeApiError, KubeApi> =>

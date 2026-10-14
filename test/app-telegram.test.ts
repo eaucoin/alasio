@@ -16,6 +16,7 @@ import {
   mount,
   alasioFor,
 } from "./support/scenarios.ts";
+import { testPool } from "./support/store.ts";
 
 /** Mounts Codex on alpha and has the operator send `first`, then `second` while it runs, queued behind it. */
 async function twoQueuedPrompts(alasio: RunningAlasio, first: string, second: string): Promise<void> {
@@ -78,6 +79,67 @@ test("an update whose processing fails is skipped, and the updates after it are 
     ["Service", 200],
     ["No active query to stop.", 200],
   ]);
+});
+
+test("an update whose handling the store fails is handled once the store answers, and answered once", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t);
+  const { telegram, stateSchema } = alasio;
+  // The store refuses the first message alasio keeps: a sequence's count outlasts the
+  // transaction the refusal rolls back.
+  await (await testPool()).query(`
+    create sequence ${stateSchema}.messages_kept;
+    create function ${stateSchema}.refuse_first_message() returns trigger language plpgsql as $$
+      begin
+        if nextval('${stateSchema}.messages_kept') = 1 then raise exception 'the store is down'; end if;
+        return new;
+      end
+    $$;
+    create trigger refuse_first_message before insert on ${stateSchema}.messages for each row execute function ${stateSchema}.refuse_first_message();
+  `);
+
+  telegram.say("/start");
+  telegram.say("/stop");
+  await telegram.waitFor("sendMessage", (call) => call.params.text === "No active query to stop.");
+  // /start was taken again once the group was joined again, and answered, once, before /stop.
+  assert.deepEqual(telegram.callsTo("sendMessage").map((call) => call.params.text.split("\n")[0]), ["Service", "No active query to stop."]);
+});
+
+test("a button press whose handling the store fails is handled once the store answers", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { stateSchema } = alasio;
+  // The store refuses the first press it takes, as it consumes the press's action.
+  await (await testPool()).query(`
+    create sequence ${stateSchema}.presses_taken;
+    create function ${stateSchema}.refuse_first_press() returns trigger language plpgsql as $$
+      begin
+        if nextval('${stateSchema}.presses_taken') = 1 then raise exception 'the store is down'; end if;
+        return old;
+      end
+    $$;
+    create trigger refuse_first_press before delete on ${stateSchema}.callback_actions for each row execute function ${stateSchema}.refuse_first_press();
+  `);
+  // The second prompt held behind the first, its Queue pressed and, once taken again, queued.
+  await twoQueuedPrompts(alasio, "First", "Second");
+});
+
+test("a press whose control waits on its harness holds back no later update", { timeout: 30_000 }, async (t) => {
+  const alasio = await alasioFor(t, { folders: ["alpha"] });
+  const { telegram, codex } = alasio;
+  await mount(alasio, "codex", "alpha");
+  telegram.say("First");
+  await answerThreadStart(codex, "thread-1", alasio.folder("alpha"));
+  await answerTurnStart(codex, "thread-1", "turn-1");
+  let mark = telegram.mark();
+  telegram.say("Second");
+  await telegram.waitFor("sendMessage", (call) => call.params.text.startsWith("Codex is currently working."), { mark });
+  // Steered, the turn's app-server not answering the steer yet.
+  telegram.press("Steer");
+  const steer = await codex.next("turn/steer");
+  mark = telegram.mark();
+  telegram.say("/start");
+  await telegram.waitFor("sendMessage", (call) => call.params.text === "Alasio is ready.", { mark, timeoutMs: 10_000 });
+  codex.answer(steer, { turnId: "turn-1" });
+  await telegram.waitFor("answerCallbackQuery", (call) => call.params.text === "Steered.");
 });
 
 test("a reply Telegram rate-limits is sent again after the wait it asks for, once, and the reply after it follows it", async (t) => {

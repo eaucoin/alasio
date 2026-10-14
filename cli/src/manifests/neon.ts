@@ -74,10 +74,12 @@ function secretVariable(secret: string, key: string): V1EnvVar {
 }
 
 /**
- * The stack's secrets, made once and kept, and each service's rendered from them, workspace
- * storage's among them when it is on, and the snapshots bucket's and the node agents'
- * when sandboxes are snapshotted, by neon/control/kube-setup.ts: a Job, which applying alasio runs to completion before
- * anything else of alasio starts (../kube/apply.ts).
+ * The stack's secrets, made once and kept, and each service's rendered from them, by
+ * neon/control/kube-setup.ts: the log's and the webhook intake's; and where Neon runs,
+ * Neon's, the object store's, workspace storage's when it is on, and the snapshots
+ * bucket's and the node agents' when sandboxes are snapshotted: a Job, which applying
+ * alasio runs to completion before anything else of alasio starts (../kube/apply.ts), with
+ * Neon or without it.
  */
 function setup(config: InstallConfig): KubernetesObject[] {
   const name = neonName("setup");
@@ -119,15 +121,20 @@ function setup(config: InstallConfig): KubernetesObject[] {
             env: [
               { name: "NAMESPACE", valueFrom: { fieldRef: { fieldPath: "metadata.namespace" } } },
               { name: "SECRET_PREFIX", value: RELEASE },
-              { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
-              { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
-              { name: "NEON_PROXY_HOST", value: PROXY_HOST },
-              { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
+              ...(config.neon.enabled
+                ? [
+                  { name: "NEON_BROKER_URL", value: `http://${neonName("storage-broker")}:50051` },
+                  { name: "NEON_CONTROLLER_URL", value: `http://${neonName("storage-controller")}:1234` },
+                  { name: "NEON_PROXY_HOST", value: PROXY_HOST },
+                  { name: "NEON_CONTROLLER_DB_HOST", value: neonName("controller-db") },
+                ]
+                : []),
               { name: "S3_ENDPOINT", value: s3Endpoint(config) },
               { name: "S3_REGION", value: objectStore.external.region },
               { name: "S3_BUCKET_NEON", value: objectStore.buckets.neon },
               { name: "S3_BUCKET_LAKE", value: objectStore.buckets.lake },
               { name: "S3_BUCKET_BACKUPS", value: objectStore.buckets.backups },
+              { name: "WEBHOOK_ADDRESS", value: config.webhook.publicAddress },
               ...(workspaceStorage.enabled
                 ? [
                   { name: "WORKSPACES_NAME", value: workspaceStorage.name },
@@ -875,10 +882,10 @@ function backup(config: InstallConfig): V1CronJob {
   };
 }
 
-/** Neon's objects, when it runs. */
+/** The stack's setup, which runs with Neon or without it, and Neon's objects, when it runs. */
 export function neonObjects(config: InstallConfig): KubernetesObject[] {
   const { neon } = config;
-  if (!neon.enabled) return [];
+  if (!neon.enabled) return setup(config);
   return [
     ...setup(config),
     ...controllerDb(config),

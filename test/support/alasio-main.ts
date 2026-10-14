@@ -19,6 +19,7 @@ import type { BaymaMcpServer } from "../../src/mcp/bayma.ts";
 import { serveAlasio } from "../../src/alasio.ts";
 import { runAlasio } from "../../src/shared/run.ts";
 import { bridgedQueryFactory } from "./claude.ts";
+import { stubUpdates } from "./stub-updates.ts";
 
 /** What the test runs alasio with. */
 export interface AlasioProcessConfig {
@@ -62,6 +63,8 @@ if (import.meta.main) {
       defaultHarness: null,
       branch: config.branch ?? null,
       branchForkKeyFile: null,
+      // Telegram's updates are the stand-in's, at the Bot API's root the environment names.
+      updates: stubUpdates(process.env["TELEGRAM_API_ROOT"] ?? ""),
       folderBayma: () => Effect.succeed(config.folderBayma),
       claudeQueryFactory: bridgedQueryFactory(config.claudeSocket),
     });

@@ -34,6 +34,7 @@ import type {
 } from "@kubernetes/client-node";
 import { Result } from "effect";
 
+import { LOG_PRINCIPALS } from "../../neon/control/secrets.ts";
 import type { HostProfile, SessionsProfile } from "../../src/kube/config.ts";
 import { hostBaymaStateDir } from "../../src/mcp/bayma.ts";
 import { memoryBytes } from "../src/capacity.ts";
@@ -644,10 +645,16 @@ describe("neon", () => {
     assert.deepEqual(env?.find(({ name }) => name === "S3_SNAPSHOTS_ACCESS_KEY")?.valueFrom, { secretKeyRef: { name: "s3-snapshots", key: "accessKey" } });
   });
 
-  test("runs no Neon when the database is the operator's", () => {
+  test("runs no Neon when the database is the operator's, nor the object store beside it, but the stack's setup and the log", () => {
     const objects = install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false } });
-    assert.deepEqual(objects.filter((object) => object.metadata?.labels?.["alasio.dev/stack"] === "neon"), []);
-    assert.deepEqual(objects.filter((object) => object.metadata?.name === "alasio-lake"), []);
+    const components = new Set(objects.filter((object) => object.metadata?.labels?.["alasio.dev/stack"] === "neon").map(({ metadata }) => metadata?.labels?.["app.kubernetes.io/component"]));
+    assert.deepEqual([...components].filter((component) => component?.startsWith("neon-")), ["neon-setup"]);
+    assert.ok(components.has("log"));
+    assert.ok(![...components].some((component) => component?.startsWith("seaweedfs")), [...components].join(", "));
+    assert.deepEqual(objects.filter((object) => /^alasio-lake/u.test(object.metadata?.name ?? "")), []);
+    // Its setup makes none of Neon's Secrets.
+    const env = one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env ?? [];
+    assert.deepEqual(env.filter(({ name }) => name.startsWith("NEON_")), []);
   });
 
   test("serves the compute's metrics where the collector scrapes them", () => {
@@ -733,6 +740,8 @@ describe("the lake's query endpoint", () => {
     const database = alasio({}).spec?.template.spec?.volumes?.find(({ name }) => name === "database");
     assert.deepEqual(database?.secret?.items?.map(({ key }) => key).slice(0, 3), ["url", "lake-verifier", "lake-reader-verifier"]);
     assert.deepEqual(verifierFiles(alasio({ lake: { enabled: false } }))?.map(([name]) => name), ["ALASIO_LAKE_VERIFIER_FILE"]);
+    // The log's password beside them, as alasio reaches its Telegram topic.
+    assert.equal(container(alasio({})).env?.find(({ name }) => name === "ALASIO_LOG_PASSWORD_FILE")?.value, "/run/alasio/log/password");
   });
 });
 
@@ -1377,7 +1386,7 @@ describe("telemetry", () => {
   test("scrapes each pod of every service of the stack, every minute, found in its namespace, so one that sleeps is not scraped", () => {
     const config = scraperConfig(install());
     const jobs: { job_name: string; scrape_interval: string }[] = config.receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake", "lake-intake", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "seaweedfs", "juicefs", "juicefs-csi"]);
+    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["compute", "lake", "lake-intake", "log", "neon-control", "pageserver", "proxy", "safekeeper", "storage-broker", "storage-controller", "webhook", "seaweedfs", "juicefs", "juicefs-csi"]);
     assert.deepEqual(jobs.find(({ job_name }) => job_name === "safekeeper"), {
       job_name: "safekeeper",
       scrape_interval: "60s",
@@ -1397,9 +1406,9 @@ describe("telemetry", () => {
     assert.deepEqual(["lake", "lake-intake", "log", "neon-control", "pageserver", "proxy"].map(port), ["$$1:9464", "$$1:9464", "$$1:9464", "$$1:8080", "$$1:9898", "$$1:7001"]);
     for (const job of jobs) assert.equal(job.scrape_interval, "60s", job.job_name);
     assert.equal(config.receivers.redis.collection_interval, "60s");
-    // Without the lake, neither it, its intake nor the log.
+    // Without the lake, neither it nor its intake; the log, which carries Telegram's updates too, still.
     const without: { job_name: string }[] = scraperConfig(install({ lake: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } })).receivers.prometheus.config.scrape_configs;
-    assert.deepEqual(without.filter(({ job_name }) => ["lake", "lake-intake", "log"].includes(job_name)), []);
+    assert.deepEqual(without.filter(({ job_name }) => ["lake", "lake-intake", "log"].includes(job_name)).map(({ job_name }) => job_name), ["log"]);
   });
 
   test("scrapes JuiceFS's pods, found in the driver's namespace, and Valkey, with its password, when workspace storage is on", () => {
@@ -1480,9 +1489,10 @@ describe("telemetry", () => {
     });
   });
 
-  test("scrapes nothing without Neon, its gateway only taking OTLP and sending it on", () => {
+  test("scrapes no service of Neon's without it, nor the object store's beside it, but the log's and the webhook intake's, its gateway sending what it takes to the endpoint alone", () => {
     const objects = install({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false }, telemetry: { otlpEndpoint: "https://otlp.example.com" } });
-    assert.deepEqual(objects.filter(({ metadata }) => metadata?.name === "alasio-collector-scraper"), []);
+    const jobs: { job_name: string }[] = scraperConfig(objects).receivers.prometheus.config.scrape_configs;
+    assert.deepEqual(jobs.map(({ job_name }) => job_name), ["log", "webhook"]);
     assert.deepEqual(Object.keys(collectorConfig(objects).exporters), ["otlphttp/external"]);
     assert.equal(variable(one<V1Deployment>(objects, "Deployment", "alasio-collector"), "LOG_PASSWORD"), undefined);
   });
@@ -1612,22 +1622,33 @@ describe("the log", () => {
     assert.match(refusal({ log: { storage: { size: "1Gi" } }, lake: { intake: { scaling: { max: 4 } } } }), /^log\.storage\.size must be at least 2\.0 GiB: each of the telemetry topics' 12 partitions /u);
   });
 
-  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both", () => {
+  test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both, the webhook intake writes the Telegram topics, main's alasio reads its own", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
-    // Each topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
-    assert.deepEqual(access.topics, ["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })));
+    // Each telemetry topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
+    assert.deepEqual(access.topics, [
+      ...["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })),
+      // A week of main's Telegram updates, on one partition, as its one alasio reads them, within a segment beside the one it writes, each flushed as it is written.
+      { name: "telegram.main", partitions: 1, retentionMs: 604_800_000, retentionBytes: 64 * 1024 * 1024, configs: { "flush.messages": "1" } },
+    ]);
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
     assert.deepEqual(access.principals, [
       { name: "gateway", acls: [{ ...telemetry, operations: ["write", "describe"] }] },
       { name: "intake", acls: [{ ...telemetry, operations: ["read", "describe"] }, { ...group, operations: ["read"] }] },
       { name: "scaler", acls: [{ ...telemetry, operations: ["describe"] }, { ...group, operations: ["describe"] }] },
+      { name: "webhook", acls: [{ resource: "topic", name: "telegram.", pattern: "prefixed", operations: ["write", "describe"] }] },
+      {
+        name: "alasio-main",
+        acls: [{ resource: "topic", name: "telegram.main", pattern: "literal", operations: ["read", "describe"] }, { resource: "group", name: "alasio.main", pattern: "literal", operations: ["read"] }],
+      },
     ]);
+    // Each one the stack's setup makes a password for, main's environment's among them.
+    assert.deepEqual(access.principals.map(({ name }: { name: string }) => name), [...LOG_PRINCIPALS]);
     // A partition for each replica the intake may run.
     assert.equal(JSON.parse(logConfig(install({ lake: { intake: { scaling: { max: 5 } } } }))["access.json"] ?? "").topics[0].partitions, 5);
   });
 
-  test("admits the gateway, the intake and KEDA's operator alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
+  test("admits the gateway, the intake, KEDA's operator, the webhook intake and alasio alone as its clients, its own nodes to its controllers, and the scraper to its metrics", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const labelsOf = (kind: string, name: string) => one<V1Deployment | V1StatefulSet>(objects, kind, name).spec?.template.metadata?.labels ?? {};
@@ -1635,12 +1656,20 @@ describe("the log", () => {
     const node = pod(labelsOf("StatefulSet", "alasio-log"));
     const reach = (name: string, port: number, kind = "Deployment") => admits(policies, pod(labelsOf(kind, name)), node, port);
     assert.deepEqual(
-      [reach("alasio-collector", 9092), reach("alasio-lake-intake", 9092), reach("alasio-keda-operator", 9092), reach("alasio-log", 9093, "StatefulSet"), reach("alasio-collector-scraper", 9464)],
-      [true, true, true, true, true],
+      [
+        reach("alasio-collector", 9092),
+        reach("alasio-lake-intake", 9092),
+        reach("alasio-keda-operator", 9092),
+        reach("alasio-webhook", 9092),
+        reach("alasio", 9092),
+        reach("alasio-log", 9093, "StatefulSet"),
+        reach("alasio-collector-scraper", 9464),
+      ],
+      [true, true, true, true, true, true, true],
     );
-    // Not alasio, the lake, Neon, nor the scraper as a client.
+    // Not the lake, Neon, nor the scraper as a client, nor a client to the controllers.
     assert.deepEqual(
-      [reach("alasio", 9092), reach("alasio-lake", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093)],
+      [reach("alasio-lake", 9092), reach("alasio-neon-pageserver", 9092, "StatefulSet"), reach("alasio-collector-scraper", 9092), reach("alasio-collector", 9093), reach("alasio-webhook", 9093)],
       [false, false, false, false, false],
     );
     // The cluster's own KEDA's operator, where it scales alasio, in its namespace.
@@ -1676,9 +1705,95 @@ describe("the log", () => {
     const fixed = install({ lake: { intake: { scaling: { min: 1, max: 1 } } } });
     assert.equal(one<V1Deployment>(fixed, "Deployment", "alasio-lake-intake").spec?.replicas, 1);
     assert.deepEqual([...all(fixed, "ScaledObject"), ...all(fixed, "TriggerAuthentication")].filter(({ metadata }) => metadata?.name === "alasio-lake-intake"), []);
-    // Nor any of it without the lake: no log, no intake.
+    // Nor an intake without the lake; the log runs all the same.
     const without = install({ lake: { enabled: false } });
-    assert.deepEqual(without.filter(({ metadata }) => /^alasio-(log|lake-intake)/u.test(metadata?.name ?? "")), []);
+    assert.deepEqual(without.filter(({ metadata }) => /^alasio-lake-intake/u.test(metadata?.name ?? "")), []);
+    assert.ok(one(without, "StatefulSet", "alasio-log"));
+  });
+});
+
+describe("the webhook intake", () => {
+  const intake = (file: Record<string, unknown> = {}) => one<V1Deployment>(install(file), "Deployment", "alasio-webhook");
+
+  test("runs one replica, on its node's port by default, the public port inside its pod too, bound as its own user, on the floor, holding no bot token", () => {
+    const deployment = intake({ webhook: { publicAddress: "203.0.113.10" } });
+    const pod = deployment.spec?.template.spec;
+    assert.deepEqual([deployment.spec?.replicas, deployment.spec?.strategy, pod?.priorityClassName], [1, { type: "Recreate" }, "alasio-floor"]);
+    assert.match(container(deployment).image ?? "", /^ghcr\.io\/eaucoin\/alasio-webhook:/u);
+    assert.deepEqual(container(deployment).ports, [{ name: "https", containerPort: 443, hostPort: 443 }, { name: "health", containerPort: 8080 }]);
+    assert.deepEqual(pod?.securityContext?.sysctls, [{ name: "net.ipv4.ip_unprivileged_port_start", value: "0" }]);
+    assert.deepEqual([pod?.securityContext?.runAsUser, pod?.securityContext?.runAsNonRoot, pod?.automountServiceAccountToken], [65532, true, false]);
+    assert.equal(container(deployment).securityContext?.readOnlyRootFilesystem, true);
+    // Its certificate, and its routes, which are none until alasio's command line registers a bot.
+    assert.deepEqual(pod?.volumes, [{ name: "tls", secret: { secretName: "alasio-webhook-tls" } }, { name: "routes", secret: { secretName: "alasio-webhook-routes", optional: true } }]);
+    const env = Object.fromEntries((container(deployment).env ?? []).map(({ name, value, valueFrom }) => [name, value ?? `${valueFrom?.secretKeyRef?.name}/${valueFrom?.secretKeyRef?.key}`]));
+    assert.deepEqual([env["LOG_USERNAME"], env["LOG_PASSWORD"], env["WEBHOOK_PORT"]], ["alasio-log-webhook/username", "alasio-log-webhook/password", "443"]);
+    assert.ok(!(container(deployment).env ?? []).some(({ valueFrom }) => valueFrom?.secretKeyRef?.name === "alasio-telegram"));
+    // Its health, its routes and its metrics, inside the cluster alone.
+    assert.deepEqual(one<V1Service>(install(), "Service", "alasio-webhook").spec?.ports, [{ name: "health", port: 8080, targetPort: "health" }]);
+  });
+
+  test("binds this machine's address alone from k3s on it, and takes Telegram's ranges alone through a LoadBalancer where the cluster has one", () => {
+    const bound = intake({ webhook: { publicAddress: "203.0.113.10", exposure: "hostAddress", port: 8443 } });
+    assert.deepEqual(container(bound).ports?.[0], { name: "https", containerPort: 8443, hostPort: 8443, hostIP: "203.0.113.10" });
+    const objects = install({ webhook: { publicAddress: "bot.example.com", exposure: "loadBalancer", scaling: { min: 2, max: 2 } } });
+    const balanced = one<V1Deployment>(objects, "Deployment", "alasio-webhook");
+    assert.deepEqual([balanced.spec?.replicas, balanced.spec?.strategy, container(balanced).ports?.[0]], [2, undefined, { name: "https", containerPort: 443 }]);
+    assert.deepEqual(one<V1Service>(objects, "Service", "alasio-webhook-public").spec, {
+      type: "LoadBalancer",
+      selector: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "webhook" },
+      ports: [{ name: "https", port: 443, targetPort: "https" }],
+      loadBalancerSourceRanges: ["149.154.160.0/20", "91.108.4.0/22"],
+      externalTrafficPolicy: "Local",
+    });
+    assert.equal(all<V1Service>(install(), "Service").some(({ metadata }) => metadata?.name === "alasio-webhook-public"), false);
+  });
+
+  test("refuses a name for the machine's address it binds, a port Telegram does not deliver to, and more than one replica on a node's port", () => {
+    const refused = (webhook: Record<string, unknown>) => {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, webhook });
+      assert.ok(Result.isFailure(decoded));
+      return decoded.failure.message;
+    };
+    assert.match(refused({ exposure: "hostAddress", publicAddress: "bot.example.com" }), /^webhook\.publicAddress must be this machine's public IPv4 address/u);
+    assert.match(refused({ port: 8080 }), /^webhook\.port /u);
+    assert.match(refused({ publicAddress: "Not An Address" }), /^webhook\.publicAddress must be an IPv4 address or a host name, or empty$/u);
+    assert.equal(refused({ scaling: { min: 2, max: 2 } }), "webhook.scaling must be 1 where the webhook intake binds its node's port, which one pod holds");
+  });
+
+  test("is reached on its port from anywhere, its health from the scraper alone, and reaches the cluster's DNS and the log alone", () => {
+    const objects = install();
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    const pod = (labels: Readonly<Record<string, string>>) => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels });
+    const labelsOf = (name: string) => one<V1Deployment>(objects, "Deployment", name).spec?.template.metadata?.labels ?? {};
+    const webhook = pod(labelsOf("alasio-webhook"));
+    assert.deepEqual(
+      [admits(policies, pod(labelsOf("alasio-collector-scraper")), webhook, 8080), admits(policies, pod(labelsOf("alasio")), webhook, 8080), admits(policies, pod({}), webhook, 443)],
+      [true, false, true],
+    );
+    const egress = (one<NetworkPolicyObject>(objects, "NetworkPolicy", "alasio-webhook").spec as { egress?: { to: Peer[]; ports: { port: number }[] }[] }).egress;
+    assert.deepEqual(egress?.map(({ to, ports }) => [to.map(({ podSelector }) => podSelector?.matchLabels), ports.map(({ port }) => port)]), [
+      [[{ "k8s-app": "kube-dns" }], [53, 53]],
+      [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "log" }], [9092]],
+    ]);
+  });
+
+  test("on this machine's public address, takes its port from Telegram's ranges alone, or the sources it is given, as the machine's firewall never sees what is forwarded to it", () => {
+    const sources = (webhook: Record<string, unknown>) =>
+      (one<NetworkPolicyObject>(install({ webhook }), "NetworkPolicy", "alasio-webhook").spec.ingress ?? [])[0]?.from?.map(({ ipBlock }) => ipBlock);
+    assert.deepEqual(sources({ exposure: "hostAddress", publicAddress: "203.0.113.7" }), [{ cidr: "149.154.160.0/20" }, { cidr: "91.108.4.0/22" }]);
+    assert.deepEqual(sources({ exposure: "hostAddress", publicAddress: "203.0.113.7", sources: ["198.51.100.0/24"] }), [{ cidr: "198.51.100.0/24" }]);
+    assert.deepEqual(sources({ exposure: "node" }), [{ cidr: "0.0.0.0/0" }]);
+    assert.deepEqual(sources({ exposure: "loadBalancer" }), [{ cidr: "0.0.0.0/0" }]);
+    // A LoadBalancer's ranges are the sources too.
+    const balanced = install({ webhook: { publicAddress: "bot.example.com", exposure: "loadBalancer", sources: ["198.51.100.0/24"] } });
+    assert.deepEqual(one<V1Service>(balanced, "Service", "alasio-webhook-public").spec?.loadBalancerSourceRanges, ["198.51.100.0/24"]);
+    const refused = (webhook: Record<string, unknown>) => {
+      const decoded = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, webhook });
+      return Result.isFailure(decoded) ? decoded.failure.message : "taken";
+    };
+    assert.equal(refused({ sources: [] }), "webhook.sources must list a network at least");
+    assert.match(refused({ sources: ["149.154.160.0"] }), /^webhook\.sources\.0 must be an IPv4 CIDR$/u);
   });
 });
 
@@ -2621,11 +2736,11 @@ describe("scaling", () => {
       ["alasio-headroom", "Never"],
     ]);
     assert.deepEqual(new Set(policies(install({ autoscaling: { preemption: false } })).map(([, policy]) => policy)), new Set(["Never"]));
-    const ofTarget = (shared: boolean, given: Record<string, unknown> = {}) => {
-      const config = installConfigOf({ autoscaling: given }, { claude: false, shared });
+    const ofTarget = (target: "docker" | "kubeconfig", given: Record<string, unknown> = {}) => {
+      const config = installConfigOf({ autoscaling: given }, { claude: false, target });
       return Result.isSuccess(config) ? config.success.autoscaling.preemption : config.failure;
     };
-    assert.deepEqual([ofTarget(false), ofTarget(true), ofTarget(true, { preemption: true })], [true, false, true]);
+    assert.deepEqual([ofTarget("docker"), ofTarget("kubeconfig"), ofTarget("kubeconfig", { preemption: true })], [true, false, true]);
     const refused = decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, autoscaling: { preemption: false, headroom: { scaling: { min: 1, max: 1 } } } });
     assert.ok(Result.isFailure(refused) && refused.failure.message === "autoscaling.headroom.scaling must be 0 when autoscaling.preemption is false, as no pod takes a placeholder's place then");
   });
