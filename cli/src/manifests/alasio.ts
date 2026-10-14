@@ -28,7 +28,7 @@ import { CPU_FEATURES_ANNOTATION } from "../../../src/kube/sandbox-shape.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
 import { NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
-import { alasioAccount, busyLabelPolicy, cloneJobPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
 import {
   BRANCH_FORK_SECRET,
   BRANCH_LABEL,
@@ -663,6 +663,10 @@ export function alasioObjects(config: InstallConfig, environment: Environment = 
     ...(environment.branch === null && forksForBranches(config) ? [branchForksService()] : []),
     // What alasio may do beyond what RBAC can say; the cluster's, but for its Sandboxes', made with main's.
     ...(environment.branch === null ? [...busyLabelPolicy(), ...secretPolicy()] : []),
+    // Where sessions are snapshotted, what alasio may set of a restored session's pod's status.
+    ...(environment.branch === null && config.sessions.enabled && nodeAgentRuns(config)
+      ? resumedConditionPolicy(componentName("resumed-condition"), alasioAccount(environment.namespace), config.sessions.namespace)
+      : []),
     ...(environment.branch === null && sessionsForked(config) ? cloneJobPolicy(cloneJob(config)) : []),
     ...sandboxPolicy(
       sandboxPolicyName(environment.namespace),

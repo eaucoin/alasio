@@ -1947,7 +1947,8 @@ describe("security", () => {
     const unheld = install({}, null);
     assert.equal(sessions(unheld).snapshots, undefined);
     assert.equal(sessions(unheld).podTemplate.metadata?.annotations?.["dev.gvisor.internal.cpufeatures"], undefined);
-    assert.ok(!JSON.stringify(one(unheld, "ValidatingAdmissionPolicy", "alasio-sandboxes")).includes("dev.gvisor.internal"));
+    const variables = one<KubernetesObject & { spec: { variables: unknown } }>(unheld, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.variables;
+    assert.ok(!JSON.stringify(variables).includes("dev.gvisor.internal"));
     assert.equal(all(unheld, "DaemonSet").filter(({ metadata }) => metadata?.name === "alasio-node-agent").length, 1);
     // Under the cluster's default runtime, nothing is snapshotted.
     const unsnapshotted = install({ sessions: { runtimeClassName: "" } });
@@ -2420,6 +2421,29 @@ describe("admission", () => {
     return at < 0 ? null : JSON.parse(expression.slice(at + pin.length - 1, expression.indexOf("]", at + pin.length) + 1));
   };
   const binding = (objects: readonly KubernetesObject[], name: string) => one<KubernetesObject & { spec: object }>(objects, "ValidatingAdmissionPolicyBinding", name).spec;
+
+  test("lets alasio restore a Sandbox only paused and gated on its resume, and set of a pod's status a restored session's resumed condition alone, true", () => {
+    const objects = install();
+    const restore = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-sandboxes").spec.validations[1]?.expression;
+    assert.equal(
+      restore,
+      '("dev.gvisor.internal.restore.host-image-path" in object.spec.podTemplate.?metadata.?annotations.orValue({})) == ' +
+        '("dev.gvisor.internal.restore.paused" in object.spec.podTemplate.?metadata.?annotations.orValue({})) && ' +
+        '(!("dev.gvisor.internal.restore.host-image-path" in object.spec.podTemplate.?metadata.?annotations.orValue({})) || ' +
+        'object.spec.podTemplate.?spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == "alasio.dev/resumed"))',
+    );
+    const resumed = one<Policy>(objects, "ValidatingAdmissionPolicy", "alasio-resumed-condition");
+    assert.deepEqual(resumed.spec.matchConstraints, { resourceRules: [{ apiGroups: [""], resources: ["pods/status"], operations: ["UPDATE"], apiVersions: ["*"] }] });
+    assert.deepEqual(resumed.spec.matchConditions.map(({ expression }) => expression), ['request.userInfo.username == "system:serviceaccount:alasio:alasio"']);
+    const [which, conditions, rest] = resumed.spec.validations.map(({ expression }) => expression);
+    assert.ok(which?.startsWith('request.namespace == "alasio-sessions" && '));
+    assert.ok(which?.endsWith('object.spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == "alasio.dev/resumed")'));
+    assert.ok(conditions?.includes('object.status.?conditions.orValue([]).all(condition, condition.type != "alasio.dev/resumed" || condition.status == "True")'));
+    for (const field of ["podIP", "podIPs", "hostIP", "phase", "containerStatuses"]) assert.ok(rest?.includes(`object.status.${field} == oldObject.status.${field}`), field);
+    assert.deepEqual(binding(objects, "alasio-resumed-condition"), { policyName: "alasio-resumed-condition", validationActions: ["Deny"] });
+    // None where no session is snapshotted, as alasio patches no pod's status there.
+    assert.ok(!all(install({ sessions: { runtimeClassName: "" } }), "ValidatingAdmissionPolicy").some(({ metadata }) => metadata?.name === "alasio-resumed-condition"));
+  });
 
   test("lets alasio run no Job but its clone's, as rendered but for the claims it is told, each a name, where it forks sessions", () => {
     const objects = install();

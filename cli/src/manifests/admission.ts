@@ -422,10 +422,69 @@ export function sandboxPolicy(
   const made = host ? `(request.namespace == ${JSON.stringify(host.namespace)} ? variables.host : ${session})` : session;
   const unmoved = "request.operation == \"UPDATE\" && object.spec.podTemplate == oldObject.spec.podTemplate && " +
     "object.spec.?volumeClaimTemplates.orValue([]) == oldObject.spec.?volumeClaimTemplates.orValue([])";
-  return admissionPolicy(name, [{ apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], operations: ["CREATE", "UPDATE"] }], `request.userInfo.username == "${account}"`, [{
-    expression: `${unmoved} || ${made}`,
-    message: "alasio makes no Sandbox but from its workspaces' templates, as alasio up renders them",
-  }], [...ofSessions, ...ofHost]);
+  // A restore's pod is left paused, and ready only once resumed; no other pod is paused.
+  const annotations = "object.spec.podTemplate.?metadata.?annotations.orValue({})";
+  const restoring = `(${JSON.stringify(RESTORE_ANNOTATION)} in ${annotations})`;
+  const gated = `object.spec.podTemplate.?spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == ${JSON.stringify(RESUMED_CONDITION)})`;
+  return admissionPolicy(name, [{ apiGroups: ["agents.x-k8s.io"], resources: ["sandboxes"], operations: ["CREATE", "UPDATE"] }], `request.userInfo.username == "${account}"`, [
+    { expression: `${unmoved} || ${made}`, message: "alasio makes no Sandbox but from its workspaces' templates, as alasio up renders them" },
+    {
+      expression: `${restoring} == (${JSON.stringify(RESTORE_PAUSED_ANNOTATION)} in ${annotations}) && (!${restoring} || ${gated})`,
+      message: "alasio restores a Sandbox from a snapshot only paused, its pod ready once resumed, and pauses none it does not restore",
+    },
+  ], [...ofSessions, ...ofHost]);
+}
+
+/**
+ * The fields of a pod's status but its conditions that every Kubernetes alasio runs on
+ * has (1.28 on), as CEL refuses a field its schema lacks: its addresses, its node's, and
+ * its containers' and its own state.
+ */
+const POD_STATUS_FIELDS = [
+  "containerStatuses",
+  "ephemeralContainerStatuses",
+  "hostIP",
+  "hostIPs",
+  "initContainerStatuses",
+  "message",
+  "nominatedNodeName",
+  "phase",
+  "podIP",
+  "podIPs",
+  "qosClass",
+  "reason",
+  "startTime",
+] as const;
+
+/**
+ * What the alasio of `account` may change of a pod's status, as it lets a restored session's
+ * pod be ready once its node's agent resumed its sandbox (src/sandbox/snapshots.ts): the
+ * RESUMED_CONDITION of a session's pod in `namespace` that is gated on it, set true, and
+ * nothing else, its addresses above all, which network policies are programmed from.
+ */
+export function resumedConditionPolicy(name: string, account: string, namespace: string): KubernetesObject[] {
+  const resumed = JSON.stringify(RESUMED_CONDITION);
+  const others = (object: string) => `${object}.status.?conditions.orValue([]).filter(condition, condition.type != ${resumed})`;
+  return admissionPolicy(name, [{ apiGroups: [""], resources: ["pods/status"], operations: ["UPDATE"] }], `request.userInfo.username == "${account}"`, [
+    {
+      expression: `request.namespace == ${JSON.stringify(namespace)} && ${JSON.stringify(WORKLOAD_LABEL)} in object.metadata.?labels.orValue({}) && ` +
+        `object.metadata.labels[${JSON.stringify(WORKLOAD_LABEL)}] == "session" && ` +
+        `object.spec.?readinessGates.orValue([]).exists(gate, gate.conditionType == ${resumed})`,
+      message: "alasio sets the status of no pod but a restored session's",
+    },
+    {
+      expression: `${others("object")} == ${others("oldObject")} && ` +
+        `object.status.?conditions.orValue([]).all(condition, condition.type != ${resumed} || condition.status == "True")`,
+      message: `alasio sets no condition of a pod's but ${RESUMED_CONDITION}, and that true`,
+    },
+    {
+      expression: POD_STATUS_FIELDS.map((field) =>
+        `(has(object.status.${field}) ? has(oldObject.status.${field}) && object.status.${field} == oldObject.status.${field} : !has(oldObject.status.${field}))`
+      ).join(" && ") +
+        " && object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) && object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({})",
+      message: "alasio changes nothing of a pod's status but its conditions, nor its labels or annotations",
+    },
+  ]);
 }
 
 /** What alasio may make as a Secret: a Sandbox's token, of its one key, as tokenSecretManifest makes it. Main's alasio's and each branch environment's. */

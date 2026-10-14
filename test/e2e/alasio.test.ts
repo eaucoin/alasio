@@ -597,6 +597,13 @@ async function untilReleased(volumeId: string, since: number): Promise<number> {
   return Date.now() - since;
 }
 
+/** Patches the status of the session `volumeId`'s pod with `status` as alasio does, merged as kubelet's patches are, its conditions by their type: the API server's answer. */
+const podStatusAsAlasio = (volumeId: string, status: unknown): Promise<number> =>
+  asAlasio("PATCH", `/api/v1/namespaces/${SESSIONS}/pods/${volumeId}/status`, "application/strategic-merge-patch+json", { status });
+
+/** The resumed condition of a restored session's pod, set to `value`. */
+const resumedCondition = (value: string) => ({ conditions: [{ type: "alasio.dev/resumed", status: value }] });
+
 /** The session's current snapshot, as a node agent's API gives it to alasio, from the bucket; null when it has none. */
 async function snapshotOf(volumeId: string): Promise<Manifest | null> {
   const [pod] = (await nodeAgents()).values();
@@ -698,6 +705,11 @@ if (inShard("snapshots")) {
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
       assert.equal(await snapshotOf(session), null);
       t.diagnostic(`the turn's answer came ${answered} ms after its prompt, the session restored meanwhile on ${pod?.spec?.nodeName}`);
+      // As alasio, of its pod's status: its resumed condition, true, alone; not its addresses, nor another condition.
+      assert.equal(await podStatusAsAlasio(session, resumedCondition("True")), 200);
+      assert.equal(await podStatusAsAlasio(session, resumedCondition("False")), 422);
+      assert.equal(await podStatusAsAlasio(session, { conditions: [{ type: "Ready", status: "False" }] }), 422);
+      assert.equal(await podStatusAsAlasio(session, { podIPs: [{ ip: "10.42.250.250" }], podIP: "10.42.250.250" }), 422);
     });
 
     test("the session's pods hold no capability, before its release and after its restore, and the restored one reaches nothing without internet", async () => {
@@ -757,6 +769,8 @@ if (inShard("snapshots")) {
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
       assert.equal(await snapshotOf(corrupt), null);
+      // Of a pod not restored, as alasio, nothing of its status.
+      assert.equal(await podStatusAsAlasio(corrupt, resumedCondition("True")), 422);
       // A restore that fell back for a failure, as this one did, is what the alert on
       // restores falling back is for: it fires, whenever its message came during the turn.
       const stub = telegram?.base;
@@ -857,11 +871,20 @@ if (inShard("snapshots")) {
         return sandbox;
       };
       const bayma = (sandbox: Sandbox) => sandbox.spec.podTemplate.spec?.containers.find(({ name }) => name === "bayma");
-      const restoringFrom = (workspace: string) => (sandbox: Sandbox) => {
+      // A restore's, of its own image, left paused and ready once resumed, or not.
+      const restoringFrom = (workspace: string, { paused = true, gated = true } = {}) => (sandbox: Sandbox) => {
         sandbox.spec.podTemplate.metadata = {
           ...sandbox.spec.podTemplate.metadata,
-          annotations: { ...sandbox.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000Z-0123abcd` },
+          annotations: {
+            ...sandbox.spec.podTemplate.metadata?.annotations,
+            "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000Z-0123abcd`,
+            ...(paused ? { "dev.gvisor.internal.restore.paused": "true" } : {}),
+          },
         };
+        if (gated && sandbox.spec.podTemplate.spec) sandbox.spec.podTemplate.spec.readinessGates = [{ conditionType: "alasio.dev/resumed" }];
+      };
+      const pausedAlone = (sandbox: Sandbox) => {
+        sandbox.spec.podTemplate.metadata = { ...sandbox.spec.podTemplate.metadata, annotations: { ...sandbox.spec.podTemplate.metadata?.annotations, "dev.gvisor.internal.restore.paused": "true" } };
       };
       for (const [name, change, status] of [
         ["e2e-before", undefined, 201],
@@ -871,6 +894,9 @@ if (inShard("snapshots")) {
         }, 422],
         ["e2e-before-own", restoringFrom("e2e-before-own"), 201],
         ["e2e-before-other", restoringFrom(taken), 422],
+        ["e2e-before-running", restoringFrom("e2e-before-running", { paused: false }), 422],
+        ["e2e-before-ungated", restoringFrom("e2e-before-ungated", { gated: false }), 422],
+        ["e2e-before-paused", pausedAlone, 422],
       ] as const) {
         assert.equal(await asAlasio("POST", sandboxes, "application/json", copied(name, change)), status, name);
         if (status === 201) await kube.remove(ref("Sandbox", name, SESSIONS));
