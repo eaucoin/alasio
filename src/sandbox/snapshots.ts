@@ -80,7 +80,8 @@ const STATUS_TIMEOUT_MS = 5000;
 const DEFER_FOR_MS = 15 * 60_000;
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
-  description: "Session sandboxes released, by outcome: snapshotted and suspended, kept running, or failed",
+  description:
+    "Session sandboxes released, by outcome: snapshotted and suspended; kept, as they run under no gVisor; failed, running on; lost, their sandbox ended unsaved, its REPLs with it; or error, the release failing beside its save",
 });
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
@@ -395,10 +396,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         yield* counted("snapshotted");
         return { snapshot };
       }
-      yield* counted("failed");
       // A core Pod, as the API server returns one.
       const after = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
       const ended = after?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated !== undefined;
+      // One that ended its sandbox lost what ran in it but bayma's checkpoints keep.
+      yield* counted(ended ? "lost" : "failed");
       yield* Effect.logWarning(`could not snapshot session ${name}: ${taken.failure.message}; ${ended ? "its sandbox ended, so it is suspended" : "it runs on"}`);
       return ended ? { snapshot: null } : ("keep" as const);
     });
@@ -457,7 +459,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
             name,
             sandboxes.release(name, stillIdle).pipe(
               Effect.tap((released) => (released ? Effect.logInfo(`released session ${name}`) : Effect.void)),
-              Effect.catch((error) => Effect.logWarning(`could not release session ${name}: ${error.message}`)),
+              Effect.catch((error) =>
+                Effect.logWarning(`could not release session ${name}: ${error.message}`).pipe(
+                  Effect.andThen(Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": "error" }))),
+                )
+              ),
               withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }),
               Effect.ensuring(done),
             ),

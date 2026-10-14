@@ -553,3 +553,41 @@ test("a node's idle sessions are released two at a time, the others left for a l
   })), () => ({ execsRunning: 0, execsQueued: 0, idleSinceMs: 0 }));
   assert.deepEqual(releasing.toSorted(), ["fs-a1", "fs-a2", "fs-b1"]);
 });
+
+test("a release whose checkpoint fails is counted failed while its sandbox runs on, and lost once it ended it; one that fails beside its save, an error", async () => {
+  const objects = new Map<string, KubernetesObject>();
+  for (const [name, ended] of [["fs-runs", false], ["fs-ended", true], ["fs-error", false]] as const) {
+    const sandbox = stored(sessionOf(profile(), name), "Running");
+    sandbox.status = { serviceFQDN: `${name}.alasio-sessions.svc.cluster.local`, conditions: [{ type: "Ready", status: "True", reason: "Ready", message: "", lastTransitionTime: new Date(0), observedGeneration: 0 }] };
+    objects.set(`Sandbox/alasio-sessions/${name}`, sandbox);
+    objects.set(`Pod/alasio-sessions/${name}`, {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name, namespace: "alasio-sessions" },
+      spec: { nodeName: name === "fs-runs" ? "node-a" : "node-b", runtimeClassName: "gvisor", containers: [] },
+      status: { containerStatuses: [{ name: "bayma", containerID: `containerd://${"a".repeat(64)}`, image: "", imageID: "", ready: !ended, restartCount: 0, state: ended ? { terminated: { exitCode: 0 } } : { running: {} } }] },
+    } as V1Pod);
+  }
+  const base = fakeAgents({ holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])] });
+  const agents: NodeAgents = { ...base.agents, checkpoint: (on) => Effect.fail(new NodeAgentError({ node: on, call: "snapshot", status: 500, reason: "runsc checkpoint failed" })) };
+  const saved: string[] = [];
+  const sandboxes = {
+    token: () => Effect.succeed("token"),
+    release: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<Saved, unknown>) =>
+      name === "fs-error"
+        ? Effect.fail(new KubeApiError({ status: 409, cause: new Error("the Sandbox changed") }))
+        : save(objects.get(`Sandbox/alasio-sessions/${name}`) as StoredSandbox).pipe(Effect.map((outcome) => (saved.push(`${name}: ${JSON.stringify(outcome)}`), outcome !== "keep"))),
+  } as unknown as Sandboxes;
+  const counted = await added("alasio.sandbox.releases", () =>
+    run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      yield* snapshotted.watch(sandboxes, () => null);
+      yield* Effect.sleep("50 millis");
+    })), () => ({ execsRunning: 0, execsQueued: 0, idleSinceMs: 0 })));
+  assert.deepEqual(saved.toSorted(), ['fs-ended: {"snapshot":null}', 'fs-runs: "keep"']);
+  assert.deepEqual(counted, {
+    "alasio.sandbox.release.outcome=failed": 1,
+    "alasio.sandbox.release.outcome=lost": 1,
+    "alasio.sandbox.release.outcome=error": 1,
+  });
+});

@@ -358,3 +358,56 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0.2]}}]
+
+      # Of the sessions released in the last hour, the share whose release failed: its
+      # sandbox's checkpoint failed while it runs on ("failed", tried again later), or once
+      # it had ended it ("lost": its REPLs' live state is gone, the session resumed from
+      # bayma's checkpoints), or the release failed beside it ("error", as a Sandbox that
+      # could not be suspended, whose snapshot is then stale). One not snapshotted, as it
+      # runs under no gVisor, is kept as designed and counts neither way. Counted as the
+      # restores' alert counts.
+      - uid: alasio-releases-failing
+        title: Releases are failing
+        condition: failing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ humanizePercentage $values.failed.Value }} of the session releases in the last hour failed; a release whose sandbox ended unsaved lost its REPLs."
+        data:
+          - refId: failed
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: failed
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(added) filter (where outcome in ('failed', 'lost', 'error')), 0) / sum(added) as failed
+                  from (
+                    select TimeUnix, Attributes['alasio.sandbox.release.outcome'] as outcome,
+                      Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
+                    from otel.metrics_sum
+                    where MetricName = 'alasio.sandbox.releases' and ServiceName = 'alasio' and ResourceAttributes['alasio.branch'] is null
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                  )
+                  where TimeUnix > now()::timestamp - interval 1 hour and outcome != 'kept'
+                  having sum(added) > 0
+              root_selector: ""
+              columns:
+                - {selector: failed, text: failed, type: number}
+          - refId: failing
+            datasourceUid: __expr__
+            model:
+              refId: failing
+              type: threshold
+              expression: failed
+              conditions: [{evaluator: {type: gt, params: [0.2]}}]

@@ -1214,7 +1214,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the Sandboxes row counts what alasio's running totals added in each interval, and the fallback alert main's failures alone", async () => {
+  test("the Sandboxes row counts what alasio's running totals added in each interval, and the fallback and release alerts main's failures alone", async () => {
     const minute = 60_000;
     const now = Math.floor(Date.now() / minute) * minute;
     const keyValues = (attributes: Readonly<Record<string, string>>) => Object.entries(attributes).map(([key, value]) => ({ key, value: { stringValue: value } }));
@@ -1264,6 +1264,9 @@ describe("the lake's reader", () => {
               counter(restores, 180, outcome("fallback", "template"), [30, 29, 28]),
               counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "snapshotted" }, [90, 50, 10]),
               counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "failed" }, [30]),
+              counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "lost" }, [20]),
+              counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "error" }, [100, 15]),
+              counter("alasio.sandbox.releases", 180, { "alasio.sandbox.release.outcome": "kept" }, [5, 4]),
               histogram("alasio.sandbox.restore.duration", 180, [[100, 99], [20, 3], [5, 5]]),
             ],
           }],
@@ -1287,7 +1290,11 @@ describe("the lake's reader", () => {
         .reduce((text, [variable = "", value = ""]) => text.replaceAll(variable, value), sql);
     };
     const rules = readFileSync(new URL("../neon/grafana/provisioning/alerting/rules.yaml", import.meta.url), "utf8");
-    const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf("title: Restores are falling back"))) ?? [];
+    /** The query of the alert titled `title`. */
+    const alertQuery = (title: string) => {
+      const [, indent = "", block = ""] = /^ *title: .*\n[\s\S]*?^( *)data: \|\n((?:\1 {2}.*\n)+)/mu.exec(rules.slice(rules.indexOf(`title: ${title}`))) ?? [];
+      return block.replaceAll(`\n${indent}  `, "\n").trim();
+    };
     const reader = await openReader(readerConfig);
     try {
       /** Each label's total over the panel's rows. */
@@ -1297,10 +1304,12 @@ describe("the lake's reader", () => {
         return summed;
       };
       assert.deepEqual(await totals("Restores", "outcome", "restores"), { "restored": 5, "fell back: prepare": 1, "fell back: template": 3, "fell back: restore": 1, "fell back: node": 4 });
-      assert.deepEqual(await totals("Releases", "outcome", "releases"), { snapshotted: 2, failed: 1 });
+      assert.deepEqual(await totals("Releases", "outcome", "releases"), { snapshotted: 2, failed: 1, lost: 1, error: 1, kept: 2 });
       assert.deepEqual((await answer(reader.db, panel("Restore time"))).map((row) => row["seconds"]), [3, 5]);
       // Main's restores that failed, of those that could have restored.
-      assert.deepEqual(await answer(reader.db, block.replaceAll(`\n${indent}  `, "\n").trim()), [{ failed: 2 / 7 }]);
+      assert.deepEqual(await answer(reader.db, alertQuery("Restores are falling back")), [{ failed: 2 / 7 }]);
+      // Main's releases that failed, lost their sandbox, or failed beside their save, of those that snapshot.
+      assert.deepEqual(await answer(reader.db, alertQuery("Releases are failing")), [{ failed: 3 / 5 }]);
     } finally {
       reader.close();
     }
