@@ -44,3 +44,23 @@ jobs:
         with:
           name: gate-09-${{ matrix.fetch }}
           path: ${{ runner.temp }}/gate-09
+
+  # The box's cut-over from overlayfs (gate/09/cutover.sh), rehearsed.
+  cutover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: gate/09/cutover.sh
+        env:
+          OUT: ${{ runner.temp }}/gate-09-cutover
+      - name: The node, when something failed
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          sudo journalctl -u k3s --no-pager | tail -100
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-09-cutover
+          path: ${{ runner.temp }}/gate-09-cutover
