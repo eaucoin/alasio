@@ -34,7 +34,6 @@ import { TelegramClient } from "./telegram/client.ts";
 import { ReceivedFiles } from "./telegram/files.ts";
 import { MediaGroups } from "./telegram/media-group-buffer.ts";
 import { Outbox } from "./telegram/outbox.ts";
-import { WorkflowHooks } from "./workflow/hook-server.ts";
 
 /** What alasio is made with: its configuration, its Neon and what main keeps there, and what the deployment's templates offer. */
 export interface AlasioOptions extends AlasioConfig, TelegramAppConfig {
@@ -54,7 +53,6 @@ export type AlasioServices =
   | ReceivedFiles
   | TelegramClient
   | Outbox
-  | WorkflowHooks
   | CodexAppServer
   | ActiveTurns
   | Harnesses
@@ -86,7 +84,6 @@ export function alasioServices(options: AlasioOptions): Layer.Layer<AlasioServic
     })),
     Layer.provideMerge(Layer.mergeAll(
       Outbox.layer,
-      WorkflowHooks.layer(options.hookPort),
       ReceivedFiles.layer(options),
       // Before Codex is first started, which is not before a turn needs it.
       options.keepCodexLogin ? Layer.effectDiscard(keepCodexLogin(codexHome())) : Layer.empty,

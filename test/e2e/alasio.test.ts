@@ -157,6 +157,10 @@ interface Scenario {
   readonly check: () => Promise<void>;
 }
 
+/** alasio's environment, as the configuration `config` sets it. */
+const environmentOf = (config: { readonly install?: { readonly alasio?: { readonly env?: Readonly<Record<string, string>> } } }): Readonly<Record<string, string>> =>
+  config.install?.alasio?.env ?? {};
+
 /** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
@@ -232,6 +236,18 @@ if (inShard("upgrade")) {
             const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(set?.spec?.selector?.matchLabels ?? {}) });
             assert.deepEqual(pods.map(({ spec }) => [spec?.priorityClassName, spec?.priority]), Array(set?.spec?.replicas ?? 1).fill([`${RELEASE}-bound`, 100_001]), name);
           }
+        },
+      },
+      {
+        seeds: "a configuration that sets ALASIO_HOOK_PORT, as the box's does",
+        seed: async () => {
+          assert.equal(environmentOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["ALASIO_HOOK_PORT"], "8789");
+        },
+        keeps: "the configuration but ALASIO_HOOK_PORT, which nothing reads now, and alasio runs without it",
+        check: async () => {
+          assert.equal(environmentOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["ALASIO_HOOK_PORT"], undefined);
+          const container = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "alasio");
+          assert.deepEqual(container?.env?.filter(({ name }) => name === "ALASIO_HOOK_PORT"), []);
         },
       },
     ];

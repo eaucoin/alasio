@@ -41,7 +41,7 @@ import { handleCallbackQuery } from "../src/telegram/callback-handler.ts";
 import type { TextMessageOptions } from "../src/telegram/client.ts";
 import { handleMessage } from "../src/telegram/message-handler.ts";
 import { listWorkspaceCandidates } from "../src/workspace/policy.ts";
-import { run, testStore } from "./support/store.ts";
+import { run, testStore, writerOf } from "./support/store.ts";
 import { type RecordingTelegram, recordingTelegram } from "./support/telegram-calls.ts";
 import { type TestAlasio, type TestServicesOptions, withServices } from "./support/turns.ts";
 
@@ -271,8 +271,8 @@ test("every session a harness is pointed at is listed with its folder, once", as
     const live = await run(store.upsertConversation({ chatId: "17", user: { id: 17 } }));
     await run(store.setActiveHarness(live, CLAUDE_HARNESS));
     await run(store.setWorkingDirectory(live, "/work/c"));
-    await run(store.upsertActiveTurn({ conversationId: live, chatId: "17", messageId: "1", sessionId: null, harness: CLAUDE_HARNESS, prompt: "hi" }));
-    await run(store.updateActiveTurnSessionId(live, "claude-live"));
+    await run(store.claimTurn({ conversationId: live, chatId: "17", messageId: "1", sessionId: null, harness: CLAUDE_HARNESS, prompt: "hi" }));
+    await run((await writerOf(store, live, "17")).updateActiveTurnSessionId("claude-live"));
 
     const codex = await run(store.upsertConversation({ chatId: "18", user: { id: 18 } }));
     await run(store.setActiveHarness(codex, CODEX_HARNESS));
@@ -386,10 +386,10 @@ test("new sessions and active turns are recorded under the active harness", asyn
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), "claude-fresh");
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CODEX_HARNESS), null);
 
-      await run(store.upsertActiveTurn({ conversationId, chatId: "4", messageId: "1", sessionId: null, harness: CLAUDE_HARNESS, prompt: "hi" }));
+      await run(store.claimTurn({ conversationId, chatId: "4", messageId: "1", sessionId: null, harness: CLAUDE_HARNESS, prompt: "hi" }));
       const [turn] = await run(store.getActiveTurns);
       assert.equal(turn?.harness, CLAUDE_HARNESS);
-      await run(store.updateActiveTurnSessionId(conversationId, "claude-live"));
+      await run((await writerOf(store, conversationId, "4")).updateActiveTurnSessionId("claude-live"));
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CLAUDE_HARNESS), "claude-live");
       assert.equal(harnessSessionOf(await run(store.getConversation(conversationId)), CODEX_HARNESS), null);
     });
@@ -400,8 +400,8 @@ test("restart recovery restores the interrupted turn's own harness session", asy
   await withStore(async (store) => {
     const conversationId = await run(store.upsertConversation({ chatId: "5", user: { id: 5 } }));
     await run(store.setActiveHarness(conversationId, CLAUDE_HARNESS));
-    await run(store.upsertActiveTurn({ conversationId, chatId: "5", messageId: "8", sessionId: "claude-1", harness: CLAUDE_HARNESS, prompt: "restart please" }));
-    await run(store.recordRestartEvent({ cause: "self_induced", thread_key: conversationId, channel: "5", thread_ts: "8", session_id: "claude-1" }));
+    await run(store.claimTurn({ conversationId, chatId: "5", messageId: "8", sessionId: "claude-1", harness: CLAUDE_HARNESS, prompt: "restart please" }));
+    await run((await writerOf(store, conversationId, "5")).recordRestartEvent({ cause: "self_induced", channel: "5", thread_ts: "8", session_id: "claude-1" }));
     const [turn] = await run(store.getActiveTurns);
     assert.ok(turn);
     // An empty environment gives the defaults even when the tests themselves run in a
@@ -617,7 +617,7 @@ test("/start offers the pickers until a service and folder are mounted", async (
 test("callbacks other than service and workspace controls are refused while nothing is mounted", async () => {
   await withStore(async (store, paths) => {
     const conversationId = await run(store.upsertConversation({ chatId: "14", user: { id: 14 } }));
-    const [actionId = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "queue", payload: { prompt: "later" } }]));
+    const [actionId = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "goal:resume" }]));
     const telegram = recordingTelegram();
     const { calls } = telegram;
     await withAlasio(store, async (alasio) => {
@@ -634,7 +634,7 @@ test("callbacks other than service and workspace controls are refused while noth
       // Mounting a service chains into the folder picker.
       assert.match(calls.sendMessage[0]?.[1] ?? "", /Folder: none/);
 
-      const [queueAgain = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "queue", payload: { prompt: "later" } }]));
+      const [queueAgain = ""] = await run(store.createCallbackActions(conversationId, [{ kind: "goal:resume" }]));
       await press("cb-16", queueAgain, 5);
       assert.deepEqual(calls.answerCallbackQuery[2], ["cb-16", NO_WORKSPACE_MOUNTED]);
 

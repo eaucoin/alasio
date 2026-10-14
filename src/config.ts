@@ -2,7 +2,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { getDefaultHarness, type HarnessName } from "./harness/names.ts";
-import { resolveHookPort } from "./shared/runtime-constants.ts";
 
 /** alasio's configuration, as its environment sets it. */
 export interface AlasioConfig {
@@ -13,7 +12,6 @@ export interface AlasioConfig {
   readonly stateDir: string;
   /** Whether Codex's login is kept in alasio's store, as its Codex home does not outlast its pod. */
   readonly keepCodexLogin: boolean;
-  readonly hookPort: number;
   readonly warmLinkedSessions: boolean;
   readonly defaultHarness: HarnessName | null;
   /**
@@ -55,7 +53,6 @@ export function loadAlasioConfig(env: NodeJS.ProcessEnv = process.env): AlasioCo
     // Codex home), none of which outlasts it: its state is in Neon.
     stateDir: env["ALASIO_STATE_DIR"]?.trim() || join(homedir(), ".alasio"),
     keepCodexLogin: env["ALASIO_KEEP_CODEX_LOGIN"] === "1",
-    hookPort: resolveHookPort(env),
     warmLinkedSessions: env["ALASIO_WARM_LINKED_SESSIONS"] === "1",
     defaultHarness: getDefaultHarness(env),
     branch: env["ALASIO_BRANCH"]?.trim()

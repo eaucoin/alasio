@@ -21,7 +21,6 @@ import type { TelegramClient } from "../../src/telegram/client.ts";
 import { MediaGroups } from "../../src/telegram/media-group-buffer.ts";
 import { Outbox, type OutboxStatus, type OutboxText } from "../../src/telegram/outbox.ts";
 import { TracingLayer } from "../../src/telemetry/index.ts";
-import { WorkflowHooks } from "../../src/workflow/hook-server.ts";
 import { recordingTelegram } from "./telegram-calls.ts";
 
 /** An outbox that queues nothing, for turns whose replies a test does not follow. */
@@ -54,9 +53,6 @@ export function recordingOutbox(): { readonly layer: Layer.Layer<Outbox>; readon
     })),
   };
 }
-
-/** No workflow hook server: no workflow waits are reported. */
-export const noWorkflowHooks: Layer.Layer<WorkflowHooks> = Layer.succeed(WorkflowHooks, WorkflowHooks.of({ port: 0, waits: new Map() }));
 
 /** Turns standing in for alasio's, each of its effects dying unless `turns` gives it, as a test expects none of the rest. */
 export function turnsStub(turns: Partial<Turns["Service"]>): Turns["Service"] {
@@ -119,7 +115,6 @@ function testServices({
       // Received files are written nowhere a test does not say.
       ReceivedFiles.layer({ stateDir: stateDir ?? "/nonexistent-state-dir" }),
       outbox,
-      noWorkflowHooks,
       // Started only by a turn on alasio's own Codex harness, which a test stands in for.
       CodexAppServer.layer,
       sandbox ? Layer.succeed(SessionSandboxes, sandbox) : Layer.empty,

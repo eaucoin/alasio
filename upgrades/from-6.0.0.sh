@@ -6,7 +6,7 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> OUT=<dir> [FAIL_AT=<point>] upgrades/from-6.0.0.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-6.0.0.sh
 #
 # UPGRADE runs the release's upgrade as the configuration's owner, which restarts alasio,
 # ending the turn it runs; UPGRADE_CHECK proves, before anything changes, that it can, and
@@ -18,7 +18,9 @@
 #   UPGRADE_CHECK="$as npx --yes alasio@<v> upgrade --check && sudo -u <owner> sudo -n true"
 #
 # the last proving that the owner's sudo asks for no password, which the upgrade does what it
-# does as root through. FAIL_AT=before-the-point-of-no-return fails the run there, once every
+# does as root through. CONFIG is that configuration's file
+# (/home/<owner>/.config/alasio/config.json), which the cut-over changes in place before
+# UPGRADE reads it. FAIL_AT=before-the-point-of-no-return fails the run there, once every
 # step before the upgrade has run, as the upgrade shard rehearses a failure.
 #
 # It upgrades main alone, as alasio upgrade does, and refuses, before it changes anything,
@@ -32,7 +34,7 @@
 # what the steps before it moved is the release's to change from then on.
 set -euo pipefail
 umask 077
-: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${OUT:?where to record}"
+: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${CONFIG:?the file of that configuration}" "${OUT:?where to record}"
 NS=alasio
 mkdir -p "$OUT"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/events.log" >&2; }
@@ -111,6 +113,7 @@ main_alone() {
 
 for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
+[ -f "$CONFIG" ] && jq -e '.install | type == "object"' "$CONFIG" >/dev/null 2>&1 || fail "CONFIG, $CONFIG, is not alasio's configuration"
 
 if [ ! -e "$OUT/point-of-no-return" ]; then
   bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1 || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
@@ -152,7 +155,23 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   k exec -i deploy/alasio-neon-compute -c compute -- psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -v ON_ERROR_STOP=1 -q <<'SQL'
 -- The outbox carries a turn's status message, the Telegram message it was sent as, and its edits.
 alter table state.telegram_outbox add column if not exists edits text, add column if not exists telegram_message_id bigint;
+-- A turn is fenced by the epoch its claim took, and says what its harness does, and how it ended.
+alter table state.turns add column if not exists epoch bigint not null default 0, add column if not exists status text not null default 'working',
+  add column if not exists waiting_on text, add column if not exists outcome text, add column if not exists status_outbox_id text;
+update state.turns set status = 'ended' where state = 'completed';
+alter table state.responses add column if not exists thread_key text, add column if not exists epoch bigint;
 SQL
+
+  # The workflow hook server is gone, and with it what ALASIO_HOOK_PORT set.
+  # Rewritten whole, its owner's and mode kept, as it was kept in OUT.
+  if jq -e '.install.alasio.env.ALASIO_HOOK_PORT != null' "$CONFIG" >/dev/null; then
+    log "removing ALASIO_HOOK_PORT, which nothing reads, from alasio's environment in $CONFIG"
+    [ -e "$OUT/config.json" ] || cp -p "$CONFIG" "$OUT/config.json"
+    jq 'del(.install.alasio.env.ALASIO_HOOK_PORT)' "$CONFIG" >"$CONFIG.part"
+    chown --reference="$CONFIG" "$CONFIG.part"
+    chmod --reference="$CONFIG" "$CONFIG.part"
+    mv "$CONFIG.part" "$CONFIG"
+  fi
 
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"

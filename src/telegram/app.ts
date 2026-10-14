@@ -57,7 +57,7 @@ const NATIVE_COMMANDS = [
 
 /** What the app is made with: alasio's configuration, and what main keeps in Neon. */
 export interface TelegramAppConfig
-  extends Pick<AlasioConfig, "workspaceRoot" | "workingDirectory" | "defaultHarness" | "hookPort" | "warmLinkedSessions">
+  extends Pick<AlasioConfig, "workspaceRoot" | "workingDirectory" | "defaultHarness" | "warmLinkedSessions">
 {
   /** Claude Code's transcripts in Neon. */
   readonly sessionStore?: NeonSessionStore | null | undefined;
@@ -205,7 +205,6 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   yield* Effect.logInfo(`  Workspace root: ${config.workspaceRoot}`);
   yield* Effect.logInfo(`  Default folder: ${config.workingDirectory ?? "none (operator chooses with /workspace)"}`);
   yield* Effect.logInfo(`  Default service: ${config.defaultHarness ?? "none (operator chooses with /service)"}`);
-  yield* Effect.logInfo(`  Hook port: ${config.hookPort}`);
   yield* Effect.logInfo(`  Session filesystems: ${sandbox ? "enabled" : "off (the deployment renders no sessions template)"}`);
   yield* client.deleteWebhook(false);
   yield* client.setMyCommands(NATIVE_COMMANDS).pipe(

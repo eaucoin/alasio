@@ -6,9 +6,20 @@ import type { Sql, StoreError } from "./sql.ts";
 
 export type TurnState = "active" | "completed";
 
+/** What the turn's harness says it is doing: working, waiting on what `waiting_on` says (a workflow run), left interrupted by a stop of alasio's, or ended. */
+export type TurnStatus = "working" | "waiting" | "interrupted" | "ended";
+
+/**
+ * How a turn ended: completed, without its answer, interrupted by the operator, stopped
+ * by alasio stopping under it (a restart, or a crash), or failed.
+ */
+export type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped" | "failed";
+
 /**
  * A row of `turns`: a conversation's turn with its harness, kept while it runs so
- * that a restart can resume it. A conversation has one row, its latest turn.
+ * that a restart can resume it. A conversation has one row, its latest turn, and its
+ * epoch: how many turns have claimed it, each turn's writes, and its harness's, made on
+ * the condition that no turn has claimed it since (TurnFenced).
  */
 export interface Turn {
   readonly id: string;
@@ -21,11 +32,17 @@ export interface Turn {
   readonly pending_response_id: string | null;
   readonly prompt: string | null;
   readonly state: TurnState;
+  readonly epoch: string;
+  readonly status: TurnStatus;
+  readonly waiting_on: string | null;
+  readonly outcome: TurnOutcome | null;
+  /** Its status message's outbox entry, once queued. */
+  readonly status_outbox_id: string | null;
   readonly started_at: Date;
   readonly completed_at: Date | null;
 }
 
-/** A turn starting, as recorded by upsertActiveTurn; its thread is its conversation's. */
+/** A turn starting, as recorded by claim; its thread is its conversation's. */
 export interface ActiveTurn {
   readonly conversationId: string;
   readonly chatId: string;
@@ -37,6 +54,12 @@ export interface ActiveTurn {
   readonly prompt?: string | null | undefined;
 }
 
+/**
+ * The turns of each conversation. A write of the turn of an epoch is conditioned on the
+ * row's epoch in the statement that makes it: an update of the row takes its lock, and
+ * one of another table locks it for share (lockAt), so a claim committed while the write
+ * waits on it is seen, and refuses the write.
+ */
 export class NeonTurnRepository {
   readonly #sql: Sql;
   readonly #schema: string;
@@ -46,11 +69,12 @@ export class NeonTurnRepository {
     this.#schema = schema;
   }
 
-  upsertActiveTurn(turn: ActiveTurn): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
+  /** Claims the conversation for a turn starting, working: the turn's epoch, one more than the turn's before it. */
+  claim(turn: ActiveTurn): Effect.Effect<number, StoreError> {
+    return this.#sql.query<{ readonly epoch: string }>(
       `insert into ${this.#schema}.turns
-         (id, conversation_id, thread_key, channel, thread_ts, session_id, harness, pending_response_id, prompt, state, started_at)
-       values ($1, $1, $1, $2, $3, $4, $5, $6, $7, 'active', now())
+         (id, conversation_id, thread_key, channel, thread_ts, session_id, harness, pending_response_id, prompt, state, epoch, status, started_at)
+       values ($1, $1, $1, $2, $3, $4, $5, $6, $7, 'active', 1, 'working', now())
        on conflict (id) do update set
          channel = excluded.channel,
          thread_ts = excluded.thread_ts,
@@ -59,45 +83,104 @@ export class NeonTurnRepository {
          pending_response_id = excluded.pending_response_id,
          prompt = excluded.prompt,
          state = 'active',
+         epoch = ${this.#schema}.turns.epoch + 1,
+         status = 'working',
+         waiting_on = null,
+         outcome = null,
+         status_outbox_id = null,
          started_at = excluded.started_at,
-         completed_at = null`,
+         completed_at = null
+       returning epoch`,
       [turn.conversationId, turn.chatId, turn.messageId, turn.sessionId ?? null, turn.harness, turn.pendingResponseId ?? null, turn.prompt ?? null],
-    ));
+    ).pipe(Effect.map(([row]) => Number(row?.epoch)));
   }
 
   /**
-   * Records the session the conversation's active turn runs in, on the turn and as its
-   * harness's session in the conversation (the mounted harness's, when no turn is active).
+   * Records the session the conversation's turn of `epoch` runs in, on the turn and as its
+   * harness's session in the conversation: whether no turn has claimed it since (a turn
+   * that ended records under its epoch until the next claim).
    */
-  updateActiveTurnSessionId(threadKey: string, sessionId: string | null): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
+  updateSessionIdAt(threadKey: string, epoch: number, sessionId: string | null): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
       `with turn as (
-         update ${this.#schema}.turns set session_id = $2 where id = $1 and state = 'active' returning harness
+         update ${this.#schema}.turns set session_id = $3 where id = $1 and epoch = $2 returning harness
        )
-       update ${this.#schema}.conversations set ${assignSession("coalesce((select harness from turn), active_harness)", "$2")}, updated_at = now()
-       where id = $1`,
-      [threadKey, sessionId],
-    ));
+       update ${this.#schema}.conversations set ${assignSession("(select harness from turn)", "$3")}, updated_at = now()
+       where id = $1 and exists (select 1 from turn)
+       returning id`,
+      [threadKey, epoch, sessionId],
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
-  updateActiveTurnPendingResponseId(threadKey: string, pendingResponseId: string | null): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `update ${this.#schema}.turns set pending_response_id = $2 where id = $1 and state = 'active'`,
-      [threadKey, pendingResponseId],
-    ));
+  /** Records the response the conversation's turn of `epoch` is writing: whether no turn has claimed it since. */
+  updatePendingResponseIdAt(threadKey: string, epoch: number, pendingResponseId: string | null): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.turns set pending_response_id = $3 where id = $1 and epoch = $2 returning id`,
+      [threadKey, epoch, pendingResponseId],
+    ).pipe(Effect.map((rows) => rows.length > 0));
   }
 
-  /** Completes the conversation's active turn; given a pending response, only the turn of that response. */
-  clearActiveTurn(threadKey: string, pendingResponseId: string | null = null): Effect.Effect<void, StoreError> {
-    return Effect.asVoid(this.#sql.query(
-      `update ${this.#schema}.turns set state = 'completed', completed_at = now()
-       where id = $1 and state = 'active' and ($2::text is null or pending_response_id = $2)`,
-      [threadKey, pendingResponseId],
-    ));
+  /** Says what the conversation's active turn of `epoch` is doing: whether the turn still holds it. */
+  setStatus(threadKey: string, epoch: number, status: TurnStatus, waitingOn: string | null = null): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.turns set status = $3, waiting_on = $4 where id = $1 and epoch = $2 and state = 'active' returning id`,
+      [threadKey, epoch, status, waitingOn],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
+   * Says that the conversation's turn of `epoch` waits on `waitingOn`, or works again for
+   * null, while it works: whether no turn has claimed the conversation since. A turn
+   * ended, or left interrupted for a restart, says what it said.
+   */
+  setWaitingAt(threadKey: string, epoch: number, waitingOn: string | null): Effect.Effect<boolean, StoreError> {
+    const working = `state = 'active' and status in ('working', 'waiting')`;
+    return this.#sql.query(
+      `update ${this.#schema}.turns set
+         status = case when ${working} then (case when $3::text is null then 'working' else 'waiting' end) else status end,
+         waiting_on = case when ${working} then $3 else waiting_on end
+       where id = $1 and epoch = $2
+       returning id`,
+      [threadKey, epoch, waitingOn],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /** Records the status message the conversation's turn of `epoch` queued: whether no turn has claimed it since. */
+  setStatusMessageAt(threadKey: string, epoch: number, outboxId: string): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.turns set status_outbox_id = $3 where id = $1 and epoch = $2 returning id`,
+      [threadKey, epoch, outboxId],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /** Ends the conversation's active turn of `epoch`, as `outcome` says it ended: whether it was that turn, and active. */
+  end(threadKey: string, epoch: number, outcome: TurnOutcome): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(
+      `update ${this.#schema}.turns set state = 'completed', status = 'ended', waiting_on = null, outcome = $3, completed_at = now()
+       where id = $1 and epoch = $2 and state = 'active'
+       returning id`,
+      [threadKey, epoch, outcome],
+    ).pipe(Effect.map((rows) => rows.length > 0));
+  }
+
+  /**
+   * Whether no turn has claimed the conversation since the turn of `epoch` did, its row
+   * locked for share until the transaction asking ends, so no claim lands before what
+   * the transaction writes on it.
+   */
+  lockAt(threadKey: string, epoch: number): Effect.Effect<boolean, StoreError> {
+    return this.#sql.query(`select 1 from ${this.#schema}.turns where id = $1 and epoch = $2 for share`, [threadKey, epoch]).pipe(
+      Effect.map((rows) => rows.length > 0),
+    );
   }
 
   getActiveTurns(): Effect.Effect<Turn[], StoreError> {
     return this.#sql.query<Turn>(`select * from ${this.#schema}.turns where state = 'active' order by started_at`);
+  }
+
+  /** The conversation's latest turn, active or ended, or null when none has run. */
+  getTurn(threadKey: string): Effect.Effect<Turn | null, StoreError> {
+    return this.#sql.query<Turn>(`select * from ${this.#schema}.turns where id = $1`, [threadKey]).pipe(Effect.map(([row]) => row ?? null));
   }
 
   /** The conversation's turn, while it is active. */

@@ -35,6 +35,7 @@ import { BaymaNotAnswering } from "../src/kube/sandboxes.ts";
 import type { BaymaMcpServer, HostBaymaScope } from "../src/mcp/bayma.ts";
 import type { ModelChoice } from "../src/persistence/conversation-repository.ts";
 import type { ResponseBlock as StoredBlock } from "../src/persistence/response-repository.ts";
+import { StoreError } from "../src/persistence/sql.ts";
 import type { NewRestartEvent } from "../src/persistence/restart-repository.ts";
 import type { SessionUsage } from "../src/persistence/usage-repository.ts";
 import {
@@ -52,6 +53,7 @@ import {
   usage,
 } from "./support/claude-sdk.ts";
 import { activeTurnsHolding, type Hold } from "./support/busy-pods.ts";
+import { ownTurnsOn } from "./support/persistence.ts";
 
 type TextResponseBlock = Extract<ResponseBlock, { type: "text" }>;
 
@@ -65,7 +67,8 @@ interface RecordingPersistence extends TurnPersistence {
     readonly posted: string[];
     readonly pending: string[];
     readonly usage: [string | null | undefined, SessionUsage | null | undefined][];
-    readonly restarts: NewRestartEvent[];
+    readonly restarts: Omit<NewRestartEvent, "thread_key">[];
+    readonly waits: (string | null)[];
   };
 }
 
@@ -79,10 +82,12 @@ function createPersistence(): RecordingPersistence {
     pending: [],
     usage: [],
     restarts: [],
+    waits: [],
   };
   const record = (write: () => void) => Effect.sync(write);
   return {
     state,
+    epoch: 1,
     createPendingResponse: (_chatId, messageId) =>
       Effect.sync(() => {
         state.pending.push(String(messageId));
@@ -91,10 +96,11 @@ function createPersistence(): RecordingPersistence {
     markPendingAsPosted: (id) => record(() => state.posted.push(id)),
     updateActiveTurnPendingResponseId: () => Effect.void,
     updatePendingSessionId: (_id, sessionId) => record(() => state.sessionIds.push(sessionId)),
-    updateActiveTurnSessionId: (_threadKey, sessionId) => record(() => state.activeTurnSessionIds.push(sessionId)),
+    updateActiveTurnSessionId: (sessionId) => record(() => state.activeTurnSessionIds.push(sessionId)),
     appendBlocksToPending: (_id, blocks) => record(() => state.blocks.push(...blocks)),
     markPendingResponseComplete: (id) => record(() => state.completed.push(id)),
     updateSessionUsage: (sessionId, turnUsage) => record(() => state.usage.push([sessionId, turnUsage])),
+    setWaiting: (waitingOn) => record(() => state.waits.push(waitingOn)),
     recordRestartEvent: (event) => record(() => state.restarts.push(event)),
   };
 }
@@ -143,7 +149,7 @@ const folderBayma = ({ threadKey }: Pick<HostBaymaScope, "threadKey">) =>
   });
 
 /** A turn for runClaudeTurn: the turn, what its live sessions are made with, and the running turns they register in. */
-interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice"> {
+interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice" | "ownTurns"> {
   readonly sessions: Pick<ClaudeSessionApi, "sessionExists">;
   readonly queryFactory: ClaudeQueryFactory;
   readonly activeTurns?: ActiveTurns["Service"];
@@ -153,7 +159,7 @@ interface ClaudeTurnRun extends Omit<TurnParams, "modelChoice"> {
 async function runClaudeTurn({ sessions, queryFactory, activeTurns = makeActiveTurns(), ...params }: ClaudeTurnRun): Promise<TurnResult> {
   return await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
     const liveSessions = yield* makeClaudeLiveSessions({ workingDirectory: params.workingDirectory, sessions, queryFactory, folderBayma });
-    return yield* liveSessions.runTurn({ modelChoice: null, ...params });
+    return yield* liveSessions.runTurn({ modelChoice: null, ownTurns: ownTurnsOn(params.persistence), ...params });
   })).pipe(Effect.provideService(ActiveTurns, activeTurns)));
 }
 
@@ -805,6 +811,7 @@ function turnParams(persistence: TurnPersistence, extra: Partial<TurnParams> = {
     workingDirectory: "/work",
     modelChoice: null,
     persistence,
+    ownTurns: ownTurnsOn(persistence),
     ...extra,
   };
 }
@@ -846,6 +853,125 @@ test("background work keeps running after the answer and its report is delivered
   assert.ok(events.includes("idle"));
   await closeAll();
   assert.equal(cli.state.closed, 1);
+});
+
+test("a report Claude Code starts while another turn holds the conversation waits for it to let go, then claims the conversation itself and is delivered", async () => {
+  const persistence = createPersistence();
+  // The turns Claude Code starts on its own write under claims of their own.
+  const own = createPersistence();
+  const ended: string[] = [];
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const events: string[] = [];
+  const turn = runTurn(liveSessions, {
+    ...turnParams(persistence),
+    ownTurns: ownTurnsOn(own, ended),
+    onBackgroundResponse: Effect.sync(() => events.push("background-response")),
+  });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Tests are running; I'll report back.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  // Another turn holds the conversation as Claude Code reports.
+  const elsewhere = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(elsewhere)));
+  cli.emit(assistantMessage([text("Checking the log.")]));
+  cli.emit(successResult({ result: "All 212 tests passed.", session_id: "s-1" }));
+  await settle();
+  assert.deepEqual([own.state.pending, ended, events], [[], [], []], "the report claimed a conversation another turn holds");
+  assert.equal(runningTurnOf(activeTurns, "telegram:1").cliInitiated, false);
+
+  // It lets go: the report claims the conversation, and is delivered under its claim alone.
+  await Effect.runPromise(Scope.close(elsewhere, Exit.void));
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(own.state.pending.length, 1);
+  assert.match(own.state.pending[0] ?? "", /^claude-cli-turn:/);
+  assert.deepEqual(own.state.completed, ["pending-1"]);
+  assert.deepEqual(textBlocks(own.state.blocks as ResponseBlock[]).map(({ content }) => content), ["Checking the log.", "All 212 tests passed."]);
+  assert.equal(persistence.state.pending.length, 1, "the report wrote under the operator's turn");
+  assert.deepEqual(ended, ["completed"]);
+  assert.deepEqual(events, ["background-response"]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("reports Claude Code starts while another turn holds the conversation are delivered in the order it made them", async () => {
+  const persistence = createPersistence();
+  const own = createPersistence();
+  const ended: string[] = [];
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(own, ended) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Started both.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+
+  const elsewhere = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(elsewhere)));
+  cli.emit(assistantMessage([text("The build is done.")]));
+  cli.emit(successResult({ result: "Build passed.", session_id: "s-1" }));
+  await settle();
+  cli.emit(assistantMessage([text("The tests are done.")]));
+  cli.emit(successResult({ result: "Tests passed.", session_id: "s-1" }));
+  await settle();
+  assert.deepEqual(own.state.pending, []);
+
+  await Effect.runPromise(Scope.close(elsewhere, Exit.void));
+  for (let waited = 0; ended.length < 2 && waited < 2000; waited += 20) await settle();
+  assert.deepEqual(textBlocks(own.state.blocks as ResponseBlock[]).map(({ content }) => content), ["The build is done.", "Build passed.", "The tests are done.", "Tests passed."]);
+  assert.deepEqual([own.state.completed, ended], [["pending-1", "pending-2"], ["completed", "completed"]]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("a report whose claim is made but whose response cannot be begun ends its claim, and lets go of the conversation", async () => {
+  const persistence = createPersistence();
+  const ended: string[] = [];
+  const unwritable: TurnPersistence = { ...createPersistence(), createPendingResponse: () => Effect.fail(new StoreError({ cause: new Error("the store is down") })) };
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(unwritable, ended) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+  cli.emit(assistantMessage([text("Reporting.")]));
+  for (let waited = 0; ended.length === 0 && waited < 2000; waited += 20) await settle();
+  assert.deepEqual(ended, ["failed"]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
+});
+
+test("a report whose claim is made but whose blocks so far cannot be stored ends its claim, and lets go of the conversation", async () => {
+  const persistence = createPersistence();
+  const ended: string[] = [];
+  const unwritable: TurnPersistence = { ...createPersistence(), appendBlocksToPending: () => Effect.fail(new StoreError({ cause: new Error("the store is down") })) };
+  const activeTurns = makeActiveTurns();
+  const cli = createFakeCli();
+  const { liveSessions, closeAll } = openLiveSessions({ workingDirectory: "/work", sessions: { sessionExists: () => Effect.succeed(true) }, queryFactory: cli.queryFactory, folderBayma }, activeTurns);
+  const turn = runTurn(liveSessions, { ...turnParams(persistence), ownTurns: ownTurnsOn(unwritable, ended) });
+  const first = await cli.nextPrompt();
+  cli.emit(initMessage("s-1"));
+  cli.emit(successResult({ result: "Started it.", session_id: "s-1", user_message_uuids: [first.uuid] }));
+  await turn;
+  // It ends while another turn holds the conversation, so it claims it with its blocks once it is let go.
+  const elsewhere = Effect.runSync(Scope.make());
+  Effect.runSync(activeTurns.register("telegram:1", { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false }).pipe(Scope.provide(elsewhere)));
+  cli.emit(assistantMessage([text("Reporting.")]));
+  cli.emit(successResult({ result: "Reported.", session_id: "s-1" }));
+  await settle();
+  await Effect.runPromise(Scope.close(elsewhere, Exit.void));
+  for (let waited = 0; ended.length === 0 && waited < 2000; waited += 20) await settle();
+  await settle();
+  // Ended once, as it failed.
+  assert.deepEqual(ended, ["failed"]);
+  assert.equal(busy(activeTurns, "telegram:1"), false);
+  await closeAll();
 });
 
 test("a turn holds the pod it works in busy while it runs: an operator's, and one Claude Code starts itself to report", async () => {

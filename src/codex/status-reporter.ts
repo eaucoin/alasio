@@ -5,14 +5,13 @@ import { Store } from "../persistence/store.ts";
 import { formatDuration } from "../shared/human-time.ts";
 import type { ChatId } from "../telegram/client.ts";
 import { Outbox } from "../telegram/outbox.ts";
-import { type WorkflowWait, WorkflowHooks } from "../workflow/hook-server.ts";
 import type { PreparedReply, ReplyMedia } from "./reply-media.ts";
 import { finalResponseToMarkdown } from "./response-markdown.ts";
 
 /** Final responses render as Telegram rich messages: tables, headings, lists, and code. */
 const FINAL_RESPONSE_OPTIONS = Object.freeze({ format: "rich" });
 
-/** How often a running turn's status is checked for a change worth showing (a workflow wait). */
+/** How often a running turn's row is read for a change of its status worth showing (a workflow wait). */
 const STATUS_CHECK = "30 seconds";
 /** How long alasio, as it stops, waits for a turn's status message to say so. */
 const RESTARTING_DELIVERY = "5 seconds";
@@ -24,7 +23,8 @@ function escapeHtml(value: string): string {
 export interface WorkingStatus {
   readonly harnessName: string;
   readonly startedAtMs: number;
-  readonly workflowWait?: Pick<WorkflowWait, "runId" | "waitType"> | null;
+  /** What the turn waits on, as its row says (turns.waiting_on); null while it works. */
+  readonly waitingOn?: string | null;
 }
 
 /**
@@ -32,12 +32,10 @@ export interface WorkingStatus {
  * ("started 3 minutes ago"), which the user's app keeps current itself, so the line needs
  * no edits to show how long the turn has run; it changes only when what it says does.
  */
-export function workingStatusHtml({ harnessName, startedAtMs, workflowWait = null }: WorkingStatus): string {
+export function workingStatusHtml({ harnessName, startedAtMs, waitingOn = null }: WorkingStatus): string {
   const unix = Math.floor(startedAtMs / 1000);
   const since = `started <tg-time unix="${unix}" format="r">just now</tg-time>`;
-  const doing = workflowWait
-    ? `${escapeHtml(harnessName)} is watching workflow ${escapeHtml(workflowWait.runId)} (${escapeHtml(workflowWait.waitType)})`
-    : `${escapeHtml(harnessName)} is working`;
+  const doing = waitingOn ? `${escapeHtml(harnessName)} is waiting on ${escapeHtml(waitingOn)}` : `${escapeHtml(harnessName)} is working`;
   return `${doing} · ${since}`;
 }
 
@@ -59,9 +57,11 @@ export interface PostedStatus {
   readonly startTime: number;
 }
 
+/** The turn whose status message to queue and keep current: the conversation's of `epoch`, in the chat. */
 export interface StatusUpdates {
   readonly chatId: ChatId;
-  readonly sessionId: string | null;
+  readonly conversationId: string;
+  readonly epoch: number;
   readonly harnessName?: string;
 }
 
@@ -89,8 +89,9 @@ export interface StatusReporter {
    */
   readonly enqueueFinalResponse: (response: FinalResponse) => Effect.Effect<void, StoreError>;
   /**
-   * Queues the turn's status message and keeps it current, in a fiber of the scope, until
-   * the scope closes. The status message once queued; null if it could not be.
+   * Queues the turn's status message, recorded on its row, and keeps it current as its row
+   * says what it does, in a fiber of the scope, until the scope closes. The status message
+   * once queued; null if it could not be.
    */
   readonly statusUpdates: (updates: StatusUpdates) => Effect.Effect<Deferred.Deferred<PostedStatus | null>, never, Scope.Scope>;
   readonly postResponse: (response: PostedResponse) => Effect.Effect<void, StoreError>;
@@ -102,7 +103,7 @@ export interface StatusReporter {
 }
 
 /**
- * The status reporter of alasio's store, outbox and workflow hooks: what a turn shows is
+ * The status reporter of alasio's store and outbox: what a turn shows is
  * queued in the outbox, its status message and that message's edits as its reply, each
  * chat's in order, so none of it is lost to a restart. With `replyMedia`
  * (codex/reply-media.ts), the media a response shows are delivered with it; without,
@@ -110,10 +111,9 @@ export interface StatusReporter {
  */
 export const makeStatusReporter = Effect.fnUntraced(function*(
   { replyMedia = null }: { readonly replyMedia?: Pick<ReplyMedia, "prepare"> | null } = {},
-): Effect.fn.Return<StatusReporter, never, Store | Outbox | WorkflowHooks> {
+): Effect.fn.Return<StatusReporter, never, Store | Outbox> {
   const store = yield* Store;
   const outbox = yield* Outbox;
-  const { waits } = yield* WorkflowHooks;
 
   const enqueueFinalResponse = Effect.fnUntraced(function*({ chatId, text, pendingResponseId }: FinalResponse) {
     const prepared: PreparedReply = replyMedia ? yield* replyMedia.prepare({ chatId, text }) : { text, options: FINAL_RESPONSE_OPTIONS };
@@ -127,34 +127,56 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
       Effect.catch((error) => Effect.logWarning(`Failed to queue an edit of the status message: ${error.message}`)),
     );
 
-  /** Keeps a queued status message current: every STATUS_CHECK, it is edited if what it says has changed. */
-  const keepCurrent = (chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, status: PostedStatus): Effect.Effect<void> => {
+  /**
+   * Keeps a queued status message current: every STATUS_CHECK, the turn's row is read, and
+   * the message edited if what the row says the turn does has changed. A turn its
+   * conversation no longer runs (ended, or claimed since) changes it no more.
+   */
+  const keepCurrent = (
+    { chatId, conversationId, epoch }: StatusUpdates,
+    shownAtFirst: string,
+    statusHtml: (waitingOn: string | null) => string,
+    status: PostedStatus,
+  ): Effect.Effect<void> => {
     let shown = shownAtFirst;
-    const check = Effect.suspend(() => {
-      const next = statusHtml(sessionId ? waits.get(sessionId) ?? null : null);
-      if (next === shown) {
-        return Effect.void;
-      }
-      shown = next;
-      return edit(chatId, status, next, { parse_mode: "HTML" });
-    });
+    const check = store.getTurn(conversationId).pipe(
+      Effect.flatMap((turn) => {
+        if (!turn || Number(turn.epoch) !== epoch || turn.state !== "active") {
+          return Effect.void;
+        }
+        const next = statusHtml(turn.status === "waiting" ? turn.waiting_on : null);
+        if (next === shown) {
+          return Effect.void;
+        }
+        shown = next;
+        return edit(chatId, status, next, { parse_mode: "HTML" });
+      }),
+      Effect.catch((error) => Effect.logWarning(`Could not read what turn ${conversationId} does: ${error.message}`)),
+    );
     return check.pipe(Effect.schedule(Schedule.spaced(STATUS_CHECK)), Effect.asVoid);
   };
 
-  const statusUpdates = Effect.fnUntraced(function*({ chatId, sessionId, harnessName = "Codex" }: StatusUpdates) {
+  const statusUpdates = Effect.fnUntraced(function*(updates: StatusUpdates) {
+    const { chatId, conversationId, epoch, harnessName = "Codex" } = updates;
     const posted = yield* Deferred.make<PostedStatus | null>();
     const startTime = yield* Clock.currentTimeMillis;
-    const statusHtml = (workflowWait: WorkflowWait | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, workflowWait });
+    const statusHtml = (waitingOn: string | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, waitingOn });
     const shown = statusHtml(null);
-    // The message is queued whole however soon the turn ends; only keeping it current is interrupted.
+    // The message is queued, and recorded on the turn's row for a start after a crash to
+    // edit, whole however soon the turn ends; only keeping it current is interrupted.
     const post = outbox.enqueueStatus({ chatId, text: shown, options: { parse_mode: "HTML" } }).pipe(
+      Effect.tap((outboxId) =>
+        store.setTurnStatusMessage(conversationId, epoch, outboxId).pipe(
+          Effect.catch((error) => Effect.logWarning(`Failed to record the status message on turn ${conversationId}: ${error.message}`)),
+        )
+      ),
       Effect.map((outboxId): PostedStatus | null => ({ outboxId, startTime })),
       Effect.catch((error) => Effect.logWarning(`Failed to queue the status message: ${error.message}`).pipe(Effect.as(null))),
       Effect.tap((status) => Deferred.succeed(posted, status)),
       Effect.uninterruptible,
     );
     yield* post.pipe(
-      Effect.flatMap((status) => (status ? keepCurrent(chatId, sessionId, shown, statusHtml, status) : Effect.void)),
+      Effect.flatMap((status) => (status ? keepCurrent(updates, shown, statusHtml, status) : Effect.void)),
       Effect.ensuring(Deferred.succeed(posted, null)),
       Effect.forkScoped,
     );

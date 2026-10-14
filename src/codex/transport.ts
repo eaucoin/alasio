@@ -9,7 +9,7 @@ import { Effect, Schema, type Scope, Stream } from "effect";
 import { getCodexTransportMode } from "../config.ts";
 import type { ModelChoice } from "../persistence/conversation-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import type { Store } from "../persistence/store.ts";
+import type { TurnFenced, TurnPersistence } from "../persistence/store.ts";
 import type { AppServer, AppServerEventsError } from "./app-server/client.ts";
 import type { AppServerEvent } from "./app-server/protocol.ts";
 import type { AppServerRequestError, AppServerStartError } from "./app-server/rpc-client.ts";
@@ -42,7 +42,7 @@ export class CodexTransportRefused extends Schema.TaggedError<CodexTransportRefu
 export type CodexEventsError = AppServerEventsError | CodexExecError;
 
 /** How opening a turn's events fails. */
-export type CodexOpenError = AppServerStartError | ThreadIdMissing | StaleTurnCleanupError | CodexExecError | CodexTransportRefused | StoreError;
+export type CodexOpenError = AppServerStartError | ThreadIdMissing | StaleTurnCleanupError | CodexExecError | CodexTransportRefused | StoreError | TurnFenced;
 
 /** A turn's events as they stream, with the session and turn they belong to, as far as they are known. */
 export interface CodexEventStream {
@@ -52,7 +52,7 @@ export interface CodexEventStream {
 }
 
 /** Where a transport records the session a turn runs in. */
-export type TurnSessionStore = Pick<Store["Service"], "updatePendingSessionId" | "updateActiveTurnSessionId">;
+export type TurnSessionStore = Pick<TurnPersistence, "updatePendingSessionId" | "updateActiveTurnSessionId">;
 
 /** A Codex session's location: its app-server, and the directory, environment, and config it runs with. */
 export interface CodexSessionOptions {
@@ -118,7 +118,7 @@ const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threa
     ? yield* appServer.ensureThread({ threadId: resumeSession, ...scope })
     : yield* appServer.startThread(scope);
   yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
-  yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
+  yield* persistence.updateActiveTurnSessionId(sessionId);
   const { model, effort } = resolveCodexModelChoice(modelChoice);
   const turnId = yield* appServer.startTurn({ threadId: sessionId, prompt, model, effort, onPromptDispatched, ...scope });
   yield* turnTimer("app_server.turn_start.returned", { turn_id: turnId ?? "unknown" });
@@ -126,12 +126,12 @@ const createAppServerStream = Effect.fnUntraced(function*({ resumeSession, threa
   return stream;
 });
 
-const createAttachedAppServerStream = Effect.fnUntraced(function*({ sessionId, turnId, persistence, pendingResponseId, turnTimer, threadKey, appServer }: AttachedCodexStreamParams) {
+const createAttachedAppServerStream = Effect.fnUntraced(function*({ sessionId, turnId, persistence, pendingResponseId, turnTimer, appServer }: AttachedCodexStreamParams) {
   if (!sessionId || !turnId) {
     return yield* new CodexTransportRefused({ message: "Cannot attach to a Codex goal turn without both session and turn ids" });
   }
   yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
-  yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
+  yield* persistence.updateActiveTurnSessionId(sessionId);
   yield* appServer.claimTurn(sessionId, turnId);
   yield* turnTimer("app_server.goal_turn.attached", { turn_id: turnId });
   const stream: CodexEventStream = { sessionId, turnId, events: appServer.eventsForTurn(sessionId, turnId) };

@@ -90,11 +90,14 @@ export class NeonPromptJobRepository {
     ).pipe(Effect.map(([row]) => row ?? null));
   }
 
-  /** Settles what becomes of a job: completed and cancelled jobs are done, any other state is not. */
-  setDisposition(id: string, state: PromptJobState, priority = 0): Effect.Effect<void, StoreError> {
+  /**
+   * Settles what becomes of a job: completed and cancelled jobs are done, any other state is
+   * not. Its priority is `priority`, where given, and stays as it was otherwise.
+   */
+  setDisposition(id: string, state: PromptJobState, priority: number | null = null): Effect.Effect<void, StoreError> {
     return Effect.asVoid(this.#sql.query(
       `update ${this.#schema}.prompt_jobs
-       set state = $2, priority = $3, completed_at = case when $2 in ('completed', 'cancelled') then now() end
+       set state = $2, priority = coalesce($3::int, priority), completed_at = case when $2 in ('completed', 'cancelled') then now() end
        where id = $1`,
       [id, state, priority],
     ));

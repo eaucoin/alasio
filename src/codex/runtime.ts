@@ -39,6 +39,7 @@ import { ActiveTurns, type RunningTurn, stopReasonText } from "../harness/active
 import { CODEX_HARNESS } from "../harness/names.ts";
 import type { HarnessError, TurnParams, TurnResult } from "../harness/index.ts";
 import type { StoreError } from "../persistence/sql.ts";
+import type { TurnFenced } from "../persistence/store.ts";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -178,7 +179,7 @@ export const warmCodexSession = Effect.fnUntraced(function*({ sessionId, ...para
  * interrupt would have Codex record it as one the user made, which the turn continued
  * after the restart is not to believe.
  */
-export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult, StoreError, ActiveTurns> {
+export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnParams): Effect.fn.Return<TurnResult, StoreError | TurnFenced, ActiveTurns> {
   const { prompt, resumeSession, threadKey, chatId, messageId, persistence } = params;
   const activeTurns = yield* ActiveTurns;
   const guardrailRecoveryDepth = params.guardrailRecoveryDepth ?? 0;
@@ -189,7 +190,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   let interrupted = false;
   let responseCompleted = false;
   const pendingResponseId = yield* persistence.createPendingResponse(chatId, messageId, resumeSession);
-  yield* persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
+  yield* persistence.updateActiveTurnPendingResponseId(pendingResponseId);
   const projection = responseProjection(pendingResponseId);
   // Why the turn is stopped, once it is; and its letting go of the conversation.
   const stopped = yield* Deferred.make<never, TurnStopped | GuardrailStopped>();
@@ -203,7 +204,6 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
   };
   const commandPolicy = createCommandEventPolicy({
     persistence,
-    threadKey,
     chatId,
     messageId,
     onBlocked: (reason) => Effect.asVoid(Deferred.fail(stopped, new GuardrailStopped({ reason }))),
@@ -221,7 +221,7 @@ export const executeCodexTurn = Effect.fnUntraced(function*(params: CodexTurnPar
       case "thread.started":
         sessionId = event.thread_id;
         yield* persistence.updatePendingSessionId(pendingResponseId, sessionId);
-        yield* persistence.updateActiveTurnSessionId(threadKey, sessionId);
+        yield* persistence.updateActiveTurnSessionId(sessionId);
         break;
       case "item.started":
       case "item.updated":

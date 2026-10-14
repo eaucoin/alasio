@@ -1,4 +1,4 @@
-import { Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
+import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, FiberSet, HashMap, Layer, Option, Ref, Schema } from "effect";
 
 import {
   type AttachedTurn,
@@ -8,6 +8,9 @@ import {
   type HarnessUnavailable,
   type NoServiceMounted,
   NoWorkspaceMounted,
+  type OwnTurn,
+  type OwnTurns,
+  harnessDisplayName,
   harnessLabelOf,
 } from "../harness/index.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
@@ -17,12 +20,12 @@ import type { GoalTurnRequest } from "../operator/goal-control.ts";
 import { type Mount, mountOf } from "../persistence/conversation-repository.ts";
 import type { PromptJob, PromptJobState } from "../persistence/prompt-job-repository.ts";
 import type { StoreError } from "../persistence/sql.ts";
-import { Store } from "../persistence/store.ts";
+import type { Turn, TurnOutcome } from "../persistence/turn-repository.ts";
+import { Store, type TurnFenced } from "../persistence/store.ts";
 import { SessionSandboxes } from "../sandbox/index.ts";
 import type { ChatId } from "../telegram/client.ts";
 import { ReceivedFiles } from "../telegram/files.ts";
 import { Outbox } from "../telegram/outbox.ts";
-import { WorkflowHooks } from "../workflow/hook-server.ts";
 import { parseWorkspace } from "../workspace/kind.ts";
 import { keepPanel } from "../operator/panel.ts";
 import { truncateText } from "../operator/text.ts";
@@ -80,9 +83,6 @@ interface SessionTurn extends TurnRequest {
   readonly attachedTurn: AttachedTurn | null;
 }
 
-/** How a turn ended: completed, without its answer, interrupted by the operator, or stopped by alasio stopping. */
-type TurnOutcome = "completed" | "incomplete" | "interrupted" | "stopped";
-
 /**
  * What a concurrent prompt's buttons (steer, queue, swerve, discard) carry: its prompt
  * job, held for the operator's choice, and its prompt. A type rather than an interface,
@@ -107,8 +107,12 @@ export class ConversationBusy extends Schema.TaggedError<ConversationBusy>()("Co
   message: Schema.String,
 }) {}
 
-/** Why a turn could not run: no harness to run it on, one that cannot run it, or alasio's store failing. */
-export type TurnError = NoServiceMounted | HarnessUnavailable | GoalTurnsUnsupported | StoreError;
+/**
+ * Why a turn could not run: no harness to run it on, one that cannot run it, another turn
+ * holding the conversation, alasio's store failing, or another turn claiming the
+ * conversation as it ran.
+ */
+export type TurnError = NoServiceMounted | HarnessUnavailable | GoalTurnsUnsupported | ConversationBusy | StoreError | TurnFenced;
 
 /** What a turn that ended without its answer shows: that it did not complete, and why, when the harness said. */
 function notCompleted(harnessName: string, blocks: readonly ResponseBlock[]): string {
@@ -134,7 +138,7 @@ export class Turns extends Context.Service<Turns, {
   readonly submit: (prompt: QueuedPrompt) => Effect.Effect<void, StoreError>;
   /** Makes sure the conversation's worker is draining its prompt jobs. */
   readonly schedule: (conversationId: string) => Effect.Effect<void>;
-  /** Settles what becomes of a prompt job; a job made pending again is scheduled. The job as it is now. */
+  /** Settles what becomes of a prompt job, its priority kept unless given; a job made pending again is scheduled. The job as it is now. */
   readonly setPromptDisposition: (jobId: string, state: PromptJobState, priority?: number) => Effect.Effect<PromptJob | null, StoreError>;
   /** Runs a turn on the conversation's mounted session now: whether its response completed. */
   readonly run: (request: TurnRequest) => Effect.Effect<boolean, TurnError>;
@@ -154,7 +158,7 @@ export class Turns extends Context.Service<Turns, {
   static readonly layer = (): Layer.Layer<
     Turns,
     never,
-    Store | Outbox | WorkflowHooks | Harnesses | ActiveTurns | ReceivedFiles
+    Store | Outbox | Harnesses | ActiveTurns | ReceivedFiles
   > => Layer.effect(Turns, makeTurns());
 }
 
@@ -187,15 +191,17 @@ const makeTurns = Effect.fnUntraced(function*() {
 
   /**
    * One turn through `harness` in the mount's folder, from its status message to its
-   * reply: its outcome, and whether its response completed. Interrupted, as alasio stops,
-   * the turn is left for after the restart: the restart recorded for it to continue
-   * then, or its completed response for delivery, and its status message saying so.
+   * reply: its outcome, and whether its response completed, run while its conversation is
+   * held busy for it (runSessionTurn). Every write of the turn's, and its end, holds only
+   * under the epoch it claimed. Interrupted, as alasio stops, the turn is left for after the
+   * restart: the restart recorded for it to continue then, or its completed response for
+   * delivery, and its status message saying so.
    */
   const runTurn = Effect.fnUntraced(function*(
     harness: Harness,
     mount: Mount,
     { conversationId, chatId, messageId, prompt, existingSession, attachedTurn, jobId = null }: Omit<SessionTurn, "traceparent">,
-  ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted | StoreError> {
+  ): Effect.fn.Return<{ readonly outcome: TurnOutcome; readonly completed: boolean }, GoalTurnsUnsupported | NoWorkspaceMounted | StoreError | TurnFenced> {
     if (attachedTurn && !harness.supportsGoals) {
       return yield* new GoalTurnsUnsupported({ harness: harness.displayName });
     }
@@ -208,29 +214,31 @@ const makeTurns = Effect.fnUntraced(function*() {
       yield* Effect.annotateCurrentSpan("alasio.volume.id", workspace.volumeId);
     }
     const modelChoice = yield* store.getModelChoice(conversationId, harness.name);
-    yield* store.upsertActiveTurn({
-      conversationId,
-      chatId: String(chatId),
-      messageId: String(messageId),
-      sessionId: existingSession ?? null,
-      harness: harness.name,
-      prompt,
-    });
-    let responseCompleted: boolean | null = null;
-    /**
-     * What a job's turn records of its progress, for a restart to know what became of its
-     * prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is not
-     * recorded is never sent, and a restart never misjudges the prompt of a turn that ran.
-     */
-    const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
-      jobId ? Effect.orDie(record(jobId)) : Effect.void;
     return yield* Effect.scoped(Effect.gen(function*() {
-      const posted = yield* status.statusUpdates({ chatId, sessionId: existingSession ?? null, harnessName: harness.displayName });
+      // Claimed, the turn's writes and its harness's hold until another turn claims the conversation.
+      const epoch = yield* store.claimTurn({
+        conversationId,
+        chatId: String(chatId),
+        messageId: String(messageId),
+        sessionId: existingSession ?? null,
+        harness: harness.name,
+        prompt,
+      });
+      const persistence = store.turnPersistence(conversationId, epoch);
+      let responseCompleted: boolean | null = null;
+      /**
+       * What a job's turn records of its progress, for a restart to know what became of its
+       * prompt. The turn dies on a record it cannot make: so a prompt whose dispatch is not
+       * recorded is never sent, and a restart never misjudges the prompt of a turn that ran.
+       */
+      const recordJob = (record: (jobId: string) => Effect.Effect<void, StoreError>): Effect.Effect<void> =>
+        jobId ? Effect.orDie(record(jobId)) : Effect.void;
+      const posted = yield* status.statusUpdates({ chatId, conversationId, epoch, harnessName: harness.displayName });
 
       /** Leaves the turn, as alasio stops, for after the restart. */
       const leaveForRestart = Effect.gen(function*() {
         const turn = yield* store.getActiveTurn(conversationId);
-        if (!turn) {
+        if (!turn || Number(turn.epoch) !== epoch) {
           // The turn had already let go of the conversation.
           return;
         }
@@ -238,11 +246,11 @@ const makeTurns = Effect.fnUntraced(function*() {
         const completed = responseCompleted
           ?? (pendingResponseId !== null && (yield* store.getCompletedResponsesPendingDelivery).some((response) => response.id === pendingResponseId));
         if (completed) {
-          yield* store.clearActiveTurn(conversationId, pendingResponseId);
-          yield* store.clearRestartEvent(conversationId);
+          yield* store.endTurn(conversationId, epoch, "completed");
           yield* Effect.logInfo(`Leaving completed response ${pendingResponseId} for post-restart delivery`);
         } else {
-          yield* store.recordExternalRestartEvent(conversationId);
+          yield* store.recordExternalRestartEvent(conversationId, epoch);
+          yield* store.setTurnStatus(conversationId, epoch, "interrupted");
           yield* Effect.logInfo(`Leaving active turn ${conversationId} for post-restart recovery because the service is stopping`);
         }
         yield* status.restarting(chatId, yield* Deferred.await(posted), harness.displayName);
@@ -250,9 +258,8 @@ const makeTurns = Effect.fnUntraced(function*() {
         Effect.catch((error) => Effect.logError(`Could not leave turn ${conversationId} for after the restart: ${error.message}`)),
       );
 
-      /** Lets go of the conversation, with nothing of the turn left for a restart. */
-      const letGo = (pendingResponseId: string) =>
-        store.clearActiveTurn(conversationId, pendingResponseId).pipe(Effect.andThen(store.clearRestartEvent(conversationId)));
+      /** Lets go of the conversation, the turn ended as `outcome` says, with nothing of it left for a restart. */
+      const letGo = (outcome: TurnOutcome) => store.endTurn(conversationId, epoch, outcome);
 
       return yield* Effect.gen(function*() {
         const queryResult = yield* harness.runTurn({
@@ -263,7 +270,8 @@ const makeTurns = Effect.fnUntraced(function*() {
           messageId: String(messageId),
           workingDirectory,
           modelChoice,
-          persistence: store,
+          persistence,
+          ownTurns: ownTurnsOf(conversationId, chatId, harness),
           attachedTurn,
           onPromptDispatched: recordJob(store.markPromptJobDispatched),
           onTransportStarted: ({ sessionId, turnId }) => recordJob((id) => store.markPromptJobUpstreamStarted(id, sessionId, turnId)),
@@ -281,12 +289,12 @@ const makeTurns = Effect.fnUntraced(function*() {
         responseCompleted = queryResult.responseCompleted;
         const shown = yield* Deferred.await(posted);
         if (newSessionId && !existingSession) {
-          yield* store.setSessionId(conversationId, newSessionId);
+          yield* persistence.updateActiveTurnSessionId(newSessionId);
           yield* Effect.annotateCurrentSpan("alasio.session.id", newSessionId);
         }
         if (interrupted) {
           yield* status.finishWithoutResponse({ chatId, pendingResponseId, status: shown, harnessName: harness.displayName });
-          yield* letGo(pendingResponseId);
+          yield* letGo("interrupted");
           return { outcome: "interrupted", completed: false } as const;
         }
         if (!responseCompleted) {
@@ -296,7 +304,7 @@ const makeTurns = Effect.fnUntraced(function*() {
             status: shown,
             statusText: notCompleted(harness.displayName, blockSequence),
           });
-          yield* letGo(pendingResponseId);
+          yield* letGo("incomplete");
           return { outcome: "incomplete", completed: false } as const;
         }
         // The response is complete in the store, and delivered from there if its handoff fails.
@@ -306,10 +314,33 @@ const makeTurns = Effect.fnUntraced(function*() {
           Effect.catch((error) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${error.message}`)),
           Effect.catchDefect((defect) => Effect.logError(`Final response handoff deferred for ${conversationId}: ${errorText(defect)}`)),
         );
-        yield* letGo(pendingResponseId);
+        yield* letGo("completed");
         return { outcome: "completed", completed: true } as const;
-      }).pipe(Effect.onInterrupt(() => leaveForRestart));
+      }).pipe(
+        Effect.onInterrupt(() => leaveForRestart),
+        // A turn that failed lets go of its conversation, said so; one interrupted is left for the restart.
+        Effect.onError((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : letGo("failed").pipe(Effect.catch((error) => Effect.logError(`Could not end failed turn ${conversationId}: ${error.message}`)))
+        ),
+      );
     }));
+  });
+
+  /**
+   * How the conversation's harness claims it for a turn it starts on its own, in the chat:
+   * as alasio's turns are claimed, the turn ending under the epoch it claimed.
+   */
+  const ownTurnsOf = (conversationId: string, chatId: ChatId, harness: Harness): OwnTurns => ({
+    claim: (messageId, sessionId) =>
+      Effect.map(
+        store.claimTurn({ conversationId, chatId: String(chatId), messageId, sessionId, harness: harness.name, prompt: null }),
+        (epoch): OwnTurn => ({
+          persistence: store.turnPersistence(conversationId, epoch),
+          end: (outcome) => Effect.asVoid(store.endTurn(conversationId, epoch, outcome)),
+        }),
+      ),
   });
 
   /**
@@ -320,8 +351,21 @@ const makeTurns = Effect.fnUntraced(function*() {
   const runSessionTurn = Effect.fnUntraced(function*(mount: Mount, turn: SessionTurn): Effect.fn.Return<boolean, TurnError> {
     const harness = yield* harnesses.requireForMount(mount);
     const labels = { "alasio.harness": harness.name };
+    // Held busy before it claims the conversation, as one decision, and until it has let go
+    // of it; refused where another turn holds it, before it is a turn at all. Once it has
+    // let go, the conversation's worker is scheduled, for what waits on it.
+    return yield* Effect.scoped(Effect.gen(function*() {
+      if (!(yield* activeTurns.reserve(turn.conversationId))) {
+        return yield* new ConversationBusy({ message: `${harness.displayName} is already working in this conversation.` });
+      }
+      return yield* measuredTurn(harness, mount, turn, labels);
+    })).pipe(Effect.ensuring(schedule(turn.conversationId)));
+  }, withLogScope(LOG_SCOPE));
+
+  /** A turn of `harness`'s, as the span `alasio.turn`, and counted and timed by its outcome. */
+  const measuredTurn = Effect.fnUntraced(function*(harness: Harness, mount: Mount, turn: SessionTurn, labels: { readonly "alasio.harness": string }): Effect.fn.Return<boolean, TurnError> {
     const startedAt = yield* Clock.currentTimeMillis;
-    let outcome: TurnOutcome | "failed" = "failed";
+    let outcome: TurnOutcome = "failed";
     runningTurns.add(1, labels);
     const { completed } = yield* runTurn(harness, mount, turn).pipe(
       Effect.tap((settled) => Effect.sync(() => {
@@ -394,6 +438,8 @@ const makeTurns = Effect.fnUntraced(function*() {
           traceparent: job.traceparent,
         })),
         Effect.flatMap((completed) => store.setPromptJobDisposition(job.id, completed ? "completed" : "cancelled")),
+        // Another turn took the conversation as this one was to start: the job waits for it to end, first in line as it was.
+        Effect.catchTag("ConversationBusy", () => store.setPromptJobDisposition(job.id, "pending", job.priority)),
         Effect.catch((error) => failJob(job, error)),
         Effect.catchDefect((defect) => failJob(job, defect)),
       );
@@ -446,6 +492,15 @@ const makeTurns = Effect.fnUntraced(function*() {
     yield* outbox.enqueueText({ chatId, text: question.text, options: { reply_markup: question.options.reply_markup } });
   });
 
+  /** Says `text` on the status message of a turn the last alasio left running, where it has one. */
+  const editLeftStatus = (turn: Turn, text: string): Effect.Effect<void> =>
+    turn.status_outbox_id
+      ? outbox.enqueueEdit(turn.status_outbox_id, { chatId: turn.channel, text }).pipe(
+        Effect.asVoid,
+        Effect.catch((error) => Effect.logWarning(`Could not queue an edit of turn ${turn.thread_key}'s status message: ${error.message}`)),
+      )
+      : Effect.void;
+
   return Turns.of({
     submit: Effect.fnUntraced(function*({ conversationId, chatId, messageId, prompt, fileIds, visibleText }: QueuedPrompt) {
       const job = yield* store.enqueuePromptJob({
@@ -464,7 +519,7 @@ const makeTurns = Effect.fnUntraced(function*() {
       yield* schedule(conversationId);
     }),
     schedule,
-    setPromptDisposition: Effect.fnUntraced(function*(jobId, state, priority = 0) {
+    setPromptDisposition: Effect.fnUntraced(function*(jobId, state, priority) {
       yield* store.setPromptJobDisposition(jobId, state, priority);
       const job = yield* store.getPromptJob(jobId);
       if (state === "pending" && job) {
@@ -507,13 +562,17 @@ const makeTurns = Effect.fnUntraced(function*() {
       return sessionId;
     }),
     reconcilePersistentState: Effect.gen(function*() {
+      // A turn whose job the agent finished ended so, whatever stopped alasio as it did.
       for (const conversationId of yield* store.recoverPromptJobsAfterRestart) {
-        yield* store.clearActiveTurn(conversationId);
-        yield* store.clearRestartEvent(conversationId);
+        const turn = yield* store.getActiveTurn(conversationId);
+        if (turn) {
+          yield* store.endTurn(conversationId, Number(turn.epoch), "completed");
+          yield* editLeftStatus(turn, `${harnessDisplayName(turn.harness)} finished this turn as alasio stopped.`);
+        }
       }
     }),
     flushCompletedResponses,
-    recoverInterruptedTurns: recoverInterruptedTurns(store),
+    recoverInterruptedTurns: recoverInterruptedTurns(store, editLeftStatus),
     resumePendingPrompts: Effect.flatMap(store.listPendingPromptConversations, (conversationIds) => Effect.forEach(conversationIds, schedule, { discard: true })),
   });
 }, withLogScope(LOG_SCOPE));

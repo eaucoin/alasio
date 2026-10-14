@@ -1,7 +1,3 @@
-import { Effect } from "effect";
-
-import { resolveHookPort } from "../shared/runtime-constants.ts";
-
 /** How an agent waits on a GitHub Actions run: watching it, polling it, or checking its status. */
 export type WorkflowWaitType = "watch" | "poll" | "check";
 
@@ -9,14 +5,6 @@ export type WorkflowWaitType = "watch" | "poll" | "check";
 export interface DetectedWorkflowWait {
   readonly runId: string;
   readonly waitType: WorkflowWaitType;
-}
-
-/** What notifyWorkflowWait posts to the workflow hook server. */
-export interface WorkflowHookNotification {
-  readonly session_id: string;
-  readonly run_id: string;
-  readonly wait_type: WorkflowWaitType;
-  readonly command: string;
 }
 
 const WORKFLOW_WAIT_PATTERNS: readonly { readonly pattern: RegExp; readonly waitType: WorkflowWaitType }[] = [
@@ -35,15 +23,7 @@ export function detectWorkflowWait(command: string): DetectedWorkflowWait | null
   return null;
 }
 
-/** Tells the workflow hook server (src/workflow/hook-server.ts) of a wait; a failure to is only logged. */
-export const notifyWorkflowWait = (notification: WorkflowHookNotification): Effect.Effect<void> =>
-  Effect.tryPromise(() =>
-    fetch(`http://localhost:${resolveHookPort()}/hook/workflow`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(notification),
-    })
-  ).pipe(
-    Effect.flatMap((response) => (response.ok ? Effect.void : Effect.logWarning(`Workflow hook POST returned ${response.status}`))),
-    Effect.catch((error) => Effect.logWarning(`Workflow hook POST failed: ${error.cause}`)),
-  );
+/** What a turn waiting on `wait` says it waits on (turns.waiting_on), as its status message shows it. */
+export function workflowWaitText({ runId, waitType }: DetectedWorkflowWait): string {
+  return `workflow run ${runId} (${waitType})`;
+}

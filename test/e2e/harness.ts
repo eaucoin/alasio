@@ -486,7 +486,12 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       ? { alasio: { repository: `${PUSHED}/alasio-codex-stand-in-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
       : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
     alasio: {
-      env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
+      env: {
+        TELEGRAM_API_ROOT: urlOf(TELEGRAM),
+        ALASIO_CODEX_BIN: CODEX_STAND_IN,
+        // Where 6.0.0's workflow hook server listened, as the box's configuration says, which the cut-over removes.
+        ...(of === "previous" ? { ALASIO_HOOK_PORT: "8789" } : {}),
+      },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
     },
@@ -675,13 +680,13 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
 
 /**
  * The upgrade shard's cut-over, as the box runs it: upgrades/from-<PREVIOUS>.sh, as root,
- * kubectl reaching the cluster by the run's kubeconfig, its UPGRADE this checkout's
- * `alasio upgrade` as this user, the run's install configuration of this checkout laid over
- * the configuration first (./release-config.ts), as this checkout's command line, of no
- * release, pins no images of its own, and its UPGRADE_CHECK this checkout's `alasio upgrade
- * --check` as this user and sudo asking this user for no password; failing at `failAt`, a
- * point the script names, when given. What it came to; from its success on, the run runs
- * this checkout's `alasio`.
+ * kubectl reaching the cluster by the run's kubeconfig, its CONFIG the run's configuration's
+ * file, its UPGRADE this checkout's `alasio upgrade` as this user, the run's install
+ * configuration of this checkout laid over the configuration first (./release-config.ts), as
+ * this checkout's command line, of no release, pins no images of its own, and its
+ * UPGRADE_CHECK this checkout's `alasio upgrade --check` as this user and sudo asking this
+ * user for no password; failing at `failAt`, a point the script names, when given. What it
+ * came to; from its success on, the run runs this checkout's `alasio`.
  */
 export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
   const { work, env, configFile, kubeconfig, release } = current();
@@ -697,7 +702,7 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   const check = `${command(...asOwner, release, "upgrade", "--check")} && ${command("sudo", "-u", user, "sudo", "-n", "true")}`;
   const out = join(work, "cut-over");
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;

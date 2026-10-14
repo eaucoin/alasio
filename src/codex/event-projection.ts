@@ -2,8 +2,7 @@ import type { FileChangeItem as SdkFileChangeItem } from "@openai/codex-sdk";
 import { Effect } from "effect";
 
 import type { MessagePhase, v2 } from "../../.types/codex/index.js";
-import type { StoreError } from "../persistence/sql.ts";
-import type { Store } from "../persistence/store.ts";
+import type { TurnPersistence, TurnWrite } from "../persistence/store.ts";
 import type { PassedThroughItem } from "./app-server/protocol.ts";
 
 /*
@@ -117,7 +116,7 @@ export type ResponseBlock =
   };
 
 /** Where a pending response's blocks are stored: alasio's store. */
-export type PendingResponseStore = Pick<Store["Service"], "appendBlocksToPending" | "markPendingResponseComplete">;
+export type PendingResponseStore = Pick<TurnPersistence, "appendBlocksToPending" | "markPendingResponseComplete">;
 
 /**
  * A turn's response in progress: its blocks so far, and those appended since it was
@@ -146,11 +145,11 @@ export function appendBlock(projection: ResponseProjection, block: ResponseBlock
 }
 
 /** Stores the blocks appended since the response was last stored, if any were. */
-export const storeBlocks = (projection: ResponseProjection, persistence: PendingResponseStore): Effect.Effect<void, StoreError> =>
+export const storeBlocks = (projection: ResponseProjection, persistence: PendingResponseStore): TurnWrite<void> =>
   Effect.suspend(() => (projection.unstored.length === 0 ? Effect.void : persistence.appendBlocksToPending(projection.pendingResponseId, projection.unstored.splice(0))));
 
 /** Stores the response's last blocks, then marks it complete, for delivery to read it whole. */
-export const completeResponse = (projection: ResponseProjection, persistence: PendingResponseStore): Effect.Effect<void, StoreError> =>
+export const completeResponse = (projection: ResponseProjection, persistence: PendingResponseStore): TurnWrite<void> =>
   storeBlocks(projection, persistence).pipe(Effect.andThen(persistence.markPendingResponseComplete(projection.pendingResponseId)));
 
 export function isVisibleCodexItem(item: CodexItem): boolean {

@@ -66,6 +66,8 @@ import type { PodRef } from "../../kube/busy.ts";
 import type { BaymaEndpoint, SandboxError } from "../../kube/sandboxes.ts";
 import type { ModelChoice } from "../../persistence/conversation-repository.ts";
 import type { StoreError } from "../../persistence/sql.ts";
+import type { TurnFenced } from "../../persistence/store.ts";
+import type { TurnOutcome } from "../../persistence/turn-repository.ts";
 import { type BaymaMcpServer, type HostBaymaScope, type NoFolderWorkspaces, noFolderBayma } from "../../mcp/bayma.ts";
 import { isBlockedDbCommand } from "../../policy/db-guardrail.ts";
 import { extractShellCommands } from "../../policy/embedded-shell.ts";
@@ -75,7 +77,7 @@ import { withLogScope } from "../../shared/log.ts";
 import type { SessionError } from "../../sandbox/index.ts";
 import { outsideTraces } from "../../telemetry/index.ts";
 import { ActiveTurns, type RunningTurn, type StopReason, stopReasonText } from "../active-turns.ts";
-import type { TransportTurn, TurnParams, TurnPersistence, TurnResult } from "../index.ts";
+import type { OwnTurn, OwnTurns, TransportTurn, TurnParams, TurnPersistence, TurnResult } from "../index.ts";
 import { CLAUDE_HARNESS } from "../names.ts";
 import { buildClaudeEnv } from "./env.ts";
 import { cacheReadTokensFromUsage, projectAssistantMessageToItems, projectResultMessage } from "./event-projection.ts";
@@ -97,6 +99,9 @@ const LOG_SCOPE = "claude-live";
 
 /** How long a turn waits for a steered prompt the CLI has not answered once its own prompt is answered. */
 const UNANSWERED_PROMPT_GRACE = "15 seconds";
+
+/** The pending response of a CLI turn that has not claimed its conversation: none yet. */
+const UNCLAIMED = "";
 
 /** A background task Claude Code reports live: a shell or agent it started that is still running. */
 export type BackgroundTask = SDKBackgroundTasksChangedMessage["tasks"][number];
@@ -122,16 +127,26 @@ export interface OperatorTurn {
   readonly earlySteers: string[];
   readonly commandPolicy: CommandEventPolicy;
   /** How the turn ended, once it has, and its response stored; or how storing it failed. */
-  readonly done: Deferred.Deferred<TurnResult, StoreError>;
+  readonly done: Deferred.Deferred<TurnResult, StoreError | TurnFenced>;
   /** Its registration as its conversation's running turn, closed as it ends. */
   readonly registration: Scope.Closeable;
   firstEventLogged?: boolean;
   firstVisibleItemLogged?: boolean;
 }
 
-/** A turn Claude Code started on its own, delivered as a reply of its own. */
+/**
+ * A turn Claude Code started on its own, delivered as a reply of its own. It holds its
+ * conversation busy, and claims it, as any turn does; where another turn holds it as it
+ * starts, it runs unclaimed, its blocks kept here, and claims the conversation once that
+ * turn has let go, to deliver its reply.
+ */
 export interface CliTurn {
-  readonly projection: ResponseProjection;
+  /** Its response so far: its pending response's, once it has claimed its conversation; under UNCLAIMED, unstored, until then. */
+  projection: ResponseProjection;
+  /** Its claim of its conversation, and the policy of its commands under it; null until it claims it. */
+  claim: { readonly own: OwnTurn; readonly commandPolicy: CommandEventPolicy } | null;
+  /** How the operator's controls reach it, once it holds its conversation. */
+  readonly running: RunningTurn;
   /** Prompts steered into it. */
   readonly promptUuids: Set<string>;
   /** Its registration as its conversation's running turn, closed as it ends. */
@@ -160,11 +175,15 @@ export interface ClaudeHost {
   closeReason: string | null;
   current: OperatorTurn | null;
   cliTurn: CliTurn | null;
+  /** Done once the last of the CLI turns' replies waiting for the conversation is delivered; null while none waits. */
+  reportsWaiting: Deferred.Deferred<void> | null;
   backgroundTasks: BackgroundTask[];
   /** Prompts of finished turns, whose late results are ignored. */
   readonly retiredUuids: Set<string>;
   readonly interruptedUuids: Set<string>;
   persistence: TurnPersistence;
+  /** How a turn the CLI starts on its own claims the conversation: as the latest operator turn's says. */
+  ownTurns: OwnTurns;
   chatId: string;
   messageId: string;
   onBackgroundResponse: Effect.Effect<void>;
@@ -185,7 +204,7 @@ export interface ClaudeLiveSessionsOptions {
 
 /** The live Claude Code processes of one working directory, one per conversation, for as long as their scope is open. */
 export interface ClaudeLiveSessions {
-  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError>;
+  readonly runTurn: (params: TurnParams) => Effect.Effect<TurnResult, StoreError | TurnFenced>;
   /** The live process serving a conversation, if any (for tests and diagnostics). */
   readonly get: (threadKey: string) => ClaudeHost | null;
 }
@@ -221,11 +240,20 @@ const releaseCliTurn = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void>
     return Scope.close(cliTurn.registration, Exit.void);
   }).pipe(Effect.andThen(host.notifyIdle));
 
-/** Lets go of a CLI turn's response, which, never completed, is never delivered: it only tidies, so a failure is only said. */
-const letGoOfResponse = (host: ClaudeHost, cliTurn: CliTurn): Effect.Effect<void> =>
-  host.persistence.markPendingAsPosted(cliTurn.projection.pendingResponseId).pipe(
-    Effect.catch((error) => Effect.logWarning(`could not let go of a CLI turn's response thread=${host.threadKey}: ${error.message}`)),
-  );
+/**
+ * Ends a CLI turn as `outcome` says, with no reply: its response, never completed, let go
+ * of, and its claim ended, where it claimed its conversation. It only tidies, so a failure
+ * is only said.
+ */
+const endCliTurn = (host: ClaudeHost, cliTurn: CliTurn, outcome: TurnOutcome): Effect.Effect<void> => {
+  const claim = cliTurn.claim;
+  return claim
+    ? claim.own.persistence.markPendingAsPosted(cliTurn.projection.pendingResponseId).pipe(
+      Effect.andThen(claim.own.end(outcome)),
+      Effect.catch((error) => Effect.logWarning(`could not end a CLI turn thread=${host.threadKey}: ${error.message}`)),
+    )
+    : Effect.void;
+};
 
 /**
  * The live processes of `workingDirectory`, for as long as the scope they are made in
@@ -333,7 +361,25 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     if (host.cliTurn) {
       const cliTurn = host.cliTurn;
       host.cliTurn = null;
-      yield* letGoOfResponse(host, cliTurn);
+      yield* endCliTurn(host, cliTurn, "incomplete");
+      yield* releaseCliTurn(host, cliTurn);
+    }
+  });
+
+  /**
+   * Settles the turn a write was refused for, as another turn has claimed the conversation
+   * since: it is ended, as it no longer holds it, and the process reads on.
+   */
+  const settleFenced = Effect.fnUntraced(function*(host: ClaudeHost, fenced: TurnFenced) {
+    yield* Effect.logWarning(`a write of a turn superseded was refused thread=${host.threadKey}: ${fenced.message}`);
+    const current = host.current;
+    if (current && current.persistence.epoch === fenced.epoch) {
+      host.current = null;
+      yield* finishOperatorTurn(host, current);
+    }
+    const cliTurn = host.cliTurn;
+    if (cliTurn && cliTurn.claim?.own.persistence.epoch === fenced.epoch) {
+      host.cliTurn = null;
       yield* releaseCliTurn(host, cliTurn);
     }
   });
@@ -347,19 +393,66 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         )),
     );
 
-  /** A turn Claude Code started on its own, typically to report a settled background task. */
+  /**
+   * Claims the conversation for a CLI turn that holds it busy: its pending response begun,
+   * with the blocks it has so far. A claim whose response could not be begun, or its blocks
+   * stored, is ended.
+   */
+  const claimCliTurn = Effect.fnUntraced(function*(host: ClaudeHost, cliTurn: CliTurn) {
+    const messageId = `claude-cli-turn:${randomUUID()}`;
+    const own = yield* host.ownTurns.claim(messageId, host.sessionId);
+    yield* Effect.gen(function*() {
+      const pendingResponseId = yield* own.persistence.createPendingResponse(host.chatId, messageId, host.sessionId);
+      cliTurn.claim = { own, commandPolicy: createCommandEventPolicy({ persistence: own.persistence, chatId: host.chatId, messageId }) };
+      cliTurn.projection = { ...cliTurn.projection, pendingResponseId };
+      yield* storeBlocks(cliTurn.projection, own.persistence);
+    }).pipe(
+      // Ended here, and so by nothing after.
+      Effect.tapError(() =>
+        Effect.sync(() => void (cliTurn.claim = null)).pipe(
+          Effect.andThen(own.end("failed")),
+          Effect.catch((error) => Effect.logWarning(`could not end a CLI turn's claim thread=${host.threadKey}: ${error.message}`)),
+        )
+      ),
+    );
+  });
+
+  /** The options a CLI turn holds the conversation busy with. */
+  const cliTurnRegistration = (host: ClaudeHost) => ({ onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) });
+
+  /**
+   * Delivers a CLI turn's reply, once it has claimed its conversation: its response
+   * completed and its claim ended, then the conversation let go of, however that went,
+   * and the reply handed to delivery.
+   */
+  const deliverCliTurn = (host: ClaudeHost, cliTurn: CliTurn, own: OwnTurn): Effect.Effect<void, StoreError | TurnFenced> =>
+    completeResponse(cliTurn.projection, own.persistence).pipe(
+      Effect.andThen(own.end("completed")),
+      Effect.andThen(Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=true`)),
+      Effect.onError(() => endCliTurn(host, cliTurn, "failed")),
+      Effect.ensuring(releaseCliTurn(host, cliTurn)),
+      Effect.andThen(host.onBackgroundResponse),
+    );
+
+  /**
+   * A turn Claude Code started on its own, typically to report a settled background task.
+   * It holds the conversation busy and claims it, unless another turn holds it, or a report
+   * before it still waits to: then it runs unclaimed, and its reply waits behind theirs.
+   */
   const ensureCliTurn = Effect.fnUntraced(function*(host: ClaudeHost) {
     if (host.cliTurn) {
       return host.cliTurn;
     }
-    const pendingResponseId = yield* host.persistence.createPendingResponse(host.chatId, `claude-cli-turn:${randomUUID()}`, host.sessionId);
     const stop = Effect.fnUntraced(function*(reason: StopReason) {
+      if (host.cliTurn !== cliTurn) {
+        return;
+      }
       const abortReason = stopReasonText(reason);
       yield* Effect.logInfo(`interrupting CLI turn thread=${host.threadKey} reason=${JSON.stringify(abortReason)}`);
       yield* interrupt(host, abortReason);
       if (host.cliTurn === cliTurn) {
         host.cliTurn = null;
-        yield* letGoOfResponse(host, cliTurn);
+        yield* endCliTurn(host, cliTurn, "interrupted");
         yield* releaseCliTurn(host, cliTurn);
       }
     }, withLogScope(LOG_SCOPE));
@@ -372,16 +465,25 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       return yield* host.channel.push(buildClaudeUserMessage(steerPrompt, uuid));
     }, withLogScope(LOG_SCOPE));
     const cliTurn: CliTurn = {
-      projection: responseProjection(pendingResponseId),
+      projection: responseProjection(UNCLAIMED),
+      claim: null,
+      // The conversation is busy while it runs, so new messages get the usual Steer/Queue
+      // choice; an operator's turn running already keeps the conversation its own.
+      running: { cliInitiated: true, stop, steer },
       promptUuids: new Set(),
       registration: yield* Scope.make(),
     };
     host.cliTurn = cliTurn;
-    // The conversation is busy while it runs, so new messages get the usual Steer/Queue
-    // choice; an operator's turn running already keeps the conversation its own.
-    const running: RunningTurn = { cliInitiated: true, stop, steer };
-    yield* activeTurns.register(host.threadKey, running, { onlyIfIdle: true, workspace: workspacePod?.(host.threadKey) }).pipe(Scope.provide(cliTurn.registration));
-    yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
+    const held = host.reportsWaiting === null
+      && (yield* activeTurns.register(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration)));
+    if (held) {
+      yield* claimCliTurn(host, cliTurn).pipe(
+        Effect.onError(() => Effect.sync(() => void (host.cliTurn = null)).pipe(Effect.andThen(releaseCliTurn(host, cliTurn)))),
+      );
+      yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)}`);
+    } else {
+      yield* Effect.logInfo(`cli-turn.started thread=${host.threadKey} session=${String(host.sessionId).slice(0, 8)} unclaimed: another turn holds the conversation, or a report waits to`);
+    }
     return cliTurn;
   });
 
@@ -390,21 +492,45 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     host.cliTurn = null;
     const projected = projectResultMessage(message);
     const text = projected?.ok ? projected.text?.trim() : `Error: ${projected?.error ?? "Claude did not complete"}`;
-    if (text) {
-      appendBlock(cliTurn.projection, {
-        type: "text",
-        content: text,
-        phase: "final_answer",
-      });
-      yield* completeResponse(cliTurn.projection, host.persistence);
-    } else {
-      yield* host.persistence.markPendingAsPosted(cliTurn.projection.pendingResponseId);
+    if (!text) {
+      yield* endCliTurn(host, cliTurn, "incomplete");
+      yield* Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=false`);
+      yield* releaseCliTurn(host, cliTurn);
+      return;
     }
-    yield* Effect.logInfo(`cli-turn.done thread=${host.threadKey} delivered=${Boolean(text)}`);
-    yield* releaseCliTurn(host, cliTurn);
-    if (text) {
-      yield* host.onBackgroundResponse;
+    appendBlock(cliTurn.projection, {
+      type: "text",
+      content: text,
+      phase: "final_answer",
+    });
+    if (cliTurn.claim) {
+      yield* deliverCliTurn(host, cliTurn, cliTurn.claim.own);
+      return;
     }
+    // Another turn holds the conversation, or a report before this one waits for it: the
+    // reply waits behind that report, then for the conversation to be free, and is then
+    // delivered under a claim of its own. The process reads on meanwhile.
+    const before = host.reportsWaiting;
+    const delivered = yield* Deferred.make<void>();
+    host.reportsWaiting = delivered;
+    yield* (before ? Deferred.await(before) : Effect.void).pipe(
+      Effect.andThen(activeTurns.registerWhenIdle(host.threadKey, cliTurn.running, cliTurnRegistration(host)).pipe(Scope.provide(cliTurn.registration))),
+      Effect.andThen(claimCliTurn(host, cliTurn)),
+      Effect.flatMap(() => (cliTurn.claim ? deliverCliTurn(host, cliTurn, cliTurn.claim.own) : Effect.void)),
+      Effect.catch((error) =>
+        Effect.logWarning(`could not deliver a CLI turn's reply thread=${host.threadKey}: ${error.message}`).pipe(
+          Effect.andThen(endCliTurn(host, cliTurn, "failed")),
+        )
+      ),
+      // However it went, the conversation is let go of, and the report after it may go.
+      Effect.ensuring(releaseCliTurn(host, cliTurn).pipe(
+        Effect.andThen(Deferred.succeed(delivered, undefined)),
+        Effect.andThen(Effect.sync(() => {
+          if (host.reportsWaiting === delivered) host.reportsWaiting = null;
+        })),
+      )),
+      Effect.forkIn(scope),
+    );
   });
 
   const handleResult = Effect.fnUntraced(function*(host: ClaudeHost, message: SDKResultMessage) {
@@ -504,7 +630,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       host.sessionId = message.session_id ?? host.sessionId;
       if (current && host.sessionId) {
         yield* current.persistence.updatePendingSessionId(current.projection.pendingResponseId, host.sessionId);
-        yield* current.persistence.updateActiveTurnSessionId(host.threadKey, host.sessionId);
+        yield* current.persistence.updateActiveTurnSessionId(host.sessionId);
       }
       return;
     }
@@ -529,7 +655,11 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         }
         mapItemToBlocks(item, target.projection);
       }
-      yield* storeBlocks(target.projection, current?.persistence ?? host.persistence);
+      // A CLI turn's blocks are stored once it has claimed its conversation.
+      const writer = current ? current.persistence : host.cliTurn?.claim?.own.persistence;
+      if (writer) {
+        yield* storeBlocks(target.projection, writer);
+      }
       return;
     }
     if (message.type === "result") {
@@ -546,7 +676,9 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
   /** Reads what the process writes until it ends, then settles what it was serving. */
   const consume = Effect.fnUntraced(function*(host: ClaudeHost) {
     const exitError = yield* Stream.fromAsyncIterable(host.sdkQuery, (cause) => new ClaudeCodeError({ cause })).pipe(
-      Stream.runForEach((message) => handleMessage(host, message)),
+      // A write refused, as another turn has claimed the conversation since, ends the turn
+      // it was for, and nothing else.
+      Stream.runForEach((message) => handleMessage(host, message).pipe(Effect.catchTag("TurnFenced", (fenced) => settleFenced(host, fenced)))),
       Effect.as(null),
       Effect.catchTag("ClaudeCodeError", (error) => Effect.succeed(error.cause)),
       // Failing to handle what it wrote, alasio's store failing among it, ends the process
@@ -592,9 +724,8 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
         },
       };
     }
-    const policy = host.current?.commandPolicy ?? createCommandEventPolicy({
+    const policy = host.current?.commandPolicy ?? host.cliTurn?.claim?.commandPolicy ?? createCommandEventPolicy({
       persistence: host.persistence,
-      threadKey: host.threadKey,
       chatId: host.chatId,
       messageId: host.messageId,
     });
@@ -657,12 +788,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       closeReason: null,
       current: null,
       cliTurn: null,
+      reportsWaiting: null,
       backgroundTasks: [],
       retiredUuids: new Set(),
       // Prompts of an interrupted turn whose closing result has not arrived; output
       // until then is that turn's tail, not a turn the CLI started itself.
       interruptedUuids: new Set(),
       persistence,
+      ownTurns: params.ownTurns,
       chatId: params.chatId,
       messageId: params.messageId,
       onBackgroundResponse: Effect.void,
@@ -698,14 +831,14 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
     return host;
   });
 
-  const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult, StoreError> {
+  const runTurn = Effect.fnUntraced(function*(params: TurnParams): Effect.fn.Return<TurnResult, StoreError | TurnFenced> {
     const { prompt, threadKey, chatId, messageId, persistence } = params;
     const turnTimer = createTurnTimer({ harness: CLAUDE_HARNESS, threadKey, resumeSession: params.resumeSession, prompt });
     yield* Effect.logInfo(`Querying Claude Code (resume=${params.resumeSession})`);
     yield* turnTimer("query.start");
     const pendingResponseId = yield* persistence.createPendingResponse(chatId, messageId, params.resumeSession);
-    yield* persistence.updateActiveTurnPendingResponseId(threadKey, pendingResponseId);
-    const done = yield* Deferred.make<TurnResult, StoreError>();
+    yield* persistence.updateActiveTurnPendingResponseId(pendingResponseId);
+    const done = yield* Deferred.make<TurnResult, StoreError | TurnFenced>();
     let host: ClaudeHost | null = null;
     /** Stops the turn, once its process runs it; one still starting is stopped as it ends. */
     const stop = Effect.fnUntraced(function*(reason: StopReason) {
@@ -758,7 +891,6 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       earlySteers: [],
       commandPolicy: createCommandEventPolicy({
         persistence,
-        threadKey,
         chatId,
         messageId,
       }),
@@ -787,6 +919,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       yield* turnTimer("query.created", { mode: started.mode });
       host = started;
       started.persistence = persistence;
+      started.ownTurns = params.ownTurns;
       started.chatId = chatId;
       started.messageId = messageId;
       started.onBackgroundResponse = params.onBackgroundResponse ?? Effect.void;
@@ -805,7 +938,7 @@ export const makeClaudeLiveSessions = Effect.fnUntraced(function*({
       // A reused process sends no new init, so the turn learns its session here.
       if (started.initialized && started.sessionId) {
         yield* persistence.updatePendingSessionId(pendingResponseId, started.sessionId);
-        yield* persistence.updateActiveTurnSessionId(threadKey, started.sessionId);
+        yield* persistence.updateActiveTurnSessionId(started.sessionId);
       }
       if (params.onTransportStarted) {
         yield* params.onTransportStarted({ sessionId: started.sessionId, turnId: null });

@@ -21,9 +21,9 @@ import { type AlasioOptions, alasioServices } from "../src/alasio.ts";
 import { TelegramApiError } from "../src/telegram/client.ts";
 import { Outbox, type OutboxText } from "../src/telegram/outbox.ts";
 import { botApiClient, paramsOf } from "./support/bot-api.ts";
-import { newSchema, run, testDatabaseUrl, testPool, testStore } from "./support/store.ts";
+import { newSchema, run, testDatabaseUrl, testPool, testStore, writerOf } from "./support/store.ts";
 import { recordingTelegram } from "./support/telegram-calls.ts";
-import { noWorkflowHooks, withServices } from "./support/turns.ts";
+import { withServices } from "./support/turns.ts";
 import { eventually } from "./support/wait.ts";
 
 /** A Telegram client for a reporter that only queues replies, never sending or editing itself. */
@@ -38,7 +38,6 @@ function reporterFor(store: Store["Service"], enqueue: (text: OutboxText) => Eff
     Layer.succeed(Store, store),
     unusedClient.layer,
     Layer.succeed(Outbox, Outbox.of({ enqueueText: enqueue, enqueueStatus: () => Effect.succeed("status-1"), enqueueEdit: () => Effect.succeed("edit-1"), deliverDue: Effect.void })),
-    noWorkflowHooks,
   ))));
 }
 
@@ -122,9 +121,9 @@ test("final response does not promote commentary when phased output lacks a fina
 
 test("missing phased final answer does not enqueue fabricated completion text", async () => {
   const store = await codexConversation();
-  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
-  await run(store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Still investigating.", phase: "commentary" }]));
-  await run(store.markPendingResponseComplete(pendingResponseId));
+  const pendingResponseId = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", "9"));
+  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Still investigating.", phase: "commentary" }]));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(pendingResponseId));
   const enqueued: OutboxText[] = [];
   const reporter = reporterFor(store, (item) => Effect.sync(() => {
     enqueued.push(item);
@@ -140,15 +139,15 @@ test("missing phased final answer does not enqueue fabricated completion text", 
 
 test("response recovery exposes only completed responses, their blocks in order", async () => {
   const store = await codexConversation();
-  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
-  await run(store.appendBlocksToPending(pendingResponseId, [
+  const pendingResponseId = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", "9"));
+  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(pendingResponseId, [
     { type: "text", content: "Looking.", phase: "commentary" },
     { type: "tool", name: "Bash" },
   ]));
-  await run(store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "The final answer.", phase: "final_answer" }]));
+  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(pendingResponseId, [{ type: "text", content: "The final answer.", phase: "final_answer" }]));
 
   assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
-  await run(store.markPendingResponseComplete(pendingResponseId));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(pendingResponseId));
   const [completed] = await run(store.getCompletedResponsesPendingDelivery);
   assert.ok(completed);
   assert.deepEqual(completed.blocks.map((block) => block["content"] ?? block["name"]), ["Looking.", "Bash", "The final answer."]);
@@ -157,21 +156,21 @@ test("response recovery exposes only completed responses, their blocks in order"
 
 test("a new response to a message lets go of the one before it that was never delivered", async () => {
   const store = await codexConversation();
-  const first = await run(store.createPendingResponse("123", "9"));
-  await run(store.markPendingResponseComplete(first));
-  const second = await run(store.createPendingResponse("123", "9"));
-  await run(store.markPendingResponseComplete(second));
+  const first = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", "9"));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(first));
+  const second = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", "9"));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(second));
   assert.deepEqual((await run(store.getCompletedResponsesPendingDelivery)).map((response) => response.id), [second]);
 });
 
 test("completed response recovery enqueues one final answer exactly once", async () => {
   const store = await codexConversation();
-  const pendingResponseId = await run(store.createPendingResponse("123", "9"));
-  await run(store.appendBlocksToPending(pendingResponseId, [
+  const pendingResponseId = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", "9"));
+  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(pendingResponseId, [
     { type: "text", content: "Still working.", phase: "commentary" },
     { type: "text", content: "The final answer.", phase: "final_answer" },
   ]));
-  await run(store.markPendingResponseComplete(pendingResponseId));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(pendingResponseId));
   const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
 
   await run(reporter.flushCompletedResponses);
@@ -284,7 +283,6 @@ test("alasio's services wire the durable outbox into final response delivery", a
       pool: await testPool(),
       stateSchema: newSchema(),
       keepCodexLogin: false,
-      hookPort: 0,
       warmLinkedSessions: false,
       defaultHarness: null,
       branch: null,
@@ -293,9 +291,10 @@ test("alasio's services wire the durable outbox into final response delivery", a
     await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
       const store = yield* Store;
       yield* store.setActiveHarness(yield* store.upsertConversation({ chatId: "123", user: { id: 123 } }), CODEX_HARNESS);
-      const pendingResponseId = yield* store.createPendingResponse("123", "9");
-      yield* store.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Delivered durably.", phase: "final_answer" }]);
-      yield* store.markPendingResponseComplete(pendingResponseId);
+      const writer = yield* Effect.promise(() => writerOf(store, CONVERSATION));
+      const pendingResponseId = yield* writer.createPendingResponse("123", "9");
+      yield* writer.appendBlocksToPending(pendingResponseId, [{ type: "text", content: "Delivered durably.", phase: "final_answer" }]);
+      yield* writer.markPendingResponseComplete(pendingResponseId);
       yield* (yield* Turns).flushCompletedResponses;
       assert.deepEqual(yield* store.getCompletedResponsesPendingDelivery, []);
       assert.equal(yield* store.getPendingOutboxCount, 1);
@@ -343,28 +342,29 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
   }));
   await run(store.claimNextPromptJob(CONVERSATION));
   await run(store.markPromptJobUpstreamStarted(original.id, "session-1", "turn-1"));
-  const partialResponseId = await run(store.createPendingResponse("123", "3334", "session-1"));
-  await run(store.appendBlocksToPending(partialResponseId, [{ type: "text", content: "Restarting now.", phase: "commentary" }]));
-  await run(store.upsertActiveTurn({
+  const epoch = await run(store.claimTurn({
     conversationId: CONVERSATION,
     chatId: "123",
     messageId: "3334",
     sessionId: "session-1",
     harness: CODEX_HARNESS,
-    pendingResponseId: partialResponseId,
     prompt: original.prompt,
   }));
-  await run(store.recordRestartEvent({ cause: "self_induced", thread_key: CONVERSATION, channel: "123", thread_ts: "3334", session_id: "session-1" }));
+  const writer = store.turnPersistence(CONVERSATION, epoch);
+  const partialResponseId = await run(writer.createPendingResponse("123", "3334", "session-1"));
+  await run(writer.updateActiveTurnPendingResponseId(partialResponseId));
+  await run(writer.appendBlocksToPending(partialResponseId, [{ type: "text", content: "Restarting now.", phase: "commentary" }]));
+  await run(writer.recordRestartEvent({ cause: "self_induced", channel: "123", thread_ts: "3334", session_id: "session-1" }));
 
   await run(store.recoverPromptJobsAfterRestart);
-  await run(recoverInterruptedTurns(store));
-  await run(recoverInterruptedTurns(store));
+  await run(recoverInterruptedTurns(store, () => Effect.void));
+  await run(recoverInterruptedTurns(store, () => Effect.void));
 
   assert.equal((await run(store.getPromptJob(original.id)))?.state, "interrupted");
   assert.deepEqual(await run(store.getActiveTurns), []);
   assert.equal(await run(store.getRestartEvent(CONVERSATION)), null);
   // The partial response was let go of: completed, it is still never delivered.
-  await run(store.markPendingResponseComplete(partialResponseId));
+  await run(writer.markPendingResponseComplete(partialResponseId));
   assert.deepEqual(await run(store.getCompletedResponsesPendingDelivery), []);
   const continuation = await run(store.claimNextPromptJob(CONVERSATION));
   assert.ok(continuation);
@@ -374,12 +374,12 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
   assert.equal(await run(store.claimNextPromptJob(CONVERSATION)), null, "staged twice, the continuation is queued once");
   assert.equal((await run(store.getMount(CONVERSATION))).sessionId, "session-1");
 
-  const completedResponseId = await run(store.createPendingResponse("123", continuation.message_id, "session-1"));
-  await run(store.appendBlocksToPending(completedResponseId, [
+  const completedResponseId = await run((await writerOf(store, CONVERSATION)).createPendingResponse("123", continuation.message_id, "session-1"));
+  await run((await writerOf(store, CONVERSATION)).appendBlocksToPending(completedResponseId, [
     { type: "text", content: "Recovered commentary.", phase: "commentary" },
     { type: "text", content: "Recovered final answer.", phase: "final_answer" },
   ]));
-  await run(store.markPendingResponseComplete(completedResponseId));
+  await run((await writerOf(store, CONVERSATION)).markPendingResponseComplete(completedResponseId));
   const reporter = reporterFor(store, (args) => store.enqueueOutboxText(args));
   await run(reporter.flushCompletedResponses);
   assert.deepEqual((await run(store.getDueOutbox(10))).map((item) => item.text), ["Recovered final answer."]);
@@ -387,9 +387,9 @@ test("self-restart recovery stages a distinct durable continuation", async () =>
 
 test("stale turn completion cannot clear a replacement turn", async () => {
   const store = await codexConversation();
-  await run(store.upsertActiveTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "1", harness: CODEX_HARNESS, pendingResponseId: "old" }));
-  await run(store.upsertActiveTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "2", harness: CODEX_HARNESS, pendingResponseId: "new" }));
-  await run(store.clearActiveTurn(CONVERSATION, "old"));
+  const old = await run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "1", harness: CODEX_HARNESS, pendingResponseId: "old" }));
+  await run(store.claimTurn({ conversationId: CONVERSATION, chatId: "123", messageId: "2", harness: CODEX_HARNESS, pendingResponseId: "new" }));
+  assert.equal(await run(store.endTurn(CONVERSATION, old, "completed")), false);
   assert.equal((await run(store.getActiveTurns))[0]?.pending_response_id, "new");
 });
 
