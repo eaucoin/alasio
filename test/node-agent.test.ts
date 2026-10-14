@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { ConfigProvider, Effect, Exit, Fiber, Layer, type Scope } from "effect";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -29,6 +29,7 @@ import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
+import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
@@ -722,6 +723,24 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
         if (typeof message === "string") assert.equal(said, message);
         else assert.match(said, message);
       };
+      /** How the `operation` (checkpoints, prepare) of main's `workspace` stands once it has ended, asked until it has. */
+      const ended = (operation: string, workspace: string) =>
+        call("GET", `/${operation}/main/${workspace}`).pipe(
+          Effect.repeat({ schedule: Schedule.spaced("20 millis"), while: ({ status, body }) => status === 200 && (body as { readonly state: string }).state === "running" }),
+        );
+      /** Starts the `operation` of `request`, which the agent answers it has, and how it ended. */
+      const run = (operation: string, request: { readonly environment: string; readonly workspace: string }) =>
+        Effect.gen(function*() {
+          assert.deepEqual(yield* call("POST", `/${operation === "checkpoints" ? "checkpoints" : "prepare"}`, request), { status: 202, body: { state: "running" } });
+          return yield* ended(operation, request.workspace);
+        });
+      /** That `answered` says an operation failed with `status`, as `message` says. */
+      const failed = (status: number, message: string | RegExp) => (answered: { readonly status: number; readonly body: unknown }) => {
+        assert.equal(answered.status, 200);
+        const { state, ...rest } = answered.body as { readonly state: string; readonly status: number; readonly error: string };
+        assert.equal(state, "failed");
+        error(status, message)({ status: rest.status, body: rest });
+      };
 
       const health = yield* Effect.promise(() => fetch(`http://127.0.0.1:${port}/healthz`));
       assert.equal(health.status, 200);
@@ -734,10 +753,12 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       error(400, /hook/u)(yield* call("POST", "/checkpoints", { ...request("fs-abc"), hook: ["bayma sandbox-hook"] }));
       error(400, /containerId/u)(yield* call("POST", "/checkpoints", { ...request("fs-abc"), containerId: "short" }));
       error(400, "the body is not JSON")(yield* call("POST", "/checkpoints", "{"));
-      const taken = yield* call("POST", "/checkpoints", request("fs-abc"));
-      assert.equal(taken.status, 200);
-      const manifest = taken.body as Manifest;
+      const taken = yield* run("checkpoints", request("fs-abc"));
+      assert.equal((taken.body as { readonly state: string }).state, "done");
+      const manifest = (taken.body as { readonly value: Manifest }).value;
       assert.equal(manifest.workspace, "fs-abc");
+      error(404, "the agent keeps no such operation of the workspace's")(yield* call("GET", "/checkpoints/main/fs-none"));
+      error(400, /workspace/u)(yield* call("GET", "/checkpoints/main/fs_abc"));
 
       assert.deepEqual(yield* call("GET", "/snapshots/main/fs-abc"), { status: 200, body: manifest });
       error(404, "the workspace has no snapshot")(yield* call("GET", "/snapshots/main/fs-none"));
@@ -752,11 +773,11 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       error(400, /to/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: { environment: "main" } }));
       error(400, /workspace/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "../fs-abc" }, to: fork }));
 
-      assert.deepEqual(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }), {
+      assert.deepEqual(yield* run("prepare", { environment: "main", workspace: "fs-abc" }), {
         status: 200,
-        body: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot) },
+        body: { state: "done", value: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot) } },
       });
-      error(404, "main/fs-none has no snapshot")(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-none" }));
+      failed(404, "main/fs-none has no snapshot")(yield* run("prepare", { environment: "main", workspace: "fs-none" }));
 
       const holdings = yield* call("GET", "/holdings");
       assert.equal(holdings.status, 200);
@@ -768,11 +789,11 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
 
       // Snapshots it cannot restore, or that are not what they say, and a bucket that fails.
       s3.objects.set("main/fs-abc/current.json", Buffer.from(JSON.stringify({ ...manifest, release: "20260801.0-eaucoin.1" })));
-      error(409, /its gVisor 20260801\.0-eaucoin\.1 is not installed here/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      failed(409, /its gVisor 20260801\.0-eaucoin\.1 is not installed here/u)(yield* run("prepare", { environment: "main", workspace: "fs-abc" }));
       s3.objects.set("main/fs-abc/current.json", Buffer.from("{}"));
       error(422, /^the snapshot of main\/fs-abc is corrupt: its current\.json is not a manifest/u)(yield* call("GET", "/snapshots/main/fs-abc"));
       s3.refuse = () => 503;
-      error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc" }));
+      failed(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* run("prepare", { environment: "main", workspace: "fs-abc" }));
       error(502, /^the bucket's read of main\/fs-abc\/current\.json failed: 503/u)(yield* call("POST", "/copies", { from: { environment: "main", workspace: "fs-abc" }, to: fork }));
       s3.refuse = () => null;
 
@@ -798,7 +819,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       assert.deepEqual(here.releases.calls(RELEASE).slice(-2).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
 
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
-      error(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* call("POST", "/checkpoints", request("fs-abc")));
+      failed(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* run("checkpoints", request("fs-abc")));
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
       error(500, `runsc resume of ${RELEASE} failed: resume failed: the container is gone`)(yield* call("POST", "/resume", resumeRequest()));
       error(404, "there is no GET /snapshots")(yield* call("GET", "/snapshots"));
@@ -837,6 +858,36 @@ test("alasio has a snapshot copied by any ready agent, and is answered its manif
     })
   ));
 
+test("a checkpoint alasio stops waiting for goes on, one asked for meanwhile is that one, and alasio is answered how it ended, or why not", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const agents = yield* agentsOf(here.agent);
+      const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
+      const checkpoints = () => here.releases.calls(RELEASE).filter((args) => args.includes("checkpoint")).length;
+      writeFileSync(held, "");
+      // alasio asks, and gives up waiting, as it would restarting: runsc goes on.
+      const asked = yield* Effect.forkChild(agents.checkpoint("node-1", request("fs-abc")));
+      yield* Effect.sync(checkpoints).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 1 }));
+      yield* Fiber.interrupt(asked);
+      // Asked again meanwhile, it is the same checkpoint, which alasio is answered with once it ends.
+      const again = yield* Effect.forkChild(agents.checkpoint("node-1", request("fs-abc")));
+      rmSync(held);
+      const manifest = yield* Fiber.join(again);
+      assert.equal(checkpoints(), 1);
+      assert.deepEqual(yield* here.agent.current({ environment: "main", workspace: "fs-abc" }), manifest);
+      // One that fails is answered with why, and the status the agent gives it.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
+      const refused = yield* Effect.flip(agents.checkpoint("node-1", request("fs-abc")));
+      assert.match(refused.message, /^the node agent of node-1 could not snapshot main\/fs-abc: checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u);
+      assert.equal(refused._tag === "NodeAgentError" && refused.status, 500);
+      // A prepare of a workspace without a snapshot is refused as the agent refuses it.
+      const unprepared = yield* Effect.flip(agents.prepare("node-1", { environment: "main", workspace: "fs-none" }));
+      assert.equal(unprepared.message, "the node agent of node-1 could not prepare main/fs-none's snapshot: main/fs-none has no snapshot");
+      assert.equal(unprepared._tag === "NodeAgentError" && unprepared.status, 404);
+    })
+  ));
+
 test("alasio has a restored sandbox resumed by its node's agent, or is told why not", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
@@ -851,6 +902,16 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
     })
   ));
+
+test("as the agent stops, an operation it runs is let end before what it runs in is closed", () =>
+  Effect.gen(function*() {
+    const scope = yield* Scope.make();
+    const operations = yield* makeOperations<string, never>(scope, () => ({ status: 500, error: "failed" }));
+    const done: string[] = [];
+    yield* operations.start("main/fs-abc", Effect.sleep("100 millis").pipe(Effect.andThen(Effect.sync(() => done.push("saved"))), Effect.as("saved")));
+    yield* Scope.close(scope, Exit.void);
+    assert.deepEqual(done, ["saved"]);
+  }).pipe(Effect.runPromise));
 
 test("the agent runs as its own process from its environment, and stops when told", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });

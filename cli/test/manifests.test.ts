@@ -1730,6 +1730,9 @@ describe("node agents", () => {
     const pod = agent.spec?.template.spec;
     assert.equal(pod?.hostPID, true);
     assert.equal(pod?.automountServiceAccountToken, false);
+    // Stopped, or replaced one node at a time, it lets what it runs end first, within the longest an operation may take.
+    assert.equal(pod?.terminationGracePeriodSeconds, 900);
+    assert.deepEqual(agent.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 1, maxSurge: 0 } });
     assert.deepEqual(pod?.nodeSelector, { "alasio.dev/sessions": "true" });
     assert.deepEqual(pod?.tolerations, [{ key: "sessions", operator: "Exists" }]);
     assert.deepEqual(pod?.volumes, [

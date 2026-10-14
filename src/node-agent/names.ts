@@ -61,3 +61,10 @@ export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";
 
 /** The variable holding the most bytes the node's snapshot cache keeps. */
 export const SNAPSHOT_CACHE_BYTES_VARIABLE = "ALASIO_SNAPSHOT_CACHE_BYTES";
+
+/**
+ * How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store,
+ * both ways, or within it. alasio waits for one so long, and an agent that stops lets the
+ * ones it runs end within it (./operations.ts).
+ */
+export const OPERATION_LIMIT_SECONDS = 15 * 60;

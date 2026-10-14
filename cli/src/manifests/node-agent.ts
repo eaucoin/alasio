@@ -27,6 +27,7 @@ import {
   GVISOR_RELEASES,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
+  OPERATION_LIMIT_SECONDS,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "../../../src/node-agent/names.ts";
@@ -78,11 +79,17 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
     metadata: { name: componentName("node-agent"), namespace: NAMESPACE, labels: labels("node-agent") },
     spec: {
       selector: { matchLabels: selectorLabels("node-agent") },
+      // A node's agent replaced once the old one is gone, as two would act on one cache, and
+      // one node's at a time, each as long as the old one's operations take to end (below).
+      updateStrategy: { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 1, maxSurge: 0 } },
       template: {
         metadata: { labels: labels("node-agent") },
         spec: {
           // A restore waits on it, as a turn does.
           ...priority("floor"),
+          // Stopped, it lets the checkpoints and prepares it runs end, rather than end a
+          // sandbox unsaved or leave its cache half written (src/node-agent/operations.ts).
+          terminationGracePeriodSeconds: OPERATION_LIMIT_SECONDS,
           hostPID: true,
           // It speaks to nothing of the cluster's but alasio, which calls it.
           automountServiceAccountToken: false,

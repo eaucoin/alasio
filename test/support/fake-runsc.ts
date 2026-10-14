@@ -7,7 +7,7 @@
  *
  * - `checkpoint --image-path=DIR ... ID`: writes an image of three files into DIR, made
  *   from ID; or fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
- *   minute while one `hang-checkpoint` is;
+ *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
  * - `image inspect --json DIR`: describes the image, as saved by the
  *   release's runsc, whose version is `release-RELEASE` (or what a file `saved-by` beside it
  *   says), with the CPU features of `image-cpu-features`;
@@ -32,15 +32,22 @@ const args = process.argv.slice(2);
 appendFileSync(join(here, "calls.jsonl"), JSON.stringify(args) + "\\n");
 const read = (name, otherwise) => (existsSync(join(here, name)) ? readFileSync(join(here, name), "utf8").trim() : otherwise);
 const rest = args.filter((arg) => !arg.startsWith("--root=") && !arg.startsWith("--systemd-cgroup="));
-if (rest[0] === "checkpoint") {
-  if (existsSync(join(here, "fail-checkpoint"))) { process.stderr.write("checkpoint failed: the sandbox is gone\\n"); process.exit(128); }
-  if (existsSync(join(here, "hang-checkpoint"))) { setTimeout(() => {}, 60000); return; }
+const checkpoint = () => {
   const image = rest.find((arg) => arg.startsWith("--image-path=")).slice("--image-path=".length);
   const id = rest[rest.length - 1];
   mkdirSync(join(image, "layers"), { recursive: true });
   writeFileSync(join(image, "checkpoint.img"), "state of " + id);
   writeFileSync(join(image, "pages_meta.img"), "meta of " + id);
   writeFileSync(join(image, "layers", "pages.img"), Buffer.alloc(4096, id));
+};
+if (rest[0] === "checkpoint") {
+  if (existsSync(join(here, "fail-checkpoint"))) { process.stderr.write("checkpoint failed: the sandbox is gone\\n"); process.exit(128); }
+  if (existsSync(join(here, "hang-checkpoint"))) { setTimeout(() => {}, 60000); return; }
+  if (existsSync(join(here, "hold-checkpoint"))) {
+    const held = setInterval(() => { if (!existsSync(join(here, "hold-checkpoint"))) { clearInterval(held); checkpoint(); } }, 20);
+    return;
+  }
+  checkpoint();
 } else if (rest[0] === "image" && rest[1] === "inspect") {
   const image = rest[rest.length - 1];
   const digest = createHash("sha256").update(readFileSync(join(image, "checkpoint.img"))).digest("hex");

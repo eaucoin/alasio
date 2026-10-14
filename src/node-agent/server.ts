@@ -5,17 +5,25 @@
  * `{ "error": "<why>" }` with its status, 400 for a request that is not one, 404 for a
  * route there is not.
  *
- * - `POST /checkpoints`, `{ environment, workspace, release, containerId, hook, podTemplate }`:
- *   checkpoints the sandbox of the container `containerId` (containerd's id) under the
- *   gVisor `release`, running `hook` (its arguments, none holding whitespace) in it first,
- *   which ends the sandbox, and makes it the workspace's snapshot, recording
- *   `podTemplate`: its manifest (200). 500 when it failed, whose error says that the
- *   workspace's snapshot was forgotten, as it is.
- * - `POST /prepare`, `{ environment, workspace }`: the workspace's current snapshot in this
- *   node's cache, for a restore on this node: `{ manifest, imagePath }` (200). 404 when it
- *   has none; 409 when this node cannot restore it (its release is not installed here, or
- *   this node's CPU lacks a feature it was saved with); 422 when its image is not what its
- *   manifest says; 502 when the bucket failed.
+ * - `POST /checkpoints`, `{ environment, workspace, namespace, pod, containerId, hook,
+ *   podTemplate }`: starts checkpointing the sandbox of the container `containerId`
+ *   (containerd's id) of the pod `namespace`/`pod`, under the gVisor release that runs it,
+ *   running `hook` (its arguments, none holding whitespace) in it first, which ends the
+ *   sandbox, and making it the workspace's snapshot, recording `podTemplate` (202), unless
+ *   one of the workspace's runs, which goes on.
+ * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200):
+ *   `{ state: "running" }`; `{ state: "done", value }`, `value` the snapshot's manifest; or
+ *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
+ *   workspace's snapshot was forgotten, as it is. 404
+ *   when it has none the agent keeps (./operations.ts).
+ * - `POST /prepare`, `{ environment, workspace }`: starts preparing the workspace's current
+ *   snapshot in this node's cache, for a restore on this node (202), unless a prepare of
+ *   it runs, which goes on.
+ * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
+ *   checkpoint's does, `value` `{ manifest, imagePath }`; `status` 404 when it has no
+ *   snapshot, 409 when this node cannot restore it (its release is not installed here, or
+ *   this node's CPU lacks a feature it was saved with), 422 when its image is not what its
+ *   manifest says, 502 when the bucket failed.
  * - `POST /copies`, `{ from: { environment, workspace }, to: { environment, workspace } }`:
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
@@ -47,7 +55,18 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 import { SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
-import { CheckpointRequest, CopyRequest, makeNodeAgent, type NodeAgent, ResumeRequest, WorkspaceRef } from "./agent.ts";
+import {
+  type CheckpointFailed,
+  CheckpointRequest,
+  CopyRequest,
+  makeNodeAgent,
+  type Manifest,
+  type NodeAgent,
+  type Prepared,
+  type PrepareError,
+  ResumeRequest,
+  WorkspaceRef,
+} from "./agent.ts";
 import { type CacheError, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
 import {
@@ -59,6 +78,7 @@ import {
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "./names.ts";
+import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
 
@@ -81,10 +101,29 @@ const STATUS: Readonly<Record<string, number>> = {
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
+const CHECKPOINT = /^\/checkpoints\/([^/]+)\/([^/]+)$/u;
+const PREPARE = /^\/prepare\/([^/]+)\/([^/]+)$/u;
 const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
 const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
+
+/** The key of a workspace's operations. */
+const keyOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;
+
+/** How an operation that failed by `cause` is answered: as a request that failed so would be. */
+const failureOf = (cause: Cause.Cause<{ readonly _tag: string; readonly message: string }>): Failure => {
+  const error = Cause.findErrorOption(cause);
+  return Option.isSome(error) ? { status: STATUS[error.value._tag] ?? 500, error: error.value.message } : { status: 500, error: Cause.pretty(cause) };
+};
+
+/** `operation`, a failure of the agent's own logged, as a request that failed so is answered. */
+const logged = <A, E extends { readonly _tag: string; readonly message: string }>(operation: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  operation.pipe(Effect.tapCause((cause) => {
+    if (Cause.hasInterruptsOnly(cause)) return Effect.void;
+    const { status, error } = failureOf(cause);
+    return status >= 500 ? Effect.logWarning(error) : Effect.void;
+  }));
 
 /** A request that is not one: why, answered 400. */
 class BadRequest extends Schema.TaggedError<BadRequest>()("BadRequest", { message: Schema.String }) {}
@@ -108,13 +147,30 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   token,
   agent,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
+  const scope = yield* Effect.scope;
+  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed>(scope, failureOf);
+  const prepares = yield* makeOperations<Prepared, PrepareError>(scope, failureOf);
+  const started = answer(202, { state: "running" });
+  /** How the operation of `operations` for the workspace a path names stands. */
+  const outcome = <A, E>(operations: Operations<A, E>, path: RegExpExecArray) =>
+    workspaceOf(path).pipe(
+      Effect.flatMap((workspace) => operations.outcome(keyOf(workspace))),
+      Effect.map((found) => (found === null ? answer(404, { error: "the agent keeps no such operation of the workspace's" }) : answer(200, found))),
+    );
+
   const route = (request: HttpServerRequest.HttpServerRequest) => {
     const { method, url } = request;
     const snapshot = SNAPSHOT.exec(url);
+    const checkpoint = CHECKPOINT.exec(url);
+    const prepare = PREPARE.exec(url);
     if (method === "POST" && url === "/checkpoints") {
-      return body(CheckpointRequest).pipe(Effect.flatMap(agent.checkpoint), Effect.map((manifest) => answer(200, manifest)));
+      return body(CheckpointRequest).pipe(Effect.flatMap((asked) => checkpoints.start(keyOf(asked), logged(agent.checkpoint(asked)))), Effect.as(started));
     }
-    if (method === "POST" && url === "/prepare") return body(WorkspaceRef).pipe(Effect.flatMap(agent.prepare), Effect.map((prepared) => answer(200, prepared)));
+    if (method === "GET" && checkpoint) return outcome(checkpoints, checkpoint);
+    if (method === "POST" && url === "/prepare") {
+      return body(WorkspaceRef).pipe(Effect.flatMap((asked) => prepares.start(keyOf(asked), logged(agent.prepare(asked)))), Effect.as(started));
+    }
+    if (method === "GET" && prepare) return outcome(prepares, prepare);
     if (method === "POST" && url === "/copies") {
       return body(CopyRequest).pipe(Effect.flatMap(({ from, to }) => agent.copy(from, to)), Effect.map((manifest) => answer(200, manifest)));
     }

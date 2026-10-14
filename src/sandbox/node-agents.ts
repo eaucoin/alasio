@@ -4,12 +4,12 @@
  * with the token alasio and they are given (ALASIO_NODE_AGENT_TOKEN).
  */
 import type { V1Pod } from "@kubernetes/client-node";
-import { Config, Duration, Effect, Redacted, Schema } from "effect";
+import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { type CheckpointRequest, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
-import { NODE_AGENT_TOKEN_VARIABLE } from "../node-agent/names.ts";
+import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -49,6 +49,14 @@ const Refusal = Schema.Struct({ error: Schema.String });
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Array(Schema.String) });
 
+/** How an agent says a checkpoint or a prepare of a workspace stands (../node-agent/operations.ts), its value as `value` reads it. */
+const OutcomeOf = <A, I>(value: Schema.Codec<A, I>) =>
+  Schema.Union([
+    Schema.Struct({ state: Schema.Literal("running") }),
+    Schema.Struct({ state: Schema.Literal("done"), value }),
+    Schema.Struct({ state: Schema.Literal("failed"), status: Schema.Number, error: Schema.String }),
+  ]);
+
 /** The node agents; see makeNodeAgents. */
 export interface NodeAgents {
   /** The nodes with a ready agent on them. */
@@ -77,8 +85,10 @@ export interface NodeAgents {
   readonly discard: (node: string, workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
 }
 
-/** How long a checkpoint, a prepare or a copy may take: a sandbox's memory, through the store, both ways, or within it. */
-const LONG_CALL: Duration.Input = "15 minutes";
+/** How long a checkpoint, a prepare or a copy may take. */
+const LONG_CALL = `${OPERATION_LIMIT_SECONDS} seconds` satisfies Duration.Input;
+/** How often alasio asks an agent how a checkpoint or a prepare it started stands. */
+const OPERATION_POLL: Duration.Input = "500 millis";
 /** How long a resume may take: the agent's wait for the pod's network policies, then runsc's resume of its containers. */
 const RESUME_CALL: Duration.Input = Duration.sum(Duration.millis(POLICY_WAIT_MS), Duration.seconds(30));
 /** How long any other call may take. */
@@ -147,6 +157,25 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   /** The path of a workspace's snapshot. */
   const snapshotPath = ({ environment, workspace }: WorkspaceRef) => `/snapshots/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}`;
 
+  /**
+   * What the agent of `node` comes to as it runs the operation of `path` (a checkpoint, a
+   * prepare) of the workspace `request` names, which it runs whatever becomes of this
+   * call: started, then asked how it stands until it has ended, within LONG_CALL.
+   */
+  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+    Effect.gen(function*() {
+      yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
+      const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
+      const ended = yield* ask(node, what, standing, OutcomeOf(value)).pipe(
+        Effect.repeat({ schedule: Schedule.spaced(OPERATION_POLL), while: ({ state }) => state === "running" }),
+        Effect.timeoutOrElse({ duration: LONG_CALL, orElse: () => Effect.fail(new NodeAgentError({ node, call: what, reason: `it had not ended within ${LONG_CALL}` })) }),
+      );
+      if (ended.state === "done") return ended.value;
+      // Repeated while it ran, it ran no more.
+      if (ended.state === "running") return yield* Effect.die("an operation ended running");
+      return yield* new NodeAgentError({ node, call: what, reason: ended.error, status: ended.status });
+    });
+
   /** Any node with a ready agent: each reads, copies and forgets in the bucket as well as another. */
   const anyNode: Effect.Effect<string, NodeAgentError | KubeApiError> = Effect.flatMap(addresses, (known) => {
     const [first] = known.keys();
@@ -155,10 +184,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
 
   return {
     nodes: Effect.map(addresses, (known) => [...known.keys()]),
-    checkpoint: (node, request) =>
-      ask(node, `snapshot ${request.environment}/${request.workspace}`, { method: "POST", path: "/checkpoints", body: request, timeout: LONG_CALL }, Manifest),
-    prepare: (node, workspace) =>
-      ask(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "POST", path: "/prepare", body: workspace, timeout: LONG_CALL }, Prepared),
+    checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
+    prepare: (node, workspace) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", workspace, Prepared),
     current: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;
