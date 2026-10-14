@@ -245,7 +245,8 @@ memory() {
     sudo awk '/^(Pss_Anon|Pss_File):/ { printf "%s %s kB, ", $1, $2 }' "/proc/$pid/smaps_rollup"
     cgroup=$(awk -F: '{ print $3 }' "/proc/$pid/cgroup")
     sudo awk '/^(anon|file) / { printf "cgroup %s %d MB, ", $1, $2 / 1048576 }' "/sys/fs/cgroup$cgroup/memory.stat"
-    printf 'GOMEMLIMIT=%s\n' "$(sudo tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^GOMEMLIMIT=//p')"
+    # Read by root: the manager's environment is root's alone to read.
+    printf 'GOMEMLIMIT=%s\n' "$(sudo sh -c "tr '\\0' '\\n' </proc/$pid/environ" | sed -n 's/^GOMEMLIMIT=//p')"
   } | tee -a "$OUT/memory-stages.txt"
 }
 counting() { # <name>: waits until it has counted for a second
@@ -352,6 +353,7 @@ kubectl -n gate delete pods --all --grace-period=0 --force --wait=true >/dev/nul
 for image in sandbox:plain sandbox:estargz counter:estargz; do sudo k3s crictl rmi "$REGISTRY/$image" >/dev/null 2>&1 || true; done
 sleep 180
 sudo sh -c "du -shx $STARGZ_ROOT/snapshotter $STARGZ_ROOT/stargz/*; true" | tee "$OUT/disk-after-rmi.txt"
+memory images-removed
 log "G6: and once the daemon restarted"
 sudo systemctl restart stargz-snapshotter
 sleep 10

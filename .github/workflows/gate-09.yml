@@ -18,25 +18,19 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      # One layer at a time in the background, as alasio sets it; and each with what may
-      # bound the FUSE manager's memory: a soft limit of Go's, the TOC metadata on disk
-      # rather than in memory, the fetched files' page cache dropped.
+      # One layer at a time in the background, as alasio sets it, the FUSE manager under no
+      # bound, and under Go's soft memory limit at two sizes, which it inherits from the
+      # daemon's service: what of its heap is garbage, and what lives.
       matrix:
         include:
           - leg: one-at-a-time
             options: "max_concurrency = 1"
-          - leg: gomemlimit
+          - leg: gomemlimit-128
             options: "max_concurrency = 1"
-            environment: GOMEMLIMIT=200MiB
-          - leg: metadata-on-disk
-            options: |
-              max_concurrency = 1
-              metadata_store = "db"
-          - leg: fadv-dontneed
-            options: |
-              max_concurrency = 1
-              [directory_cache]
-              fadv_dontneed = true
+            environment: GOMEMLIMIT=128MiB
+          - leg: gomemlimit-64
+            options: "max_concurrency = 1"
+            environment: GOMEMLIMIT=64MiB
     steps:
       # The sandbox image is pushed whole and as eStargz, and pulled again by the node.
       - name: Free disk space
