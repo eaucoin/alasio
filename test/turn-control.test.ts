@@ -18,7 +18,7 @@ import { CODEX_HARNESS, harnessDisplayName } from "../src/harness/names.ts";
 import { StoreError } from "../src/persistence/sql.ts";
 import { Store, TurnFenced } from "../src/persistence/store.ts";
 import { forgetfulPersistence } from "./support/persistence.ts";
-import { run, testStore } from "./support/store.ts";
+import { holdsIn, newSchema, run, testStore } from "./support/store.ts";
 import { type QueuedToOutbox, recordingOutbox, type TestAlasio, withServices } from "./support/turns.ts";
 
 /** A Codex harness whose turns run as `turn` says, given what alasio gives each. */
@@ -59,12 +59,13 @@ const answered = (params: TurnParams, text: string): Effect.Effect<TurnResult, S
 const CONVERSATION_CHAT = 41;
 
 /** A Codex conversation on a folder, in a new store. */
-async function conversation(): Promise<{ readonly store: Store["Service"]; readonly conversationId: string }> {
-  const store = await testStore();
+async function conversation(): Promise<{ readonly store: Store["Service"]; readonly schema: string; readonly conversationId: string }> {
+  const schema = newSchema();
+  const store = await testStore({ schema });
   const conversationId = await run(store.upsertConversation({ chatId: String(CONVERSATION_CHAT), user: { id: CONVERSATION_CHAT } }));
   await run(store.setActiveHarness(conversationId, CODEX_HARNESS));
   await run(store.setWorkingDirectory(conversationId, "/work"));
-  return { store, conversationId };
+  return { store, schema, conversationId };
 }
 
 /** Runs `use` on alasio's services over `store`, its Codex the scripted `harness`, what it queues for Telegram recorded. */
@@ -149,10 +150,11 @@ test("a turn a harness starts on its own claims the conversation, as alasio's tu
   });
 });
 
-test("alasio starting ends each turn the last one left running, its status message saying how", async () => {
-  const { store, conversationId } = await conversation();
+test("alasio starting lets go of the holds the last one left, and ends each turn it left running, its status message saying how", async () => {
+  const { store, schema, conversationId } = await conversation();
   const harness = scriptedHarness((params) => answered(params, "unused"));
-  // Left by an alasio killed mid-turn: its turn, working, with its status message.
+  // Left by an alasio killed mid-turn: its hold, and its turn, working, with its status message.
+  await run(store.holdConversations([conversationId], "forking"));
   const epoch = await run(store.claimTurn({ conversationId, chatId: String(CONVERSATION_CHAT), messageId: "9", harness: CODEX_HARNESS }));
   assert.equal(await run(store.setTurnStatusMessage(conversationId, epoch, "status-of-the-killed")), true);
   const killed = store.turnPersistence(conversationId, epoch);
@@ -160,6 +162,7 @@ test("alasio starting ends each turn the last one left running, its status messa
   await run(killed.updateActiveTurnPendingResponseId(partial));
   await withTurns(store, harness, async (alasio, queued) => {
     await alasio.runPromise(Effect.flatMap(Turns, (turns) => Effect.andThen(turns.reconcilePersistentState, turns.recoverInterruptedTurns)));
+    assert.deepEqual(await holdsIn(schema), []);
     const ended = await run(store.getTurn(conversationId));
     assert.deepEqual([ended?.state, ended?.status, ended?.outcome], ["completed", "ended", "stopped"]);
     assert.deepEqual(queued.edits.map(({ edits, text }) => [edits, text]), [[

@@ -35,6 +35,7 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 import { nameProblem } from "../../neon/control/branches.ts";
 import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { holdConversations } from "../harness/holds.ts";
 import { hasStatus } from "../kube/client.ts";
 import { Store } from "../persistence/store.ts";
 import { SessionInheritError, SessionSandboxes } from "../sandbox/index.ts";
@@ -94,7 +95,7 @@ export const serveBranchForks = Effect.fnUntraced(function*({
     if (knowing.length === 0 && !made) return answer(404, { error: `alasio has no session ${volumeId}` });
     const mounting = knowing.filter(({ mounted }) => mounted).map(({ conversationId }) => conversationId);
     const forked = yield* Effect.scoped(Effect.gen(function*() {
-      if (!(yield* activeTurns.hold(mounting))) return false;
+      if (!(yield* holdConversations(activeTurns, store, mounting, `forking session ${volumeId} for the branch ${branch}`))) return false;
       yield* sandboxes.volumes.fork(volumeId, volumeId, branchSessionsNamespace(branch)).pipe(
         // Forked already, by an earlier request of the branch's.
         Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(409)(error), () => Effect.void),

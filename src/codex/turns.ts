@@ -562,6 +562,8 @@ const makeTurns = Effect.fnUntraced(function*() {
       return sessionId;
     }),
     reconcilePersistentState: Effect.gen(function*() {
+      // What the last alasio held busy, it held while it ran.
+      yield* store.releaseConversations(null);
       // A turn whose job the agent finished ended so, whatever stopped alasio as it did.
       for (const conversationId of yield* store.recoverPromptJobsAfterRestart) {
         const turn = yield* store.getActiveTurn(conversationId);

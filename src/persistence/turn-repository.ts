@@ -178,6 +178,24 @@ export class NeonTurnRepository {
     return this.#sql.query<Turn>(`select * from ${this.#schema}.turns where state = 'active' order by started_at`);
   }
 
+  /** Holds the conversations busy for `reason`, as no turn: a fork's. */
+  hold(conversationIds: readonly string[], reason: string): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `insert into ${this.#schema}.conversation_holds (conversation_id, reason)
+       select id, $2 from unnest($1::text[]) as held (id)
+       on conflict (conversation_id) do update set reason = excluded.reason, held_at = now()`,
+      [conversationIds, reason],
+    ));
+  }
+
+  /** Lets go of the conversations' holds; none is left by the alasio that held them, with `null`. */
+  release(conversationIds: readonly string[] | null): Effect.Effect<void, StoreError> {
+    return Effect.asVoid(this.#sql.query(
+      `delete from ${this.#schema}.conversation_holds where $1::text[] is null or conversation_id = any($1::text[])`,
+      [conversationIds],
+    ));
+  }
+
   /** The conversation's latest turn, active or ended, or null when none has run. */
   getTurn(threadKey: string): Effect.Effect<Turn | null, StoreError> {
     return this.#sql.query<Turn>(`select * from ${this.#schema}.turns where id = $1`, [threadKey]).pipe(Effect.map(([row]) => row ?? null));
