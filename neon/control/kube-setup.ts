@@ -9,8 +9,10 @@
  * NEON_PROXY_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
  * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
- * identities, and its filers' store's users' passwords, are made here otherwise. With workspace
- * storage on, WORKSPACES_NAME (its JuiceFS file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
+ * identities, and its filers' store's users' passwords, are made here otherwise, and with
+ * sessions snapshotted, S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY, the store's key
+ * for the snapshots bucket alone. With workspace storage on, WORKSPACES_NAME (its JuiceFS
+ * file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
  * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
  * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
  * alasio keeps them while its volumes remain). With session sandboxes snapshotted,
@@ -77,7 +79,7 @@ export interface WorkspacesConfig {
 /** The deployment's configuration, from the environment the module comment lists. */
 export type SetupConfig = SetupConfigBase & (
   | { external: false }
-  | { external: true; accessKey: string; secretKey: string }
+  | { external: true; accessKey: string; secretKey: string; snapshots: S3Credentials | null }
 );
 
 interface SetupConfigBase {
@@ -170,9 +172,16 @@ export function secretNames(prefix: string): SecretNames {
 export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: RenderSecretsOptions): RenderedSecrets {
   const names = secretNames(config.prefix);
   const token = (scope: string, tenantId?: string) => signToken(privateKeyPem, scope, tenantId);
-  const s3 = (identity: S3Identity): S3Credentials => (config.external
-    ? { accessKey: config.accessKey, secretKey: config.secretKey }
-    : secrets.s3[identity]);
+  // The snapshots bucket is reached as an identity of its own, of an external store's too:
+  // what writes it writes what the node agents restore as root.
+  const s3 = (identity: S3Identity): S3Credentials => {
+    if (!config.external) return secrets.s3[identity];
+    if (identity === "snapshots") {
+      if (!config.snapshots) throw new Error("S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY must be set where sessions are snapshotted on an external store");
+      return config.snapshots;
+    }
+    return { accessKey: config.accessKey, secretKey: config.secretKey };
+  };
   const aws = (identity: S3Identity) => ({ AWS_ACCESS_KEY_ID: s3(identity).accessKey, AWS_SECRET_ACCESS_KEY: s3(identity).secretKey });
   const storage = (prefix: string) => remoteStorage(prefix, { endpoint: config.s3Endpoint, bucket: config.neonBucket, region: config.s3Region });
   const rendered: RenderedSecrets = {
@@ -323,7 +332,13 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     snapshotsBucket: env["SNAPSHOTS_BUCKET"]?.trim() || null,
   };
   return external
-    ? { ...base, external, accessKey: required("S3_ACCESS_KEY"), secretKey: required("S3_SECRET_KEY") }
+    ? {
+      ...base,
+      external,
+      accessKey: required("S3_ACCESS_KEY"),
+      secretKey: required("S3_SECRET_KEY"),
+      snapshots: base.snapshotsBucket ? { accessKey: required("S3_SNAPSHOTS_ACCESS_KEY"), secretKey: required("S3_SNAPSHOTS_SECRET_KEY") } : null,
+    }
     : { ...base, external };
 }
 

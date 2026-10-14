@@ -141,6 +141,12 @@ function setup(config: InstallConfig): KubernetesObject[] {
                 { name: "S3_EXTERNAL", value: "1" },
                 { name: "S3_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "accessKey" } } },
                 { name: "S3_SECRET_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.existingSecret, key: "secretKey" } } },
+                ...(sandboxSnapshots(config)
+                  ? [
+                    { name: "S3_SNAPSHOTS_ACCESS_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "accessKey" } } },
+                    { name: "S3_SNAPSHOTS_SECRET_KEY", valueFrom: { secretKeyRef: { name: objectStore.external.snapshotsSecret, key: "secretKey" } } },
+                  ]
+                  : []),
               ]),
             ],
             securityContext: restrictedContainer(),

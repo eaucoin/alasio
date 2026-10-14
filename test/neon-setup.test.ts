@@ -85,9 +85,14 @@ test("the setup's configuration comes from the environment, checked", () => {
   assert.equal(config.external, false);
   assert.throws(() => setupConfig({ ...ENV, NEON_PROXY_HOST: "" }), /NEON_PROXY_HOST must be set/);
   assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1" }), /S3_ACCESS_KEY must be set/);
-  const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" });
+  // Where sessions are snapshotted, the external store's key for the snapshots bucket alone is required.
+  assert.throws(() => setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b" }), /S3_SNAPSHOTS_ACCESS_KEY must be set/);
+  const external = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b", S3_SNAPSHOTS_ACCESS_KEY: "c", S3_SNAPSHOTS_SECRET_KEY: "d" });
   assert.ok(external.external);
   assert.equal(external.accessKey, "a");
+  assert.deepEqual(external.snapshots, { accessKey: "c", secretKey: "d" });
+  const unsnapshotted = setupConfig({ ...ENV, S3_EXTERNAL: "1", S3_ACCESS_KEY: "a", S3_SECRET_KEY: "b", SNAPSHOTS_BUCKET: "" });
+  assert.ok(unsnapshotted.external && unsnapshotted.snapshots === null);
   assert.equal(config.workspaces?.valkeyAddress, "q-valkey.alasio.svc.cluster.local:6379");
   assert.equal(setupConfig({ ...ENV, WORKSPACES_NAME: "" }).workspaces, null);
   assert.throws(() => setupConfig({ ...ENV, WORKSPACES_BUCKET_URL: "" }), /WORKSPACES_BUCKET_URL must be set/);
@@ -263,12 +268,14 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
   };
 }
 
-test("with an external object store, every service uses its credentials and no SeaweedFS identities are made", () => {
+test("with an external object store, every service uses its credentials, but the node agents their key for the snapshots bucket, and no SeaweedFS identities are made", () => {
   const config = setupConfig({
     ...ENV,
     S3_EXTERNAL: "1",
     S3_ACCESS_KEY: "AK",
     S3_SECRET_KEY: "SK",
+    S3_SNAPSHOTS_ACCESS_KEY: "SNAP-AK",
+    S3_SNAPSHOTS_SECRET_KEY: "SNAP-SK",
     S3_REGION: "eu-west-1",
     S3_BUCKET_NEON: "my-neon",
     WORKSPACES_BUCKET_URL: "https://s3.example.com/my-workspaces",
@@ -295,9 +302,13 @@ test("with an external object store, every service uses its credentials and no S
     S3_ENDPOINT: "http://q-seaweedfs:8333",
     S3_REGION: "eu-west-1",
     S3_BUCKET: "snapshots",
-    AWS_ACCESS_KEY_ID: "AK",
-    AWS_SECRET_ACCESS_KEY: "SK",
+    AWS_ACCESS_KEY_ID: "SNAP-AK",
+    AWS_SECRET_ACCESS_KEY: "SNAP-SK",
   });
+  // No other Secret holds the snapshots bucket's key.
+  for (const [name, data] of Object.entries(rendered)) {
+    if (name !== names.snapshots) assert.ok(!JSON.stringify(data).includes("SNAP-"), name);
+  }
 });
 
 test("without workspace storage, neither its Secrets nor its identity are made", () => {

@@ -473,12 +473,18 @@ const ObjectStore = Schema.Struct({
     }),
     {},
   ),
-  /** Or an S3-compatible store of the operator's: its endpoint, region, and a Secret with `accessKey` and `secretKey`. */
+  /**
+   * Or an S3-compatible store of the operator's: its endpoint, region, and a Secret with
+   * `accessKey` and `secretKey`; and, where sessions are snapshotted, a Secret of the same
+   * keys for a key of the store's that reaches the snapshots bucket alone, which only the
+   * node agents hold, as what writes that bucket writes what they restore as root.
+   */
   external: defaulted(
     Schema.Struct({
       endpoint: defaulted(OptionalUrl, ""),
       region: defaulted(NonEmpty, "us-east-1"),
       existingSecret: defaulted(OptionalSecretName, ""),
+      snapshotsSecret: defaulted(OptionalSecretName, ""),
     }),
     {},
   ),
@@ -695,6 +701,9 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (config.neon.enabled && !config.objectStore.bundled.enabled) {
     if (!config.objectStore.external.endpoint) return { path: ["objectStore", "external", "endpoint"], issue: "is required when objectStore.bundled.enabled is false" };
     if (!config.objectStore.external.existingSecret) return { path: ["objectStore", "external", "existingSecret"], issue: "is required with an external object store" };
+    if (config.sessions.enabled && config.sessions.runtimeClassName !== "" && !config.objectStore.external.snapshotsSecret) {
+      return { path: ["objectStore", "external", "snapshotsSecret"], issue: "is required with an external object store where sessions are snapshotted: a key that reaches the snapshots bucket alone" };
+    }
   }
   if (config.workspaceStorage.enabled && !config.sessions.enabled) {
     return { path: ["workspaceStorage", "enabled"], issue: "must be false when sessions.enabled is false, as its volumes are sessions' workspaces" };

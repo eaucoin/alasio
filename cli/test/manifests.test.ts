@@ -234,6 +234,10 @@ describe("configuration", () => {
       message({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com" } } }),
       "objectStore.external.existingSecret is required with an external object store",
     );
+    assert.equal(
+      message({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3" } } }),
+      "objectStore.external.snapshotsSecret is required with an external object store where sessions are snapshotted: a key that reaches the snapshots bucket alone",
+    );
     assert.equal(message({ sessions: { enabled: false } }), "workspaceStorage.enabled must be false when sessions.enabled is false, as its volumes are sessions' workspaces");
     assert.equal(
       message({ neon: { enabled: false, external: { existingSecret: "db" } } }),
@@ -546,12 +550,13 @@ describe("neon", () => {
   });
 
   test("uses the operator's object store and makes no SeaweedFS when told", () => {
-    const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3" } } });
+    const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } } });
     assert.deepEqual(objects.filter((object) => object.metadata?.name?.startsWith("alasio-seaweedfs")), []);
     const env = one<V1Job>(objects, "Job", "alasio-neon-setup").spec?.template.spec?.containers[0]?.env;
     assert.deepEqual(env?.find(({ name }) => name === "S3_EXTERNAL"), { name: "S3_EXTERNAL", value: "1" });
-    // Its operator makes the snapshots bucket, which the setup still gives the node agents.
+    // Its operator makes the snapshots bucket, which the setup still gives the node agents, with its key of their own.
     assert.deepEqual(env?.find(({ name }) => name === "SNAPSHOTS_BUCKET"), { name: "SNAPSHOTS_BUCKET", value: "snapshots" });
+    assert.deepEqual(env?.find(({ name }) => name === "S3_SNAPSHOTS_ACCESS_KEY")?.valueFrom, { secretKeyRef: { name: "s3-snapshots", key: "accessKey" } });
   });
 
   test("runs no Neon when the database is the operator's", () => {
@@ -1683,7 +1688,7 @@ describe("workspace storage", () => {
   });
 
   test("keeps its data in the operator's object store, with its keys, when it is theirs", () => {
-    const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com/", existingSecret: "s3" } } });
+    const objects = install({ objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com/", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } } });
     assert.equal(setupVariable(objects, "WORKSPACES_BUCKET_URL"), "https://s3.example.com/workspaces");
     assert.equal(setupVariable(objects, "S3_EXTERNAL"), "1");
     assert.deepEqual(all(objects, "NetworkPolicy").filter((policy) => policy.metadata?.name === "alasio-seaweedfs-workspaces"), []);
@@ -1801,7 +1806,7 @@ describe("node agents", () => {
       { to: [selected("collector")], ports: [{ protocol: "TCP", port: 4318 }] },
     ]);
     // An operator's object store, on its endpoint's port at any address, and no collector to reach without one.
-    const external = (endpoint: string) => ({ objectStore: { bundled: { enabled: false }, external: { endpoint, existingSecret: "s3" } }, lake: { enabled: false } });
+    const external = (endpoint: string) => ({ objectStore: { bundled: { enabled: false }, external: { endpoint, existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } });
     assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }]);
     assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }]);
     assert.deepEqual(all(install(external("http://minio.lan:9000")), "NetworkPolicy").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs-snapshots"), []);
