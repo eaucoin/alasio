@@ -24,11 +24,11 @@ import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
-import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR } from "../../src/node-agent/names.ts";
+import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
@@ -604,6 +604,115 @@ const podStatusAsAlasio = (volumeId: string, status: unknown): Promise<number> =
 /** The resumed condition of a restored session's pod, set to `value`. */
 const resumedCondition = (value: string) => ({ conditions: [{ type: "alasio.dev/resumed", status: value }] });
 
+/**
+ * What a node agent's cgroup says of its memory: its limit, what it holds now, and of that,
+ * what is anonymous, cached, dirty and being written back, and the two last together (what
+ * is written and not yet on the disk); and how often it was OOM-killed.
+ */
+interface AgentMemory {
+  readonly max: string;
+  readonly current: number;
+  readonly anon: number;
+  readonly file: number;
+  readonly dirty: number;
+  readonly writeback: number;
+  readonly unsynced: number;
+  readonly oomKills: number;
+}
+
+/**
+ * What a node agent's cgroup may hold dirty beside its gets' data, which their budget
+ * (UNSYNCED_DOWNLOAD_BYTES) bounds: the partial pages at each end of a get's range, and
+ * the filesystem's own records of the files they write, both charged to the cgroup too. CI
+ * saw 32 KiB of it restoring a 1 GiB session; the agent's memory limit leaves room for it.
+ */
+const FILESYSTEM_DIRTY_BYTES = 1024 ** 2;
+
+/** The node agents' memory, as profileNodeAgents says it: each one's peaks, and how often the agents restarted while it was read. */
+interface AgentsMemory {
+  readonly text: string;
+  readonly peaks: ReadonlyMap<string, AgentMemory>;
+  readonly restarts: number;
+}
+
+/**
+ * The node agents' memory, sampled every second from their own cgroups until stopped:
+ * each one's peak of every measure, how often its cgroup OOM-killed, and how its
+ * container last ended where it restarted.
+ */
+function profileNodeAgents(): { readonly stop: () => void; readonly said: () => Promise<AgentsMemory> } {
+  const peaks = new Map<string, AgentMemory>();
+  const agents = () => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
+  const restartsOf = (pods: readonly V1Pod[]) =>
+    pods.reduce((sum, { status }) => sum + (status?.containerStatuses?.find(({ name }) => name === "node-agent")?.restartCount ?? 0), 0);
+  const before = agents().then(restartsOf);
+  let running = true;
+  let unread: string | null = null;
+  // The agent's own cgroup: the root of its cgroup namespace, or, sharing the host's, the
+  // path /proc/self/cgroup names under the hierarchy.
+  const readCgroup = [
+    "own=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)",
+    "[ -f \"$own/memory.max\" ] || own=/sys/fs/cgroup",
+    "cat \"$own/memory.max\" \"$own/memory.current\" \"$own/memory.stat\" \"$own/memory.events\"",
+  ].join("; ");
+  const sample = async () => {
+    for (const [node, pod] of await nodeAgents()) {
+      const read = await kube.execOk(NAMESPACE, pod, ["sh", "-c", readCgroup], { container: "node-agent" }).catch((error: unknown) => {
+        unread ??= error instanceof Error ? error.message : String(error);
+        return null;
+      });
+      if (read === null) continue;
+      const [max = "", current = "0", ...rest] = read.trim().split("\n");
+      const field = (name: string) => Number(rest.find((line) => line.startsWith(`${name} `))?.split(" ")[1] ?? 0);
+      const dirty = field("file_dirty");
+      const writeback = field("file_writeback");
+      const seen: AgentMemory = { max, current: Number(current), anon: field("anon"), file: field("file"), dirty, writeback, unsynced: dirty + writeback, oomKills: field("oom_kill") };
+      const peak = peaks.get(node);
+      peaks.set(node, peak ? {
+        max,
+        current: Math.max(peak.current, seen.current),
+        anon: Math.max(peak.anon, seen.anon),
+        file: Math.max(peak.file, seen.file),
+        dirty: Math.max(peak.dirty, seen.dirty),
+        writeback: Math.max(peak.writeback, seen.writeback),
+        unsynced: Math.max(peak.unsynced, seen.unsynced),
+        oomKills: Math.max(peak.oomKills, seen.oomKills),
+      } : seen);
+    }
+  };
+  const looping = (async () => {
+    while (running) {
+      await sample().catch(() => {});
+      await sleep(1000);
+    }
+  })();
+  const mib = (bytes: number) => `${Math.round(bytes / 1024 ** 2)} MiB`;
+  return {
+    stop: () => {
+      running = false;
+    },
+    said: async () => {
+      await looping;
+      const pods = await agents();
+      const statusOf = (node: string | undefined) => pods.find(({ spec }) => spec?.nodeName === node)?.status?.containerStatuses?.find(({ name }) => name === "node-agent");
+      const restarts = (node: string | undefined) => {
+        const status = statusOf(node);
+        const ended = status?.lastState?.terminated;
+        return `${status?.restartCount ?? 0} restarts${ended ? `, last ended ${ended.reason} (exit ${ended.exitCode}) at ${ended.finishedAt}` : ""}`;
+      };
+      const seen = [...peaks].map(([node, { max, current, anon, file, dirty, writeback, unsynced, oomKills }]) =>
+        `${node}: limit ${max === "max" ? max : mib(Number(max))}, peak ${mib(current)} (anon ${mib(anon)}, file ${mib(file)}, dirty ${mib(dirty)}, writeback ${mib(writeback)}, not yet on the disk ${mib(unsynced)}), ${oomKills} OOM kills, ${restarts(node)}`
+      );
+      const unseen = pods.filter(({ spec }) => !peaks.has(spec?.nodeName ?? "")).map(({ spec }) => `${spec?.nodeName}: not read (${unread ?? "no sample"}), ${restarts(spec?.nodeName)}`);
+      return {
+        text: [...seen, ...unseen].join("; "),
+        peaks,
+        restarts: restartsOf(pods) - (await before),
+      };
+    },
+  };
+}
+
 /** The session's current snapshot, as a node agent's API gives it to alasio, from the bucket; null when it has none. */
 async function snapshotOf(volumeId: string): Promise<Manifest | null> {
   const [pod] = (await nodeAgents()).values();
@@ -681,7 +790,7 @@ if (inShard("snapshots")) {
     });
 
     test("the session's pod was held to the CPU features every node's agent said, which alasio up recorded in the sessions' template, as alasio status says", async () => {
-      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=node-agent" });
+      const agents = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) });
       const said = agents.map((pod) => {
         const message = pod.status?.initContainerStatuses?.find(({ name }) => name === "cpu-features")?.state?.terminated?.message;
         return (JSON.parse(message ?? "{}") as { readonly cpuFeatures?: readonly string[] }).cpuFeatures ?? [];
@@ -849,7 +958,25 @@ if (inShard("snapshots")) {
         if (from === "bucket") {
           for (const pod of (await nodeAgents()).values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${big}`], { container: "node-agent" });
         }
-        const answered = await turn(`hello with ${BIG_REPL_MEBIBYTES} MiB from the ${from}`);
+        // The node agents' memory as they prepare it, said whatever comes of the turn.
+        const profile = profileNodeAgents();
+        let memory: AgentsMemory | undefined;
+        const answered = await turn(`hello with ${BIG_REPL_MEBIBYTES} MiB from the ${from}`).finally(async () => {
+          profile.stop();
+          memory = await profile.said();
+          t.diagnostic(`the node agents' memory as it was restored from the ${from}: ${memory.text}`);
+        });
+        // Within their budget of what is written and not yet on the disk, beside the filesystem's
+        // own, and so never killed for it.
+        assert.ok(memory && memory.peaks.size > 0, "the node agents' memory was not read");
+        for (const [node, { unsynced, oomKills }] of memory.peaks) {
+          assert.ok(
+            unsynced <= UNSYNCED_DOWNLOAD_BYTES + FILESYSTEM_DIRTY_BYTES,
+            `the node agent on ${node} held ${unsynced} bytes not yet on the disk, past its budget of ${UNSYNCED_DOWNLOAD_BYTES} and the filesystem's ${FILESYSTEM_DIRTY_BYTES}`,
+          );
+          assert.equal(oomKills, 0, `the node agent on ${node} was OOM-killed`);
+        }
+        assert.equal(memory.restarts, 0, memory.text);
         const summed = await repl.sum(big, held);
         assert.equal(summed.sha256, sha256);
         assert.match(summed.notice ?? "", CAME_BACK_WHOLE);

@@ -191,3 +191,45 @@ test("the bucket's gets go `parallel` at a time, every one of its files together
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("a get holds the bucket to the size its file is said to be, a JSON object to a manifest's, and one range that fails stops the rest and lets go of the budget", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300 });
+    const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
+    const failure = async <A>(effect: Effect.Effect<A, unknown>) => {
+      const exit = await Effect.runPromiseExit(effect);
+      assert.ok(Exit.isFailure(exit));
+      return String(exit.cause);
+    };
+
+    // An object larger than its manifest says, got whole: nothing past what it is said to be is written.
+    s3.objects.set("main/fs-a/s1/small.img", pages.subarray(0, 900));
+    assert.match(await failure(bucket.getFile("main/fs-a/s1/small.img", join(directory, "small.img"), 600)), /it holds more than the 600 bytes it is said to/u);
+    assert.ok(readFileSync(join(directory, "small.img")).length <= 600);
+
+    // A JSON object larger than any manifest is refused, not read whole.
+    s3.objects.set("main/fs-a/current.json", Buffer.from(JSON.stringify({ padding: "x".repeat(2 * 1024 * 1024) })));
+    assert.match(await failure(bucket.getJson("main/fs-a/current.json")), /the bucket's read of main\/fs-a\/current\.json failed: it holds more than 1048576 bytes/u);
+
+    // The second range fails at once while the first is slow: the first is aborted, no other starts, and the budget is free.
+    s3.objects.set("main/fs-b/s1/pages.img", pages);
+    s3.getDelayMs = 5000;
+    s3.refuse = (method, _key, asked) => (method === "GET" && asked.endsWith("bytes=1000-1999") ? 503 : null);
+    s3.requests.length = 0;
+    const started = Date.now();
+    assert.match(await failure(bucket.getFile("main/fs-b/s1/pages.img", join(directory, "pages.img"), pages.length)), /503 InternalError/u);
+    assert.ok(Date.now() - started < 2500, `the failure took ${Date.now() - started} ms, as long as the slow range`);
+    assert.deepEqual(s3.requests.toSorted(), ["GET main/fs-b/s1/pages.img bytes=0-999", "GET main/fs-b/s1/pages.img bytes=1000-1999"]);
+    s3.getDelayMs = 0;
+    s3.refuse = () => null;
+    s3.objects.set("main/fs-c/s1/a.img", pages.subarray(0, 500));
+    s3.objects.set("main/fs-c/s1/b.img", pages.subarray(0, 500));
+    const got = await Promise.all(["a", "b"].map((name) => Effect.runPromise(bucket.getFile(`main/fs-c/s1/${name}.img`, join(directory, `${name}.img`), 500))));
+    assert.deepEqual(got.map(({ bytes }) => bytes), [500, 500]);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

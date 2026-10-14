@@ -119,6 +119,8 @@ export const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 const IDLE_TIMEOUT_MS = 60_000;
 /** The most of a failed response's body read for its reason. */
 const ERROR_BODY_BYTES = 64 * 1024;
+/** The most a JSON object of the bucket's may hold: a manifest, which names a snapshot's few files, is a few KiB. */
+const JSON_BYTES = 1024 * 1024;
 
 const sha256Hex = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 const hmac = (key: string | Buffer, data: string): Buffer => createHmac("sha256", key).update(data).digest();
@@ -200,6 +202,21 @@ async function bodyText(response: IncomingMessage, limit: number): Promise<strin
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** A response's body, which must hold at most `limit` bytes, read whole. */
+async function boundedText(response: IncomingMessage, limit: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of response) {
+    size += (chunk as Buffer).length;
+    if (size > limit) {
+      response.destroy();
+      throw new Error(`it holds more than ${limit} bytes`);
+    }
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 /** Why a response is a failure: its status, and S3's code and message for it, if it gave them. */
 async function failureOf(response: IncomingMessage): Promise<string> {
   const body = await bodyText(response, ERROR_BODY_BYTES);
@@ -236,14 +253,48 @@ function limiter(count: number): <A>(work: () => Promise<A>) => Promise<A> {
 }
 
 /**
- * Writes what `source` gives into `file` from `start`, syncing the file to the disk
- * before it would have more than `syncBytes` written since it last did, and once it is all
- * written; each chunk is given to `seen` first. The bytes it wrote.
+ * Runs `work` for each of `count` items, by its index, `parallel` at a time, in order. The
+ * first that fails stops the rest: none starts after it, and each running is aborted
+ * through the signal it is given, as `signal` aborts them all; so what they hold, the
+ * budget of gets among it, is let go of. Fails with that first failure, once each has ended.
  */
-async function writeSynced(file: FileHandle, source: AsyncIterable<Buffer>, start: number, syncBytes: number, seen: (chunk: Buffer) => void = () => {}): Promise<number> {
+async function eachInParallel(count: number, parallel: number, signal: AbortSignal, work: (index: number, signal: AbortSignal) => Promise<void>): Promise<void> {
+  const controller = new AbortController();
+  const aborted = () => controller.abort(signal.reason);
+  signal.addEventListener("abort", aborted, { once: true });
+  let next = 0;
+  const failed: { first: { readonly cause: unknown } | null } = { first: null };
+  try {
+    await Promise.all(Array.from({ length: Math.min(parallel, count) }, async () => {
+      while (next < count && failed.first === null) {
+        const index = next++;
+        try {
+          await work(index, controller.signal);
+        } catch (cause) {
+          if (failed.first === null) {
+            failed.first = { cause };
+            controller.abort(cause);
+          }
+        }
+      }
+    }));
+  } finally {
+    signal.removeEventListener("abort", aborted);
+  }
+  if (failed.first !== null) throw failed.first.cause;
+}
+
+/**
+ * Writes what `source` gives into `file` from `start`, `length` bytes and no more, syncing
+ * the file to the disk before it would have more than `syncBytes` written since it last did,
+ * and once it is all written; each chunk is given to `seen` first. The bytes it wrote: a
+ * source that gives more than `length` fails before any of the rest is written.
+ */
+async function writeSynced(file: FileHandle, source: AsyncIterable<Buffer>, start: number, length: number, syncBytes: number, seen: (chunk: Buffer) => void = () => {}): Promise<number> {
   let position = start;
   let unsynced = 0;
   for await (const chunk of source) {
+    if (position - start + chunk.length > length) throw new Error(`it holds more than the ${length} bytes it is said to`);
     seen(chunk);
     for (let offset = 0; offset < chunk.length;) {
       if (unsynced === syncBytes) {
@@ -313,23 +364,24 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
   };
 
   /**
-   * Puts the object `key` in `count` parts, each sent by `part(number, query)` (its
-   * number from 1, and the query that names it) and answering its ETag, `parallel` at a
-   * time; aborted if any fails.
+   * Puts the object `key` in `count` parts, each sent by `part(number, query, signal)`
+   * (its number from 1, the query that names it, and what aborts it) and answering its
+   * ETag, `parallel` at a time; aborted if any fails, the parts still being sent with it.
    */
-  const multipart = async (key: string, count: number, part: (number: number, query: Readonly<Record<string, string>>) => Promise<string>, signal: AbortSignal): Promise<void> => {
+  const multipart = async (
+    key: string,
+    count: number,
+    part: (number: number, query: Readonly<Record<string, string>>, signal: AbortSignal) => Promise<string>,
+    signal: AbortSignal,
+  ): Promise<void> => {
     const created = await bodyText(await succeeded(await call("POST", key, { query: { uploads: "" } }, signal)), Number.POSITIVE_INFINITY);
     const [uploadId] = elements(created, "UploadId");
     if (!uploadId) throw new Error("it began no multipart upload");
     try {
       const etags = new Array<string>(count);
-      let next = 0;
-      await Promise.all(Array.from({ length: Math.min(parallel, count) }, async () => {
-        while (next < count) {
-          const number = ++next;
-          etags[number - 1] = await part(number, { partNumber: String(number), uploadId });
-        }
-      }));
+      await eachInParallel(count, parallel, signal, async (index, partSignal) => {
+        etags[index] = await part(index + 1, { partNumber: String(index + 1), uploadId }, partSignal);
+      });
       const parts = etags.map((etag, index) => `<Part><PartNumber>${index + 1}</PartNumber><ETag>${escapeXml(etag)}</ETag></Part>`).join("");
       const bytes = Buffer.from(`<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUpload>${parts}</CompleteMultipartUpload>`);
       // S3 may answer 200 with an error, the parts not put together.
@@ -351,9 +403,9 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         const { size } = await stat(path);
         if (size <= partBytes) return void (await bodyText(await succeeded(await call("PUT", key, { body: { file: path, size } }, signal)), 0));
         const parts = ranges(size);
-        await multipart(key, parts.length, async (number, query) => {
+        await multipart(key, parts.length, async (number, query, partSignal) => {
           const { start, length } = parts[number - 1] ?? { start: 0, length: 0 };
-          const response = await succeeded(await call("PUT", key, { query, body: { file: path, size: length, start } }, signal));
+          const response = await succeeded(await call("PUT", key, { query, body: { file: path, size: length, start } }, partSignal));
           await bodyText(response, 0);
           const etag = response.headers.etag;
           if (!etag) throw new Error(`its part ${number} was answered with no ETag`);
@@ -367,26 +419,23 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         try {
           if (size <= partBytes) {
             const hash = createHash("sha256");
-            const bytes = await getting(async () => writeSynced(file, await succeeded(await call("GET", key, {}, signal)), 0, syncBytes, (chunk) => hash.update(chunk)));
+            const bytes = await getting(async () => writeSynced(file, await succeeded(await call("GET", key, {}, signal)), 0, size, syncBytes, (chunk) => hash.update(chunk)));
             return { bytes, sha256: hash.digest("hex") };
           }
           // In ranges, each written where it goes, then read again for its hash.
           await file.truncate(size);
           const parts = ranges(size);
-          let next = 0;
-          await Promise.all(Array.from({ length: Math.min(parallel, parts.length) }, async () => {
-            while (next < parts.length) {
-              const { start, length } = parts[next++] ?? { start: 0, length: 0 };
-              await getting(async () => {
-                const response = await succeeded(await call("GET", key, { headers: { range: `bytes=${start}-${start + length - 1}` } }, signal));
-                if (response.statusCode !== 206 || Number(response.headers["content-length"]) !== length) {
-                  await bodyText(response, 0);
-                  throw new Error(`its range from byte ${start} was answered ${response.statusCode} with ${response.headers["content-length"]} bytes, not ${length}`);
-                }
-                await writeSynced(file, response, start, syncBytes);
-              });
-            }
-          }));
+          await eachInParallel(parts.length, parallel, signal, async (index, rangeSignal) => {
+            const { start, length } = parts[index] ?? { start: 0, length: 0 };
+            await getting(async () => {
+              const response = await succeeded(await call("GET", key, { headers: { range: `bytes=${start}-${start + length - 1}` } }, rangeSignal));
+              if (response.statusCode !== 206 || Number(response.headers["content-length"]) !== length) {
+                await bodyText(response, 0);
+                throw new Error(`its range from byte ${start} was answered ${response.statusCode} with ${response.headers["content-length"]} bytes, not ${length}`);
+              }
+              await writeSynced(file, response, start, length, syncBytes);
+            });
+          });
         } finally {
           await file.close();
         }
@@ -404,8 +453,11 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     getJson: (key) =>
       attempt("read", key, async (signal) => {
         const response = await succeeded(await call("GET", key, {}, signal), [404]);
-        const text = await bodyText(response, Number.POSITIVE_INFINITY);
-        if (response.statusCode === 404) return null;
+        if (response.statusCode === 404) {
+          await bodyText(response, 0);
+          return null;
+        }
+        const text = await boundedText(response, JSON_BYTES);
         try {
           return JSON.parse(text) as unknown;
         } catch {
@@ -419,10 +471,10 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         if (size <= copyBytes) return void (await bodyText(await succeeded(await call("PUT", to, { signedHeaders: source }, signal)), 0));
         // In parts of the most S3 copies at once.
         const parts = Array.from({ length: Math.ceil(size / copyBytes) }, (_, index) => ({ start: index * copyBytes, length: Math.min(copyBytes, size - index * copyBytes) }));
-        await multipart(to, parts.length, async (number, query) => {
+        await multipart(to, parts.length, async (number, query, partSignal) => {
           const { start, length } = parts[number - 1] ?? { start: 0, length: 0 };
           const range = { ...source, "x-amz-copy-source-range": `bytes=${start}-${start + length - 1}` };
-          const answered = await bodyText(await succeeded(await call("PUT", to, { query, signedHeaders: range }, signal)), ERROR_BODY_BYTES);
+          const answered = await bodyText(await succeeded(await call("PUT", to, { query, signedHeaders: range }, partSignal)), ERROR_BODY_BYTES);
           const [etag] = elements(answered, "ETag");
           if (!etag) throw new Error(`its part ${number} was answered with no ETag`);
           return etag;

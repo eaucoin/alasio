@@ -27,8 +27,8 @@ export interface FakeS3 {
   readonly requests: string[];
   /** The multipart uploads begun and neither completed nor aborted, by their ids. */
   readonly uploads: Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>;
-  /** Answers a request with the status it gives, as S3 would with an error, rather than doing it; null does it. */
-  refuse: (method: string, key: string) => number | null;
+  /** Answers a request (`asked` as `requests` records it) with the status it gives, as S3 would with an error, at once, rather than doing it; null does it. */
+  refuse: (method: string, key: string, asked: string) => number | null;
   /** How long it waits before it answers a get of an object, so gets overlap as they would on a network. */
   getDelayMs: number;
   /** The most gets of objects it has answered at once. */
@@ -100,14 +100,14 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     const multipartOf = url.searchParams.has("uploads") ? "?uploads" : uploadId === null ? "" : partNumber !== null ? ` part ${partNumber}` : method === "POST" ? " complete" : " abort";
     const asked = !key ? `${method} ?${url.searchParams}` : `${method} ${key}${multipartOf}${source === null ? "" : ` from ${source}`}${typeof range === "string" && method === "GET" ? ` ${range}` : ""}`;
     requests.push(asked);
+    const refused = fake.refuse(method, key, asked);
+    if (refused !== null) return error(response, refused, "InternalError", "refused, as the test asks");
     if (key && method === "GET") {
       getting += 1;
       mostGetting = Math.max(mostGetting, getting);
       response.on("close", () => void (getting -= 1));
       if (fake.getDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, fake.getDelayMs));
     }
-    const refused = fake.refuse(method, key);
-    if (refused !== null) return error(response, refused, "InternalError", "refused, as the test asks");
     if (key && url.searchParams.has("uploads") && method === "POST") {
       const id = `upload-${uploads.size + requests.length}`;
       uploads.set(id, { key, parts: new Map() });
