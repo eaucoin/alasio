@@ -4,6 +4,7 @@ import { test } from "node:test";
 import type { KubernetesObject, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
+import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
 import { added } from "./support/metrics.ts";
@@ -79,7 +80,8 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
   readonly held?: readonly string[];
   readonly current?: Manifest | null;
   readonly holdings?: readonly Holdings[];
-  readonly prepare?: (node: string) => string | null;
+  /** Why a prepare on the node fails, and with which status (409 unless said), or null when it does not. */
+  readonly prepare?: (node: string) => string | { readonly status: number; readonly reason: string } | null;
   readonly read?: NodeAgentError;
   /** Why the agent does not resume a restored sandbox, or null when it does. */
   readonly resumed?: string | null;
@@ -97,9 +99,10 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
       Effect.suspend(() => {
         asked.push(`prepare on ${node}`);
         const refused = prepare(node);
+        const { status, reason } = typeof refused === "string" ? { status: 409, reason: refused } : refused ?? { status: 0, reason: "" };
         return refused === null
           ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1` })
-          : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status: 409, reason: refused }));
+          : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status, reason }));
       }),
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
@@ -204,7 +207,7 @@ test("a session with a snapshot on the current template is restored on a node th
     const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
     return yield* snapshotted.restore(stored(desired), desired);
   }));
-  assert.ok(plan);
+  assert.ok(plan && "podTemplate" in plan);
   // node-a lacks avx, node-b the release; node-d holds it, and fails.
   assert.deepEqual(asked, ["prepare on node-d", "prepare on node-c"]);
   assert.deepEqual(plan.kept, desired.spec.podTemplate);
@@ -248,7 +251,7 @@ test("a restored pod is let run once its containers run, by its node's agent, th
     const outcome = await run(kube, Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
       const plan = yield* snapshotted.restore(stored(desired), desired);
-      assert.ok(plan);
+      assert.ok(plan && "podTemplate" in plan);
       assert.equal(plan.podTemplate.metadata?.annotations?.["dev.gvisor.internal.restore.paused"], "true");
       assert.deepEqual(plan.podTemplate.spec?.readinessGates, [{ conditionType: RESUMED_CONDITION }]);
       return yield* plan.resume.pipe(Effect.as("resumed"), Effect.catch((refused) => Effect.succeed(refused.message)));
@@ -274,7 +277,7 @@ test("a snapshot on the template before the current one is restored into that on
   await run(fakeKube(), Effect.gen(function*() {
     const snapshotted = yield* makeSessionSnapshots({ profile: newer, snapshots, agents, templates: templates(newer, older) });
     const plan = yield* snapshotted.restore(stored(desired), desired);
-    assert.ok(plan);
+    assert.ok(plan && "podTemplate" in plan);
     assert.deepEqual(plan.kept, recorded);
     assert.equal(plan.podTemplate.spec?.containers[0]?.image, "agent@sha256:1");
     assert.equal(plan.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-3");
@@ -313,10 +316,10 @@ test("a session without a snapshot is resumed as it is, and one whose snapshot c
     fakeAgents({ current: manifestOf(sessionOf(profile("agent@sha256:0")).spec.podTemplate), holdings: [node("node-a", [CURRENT])] }),
     // On no node with every CPU feature it was saved with.
     fakeAgents({ current: manifestOf(desired.spec.podTemplate, CURRENT, ["avx512f"]), holdings: [node("node-a", [CURRENT])] }),
-    // Prepared on no node.
-    fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], prepare: () => "the bucket failed" }),
-    // Not read.
-    fakeAgents({ read: new NodeAgentError({ node: "any node", call: "be reached", reason: "no agent is ready" }) }),
+    // Prepared on no node: none can restore it, or its image is not what it says.
+    fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])], prepare: (on) => (on === "node-a" ? "its CPU lacks avx" : { status: 422, reason: "its image is corrupt" }) }),
+    // Not read: what the bucket holds is no snapshot.
+    fakeAgents({ read: new NodeAgentError({ node: "node-a", call: "read alasio-sessions/fs-abc123's snapshot", status: 422, reason: "its current.json is not a manifest" }) }),
   ];
   const fallbacks = await added("alasio.sandbox.restores", async () => {
     for (const { agents, asked } of cases) {
@@ -328,6 +331,51 @@ test("a session without a snapshot is resumed as it is, and one whose snapshot c
     fallbacks,
     Object.fromEntries(["release", "template", "node", "prepare", "unreadable"].map((why) => [`alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=${why}`, 1])),
   );
+});
+
+test("a restore that fails for what may pass is deferred, its snapshot kept, as is one whose sandbox never ran, until restores have been for 15 minutes", async () => {
+  const desired = sessionOf(profile());
+  const manifest = manifestOf(desired.spec.podTemplate);
+  let reading: NodeAgentError | undefined = new NodeAgentError({ node: "node-a", call: "read alasio-sessions/fs-abc123's snapshot", status: 502, reason: "the bucket answered 503" });
+  let preparing: { readonly status: number; readonly reason: string } | null = null;
+  const base = fakeAgents({ current: manifest, holdings: [node("node-a", [CURRENT])] });
+  const agents: NodeAgents = {
+    ...base.agents,
+    current: (workspace) => (reading ? Effect.fail(reading) : base.agents.current(workspace)),
+    prepare: (on, workspace) => (preparing ? Effect.fail(new NodeAgentError({ node: on, call: "prepare", ...preparing })) : base.agents.prepare(on, workspace)),
+  };
+  const counted = await added("alasio.sandbox.restores", () =>
+    run(fakeKube(), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      const restore = snapshotted.restore(stored(desired), desired);
+      // Its bucket fails, then its node's agent as it prepares it: deferred, its snapshot kept.
+      assert.deepEqual(yield* restore, { deferred: "the node agent of node-a could not read alasio-sessions/fs-abc123's snapshot: the bucket answered 503" });
+      reading = undefined;
+      preparing = { status: 502, reason: "the bucket answered 503" };
+      assert.deepEqual(yield* restore, { deferred: "the node agent of node-a could not prepare: the bucket answered 503" });
+      preparing = null;
+      // Prepared, its pod does not come back, its sandbox never having run: deferred; having run, it falls back.
+      const plan = yield* restore;
+      assert.ok(plan && "podTemplate" in plan);
+      assert.equal(plan.snapshot, "s-1");
+      assert.equal(yield* plan.failed({ why: "its pod did not run within 3 minutes", resumed: false }), "deferred");
+      assert.deepEqual(base.asked.filter((each) => each.startsWith("forget")), []);
+      assert.equal(yield* plan.failed({ why: "Sandbox did not become ready", resumed: true }), "fallen back");
+      assert.deepEqual(base.asked.filter((each) => each.startsWith("forget")), ["forget alasio-sessions/fs-abc123"]);
+      // Deferred for 15 minutes from the first, it falls back.
+      reading = new NodeAgentError({ node: "node-a", call: "read alasio-sessions/fs-abc123's snapshot", reason: "connect ECONNREFUSED" });
+      assert.ok(yield* restore.pipe(Effect.map((came) => came !== null && "deferred" in came)));
+      yield* TestClock.adjust("15 minutes");
+      assert.equal(yield* restore, null);
+    }).pipe(Effect.provide(TestClock.layer())))
+  );
+  assert.deepEqual(counted, {
+    "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=unreadable": 2,
+    "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=prepare": 1,
+    "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=restore": 1,
+    "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1,
+    "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=unreadable": 1,
+  });
 });
 
 test("a session is restored only from the snapshot its Sandbox was released into: one it moved on from is stale, and forgotten", async () => {
@@ -397,7 +445,8 @@ test("where one release is kept, a snapshot is restored under it alone, and one 
       return yield* snapshotted.restore(stored(desired), desired);
     }));
   const plan = await restore(fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])] }).agents);
-  assert.equal(plan?.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-4");
+  assert.ok(plan && "podTemplate" in plan);
+  assert.equal(plan.podTemplate.spec?.runtimeClassName, "gvisor-20260921-0-eaucoin-4");
   const before = fakeAgents({ current: manifestOf(desired.spec.podTemplate, PREVIOUS), holdings: [node("node-a", [CURRENT, PREVIOUS])] });
   const fallbacks = await added("alasio.sandbox.restores", async () => assert.equal(await restore(before.agents), null));
   assert.deepEqual(fallbacks, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=release": 1 });

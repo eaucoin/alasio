@@ -41,6 +41,8 @@ import {
   SANDBOX_API_VERSION,
   SANDBOX_KIND,
   type Sandbox,
+  type RestoreDeferred,
+  type RestoreFailure,
   type SandboxRestore,
   SandboxRestoreRefused,
   type Saved,
@@ -68,6 +70,12 @@ const RELEASE_POLL: Duration.Input = "15 seconds";
 const COLLECT_POLL: Duration.Input = "10 minutes";
 /** How long a look at a bayma's status may take. */
 const STATUS_TIMEOUT_MS = 5000;
+/**
+ * How long a session's restore is deferred for, from its first that was, while what it
+ * needs fails for a while (an agent, the bucket, its pod's start, its network policies),
+ * before it is brought up without its snapshot: the prompts meanwhile are told so.
+ */
+const DEFER_FOR_MS = 15 * 60_000;
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description: "Session sandboxes released, by outcome: snapshotted and suspended, kept running, or failed",
@@ -124,8 +132,11 @@ export interface SessionSnapshotsOptions {
 export interface SessionSnapshots {
   /** Whether a running Sandbox stays on its template: one restored onto the template before the current one. */
   readonly keeps: (sandbox: StoredSandbox) => boolean;
-  /** How a suspended Sandbox is restored from its snapshot, or null when it is resumed without one (said why, when it had one). */
-  readonly restore: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | null>;
+  /**
+   * How a suspended Sandbox is restored from its snapshot; null when it is resumed without
+   * one (said why, when it had one); or why its restore is deferred, its snapshot kept.
+   */
+  readonly restore: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | RestoreDeferred | null>;
   /**
    * Releases each running session once it has run no exec and no turn for long enough,
    * looking every RELEASE_POLL, for as long as the scope lasts; `lastTurn(name)` is when
@@ -156,27 +167,59 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       Effect.andThen(Effect.logInfo(`forgot the snapshot of session ${name}: ${why}`)),
     );
 
+  /** Since when each session's restore has been deferred, from the first that was: in memory, as alasio's start begins a window anew. */
+  const deferredSince = new Map<string, number>();
+
   /** Resumes the session without its snapshot, which is forgotten, saying why, and counted as `fallback`. */
   const fallBack = (name: string, fallback: Fallback, why: string): Effect.Effect<null> =>
     Effect.logWarning(`session ${name} is resumed from bayma's checkpoints, not from its snapshot: ${why}`).pipe(
-      Effect.andThen(Effect.sync(() => restores.add(1, { "alasio.sandbox.restore.outcome": "fallback", "alasio.sandbox.restore.fallback": fallback }))),
+      Effect.andThen(Effect.sync(() => {
+        deferredSince.delete(name);
+        restores.add(1, { "alasio.sandbox.restore.outcome": "fallback", "alasio.sandbox.restore.fallback": fallback });
+      })),
       Effect.andThen(forget(name, why)),
       Effect.as(null),
     );
 
-  /** The nodes that can restore `manifest`, those holding its image first: they have its release, with every CPU feature it was saved with. */
+  /**
+   * Defers the session's restore, which failed for `why`, as what it needs may come back:
+   * its snapshot kept, as nothing has run since, for the next bring-up; once its restores
+   * have been deferred for DEFER_FOR_MS, it falls back as `fallback` instead.
+   */
+  const deferOr = (name: string, fallback: Fallback, why: string): Effect.Effect<RestoreDeferred | null> =>
+    Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis;
+      const since = deferredSince.get(name) ?? now;
+      if (now - since >= DEFER_FOR_MS) return yield* fallBack(name, fallback, `${why}, as its restores have been for ${Math.round((now - since) / 60_000)} minutes`);
+      deferredSince.set(name, since);
+      restores.add(1, { "alasio.sandbox.restore.outcome": "deferred", "alasio.sandbox.restore.fallback": fallback });
+      yield* Effect.logWarning(`the restore of session ${name} from its snapshot is deferred, its snapshot kept for the next try: ${why}`);
+      return { deferred: why };
+    });
+
+  /** Whether an agent's failure `error` may pass: one of reaching it, or of the bucket behind it, not one of what it was asked of. */
+  const passing = (error: NodeAgentError | KubeApiError): boolean =>
+    error._tag === "KubeApiError" || error.status === undefined || error.status >= 500;
+
+  /**
+   * The nodes that can restore `manifest`, those holding its image first: they have its
+   * release, with every CPU feature it was saved with; and whether every agent said what
+   * its node holds.
+   */
   const nodesFor = (manifest: Manifest) =>
     Effect.gen(function*() {
-      const held = yield* Effect.forEach(yield* agents.nodes, (node) =>
+      const found = yield* agents.nodes;
+      const held = yield* Effect.forEach(found, (node) =>
         agents.holdings(node).pipe(
           Effect.map((holdings) => [holdings]),
           Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([]))),
         ));
+      const answered = found.length > 0 && held.every((each) => each.length > 0);
       const able = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
       const holds = (cached: (typeof able)[number]["cached"]) => cached.some(({ snapshot }) => snapshot === manifest.snapshot);
-      return [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node);
+      return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered };
     });
 
   /**
@@ -194,32 +237,35 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           const pod = read as V1Pod | null;
           const statuses = pod?.status?.containerStatuses ?? [];
           if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded" || statuses.some(({ state }) => state?.terminated)) {
-            return Effect.fail(new SandboxRestoreRefused({ reason: `its pod ended before it ran (${pod?.status?.reason ?? pod?.status?.phase ?? "terminated"})` }));
+            return Effect.fail(new SandboxRestoreRefused({ reason: `its pod ended before it ran (${pod?.status?.reason ?? pod?.status?.phase ?? "terminated"})`, resumed: false }));
           }
           const ready = pod && statuses.length > 0 && statuses.every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0;
           return ready ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
         }),
         Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT)]) }),
-        Effect.catchTag("PodNotRunning", () => Effect.fail(new SandboxRestoreRefused({ reason: `its pod did not run within ${POD_RUNNING_TIMEOUT}` }))),
-        Effect.catchTag("KubeApiError", (error) => Effect.fail(new SandboxRestoreRefused({ reason: error.message }))),
+        Effect.catchTag("PodNotRunning", () => Effect.fail(new SandboxRestoreRefused({ reason: `its pod did not run within ${POD_RUNNING_TIMEOUT}`, resumed: false }))),
+        Effect.catchTag("KubeApiError", (error) => Effect.fail(new SandboxRestoreRefused({ reason: error.message, resumed: false }))),
       );
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^containerd:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
+      // Its agent leaves it paused where its network policies are not in force (504); of any other failure, its sandbox may have run.
       yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds }).pipe(
-        Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message })),
+        Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: !(error._tag === "NodeAgentError" && error.status === 504) })),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
       yield* kube.patchPodStatus(profile.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
-        Effect.mapError((error) => new SandboxRestoreRefused({ reason: `its readiness could not be set: ${error.message}` })),
+        Effect.mapError((error) => new SandboxRestoreRefused({ reason: `its readiness could not be set: ${error.message}`, resumed: true })),
       );
     });
 
-  const restore = (sandbox: StoredSandbox, desired: Sandbox): Effect.Effect<SandboxRestore | null> => {
+  const restore = (sandbox: StoredSandbox, desired: Sandbox): Effect.Effect<SandboxRestore | RestoreDeferred | null> => {
     const name = sandbox.metadata.name;
     return Effect.gen(function*() {
       const started = yield* Clock.currentTimeMillis;
       const read = yield* agents.current(ref(name)).pipe(Effect.result);
-      if (read._tag === "Failure") return yield* fallBack(name, "unreadable", read.failure.message);
+      if (read._tag === "Failure") {
+        return yield* (passing(read.failure) ? deferOr : fallBack)(name, "unreadable", read.failure.message);
+      }
       const manifest = read.success;
       if (!manifest) return null;
       // Only the snapshot its Sandbox was released into: one it has moved on from since,
@@ -237,17 +283,19 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       const own = recorded.metadata?.labels?.[SANDBOX_LABEL] === name;
       const base = template === templates.current ? desired.spec.podTemplate : template !== undefined && template === templates.previous && own ? recorded : null;
       if (!base) return yield* fallBack(name, "template", "the session template it was taken on is no longer kept");
-      const nodes = yield* nodesFor(manifest).pipe(Effect.result);
-      if (nodes._tag === "Failure") return yield* fallBack(name, "unreadable", nodes.failure.message);
-      if (nodes.success.length === 0) {
-        return yield* fallBack(name, "node", `no node has gVisor ${manifest.release} and every CPU feature it was saved with`);
+      const able = yield* nodesFor(manifest).pipe(Effect.result);
+      if (able._tag === "Failure") return yield* deferOr(name, "unreadable", able.failure.message);
+      if (able.success.nodes.length === 0) {
+        const none = `no node has gVisor ${manifest.release} and every CPU feature it was saved with`;
+        return yield* (able.success.answered ? fallBack(name, "node", none) : deferOr(name, "node", `${none} of the nodes whose agents answered`));
       }
-      let why = "";
-      for (const node of nodes.success) {
+      // Each node is tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
+      const failures: (NodeAgentError | KubeApiError)[] = [];
+      for (const node of able.success.nodes) {
         const prepared = yield* agents.prepare(node, ref(name)).pipe(Effect.result);
         if (prepared._tag === "Failure") {
-          why = prepared.failure.message;
-          yield* Effect.logWarning(why);
+          failures.push(prepared.failure);
+          yield* Effect.logWarning(prepared.failure.message);
           continue;
         }
         yield* Effect.logInfo(`restoring session ${name} on ${node} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
@@ -269,21 +317,28 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           },
         };
         return {
+          snapshot: manifest.snapshot,
           podTemplate: restoring,
           kept: base,
           resume: resumeRestored(name, node),
           // The session moves on from it.
           restored: Clock.currentTimeMillis.pipe(
             Effect.map((now) => {
+              deferredSince.delete(name);
               restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
               restoreDuration.record((now - started) / 1000);
             }),
             Effect.andThen(forget(name, "the session restored from it runs on")),
           ),
-          failed: (failure: string) => fallBack(name, "restore", failure).pipe(Effect.asVoid),
+          failed: ({ why, resumed }: RestoreFailure) =>
+            (resumed ? fallBack(name, "restore", why) : deferOr(name, "restore", why)).pipe(Effect.map((came) => (came === null ? "fallen back" : "deferred"))),
         };
       }
-      return yield* fallBack(name, "prepare", why);
+      // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
+      const why = failures.map(({ message }) => message).join("; ");
+      return yield* (failures.some(passing) && !failures.some((failure) => failure._tag === "NodeAgentError" && (failure.status === 404 || failure.status === 422))
+        ? deferOr(name, "prepare", why)
+        : fallBack(name, "prepare", why));
     }).pipe(withAlasioSpan("alasio.sandbox.restore", { attributes: { "alasio.sandbox.name": name } }), withLogScope("snapshots"));
   };
 

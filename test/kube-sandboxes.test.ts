@@ -28,6 +28,7 @@ import {
   podEnded,
   POD_TEMPLATE_ANNOTATION,
   podTemplateHash,
+  type RestoreDeferred,
   type Sandbox,
   type SandboxFault,
   type SandboxRestore,
@@ -36,6 +37,7 @@ import {
   type SandboxStatus,
   sandboxManifest,
   sandboxReady,
+  SNAPSHOT_ANNOTATION,
   type StoredSandbox,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
@@ -598,14 +600,16 @@ const RESTORING = "test.dev/restore-from";
 
 /**
  * A restore of the Sandbox `current` makes, from a snapshot of a pod of `older`'s template:
- * what it is told, in `told`.
+ * what it is told, in `told`; refused `refused`, as its sandbox ran or not, then fallen back,
+ * or deferred where `defers` says so.
  */
-const restoreOf = (older: Sandbox, told: string[], refused?: string): SandboxRestore => ({
+const restoreOf = (older: Sandbox, told: string[], refused?: { readonly reason: string; readonly resumed: boolean }, defers = false): SandboxRestore => ({
+  snapshot: "s-1",
   podTemplate: { ...older.spec.podTemplate, metadata: { ...older.spec.podTemplate.metadata, annotations: { [RESTORING]: "/snapshots/fs-abc123" } } },
   kept: older.spec.podTemplate,
-  resume: refused === undefined ? Effect.sync(() => void told.push("resumed")) : Effect.fail(new SandboxRestoreRefused({ reason: refused })),
+  resume: refused === undefined ? Effect.sync(() => void told.push("resumed")) : Effect.fail(new SandboxRestoreRefused(refused)),
   restored: Effect.sync(() => told.push("restored")),
-  failed: (why) => Effect.sync(() => told.push(`failed: ${why}`)),
+  failed: ({ why, resumed }) => Effect.sync(() => (told.push(`failed${resumed ? " after its resume" : ""}: ${why}`), defers && !resumed ? "deferred" : "fallen back")),
 });
 
 test("ensure resumes a suspended Sandbox from a snapshot of its pod, by the template the snapshot gives, then keeps the template that pod was made from", async () => {
@@ -660,7 +664,7 @@ test("a Sandbox whose restore's pod ends is suspended again, its restore told wh
     const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told)) });
     yield* sandboxes.ensure("fs-abc123", () => current);
   })).finally(controller.stop);
-  assert.deepEqual(told, ["resumed", "failed: the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)"]);
+  assert.deepEqual(told, ["resumed", "failed after its resume: the pod of Sandbox alasio-sessions/fs-abc123 ended (PodFailed)"]);
   // The restore's pod, then one of alasio's template.
   assert.equal(controller.pods.length, 2);
   const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
@@ -707,14 +711,43 @@ test("a Sandbox whose restored pod is not let run is suspended again, its restor
   const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
   const told: string[] = [];
   const controller = kube.control("alasio-sessions", "fs-abc123");
+  const refused = { reason: "its readiness could not be set", resumed: true };
   await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
-    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told, "its egress was not confined within 30s")) });
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.succeed(restoreOf(older, told, refused, true)) });
     yield* sandboxes.ensure("fs-abc123", () => current);
   })).finally(controller.stop);
-  assert.deepEqual(told, ["failed: its egress was not confined within 30s"]);
+  assert.deepEqual(told, ["failed after its resume: its readiness could not be set"]);
   const resumed = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
   assert.deepEqual(resumed?.spec?.podTemplate, current.spec.podTemplate);
   assert.equal(resumed?.spec?.operatingMode, "Running");
+});
+
+test("a Sandbox whose restore is deferred, before it or as its pod's sandbox never ran, is left suspended, released into its snapshot, and the bring-up fails saying so", async () => {
+  const kube = fakeKube();
+  const older = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  kube.create(older);
+  kube.patch("Sandbox", "alasio-sessions", "fs-abc123", { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: "s-1" } }, spec: { operatingMode: "Suspended" } });
+  const current = sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+  const told: string[] = [];
+  const controller = kube.control("alasio-sessions", "fs-abc123");
+  const plans: (SandboxRestore | RestoreDeferred)[] = [
+    { deferred: "the bucket answered 503" },
+    restoreOf(older, told, { reason: "the network policies of alasio-sessions/fs-abc123 are not in force", resumed: false }, true),
+  ];
+  const errors = await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+    const sandboxes = yield* makeSandboxes({ namespace: "alasio-sessions", port: 7290, poll: "5 millis", restore: () => Effect.sync(() => plans.shift() ?? null) });
+    const first = yield* Effect.flip(sandboxes.ensure("fs-abc123", () => current));
+    const second = yield* Effect.flip(sandboxes.ensure("fs-abc123", () => current));
+    return [first.message, second.message];
+  })).finally(controller.stop);
+  assert.deepEqual(errors, [
+    "Sandbox alasio-sessions/fs-abc123 could not be restored from its snapshot now, which is kept for the next try: the bucket answered 503",
+    "Sandbox alasio-sessions/fs-abc123 could not be restored from its snapshot now, which is kept for the next try: the network policies of alasio-sessions/fs-abc123 are not in force",
+  ]);
+  assert.deepEqual(told, ["failed: the network policies of alasio-sessions/fs-abc123 are not in force"]);
+  const left = kube.peek("Sandbox", "alasio-sessions", "fs-abc123");
+  assert.equal(left?.spec?.operatingMode, "Suspended");
+  assert.equal(left?.metadata.annotations?.[SNAPSHOT_ANNOTATION], "s-1");
 });
 
 test("a running Sandbox on another template is moved onto alasio's unless its caller keeps it, and a pod that ends as it is waited for fails the bring-up at once", async () => {

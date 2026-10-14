@@ -179,19 +179,33 @@ export interface SandboxFault {
 }
 
 /**
- * A suspended Sandbox resumed from a snapshot of the pod it ran: the pod template it
+ * A suspended Sandbox resumed from a snapshot of its pod, `snapshot`: the pod template it
  * resumes with, which brings that pod back, left paused, `podTemplate`; the template it
  * keeps once the pod is back, `kept`, the one that pod was made from; what lets the pod's
  * sandbox run once its pod runs, which makes the pod ready, or refuses it, `resume`; and
  * what is done once the pod is ready, `restored`, or once it failed to come back, or was
- * refused, `failed(why)`, after which the Sandbox is resumed as one that has no snapshot is.
+ * refused, `failed`. What that says comes of it: the Sandbox resumed as one that has no
+ * snapshot is ("fallen back"), or, where its sandbox never ran, suspended again, still
+ * released into the snapshot, for the next bring-up to restore ("deferred").
  */
 export interface SandboxRestore {
+  readonly snapshot: string;
   readonly podTemplate: V1PodTemplateSpec;
   readonly kept: V1PodTemplateSpec;
   readonly resume: Effect.Effect<void, SandboxRestoreRefused>;
   readonly restored: Effect.Effect<void>;
-  readonly failed: (why: string) => Effect.Effect<void>;
+  readonly failed: (failure: RestoreFailure) => Effect.Effect<"fallen back" | "deferred">;
+}
+
+/** Why a restore's pod did not come back, and whether its sandbox ran meanwhile, so the snapshot no longer is the session. */
+export interface RestoreFailure {
+  readonly why: string;
+  readonly resumed: boolean;
+}
+
+/** A restore that cannot be done now, but may be later, the Sandbox left suspended, released into its snapshot: why. */
+export interface RestoreDeferred {
+  readonly deferred: string;
 }
 
 /** What a release's save came to: the Sandbox left running, or suspended, saved into the snapshot named, or into none. */
@@ -204,17 +218,29 @@ export type Saved = "keep" | { readonly snapshot: string | null };
  */
 export const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
 
-/** A Sandbox restored from a snapshot of its pod is not let run: why. */
+/** A Sandbox restored from a snapshot of its pod is not let run: why, and whether its sandbox ran all the same. */
 export class SandboxRestoreRefused extends Schema.TaggedError<SandboxRestoreRefused>()("SandboxRestoreRefused", {
   reason: Schema.String,
+  resumed: Schema.Boolean,
 }) {
   override get message(): string {
     return this.reason;
   }
 }
 
+/** A Sandbox's restore from its snapshot was deferred, the snapshot kept for the next bring-up: why. */
+export class SandboxRestoreDeferred extends Schema.TaggedError<SandboxRestoreDeferred>()("SandboxRestoreDeferred", {
+  namespace: Schema.String,
+  name: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `Sandbox ${this.namespace}/${this.name} could not be restored from its snapshot now, which is kept for the next try: ${this.reason}`;
+  }
+}
+
 /** How bringing a Sandbox's bayma up fails. */
-export type SandboxError = KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone | SandboxTokenMissing | BaymaNotAnswering;
+export type SandboxError = KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone | SandboxTokenMissing | BaymaNotAnswering | SandboxRestoreDeferred;
 
 /** The Sandboxes of one namespace; see makeSandboxes. */
 export interface Sandboxes {
@@ -263,10 +289,10 @@ export interface SandboxesOptions {
   readonly keeps?: (sandbox: StoredSandbox) => boolean;
   /**
    * How the suspended Sandbox `sandbox`, which `desired` is made from, is resumed from a
-   * snapshot of its pod, or null when it is resumed as it is (moved onto alasio's current
-   * template first, when it is on another).
+   * snapshot of its pod; null when it is resumed as it is (moved onto alasio's current
+   * template first, when it is on another); or why it cannot be now, but may be later.
    */
-  readonly restore?: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | null>;
+  readonly restore?: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | RestoreDeferred | null>;
 }
 
 /** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
@@ -562,12 +588,16 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   /**
    * `sandbox`, suspended, resumed from a snapshot of its pod as `plan` says: running the
    * template that brings that pod back, then, once it is back, keeping the template it was
-   * made from. One whose pod does not come back is suspended again, `plan` told why.
+   * made from. One whose pod does not come back is suspended again, `plan` told why, and
+   * released into the snapshot again where `plan` defers it.
    */
   const restoreFrom = Effect.fnUntraced(function*(
     sandbox: StoredSandbox,
     plan: SandboxRestore,
-  ): Effect.fn.Return<{ readonly restored: StoredSandbox } | { readonly failed: StoredSandbox }, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
+  ): Effect.fn.Return<
+    { readonly restored: StoredSandbox } | { readonly failed: StoredSandbox } | RestoreDeferred,
+    KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone
+  > {
     const name = sandbox.metadata.name;
     yield* Effect.logInfo(`restoring Sandbox ${namespace}/${name} from a snapshot of its pod`);
     // Until it is back, it runs the restore's template, which is no template of alasio's:
@@ -577,19 +607,27 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       metadata: { annotations: { [POD_TEMPLATE_ANNOTATION]: podTemplateHash(plan.podTemplate), [SNAPSHOT_ANNOTATION]: null } },
       spec: { operatingMode: "Running", podTemplate: mergePatch(sandbox.spec.podTemplate, plan.podTemplate) },
     }));
+    // Once resumed, its sandbox has run: what fails after is the session's, which has moved on.
     const back = yield* plan.resume.pipe(
-      Effect.andThen(awaitCondition(restoring, "Ready")),
+      Effect.catchTag("SandboxRestoreRefused", (error) => Effect.fail({ why: error.message, resumed: error.resumed })),
+      Effect.andThen(awaitCondition(restoring, "Ready").pipe(
+        Effect.catchTags({
+          SandboxNotReady: (error) => Effect.fail({ why: error.message, resumed: true }),
+          SandboxPodEnded: (error) => Effect.fail({ why: error.message, resumed: true }),
+        }),
+      )),
       Effect.map((ready) => ({ ready })),
-      Effect.catchTags({
-        SandboxNotReady: (error) => Effect.succeed({ why: error.message }),
-        SandboxPodEnded: (error) => Effect.succeed({ why: error.message }),
-        SandboxRestoreRefused: (error) => Effect.succeed({ why: error.message }),
-      }),
+      Effect.catch((failure: RestoreFailure | KubeApiError | SandboxGone) => ("why" in failure ? Effect.succeed({ failure }) : Effect.fail(failure))),
     );
-    if ("why" in back) {
-      yield* plan.failed(back.why);
-      const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
-      return { failed: yield* awaitCondition(suspending, "Suspended") };
+    if ("failure" in back) {
+      const came = yield* plan.failed(back.failure);
+      // Ended, its pod's sandbox never having run, the Sandbox is released into its snapshot again.
+      const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
+        ...(came === "deferred" ? { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: plan.snapshot } } } : {}),
+        spec: { operatingMode: "Suspended" },
+      }));
+      const suspended = yield* awaitCondition(suspending, "Suspended");
+      return came === "deferred" ? { deferred: back.failure.why } : { failed: suspended };
     }
     // The pod runs on; the template now says what it was made from, for any pod after it.
     const restored = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
@@ -620,7 +658,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     }
     if (sandbox.spec?.operatingMode === "Suspended") {
       const plan = restore ? yield* restore(sandbox, desired) : null;
-      const outcome = plan ? yield* restoreFrom(sandbox, plan) : null;
+      const outcome = plan === null || "deferred" in plan ? plan : yield* restoreFrom(sandbox, plan);
+      if (outcome && "deferred" in outcome) return yield* new SandboxRestoreDeferred({ namespace, name, reason: outcome.deferred });
       if (outcome && "restored" in outcome) {
         sandbox = outcome.restored;
       } else {
