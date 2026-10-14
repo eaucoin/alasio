@@ -1,0 +1,26 @@
+# The collector's gateway as 03 makes it, for the log gate: OTLP in, each signal to its topic
+# as OTLP protobuf, acked by every in-sync replica, with no sending queue and no retry, so a
+# producer's export is answered only once the log has it.
+receivers:
+  otlp:
+    protocols:
+      http: { endpoint: 0.0.0.0:4318 }
+exporters:
+  kafka:
+    brokers: [automq:9092]
+    protocol_version: 3.9.0
+    auth:
+      sasl: { username: gateway, password: gateway-secret, mechanism: SCRAM-SHA-512 }
+    traces: { topic: otel.spans, encoding: otlp_proto }
+    logs: { topic: otel.logs, encoding: otlp_proto }
+    metrics: { topic: otel.metrics, encoding: otlp_proto }
+    producer: { required_acks: -1 }
+    timeout: 10s
+    sending_queue: { enabled: false }
+    retry_on_failure: { enabled: false }
+service:
+  telemetry: { metrics: { level: none } }
+  pipelines:
+    traces: { receivers: [otlp], exporters: [kafka] }
+    logs: { receivers: [otlp], exporters: [kafka] }
+    metrics: { receivers: [otlp], exporters: [kafka] }

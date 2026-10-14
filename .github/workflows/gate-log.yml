@@ -1,0 +1,36 @@
+name: gate-log
+
+# The log gate of 03 and 04 (gate/log/run.sh): AutoMQ on SeaweedFS with SCRAM principals and
+# ACLs, the one Kafka client against it, and the collector's Kafka exporter. On its branch
+# alone, whenever what it runs changes.
+on:
+  push:
+    branches: [track/telemetry-log-gate]
+    paths: [.github/workflows/gate-log.yml, gate/log/**, package.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  log:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: gate/log/run.sh
+        env:
+          OUT: ${{ runner.temp }}/gate-log
+      - if: always()
+        run: |
+          for name in automq collector s3; do docker logs "$name" >"$RUNNER_TEMP/gate-log/$name-final.log" 2>&1 || true; done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-log
+          path: ${{ runner.temp }}/gate-log
