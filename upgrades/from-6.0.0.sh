@@ -143,6 +143,17 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   [ "$differing" = 0 ] || fail "$differing branches of the storage controller's database differ from neon-control's record"
   log "neon-control's record moved: $(jq -r '[.branches[] | "\(.name) \(.state)"] | join(", ")' "$OUT/branches.json")"
 
+  # alasio's state, in main's database, given what this release keeps that 6.0.0 did not,
+  # with alasio stopped, so that nothing writes to the tables as they change, until the
+  # upgrade starts this release's alasio.
+  log "stopping alasio, so nothing writes to its state as it changes"
+  stop alasio
+  log "changing alasio's state for this release"
+  k exec -i deploy/alasio-neon-compute -c compute -- psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -v ON_ERROR_STOP=1 -q <<'SQL'
+-- The outbox carries a turn's status message, the Telegram message it was sent as, and its edits.
+alter table state.telegram_outbox add column if not exists edits text, add column if not exists telegram_message_id bigint;
+SQL
+
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"
 fi

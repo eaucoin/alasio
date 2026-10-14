@@ -1,9 +1,9 @@
-import { Clock, Deferred, Effect, Schedule, type Scope } from "effect";
+import { Clock, Deferred, Effect, Fiber, Schedule, type Scope } from "effect";
 
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
 import { formatDuration } from "../shared/human-time.ts";
-import { type ChatId, TelegramClient } from "../telegram/client.ts";
+import type { ChatId } from "../telegram/client.ts";
 import { Outbox } from "../telegram/outbox.ts";
 import { type WorkflowWait, WorkflowHooks } from "../workflow/hook-server.ts";
 import type { PreparedReply, ReplyMedia } from "./reply-media.ts";
@@ -14,6 +14,8 @@ const FINAL_RESPONSE_OPTIONS = Object.freeze({ format: "rich" });
 
 /** How often a running turn's status is checked for a change worth showing (a workflow wait). */
 const STATUS_CHECK = "30 seconds";
+/** How long alasio, as it stops, waits for a turn's status message to say so. */
+const RESTARTING_DELIVERY = "5 seconds";
 
 function escapeHtml(value: string): string {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -51,9 +53,9 @@ export interface FinalResponse {
   readonly pendingResponseId: string | null | undefined;
 }
 
-/** A turn's status message, once posted: its id, and when the turn started. */
+/** A turn's status message, once queued: its outbox entry, which its edits name, and when the turn started. */
 export interface PostedStatus {
-  readonly messageId: number;
+  readonly outboxId: string;
   readonly startTime: number;
 }
 
@@ -87,8 +89,8 @@ export interface StatusReporter {
    */
   readonly enqueueFinalResponse: (response: FinalResponse) => Effect.Effect<void, StoreError>;
   /**
-   * Posts the turn's status message and keeps it current, in a fiber of the scope, until
-   * the scope closes. The status message once posted; null if it could not be.
+   * Queues the turn's status message and keeps it current, in a fiber of the scope, until
+   * the scope closes. The status message once queued; null if it could not be.
    */
   readonly statusUpdates: (updates: StatusUpdates) => Effect.Effect<Deferred.Deferred<PostedStatus | null>, never, Scope.Scope>;
   readonly postResponse: (response: PostedResponse) => Effect.Effect<void, StoreError>;
@@ -100,15 +102,16 @@ export interface StatusReporter {
 }
 
 /**
- * The status reporter of alasio's store, Telegram client, outbox and workflow hooks. With
- * `replyMedia` (codex/reply-media.ts), the media a response shows are delivered with it;
- * without, responses go as rich text only.
+ * The status reporter of alasio's store, outbox and workflow hooks: what a turn shows is
+ * queued in the outbox, its status message and that message's edits as its reply, each
+ * chat's in order, so none of it is lost to a restart. With `replyMedia`
+ * (codex/reply-media.ts), the media a response shows are delivered with it; without,
+ * responses go as rich text only.
  */
 export const makeStatusReporter = Effect.fnUntraced(function*(
   { replyMedia = null }: { readonly replyMedia?: Pick<ReplyMedia, "prepare"> | null } = {},
-): Effect.fn.Return<StatusReporter, never, Store | TelegramClient | Outbox | WorkflowHooks> {
+): Effect.fn.Return<StatusReporter, never, Store | Outbox | WorkflowHooks> {
   const store = yield* Store;
-  const client = yield* TelegramClient;
   const outbox = yield* Outbox;
   const { waits } = yield* WorkflowHooks;
 
@@ -117,8 +120,15 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     yield* outbox.enqueueText({ chatId, text: prepared.text, options: prepared.options, pendingResponseId });
   });
 
-  /** Keeps a posted status message current: every STATUS_CHECK, it is edited if what it says has changed. */
-  const keepCurrent = (chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, messageId: number): Effect.Effect<void> => {
+  /** Queues an edit of the status message; one that cannot be queued is said, and left out. */
+  const edit = (chatId: ChatId, status: PostedStatus, text: string, options: { readonly parse_mode?: "HTML" } = {}): Effect.Effect<void> =>
+    outbox.enqueueEdit(status.outboxId, { chatId, text, options }).pipe(
+      Effect.asVoid,
+      Effect.catch((error) => Effect.logWarning(`Failed to queue an edit of the status message: ${error.message}`)),
+    );
+
+  /** Keeps a queued status message current: every STATUS_CHECK, it is edited if what it says has changed. */
+  const keepCurrent = (chatId: ChatId, sessionId: string | null, shownAtFirst: string, statusHtml: (wait: WorkflowWait | null) => string, status: PostedStatus): Effect.Effect<void> => {
     let shown = shownAtFirst;
     const check = Effect.suspend(() => {
       const next = statusHtml(sessionId ? waits.get(sessionId) ?? null : null);
@@ -126,9 +136,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
         return Effect.void;
       }
       shown = next;
-      return client.editMessageText(chatId, messageId, next, { parse_mode: "HTML" }).pipe(
-        Effect.catch((error) => Effect.logWarning(`Failed to edit status message: ${error}`)),
-      );
+      return edit(chatId, status, next, { parse_mode: "HTML" });
     });
     return check.pipe(Effect.schedule(Schedule.spaced(STATUS_CHECK)), Effect.asVoid);
   };
@@ -138,15 +146,15 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     const startTime = yield* Clock.currentTimeMillis;
     const statusHtml = (workflowWait: WorkflowWait | null) => workingStatusHtml({ harnessName, startedAtMs: startTime, workflowWait });
     const shown = statusHtml(null);
-    // The message is posted whole however soon the turn ends; only keeping it current is interrupted.
-    const post = client.sendMessage(chatId, shown, { parse_mode: "HTML" }).pipe(
-      Effect.map(([sent]) => (sent?.message_id ? { messageId: sent.message_id, startTime } : null)),
-      Effect.catch((error) => Effect.logWarning(`Failed to post status message: ${error}`).pipe(Effect.as(null))),
+    // The message is queued whole however soon the turn ends; only keeping it current is interrupted.
+    const post = outbox.enqueueStatus({ chatId, text: shown, options: { parse_mode: "HTML" } }).pipe(
+      Effect.map((outboxId): PostedStatus | null => ({ outboxId, startTime })),
+      Effect.catch((error) => Effect.logWarning(`Failed to queue the status message: ${error.message}`).pipe(Effect.as(null))),
       Effect.tap((status) => Deferred.succeed(posted, status)),
       Effect.uninterruptible,
     );
     yield* post.pipe(
-      Effect.flatMap((status) => (status ? keepCurrent(chatId, sessionId, shown, statusHtml, status.messageId) : Effect.void)),
+      Effect.flatMap((status) => (status ? keepCurrent(chatId, sessionId, shown, statusHtml, status) : Effect.void)),
       Effect.ensuring(Deferred.succeed(posted, null)),
       Effect.forkScoped,
     );
@@ -157,7 +165,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     const trimmedResponse = response.trim();
     if (status) {
       const elapsedSeconds = ((yield* Clock.currentTimeMillis) - status.startTime) / 1000;
-      yield* client.editMessageText(chatId, status.messageId, `${harnessName} worked for ${formatDuration(elapsedSeconds)}.`).pipe(Effect.ignore);
+      yield* edit(chatId, status, `${harnessName} worked for ${formatDuration(elapsedSeconds)}.`);
     }
     if (!trimmedResponse) {
       if (pendingResponseId) {
@@ -170,7 +178,7 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
 
   const finishWithoutResponse = Effect.fnUntraced(function*({ chatId, pendingResponseId, status, statusText = null, harnessName = "Codex" }: UnansweredTurn) {
     if (status) {
-      yield* client.editMessageText(chatId, status.messageId, statusText ?? `${harnessName} interrupted.`).pipe(Effect.ignore);
+      yield* edit(chatId, status, statusText ?? `${harnessName} interrupted.`);
     }
     if (pendingResponseId) {
       yield* store.markPendingAsPosted(pendingResponseId);
@@ -183,7 +191,16 @@ export const makeStatusReporter = Effect.fnUntraced(function*(
     postResponse,
     finishWithoutResponse,
     restarting: (chatId, status, harnessName) =>
-      status ? client.editMessageText(chatId, status.messageId, restartingStatusText(harnessName)).pipe(Effect.ignore) : Effect.void,
+      status
+        // Delivered now if it can be, as alasio stops; else after the restart, before anything the turn sends then.
+        // The wait is RESTARTING_DELIVERY at most: the pass goes on detached, so an entry it is
+        // delivering then, which is not cut short, holds alasio's stopping back no longer.
+        ? edit(chatId, status, restartingStatusText(harnessName)).pipe(
+          Effect.andThen(Effect.forkDetach(outbox.deliverDue)),
+          Effect.flatMap((pass) => Fiber.await(pass).pipe(Effect.timeoutOption(RESTARTING_DELIVERY))),
+          Effect.asVoid,
+        )
+        : Effect.void,
     flushCompletedResponses: Effect.gen(function*() {
       for (const completed of yield* store.getCompletedResponsesPendingDelivery) {
         const response = finalResponseToMarkdown(completed.blocks);
