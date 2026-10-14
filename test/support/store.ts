@@ -42,6 +42,12 @@ export async function testPool(): Promise<pg.Pool> {
   return (await database()).pool;
 }
 
+/** The holds the store in `schema` keeps (conversation_holds), as [conversation, reason], in the order held. */
+export async function holdsIn(schema: string): Promise<(readonly [string, string])[]> {
+  const { rows } = await (await database()).pool.query<{ conversation_id: string; reason: string }>(`select conversation_id, reason from ${schema}.conversation_holds order by held_at`);
+  return rows.map(({ conversation_id, reason }) => [conversation_id, reason] as const);
+}
+
 /** A schema no store of the test file's has used. */
 export function newSchema(): string {
   schemas += 1;

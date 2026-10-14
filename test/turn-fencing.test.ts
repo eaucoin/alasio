@@ -3,9 +3,11 @@ import test from "node:test";
 
 import { Effect, Exit } from "effect";
 
+import { ActiveTurns } from "../src/harness/active-turns.ts";
+import { holdConversations } from "../src/harness/holds.ts";
 import { CODEX_HARNESS } from "../src/harness/names.ts";
 import { TurnFenced } from "../src/persistence/store.ts";
-import { newSchema, run, testPool, testStore } from "./support/store.ts";
+import { holdsIn, newSchema, run, testPool, testStore } from "./support/store.ts";
 
 /** A conversation of Codex's in a new store, in `schema`, and a turn claim of it. */
 async function conversation() {
@@ -158,3 +160,24 @@ async function statusOf(store: Awaited<ReturnType<typeof testStore>>, conversati
   const turn = await run(store.getActiveTurn(conversationId));
   return [turn?.status, turn?.waiting_on, turn?.outcome];
 }
+
+test("a fork's hold is a row of the store while it lasts, held only where no turn runs, and no turn starts under it", async () => {
+  const { store, schema, conversationId } = await conversation();
+  const reasons = () => holdsIn(schema);
+  await Effect.runPromise(Effect.gen(function*() {
+    const activeTurns = yield* ActiveTurns;
+    yield* Effect.scoped(Effect.gen(function*() {
+      assert.equal(yield* holdConversations(activeTurns, store, [conversationId], "forking session fs-a into fs-b"), true);
+      assert.deepEqual(yield* Effect.promise(reasons), [[conversationId, "forking session fs-a into fs-b"]]);
+      assert.equal(yield* activeTurns.isBusy(conversationId), true);
+      assert.equal(yield* activeTurns.reserve(conversationId), false);
+    }));
+    assert.deepEqual(yield* Effect.promise(reasons), []);
+    // A turn runs: no hold, and no row.
+    yield* Effect.scoped(Effect.gen(function*() {
+      yield* activeTurns.register(conversationId, { stop: () => Effect.void, steer: () => Effect.succeed(false), cliInitiated: false });
+      assert.equal(yield* holdConversations(activeTurns, store, [conversationId], "forking"), false);
+      assert.deepEqual(yield* Effect.promise(reasons), []);
+    }));
+  }).pipe(Effect.provide(ActiveTurns.layer)));
+});

@@ -17,6 +17,7 @@ import { Context, Effect, Layer, Option, Schema } from "effect";
 import type { AlasioConfig } from "../config.ts";
 import { Turns } from "../codex/turns.ts";
 import { ActiveTurns } from "../harness/active-turns.ts";
+import { holdConversations } from "../harness/holds.ts";
 import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness/index.ts";
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
@@ -232,7 +233,7 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
       ]);
       const volumeId = newVolumeId();
       yield* Effect.scoped(Effect.gen(function*() {
-        if (!(yield* activeTurns.hold([...mounting]))) {
+        if (!(yield* holdConversations(activeTurns, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`))) {
           return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
         }
         yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));

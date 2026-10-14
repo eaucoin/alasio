@@ -206,6 +206,10 @@ export class Store extends Context.Service<Store, {
   readonly getActiveTurn: (conversationId: string) => Stored<Turn | null>;
   /** The conversation's latest turn, active or ended: what its harness said it did, and how it ended. */
   readonly getTurn: (conversationId: string) => Stored<Turn | null>;
+  /** Holds the conversations busy for `reason`, as no turn does (a fork). */
+  readonly holdConversations: (conversationIds: readonly string[], reason: string) => Stored<void>;
+  /** Lets go of the conversations' holds; of every one, for null. */
+  readonly releaseConversations: (conversationIds: readonly string[] | null) => Stored<void>;
 
   /** Lets go of a response, as delivered or never to be. */
   readonly markPendingAsPosted: (pendingResponseId: string) => Stored<void>;
@@ -357,6 +361,8 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     getActiveTurns: turns.getActiveTurns(),
     getActiveTurn: (conversationId) => turns.getActiveTurn(conversationId),
     getTurn: (conversationId) => turns.getTurn(conversationId),
+    holdConversations: (conversationIds, reason) => turns.hold(conversationIds, reason),
+    releaseConversations: (conversationIds) => turns.release(conversationIds),
 
     markPendingAsPosted: (pendingResponseId) => Effect.asVoid(responses.markPendingAsPosted(pendingResponseId)),
     getCompletedResponsesPendingDelivery: responses.getCompletedResponsesPendingDelivery(),
