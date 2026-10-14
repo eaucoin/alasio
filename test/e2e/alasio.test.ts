@@ -13,6 +13,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1350,6 +1351,9 @@ if (inShard("telemetry")) {
       }
       // The object store's volume servers', of their disks, labelled with their pods.
       await untilInLake("metric of the object store's volume servers' disks", metricRows("ServiceName = 'seaweedfs' and MetricName = 'SeaweedFS_volumeServer_resource' and Attributes['pod'] like '%-seaweedfs-volume-%'"));
+      // The log's, its brokers' among them, and its intake's, how far behind it is.
+      await untilInLake("metric of the log's", metricRows("ServiceName = 'log' and MetricName = 'kafka_server_broker_state'"));
+      await untilInLake("metric of the lake's intake's", metricRows("ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records'"));
     });
 
     describe("Grafana", () => {
@@ -1374,17 +1378,29 @@ if (inShard("telemetry")) {
         assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Stack health"]);
         // The Stack health dashboard's tables of services and of the object store's volume servers, as their panels query them.
         const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
-        const queryOf = (panel: string) => stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`);
+        // Each as Grafana's browser sends it: it fills in ${__interval_ms} (a minute here, the scrape's), which /api/ds/query
+        // takes as sent, the data source expanding ${__from} and ${__to} alone.
+        const queryOf = (panel: string): object =>
+          JSON.parse(JSON.stringify(stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`)).replaceAll("${__interval_ms}", "60000"));
         const services = queryOf("Services now");
-        for (const panel of ["Services now", "The object store's volume servers"]) {
+        for (const panel of ["Services now", "The object store's volume servers", "The log's answers", "Telemetry waiting in the log"]) {
           let rows = 0;
+          let error: string | undefined;
           for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
             const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [queryOf(panel)] }) })).body as {
-              results: { A: { frames?: { data: { values: unknown[][] } }[] } };
+              results: { A: { frames?: { data: { values: unknown[][] } }[]; error?: string } };
             };
             rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+            error = answered.results.A.error;
           }
-          assert.ok(rows > 0, `${panel} answered with no row`);
+          if (rows === 0) {
+            // The metrics the panel may read, each name once, with how many of its points are of Produce requests, as the lake has them.
+            const names = await lakeQuery(
+              "select ServiceName, MetricName, count(*) as n, count(*) filter (where Attributes['request'] = 'Produce') as produce from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
+                "and (MetricName like 'kafka_request_total_time%' or MetricName like 'kafka_log_size%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2",
+            ).catch((failure: unknown) => String(failure));
+            assert.fail(`${panel} answered with no row${error ? `, and the error ${error}` : ""}; the log's and the intake's metrics it may read: ${JSON.stringify(names)}`);
+          }
         }
         // A query the lake refuses says why, in Grafana.
         const refused = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [{ ...services, url_options: { ...(services as { url_options: object }).url_options, data: "select nothing" } }] }) })).body as {
@@ -1411,8 +1427,11 @@ if (inShard("telemetry")) {
         const alerts = await untilAlerted();
         assert.deepEqual([...alerts.keys()].sort(), ["1001", String(OTHER_OPERATOR)]);
         for (const [text] of alerts.values()) assert.match(text ?? "", /conversation = telegram:1001/u);
-        const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string }[] }[] } };
-        assert.equal(rules.data.groups.flatMap((group) => group.rules).find(({ name }) => name === "Turns are failing")?.state, "firing");
+        const rules = (await api("/api/prometheus/grafana/api/v1/rules")).body as { data: { groups: { rules: { name: string; state: string; health: string; lastError?: string }[] }[] } };
+        const evaluated = rules.data.groups.flatMap((group) => group.rules);
+        assert.equal(evaluated.find(({ name }) => name === "Turns are failing")?.state, "firing");
+        // Every rule's query answers: none fails on the lake.
+        assert.deepEqual(evaluated.filter(({ health }) => health === "error").map(({ name, lastError }) => `${name}: ${lastError}`), []);
       });
     });
 
@@ -1423,6 +1442,229 @@ if (inShard("telemetry")) {
       const names = ["juicefs_", "juicefs_provision_errors", "redis.memory.used"];
       const arrived = await Promise.all(names.map((name) => untilExported("metrics", name, 180_000)));
       assert.deepEqual(names.filter((_, index) => !arrived[index]), [], "no metric of these names arrived");
+    });
+
+    describe("through the log", () => {
+      let gateway: Forward | undefined;
+
+      before(async () => {
+        gateway = await kube.forward(NAMESPACE, componentName("collector"), 4318);
+      });
+
+      after(() => {
+        gateway?.close();
+      });
+
+      /** The exports the gateway did not answer as taken, each by its run, its seq and its status, for a failure's message. */
+      const refused: string[] = [];
+
+      /** Exports the span `seq` of the run `run` to the collector's gateway, as a producer does: whether it was answered as taken. */
+      const exported = async (run: string, seq: number): Promise<boolean> => {
+        const now = BigInt(Date.now()) * 1_000_000n;
+        const body = {
+          resourceSpans: [{
+            resource: { attributes: [{ key: "service.name", value: { stringValue: "e2e-log" } }] },
+            scopeSpans: [{
+              spans: [{
+                traceId: randomBytes(16).toString("hex"),
+                spanId: randomBytes(8).toString("hex"),
+                name: "e2e.log",
+                kind: 1,
+                startTimeUnixNano: String(now),
+                endTimeUnixNano: String(now + 1000n),
+                attributes: [{ key: "e2e.run", value: { stringValue: run } }, { key: "e2e.seq", value: { intValue: String(seq) } }],
+              }],
+            }],
+          }],
+        };
+        const answered = await fetch(`${gateway?.base}/v1/traces`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) })
+          .then(({ status }) => status, () => 0);
+        if (answered !== 200) refused.push(`${run.slice(0, 8)} seq ${seq} (${answered || "unanswered"})`);
+        return answered === 200;
+      };
+
+      /** Exports the run's spans `from` to `to`, `concurrency` at a time: those answered as taken. */
+      const exportAll = async (run: string, from: number, to: number, concurrency = 1): Promise<number[]> => {
+        const taken: number[] = [];
+        let next = from;
+        await Promise.all(Array.from({ length: concurrency }, async () => {
+          for (let seq = next++; seq < to; seq = next++) if (await exported(run, seq)) taken.push(seq);
+        }));
+        return taken;
+      };
+
+      /** The tail of `container`'s log in the pod `pod`, its lines that match `only` where given, for a failure's message. */
+      const tail = async (pod: Promise<string>, container: string, only?: RegExp): Promise<string> => {
+        const logged = await pod.then((name) => kube.logs(NAMESPACE, name, container)).catch((error: unknown) => String(error));
+        return logged.split("\n").filter((line) => !only || only.test(line)).slice(-30).join("\n");
+      };
+
+      /** What the intake, the log and KEDA say, for a failure's message: the intake's records by outcome, and each one's last lines. */
+      const logState = async (): Promise<string> => {
+        const outcomes = await lakeQuery("select Attributes['topic'] as topic, Attributes['outcome'] as outcome, max(Value) as n from otel.metrics_sum where ServiceName = 'lake-intake' and MetricName like 'lake_telemetry_records%' group by all").catch((error: unknown) => String(error));
+        return [
+          `the intake's records: ${JSON.stringify(outcomes)}`,
+          `the intake's log:\n${await tail(kube.runningPod(NAMESPACE, componentName("lake-intake")), "intake")}`,
+          `the log's warnings:\n${await tail(Promise.resolve(`${componentName("log")}-0`), "log", /WARN|ERROR/u)}`,
+          `KEDA's operator:\n${await tail(kube.runningPod(NAMESPACE, componentName("keda-operator")), "keda-operator", /kafka|lake-intake/u)}`,
+        ].join("\n");
+      };
+
+      /**
+       * Where the spans exported around `at` are, for a failure's message: the records the
+       * log holds of otel.spans from 15 s before it to 45 s after (./log-records.ts), each
+       * partition's by offset, the run's marked with their seq; the offsets the intake's
+       * group was told and those the lake holds; and the spans of those records the lake
+       * lacks, and those the lake has, started in that window, that no record holds: what
+       * tells a span the log lost from one the intake skipped, and offsets the log gave
+       * twice.
+       */
+      const whereSpansAre = async (at: number): Promise<string> => {
+        const [from, to] = [at - 15_000, at + 45_000];
+        const script = readFileSync(join(import.meta.dirname, "log-records.ts"), "utf8");
+        const read = await kube.exec(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", String(from), String(to)], { container: "access", stdin: script })
+          .then(({ stdout, stderr }) => `${stdout}${stderr}`, (error: unknown) => String(error));
+        let log: { partitions: object[]; committed: object[]; records: { partition: number; offset: string; spans: { traceId: string; spanId: string; service?: string; name?: string; seq?: number }[] | string }[] };
+        try {
+          log = JSON.parse(read.trim().split("\n").at(-1) ?? "");
+        } catch {
+          return `the log's records could not be read: ${read}`;
+        }
+        const offsets = await lakeQuery("from otel.intake_offsets order by all").catch((error: unknown) => String(error));
+        const lake = await lakeQuery(`select TraceId, SpanId, ServiceName, SpanName from otel.traces where Timestamp >= make_timestamp(${(from - 300_000) * 1000})`).catch(() => []);
+        const inLake = new Set(lake.map((row) => `${String(row["TraceId"])}:${String(row["SpanId"])}`));
+        const logged = log.records.flatMap((record) => (typeof record.spans === "string" ? [] : record.spans.map((span) => ({ ...span, at: `${record.partition}@${record.offset}` }))));
+        const inLog = new Set(logged.map((span) => `${span.traceId}:${span.spanId}`));
+        const started = await lakeQuery(`select TraceId, SpanId, ServiceName, SpanName from otel.traces where Timestamp between make_timestamp(${(from + 20_000) * 1000}) and make_timestamp(${(to - 20_000) * 1000})`).catch(() => []);
+        const byPartition = new Map<number, string[]>();
+        for (const record of log.records) {
+          const seqs = typeof record.spans === "string" ? [record.spans] : record.spans.flatMap(({ seq }) => (seq === undefined ? [] : [`seq ${seq}`]));
+          byPartition.set(record.partition, [...(byPartition.get(record.partition) ?? []), `${record.offset}${seqs.length > 0 ? ` (${seqs.join(", ")})` : ""}`]);
+        }
+        return [
+          `the log: ${JSON.stringify(log.partitions)}; the intake's group told ${JSON.stringify(log.committed)}; the lake's offsets ${JSON.stringify(offsets)}`,
+          ...[...byPartition].map(([partition, records]) => `partition ${partition}'s records from ${new Date(from).toISOString()} to ${new Date(to).toISOString()}: ${records.join(" ")}`),
+          `their spans the lake lacks: ${JSON.stringify(logged.filter((span) => !inLake.has(`${span.traceId}:${span.spanId}`)))}`,
+          `spans the lake has, started from 5 s after the crash to 25 s after, that no record of the log holds: ${JSON.stringify(started.filter((row) => !inLog.has(`${String(row["TraceId"])}:${String(row["SpanId"])}`)))}`,
+          `exports the gateway did not answer as taken: ${refused.slice(-40).join(", ") || "none"}`,
+          `the gateway's log:\n${await tail(kube.runningPod(NAMESPACE, componentName("collector")), "collector")}`,
+        ].join("\n");
+      };
+
+      /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each; `crashed`, where given, is when the log was made to crash. */
+      const untilWritten = async (run: string, taken: readonly number[], crashed?: number, timeoutMs = 600_000): Promise<Map<number, number>> => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const rows = await lakeQuery(`select SpanAttributes['e2e.seq'] as seq, count(*) as n from otel.traces where ServiceName = 'e2e-log' and SpanAttributes['e2e.run'] = '${run}' group by 1`).catch(() => []);
+          const written = new Map(rows.map((row) => [Number(row["seq"]), Number(row["n"])]));
+          if (taken.every((seq) => written.has(seq))) return written;
+          if (Date.now() > deadline) {
+            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${crashed === undefined ? "" : `${await whereSpansAre(crashed)}\n`}${await logState()}`);
+          }
+          await sleep(5000);
+        }
+      };
+
+      test("the log flushes each telemetry topic to its volume within a second, its flusher looking each second", async () => {
+        const script = readFileSync(join(import.meta.dirname, "log-configs.ts"), "utf8");
+        const said = await kube.execOk(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", "0"], { container: "access", stdin: script });
+        const { node, topic }: { node: Record<string, string | null>; topic: Record<string, string | null> } = JSON.parse(said.trim().split("\n").at(-1) ?? "");
+        assert.deepEqual([node["log.flush.scheduler.interval.ms"], topic["flush.ms"]], ["1000", "1000"]);
+      });
+
+      test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async () => {
+        const run = randomUUID();
+        const before = await exportAll(run, 0, 40);
+        assert.equal(before.length, 40, "the gateway took every span while the log ran");
+        const crashed = Date.now();
+        await kube.kill(NAMESPACE, `${componentName("log")}-0`);
+        // Each export sent on until one is taken again, as a producer sends what was refused again.
+        const during: number[] = [];
+        for (let seq = 40, deadline = Date.now() + 600_000; during.length < 20; seq += 1) {
+          if (Date.now() > deadline) assert.fail("the gateway took no export again within ten minutes of the log's crash");
+          if (await exported(run, seq)) during.push(seq);
+        }
+        const written = await untilWritten(run, [...before, ...during], crashed);
+        assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+      });
+
+      test("the lake put back, as a restore of its catalog puts it, has its intake read again from the log what it lost, written once", async () => {
+        const run = randomUUID();
+        assert.deepEqual(await exportAll(run, 0, 1), [0]);
+        await untilWritten(run, [0]);
+        const intake = await kube.runningPod(NAMESPACE, componentName("lake-intake"));
+        const script = readFileSync(join(import.meta.dirname, "lake-rewind.ts"), "utf8").replaceAll('from "../../neon/lake/src/', 'from "/opt/lake/src/');
+        await kube.execOk(NAMESPACE, intake, ["sh", "-c", 'cd /opt/lake && node --input-type=module-typescript - "$@"', "node", run], { container: "intake", stdin: script });
+        assert.equal(Number((await lakeQuery(`select count(*) as n from otel.traces where SpanAttributes['e2e.run'] = '${run}'`))[0]?.["n"]), 0);
+        // Its successor, joining, has the group told the lake's offsets, and reads again from the log's start.
+        await kube.kill(NAMESPACE, intake);
+        const written = await untilWritten(run, [0]);
+        assert.deepEqual([...written.values()], [1], "the span is written once");
+      });
+
+      test("the intake's crash, as it gathers or writes a batch, loses nothing and writes nothing twice", async () => {
+        const run = randomUUID();
+        const first = await exportAll(run, 0, 100, 4);
+        // The intake killed as it gathers or writes a batch, whatever it had of the run read again by its successor.
+        await sleep(30_000);
+        await kube.kill(NAMESPACE, await kube.runningPod(NAMESPACE, componentName("lake-intake")));
+        const second = await exportAll(run, 100, 200, 4);
+        assert.equal(first.length + second.length, 200, "the gateway took every span");
+        const written = await untilWritten(run, [...first, ...second]);
+        assert.equal(written.size, 200);
+        assert.deepEqual([...written.entries()].filter(([, n]) => n > 1), [], "no span is written twice");
+      });
+
+      test("the intake wakes from none on what waits in the log, and scales out on a backlog, to as many as the topics have partitions", async (t) => {
+        const scaledObject = ref("ScaledObject", componentName("lake-intake"), NAMESPACE);
+        const intake = ref("Deployment", componentName("lake-intake"), NAMESPACE);
+        // What KEDA, and the HPA it makes, scale it to.
+        const replicas = async () => (await kube.get<V1Deployment>(intake))?.spec?.replicas ?? 0;
+        // The lake's write lock, held in a session of the catalog's database as long as the test says, as while the lake cannot be written:
+        // the backlog stays in the log, however fast the intake reads it, until KEDA has scaled it out.
+        const compute = await kube.runningPod(NAMESPACE, "alasio-neon-compute");
+        const catalog = (sql: string, application = "e2e") =>
+          kube.exec(NAMESPACE, compute, ["psql", "-h", "127.0.0.1", "-p", "55433", "-U", "cloud_admin", "-d", `dbname=lake application_name=${application}`, "-Atc", sql], { container: "compute" });
+        let held: Promise<unknown> | null = null;
+        const release = async () => {
+          await catalog("select pg_terminate_backend(pid) from pg_stat_activity where application_name = 'e2e-write-lock'");
+          await held?.catch(() => {});
+        };
+        // Held at none, as while nothing waits.
+        await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": "0" } } });
+        try {
+          for (const deadline = Date.now() + 300_000; (await kube.get<V1Deployment>(intake))?.status?.replicas; await sleep(2000)) {
+            if (Date.now() > deadline) assert.fail("the intake did not stop while paused at none");
+          }
+          held = catalog("select pg_advisory_lock(hashtext('alasio.lake.write')); select pg_sleep(1200)", "e2e-write-lock");
+          for (const deadline = Date.now() + 60_000; ; await sleep(1000)) {
+            const granted = await catalog("select count(*) from pg_locks join pg_stat_activity using (pid) where locktype = 'advisory' and granted and application_name = 'e2e-write-lock'");
+            if (granted.stdout.trim() === "1") break;
+            if (Date.now() > deadline) assert.fail(`the test could not hold the lake's write lock: ${granted.stderr}${granted.stdout}`);
+          }
+          const run = randomUUID();
+          // Some thousands a partition, as after an outage: KEDA gives it a replica a thousand.
+          const taken = await exportAll(run, 0, 6000, 16);
+          assert.equal(taken.length, 6000);
+          await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
+          let most = 0;
+          for (const deadline = Date.now() + 300_000; most < 2; await sleep(2000)) {
+            if (Date.now() > deadline) {
+              const scaled = await kube.get<KubernetesObject & { status?: object }>(scaledObject);
+              assert.fail(`the intake ran ${most} replica(s) at most, on a backlog of 6000 records; its ScaledObject: ${JSON.stringify(scaled?.status)}\n${await logState()}`);
+            }
+            most = Math.max(most, await replicas());
+          }
+          t.diagnostic(`the intake ran ${most} replicas on the backlog`);
+          // The lake writable again, each replica writes what it read, its share once, whichever had it before a rebalance.
+          await release();
+          const written = await untilWritten(run, taken);
+          assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+        } finally {
+          await release();
+          await kube.patch(scaledObject, { metadata: { annotations: { "autoscaling.keda.sh/paused-replicas": null } } });
+        }
+      });
     });
   });
 }

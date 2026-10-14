@@ -765,7 +765,10 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
  * container's restarts with them) and latest events, why each pod that is not ready is
  * not, with its logs, and the latest logs of the pods a compute's wake goes through, its
  * proxy's, neon-control's and each compute's, ready or not: a compute's Postgres restarting
- * within its container leaves its pod ready, and says why in its log alone.
+ * within its container leaves its pod ready, and says why in its log alone; the lake's and
+ * its intake's, whose queries and writes wait on the catalog there unseen; and of any
+ * other ready pod a container of which restarted, as one killed for its memory is ready
+ * again by the time this is said.
  */
 export async function dumpClusterState(): Promise<void> {
   if (!api) return;
@@ -799,8 +802,10 @@ export async function dumpClusterState(): Promise<void> {
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
       }
     }
-    const waking = new Set(["neon-proxy", "neon-control", "neon-compute"]);
-    for (const pod of pods.filter((each) => each.status?.phase === "Running" && waking.has(each.metadata?.labels?.["app.kubernetes.io/component"] ?? "") && podProblems(each).length === 0)) {
+    const waking = new Set(["neon-proxy", "neon-control", "neon-compute", "lake", "lake-intake"]);
+    const restarts = (pod: V1Pod) => (pod.status?.containerStatuses ?? []).some(({ restartCount }) => restartCount > 0);
+    const told = (pod: V1Pod) => waking.has(pod.metadata?.labels?.["app.kubernetes.io/component"] ?? "") || restarts(pod);
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && told(each) && podProblems(each).length === 0)) {
       const { namespace = "", name = "" } = pod.metadata ?? {};
       for (const container of pod.spec?.containers ?? []) {
         // A container restarted, what it logged as it ended too, which is why.
