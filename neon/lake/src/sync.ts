@@ -84,23 +84,26 @@ export interface MaintenanceOptions {
    * does, and writes files of its own beside them, which this one's never named.
    */
   keepFiles: boolean;
+  /** The time of the pass, the one its retention's days and its record of when are taken of; now unless given. */
+  now?: Date;
 }
 
 /**
  * Keeps the lake in order: deletes the telemetry older than `retentionDays` days
  * (./otel.ts), then runs DuckLake's maintenance (MAINTENANCE), each step on its own, but
  * for those that delete files when it `keepFiles`; what they would have deleted waits
- * for the first pass that does not. Records when, so a restart does not repeat it.
+ * for the first pass that does not. Records when, so a restart does not repeat it: the one
+ * time it takes, `now`, so that a pass across midnight cuts the days it keeps as it records.
  */
-export async function maintainLake(db: DuckDBConnection, { retentionDays, keepFiles }: MaintenanceOptions): Promise<void> {
-  await deleteExpiredTelemetry(db, retentionDays);
+export async function maintainLake(db: DuckDBConnection, { retentionDays, keepFiles, now = new Date() }: MaintenanceOptions): Promise<void> {
+  await deleteExpiredTelemetry(db, retentionDays, now);
   for (const step of MAINTENANCE) {
     if (keepFiles && DELETING.has(step)) continue;
     await transaction(db, () => db.run(`call ${step}('${LAKE}')`));
   }
   await transaction(db, async () => {
     await db.run(`delete from ${LAKE}.loader.meta where key = 'maintained_at'`);
-    await db.run(`insert into ${LAKE}.loader.meta values ('maintained_at', ${literal(new Date().toISOString())})`);
+    await db.run(`insert into ${LAKE}.loader.meta values ('maintained_at', ${literal(now.toISOString())})`);
   });
 }
 

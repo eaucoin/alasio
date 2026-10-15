@@ -2,7 +2,7 @@
  * The telemetry intake's service: a replica of `lake-intake` (cli/src/manifests/lake.ts),
  * which KEDA scales on the lag of its consumer group, consuming the log's telemetry
  * topics into the lake (./intake.ts). Its writes take turns with every other writer's of
- * the lake under its write lock (./lake.ts). It serves /healthz (its loop is not wedged),
+ * the lake under its write lock (./lake.ts). It serves /healthz (its loop is not wedged, or what it is wedged on),
  * /readyz (it holds the lake and its member of the group) and /metrics (Prometheus, for
  * the stack's collector) on LAKE_HTTP_PORT; logs a JSON line per event, and exports each
  * as telemetry too (./telemetry.ts).
@@ -67,8 +67,8 @@ const intake = startIntake({ open, join: () => joinLog(config.log, GROUP, Object
 
 const server = createServer((request, response) => {
   if (request.method === "GET" && request.url === "/healthz") {
-    const well = intake.well();
-    response.writeHead(well ? 200 : 503, { "content-type": "text/plain" }).end(`intake: ${well ? "its loop comes round" : "its loop is wedged"}\n`);
+    const { ok, detail } = intake.health();
+    response.writeHead(ok ? 200 : 503, { "content-type": "text/plain" }).end(`intake: ${detail}\n`);
     return;
   }
   if (request.method === "GET" && request.url === "/readyz") {

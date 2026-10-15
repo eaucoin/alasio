@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -22,13 +22,13 @@ import { syncCodex } from "../neon/lake/src/codex.ts";
 import { type EndpointConfig, type LakeConfig, loadConfig, loadEndpointConfig } from "../neon/lake/src/config.ts";
 import { startEndpoint } from "../neon/lake/src/endpoint.ts";
 import { EXTENSIONS } from "../neon/lake/src/extensions.ts";
-import { BATCH, DUCKDB_MEMORY, type IntakeSource, type LogRecord, startIntake } from "../neon/lake/src/intake.ts";
+import { BATCH, DUCKDB_MEMORY, type IntakeSource, type LogRecord, type PartitionAt, REREAD_SKEW_MS, startIntake, unreachable } from "../neon/lake/src/intake.ts";
 import { conninfo, LAKE, type Lake, openLake, type Row, rows, transaction, writeLock, WriteLockLost } from "../neon/lake/src/lake.ts";
 import { gathering, type Read } from "../neon/lake/src/log.ts";
 import { startLoader } from "../neon/lake/src/loader.ts";
 import { createMetrics, sampleMemory } from "../neon/lake/src/metrics.ts";
 import { lakeModelVersion, MODEL_VERSION, ROW_GROUP_ROWS } from "../neon/lake/src/model.ts";
-import { ensureOtel, type Held, mergeTelemetry, type Position, type TelemetryRows, telemetryRows, writeConsumed } from "../neon/lake/src/otel.ts";
+import { askReread, ensureOtel, type Held, LakeSetBack, mergeTelemetry, type Position, rereadGaps, type TelemetryRows, telemetryRows, telemetryTime, writeConsumed } from "../neon/lake/src/otel.ts";
 import { encodeRequest, type LogsRequest, type MetricsRequest, PART_ITEMS, REQUEST_ROW_BYTES, requestParts, requestRowBytes } from "../neon/lake/src/otlp.ts";
 import { format } from "../neon/lake/src/query.ts";
 import { answer, grantReads, openReader } from "../neon/lake/src/reader.ts";
@@ -489,9 +489,12 @@ const gaugeRequest = (service: string, time: bigint): MetricsRequest => ({
   }],
 });
 
+/** The log's start of every partition the tests write of themselves: their first record. */
+const fromStart = async () => 0n;
+
 let testOffset = 0n;
 /** Writes `rows` as the intake writes a record's: of a partition of the tests' own, at its next offset. */
-const writeTelemetry = (db: DuckDBConnection, rows: TelemetryRows) => writeConsumed(db, [{ topic: "otel.test", topicId: "otel.test-id", partition: 0, offset: testOffset++, rows: [rows] }]);
+const writeTelemetry = (db: DuckDBConnection, rows: TelemetryRows) => writeConsumed(db, [{ topic: "otel.test", topicId: "otel.test-id", partition: 0, offset: testOffset++, rows: [rows] }], fromStart);
 
 /** The lake as the intake opens it: no source, the telemetry's schema ready. */
 async function openForIntake() {
@@ -507,17 +510,27 @@ describe("telemetry", () => {
   const logRecord = (partition: number, offset: number, service: string, ...times: bigint[]) => record("otel.logs", partition, offset, encodeRequest("logs", logRequest(service, ...times)));
 
   /**
-   * A member of the group that hands out `batches` in turn, then nothing, recording what it is
-   * told; its commits fail where `failCommits`, and it tells the group the lake's offsets where
-   * `behind`, a group told past them.
+   * A member of the group that hands out `batches` in turn, once `ready`, then nothing,
+   * recording what it is told; its commits fail where `failCommits`, it tells the group the
+   * lake's offsets where `behind`, a group told past them, and the log has its topics'
+   * records of a time where `at` says; it holds every partition from its first record.
    */
-  function member(batches: LogRecord[][], { failCommits = false, behind = false }: { failCommits?: boolean; behind?: boolean } = {}) {
+  function member(
+    batches: LogRecord[][],
+    { failCommits = false, behind = false, at = {}, ready = () => true }: {
+      failCommits?: boolean;
+      behind?: boolean;
+      at?: Readonly<Record<string, readonly PartitionAt[]>>;
+      ready?: () => boolean;
+    } = {},
+  ) {
     const committed: Position[][] = [];
     const rewound: Held[][] = [];
+    const askedAt: { topic: string; ms: number }[] = [];
     let closed = false;
     const source: IntakeSource = {
       async next() {
-        const batch = batches.shift();
+        const batch = ready() ? batches.shift() : undefined;
         if (batch) return batch;
         await new Promise((resolve) => setTimeout(resolve, 20));
         return [];
@@ -530,6 +543,13 @@ describe("telemetry", () => {
         rewound.push([...held]);
         return behind;
       },
+      async start() {
+        return 0n;
+      },
+      async offsetsAt(topic, ms) {
+        askedAt.push({ topic, ms });
+        return [...(at[topic] ?? [])];
+      },
       async lag() {
         return new Map([["otel.logs", batches.flat().length], ["otel.spans", 0]]);
       },
@@ -537,7 +557,7 @@ describe("telemetry", () => {
         closed = true;
       },
     };
-    return { source, committed, rewound, closed: () => closed };
+    return { source, committed, rewound, askedAt, closed: () => closed };
   }
 
   const until = async (what: string, done: () => boolean) => {
@@ -574,12 +594,12 @@ describe("telemetry", () => {
     tracer.startSpan("alasio.turn", { attributes: { "alasio.conversation.id": "telegram:7" } }).end();
     const traces = ProtobufTraceSerializer.serializeRequest(spans.getFinishedSpans());
     assert.ok(traces);
-    const group = member([[record("otel.spans", 0, 0, traces), logRecord(1, 5, "intake-test", NOW, NOW + 1n), record("otel.logs", 1, 6, Uint8Array.from([0x0a, 0x05, 0x01]))]]);
+    const group = member([[record("otel.spans", 0, 0, traces), logRecord(1, 0, "intake-test", NOW, NOW + 1n), record("otel.logs", 1, 1, Uint8Array.from([0x0a, 0x05, 0x01]))]]);
     const metrics = createMetrics();
     const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics, log: () => {}, batch: { ...BATCH, ms: 10 } });
     try {
       await until("the batch's commit to the group", () => group.committed.length > 0);
-      assert.deepEqual(group.committed[0]?.toSorted((a, b) => a.topic.localeCompare(b.topic)), [{ topic: "otel.logs", partition: 1, offset: 7n }, { topic: "otel.spans", partition: 0, offset: 1n }]);
+      assert.deepEqual(group.committed[0]?.toSorted((a, b) => a.topic.localeCompare(b.topic)), [{ topic: "otel.logs", partition: 1, offset: 2n }, { topic: "otel.spans", partition: 0, offset: 1n }]);
       assert.ok(intake.ready());
       const reader = await openLake(readerConfig, { readOnly: true });
       try {
@@ -603,10 +623,10 @@ describe("telemetry", () => {
 
   test("a batch the lake has, read again as the group was not told of it, is written once", async () => {
     const service = `repeated-${Date.now()}`;
-    const batch = [logRecord(2, 0, service, NOW), logRecord(2, 1, service, NOW)];
+    const batch = [logRecord(2, 0, service, NOW), logRecord(2, 1, service, NOW + 1n)];
     // The first member writes the batch, then cannot tell the group, as after a rebalance or a crash.
     const first = member([batch], { failCommits: true });
-    const second = member([[...batch, logRecord(2, 2, service, NOW)]]);
+    const second = member([[...batch, logRecord(2, 2, service, NOW + 2n)]]);
     const members = [first, second];
     const metrics = createMetrics();
     const intake = startIntake({ open: openForIntake, join: async () => members.shift()?.source ?? assert.fail("joined a third time"), metrics, log: () => {}, batch: { ...BATCH, ms: 10 }, retryMs: 10 });
@@ -628,8 +648,8 @@ describe("telemetry", () => {
 
   test("a topic made anew, as a restore of the object store makes the log's, is written from its start, the offsets the lake held being the topic's before", async () => {
     const service = `made-anew-${Date.now()}`;
-    const before = [logRecord(4, 0, service, NOW), logRecord(4, 1, service, NOW)];
-    const made = (offset: number) => record("otel.logs", 4, offset, encodeRequest("logs", logRequest(service, NOW)), "otel.logs-made-anew");
+    const before = [logRecord(4, 0, service, NOW), logRecord(4, 1, service, NOW + 1n)];
+    const made = (offset: number) => record("otel.logs", 4, offset, encodeRequest("logs", logRequest(service, NOW + 10n + BigInt(offset))), "otel.logs-made-anew");
     // The first member writes its batch, then loses the log, which comes back made anew.
     const first = member([before], { failCommits: true });
     const second = member([[made(0), made(1), made(2)]]);
@@ -651,12 +671,67 @@ describe("telemetry", () => {
     assert.doesNotMatch(metrics.render(), /outcome="repeated"/u);
   });
 
+  test("what the log holds twice, at two offsets, as a producer's retry writes it, is in the lake once: a span by its ids, a log record by its id, its producer's or one made of what it is, a point by its series and time", async () => {
+    const service = `twice-${Date.now()}`;
+    const span = (spanId: string) => encodeRequest("traces", {
+      resourceSpans: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: service } }] },
+        scopeSpans: [{ spans: [{ traceId: Buffer.from("5b8efff798038103d269b633813fc60c", "hex"), spanId: Buffer.from(spanId, "hex"), name: "twice", startTimeUnixNano: String(NOW), endTimeUnixNano: String(NOW + 1n) }] }],
+      }],
+    });
+    const logOf = (id: string | null, time = NOW) => encodeRequest("logs", {
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: service } }] },
+        scopeLogs: [{ logRecords: [{ timeUnixNano: String(time), body: { stringValue: "an event" }, attributes: id ? [{ key: "log.record.uid", value: { stringValue: id } }] : [] }] }],
+      }],
+    });
+    const point = (time: bigint) => encodeRequest("metrics", gaugeRequest(service, time));
+    // The first batch, then a second that repeats each of its records at offsets of its own,
+    // and repeats some within itself; a log record without an id is known by what it is, as an
+    // SDK's export sent again is, and one of another time is another.
+    const group = member([
+      [record("otel.spans", 5, 0, span("eee19b7ec3c1b174")), record("otel.logs", 5, 0, logOf("a")), record("otel.logs", 5, 1, logOf(null)), record("otel.metrics", 5, 0, point(NOW))],
+      [
+        record("otel.spans", 5, 1, span("eee19b7ec3c1b174")),
+        record("otel.spans", 5, 2, span("eee19b7ec3c1b175")),
+        record("otel.spans", 5, 3, span("eee19b7ec3c1b175")),
+        record("otel.logs", 5, 2, logOf("a")),
+        record("otel.logs", 5, 3, logOf("b")),
+        record("otel.logs", 5, 4, logOf("b")),
+        record("otel.logs", 5, 5, logOf(null)),
+        record("otel.logs", 5, 6, logOf(null, NOW + 1n)),
+        record("otel.metrics", 5, 1, point(NOW)),
+        record("otel.metrics", 5, 2, point(NOW + 1n)),
+      ],
+    ]);
+    const metrics = createMetrics();
+    const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics, log: () => {}, batch: { ...BATCH, ms: 10 } });
+    try {
+      await until("the second batch's commit", () => group.committed.length > 1);
+    } finally {
+      await intake.stop();
+    }
+    const lake = await openLake(config, { readOnly: true });
+    try {
+      const count = async (table: string) => (await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.${table} where ServiceName = '${service}'`)).n;
+      assert.deepEqual([await count("traces"), await count("logs"), await count("metrics_gauge")], [2n, 4n, 2n]);
+      // An id it was not given is the lake's to see, as one it was is.
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}' and LogAttributes['log.record.uid'] similar to '[0-9a-f]{32}'`)).n, 2n);
+    } finally {
+      lake.close();
+    }
+    const text = metrics.render();
+    assert.match(text, /^lake_telemetry_duplicate_rows_total\{table="otel.traces"\} 2$/m);
+    assert.match(text, /^lake_telemetry_duplicate_rows_total\{table="otel.logs"\} 3$/m);
+    assert.match(text, /^lake_telemetry_duplicate_rows_total\{table="otel.metrics_gauge"\} 1$/m);
+  });
+
   test("the intake, as it joins, has the group told the lake's offsets, so a lake put back reads again from the log what it lost, and joins again to read it", async () => {
     const service = `rewound-${Date.now()}`;
     // The lake holds two records of partition 17.
     await withLake(async (db) => {
       await ensureOtel(db);
-      await writeConsumed(db, [0, 1].map((offset) => ({ topic: "otel.logs", topicId: "otel.logs-id", partition: 17, offset: BigInt(offset), rows: [telemetryRows("logs", logRequest(service, NOW + BigInt(offset)))] })));
+      await writeConsumed(db, [0, 1].map((offset) => ({ topic: "otel.logs", topicId: "otel.logs-id", partition: 17, offset: BigInt(offset), rows: [telemetryRows("logs", logRequest(service, NOW + BigInt(offset)))] })), fromStart);
     });
     // A member of a group told past them, which tells it the lake's; then one that reads from there.
     const behind = member([], { behind: true });
@@ -672,6 +747,224 @@ describe("telemetry", () => {
     assert.ok(behind.closed());
     assert.deepEqual(behind.committed, []);
     assert.deepEqual(again.committed[0], [{ topic: "otel.logs", partition: 17, offset: 3n }]);
+  });
+
+  test("a table of the telemetry's rows' times are read by its time column, and a reread is asked of the telemetry's tables alone", async () => {
+    assert.deepEqual(["otel.traces", "otel.logs", "otel.metrics_sum", "claude.entries", "otel.intake_offsets"].map(telemetryTime), ["Timestamp", "Timestamp", "TimeUnix", null, null]);
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await assert.rejects(askReread(db, [{ table: "claude.entries", from: "2026-10-16 00:00:00" }]), /^Error: claude\.entries is no table of the telemetry's$/u);
+    });
+  });
+
+  test("asked to read again what the lake lost, the intake sets its offsets back to where the log has records of its time, and writes again each row the lake no longer has, once", async () => {
+    const service = `reread-${Date.now()}`;
+    const second = 1_000_000_000n;
+    const at = (offset: number) => logRecord(24, offset, service, NOW + BigInt(offset) * second);
+    let since = "";
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      // The lake holds records 0 to 3 of partition 24, then loses the rows of 2 and 3, as a
+      // reconciliation forgets the file that held them, and asks them read again from their time.
+      await writeConsumed(db, [0, 1, 2, 3].map((offset) => ({ ...at(offset), rows: [telemetryRows("logs", logRequest(service, NOW + BigInt(offset) * second))] })), fromStart);
+      since = (await one<{ since: string }>(db, `select min(Timestamp)::varchar as since from ${LAKE}.otel.logs where ServiceName = '${service}' and Timestamp >= make_timestamp_ns(${NOW + 2n * second})`)).since;
+      await transaction(db, () => db.run(`delete from ${LAKE}.otel.logs where ServiceName = '${service}' and Timestamp >= make_timestamp_ns(${NOW + 2n * second})`));
+      await askReread(db, [{ table: "otel.logs", from: since }]);
+    });
+    // The member whose next write takes that up, the log having records of that time from offset
+    // 1 on, as its clocks' skew allows; one that joins again, the group told past the lake's
+    // offsets; and one that reads from there.
+    const asked = member([[at(4)]], { at: { "otel.logs": [{ partition: 24, offset: 1n, at: Number(NOW / 1_000_000n) + 1000, start: 0n, end: 5n }] } });
+    const behind = member([], { behind: true });
+    const again = member([[at(1), at(2), at(3), at(4)]]);
+    const members = [asked, behind, again];
+    const logged: string[] = [];
+    const intake = startIntake({ open: openForIntake, join: async () => members.shift()?.source ?? assert.fail("joined a fourth time"), metrics: createMetrics(), log: (message) => logged.push(message), batch: { ...BATCH, ms: 10 } });
+    try {
+      await until("the third member's commit", () => again.committed.length > 0);
+    } finally {
+      await intake.stop();
+    }
+    assert.deepEqual(asked.askedAt, [{ topic: "otel.logs", ms: Number(NOW / 1_000_000n) + 2000 - REREAD_SKEW_MS }]);
+    assert.deepEqual(asked.committed, []);
+    assert.ok(asked.closed());
+    assert.ok(logged.includes("telemetry intake reads again from the log what the lake lost"), logged.join("\n"));
+    assert.ok(behind.rewound[0]?.some((held) => held.partition === 24 && held.offset === 1n));
+    assert.deepEqual(again.committed[0], [{ topic: "otel.logs", partition: 24, offset: 5n }]);
+    const lake = await openLake(config, { readOnly: true });
+    try {
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 5n);
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.intake_rereads`)).n, 0n);
+      // The log held all of it: nothing it could not refill.
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.intake_reread_gaps where Signal = 'logs' and FromTime = $1::TIMESTAMP_NS`, [since])).n, 0n);
+    } finally {
+      lake.close();
+    }
+  });
+
+  test("a write asks the log where a partition starts only of a batch read past the lake's offset, and refuses it unless the log starts there", async () => {
+    const service = `starts-${Date.now()}`;
+    const asked: string[] = [];
+    const startingAt = (start: bigint) => async (topic: string, partition: number) => {
+      asked.push(`${topic}/${partition}`);
+      return start;
+    };
+    const batch = (...offsets: number[]) => offsets.map((offset) => ({ ...logRecord(32, offset, service, NOW + BigInt(offset)), rows: [telemetryRows("logs", logRequest(service, NOW + BigInt(offset)))] }));
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      // Following on from the lake's offset, or read again before it: nothing asked.
+      await writeConsumed(db, batch(0, 1), startingAt(0n));
+      await writeConsumed(db, batch(2, 3), startingAt(0n));
+      await writeConsumed(db, batch(2, 3, 4), startingAt(0n));
+      assert.deepEqual(asked, []);
+      // Read past it: asked, refused where the log holds the records between, taken where it starts there.
+      await assert.rejects(writeConsumed(db, batch(7, 8), startingAt(0n)), LakeSetBack);
+      await writeConsumed(db, batch(7, 8), startingAt(7n));
+      assert.deepEqual(asked, ["otel.logs/32", "otel.logs/32"]);
+    });
+  });
+
+  test("a reread one replica takes up, setting back the partitions of another's, has the other read its own again from the lake's offsets, not past them", async () => {
+    const services = { a: `replica-a-${Date.now()}`, b: `replica-b-${Date.now()}` };
+    const second = 1_000_000_000n;
+    const recordOf = (replica: "a" | "b", offset: number) => logRecord(replica === "a" ? 30 : 31, offset, services[replica], NOW + BigInt(offset) * second);
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      // Each replica's partition holds records 0 to 3; the lake loses the rows of 2 and 3 of both.
+      for (const replica of ["a", "b"] as const) {
+        await writeConsumed(db, [0, 1, 2, 3].map((offset) => ({ ...recordOf(replica, offset), rows: [telemetryRows("logs", logRequest(services[replica], NOW + BigInt(offset) * second))] })), fromStart);
+      }
+      const since = (await one<{ since: string }>(db, `select min(Timestamp)::varchar as since from ${LAKE}.otel.logs where ServiceName = '${services.a}' and Timestamp >= make_timestamp_ns(${NOW + 2n * second})`)).since;
+      await transaction(db, () => db.run(`delete from ${LAKE}.otel.logs where ServiceName in ('${services.a}', '${services.b}') and Timestamp >= make_timestamp_ns(${NOW + 2n * second})`));
+      await askReread(db, [{ table: "otel.logs", from: since }]);
+    });
+    // Replica A takes up the reread, the log having both partitions' records of that time from 2 on.
+    const ms = Number(NOW / 1_000_000n) + 2000;
+    const takes = member([[recordOf("a", 4)]], { at: { "otel.logs": [30, 31].map((partition) => ({ partition, offset: 2n, at: ms, start: 0n, end: 5n })) } });
+    const aAgain = [member([], { behind: true }), member([[recordOf("a", 2), recordOf("a", 3), recordOf("a", 4)]])];
+    // Replica B, told nothing, reads its next record, past its partition's offset set back, once A has.
+    const bFirst = member([[recordOf("b", 4)]], { ready: () => takes.closed() });
+    const bAgain = [member([], { behind: true }), member([[recordOf("b", 2), recordOf("b", 3), recordOf("b", 4)]])];
+    const aMembers = [takes, ...aAgain];
+    const bMembers = [bFirst, ...bAgain];
+    const logged: string[] = [];
+    const start = (members: ReturnType<typeof member>[]) =>
+      startIntake({ open: openForIntake, join: async () => members.shift()?.source ?? assert.fail("joined a fourth time"), metrics: createMetrics(), log: (message) => logged.push(message), batch: { ...BATCH, ms: 10 }, retryMs: 10 });
+    const replicas = [start(aMembers), start(bMembers)];
+    try {
+      await until("both replicas' commits", () => (aAgain[1]?.committed.length ?? 0) > 0 && (bAgain[1]?.committed.length ?? 0) > 0);
+    } finally {
+      await Promise.all(replicas.map((replica) => replica.stop()));
+    }
+    assert.deepEqual(bFirst.committed, []);
+    assert.ok(bFirst.closed());
+    assert.ok(logged.includes("telemetry intake reads again from the lake's offsets, set back beneath it"), logged.join("\n"));
+    assert.deepEqual(bAgain[1]?.committed[0], [{ topic: "otel.logs", partition: 31, offset: 5n }]);
+    const lake = await openLake(config, { readOnly: true });
+    try {
+      for (const service of Object.values(services)) {
+        assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 5n, service);
+      }
+    } finally {
+      lake.close();
+    }
+  });
+
+  test("what of a reread the log no longer holds is the time from it to the first record a partition still holds, where its retention deleted any", () => {
+    const since = Date.parse("2026-10-16T10:00:00.000Z");
+    const reread = { signal: "traces" as const, since: "2026-10-16 10:00:00", sinceMs: since };
+    const now = Date.parse("2026-10-16T12:00:00.000Z");
+    const partition = (offset: bigint | null, at: number | null, start: bigint, end: bigint): PartitionAt => ({ partition: 0, offset, at, start, end });
+    // All it ever held; a record before the time still held; records before it alone: nothing lost.
+    assert.equal(unreachable(reread, [partition(0n, since + 5_000, 0n, 9n)], now), null);
+    assert.equal(unreachable(reread, [partition(7n, since + 5_000, 3n, 9n)], now), null);
+    assert.equal(unreachable(reread, [partition(null, null, 3n, 9n)], now), null);
+    // Its first record held of the time or later, of a time no later than the reread's: nothing of it lost.
+    assert.equal(unreachable(reread, [partition(3n, since, 3n, 9n)], now), null);
+    // Its first record held of later, records before it deleted: to that record's time, the latest of the partitions'.
+    assert.deepEqual(unreachable(reread, [partition(3n, since + 60_000, 3n, 9n), partition(4n, since + 30_000, 4n, 9n)], now), { signal: "traces", from: "2026-10-16T10:00:00.000Z", to: "2026-10-16T10:01:00.000Z" });
+    // Every record it held deleted: to now.
+    assert.deepEqual(unreachable(reread, [partition(null, null, 9n, 9n)], now), { signal: "traces", from: "2026-10-16T10:00:00.000Z", to: "2026-10-16T12:00:00.000Z" });
+  });
+
+  test("a reread the log no longer holds all of reads what it holds, and says what it cannot refill, in its log, as a metric and in the lake", async () => {
+    const service = `gap-${Date.now()}`;
+    const second = 1_000_000_000n;
+    const at = (offset: number) => logRecord(26, offset, service, NOW + BigInt(offset) * second);
+    const started = new Date().toISOString();
+    let since = "";
+    await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeConsumed(db, [0, 1, 2, 3].map((offset) => ({ ...at(offset), rows: [telemetryRows("logs", logRequest(service, NOW + BigInt(offset) * second))] })), fromStart);
+      since = (await one<{ since: string }>(db, `select min(Timestamp)::varchar as since from ${LAKE}.otel.logs where ServiceName = '${service}'`)).since;
+      await transaction(db, () => db.run(`delete from ${LAKE}.otel.logs where ServiceName = '${service}'`));
+      await askReread(db, [{ table: "otel.logs", from: since }]);
+    });
+    // The log deleted records 0 and 1 of partition 26: it holds those of 2 seconds on alone.
+    const sinceMs = Number(NOW / 1_000_000n);
+    const asked = member([[at(4)]], { at: { "otel.logs": [{ partition: 26, offset: 2n, at: sinceMs + 2000, start: 2n, end: 5n }] } });
+    const behind = member([], { behind: true });
+    const again = member([[at(2), at(3), at(4)]]);
+    const members = [asked, behind, again];
+    const logged: { message: string; fields?: Record<string, unknown> }[] = [];
+    const metrics = createMetrics();
+    const intake = startIntake({ open: openForIntake, join: async () => members.shift()?.source ?? assert.fail("joined a fourth time"), metrics, log: (message, fields) => logged.push({ message, ...(fields ? { fields } : {}) }), batch: { ...BATCH, ms: 10 } });
+    try {
+      await until("the third member's commit", () => again.committed.length > 0);
+    } finally {
+      await intake.stop();
+    }
+    const gap = { signal: "logs", from: new Date(sinceMs).toISOString(), to: new Date(sinceMs + 2000).toISOString() };
+    assert.deepEqual(logged.find(({ message }) => message === "telemetry intake cannot read again what the lake lost of a time the log no longer holds")?.fields, gap);
+    const text = metrics.render();
+    assert.match(text, /^lake_telemetry_reread_gaps_total\{signal="logs"\} 1$/m);
+    assert.match(text, /^lake_telemetry_reread_gap_seconds\{signal="logs"\} 2$/m);
+    const lake = await openLake(config, { readOnly: true });
+    try {
+      assert.deepEqual(await rereadGaps(lake.db, started), [gap]);
+      // What the log still held is in the lake again.
+      assert.equal((await one<Count>(lake.db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 3n);
+    } finally {
+      lake.close();
+    }
+  });
+
+  test("a write that meets a file the lake names and the store does not give back fails naming it and what sets it right, and the intake's health says so once that goes on", async () => {
+    const service = `unreadable-${Date.now()}`;
+    // A day of its own, its one file then gone from the store.
+    const start = NOW - 30n * DAY;
+    const day = new Date(Number(start / 1_000_000n));
+    const partition = `year=${day.getUTCFullYear()}/month=${day.getUTCMonth() + 1}/day=${day.getUTCDate()}/`;
+    const file = await withLake(async (db) => {
+      await ensureOtel(db);
+      await writeConsumed(db, [{ topic: "otel.logs", topicId: "otel.logs-id", partition: 25, offset: 0n, rows: [telemetryRows("logs", logRequest(service, start))] }], fromStart);
+      const [only, ...others] = await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'logs', schema => 'otel') where contains(data_file, '${partition}')`);
+      assert.ok(only && others.length === 0);
+      return only.data_file;
+    });
+    const held = readFileSync(file);
+    rmSync(file);
+    try {
+      const group = member(Array.from({ length: 1000 }, () => [logRecord(25, 1, service, start - 1n, start + 1n)]));
+      const failures: string[] = [];
+      const log = (message: string, fields?: Record<string, unknown>) => {
+        if (message === "telemetry intake lost the lake or the log") failures.push(String(fields?.["error"]));
+      };
+      const intake = startIntake({ open: openForIntake, join: async () => group.source, metrics: createMetrics(), log, batch: { ...BATCH, ms: 10 }, retryMs: 10, failingMs: 1000 });
+      try {
+        await until("a batch's failure", () => failures.length > 0);
+        const named = `the object store did not give back ${file}, a file of otel.logs the lake's catalog names (`;
+        assert.ok(failures[0]?.startsWith(named), failures[0]);
+        assert.ok(failures[0]?.endsWith("): where this goes on, the store lost it, and run alasio lake reconcile to set the lake right"), failures[0]);
+        await until("the intake not well", () => !intake.health().ok);
+        assert.ok(intake.health().detail.includes(named), intake.health().detail);
+        assert.deepEqual(group.committed, []);
+      } finally {
+        await intake.stop();
+      }
+    } finally {
+      writeFileSync(file, held);
+    }
   });
 
   test("the intake joins the group only once it holds the lake, and tries again until it can open it", async () => {
@@ -715,7 +1008,7 @@ describe("telemetry", () => {
         select 'merged' as ServiceName, md5(i::VARCHAR) as MetricName, make_timestamp_ns(${start} + i) as TimeUnix, i::DOUBLE as Value
         from range(${target / 10n}) t(i)`);
       for (const offset of [0, 1, 2]) {
-        await writeConsumed(db, [{ topic: "otel.metrics", topicId: "otel.metrics-id", partition: 9, offset: BigInt(offset), rows: [telemetryRows("metrics", gaugeRequest("merged", start + BigInt(offset)))] }]);
+        await writeConsumed(db, [{ topic: "otel.metrics", topicId: "otel.metrics-id", partition: 9, offset: BigInt(offset), rows: [telemetryRows("metrics", gaugeRequest("merged", start + BigInt(offset)))] }], fromStart);
       }
       const large = (await files()).filter(({ size }) => size >= target).map(({ data_file }) => data_file);
       assert.ok(large.length > 0);
@@ -733,7 +1026,7 @@ describe("telemetry", () => {
       await writeConsumed(db, [
         { topic: "otel.logs", topicId: "otel.logs-id", partition: 8, offset: 0n, rows: [telemetryRows("logs", logRequest("files", NOW))] },
         { topic: "otel.metrics", topicId: "otel.metrics-id", partition: 8, offset: 0n, rows: [telemetryRows("metrics", gaugeRequest("files", NOW))] },
-      ]);
+      ], fromStart);
       assert.deepEqual({ logs: await files("logs"), gauge: await files("metrics_gauge") }, { logs: before.logs + 1n, gauge: before.gauge + 1n });
     });
   });
@@ -750,7 +1043,7 @@ describe("telemetry", () => {
       const written = await writeConsumed(db, [
         { topic: "otel.logs", topicId: "otel.logs-id", partition: 14, offset: 0n, rows: rowsOf(broken) },
         { topic: "otel.logs", topicId: "otel.logs-id", partition: 14, offset: 1n, rows: rowsOf(encodeRequest("logs", logRequest("whole", NOW))) },
-      ]);
+      ], fromStart);
       assert.deepEqual(written.malformed.map(({ offset }) => offset), [0n]);
       const count = async (service: string) => (await one<Count>(db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n;
       assert.deepEqual([await count("half"), await count("whole")], [0n, 1n]);
@@ -950,10 +1243,12 @@ describe("telemetry", () => {
     const intake = startIntake({ open, join: async () => group.source, metrics: createMetrics(), log, batch: { ...BATCH, ms: 10 }, retryMs: 10, failingMs: 1000 });
     try {
       await until("a batch's failure", () => failures > 0);
-      assert.equal(intake.well(), true);
+      assert.equal(intake.health().ok, true);
       await new Promise((resolve) => setTimeout(resolve, 1500));
       assert.ok(failures > 1, `${failures} failures`);
-      assert.equal(intake.well(), false);
+      const { ok, detail } = intake.health();
+      assert.equal(ok, false);
+      assert.match(detail, /^its batches have failed for \d+ s, the last as the lake's write lock was not held: Connection terminated unexpectedly$/u);
     } finally {
       await intake.stop();
     }
@@ -974,6 +1269,12 @@ describe("telemetry", () => {
       async rewind() {
         return false;
       },
+      async offsetsAt() {
+        return [];
+      },
+      async start() {
+        return 0n;
+      },
       async lag() {
         return new Map();
       },
@@ -983,10 +1284,12 @@ describe("telemetry", () => {
     };
     const intake = startIntake({ open: openForIntake, join: async () => stuck, metrics: createMetrics(), log: () => {}, stallMs: 200 });
     try {
-      assert.equal(intake.well(), true);
+      assert.deepEqual(intake.health(), { ok: true, detail: "its loop comes round" });
       await until("the intake gathering", () => gathered);
       await new Promise((resolve) => setTimeout(resolve, 300));
-      assert.equal(intake.well(), false);
+      const { ok, detail } = intake.health();
+      assert.equal(ok, false);
+      assert.match(detail, /^its loop has not come round for \d+ s$/u);
     } finally {
       await intake.stop();
     }
@@ -1096,10 +1399,22 @@ describe("telemetry", () => {
     });
   });
 
+  test("a maintenance pass cuts the days it keeps, and records when it ran, of the one time it is given", async () => {
+    await withLake(async (db) => {
+      const service = `cut-${Date.now()}`;
+      await writeConsumed(db, [{ topic: "otel.logs", topicId: "otel.logs-id", partition: 33, offset: 0n, rows: [telemetryRows("logs", logRequest(service, NOW - 30n * DAY, NOW - 29n * DAY))] }], fromStart);
+      // A pass a day on from the rows' now: the day 30 days before that is past its 30 days, the one 29 before is not.
+      const now = new Date(Number((NOW + DAY) / 1_000_000n));
+      await maintainLake(db, { retentionDays: 30, keepFiles: true, now });
+      assert.equal((await one<Count>(db, `select count(*) as n from ${LAKE}.otel.logs where ServiceName = '${service}'`)).n, 1n);
+      assert.deepEqual(await lastMaintained(db), now);
+    });
+  });
+
   test("maintenance deletes the days of telemetry past its retention, and then their files", async () => {
     await withLake(async (db) => {
       const days = [40n, 31n, 30n, 0n];
-      await writeConsumed(db, [{ topic: "otel.logs", topicId: "otel.logs-id", partition: 7, offset: 0n, rows: [telemetryRows("logs", logRequest("retained", ...days.map((ago) => NOW - ago * DAY)))] }]);
+      await writeConsumed(db, [{ topic: "otel.logs", topicId: "otel.logs-id", partition: 7, offset: 0n, rows: [telemetryRows("logs", logRequest("retained", ...days.map((ago) => NOW - ago * DAY)))] }], fromStart);
       const day = (ago: bigint) => new Date(Number((NOW - ago * DAY) / 1_000_000n));
       const partition = (date: Date) => join(dataDir ?? "", "otel", "logs", `year=${date.getUTCFullYear()}`, `month=${date.getUTCMonth() + 1}`, `day=${date.getUTCDate()}`);
       const files = (ago: bigint) => readdirSync(partition(day(ago))).filter((name) => name.endsWith(".parquet"));
@@ -1108,12 +1423,14 @@ describe("telemetry", () => {
       await db.run(`call ${LAKE}.set_option('expire_older_than', '0 seconds')`);
       await db.run(`call ${LAKE}.set_option('delete_older_than', '0 seconds')`);
 
-      await maintainLake(db, { retentionDays: 30, keepFiles: false });
+      // Of the one time the test's rows are of, whatever the clock says as it runs, across midnight too.
+      const now = new Date(Number(NOW / 1_000_000n));
+      await maintainLake(db, { retentionDays: 30, keepFiles: false, now });
       const kept = await rows<{ day: Date }>(db, `select Timestamp::DATE::TIMESTAMP as day from ${LAKE}.otel.logs where ServiceName = 'retained' order by Timestamp`);
       assert.deepEqual(kept.map(({ day }) => day.toISOString().slice(0, 10)), [30n, 0n].map((ago) => day(ago).toISOString().slice(0, 10)));
       // The pass after the one that deleted them deletes their files, once their snapshots expire.
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await maintainLake(db, { retentionDays: 30, keepFiles: false });
+      await maintainLake(db, { retentionDays: 30, keepFiles: false, now });
       assert.deepEqual([files(40n), files(31n)], [[], []]);
       assert.ok(files(30n).length > 0);
     });

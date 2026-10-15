@@ -42,6 +42,7 @@ import { installConfigOf } from "../src/config.ts";
 import { branchObjects } from "../src/manifests/branch.ts";
 import type { ScaledObject } from "../src/manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
+import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 
@@ -1556,14 +1557,29 @@ describe("the log", () => {
       "default.replication.factor=1",
       "min.insync.replicas=1",
       "log.dirs=/data/log",
-      "log.retention.ms=86400000",
+      "log.retention.ms=259200000",
       "log.segment.bytes=67108864",
       "log.roll.ms=3600000",
       "message.max.bytes=8388608",
       // Its flusher looking each second for what its topics' flush.ms says to flush, where it would look never.
       "log.flush.scheduler.interval.ms=1000",
     ]) assert.ok(lines.includes(line), line);
-    assert.match(properties(install({ log: { retention: "6h" } })), /^log\.retention\.ms=21600000$/mu);
+    assert.match(properties(install({ log: { retention: "6h" }, objectStore: { bundled: { filerStore: { backups: { enabled: false } } } } })), /^log\.retention\.ms=21600000$/mu);
+  });
+
+  test("keeps its records as long as the filer store's backups go back, and a day more, for the lake's telemetry a restore loses to be read again", () => {
+    // 48 hourly backups by default: 72 hours.
+    assert.equal(filerStoreBackupHours({ schedule: "23 * * * *", keep: 48 }), 48);
+    assert.equal(filerStoreBackupHours({ schedule: "0 */6 * * *", keep: 8 }), 48);
+    assert.equal(filerStoreBackupHours({ schedule: "15 3 * * *", keep: 7 }), 168);
+    assert.equal(filerStoreBackupHours({ schedule: "0 3 * * 1", keep: 4 }), null);
+    assert.equal(refusal({}), "taken");
+    assert.equal(
+      refusal({ log: { retention: "48h" } }),
+      "log.retention must be at least 72h: the filer store's backups go back 48h (objectStore.bundled.filerStore.backups), a restore of the oldest loses the lake's telemetry written since, which the log refills only while it holds it, and a day more",
+    );
+    assert.equal(refusal({ log: { retention: "48h" }, objectStore: { bundled: { filerStore: { backups: { keep: 24 } } } } }), "taken");
+    assert.equal(refusal({ objectStore: { bundled: { filerStore: { backups: { schedule: "15 3 * * *", keep: 7 } } } } }).startsWith("log.retention must be at least 192h"), true);
   });
 
   test("runs 1 node or 3 in a quorum, spread strictly, one evicted at a time, each partition on all three and acknowledged by two", () => {
@@ -1599,7 +1615,7 @@ describe("the log", () => {
   test("gives each principal what it does alone: the gateway writes the telemetry topics, the intake reads them in its group, KEDA describes both", () => {
     const access = JSON.parse(logConfig(install())["access.json"] ?? "");
     // Each topic flushed to the volume within a second, so a host's crash loses a second of what it acknowledged at most.
-    assert.deepEqual(access.topics, ["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 86_400_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })));
+    assert.deepEqual(access.topics, ["otel.spans", "otel.logs", "otel.metrics"].map((name) => ({ name, partitions: 2, retentionMs: 259_200_000, retentionBytes: 448 * 1024 * 1024, configs: { "flush.ms": "1000" } })));
     const telemetry = { resource: "topic", name: "otel.", pattern: "prefixed" };
     const group = { resource: "group", name: "lake-intake", pattern: "literal" };
     assert.deepEqual(access.principals, [

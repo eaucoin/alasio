@@ -199,6 +199,8 @@ function gatewayConfig(config: InstallConfig): object {
       : {}),
     ...(config.telemetry.otlpEndpoint ? externalExporter(config) : {}),
   };
+  // Nothing between: a log record without an id of its own the lake's intake knows by what it
+  // is (neon/lake/src/otel.ts logRecordId), so the same record sent twice is one.
   const sent = { receivers: ["otlp"], exporters: Object.keys(exporters) };
   return { ...BASE, exporters, service: { ...SERVICE, pipelines: { traces: sent, logs: sent, metrics: sent } } };
 }

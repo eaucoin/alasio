@@ -240,6 +240,22 @@ const telemetryPartitions = (config: Pick<InstallConfig, "lake">): number => 3 *
  * less the segment each writes beside those it keeps, as retention deletes closed segments
  * alone.
  */
+/** How much longer than the filer store's backups go back the log keeps its records: the day a restore and the lake's reconciliation take, and more. */
+export const LOG_RETENTION_MARGIN_HOURS = 24;
+
+/**
+ * How far back the filer store's backups go, in hours: `keep` of them, taken on `schedule`
+ * at a fixed minute of every hour, of every Nth hour, or of a fixed hour each day; null for a
+ * schedule of another form, which is not known so.
+ */
+export function filerStoreBackupHours({ schedule, keep }: { readonly schedule: string; readonly keep: number }): number | null {
+  const [minute = "", hour = "", ...rest] = schedule.trim().split(/\s+/u);
+  if (rest.length !== 3 || rest.some((field) => field !== "*") || !/^[0-9]+$/u.test(minute)) return null;
+  const every = hour === "*" ? 1 : /^\*\/([1-9][0-9]*)$/u.exec(hour)?.[1];
+  if (every !== undefined) return Number(every) * keep;
+  return /^[0-9]+$/u.test(hour) ? 24 * keep : null;
+}
+
 export function telemetryRetentionBytes(config: Pick<InstallConfig, "log" | "lake">): number {
   return Math.floor((memoryBytes(config.log.storage.size) * 3) / 4 / telemetryPartitions(config)) - LOG_SEGMENT_BYTES;
 }
@@ -250,11 +266,13 @@ export function telemetryRetentionBytes(config: Pick<InstallConfig, "log" | "lak
  * is on too. Its nodes are brokers and KRaft's controllers both, 1, or 3 in a quorum, their
  * count set as the log is made and never changed after, as KRaft's voters are fixed. It is
  * a buffer, not a store: what it holds is kept for `retention`, within its volume, the lake
- * keeping what is read from it.
+ * keeping what is read from it. That is also what the lake's telemetry is refilled from where
+ * the lake loses files, as a restore of the filer store's oldest backup loses what was written
+ * since (filerStoreBackupHours): so it keeps them, and a day more, LOG_RETENTION_MARGIN_HOURS.
  */
 const Log = Schema.Struct({
   scaling: Scaling({ min: 1, max: 1 }, { floor: true, scaled: false, most: 3 }),
-  retention: defaulted(matching(/^[1-9][0-9]*h$/u, "must be a number of hours, such as 24h"), "24h"),
+  retention: defaulted(matching(/^[1-9][0-9]*h$/u, "must be a number of hours, such as 24h"), "72h"),
   storage: Storage("4Gi"),
   resources: Resources({ requests: { cpu: "100m", memory: "512Mi" }, limits: { memory: "1Gi" } }),
 });
@@ -810,6 +828,14 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
   if (config.log.scaling.min === 2) return { path: ["log", "scaling"], issue: "must be 1 or 3: two of KRaft's voters elect no leader once one is gone" };
   if (memoryBytes(config.log.resources.limits["memory"] ?? "0") < memoryBytes(LOG_MEMORY)) {
     return { path: ["log", "resources", "limits", "memory"], issue: `must be at least ${LOG_MEMORY}: a heap of 512 MiB, and the JVM's own` };
+  }
+  const backedUp = bundled.enabled && bundled.filerStore.backups.enabled ? filerStoreBackupHours(bundled.filerStore.backups) : null;
+  if (backedUp !== null && Number(config.log.retention.slice(0, -1)) < backedUp + LOG_RETENTION_MARGIN_HOURS) {
+    return {
+      path: ["log", "retention"],
+      issue: `must be at least ${backedUp + LOG_RETENTION_MARGIN_HOURS}h: the filer store's backups go back ${backedUp}h (objectStore.bundled.filerStore.backups), ` +
+        `a restore of the oldest loses the lake's telemetry written since, which the log refills only while it holds it, and a day more`,
+    };
   }
   if (telemetryRetentionBytes(config) < LOG_SEGMENT_BYTES) {
     const least = Math.ceil((telemetryPartitions(config) * 2 * LOG_SEGMENT_BYTES * 4) / 3);

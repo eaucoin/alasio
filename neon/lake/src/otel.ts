@@ -42,6 +42,8 @@
  * The rest join through these: alasio's logs within a turn carry its span's TraceId,
  * and Claude Code's own telemetry its `session.id`, the session's id.
  */
+import { createHash } from "node:crypto";
+
 import { type DuckDBAppender, type DuckDBConnection, DuckDBDataChunk, type DuckDBType, type DuckDBValue, listValue, mapValue, structValue, timestampNanosValue } from "@duckdb/node-api";
 
 import { LAKE, rows, transaction } from "./lake.ts";
@@ -55,12 +57,15 @@ import {
   integer,
   type Integer,
   type KeyValue,
+  type LogRecord,
   type LogsRequest,
   MalformedRequest,
   type MetricsRequest,
   type Requests,
   type Resource,
+  type ResourcePart,
   type Scope,
+  type ScopePart,
   type Signal,
   type TracesRequest,
 } from "./otlp.ts";
@@ -150,14 +155,33 @@ const OFFSETS = "intake_offsets";
 const OFFSETS_COLUMNS = "Topic VARCHAR, TopicId VARCHAR, PartitionId INTEGER, NextOffset BIGINT";
 
 /**
+ * What the intake is asked to read again from the log (askReread): of a signal's topic, its
+ * records from `Since` on, the earliest time of the rows the lake lost of it. Inlined in the
+ * catalog, as the offsets are.
+ */
+const REREADS = "intake_rereads";
+const REREADS_COLUMNS = "Signal VARCHAR, Since TIMESTAMP_NS";
+
+/**
+ * What the intake, taking up a reread, found the log no longer holds (RereadGap): of a
+ * signal, the time from which it was asked to read again to that of the first record the log
+ * still holds, and when it found that. Inlined in the catalog, as the rereads are.
+ */
+const REREAD_GAPS = "intake_reread_gaps";
+const REREAD_GAPS_COLUMNS = "Signal VARCHAR, FromTime TIMESTAMP_NS, ToTime TIMESTAMP_NS, FoundAt TIMESTAMP_NS";
+
+/**
  * Makes the `otel` schema's tables where they are missing, each partitioned by its
- * day, and the intake's offsets; and sets that nothing of the telemetry is inlined in the
- * catalog, the offsets alone, and the size up to which the telemetry's files are merged.
+ * day, and the intake's offsets, what it is asked to read again and what it found it could
+ * not; and sets that nothing of the telemetry is inlined in the catalog, those three alone,
+ * and the size up to which the telemetry's files are merged.
  */
 export async function ensureOtel(db: DuckDBConnection): Promise<void> {
   await transaction(db, async () => {
     await db.run(`create schema if not exists ${LAKE}.otel`);
     await db.run(`create table if not exists ${LAKE}.otel.${OFFSETS} (${OFFSETS_COLUMNS})`);
+    await db.run(`create table if not exists ${LAKE}.otel.${REREADS} (${REREADS_COLUMNS})`);
+    await db.run(`create table if not exists ${LAKE}.otel.${REREAD_GAPS} (${REREAD_GAPS_COLUMNS})`);
     for (const [table, { columns, time }] of Object.entries(TABLES)) {
       const [exists] = (await db.runAndReadAll(
         `select 1 from duckdb_tables() where database_name = '${LAKE}' and schema_name = 'otel' and table_name = $1`,
@@ -174,7 +198,134 @@ export async function ensureOtel(db: DuckDBConnection): Promise<void> {
       await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 0, schema => 'otel', table_name => '${table}')`);
       await db.run(`call ${LAKE}.set_option('target_file_size', '${TELEMETRY_FILE_SIZE}', schema => 'otel', table_name => '${table}')`);
     }
-    await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 1000, schema => 'otel', table_name => '${OFFSETS}')`);
+    for (const table of [OFFSETS, REREADS, REREAD_GAPS]) await db.run(`call ${LAKE}.set_option('data_inlining_row_limit', 1000, schema => 'otel', table_name => '${table}')`);
+  });
+}
+
+/** The signal each table's rows are of, whose topic the intake reads them from. */
+const SIGNALS: Readonly<Record<OtelTable, Signal>> = {
+  traces: "traces",
+  logs: "logs",
+  metrics_gauge: "metrics",
+  metrics_sum: "metrics",
+  metrics_histogram: "metrics",
+  metrics_exponential_histogram: "metrics",
+  metrics_summary: "metrics",
+};
+
+/** The table of the telemetry's named `table` in the lake, as "otel.traces"; null for another. */
+const telemetryTable = (table: string): OtelTable | null => {
+  const name = /^otel\.(\w+)$/u.exec(table)?.[1];
+  return name !== undefined && Object.hasOwn(TABLES, name) ? name as OtelTable : null;
+};
+
+/** The column of the time of each row of `table`, a table of the lake's as "otel.traces": a lost file's rows' earliest is its range's start (askReread). Null for a table not of the telemetry's. */
+export function telemetryTime(table: string): string | null {
+  const known = telemetryTable(table);
+  return known === null ? null : TABLES[known].time;
+}
+
+/** Rows a table of the telemetry's lost, from `from` on: the earliest of its time column (telemetryTime) they held, as text; null where that is not known, for all the log holds. */
+export interface TelemetryLoss {
+  readonly table: string;
+  readonly from: string | null;
+}
+
+/** The time a loss whose start is not known is read again from: the log's first record's on. */
+const ALL_OF_IT = "1970-01-01 00:00:00";
+
+/**
+ * Asks the intake to read again from the log what `losses` lost, as the lake's catalog,
+ * set right with its store, forgets files the store no longer holds: of each signal's topic,
+ * its records from the earliest of its tables' losses on. The intake takes it up at its next
+ * write (writeConsumed), where it sets its offsets back to where the log has those records
+ * and reads from there, which writes each row the lake no longer has, once. Asked again
+ * before then, it reads from the earlier.
+ */
+export async function askReread(db: DuckDBConnection, losses: readonly TelemetryLoss[]): Promise<void> {
+  const known = losses.map((loss) => {
+    const table = telemetryTable(loss.table);
+    if (table === null) throw new Error(`${loss.table} is no table of the telemetry's`);
+    return { ...loss, signal: SIGNALS[table] };
+  });
+  await transaction(db, async () => {
+    for (const { signal, from } of known) await db.run(`insert into ${LAKE}.otel.${REREADS} values ($1, $2::TIMESTAMP_NS)`, [signal, from ?? ALL_OF_IT]);
+  });
+}
+
+/** What the intake is asked to read again of a signal's topic: from `since`, as text, and in milliseconds since the epoch, on. */
+export interface Reread {
+  readonly signal: Signal;
+  readonly since: string;
+  readonly sinceMs: number;
+}
+
+/** What the intake is asked to read again and has not yet taken up, of each signal the earliest asked. */
+export async function rereadsAsked(db: DuckDBConnection): Promise<Reread[]> {
+  return (await rows<{ Signal: Signal; since: string; ms: bigint }>(
+    db,
+    `select Signal, min(Since)::varchar as since, epoch_ms(min(Since)::TIMESTAMP) as ms from ${LAKE}.otel.${REREADS} group by Signal order by Signal`,
+  )).map(({ Signal, since, ms }) => ({ signal: Signal, since, sinceMs: Number(ms) }));
+}
+
+/** The intake was asked to read records again (askReread): a write takes that up before any. */
+export class RereadAsked extends Error {
+  override readonly name = "RereadAsked";
+  readonly asked: readonly Reread[];
+  constructor(asked: readonly Reread[]) {
+    super(`the intake is asked to read again ${asked.map(({ signal, since }) => `${signal} from ${since}`).join(", ")}`);
+    this.asked = asked;
+  }
+}
+
+/**
+ * What a reread cannot refill: of `signal`, the rows of `from` to `to`, ISO 8601 times, as
+ * the log no longer holds the records of that time, its retention past them.
+ */
+export interface RereadGap {
+  readonly signal: Signal;
+  readonly from: string;
+  readonly to: string;
+}
+
+/** The gaps the intake found taking up rereads (readAgainFrom) at `since`, an ISO 8601 time, or later, in the order found. */
+export async function rereadGaps(db: DuckDBConnection, since: string): Promise<RereadGap[]> {
+  return (await rows<{ Signal: Signal; from: bigint; to: bigint }>(
+    db,
+    `select Signal, epoch_ms(FromTime::TIMESTAMP) as "from", epoch_ms(ToTime::TIMESTAMP) as "to" from ${LAKE}.otel.${REREAD_GAPS}
+      where FoundAt >= epoch_ms($1::BIGINT)::TIMESTAMP_NS order by FoundAt, Signal`,
+    [Date.parse(since)],
+  )).map(({ Signal, from, to }) => ({ signal: Signal, from: new Date(Number(from)).toISOString(), to: new Date(Number(to)).toISOString() }));
+}
+
+/**
+ * Takes up `asked` (RereadAsked): sets each partition's offset back to `from`'s, where the
+ * log has the records of their time, where the lake holds it past that, records `gaps`, what
+ * it cannot refill (rereadGaps), and clears what was asked, in one transaction. Returns the
+ * offsets set back.
+ */
+export function readAgainFrom(db: DuckDBConnection, asked: readonly Reread[], from: readonly Position[], gaps: readonly RereadGap[] = []): Promise<Position[]> {
+  return transaction(db, async () => {
+    for (const { signal, from: start, to } of gaps) {
+      await db.run(`insert into ${LAKE}.otel.${REREAD_GAPS} values ($1, epoch_ms($2::BIGINT)::TIMESTAMP_NS, epoch_ms($3::BIGINT)::TIMESTAMP_NS, epoch_ms($4::BIGINT)::TIMESTAMP_NS)`, [
+        signal,
+        Date.parse(start),
+        Date.parse(to),
+        Date.now(),
+      ]);
+    }
+    const held = new Map((await heldOffsets(db)).map((offset) => [partitionKey(offset), offset]));
+    const back: Position[] = [];
+    for (const position of from) {
+      const kept = held.get(partitionKey(position));
+      if (!kept || kept.offset <= position.offset) continue;
+      await db.run(`delete from ${LAKE}.otel.${OFFSETS} where Topic = $1 and PartitionId = $2`, [kept.topic, kept.partition]);
+      await db.run(`insert into ${LAKE}.otel.${OFFSETS} values ($1, $2, $3, $4)`, [kept.topic, kept.topicId, kept.partition, position.offset]);
+      back.push(position);
+    }
+    // What was asked since from a time as late or later is taken up with it.
+    for (const { signal, since } of asked) await db.run(`delete from ${LAKE}.otel.${REREADS} where Signal = $1 and Since >= $2::TIMESTAMP_NS`, [signal, since]);
+    return back;
   });
 }
 
@@ -317,13 +468,44 @@ function traceRows(request: TracesRequest): TelemetryRows {
   return { traces };
 }
 
+/** The attribute of a log record's own id, OpenTelemetry's, which logRecordId gives a record without one. */
+export const LOG_RECORD_ID = "log.record.uid";
+
+/**
+ * The id of `record`, of `resource` and `scope`, where its producer gave it none: what it
+ * is, hashed, its times, ids, severity, body and attributes, and its resource's and scope's,
+ * so that a record sent twice, as an SDK sends an export again whose answer it did not have,
+ * is known for one (insertNew), where an id given as each try was taken would tell the two
+ * apart.
+ */
+function logRecordId(resource: ResourcePart, scope: ScopePart, record: LogRecord): string {
+  const hash = createHash("sha256");
+  const add = (...values: readonly string[]) => {
+    for (const value of values) hash.update(value).update("\u0000");
+  };
+  const pairs = (given: readonly KeyValue[] | undefined) => {
+    add(String(given?.length ?? 0));
+    for (const { key, value } of given ?? []) add(key ?? "", text(value));
+  };
+  pairs(resource.resource?.attributes);
+  add(resource.schemaUrl ?? "", scope.scope?.name ?? "", scope.scope?.version ?? "");
+  pairs(scope.scope?.attributes);
+  add(scope.schemaUrl ?? "", String(integer(record.timeUnixNano)), String(integer(record.observedTimeUnixNano)), hexId(record.traceId), hexId(record.spanId));
+  add(String(record.flags ?? 0), String(record.severityNumber ?? 0), record.severityText ?? "", text(record.body), record.eventName ?? "");
+  pairs(record.attributes);
+  return hash.digest("hex").slice(0, 32);
+}
+
 function logRows(request: LogsRequest): TelemetryRows {
   const logs: TelemetryRow[] = [];
   for (const part of list(request.resourceLogs, "resourceLogs")) {
     const resource = { ServiceName: serviceName(part.resource), ResourceSchemaUrl: part.schemaUrl ?? "", ResourceAttributes: attributes(part.resource?.attributes) };
-    for (const { scope, schemaUrl, logRecords } of list(part.scopeLogs, "scopeLogs")) {
+    for (const scopePart of list(part.scopeLogs, "scopeLogs")) {
+      const { scope, schemaUrl, logRecords } = scopePart;
       const origin = { ScopeSchemaUrl: schemaUrl ?? "", ScopeName: scope?.name ?? "", ScopeVersion: scope?.version ?? "", ScopeAttributes: attributes(scope?.attributes) };
       for (const record of list(logRecords, "logRecords")) {
+        const own = list(record.attributes, "attributes");
+        const id = own.some(({ key }) => key === LOG_RECORD_ID) ? [] : [{ key: LOG_RECORD_ID, value: { stringValue: logRecordId(part, scopePart, record) } }];
         const when = integer(record.timeUnixNano);
         logs.push({
           // Where a record has no time of its own, the time it was seen.
@@ -336,7 +518,7 @@ function logRows(request: LogsRequest): TelemetryRows {
           Body: text(record.body),
           ...resource,
           ...origin,
-          LogAttributes: attributes(record.attributes),
+          LogAttributes: attributes([...own, ...id]),
           EventName: record.eventName ?? "",
         });
       }
@@ -450,6 +632,46 @@ export function telemetryRows<S extends Signal>(signal: S, request: Requests[S])
 /** The temporary table a batch's rows of a table are staged in, in DuckDB's own memory. */
 const batchStaging = (table: OtelTable) => `otel_${table}`;
 
+
+/**
+ * What a row is, whatever the log it came through wrote of it: a span, by its trace's id
+ * and its own; a log record, by its id, its producer's or logRecordId's; a metric's
+ * point, by its series (its service, scope, name and attributes, and its resource's) and
+ * its times. A row the lake has, or the batch has before it, as a producer's retry, or a
+ * sender's, writes a record twice, is written once.
+ */
+const pointIdentity = (row: string) => ["ServiceName", "ScopeName", "MetricName", "Attributes", "ResourceAttributes", "StartTimeUnix", "TimeUnix"].map((column) => `${row}.${column}`);
+const IDENTITY: Readonly<Record<OtelTable, (row: string) => readonly string[]>> = {
+  traces: (row) => [`${row}.TraceId`, `${row}.SpanId`],
+  logs: (row) => [`${row}.LogAttributes['${LOG_RECORD_ID}']`],
+  metrics_gauge: pointIdentity,
+  metrics_sum: pointIdentity,
+  metrics_histogram: pointIdentity,
+  metrics_exponential_histogram: pointIdentity,
+  metrics_summary: pointIdentity,
+};
+
+/**
+ * Inserts the rows staged for `table` that are not there already, nor before them in the
+ * batch, by what each is (IDENTITY), among the table's rows of the batch's time: the
+ * number inserted.
+ */
+async function insertNew(db: DuckDBConnection, table: OtelTable): Promise<number> {
+  const { time } = TABLES[table];
+  const [range] = await rows<{ low: string | null; high: string | null }>(db, `select min(${time})::varchar as low, max(${time})::varchar as high from temp.${batchStaging(table)}`);
+  const ours = IDENTITY[table]("s");
+  const theirs = IDENTITY[table]("t");
+  const held = range?.low && range.high
+    ? `not exists (select 1 from ${LAKE}.otel.${table} t where t.${time} between '${range.low}'::TIMESTAMP_NS and '${range.high}'::TIMESTAMP_NS and ` +
+      `${ours.map((column, index) => `${theirs[index]} is not distinct from ${column}`).join(" and ")})`
+    : "true";
+  const inserted = await db.run(
+    `insert into ${LAKE}.otel.${table} select * from temp.${batchStaging(table)} s where ${held} ` +
+      `qualify row_number() over (partition by ${ours.join(", ")}) = 1`,
+  );
+  return Number(inserted.rowsChanged);
+}
+
 /** The rows a staging table is given at once: a vector's, DuckDB's own size of a data chunk. */
 const CHUNK_ROWS = 2048;
 
@@ -472,6 +694,42 @@ const VALUE_REFUSED = /^(Conversion|Constraint|Invalid Input|Out of Range|Mismat
 
 /** An error of DuckDB's own, its kind first, as "Out of Memory Error: ...". */
 export const DUCKDB_ERROR = /^[A-Z][A-Za-z]*( [A-Za-z]+)* Error: /u;
+
+/**
+ * A file the lake's catalog names that the object store did not give back, as a write read
+ * the rows it holds to write none twice (insertNew): where that goes on, the store lost it,
+ * as a restore of its filer store loses what was written since its backup, and every write
+ * of the rows of its time fails on it until the catalog is set right with the store.
+ */
+export class LakeFileUnreadable extends Error {
+  override readonly name = "LakeFileUnreadable";
+  readonly file: string;
+  constructor(file: string, table: OtelTable, cause: Error) {
+    super(
+      `the object store did not give back ${file}, a file of otel.${table} the lake's catalog names (${cause.message}): ` +
+        "where this goes on, the store lost it, and run alasio lake reconcile to set the lake right",
+      { cause },
+    );
+    this.file = file;
+  }
+}
+
+/** DuckDB failing to read a Parquet file, as it names it: the store's answer to a GET of it, or its file not opened. */
+const FILE_UNREAD = /^(?:HTTP|IO) Error: .*?["']([^"']+\.parquet)["']/u;
+
+/** `error`, raised reading `table`'s rows, as LakeFileUnreadable where it is DuckDB's failing to read a file of them; as it is otherwise. */
+function unreadable(error: unknown, table: OtelTable): unknown {
+  if (!(error instanceof Error)) return error;
+  const file = FILE_UNREAD.exec(error.message)?.[1];
+  if (file === undefined) return error;
+  let named = file;
+  try {
+    named = decodeURIComponent(file);
+  } catch {
+    // Named as DuckDB gave it.
+  }
+  return new LakeFileUnreadable(named, table, error);
+}
 
 /**
  * `error`, raised staging or writing rows, as the rows' (UnwritableRows) where it is theirs:
@@ -565,9 +823,14 @@ export interface Consumed extends Position {
   readonly rows: Iterable<TelemetryRows>;
 }
 
-/** What writeConsumed did: the rows each table was given, the records skipped as written before or undecodable, and where each partition is written to now. */
+/**
+ * What writeConsumed did: the rows each table was given, and those it was not as it has
+ * them (insertNew), the records skipped as written before or undecodable, and where each
+ * partition is written to now.
+ */
 export interface ConsumedWrite {
   readonly written: Partial<Record<OtelTable, number>>;
+  readonly duplicates: Partial<Record<OtelTable, number>>;
   readonly repeated: number;
   /** The records skipped as they do not decode. */
   readonly malformed: readonly Position[];
@@ -588,31 +851,75 @@ export async function heldOffsets(db: DuckDBConnection): Promise<Held[]> {
 
 const partitionKey = ({ topic, partition }: Pick<Position, "topic" | "partition">) => `${topic}\u0000${partition}`;
 
+/** The offset of the first record a partition of the log's still holds, as the log says. */
+export type LogStart = (topic: string, partition: number) => Promise<bigint>;
+
+/**
+ * A batch read past the offsets the lake holds (writeConsumed): its member was not told of
+ * the lake's being set back beneath it, and joins again to read from `held`, the lake's.
+ */
+export class LakeSetBack extends Error {
+  override readonly name = "LakeSetBack";
+  readonly held: readonly Position[];
+  constructor(held: readonly Position[]) {
+    super(`the lake holds ${held.map(({ topic, partition, offset }) => `${topic}/${partition} to ${offset}`).join(", ")}, before what the batch was read from`);
+    this.held = held;
+  }
+}
+
 /**
  * Writes `consumed`, a batch the intake read from the log, in one transaction with the
  * offset each of its partitions is written to: of each partition, the records at or past
  * the offset the lake holds alone, so a batch written before, read again after a crash or
  * a rebalance, is written once; every record of a topic other than the one the lake holds
- * an offset of, by its id, as one made anew is. Each record's rows are staged in DuckDB's
- * memory first, a record at a time (staging).
+ * an offset of, by its id, as one made anew is. Of those, each row the lake has already is
+ * not written again (insertNew): what the log holds twice, at two offsets, is in the lake
+ * once. Each record's rows are staged in DuckDB's memory first, a record at a time (staging).
+ *
+ * A partition's records that begin past the offset the lake holds, and past the first record
+ * the log still holds (`logStart`), were read by a member the lake was set back beneath, as
+ * another replica's taking up a reread sets back every partition's, or a restore of the
+ * catalog does: the write is refused (LakeSetBack), so that the member joins again and reads
+ * from the lake's offsets, rather than set them past what the lake no longer has.
  */
-export function writeConsumed(db: DuckDBConnection, consumed: readonly Consumed[]): Promise<ConsumedWrite> {
+export function writeConsumed(db: DuckDBConnection, consumed: readonly Consumed[], logStart: LogStart): Promise<ConsumedWrite> {
   return transaction(db, async () => {
+    // Asked to read records again, the intake sets its offsets back first (readAgainFrom), or
+    // this write would set them past what it is to read again.
+    const asked = await rereadsAsked(db);
+    if (asked.length > 0) throw new RereadAsked(asked);
     const held = new Map((await heldOffsets(db)).map((offset) => [partitionKey(offset), { topicId: offset.topicId, next: offset.offset }]));
     const heldOf = (record: Consumed) => {
       const offset = held.get(partitionKey(record));
       return offset?.topicId === record.topicId ? offset.next : 0n;
     };
+    const firsts = new Map<string, Consumed>();
+    for (const record of consumed) {
+      const first = firsts.get(partitionKey(record));
+      if (!first || record.offset < first.offset) firsts.set(partitionKey(record), record);
+    }
+    const beneath: Position[] = [];
+    for (const first of firsts.values()) {
+      const kept = heldOf(first);
+      // The log is asked its start of a partition read past the lake's offset alone, the one the
+      // fence needs it of: a batch that follows on from the lake's, as nearly every batch does,
+      // asks it nothing within the write lock.
+      if (first.offset <= kept) continue;
+      if (first.offset > await logStart(first.topic, first.partition)) beneath.push({ topic: first.topic, partition: first.partition, offset: kept });
+    }
+    if (beneath.length > 0) throw new LakeSetBack(beneath);
     const fresh = consumed.filter((record) => record.offset >= heldOf(record));
     const staged = staging(db);
     const malformed: Position[] = [];
     for (const record of fresh) if (!(await staged.record(record.rows))) malformed.push(record);
     const written: Partial<Record<OtelTable, number>> = {};
+    const duplicates: Partial<Record<OtelTable, number>> = {};
     for (const { table, rows: stagedRows } of staged.tables()) {
-      await db.run(`insert into ${LAKE}.otel.${table} from temp.${batchStaging(table)}`).catch((error: unknown) =>
-        Promise.reject(error instanceof Error && VALUE_REFUSED.test(error.message) ? new UnwritableRows(error) : error)
+      const inserted = await insertNew(db, table).catch((error: unknown) =>
+        Promise.reject(error instanceof Error && VALUE_REFUSED.test(error.message) ? new UnwritableRows(error) : unreadable(error, table))
       );
-      written[table] = stagedRows;
+      written[table] = inserted;
+      if (inserted < stagedRows) duplicates[table] = stagedRows - inserted;
     }
     const next = new Map<string, Position & { readonly topicId: string }>();
     for (const record of fresh) {
@@ -631,6 +938,7 @@ export function writeConsumed(db: DuckDBConnection, consumed: readonly Consumed[
     }
     return {
       written,
+      duplicates,
       repeated: consumed.length - fresh.length,
       malformed,
       next: [...positions.values()],

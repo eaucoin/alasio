@@ -63,6 +63,13 @@ const rowsOf = (signal: Signal, body: Uint8Array | undefined) => {
   return plainRows(decodedRows(signal, body));
 };
 
+/** A log record's attributes but the id the intake makes it, of what it is, where it has none of its own: checked to be one. */
+function ownAttributes(attributes: unknown): Record<string, unknown> {
+  const { "log.record.uid": id, ...own } = attributes as Record<string, unknown>;
+  assert.match(String(id), /^[0-9a-f]{32}$/u);
+  return own;
+}
+
 /** An id, given as hex, as protobuf carries it. */
 const id = (hex: string) => Buffer.from(hex, "hex");
 
@@ -126,7 +133,7 @@ test("log records are a row of otel.logs each", async () => {
     [warned["Timestamp"], warned["SeverityText"], warned["SeverityNumber"], warned["ServiceName"], warned["Body"], warned["ScopeName"], warned["EventName"], warned["TraceId"], warned["TraceFlags"]],
     [START, "WARN", SeverityNumber.WARN, "alasio", "load failed", "alasio-lake", "lake.load", "", 0],
   );
-  assert.deepEqual(warned["LogAttributes"], { error: "permission denied" });
+  assert.deepEqual(ownAttributes(warned["LogAttributes"]), { error: "permission denied" });
   assert.equal(structured["Body"], '{"nested":[1,"two"]}');
 });
 
@@ -224,7 +231,7 @@ test("attribute values read as the ClickHouse exporter writes them, the last of 
   }));
   assert.ok(row);
   assert.equal(row["Body"], '{"big":9007199254740993,"list":[false,1.5]}');
-  assert.deepEqual(row["LogAttributes"], { bytes: "AAEC", twice: "last", empty: "" });
+  assert.deepEqual(ownAttributes(row["LogAttributes"]), { bytes: "AAEC", twice: "last", empty: "" });
   assert.equal(row["ServiceName"], "");
   assert.equal(row["Timestamp"], START);
 });
@@ -315,6 +322,6 @@ test("the lake's events are exported as log records where the standard variables
   const [event] = logs;
   assert.ok(event);
   assert.deepEqual([event["ServiceName"], event["Body"], event["ScopeName"]], ["alasio-lake", "load failed", "alasio-lake"]);
-  assert.deepEqual(event["LogAttributes"], { error: "permission denied", claude: '{"inserted":1}' });
+  assert.deepEqual(ownAttributes(event["LogAttributes"]), { error: "permission denied", claude: '{"inserted":1}' });
   assert.equal((event["ResourceAttributes"] as Record<string, string>)["deployment.environment.name"], "test");
 });

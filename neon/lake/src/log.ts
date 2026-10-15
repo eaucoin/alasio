@@ -117,6 +117,22 @@ export async function joinLog(access: LogAccess, group: string, topics: readonly
       if (back.length > 0) await consumer.commit({ offsets: back });
       return back.length > 0;
     },
+    async start(topic, partition) {
+      return (await consumer.listOffsets({ topics: [topic], timestamp: -2n })).get(topic)?.[partition] ?? 0n;
+    },
+    async offsetsAt(topic, ms) {
+      const [at, starts, ends] = await Promise.all([
+        consumer.listOffsetsWithTimestamps({ topics: [topic], timestamp: BigInt(ms) }),
+        consumer.listOffsets({ topics: [topic], timestamp: -2n }),
+        consumer.listOffsets({ topics: [topic] }),
+      ]);
+      return (starts.get(topic) ?? []).map((start, partition) => {
+        // -1 of a partition none of whose records is so late.
+        const found = at.get(topic)?.get(partition);
+        const held = found !== undefined && found.offset >= 0n;
+        return { partition, offset: held ? found.offset : null, at: held ? Number(found.timestamp) : null, start, end: ends.get(topic)?.[partition] ?? start };
+      });
+    },
     async lag() {
       // Each partition's end, against where the group was last told, or its start where it never was.
       const [ends, starts] = await Promise.all([consumer.listOffsets({ topics: [...topics] }), consumer.listOffsets({ topics: [...topics], timestamp: -2n })]);

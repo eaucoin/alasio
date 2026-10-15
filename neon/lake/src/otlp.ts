@@ -53,12 +53,12 @@ export interface Scope {
 }
 
 /** What a request's resource parts and their scope parts have alike. */
-interface ScopePart {
+export interface ScopePart {
   readonly scope?: Scope;
   readonly schemaUrl?: string;
 }
 
-interface ResourcePart {
+export interface ResourcePart {
   readonly resource?: Resource;
   readonly schemaUrl?: string;
 }

@@ -1300,7 +1300,8 @@ if (inShard("telemetry")) {
 
     test("alasio's own traces, logs and metrics are in the lake, queryable through alasio lake", async () => {
       await untilInLake("trace of alasio's", "select count(*) as n from otel.traces where ServiceName = 'alasio'");
-      await untilInLake("log record of alasio's", "select count(*) as n from otel.logs where ServiceName = 'alasio'");
+      // Each with the id the lake's intake knows it by, which it makes of what the record is.
+      await untilInLake("log record of alasio's", "select count(*) as n from otel.logs where ServiceName = 'alasio' and LogAttributes['log.record.uid'] similar to '[0-9a-f]{32}'");
       await untilInLake("metric of alasio's", metricRows("ServiceName = 'alasio'"));
     });
 
