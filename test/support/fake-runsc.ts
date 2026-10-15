@@ -5,18 +5,22 @@
  * answers what the node agent asks runsc as the fork's runsc does
  * (runsc/cmd/checkpoint.go, resume.go, image/inspect.go, cpu_features.go):
  *
- * - `checkpoint --image-path=DIR ... ID`: writes an image of three files into DIR, made
- *   from ID; or fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
+ * - `checkpoint --image-path=DIR [--parent-image-path=PARENT] ... ID`: writes an image of
+ *   ID into DIR, of runsc's three files: its state file, its pages, and its pages metadata,
+ *   which here names the images it holds pages of besides its own, its layers: none, or
+ *   PARENT's digest and PARENT's layers, failing as runsc does without PARENT's pages
+ *   metadata. Or it fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
  *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
- * - `image inspect --json DIR`: describes the image, as saved by the
- *   release's runsc, whose version is `release-RELEASE` (or what a file `saved-by` beside it
- *   says), with the CPU features of `image-cpu-features`;
+ * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
+ *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
+ *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's;
+ * - `image layers DIR`: its layers' digests, a line each;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
  * - `state ID`: the container's sandbox's process and its pod's annotations, as
  *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
  *   does not hold; that process's program, in the stand-in's /proc, is the runsc of the
- *   release that runs it.
+ *   release that runs it, and its arguments runsc's flags, which track its writes or not.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -32,13 +36,24 @@ const args = process.argv.slice(2);
 appendFileSync(join(here, "calls.jsonl"), JSON.stringify(args) + "\\n");
 const read = (name, otherwise) => (existsSync(join(here, name)) ? readFileSync(join(here, name), "utf8").trim() : otherwise);
 const rest = args.filter((arg) => !arg.startsWith("--root=") && !arg.startsWith("--systemd-cgroup="));
+const flag = (name) => rest.find((arg) => arg.startsWith("--" + name + "="))?.slice(name.length + 3);
+const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const checkpoint = () => {
-  const image = rest.find((arg) => arg.startsWith("--image-path=")).slice("--image-path=".length);
+  const image = flag("image-path");
   const id = rest[rest.length - 1];
-  mkdirSync(join(image, "layers"), { recursive: true });
-  writeFileSync(join(image, "checkpoint.img"), "state of " + id);
-  writeFileSync(join(image, "pages_meta.img"), "meta of " + id);
-  writeFileSync(join(image, "layers", "pages.img"), Buffer.alloc(4096, id));
+  const parent = flag("parent-image-path");
+  let layers = [];
+  if (parent !== undefined) {
+    if (!existsSync(join(parent, "pages_meta.img"))) { process.stderr.write("checkpoint failed: the parent image " + parent + " has no pages metadata\\n"); process.exit(128); }
+    const parentMeta = readFileSync(join(parent, "pages_meta.img"));
+    layers = [sha256(parentMeta), ...JSON.parse(parentMeta).layers];
+  }
+  mkdirSync(image, { recursive: true });
+  // Each save its own state, as each sandbox's moment is.
+  const state = "state of " + id + " at " + process.hrtime.bigint();
+  writeFileSync(join(image, "checkpoint.img"), state);
+  writeFileSync(join(image, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers }));
+  writeFileSync(join(image, "pages.img"), Buffer.alloc(4096, id));
 };
 if (rest[0] === "checkpoint") {
   if (existsSync(join(here, "fail-checkpoint"))) { process.stderr.write("checkpoint failed: the sandbox is gone\\n"); process.exit(128); }
@@ -50,14 +65,17 @@ if (rest[0] === "checkpoint") {
   checkpoint();
 } else if (rest[0] === "image" && rest[1] === "inspect") {
   const image = rest[rest.length - 1];
-  const digest = createHash("sha256").update(readFileSync(join(image, "checkpoint.img"))).digest("hex");
+  const meta = readFileSync(join(image, "pages_meta.img"));
   process.stdout.write(JSON.stringify({
-    digest: "sha256:" + digest,
-    format: { major: 1, minor: 0 },
+    digest: sha256(meta),
+    format: { major: 2, minor: 0 },
     state: { size: 10, metadata: { runsc_version: read("saved-by", "release-" + basename(here)), cpu_features: read("image-cpu-features", "sse,avx"), platform: "systrap" } },
-    layers: [{ pages_size: 4096, path: join(image, "layers", "pages.img") }],
+    layers: [{ pages_size: 4096, path: join(image, "pages.img") }, ...JSON.parse(meta).layers.map((digest) => ({ digest, pages_size: 4096, path: join(image, "layers", digest, "pages.img") }))],
     memory_files: [],
   }, null, 2) + "\\n");
+} else if (rest[0] === "image" && rest[1] === "layers") {
+  const image = rest[rest.length - 1];
+  for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "state") {
@@ -83,8 +101,11 @@ export interface FakeReleases {
   readonly calls: (release: string) => string[][];
   /** The node's processes, as the agent reads them: each container's sandbox's, of its release's runsc. */
   readonly procRoot: string;
-  /** Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state says. */
-  readonly runs: (containerId: string, release: string, namespace: string, pod: string) => void;
+  /**
+   * Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state
+   * says, its sandbox tracking its writes (`--dirty-tracking=wp`) unless `tracksWrites` is false.
+   */
+  readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean) => void;
 }
 
 /** Installs `releases` under `root`, each with an options file giving runsc systemd's cgroups. */
@@ -102,11 +123,14 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
   const procRoot = join(root, "proc");
   const containers = join(releasesDir, "containers.json");
   let pid = 4000;
-  const runs = (containerId: string, release: string, namespace: string, pod: string) => {
+  const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true) => {
     const held = existsSync(containers) ? JSON.parse(readFileSync(containers, "utf8")) as Record<string, unknown> : {};
     pid += 1;
     mkdirSync(join(procRoot, String(pid)), { recursive: true });
     symlinkSync(join(dirOf(release), "runsc"), join(procRoot, String(pid), "exe"));
+    // As runsc starts a sandbox: its flags, then its command.
+    const argv = ["runsc-sandbox", "--root=/run/containerd/runsc/k8s.io", `--dirty-tracking=${tracksWrites ? "wp" : "off"}`, "boot", containerId];
+    writeFileSync(join(procRoot, String(pid), "cmdline"), `${argv.join("\0")}\0`);
     held[containerId] = { pid, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
     writeFileSync(containers, JSON.stringify(held));
   };

@@ -37,11 +37,20 @@
  *   which address what was missing, its sandbox left paused; 500 when a command failed.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
- * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshot, in the bucket and
+ * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshots, in the bucket and
  *   in this node's cache (204).
+ * - `DELETE /snapshots/<environment>/<workspace>/current`: makes its current snapshot,
+ *   which its sandbox was restored from, current no more, its images kept as the layers
+ *   of its next (204).
+ * - `POST /collect`, `{ environment, workspace }`: collects what of the workspace's in the
+ *   bucket no snapshot needs any more: `{ kept }`, the digests of the images it keeps (200).
+ * - `GET /snapshots/<environment>`: `{ workspaces }`, those the bucket holds anything of.
+ * - `DELETE /cache/<environment>/<workspace>?keep=<digest>,...`: removes from this node's
+ *   cache the workspace's images but those kept, unless a restore may still be reading
+ *   them: `{ discarded }`, whether it did (200).
  * - `GET /holdings`: `{ node, releases: [{ release, cpuFeatures }], cached: [{ environment,
- *   workspace, snapshot, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
- *   features each sees on it, and the snapshots in its cache.
+ *   workspace, images, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
+ *   features each sees on it, and the workspaces whose images its cache holds, by digest.
  * - `GET /healthz`: 200 once it serves.
  *
  * A manifest is ./agent.ts Manifest.
@@ -52,7 +61,6 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
 import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 
-import { SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import {
@@ -67,7 +75,7 @@ import {
   ResumeRequest,
   WorkspaceRef,
 } from "./agent.ts";
-import { type CacheError, makeSnapshotCache } from "./cache.ts";
+import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
 import {
   CONTAINERD,
@@ -101,6 +109,7 @@ const STATUS: Readonly<Record<string, number>> = {
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
+const SPENT = /^\/snapshots\/([^/]+)\/([^/]+)\/current$/u;
 const CHECKPOINT = /^\/checkpoints\/([^/]+)\/([^/]+)$/u;
 const PREPARE = /^\/prepare\/([^/]+)\/([^/]+)$/u;
 const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
@@ -184,6 +193,11 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       );
     }
     if (method === "DELETE" && snapshot) return workspaceOf(snapshot).pipe(Effect.flatMap(agent.forget), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    const spent = SPENT.exec(url);
+    if (method === "DELETE" && spent) return workspaceOf(spent).pipe(Effect.flatMap(agent.spend), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    if (method === "POST" && url === "/collect") {
+      return body(WorkspaceRef).pipe(Effect.flatMap(agent.collect), Effect.map((kept) => answer(200, { kept })));
+    }
     if (method === "GET" && url === "/holdings") return agent.holdings.pipe(Effect.map((holdings) => answer(200, holdings)));
     const environment = ENVIRONMENT.exec(url);
     if (method === "GET" && environment) {
@@ -195,10 +209,11 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     const cached = CACHED.exec(url);
     if (method === "DELETE" && cached) {
-      const keep = decodeURIComponent(cached[3] ?? "");
-      if (keep !== "" && !new RegExp(`^${SNAPSHOT_ID}$`, "u").test(keep)) return Effect.fail(new BadRequest({ message: `${keep} is no snapshot's id` }));
+      const keep = decodeURIComponent(cached[3] ?? "").split(",").filter(Boolean);
+      const other = keep.find((digest) => !DIGEST.test(digest));
+      if (other !== undefined) return Effect.fail(new BadRequest({ message: `${other} is no image's digest` }));
       return workspaceOf(cached).pipe(
-        Effect.flatMap((ref) => agent.discard(ref, keep === "" ? null : keep)),
+        Effect.flatMap((ref) => agent.discard(ref, keep)),
         Effect.map((discarded) => answer(200, { discarded })),
       );
     }
