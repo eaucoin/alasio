@@ -127,6 +127,40 @@ export async function held(withinMs = 300_000): Promise<{ counts: Map<number, nu
   }
 }
 
+const S3 = ["--endpoint-url", "http://127.0.0.1:18333"];
+const S3_ENV = { AWS_ACCESS_KEY_ID: "log", AWS_SECRET_ACCESS_KEY: "log-secret", AWS_DEFAULT_REGION: "us-east-1" };
+/** The bucket a tiered broker's segments are in. */
+export const TIER = "tier";
+
+/** Runs the AWS CLI on the object store's S3 API, as the log's identity. */
+export const s3 = (args: readonly string[]) => run("aws", [...S3, ...args], S3_ENV);
+
+/** The tier's objects' keys. */
+export async function tier(): Promise<string[]> {
+  const { code, stdout } = await s3(["s3api", "list-objects-v2", "--bucket", TIER, "--query", "Contents[].Key", "--output", "json"]);
+  if (code !== 0) throw new Error("the tier could not be listed");
+  return (JSON.parse(stdout || "null") as string[] | null) ?? [];
+}
+
+/** The segments of `keys`, the tier's. */
+export const segments = (keys: readonly string[]) => keys.filter((key) => key.endsWith(".log"));
+
+/** The segments of otel.spans on the broker's volume, by partition: the base offset of each. */
+export async function local(): Promise<Map<number, number[]>> {
+  const { stdout } = await run("docker", ["exec", "broker", "sh", "-c", `cd /var/lib/kafka/data && for d in ${TOPIC}-*; do for f in "$d"/*.log; do [ -e "$f" ] && echo "$f"; done; done`]);
+  const held = new Map<number, number[]>();
+  for (const line of stdout.split("\n").filter(Boolean)) {
+    const [, partition, base] = /-(\d+)\/(\d+)\.log$/u.exec(line) ?? [];
+    if (partition === undefined || base === undefined) continue;
+    held.set(Number(partition), [...(held.get(Number(partition)) ?? []), Number(base)]);
+  }
+  return held;
+}
+
+/** What `local` holds, as said: each partition's segments, and the first offset of each partition the volume still has. */
+export const describeLocal = (held: Map<number, number[]>) =>
+  [...held].toSorted(([a], [b]) => a - b).map(([partition, bases]) => `partition ${partition}: ${bases.length} segments from offset ${Math.min(...bases)}`).join("; ");
+
 /** otel.spans's topic id. */
 export async function topicId(): Promise<string> {
   const consumer = new Consumer({ clientId: "gate", groupId: `gate-${randomUUID()}`, bootstrapBrokers: BROKERS });

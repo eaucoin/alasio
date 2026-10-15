@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The log's restart gate, 03's: which log keeps every record it acknowledged through its
 # broker's restarts, as the collector's gateway produces to it. One broker in Docker on the
-# runner, BROKER's (AutoMQ 1.7.4 on SeaweedFS 4.48; Apache Kafka 4.2 in KRaft, one node,
+# runner, BROKER's (AutoMQ 1.7.4 on SeaweedFS 4.48; Apache Kafka 4.2.2 in KRaft, one node,
 # on a volume of its own; or that Kafka with its segments tiered to SeaweedFS 4.48, and
 # then the filer store put back under it and the log made anew, gate/log-restart/restore.ts),
 # the collector's gateway producing to it with PRODUCER's
@@ -22,7 +22,7 @@ ROUNDS=${ROUNDS:-18}
 mkdir -p "$OUT/data" && chmod 777 "$OUT/data"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/events.log"; }
 AUTOMQ=automqinc/automq:1.7.4
-KAFKA=apache/kafka:4.2.0
+KAFKA=apache/kafka:4.2.2@sha256:1213eb3943d551e5ed1fca7a4e109001cee35770b66a02a0c37a8964efe09b69
 SEAWEEDFS=chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
 COLLECTOR=otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
 
@@ -131,10 +131,8 @@ chmod 644 "$OUT/collector.yaml"
 docker run -d --name collector --network log -p 127.0.0.1:14318:4318 -v "$OUT/collector.yaml:/etc/otelcol/config.yaml:ro" "$COLLECTOR" --config /etc/otelcol/config.yaml >/dev/null
 log "the collector's gateway produces with acks $acks"
 
-ROUNDS=$ROUNDS OUT=$OUT node "$repo/gate/log-restart/rounds.ts"
+ROUNDS=$ROUNDS OUT=$OUT TIERED=$([ "$BROKER" = kafka-tiered ] && echo 1 || echo 0) node "$repo/gate/log-restart/rounds.ts"
 if [ "$BROKER" = kafka-tiered ]; then
-  tiered=$(s3 s3api list-objects-v2 --bucket tier --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -c '\.log$' || true)
-  log "after the rounds: $tiered segments in the tier, $(docker exec broker sh -c 'ls /var/lib/kafka/data/otel.spans-*/' | grep -c '\.log$' || true) on the volume"
   OUT=$OUT KAFKA_IMAGE=$KAFKA TOPIC_CONFIGS=$topic_configs node "$repo/gate/log-restart/restore.ts"
 fi
 docker logs collector >"$OUT/collector.log" 2>&1

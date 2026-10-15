@@ -15,28 +15,10 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { docker, exported, held, OUT, run, say, sleep, TOPIC, topicId } from "./spans.ts";
+import { describeLocal, docker, exported, held, local, OUT, run, s3, say, segments, sleep, TIER, tier, TOPIC, topicId } from "./spans.ts";
 
-const S3 = ["--endpoint-url", "http://127.0.0.1:18333"];
-const S3_ENV = { AWS_ACCESS_KEY_ID: "log", AWS_SECRET_ACCESS_KEY: "log-secret", AWS_DEFAULT_REGION: "us-east-1" };
-const BUCKET = process.env["TIER_BUCKET"] ?? "tier";
 const KAFKA_IMAGE = process.env["KAFKA_IMAGE"] ?? "";
 const TOPIC_CONFIGS = (process.env["TOPIC_CONFIGS"] ?? "").split(" ").filter(Boolean);
-
-/** The tier's objects' keys. */
-async function tier(): Promise<string[]> {
-  const { code, stdout } = await run("aws", [...S3, "s3api", "list-objects-v2", "--bucket", BUCKET, "--query", "Contents[].Key", "--output", "json"], S3_ENV);
-  if (code !== 0) throw new Error(`the tier could not be listed`);
-  return (JSON.parse(stdout || "null") as string[] | null) ?? [];
-}
-
-/** The segment files of otel.spans on the broker's volume. */
-async function local(): Promise<number> {
-  const { stdout } = await run("docker", ["exec", "broker", "sh", "-c", `ls /var/lib/kafka/data/${TOPIC}-*/ | grep -c '\\.log$' || true`]);
-  return Number(stdout.trim() || 0);
-}
-
-const segments = (keys: readonly string[]) => keys.filter((key) => key.endsWith(".log"));
 
 let seq = Number(readFileSync(join(OUT, "next-seq"), "utf8"));
 
@@ -59,7 +41,7 @@ const serving = async () => {
 
 // 1.
 const backup = new Set(await tier());
-say(`the filer store's backup: ${segments([...backup]).length} segments in the tier, ${await local()} on the volume`);
+say(`the filer store's backup: ${segments([...backup]).length} segments in the tier; on the volume, ${describeLocal(await local())}`);
 
 // 2.
 const since: number[] = [];
@@ -78,7 +60,7 @@ await sleep(30_000);
 // 3.
 await docker(["stop", "-t", "120", "broker"]);
 const made = (await tier()).filter((key) => !backup.has(key));
-for (const key of made) await run("aws", [...S3, "s3api", "delete-object", "--bucket", BUCKET, "--key", key], S3_ENV);
+for (const key of made) await s3(["s3api", "delete-object", "--bucket", TIER, "--key", key]);
 say(`the filer store put back: ${made.length} objects made since the backup gone, ${segments(made).length} of them segments`);
 await docker(["start", "broker"]);
 await serving();
@@ -95,7 +77,7 @@ if (errors) say(`the broker's errors reading it:\n${errors}`);
 const idBefore = await topicId();
 await docker(["stop", "-t", "120", "broker"]);
 await docker(["run", "--rm", "--user", "0", "--entrypoint", "sh", "-v", `${join(OUT, "data")}:/data`, KAFKA_IMAGE, "-c", "rm -rf /data/* /data/.[!.]*"]);
-await run("aws", [...S3, "s3", "rm", `s3://${BUCKET}`, "--recursive", "--only-show-errors"], S3_ENV);
+await s3(["s3", "rm", `s3://${TIER}`, "--recursive", "--only-show-errors"]);
 await docker(["start", "broker"]);
 await serving();
 const created = await run("docker", ["exec", "broker", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "broker:9092", "--create", "--topic", TOPIC, "--partitions", "2",
