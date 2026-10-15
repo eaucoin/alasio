@@ -326,7 +326,8 @@ export function neonStack(): void {
       });
 
       test("an upgrade that changes nothing restarts nothing of the stack", async () => {
-        const pods = async () => (await runningPods()).map((pod) => pod.metadata?.uid).sort();
+        // Its workloads' pods: not a Job's, which a CronJob starts at its minute whatever an upgrade does.
+        const pods = async () => (await runningPods()).filter(({ metadata }) => !metadata?.ownerReferences?.some(({ kind }) => kind === "Job")).map((pod) => pod.metadata?.uid).sort();
         const before = await pods();
         await alasioOk("upgrade", "--timeout", "10m");
         assert.deepEqual(await pods(), before);
