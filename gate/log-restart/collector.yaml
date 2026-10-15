@@ -1,0 +1,21 @@
+# The collector's gateway as 03 makes it, for the log's restart gate (gate/log-restart/run.sh):
+# OTLP in, spans to otel.spans as OTLP protobuf, acked as @ACKS@ says (-1, every in-sync
+# replica, with franz-go's idempotent producer; 1, the leader, without it), with no sending
+# queue and no retry, so a producer's export is answered only once the log has it.
+receivers:
+  otlp:
+    protocols:
+      http: { endpoint: 0.0.0.0:4318 }
+exporters:
+  kafka:
+    brokers: [broker:9092]
+    protocol_version: 3.9.0
+    traces: { topic: otel.spans, encoding: otlp_proto }
+    producer: { required_acks: @ACKS@ }
+    timeout: 10s
+    sending_queue: { enabled: false }
+    retry_on_failure: { enabled: false }
+service:
+  telemetry: { metrics: { level: none } }
+  pipelines:
+    traces: { receivers: [otlp], exporters: [kafka] }
