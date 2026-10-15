@@ -27,11 +27,17 @@
  * rather than in Docker: of one node, from images pushed already, it needs npm and sudo
  * that asks for no password, through which alasio's command line does what it does as
  * root, and the tests what they do as root on the node, which is this machine.
+ *
+ * The `upgrade` shard sets alasio up as the release before set it up, on the host target,
+ * as the box is: by the published package of the release ALASIO_E2E_PREVIOUS names, with
+ * that release's images, but for alasio's, which is the stand-in for Codex built on that
+ * release's alasio image, pushed as alasio-codex-stand-in-previous. Its suite upgrades it to
+ * this checkout by the cut-over the box runs (cutOver).
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -97,7 +103,7 @@ export function targetOf(value: string | undefined): "host" | "docker" {
 }
 
 /** The shards of the suites, each run on a cluster of its own. */
-export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling"] as const;
+export const SHARDS = ["sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "upgrade"] as const;
 export type Shard = (typeof SHARDS)[number];
 
 /** The shard `value` names, or none, every suite, when it is unset or empty. */
@@ -112,14 +118,22 @@ export function shardOf(value: string | undefined): Shard | undefined {
  * The shard of the suites the run runs, ALASIO_E2E_SHARD's: `sessions`, alasio on
  * Kubernetes; `workspaces`, workspaces on JuiceFS, on sessions of its own; `neon`,
  * alasio's Neon; `telemetry`, where alasio's telemetry goes, on a session of its own;
- * `branches`, branch environments; or `scaling`, how alasio is scaled, sized and drained,
- * with Grafana highly available; every suite unless set. Each shard runs the command
- * line's suite, and uninstall's, as well.
+ * `branches`, branch environments; `scaling`, how alasio is scaled, sized and drained,
+ * with Grafana highly available; or `upgrade`, what alasio keeps upgraded from the release
+ * before; every suite but the upgrade's unless set, as an upgrade starts from a release's
+ * installation of its own. Each shard runs the command line's suite, and uninstall's, as
+ * well.
  */
 export const SHARD = shardOf(process.env["ALASIO_E2E_SHARD"]);
 
+/** Whether a run of the shard `selected`, or of every suite if none, runs the suites of `shard`. */
+export const runsShard = (selected: Shard | undefined, shard: Shard): boolean => (selected === undefined ? shard !== "upgrade" : selected === shard);
+
 /** Whether the run runs the suites of `shard`. */
-export const inShard = (shard: Shard): boolean => SHARD === undefined || SHARD === shard;
+export const inShard = (shard: Shard): boolean => runsShard(SHARD, shard);
+
+/** The release the upgrade shard upgrades from, as `<major>.<minor>.<patch>`. */
+export const PREVIOUS = process.env["ALASIO_E2E_PREVIOUS"] || undefined;
 
 /**
  * The images built here: their names, and what they are built from. alasio's runs in
@@ -159,8 +173,10 @@ export interface Ran {
 interface Setup {
   /** The run's directory: the config, the cluster's storage, the folder workspaces' home, and alasio installed. */
   readonly work: string;
-  /** The `alasio` installed from the package. */
-  readonly bin: string;
+  /** The `alasio` the run runs: `release`, or, until the upgrade shard's cut-over, the previous release's. */
+  bin: string;
+  /** This checkout's `alasio`, installed from its package. */
+  readonly release: string;
   /** The environment alasio runs in: its config, and the cluster's storage, in the run's directory. */
   readonly env: NodeJS.ProcessEnv;
   readonly configFile: string;
@@ -454,12 +470,21 @@ async function push(pushHost: string, name: keyof typeof IMAGES, args: readonly 
   await docker("builder", "prune", "--all", "--force");
 }
 
-/** The install configuration the run starts alasio with: its images, pulled from where they were pushed, alasio's with the stand-in for Codex, the stand-ins, small volumes, and requests small enough that the whole of it schedules on a CI runner's two CPUs. */
-function installation(): Record<string, unknown> {
+/**
+ * The install configuration the run starts alasio with: its images, pulled from where they
+ * were pushed, alasio's with the stand-in for Codex, the stand-ins, small volumes, and
+ * requests small enough that the whole of it schedules on a CI runner's two CPUs. Of the
+ * previous release, its own images, which its package pins, but for alasio's, the stand-in
+ * built on it. A setting the previous release does not have is given to this checkout's
+ * alone, as that release refuses a configuration with a setting it does not know.
+ */
+function installation(of: "previous" | "release"): Record<string, unknown> {
   const pushed = (name: keyof typeof IMAGES) => ({ ...pulledOf(name), digest: "" });
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
-    images: { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
+    images: of === "previous"
+      ? { alasio: { repository: `${PUSHED}/alasio-codex-stand-in-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
+      : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM), ALASIO_CODEX_BIN: CODEX_STAND_IN },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
@@ -529,11 +554,17 @@ export async function setUp(): Promise<void> {
   for (const name of ["KUBECONFIG", "TELEGRAM_BOT_TOKEN", "TELEGRAM_API_ROOT", "CLAUDE_CODE_OAUTH_TOKEN"]) delete env[name];
 
   if (TARGET === "host" && (!PUSHED || AGENTS > 0)) throw new Error("the host target's run is of one node, from images pushed already (ALASIO_E2E_REGISTRY)");
+  const previous = SHARD === "upgrade";
+  if (previous && (TARGET !== "host" || !PREVIOUS)) throw new Error("the upgrade shard upgrades k3s on this machine, as the box's, from the release ALASIO_E2E_PREVIOUS names");
   const prefix = join(work, "prefix");
-  setup = { work, bin: join(prefix, "bin", "alasio"), env, configFile, kubeconfig: join(configHome, "alasio", "kubeconfig"), storage, home };
-
   console.error(`# packing alasio's package and installing it in ${prefix}`);
-  await installCli((await packCli(work)).tarball, prefix);
+  const release = await installCli((await packCli(work)).tarball, prefix);
+  let bin = release;
+  if (previous) {
+    console.error(`# installing alasio ${PREVIOUS}'s package in ${join(work, "previous")}`);
+    bin = await installCli(`alasio@${PREVIOUS}`, join(work, "previous"));
+  }
+  setup = { work, bin, release, env, configFile, kubeconfig: join(configHome, "alasio", "kubeconfig"), storage, home };
 
   if (!PUSHED) await build("alasio-node", NODE_IMAGE);
   mkdirSync(join(configHome, "alasio"), { recursive: true, mode: 0o700 });
@@ -549,7 +580,7 @@ export async function setUp(): Promise<void> {
         ...(PUSHED ? {} : { registries: { mirrors: { [REGISTRY_HOST]: { endpoint: [`http://${REGISTRY_HOST}`] } } } }),
       },
     };
-  writeFileSync(configFile, JSON.stringify({ target, install: installation() }), { mode: 0o600 });
+  writeFileSync(configFile, JSON.stringify({ target, install: installation(previous ? "previous" : "release") }), { mode: 0o600 });
   const botToken = join(work, "bot-token");
   writeFileSync(botToken, "123:e2e", { mode: 0o600 });
   const telegram = createTelegramStub();
@@ -637,6 +668,40 @@ async function trustTelegramStandIn(): Promise<void> {
     },
   });
   await kube.awaitReady([ref("Deployment", grafana, NAMESPACE)], "10 minutes");
+}
+
+/** A word of sh, quoted. */
+const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`;
+
+/**
+ * The upgrade shard's cut-over, as the box runs it: upgrades/from-<PREVIOUS>.sh, as root,
+ * kubectl reaching the cluster by the run's kubeconfig, its UPGRADE this checkout's
+ * `alasio upgrade` as this user, the run's install configuration of this checkout laid over
+ * the configuration first (./release-config.ts), as this checkout's command line, of no
+ * release, pins no images of its own, and its UPGRADE_CHECK this checkout's `alasio upgrade
+ * --check` as this user and sudo asking this user for no password; failing at `failAt`, a
+ * point the script names, when given. What it came to; from its success on, the run runs
+ * this checkout's `alasio`.
+ */
+export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
+  const { work, env, configFile, kubeconfig, release } = current();
+  const script = join(root, "upgrades", `from-${PREVIOUS}.sh`);
+  if (!existsSync(script)) throw new Error(`no upgrades/from-${PREVIOUS}.sh says how an installation of ${PREVIOUS} upgrades to this release: write one, if only to run UPGRADE`);
+  const installFile = join(work, "release-install.json");
+  writeFileSync(installFile, JSON.stringify(installation("release")), { mode: 0o600 });
+  const user = userInfo().username;
+  const asOwner = ["sudo", "-u", user, "env", ...["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME"].map((name) => `${name}=${env[name] ?? ""}`)];
+  const command = (...words: string[]) => words.map(shellWord).join(" ");
+  const configured = command(...asOwner, process.execPath, join(root, "test", "e2e", "release-config.ts"), configFile, installFile);
+  const upgrade = `${configured} && ${command(...asOwner, release, "upgrade", "--timeout", "30m")}`;
+  const check = `${command(...asOwner, release, "upgrade", "--check")} && ${command("sudo", "-u", user, "sudo", "-n", "true")}`;
+  const out = join(work, "cut-over");
+  console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  if (ran.code === 0) current().bin = release;
+  return ran;
 }
 
 /** What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods and latest events, and why each pod that is not ready is not, with its logs. */

@@ -75,9 +75,9 @@ export async function packCli(destination: string): Promise<PackedCli> {
   return { tarball: join(destination, report.filename), files: report.files.map(({ path }) => path) };
 }
 
-/** Installs the package of `tarball` into `prefix`, as npm installs a command: the path of its `alasio`. */
-export async function installCli(tarball: string, prefix: string): Promise<string> {
-  await run("npm", ["install", "--global", "--prefix", prefix, "--no-audit", "--no-fund", tarball], { maxBuffer: MAX_BUFFER });
+/** Installs the package `spec` names, a tarball or a published release (`alasio@<version>`), into `prefix`, as npm installs a command: the path of its `alasio`. */
+export async function installCli(spec: string, prefix: string): Promise<string> {
+  await run("npm", ["install", "--global", "--prefix", prefix, "--no-audit", "--no-fund", spec], { maxBuffer: MAX_BUFFER });
   return join(prefix, "bin", "alasio");
 }
 

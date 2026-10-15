@@ -4,8 +4,9 @@
  * operator drives it, its sessions' confinement checked from inside them, its own code
  * paths run in its pod with its ServiceAccount, its telemetry looked for in its lake and
  * where the installation's goes, its workspaces' JuiceFS put through file operations, crashes and a
- * restore (./workspace-storage.ts), its Neon through crashes and losses (neon/test/stack.ts), and
- * removed, with all it keeps, by its command line at the end.
+ * restore (./workspace-storage.ts), its Neon through crashes and losses (neon/test/stack.ts),
+ * an installation of the release before upgraded to it with what it holds, by the cut-over the
+ * box runs (upgrades/), and removed, with all it keeps, by its command line at the end.
  *
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
  */
@@ -34,6 +35,7 @@ import {
   alasioOkWith,
   alasioRunning,
   CLUSTER,
+  cutOver,
   dumpClusterState,
   type Forward,
   HOST_PROFILE,
@@ -48,6 +50,7 @@ import {
   onNode,
   OTHER_OPERATOR,
   paths,
+  PREVIOUS,
   ref,
   SESSIONS,
   setUp,
@@ -136,6 +139,119 @@ function operator(base: string) {
       await this.press(button && "callback_data" in button ? button.callback_data : undefined);
     },
   };
+}
+
+/**
+ * What alasio keeps upgraded from the release before, a scenario at a time: its seed, run on
+ * an installation of that release (./harness.ts), and its check, run once the installation is
+ * upgraded to this checkout by the cut-over the box runs (cutOver). A change an installation
+ * is upgraded to adds the scenario that proves it keeps what that installation holds.
+ */
+interface Scenario {
+  /** What the seed makes, on the release before. */
+  readonly seeds: string;
+  readonly seed: () => Promise<void>;
+  /** What the check proves is kept, upgraded. */
+  readonly keeps: string;
+  readonly check: () => Promise<void>;
+}
+
+/** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
+const answered = (call: RecordedCall, chat?: number) =>
+  call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
+
+if (inShard("upgrade")) {
+  describe(`alasio upgraded from ${PREVIOUS}`, () => {
+    let branchTelegram: Forward | undefined;
+
+    before(async () => {
+      telegram = await forward(TELEGRAM);
+      branchTelegram = await forward(TELEGRAM_BRANCH);
+      tg = operator(telegram.base);
+      await tg.waitFor((call) => call.method === "setMyCommands", 300_000).catch(() => {});
+    });
+
+    after(() => {
+      telegram?.close();
+      branchTelegram?.close();
+    });
+
+    /** Whether the Deployment `name` of main's runs its replicas, ready. */
+    const runs = async (name: string) => {
+      const deployment = await kube.get<V1Deployment>(ref("Deployment", name, NAMESPACE));
+      return (deployment?.spec?.replicas ?? 0) > 0 && deployment?.status?.readyReplicas === deployment?.spec?.replicas;
+    };
+
+    let volumeId: string;
+    /** The folder mounted in the other chat, and what it holds. */
+    let folder: string;
+    let messages: number;
+    const scenarios: readonly Scenario[] = [
+      {
+        seeds: "main at work, in a session workspace and in a folder, a file in each",
+        seed: async () => {
+          volumeId = await workInMain();
+          await tg.say("hello", FOLDER_CHAT);
+          await tg.waitFor((call) => answered(call, FOLDER_CHAT));
+          folder = await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`);
+          assert.ok(folder.startsWith(paths().home), `the folder chat mounts ${folder}`);
+          await onNode("", `printf %s 'written by main' >'${folder}/proof' && chown ${HOST_USER}:${HOST_USER} '${folder}/proof'`);
+          messages = Number(await onDatabase(NAMESPACE, "select count(*) from state.messages"));
+        },
+        keeps: "main's conversations go on where they were mounted, in the session workspace and in the folder, each file as it was",
+        check: async () => {
+          assert.match(await alasioOk("status"), new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
+          assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), `sessionfs:${volumeId}`);
+          assert.equal(await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`), folder);
+          await tg.say("again");
+          await tg.waitFor((call) => answered(call));
+          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
+          await tg.say("again", FOLDER_CHAT);
+          await tg.waitFor((call) => answered(call, FOLDER_CHAT));
+          assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by main");
+          assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
+        },
+      },
+    ];
+
+    for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
+
+    // A branch environment another release made does not run on what an upgrade changes,
+    // so a cut-over refuses while one exists, before it changes anything.
+    test(`on ${PREVIOUS}: a branch environment, which the cut-over refuses to go past, before it changes anything, until it is deleted`, { timeout: 60 * 60_000 }, async () => {
+      await createBranch(branchTelegram?.base);
+      const refused = await cutOver();
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.match(refused.stderr, new RegExp(`\\(alasio branch delete ${BRANCH}\\)`, "u"));
+      assert.ok(await runs("alasio-neon-control"), "neon-control runs as it did");
+      assert.ok(await runs(RELEASE), "alasio runs as it did");
+      await alasioOk("branch", "delete", BRANCH);
+    });
+
+    test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, starts again what it stopped`, { timeout: 60 * 60_000 }, async () => {
+      const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
+      assert.notEqual(failed.code, 0, failed.stdout);
+      assert.match(failed.stderr, /FAILED: a failure injected before the point of no return/u);
+      assert.match(failed.stderr, /starting again what the cut-over stopped/u);
+      await kube.awaitReady([ref("Deployment", "alasio-neon-control", NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
+      await tg.say("between the cut-overs");
+      await tg.waitFor((call) => answered(call));
+    });
+
+    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after that failure, through`, { timeout: 60 * 60_000 }, async () => {
+      const ran = await cutOver();
+      assert.equal(ran.code, 0, ran.stdout);
+    });
+
+    test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
+      const again = await cutOver();
+      assert.equal(again.code, 0, again.stdout);
+      assert.match(again.stderr, /upgrading, from the cut-over begun at /u);
+      assert.doesNotMatch(again.stderr, /moving neon-control's record/u);
+    });
+
+    for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
+  });
 }
 
 describe("alasio's command line, on the alasio it installed", () => {
@@ -1003,6 +1119,39 @@ const BRANCH_SESSIONS = `${BRANCH_NAMESPACE}-sessions`;
 /** The chat, another user's, that main mounts on a folder. */
 const FOLDER_CHAT = OTHER_OPERATOR;
 
+/**
+ * Main at work, as its operator has it: a session workspace without internet, a file
+ * written in it, and a turn on Codex there, in the operator's chat; and, where folder
+ * workspaces are on, a folder mounted in another chat, on Codex. The session's volume id.
+ */
+async function workInMain(): Promise<string> {
+  const volumeId = await newSession("none");
+  await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');
+  await tg.say("/service codex");
+  await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  await tg.say("hello");
+  await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
+  if (HOST_PROFILE) {
+    await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
+    await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
+    await tg.say("/service codex", FOLDER_CHAT);
+    await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
+  }
+  return volumeId;
+}
+
+/**
+ * Makes the run's branch environment by `alasio branch create`, with `overrides` over its
+ * installation. Its alasio talks to its own bot's stand-in, which `base` forwards to here,
+ * as the command line checks its token with it.
+ */
+async function createBranch(base: string | undefined, overrides: Record<string, unknown> = {}): Promise<void> {
+  const work = mkdtempSync(join(tmpdir(), "alasio-e2e-branch-"));
+  writeFileSync(join(work, "bot-token"), "456:branch", { mode: 0o600 });
+  writeFileSync(join(work, "overrides.json"), JSON.stringify({ ...overrides, alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } } }));
+  await alasioOkWith({ TELEGRAM_API_ROOT: base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"));
+}
+
 /** Runs `sql` on alasio's database in `namespace` (main's, or a branch's), as the compute's own superuser, in its pod: what psql printed. */
 async function onDatabase(namespace: string, sql: string): Promise<string> {
   const pod = await kube.runningPod(namespace, "alasio-neon-compute");
@@ -1058,27 +1207,13 @@ if (inShard("branches")) {
     });
 
     test("main works in a session workspace on Codex, and in a folder in another chat, which the branch inherits", async () => {
-      volumeId = await newSession("none");
-      await inSession(volumeId, 'require("fs").writeFileSync("/workspace/proof", "written by main")');
-      await tg.say("/service codex");
-      await tg.waitFor((call) => /^Active: Codex$/mu.test(call.payload.text ?? ""));
-      await tg.say("hello");
-      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
-      if (HOST_PROFILE) {
-        await tg.say("/workspace new e2e-folder", FOLDER_CHAT);
-        await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /e2e-folder/u.test(call.payload.text ?? ""));
-        await tg.say("/service codex", FOLDER_CHAT);
-        await tg.waitFor((call) => Number(call.payload.chat_id) === FOLDER_CHAT && /^Active: Codex$/mu.test(call.payload.text ?? ""));
-      }
+      volumeId = await workInMain();
     });
 
     test("alasio branch create makes the branch, serving its own bot, and main's lake keeps its files while it is", async () => {
-      const work = mkdtempSync(join(tmpdir(), "alasio-e2e-branch-"));
-      writeFileSync(join(work, "bot-token"), "456:branch", { mode: 0o600 });
-      // The branch's alasio talks to its own bot's stand-in, as the command line checks its token with it; its compute sleeps after a minute idle.
-      writeFileSync(join(work, "overrides.json"), JSON.stringify({ alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } }, neon: { compute: { suspendAfter: "1m" } } }));
       const started = Date.now();
-      await alasioOkWith({ TELEGRAM_API_ROOT: branchTelegram?.base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"));
+      // Its compute sleeps after a minute idle.
+      await createBranch(branchTelegram?.base, { neon: { compute: { suspendAfter: "1m" } } });
       console.error(`# the branch ran ${((Date.now() - started) / 1000).toFixed(1)}s after alasio branch create was run`);
       await branch.waitFor((call) => call.method === "setMyCommands", 300_000);
       assert.match(await alasioOk("branch", "list"), new RegExp(`^${BRANCH}: a branch of main, \\d+m old, made by alasio \\S+, its alasio ready, `, "mu"));

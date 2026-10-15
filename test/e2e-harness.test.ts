@@ -1,13 +1,15 @@
 /**
  * The shard of the end-to-end run's suites (test/e2e/harness.ts) its environment selects,
- * and where it makes its cluster, as CI's end-to-end jobs select each; and the Telegram
+ * and where it makes its cluster, as CI's end-to-end jobs select each; the configuration the
+ * upgrade shard upgrades with; and the Telegram
  * stand-in's reading of what is sent it as a form, as Grafana sends its alerts.
  */
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
-import { shardOf, targetOf } from "./e2e/harness.ts";
+import { runsShard, shardOf, targetOf } from "./e2e/harness.ts";
+import { overlaid } from "./e2e/release-config.ts";
 import { createTelegramStub } from "./e2e/telegram-stub.ts";
 
 test("ALASIO_E2E_SHARD names a shard of the suites, and every suite unset or empty", () => {
@@ -17,12 +19,33 @@ test("ALASIO_E2E_SHARD names a shard of the suites, and every suite unset or emp
   assert.equal(shardOf("telemetry"), "telemetry");
   assert.equal(shardOf("branches"), "branches");
   assert.equal(shardOf("scaling"), "scaling");
+  assert.equal(shardOf("upgrade"), "upgrade");
   assert.equal(shardOf(undefined), undefined);
   assert.equal(shardOf(""), undefined);
 });
 
 test("a shard there is not is refused, with those there are", () => {
-  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling" });
+  assert.throws(() => shardOf("kubernetes"), { message: "ALASIO_E2E_SHARD is kubernetes, not one of sessions, workspaces, neon, telemetry, branches, scaling, upgrade" });
+});
+
+test("a run of every suite runs every shard's but the upgrade's, which starts from an installation of its own; a run of a shard runs its own alone", () => {
+  assert.equal(runsShard(undefined, "sessions"), true);
+  assert.equal(runsShard(undefined, "upgrade"), false);
+  assert.equal(runsShard("upgrade", "upgrade"), true);
+  assert.equal(runsShard("upgrade", "sessions"), false);
+  assert.equal(runsShard("sessions", "sessions"), true);
+});
+
+test("the upgrade shard's install configuration is laid over the one alasio init wrote, keeping what only that has", () => {
+  const written = { host: { user: "1000:1000", home: "/home/operator" }, images: { alasio: { repository: "old", tag: "6.0.0" }, pullPolicy: "IfNotPresent" }, alasio: { env: { A: "1" } } };
+  const release = { images: { alasio: { repository: "new", tag: "e2e" } }, alasio: { env: { B: "2" } }, sessions: { storage: { size: "1Gi" } } };
+  assert.deepEqual(overlaid(written, release), {
+    host: { user: "1000:1000", home: "/home/operator" },
+    images: { alasio: { repository: "new", tag: "e2e" }, pullPolicy: "IfNotPresent" },
+    alasio: { env: { A: "1", B: "2" } },
+    sessions: { storage: { size: "1Gi" } },
+  });
+  assert.deepEqual(overlaid({ list: [1, 2] }, { list: [3] }), { list: [3] });
 });
 
 test("ALASIO_E2E_TARGET makes the cluster in Docker unless it names the host, and refuses another", () => {

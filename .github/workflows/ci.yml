@@ -10,6 +10,12 @@ on:
         description: "End-to-end jobs to run, each a shard, target/shard or target/agents/shard (all if empty)"
         type: string
         default: ""
+      # The release the upgrade shard upgrades from, which an installation runs before it
+      # upgrades to this: npm's latest, as the box's is, unless another is named.
+      previous:
+        description: "Release the upgrade shard upgrades from, as 6.0.0 (npm's latest if empty)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -58,12 +64,22 @@ jobs:
       packages: write
     outputs:
       registry: ${{ steps.push.outputs.registry }}
+      previous: ${{ steps.previous.outputs.previous }}
     steps:
       - uses: actions/checkout@v4
-      # For tooling/node-image.ts, which says the node image's pins.
+      # For tooling/node-image.ts, which says the node image's pins, and npm, which says the
+      # release the upgrade shard upgrades from.
       - uses: actions/setup-node@v4
         with:
           node-version: 24.14.0
+      - id: previous
+        name: Say the release the upgrade shard upgrades from
+        env:
+          PREVIOUS: ${{ inputs.previous }}
+        run: |
+          previous=$(npm view "alasio@${PREVIOUS:-latest}" version)
+          [[ $previous =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::npm names no one release of alasio by ${PREVIOUS:-latest}: ${previous:-none}"; exit 1; }
+          echo "previous=$previous" | tee --append "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -71,19 +87,24 @@ jobs:
           password: ${{ github.token }}
       # All five at once, each line said with its image's name, the node image with its pins
       # (tooling/node-image.ts), and on alasio's, alasio-codex-stand-in, which the end-to-end
-      # runs install (test/e2e/codex-stand-in.Dockerfile); the step fails if any did.
+      # runs install (test/e2e/codex-stand-in.Dockerfile); and the stand-in again, as
+      # alasio-codex-stand-in-previous, on the published alasio image of the release the
+      # upgrade shard upgrades from; the step fails if any did.
       - id: push
         name: Build and push the images
         shell: bash
         env:
           PUSH_TO: ${{ env.REGISTRY }}/run-${{ github.run_id }}-${{ github.run_attempt }}
           SOURCE: https://github.com/${{ github.repository }}
+          PREVIOUS: ${{ steps.previous.outputs.previous }}
         run: |
           declare -A pids
-          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node"; do
+          for image in "alasio:." "alasio-agent:sandbox/agent" "alasio-lake:neon/lake" "alasio-grafana:neon/grafana" "alasio-node:cluster/node" "alasio-codex-stand-in-previous:test"; do
             name=${image%%:*}
             args=()
             [ "$name" != alasio-node ] || mapfile -t args < <(node tooling/node-image.ts)
+            [ "$name" != alasio-codex-stand-in-previous ] ||
+              args=(--file test/e2e/codex-stand-in.Dockerfile --build-arg "ALASIO=ghcr.io/eaucoin/alasio:$PREVIOUS")
             {
               docker build "${args[@]}" --tag "$PUSH_TO/$name:e2e" --label "org.opencontainers.image.source=$SOURCE" "${image#*:}" &&
                 docker push "$PUSH_TO/$name:e2e" &&
@@ -108,7 +129,8 @@ jobs:
   # alasio install, on one: behind ufw for one shard, as a server often is, and without a
   # firewall for the others. The shards need nothing of each other's: alasio on
   # Kubernetes, workspaces on JuiceFS, Neon, alasio's telemetry, branch environments, and
-  # how alasio is scaled, sized and drained (test/e2e/harness.ts). All of them, or those
+  # how alasio is scaled, sized and drained, and, on the host target alone, as the box's,
+  # alasio upgraded from the release before (test/e2e/harness.ts). All of them, or those
   # the run's shards input names, each word of it a shard on every cluster, target/shard
   # on its target's, or target/agents/shard on one; a word that names none fails the run
   # before any starts.
@@ -130,8 +152,9 @@ jobs:
               else [.target, (.agents | tostring), .shard] end;
             def named($word): ($word | split("/")) as $parts | name($parts | length) == $parts;
             [({target: "docker", agents: (0, 2)}, {target: "host", agents: 0}) as $cluster
-              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling") as $shard
+              | ("sessions", "workspaces", "neon", "telemetry", "branches", "scaling", "upgrade") as $shard
               | $cluster + {shard: $shard}
+              | select(.shard != "upgrade" or .target == "host")
               | if .target == "host" and .shard == "sessions" then . + {firewall: "ufw"} else . end]
             | . as $jobs
             | [$shards | splits("[\\s,]+") | select(. != "")] as $words
@@ -211,6 +234,7 @@ jobs:
           ALASIO_E2E_AGENTS: ${{ matrix.agents }}
           ALASIO_E2E_SHARD: ${{ matrix.shard }}
           ALASIO_E2E_REGISTRY: ${{ needs.images.outputs.registry }}
+          ALASIO_E2E_PREVIOUS: ${{ needs.images.outputs.previous }}
       - name: ufw's rules are as they were before alasio
         if: matrix.firewall == 'ufw'
         run: |
@@ -235,7 +259,7 @@ jobs:
         run: |
           failed=0
           for attempt in $(seq "$GITHUB_RUN_ATTEMPT"); do
-            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node alasio-codex-stand-in; do
+            for name in alasio alasio-agent alasio-lake alasio-grafana alasio-node alasio-codex-stand-in alasio-codex-stand-in-previous; do
               image="$REGISTRY/run-$GITHUB_RUN_ID-$attempt/$name"
               package="alasio-ci/run-$GITHUB_RUN_ID-$attempt/$name"
               if said=$(gh api --method DELETE "/users/eaucoin/packages/container/${package//\//%2F}" 2>&1); then
