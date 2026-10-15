@@ -571,7 +571,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
       const manifest: Manifest = { ...source, environment: to.environment, workspace: to.workspace };
       yield* Effect.gen(function*() {
-        yield* Effect.forEach(source.files, ({ path }) => bucket.copy(`${prefixOf(from)}/${snapshot}/${path}`, `${prefixOf(to)}/${snapshot}/${path}`), { discard: true });
+        yield* Effect.forEach(source.files, ({ path, bytes }) => bucket.copy(`${prefixOf(from)}/${snapshot}/${path}`, `${prefixOf(to)}/${snapshot}/${path}`, bytes), { discard: true });
         yield* bucket.putJson(`${prefixOf(to)}/${snapshot}/${MANIFEST_FILE}`, manifest);
         yield* bucket.putJson(`${prefixOf(to)}/${CURRENT_FILE}`, manifest);
       }).pipe(
@@ -606,7 +606,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       for (const file of manifest.files) {
         const target = join(directory, file.path);
         yield* onDisk(() => mkdir(dirname(target), { recursive: true }));
-        const received = yield* bucket.getFile(`${prefixOf(manifest)}/${snapshot}/${file.path}`, target);
+        const received = yield* bucket.getFile(`${prefixOf(manifest)}/${snapshot}/${file.path}`, target, file.bytes);
         if (received.bytes !== file.bytes || received.sha256 !== file.sha256) {
           return yield* new SnapshotCorrupt({
             environment,

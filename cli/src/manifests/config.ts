@@ -13,6 +13,7 @@ import type { V1Affinity, V1EnvFromSource, V1Toleration } from "@kubernetes/clie
 import { Effect, Predicate, Result, Schema, SchemaGetter, SchemaIssue } from "effect";
 
 import { memoryBytes, memoryText } from "../capacity.ts";
+import { NODE_AGENT_MEMORY_FLOOR } from "../../../src/node-agent/names.ts";
 import { IMAGES } from "../release.ts";
 
 /** The install configuration is not what alasio installs from; the message says which key and why. */
@@ -204,8 +205,14 @@ const Snapshots = Schema.Struct({
   releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
   /** The most of snapshots each node keeps on its disk, for restores there. */
   nodeCache: defaulted(Size, "5Gi"),
-  /** The node agent, which takes snapshots on its node and prepares them there. */
-  nodeAgent: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "512Mi" } }) }), {}),
+  /**
+   * The node agent, which takes snapshots on its node and prepares them there. Its memory
+   * request is its own, as measured (NODE_AGENT_OWN_BYTES, src/node-agent/names.ts); its
+   * limit is at least that and its budget of what it holds written and not yet on the disk
+   * (NODE_AGENT_MEMORY_FLOOR, 192 MiB), and leaves room over both for the page cache it
+   * reads through, which the kernel reclaims under it.
+   */
+  nodeAgent: defaulted(Schema.Struct({ resources: Resources({ requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } }) }), {}),
 });
 
 const Sessions = Schema.Struct({
@@ -721,6 +728,13 @@ function completeness(config: typeof InstallStruct.Type): { readonly path: Reado
     return {
       path: ["objectStore", "bundled", "filerStore", "resources", "limits", "memory"],
       issue: `must be at least ${memoryText(2 * filerStoreMaxmemoryBytes(bundled.filerStore.entries))}, twice what its entries take, for the fork that writes its snapshots`,
+    };
+  }
+  const { nodeAgent } = config.sessions.snapshots;
+  if (config.sessions.enabled && config.sessions.runtimeClassName !== "" && memoryBytes(nodeAgent.resources.limits["memory"] ?? "0") < NODE_AGENT_MEMORY_FLOOR) {
+    return {
+      path: ["sessions", "snapshots", "nodeAgent", "resources", "limits", "memory"],
+      issue: `must be at least ${memoryText(NODE_AGENT_MEMORY_FLOOR)}: the node agent's own memory, and what a restore holds written and not yet on the disk`,
     };
   }
   if (config.autoscaling.headroom.scaling.min > 0 && !config.autoscaling.preemption) {

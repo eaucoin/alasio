@@ -64,15 +64,15 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
     // A key of characters a path encodes, streamed up unsigned and down with its hash.
     await run(bucket.putFile("main/fs-abc/s1/a page+1.img", source));
     assert.deepEqual(s3.objects.get("main/fs-abc/s1/a page+1.img"), pages);
-    const received = await run(bucket.getFile("main/fs-abc/s1/a page+1.img", join(directory, "copy.img")));
+    const received = await run(bucket.getFile("main/fs-abc/s1/a page+1.img", join(directory, "copy.img"), pages.length));
     assert.deepEqual(received, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
     assert.deepEqual(readFileSync(join(directory, "copy.img")), pages);
 
     // Copied in the bucket, its source named as its path is, the request signed with it.
-    await run(bucket.copy("main/fs-abc/s1/a page+1.img", "main/fs-new/s1/a page+1.img"));
+    await run(bucket.copy("main/fs-abc/s1/a page+1.img", "main/fs-new/s1/a page+1.img", pages.length));
     assert.deepEqual(s3.objects.get("main/fs-new/s1/a page+1.img"), pages);
     assert.equal(s3.requests.at(-1), "PUT main/fs-new/s1/a page+1.img from main/fs-abc/s1/a page+1.img");
-    const uncopied = await Effect.runPromiseExit(bucket.copy("main/fs-abc/s9/none", "main/fs-new/s9/none"));
+    const uncopied = await Effect.runPromiseExit(bucket.copy("main/fs-abc/s9/none", "main/fs-new/s9/none", 10));
     assert.ok(Exit.isFailure(uncopied));
     assert.match(String(uncopied.cause), /the bucket's copy of main\/fs-abc\/s9\/none to main\/fs-new\/s9\/none failed: 404 NoSuchKey/u);
     assert.equal(s3.objects.has("main/fs-new/s9/none"), false);
@@ -97,7 +97,7 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
     await run(bucket.remove("main/fs-abc/s2/a"));
     assert.equal(s3.objects.has("main/fs-abc/s2/a"), false);
 
-    const missing = await Effect.runPromiseExit(bucket.getFile("main/fs-abc/s9/none", join(directory, "none")));
+    const missing = await Effect.runPromiseExit(bucket.getFile("main/fs-abc/s9/none", join(directory, "none"), 10));
     assert.ok(Exit.isFailure(missing));
     assert.match(String(missing.cause), /the bucket's download of main\/fs-abc\/s9\/none failed: 404 NoSuchKey The specified key does not exist\./u);
 
@@ -105,6 +105,87 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
     const refused = await Effect.runPromiseExit(stranger.getJson("main/fs-abc/current.json"));
     assert.ok(Exit.isFailure(refused));
     assert.match(String(refused.cause), /the bucket's read of main\/fs-abc\/current\.json failed: 403 SignatureDoesNotMatch/u);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a file larger than a part is put in parts, some at a time, and got in ranges; one larger than a copy is copied in parts; an upload that fails is aborted", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300, copyBytes: 1500 });
+    const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
+    const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
+    const source = join(directory, "pages.img");
+    writeFileSync(source, pages);
+    const key = "main/fs-abc/s1/pages.img";
+
+    // Four parts, the last the rest, put together in order.
+    await run(bucket.putFile(key, source));
+    assert.deepEqual(s3.objects.get(key), pages);
+    assert.deepEqual(s3.requests.filter((asked) => asked.startsWith(`PUT ${key} part`)).toSorted(), [1, 2, 3, 4].map((part) => `PUT ${key} part ${part}`));
+    assert.deepEqual([s3.requests[0], s3.requests.at(-1)], [`POST ${key}?uploads`, `POST ${key} complete`]);
+    // A file of a part or less is put whole.
+    writeFileSync(join(directory, "small.img"), pages.subarray(0, 1000));
+    await run(bucket.putFile("main/fs-abc/s1/small.img", join(directory, "small.img")));
+    assert.equal(s3.requests.at(-1), "PUT main/fs-abc/s1/small.img");
+
+    // Got in ranges of a part, each where it goes.
+    s3.requests.length = 0;
+    const received = await run(bucket.getFile(key, join(directory, "copy.img"), pages.length));
+    assert.deepEqual(received, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
+    assert.deepEqual(readFileSync(join(directory, "copy.img")), pages);
+    assert.deepEqual(s3.requests.toSorted(), ["bytes=0-999", "bytes=1000-1999", "bytes=2000-2999", "bytes=3000-3499"].map((range) => `GET ${key} ${range}`));
+    // One shorter than its manifest says fails as it is got.
+    s3.objects.set(key, pages.subarray(0, 2500));
+    const short = await Effect.runPromiseExit(bucket.getFile(key, join(directory, "short.img"), pages.length));
+    assert.ok(Exit.isFailure(short));
+    assert.match(String(short.cause), /the bucket's download of main\/fs-abc\/s1\/pages\.img failed: (416 InvalidRange|its range from byte 2000 was answered 206 with 500 bytes, not 1000)/u);
+    s3.objects.set(key, pages);
+
+    // Copied in parts of the most copied at once.
+    s3.requests.length = 0;
+    await run(bucket.copy(key, "main/fs-new/s1/pages.img", pages.length));
+    assert.deepEqual(s3.objects.get("main/fs-new/s1/pages.img"), pages);
+    assert.deepEqual(s3.requests.filter((asked) => asked.includes(" part ")).toSorted(), [1, 2, 3].map((part) => `PUT main/fs-new/s1/pages.img part ${part} from ${key}`));
+
+    // An upload one of whose parts fails is aborted, leaving no object and no upload.
+    s3.refuse = (method, refused) => (method === "PUT" && refused === "main/fs-abc/s2/pages.img" && s3.requests.at(-1)?.endsWith("part 3") ? 503 : null);
+    const failed = await Effect.runPromiseExit(bucket.putFile("main/fs-abc/s2/pages.img", source));
+    assert.ok(Exit.isFailure(failed));
+    assert.match(String(failed.cause), /the bucket's upload of main\/fs-abc\/s2\/pages\.img failed: 503 InternalError/u);
+    assert.ok(s3.requests.includes("DELETE main/fs-abc/s2/pages.img abort"));
+    assert.equal(s3.objects.has("main/fs-abc/s2/pages.img"), false);
+    assert.equal(s3.uploads.size, 0);
+  } finally {
+    await s3.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the bucket's gets go `parallel` at a time, every one of its files together, each written synced to the disk", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300 });
+    const pages = Buffer.from(Array.from({ length: 3500 }, (_, index) => index % 251));
+    const small = pages.subarray(0, 700);
+    s3.objects.set("main/fs-a/s1/pages.img", pages);
+    s3.objects.set("main/fs-b/s1/pages.img", pages);
+    s3.objects.set("main/fs-c/s1/small.img", small);
+    s3.getDelayMs = 30;
+    // Two snapshots' images in ranges, and a small file whole, at once.
+    const got = await Promise.all([
+      Effect.runPromise(bucket.getFile("main/fs-a/s1/pages.img", join(directory, "a.img"), pages.length)),
+      Effect.runPromise(bucket.getFile("main/fs-b/s1/pages.img", join(directory, "b.img"), pages.length)),
+      Effect.runPromise(bucket.getFile("main/fs-c/s1/small.img", join(directory, "c.img"), small.length)),
+    ]);
+    assert.equal(s3.mostGetting(), 2);
+    const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    assert.deepEqual(got, [{ bytes: pages.length, sha256: sha256(pages) }, { bytes: pages.length, sha256: sha256(pages) }, { bytes: small.length, sha256: sha256(small) }]);
+    assert.deepEqual([readFileSync(join(directory, "a.img")), readFileSync(join(directory, "b.img")), readFileSync(join(directory, "c.img"))], [pages, pages, small]);
   } finally {
     await s3.close();
     rmSync(directory, { recursive: true, force: true });

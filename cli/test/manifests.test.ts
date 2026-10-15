@@ -172,7 +172,7 @@ describe("configuration", () => {
     assert.deepEqual(config.sessions.snapshots, {
       releaseAfter: "5m",
       nodeCache: "5Gi",
-      nodeAgent: { resources: { requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "512Mi" } } },
+      nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
   });
 
@@ -1722,6 +1722,17 @@ describe("workspace storage", () => {
 describe("node agents", () => {
   const agentOf = (objects: readonly KubernetesObject[]) => one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent");
 
+  test("refuse a memory limit that leaves no room for the agent's own memory and a restore's parts not yet on the disk, where sessions are snapshotted", () => {
+    const limited = (memory: string, sessions: Record<string, unknown> = {}) =>
+      decodeInstallConfig({ alasio: { telegram: { existingSecret: "telegram" } }, sessions: { ...sessions, snapshots: { nodeAgent: { resources: { limits: { memory } } } } } });
+    const refused = limited("160Mi");
+    assert.ok(Result.isFailure(refused));
+    assert.equal(refused.failure.message, "sessions.snapshots.nodeAgent.resources.limits.memory must be at least 192 MiB: the node agent's own memory, and what a restore holds written and not yet on the disk");
+    assert.ok(Result.isSuccess(limited("192Mi")));
+    // Sessions not snapshotted run no node agent.
+    assert.ok(Result.isSuccess(limited("160Mi", { runtimeClassName: "" })));
+  });
+
   test("run privileged in the node's PID namespace, on every node sessions run on, with the node's paths at the same paths", () => {
     const objects = install({ sessions: { nodeSelector: { "alasio.dev/sessions": "true" }, tolerations: [{ key: "sessions", operator: "Exists" }] } });
     const agent = agentOf(objects);
@@ -1753,7 +1764,7 @@ describe("node agents", () => {
     ]);
     assert.deepEqual(container?.ports, [{ name: "api", containerPort: 8484 }]);
     assert.deepEqual(container?.readinessProbe, { httpGet: { path: "/healthz", port: "api" }, periodSeconds: 10 });
-    assert.deepEqual(container?.resources, { requests: { cpu: "20m", memory: "96Mi" }, limits: { memory: "512Mi" } });
+    assert.deepEqual(container?.resources, { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } });
     // First, as the pod starts, it says the node's CPU features under the current release, as runsc does, with the paths runsc reads.
     const [features, ...others] = pod?.initContainers ?? [];
     assert.deepEqual(others, []);

@@ -1,9 +1,10 @@
 /**
  * Where a node keeps its gVisor releases, containerd's runtimes of them and its
- * snapshots, and where its node agent serves: as the agent reads them, the clusters alasio
- * makes lay them out (cli/src/cluster/), and the installation's manifests give them to
- * the agent (cli/src/manifests/node-agent.ts). Free of any import but sandbox-shape's,
- * itself free of any, so the command line takes it without the agent.
+ * snapshots, where its node agent serves, and the memory the agent needs: as the agent
+ * reads them, the clusters alasio makes lay them out (cli/src/cluster/), and the
+ * installation's manifests give them to the agent (cli/src/manifests/node-agent.ts). Free
+ * of any import but sandbox-shape's, itself free of any, so the command line takes it
+ * without the agent.
  */
 
 /** The port a node agent serves its API on, on its pod's address. */
@@ -55,6 +56,34 @@ export interface CpuFeaturesReport {
   readonly release: string;
   readonly cpuFeatures: readonly string[];
 }
+
+/** A part of a snapshot file the node agent puts or gets (./s3.ts): 32 MiB, as large as S3's 10000 parts make an object of 312 GiB. */
+export const SNAPSHOT_PART_BYTES = 32 * 1024 ** 2;
+
+/** How many parts of a snapshot file the node agent puts or gets at a time, and how many gets, of every snapshot it gets. */
+export const SNAPSHOT_PARTS_AT_ONCE = 4;
+
+/** What a get of the node agent's writes to its file between syncs to the disk: 8 MiB. */
+export const SNAPSHOT_SYNC_BYTES = 8 * 1024 ** 2;
+
+/**
+ * The node agent's memory budget for what it gets: what it holds written and not yet on
+ * the disk, at most, of every get at a time together (./s3.ts). The kernel counts it in the
+ * agent's memory and cannot reclaim it before it is written, so the agent's memory limit
+ * leaves room for it beside the agent's own; what it reads through the page cache, the
+ * kernel reclaims.
+ */
+export const UNSYNCED_DOWNLOAD_BYTES = SNAPSHOT_PARTS_AT_ONCE * SNAPSHOT_SYNC_BYTES;
+
+/**
+ * The node agent's own memory: what it was measured to hold restoring a 1 GiB session's
+ * snapshot from the bucket on a node of its own (test/e2e, 125 to 145 MiB anonymous),
+ * rounded up.
+ */
+export const NODE_AGENT_OWN_BYTES = 160 * 1024 ** 2;
+
+/** The least memory limit a node agent runs under: its own, and a download's budget beside it. */
+export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_BYTES;
 
 /** The variable holding the token alasio presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";

@@ -155,9 +155,11 @@ const NEON_LIFECYCLE = {
 };
 
 /**
- * The lifecycle rule of the snapshots bucket: a node agent ended mid-upload leaves the
- * parts it had sent, which are aborted after a day, the least S3 allows. An operator's
- * store is given none of it either: its operator gives the bucket this rule.
+ * The lifecycle rule of the snapshots bucket. A node agent puts a file larger than a
+ * part in parts (src/node-agent/s3.ts), and aborts an upload that fails; one it could not
+ * abort, ended mid-upload, leaves the parts it had sent, which this aborts after a day,
+ * the least S3 allows. An external store is given no rule by alasio: its operator gives
+ * the bucket this one.
  */
 const SNAPSHOTS_LIFECYCLE = {
   Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
