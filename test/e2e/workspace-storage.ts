@@ -689,7 +689,8 @@ export function workspaceStorage(): void {
         inPod("juicefs", [
           "set -eu",
           "mkdir -p /mounted",
-          'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$META_URL" /mounted',
+          // It prints a dot on its standard output each time it finds the mount not ready yet, and no newline after.
+          'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$META_URL" /mounted >/dev/null',
           "ls -a /mounted",
           "umount /mounted",
         ].join("\n"))
@@ -724,7 +725,7 @@ export function workspaceStorage(): void {
           'juicefs config "$restored" --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" --force',
           'juicefs fsck "$restored"',
           "mkdir -p /restored",
-          'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$restored" /restored',
+          'juicefs mount --background --read-only --no-bgjob --cache-size 0 "$restored" /restored >/dev/null',
           `cd /restored/${await directoryOf(none)}${FIXTURE}`,
           DIGEST,
           "cd / && umount /restored",
