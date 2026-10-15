@@ -253,8 +253,16 @@ export async function lakeQuery(sql: string): Promise<Record<string, unknown>[]>
   return stdout.trim().split("\n").filter(Boolean).map((line): Record<string, unknown> => JSON.parse(line));
 }
 
+/**
+ * The command lines the run started that have not ended: a test that timed out leaves its
+ * own running, which tearDown ends, so none keeps the run alive past its tests.
+ */
+const running = new Set<ChildProcess>();
+
 /** What `child` writes and exits with; what it says on stderr, its progress, is said here too, as it says it. */
 function capture(child: ChildProcess): Promise<Ran> {
+  running.add(child);
+  child.on("close", () => running.delete(child));
   let stdout = "";
   let stderr = "";
   child.stdout?.on("data", (chunk: Buffer) => {
@@ -836,6 +844,10 @@ export async function dumpClusterState(): Promise<void> {
 
 /** Removes what the run made, unless it is kept: the registry, the cluster, with all it holds, the node image, and the run's directory. */
 export async function tearDown(): Promise<void> {
+  for (const child of running) {
+    console.error(`# ended ${child.spawnargs.join(" ")}, still running as the run ends`);
+    child.kill("SIGTERM");
+  }
   if (!setup) return;
   const { work, configFile } = setup;
   if (KEEP) {

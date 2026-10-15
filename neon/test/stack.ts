@@ -1207,7 +1207,8 @@ export function neonStack(): void {
         }
       });
 
-      test("alasio restore-filer-store puts the filer store back from its backup: what was there then is, what was written since is not, and the stack runs on it again", async () => {
+      // Bounded, as the restore's waits are: a restore that waits on, its command line ended as the run ends (test/e2e/harness.ts tearDown).
+      test("alasio restore-filer-store puts the filer store back from its backup: what was there then is, what was written since is not, the log goes on throughout, and the stack runs on it again", { timeout: 1_500_000 }, async () => {
         const bucket = `restore-${Date.now()}`;
         const gateway = async () => (await gateways())[0] ?? assert.fail("no gateway runs");
         const held = async (key: string) =>
@@ -1230,13 +1231,18 @@ export function neonStack(): void {
           await onGateway(await gateway(), `echo after > /tmp/body; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key after --body /tmp/body >/dev/null`);
           assert.deepEqual([await held("before"), await held("after")], ["held", "held"]);
 
+          // The log's nodes, by their pods' ids, which run on throughout the restore.
+          const logNodes = async () =>
+            (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf({ "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": "log" }) })).map(({ metadata }) => metadata?.uid);
+          const nodes = await logNodes();
           const listed = await alasioOk("restore-filer-store");
           const stamp = /^ {2}(\d{8}T\d{6}Z) /mu.exec(listed)?.[1] ?? assert.fail(`no backup is listed:\n${listed}`);
-          const restored = await alasioOk("restore-filer-store", stamp, "--yes", "--timeout", "30m");
+          const restored = await alasioOk("restore-filer-store", stamp, "--yes", "--timeout", "20m");
           assert.match(restored, /^The filer store is as it was at .+, with its \d+ keys, and alasio runs on it again\.$/mu);
           await up();
           assert.deepEqual([await held("before"), await held("after")], ["held", "missing"]);
           assert.deepEqual(await query("select said from restored"), [{ said: "before" }]);
+          assert.deepEqual(await logNodes(), nodes);
         } finally {
           await onGateway(await gateway(), `aws s3 --endpoint-url http://127.0.0.1:8333 rb --force s3://${bucket} >/dev/null`).catch(() => {});
           await query("drop table if exists restored").catch(() => {});

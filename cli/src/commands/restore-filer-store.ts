@@ -19,6 +19,7 @@ import { type Kind, kind, KubeApi, type ObjectRef, refOf } from "../kube/api.ts"
 import { awaitEnded, awaitGone, awaitReady, awaitScheduled, selectorOf, type WaitOptions } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../manifests/common.ts";
 import type { InstallConfig } from "../manifests/config.ts";
+import { LOG_COMPONENT } from "../manifests/log.ts";
 import {
   BACKUPS_LISTING,
   backupsListing,
@@ -109,10 +110,15 @@ const backups = Effect.fnUntraced(function*(config: InstallConfig, options: Wait
   return files.flatMap((file) => BACKUP_FILE.exec(file)?.slice(1, 2) ?? []).toSorted().toReversed();
 });
 
-/** The workloads that write to the store, through it: alasio and the data stack, main's and each branch environment's; and its filers and gateways, which write to the filer store. */
+/**
+ * The workloads that write to the store, through it: alasio and the data stack, main's and
+ * each branch environment's, but the log, whose segments are on its own volumes, so it
+ * keeps what it holds and what reaches it meanwhile for its consumers to read once they run
+ * again; and its filers and gateways, which write to the filer store.
+ */
 const writers = Effect.map(listed<Workload>(WORKLOADS), (workloads) => {
   const component = (workload: Workload) => workload.metadata?.labels?.["app.kubernetes.io/component"] ?? "";
-  const store = new Set(Object.values(COMPONENTS));
+  const store = new Set([...Object.values(COMPONENTS), LOG_COMPONENT]);
   const front = new Set([COMPONENTS.gateway, COMPONENTS.filer]);
   return {
     clients: workloads.filter((workload) => !store.has(component(workload)) && (component(workload) === "alasio" || workload.metadata?.labels?.["alasio.dev/stack"] === "neon")),
@@ -258,8 +264,9 @@ const restore = Effect.fnUntraced(function*(settings: InstallConfig, stamp: stri
 
 /** What a restore rolls back, as the command's confirmation and its help say. */
 const ROLLS_BACK = "The store's namespace, every bucket, object, version and tag, goes back to when the backup was taken: what was written since is lost, " +
-  "and what was deleted since is listed again with its data gone; Neon's own files go back with it, so the database may lose what was written since too, " +
-  "and workspace storage's files written since lose their data.";
+  "and what was deleted since is listed again with its data gone. Neon's own files in the store go back with it while its pageserver's and safekeepers' volumes do not: " +
+  "what the database wrote since is likely lost, and Neon may not start on them at all, when the database's dumps in the backups bucket, of before the backup, are what restores it. " +
+  "Workspace storage's files written since lose their data. The log, on its own volumes, keeps what it holds.";
 
 export const restoreFilerStore = Command.make(
   "restore-filer-store",
@@ -309,7 +316,7 @@ export const restoreFilerStore = Command.make(
       "The filer store keeps the store's namespace: a store whose filer store is lost has its data on its volumes with nothing to find it by, which " +
       "the gateways refuse to start on. " +
       `${ROLLS_BACK} ` +
-      "It stops alasio, Neon and the lake (main's and branch environments'), then the object store's gateways and filers, and the installation's CronJobs, " +
+      "It stops alasio, Neon and the lake (main's and branch environments'), but not the log, then the object store's gateways and filers, and the installation's CronJobs, " +
       "waiting for their running Jobs to end; sessions keep running, their workspace storage failing to write until the store is back. " +
       "It loads the backup onto the filer store's volume, checks the filer store holds as many keys as the backup, and starts everything again as it was: " +
       "its replicas, and its ScaledObjects and CronJobs paused or suspended only where they were before. " +

@@ -633,7 +633,7 @@ test("up changes no count of the object store's masters, nor lowers its volume s
   assert.equal(statefulSet("alasio-seaweedfs-volume")?.spec?.["replicas"], 1);
 });
 
-test("restore-filer-store lists the filer store's backups, and puts one back with what writes to the store stopped, alasio and Neon first, and started again as it was", async (t) => {
+test("restore-filer-store lists the filer store's backups, and puts one back with what writes to the store stopped, alasio and Neon first, the log left running, and started again as it was", async (t) => {
   const { alasio, kube } = await installed(t);
   const at = (path: string) => kube.get(`/apis/${path}`);
   const listing = "filer-store-20261013T082300Z.rdb\nfiler-store-20261013T092300Z.rdb\n";
@@ -693,6 +693,9 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
     "/jobs/alasio-seaweedfs-filer-store-restore",
   ].map(first);
   assert.ok(order.every((index, position) => index >= 0 && (position === 0 || index > (order[position - 1] ?? 0))), JSON.stringify(order));
+  // The log, whose segments are on its own volumes, goes on throughout, keeping what reaches it.
+  assert.ok(at("apps/v1/namespaces/alasio/statefulsets/alasio-log"));
+  assert.equal(first("/statefulsets/alasio-log"), -1);
   // Started again, what its volumes hold to a node first: Neon's storage before what runs anywhere.
   const last = (path: string) => changed.findLastIndex((change) => change.path.endsWith(path));
   for (const [held, free] of [["/statefulsets/alasio-neon-pageserver", "/deployments/alasio-neon-compute"], ["/statefulsets/alasio-neon-safekeeper", "/deployments/alasio"]] as const) {
