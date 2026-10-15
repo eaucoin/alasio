@@ -13,7 +13,11 @@
 # <owner> env HOME=<their home> npx --yes alasio@<previous> upgrade`); PREVIOUS_CHECK, which
 # must succeed before anything changes, proves it can (the same with `--version`). As it
 # starts it records OUT/rolling-back, which the cut-over then refuses; run again, it goes on.
-# The filer store's
+# What the old store answers otherwise than the cut-over recorded before it touched anything
+# (its volumes, its inventory, the bytes of the versions read back, a new object taken) does
+# not keep the stack stopped: it is recorded in OUT/discrepancies.txt, and the rollback, done,
+# exits 3 rather than 0. Only the volume itself (the recorded PV on the old store's claim, its
+# data files all there) and the old store's starting stop it. The filer store's
 # Secrets and the root Secret's keys for them, which the cut-over made, are left: the previous
 # release reads neither, and the next cut-over takes them as they are.
 set -euo pipefail
@@ -93,28 +97,46 @@ if [ -n "$was" ]; then
   unmark statefulset "$OLD" "$NS"
 fi
 k rollout status statefulset/"$OLD" --timeout="${WAIT}s" || fail "the old store is not ready within ${WAIT}s"
+# The old store, on its own volume, is the store as the stack had it: what it answers
+# otherwise than before the cut-over is recorded, for the operator to look into, and the
+# stack brought back all the same. Held stopped, it would gain nothing, and a check of its
+# answers can be wrong as well as the store.
+: >"$OUT/discrepancies.txt"
+differs() {
+  log "DIFFERS: $*"
+  printf '%s\n' "$*" >>"$OUT/discrepancies.txt"
+}
 if [ -e "$OUT/inventory-before.json" ]; then
   # The old store's volumes, as the cut-over found them on the disk once it stopped it, or as its masters said them before.
   left=$(cat "$OUT/volumes-stopped.txt" 2>/dev/null || cat "$OUT/volumes-before.txt")
   volumes_now=$(volumes old_shell volume-list-rolled-back.txt)
-  [ -n "$volumes_now" ] || fail "the old store's masters list no volumes (volume-list-rolled-back.txt)"
+  [ -n "$volumes_now" ] || differs "the old store's masters list no volumes (volume-list-rolled-back.txt)"
   for volume in $left; do
-    grep -qw -- "$volume" <<<"$volumes_now" || fail "the old store's masters no longer know the volume $volume"
+    grep -qw -- "$volume" <<<"$volumes_now" || differs "the old store's masters no longer know the volume $volume"
   done
   if [ -n "$pv" ]; then
     highest=$(find "$dir" -maxdepth 1 -name '*.dat' -printf '%f\n' | sed 's/\.dat$//; s/.*_//' | sort -n | tail -n 1)
     newest=$(kx "$OLD_POD" -c seaweedfs -- wget -q -O - http://127.0.0.1:9333/cluster/status | jq -r '.MaxVolumeId // 0')
-    [ "$newest" -ge "${highest:-0}" ] || fail "the old master would make volume $((newest + 1)) again: the disk holds volume $highest"
+    [ "$newest" -ge "${highest:-0}" ] || differs "the old master would make volume $((newest + 1)) again: the disk holds volume $highest"
   fi
-  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json"
-  diff -u "$OUT/inventory-before.json" "$OUT/inventory-rolled-back.json" >"$OUT/inventory-diff-rolled-back.txt" || fail "the old store's inventory differs from before the cut-over (inventory-diff-rolled-back.txt)"
-  checked="its inventory identical to before the cut-over"
-  read=$(read_back "$OUT/inventory-before.json" "$OLD_POD" "$READ_BACK") || fail "through the old store: $read"
+  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json" || differs "the old store's inventory is not read whole"
+  diff -u "$OUT/inventory-before.json" "$OUT/inventory-rolled-back.json" >"$OUT/inventory-diff-rolled-back.txt" ||
+    differs "the old store's inventory differs from before the cut-over (inventory-diff-rolled-back.txt)"
+  if contents "$OLD_POD" <"$OUT/read-back.tsv" >"$OUT/contents-rolled-back.tsv"; then
+    diff -u "$OUT/contents-before.tsv" "$OUT/contents-rolled-back.tsv" >"$OUT/contents-diff-rolled-back.txt" ||
+      differs "versions read back hold other bytes than before the cut-over (contents-diff-rolled-back.txt)"
+  else
+    differs "the old store does not read every version it read before the cut-over (read-back.tsv)"
+  fi
+  checked="its inventory against before the cut-over, $(wc -l <"$OUT/read-back.tsv") versions read back against their bytes then"
 else
-  # The cut-over stopped before its inventory: the store is read back as it answers now.
-  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json"
-  checked="no inventory before (the cut-over stopped at step $reached), its inventory read now"
-  read=$(read_back "$OUT/inventory-rolled-back.json" "$OLD_POD" "$READ_BACK") || fail "through the old store: $read"
+  # The cut-over stopped before its inventory, before anything of the store was touched: it is
+  # read as it answers now.
+  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json" || differs "the old store's inventory is not read whole"
+  read_back_set "$OUT/inventory-rolled-back.json" "$READ_BACK" >"$OUT/read-back-rolled-back.tsv"
+  contents "$OLD_POD" <"$OUT/read-back-rolled-back.tsv" >"$OUT/contents-rolled-back.tsv" ||
+    differs "the old store does not read every version it lists (read-back-rolled-back.tsv)"
+  checked="no inventory before (the cut-over stopped at step $reached), $(wc -l <"$OUT/contents-rolled-back.tsv") versions read now"
 fi
 probe=$(kx "$OLD_POD" -c lifecycle -- sh -c 'set -e
   s3api() { aws --endpoint-url http://127.0.0.1:8333 s3api "$@"; }
@@ -123,8 +145,8 @@ probe=$(kx "$OLD_POD" -c lifecycle -- sh -c 'set -e
   s3api put-object --bucket "$bucket" --key rollback-probe --body /tmp/probe >/dev/null
   s3api get-object --bucket "$bucket" --key rollback-probe /tmp/probe-back >/dev/null
   cmp -s /tmp/probe /tmp/probe-back && s3api delete-object --bucket "$bucket" --key rollback-probe >/dev/null && echo written') || true
-[ "$probe" = written ] || fail "the old store takes no new object"
-log "the old store: $checked; $read versions read back; a new object taken"
+[ "$probe" = written ] || differs "the old store takes no new object"
+log "the old store: $checked; $(wc -l <"$OUT/discrepancies.txt") discrepancies"
 
 log "5. the seal lifted, the previous release applied, and every writer started as it was"
 unseal_old
@@ -137,4 +159,8 @@ if [ -e "$OUT/writers.txt" ]; then
 fi
 mv "$OUT/step" "$OUT/rolled-back-from-step"
 rm "$OUT/rolling-back"
+if [ -s "$OUT/discrepancies.txt" ]; then
+  log "rolled back from step $reached; the old store answers otherwise than before the cut-over in $(wc -l <"$OUT/discrepancies.txt") ways (discrepancies.txt)"
+  exit 3
+fi
 log "rolled back from step $reached"

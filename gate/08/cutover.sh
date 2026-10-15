@@ -12,7 +12,9 @@
 # UPGRADE applies the release, as the configuration's owner does (`sudo -u <owner> env
 # HOME=<their home> npx --yes alasio@<v> upgrade`); UPGRADE_CHECK, which must succeed before
 # any writer stops, proves it can (the same with `--version`). Without UPGRADE the cut-over
-# stops once the store is checked, before any writer starts.
+# stops once the store is checked, before any writer starts. Of each bucket, READ_BACK
+# versions are read through the old store before anything of it is touched, and read back
+# through each of the release's gateways: the same bytes, by their SHA-256.
 #
 # Run again, it goes on from the step it reached, as recorded in OUT/step, which only grows:
 # what each step changes is marked or recorded once, and the metadata's copy, once the
@@ -122,6 +124,10 @@ if [ ! -e "$OUT/inventory-before.json" ]; then
   printf 'fs.meta.save -o /tmp/meta-before.meta /\n' | old_shell >"$OUT/fs-meta-save.txt"
   kx "$OLD_POD" -c seaweedfs -- cat /tmp/meta-before.meta >"$OUT/meta-before.meta"
   kx "$OLD_POD" -c seaweedfs -- tar -C /data -cf - filerldb2 m9333 >"$OUT/old-filer-and-master.tar"
+  # What the versions read back hold, as the old store reads them: what each store is read
+  # back against, as it answered before anything of it was touched.
+  read_back_set "$OUT/inventory-before.part.json" "$READ_BACK" >"$OUT/read-back.tsv"
+  contents "$OLD_POD" <"$OUT/read-back.tsv" >"$OUT/contents-before.tsv" || fail "the old store does not read every version read back (read-back.tsv)"
   mv "$OUT/inventory-before.part.json" "$OUT/inventory-before.json"
 fi
 volumes_before=$(cat "$OUT/volumes-before.txt")
@@ -253,11 +259,15 @@ entries_after=$(entries new_shell /buckets entries-after-saved.txt)
 log_files new_shell /topics/.system/log >"$OUT/log-after.txt"
 comm -23 "$OUT/log-before.txt" "$OUT/log-after.txt" >"$OUT/log-missing.txt"
 [ ! -s "$OUT/log-missing.txt" ] || fail "the filers' log of changes lacks $(wc -l <"$OUT/log-missing.txt") of the old one's files (log-missing.txt)"
+# The inventory, a listing, against the old store's listing, which the same code answers in
+# both releases; each version read back against what the old store read it as.
 for gateway in $(k get pods -l app.kubernetes.io/component=seaweedfs -o jsonpath='{.items[*].metadata.name}'); do
   inventory "$gateway" lifecycle >"$OUT/inventory-after-$gateway.json"
   diff -u "$OUT/inventory-before.json" "$OUT/inventory-after-$gateway.json" >"$OUT/inventory-diff-$gateway.txt" || fail "the inventory through $gateway differs (inventory-diff-$gateway.txt)"
-  read=$(read_back "$OUT/inventory-before.json" "$gateway" "$READ_BACK") || fail "through $gateway: $read"
-  log "through $gateway: the inventory identical, $read versions read back, each its ETag"
+  contents "$gateway" <"$OUT/read-back.tsv" >"$OUT/contents-after-$gateway.tsv" || fail "$gateway does not read every version read back (read-back.tsv)"
+  diff -u "$OUT/contents-before.tsv" "$OUT/contents-after-$gateway.tsv" >"$OUT/contents-diff-$gateway.txt" ||
+    fail "through $gateway, versions read back hold other bytes than the old store's (contents-diff-$gateway.txt)"
+  log "through $gateway: the inventory identical, $(wc -l <"$OUT/contents-before.tsv") versions read back, each its bytes as before"
 done
 log "checked: volumes $volumes_after (made since: ${extra:-none}); $entries_after under /buckets; the log of changes whole"
 injected 8

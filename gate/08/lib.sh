@@ -365,22 +365,40 @@ inventory() {
   rm -rf "$work"
 }
 
-# Every version of every bucket of $1, an inventory, read back through the gateway's pod $2,
-# each its ETag; at most $3 of each bucket, the first in the inventory's order, by key and
-# version.
-read_back() {
-  local inventory=$1 pod=$2 most=$3
-  jq -r --argjson most "$most" '.[] | .bucket as $bucket | [.versions[] | select(.deleteMarker != true)][:$most][] | [$bucket, .Key, (.VersionId // "null"), .ETag] | @tsv' "$inventory" |
-    kx -i "$pod" -c lifecycle -- sh -c '
-      checked=0
-      while IFS="	" read -r bucket key version etag; do
-        set -- --bucket "$bucket" --key "$key"
-        [ "$version" = null ] || set -- "$@" --version-id "$version"
-        got=$(aws --endpoint-url http://127.0.0.1:8333 s3api get-object "$@" /tmp/read-back --query ETag --output text)
-        [ "$got" = "$etag" ] || { echo "$bucket/$key $version reads back as $got, not $etag"; exit 1; }
-        checked=$((checked + 1))
-      done
-      echo "$checked"'
+# The versions of the inventory $1 to read back: of each bucket's, at most $2, those of more
+# than one chunk first (their listed ETags end in `-<chunks>`: multipart uploads, and single
+# PUTs larger than a chunk), then the others spread evenly over the inventory's order, by key
+# and version, their first and last among them, so that each kind of object a bucket holds is
+# read. As bucket, key and version id per line, tab-separated: "null" is the version a write
+# to a bucket without versioning made.
+read_back_set() {
+  jq -r --argjson most "$2" '
+    def spread($n): length as $count | if $count <= $n then . elif $n <= 0 then [] elif $n == 1 then .[:1]
+      else . as $all | [range(0; $n) as $i | $all[$i * ($count - 1) / ($n - 1) | floor]] end;
+    .[] | .bucket as $bucket | [.versions[] | select(.deleteMarker != true)]
+    | ([.[] | select(.ETag // "" | test("-"))][:$most]) as $chunked
+    | ($chunked + ([.[] | select(.ETag // "" | test("-") | not)] | spread($most - ($chunked | length))))[]
+    | [$bucket, .Key, (.VersionId // "null")] | @tsv' "$1"
+}
+
+# What each version of the read-back set on stdin holds, read through the S3 port of the pod
+# $1, in its lifecycle container: its line, then the SHA-256 of its bytes. Each is streamed
+# through a pipe to its digest, never held, as a version may be larger than the container's
+# memory. What proves a version the same is its bytes: an ETag is not them, and SeaweedFS's
+# ListObjectVersions gives a version written without versioning the ETag of its chunks (the
+# MD5 of their MD5s, `-<chunks>`), where GET and HEAD give it the ETag its write was answered
+# with (a multipart upload's `-<parts>`, or the MD5 of its bytes).
+contents() {
+  # The bytes to the pipe on fd 3, the answer's metadata, which aws prints, to nowhere; a read
+  # that fails leaves its mark, as the pipe's status is its digest's.
+  kx -i "$1" -c lifecycle -- sh -c '
+    while IFS="	" read -r bucket key version; do
+      rm -f /tmp/read-back.failed
+      digest=$({ aws --endpoint-url http://127.0.0.1:8333 s3api get-object --bucket "$bucket" --key "$key" --version-id "$version" /dev/fd/3 3>&1 >/dev/null </dev/null ||
+        touch /tmp/read-back.failed; } | sha256sum | cut -d " " -f 1)
+      [ ! -e /tmp/read-back.failed ] || { echo "$bucket/$key $version is not read" >&2; exit 1; }
+      printf "%s\t%s\t%s\t%s\n" "$bucket" "$key" "$version" "$digest"
+    done'
 }
 
 # The host path of the PV $1, as local-path or a hostPath one says it.

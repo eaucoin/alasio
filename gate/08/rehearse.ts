@@ -4,8 +4,9 @@
  * published package on the host target, with the stand-ins for Telegram (test/e2e/stand-ins.ts)
  * in place of Telegram, and in use: a session workspace, live, its files on JuiceFS; a branch
  * environment; rows in Neon, megabytes of them; thousands of versions and delete markers in
- * the store, beside what alasio, Neon, the lake, JuiceFS and the backups put there; and, as
- * each cut-over starts, CronJobs' Jobs running. Then
+ * the store, beside what alasio, Neon, the lake, JuiceFS and the backups put there, and objects
+ * of more than one chunk of the kinds and sizes the box's store holds, multipart dumps of
+ * hundreds of megabytes among them; and, as each cut-over starts, CronJobs' Jobs running. Then
  *
  * - `forward`: the release's upgrade alone, which refuses while the store keeps its data on
  *   its one pod's volume; then the cut-over, on one OUT, failing after each step (5a and 6a
@@ -18,7 +19,9 @@
  *   injected once that step has run, run again and failing there again, its step recorded no
  *   less; the old store's pod, from step 2 to 5, reached by none of the stack's pods, as a
  *   probe proves; the rollback; the cut-over refusing the OUT rolled back; and alasio 5.1.0,
- *   its session, its branch and its data checked as before.
+ *   its session, its branch and its data checked as before. The step `bytes` is a version
+ *   read back as other bytes than before: the cut-over stopping at its checks, the rollback
+ *   recording the old store's answer as differing, and bringing the stack back all the same.
  *
  * Folder workspaces are on, as on the box: a Sandbox of their bayma's pod template, which no
  * cut-over may stop, is checked untouched through every failure.
@@ -351,6 +354,9 @@ async function setUp(): Promise<{ readonly tg: ReturnType<typeof operator>; read
     "rm -rf /tmp/versions",
   ].join("\n"));
 
+  say("objects of the kinds and sizes the box's store holds: Neon's dumps, the lake's Parquet files, Neon's layers");
+  boxObjects();
+
   say("a branch environment");
   const branchTelegram = standIn(TELEGRAM_BRANCH.service, TELEGRAM_BRANCH.port, 18082);
   await branchTelegram.open();
@@ -367,6 +373,60 @@ async function setUp(): Promise<{ readonly tg: ReturnType<typeof operator>; read
   writeFileSync(join(WORK, "kept.json"), JSON.stringify(kept, null, 2));
   await check(tg, kept, previous);
   return { tg, kept };
+}
+
+/**
+ * Beside the many small objects, those the box's store holds that are of more than one chunk
+ * (C1's inventory, program/progress/object-store.md), each as its writer writes it, from a pod
+ * of the backup's upload container, which has the stack's S3 identity: Neon's dumps, the
+ * smallest and the largest the box keeps, as the backup uploads them (`aws s3 cp`, parts of 8
+ * MiB); the lake's Parquet files as DuckDB writes them, a single PUT of several chunks and a
+ * multipart upload of parts of no whole number of chunks; Neon's largest layer, one PUT to its
+ * versioned bucket; and a multipart object there, written twice, current and noncurrent. A
+ * dump's ETags then differ as the box's did: listed by its 4 MiB chunks, read by its parts.
+ */
+function boxObjects(): void {
+  const backup = JSON.parse(kubectl("-n", "alasio", "get", "cronjob", "alasio-neon-backup", "-o", "json")) as {
+    spec: { jobTemplate: { spec: { template: { metadata: { labels: Record<string, string> }; spec: { containers: { name: string }[] } & Record<string, unknown> } } } };
+  };
+  const { metadata, spec } = backup.spec.jobTemplate.spec.template;
+  const upload = spec.containers.find((container) => container.name === "upload") ?? fail("the backup has no upload container");
+  const write = [
+    "set -eu",
+    's3() { aws s3 --endpoint-url "$S3_ENDPOINT" "$@"; }',
+    's3api() { aws s3api --endpoint-url "$S3_ENDPOINT" "$@"; }',
+    "object() { head -c \"$1\" /dev/urandom >/tmp/object; }",
+    "printf '[default]\\ns3 =\\n  multipart_threshold = 80213616\\n  multipart_chunksize = 80213616\\n' >/tmp/duckdb-parts",
+    'object 130170545; s3 cp --quiet /tmp/object "s3://$BUCKET/rehearsal/alasio-smallest.dump"',
+    'object 275199644; s3 cp --quiet /tmp/object "s3://$BUCKET/rehearsal/alasio-largest.dump"',
+    "object 18885630; s3api put-object --bucket lake --key rehearsal/one-put.parquet --body /tmp/object >/dev/null",
+    "object 224329961; AWS_CONFIG_FILE=/tmp/duckdb-parts s3 cp --quiet /tmp/object s3://lake/rehearsal/multipart.parquet",
+    "object 268460032; s3api put-object --bucket neon --key rehearsal/layer --body /tmp/object >/dev/null",
+    "for round in 1 2; do object 20971520; s3 cp --quiet /tmp/object s3://neon/rehearsal/multipart; done",
+    "rm /tmp/object",
+  ].join("\n");
+  const pod = {
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "rehearsal-objects", namespace: "alasio", labels: metadata.labels },
+    spec: {
+      ...spec,
+      initContainers: [],
+      containers: [{ ...upload, name: "objects", command: ["/bin/sh", "-c", write], resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "1Gi" } } }],
+    },
+  };
+  run("kubectl", ["--kubeconfig", kubeconfig, "apply", "-f", "-"], { input: JSON.stringify(pod) });
+  try {
+    kubectl("-n", "alasio", "wait", "pod/rehearsal-objects", "--for=jsonpath={.status.phase}=Succeeded", "--timeout=1200s");
+  } finally {
+    process.stderr.write(kubectl("-n", "alasio", "logs", "rehearsal-objects"));
+    kubectl("-n", "alasio", "delete", "pod", "rehearsal-objects", "--wait=false");
+  }
+  const s3api = "aws --endpoint-url http://127.0.0.1:8333 s3api";
+  const listed = inOldStore(`${s3api} list-object-versions --bucket backups --prefix rehearsal/alasio-smallest.dump --query 'Versions[0].ETag' --output text`).trim();
+  const read = inOldStore(`${s3api} head-object --bucket backups --key rehearsal/alasio-smallest.dump --query ETag --output text`).trim();
+  if (!listed.endsWith('-32"') || !read.endsWith('-16"')) fail(`the smallest dump is listed as ${listed} and read as ${read}, not by its 32 chunks and its 16 parts`);
+  say(`the smallest dump listed as ${listed}, read as ${read}`);
 }
 
 /** The folder workspaces' namespace, the host profile's, of the configuration's default. */
@@ -457,6 +517,34 @@ function sealed(): void {
 /** The step a cut-over recorded in `out`, which root's scripts keep to root. */
 const recorded = (out: string) => run("sudo", ["cat", join(out, "step")], { env: process.env }).trim();
 
+/**
+ * A version read back whose bytes differ from what the old store read before: the cut-over,
+ * stopped after its inventory, has the first digest it recorded made another, as a store or
+ * a check reading wrongly would, and run again stops at its checks; the rollback, finding the
+ * old store's answer differ from the recorded one too, records it, and brings the stack back
+ * all the same.
+ */
+async function bytesDiffer(tg: ReturnType<typeof operator>, kept: Kept, cutover: Readonly<Record<string, string>>): Promise<void> {
+  const out = cutover["OUT"] ?? fail("the cut-over has no OUT");
+  runningJobs("at-bytes");
+  say("the cut-over, stopped after its inventory, the first digest it recorded made another");
+  const cut = script("cutover.sh", { ...cutover, FAIL_AT: "4" });
+  if (cut.code === 0 || !cut.stderr.includes("a failure injected after step 4")) fail("the cut-over did not fail as injected after step 4");
+  run("sudo", ["sed", "-i", `1s/[0-9a-f]\\{64\\}$/${"0".repeat(64)}/`, join(out, "contents-before.tsv")], { env: process.env });
+  say("run again, it stops at its checks");
+  const again = script("cutover.sh", cutover);
+  if (again.code === 0 || !again.stderr.includes("hold other bytes than the old store's")) fail("the cut-over went on past a version read back as other bytes");
+  if (recorded(out) !== "8") fail(`the cut-over recorded step ${recorded(out)}, not 8`);
+  say("the rollback records the old store's differing answer, and brings the stack back");
+  const back = script("rollback.sh", { RELEASE: cutover["RELEASE"] ?? "", OUT: out, PREVIOUS: PREVIOUS(), PREVIOUS_CHECK: PREVIOUS_CHECK() });
+  if (back.code !== 3 || !back.stderr.includes("DIFFERS: versions read back hold other bytes than before the cut-over")) fail(`the rollback exited ${back.code}, not 3 with the bytes recorded as differing`);
+  const differing = run("sudo", ["cat", join(out, "discrepancies.txt")], { env: process.env }).trim().split("\n");
+  if (differing.length !== 1) fail(`the rollback recorded ${differing.length} discrepancies, not the one: ${differing.join("; ")}`);
+  await check(tg, kept, previous);
+  folderUntouched(kept);
+  say("rolled back from step 8, the discrepancy recorded");
+}
+
 async function main(): Promise<void> {
   const [mode, ...steps] = process.argv.slice(2);
   if (mode !== "forward" && mode !== "rollback") fail("usage: rehearse.ts forward | rollback <step>...");
@@ -468,6 +556,10 @@ async function main(): Promise<void> {
       const out = join(WORK, `cutover-${step}`);
       mkdirSync(out, { recursive: true });
       const { release: releaseFile, csi } = render(out);
+      if (step === "bytes") {
+        await bytesDiffer(tg, kept, { RELEASE: releaseFile, CSI_NAMESPACE: csi, OUT: out, ...settings });
+        continue;
+      }
       const cutover = { RELEASE: releaseFile, CSI_NAMESPACE: csi, OUT: out, FAIL_AT: step, ...settings };
       // The step a failure after step `step` leaves recorded: 5a and 6a are within 5 and 6.
       const within = step.replace(/[ab]$/u, () => "");

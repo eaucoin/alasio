@@ -5,7 +5,8 @@ name: gate-08-cutover
 # installed by its package on k3s on the runner, the host target, in use, its session, its
 # branch, its rows and versions, a folder workspace; then the cut-over failing after each step
 # and run again, its upgrade failing and run again, rolled forward; and, in two jobs, rolled back
-# from a failure after each of its steps before the upgrade, each run again first. On its
+# from a failure after each of its steps before the upgrade, each run again first, and from a
+# version read back as other bytes than before. On its
 # branch alone, whenever what it runs changes.
 on:
   push:
@@ -23,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8"]
+        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8 bytes"]
     steps:
       # alasio's images and its cluster's take more disk than a runner starts with free, so
       # the software it comes with that this job does not use goes first, in the background,
