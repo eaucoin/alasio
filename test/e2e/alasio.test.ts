@@ -753,13 +753,22 @@ if (inShard("telemetry")) {
       };
 
       test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async (t) => {
-        for (let round = 1; round <= 20; round += 1) {
+        for (let round = 1; round <= 30; round += 1) {
         t.diagnostic(`round ${round} at ${new Date().toISOString()}`);
         const run = randomUUID();
         const before = await exportAll(run, 0, 40);
         assert.equal(before.length, 40, "the gateway took every span while the log ran");
         const crashed = Date.now();
-        await kube.kill(NAMESPACE, `${componentName("log")}-0`);
+        // The repro's three ways of stopping the broker, in turn: deleted at once (as the test does), its JVM killed in place, deleted with its grace.
+        const way = (["force-deleted", "killed", "deleted"] as const)[(round - 1) % 3];
+        t.diagnostic(`round ${round}: the broker ${way}`);
+        if (way === "force-deleted") await kube.kill(NAMESPACE, `${componentName("log")}-0`);
+        else if (way === "deleted") await kube.remove(ref("Pod", `${componentName("log")}-0`, NAMESPACE));
+        else {
+          const node = (await kube.get<V1Pod>(ref("Pod", `${componentName("log")}-0`, NAMESPACE)))?.spec?.nodeName ?? "";
+          const crictl = TARGET === "host" ? "k3s crictl" : "crictl";
+          await onNode(node, `${crictl} stop --timeout 0 $(${crictl} ps --name '^log$' --pod $(${crictl} pods --name '^alasio-log-0$' -q) -q)`);
+        }
         // Each export sent on until one is taken again, as a producer sends what was refused again.
         const during: number[] = [];
         for (let seq = 40, deadline = Date.now() + 600_000; during.length < 20; seq += 1) {
