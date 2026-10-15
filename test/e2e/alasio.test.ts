@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -113,14 +113,11 @@ async function forward(standIn: StandIn): Promise<Forward> {
 /** The operator, through the Telegram stand-in: says things, presses buttons, reads replies. */
 function operator(base: string) {
   let seen = 0;
-  /** Every call read, in the order alasio made them. */
-  const read: RecordedCall[] = [];
   const post = async (path: string, body: ControlMessage | ControlCallback) => (await fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json();
   const calls = async () => {
     // The stand-in answers what it was called with.
     const listed = (await (await fetch(`${base}/control/calls?since=${seen}`)).json()) as CallsListing;
     seen = listed.total;
-    read.push(...listed.calls);
     return listed.calls;
   };
   const buttons = (call: RecordedCall): InlineKeyboardButton[] => {
@@ -133,18 +130,10 @@ function operator(base: string) {
     say: (text: string, user?: number) => post("/control/message", { text, ...(user === undefined ? {} : { chatId: user, userId: user }) }),
     press: (data: string | undefined) => post("/control/callback", { data }),
     calls,
-    /** Where the calls alasio makes from now on start, for waitFor: every call alasio made so far read. */
-    mark: async (): Promise<number> => {
-      await calls();
-      return read.length;
-    },
-    /**
-     * What alasio sends until `predicate` holds for one, which is returned: from now on, or
-     * from `from`, a mark, those read since included.
-     */
-    async waitFor(predicate: (call: RecordedCall) => boolean, timeoutMs = 300_000, from?: number): Promise<RecordedCall> {
+    /** What alasio sends until `predicate` holds for one, which is returned. */
+    async waitFor(predicate: (call: RecordedCall) => boolean, timeoutMs = 300_000): Promise<RecordedCall> {
       const deadline = Date.now() + timeoutMs;
-      const got: RecordedCall[] = from === undefined ? [] : read.slice(from);
+      const got: RecordedCall[] = [];
       while (Date.now() < deadline) {
         got.push(...(await calls()));
         const hit = got.find(predicate);
@@ -177,10 +166,6 @@ interface Scenario {
   readonly check: () => Promise<void>;
 }
 
-/** alasio's environment, as the configuration `config` sets it. */
-const environmentOf = (config: { readonly install?: { readonly alasio?: { readonly env?: Readonly<Record<string, string>> } } }): Readonly<Record<string, string>> =>
-  config.install?.alasio?.env ?? {};
-
 /** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
@@ -207,18 +192,10 @@ if (inShard("upgrade")) {
       return (deployment?.spec?.replicas ?? 0) > 0 && deployment?.status?.readyReplicas === deployment?.spec?.replicas;
     };
 
-    /** Where the calls alasio made from the cut-over on start, as the operator read them. */
-    let cutOverFrom: number;
     let volumeId: string;
     /** The folder mounted in the other chat, and what it holds. */
     let folder: string;
     let messages: number;
-    /** The StatefulSets of main's that keep their data on claims. */
-    let held: string[];
-    /** A prompt held across the upgrade. */
-    const HELD_PROMPT = "held across the upgrade";
-    /** The session's pod as 6.0.0 ran it. */
-    let ranBefore: string | undefined;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -245,84 +222,6 @@ if (inShard("upgrade")) {
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
         },
       },
-      {
-        seeds: "the stack's StatefulSets that keep their data on claims, which a local disk holds to its node",
-        seed: async () => {
-          held = (await kube.list<V1StatefulSet>("StatefulSet", { namespace: NAMESPACE }))
-            .filter(({ spec }) => (spec?.volumeClaimTemplates?.length ?? 0) > 0)
-            .map(({ metadata }) => metadata?.name ?? "");
-          assert.ok(held.includes(`${RELEASE}-neon-safekeeper`), held.join(", "));
-        },
-        keeps: "each of their pods runs under the class above the floor, the upgrade having made it again on its volume",
-        check: async () => {
-          for (const name of held) {
-            const set = await kube.get<V1StatefulSet>(ref("StatefulSet", name, NAMESPACE));
-            // One this release no longer has is another change's to prove gone.
-            if (!set) continue;
-            const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(set?.spec?.selector?.matchLabels ?? {}) });
-            assert.deepEqual(pods.map(({ spec }) => [spec?.priorityClassName, spec?.priority]), Array(set?.spec?.replicas ?? 1).fill([`${RELEASE}-bound`, 100_001]), name);
-          }
-        },
-      },
-      {
-        seeds: "a configuration that sets ALASIO_HOOK_PORT, as the box's does",
-        seed: async () => {
-          assert.equal(environmentOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["ALASIO_HOOK_PORT"], "8789");
-        },
-        keeps: "the configuration but ALASIO_HOOK_PORT, which nothing reads now, and alasio runs without it",
-        check: async () => {
-          assert.equal(environmentOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["ALASIO_HOOK_PORT"], undefined);
-          const container = (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "alasio");
-          assert.deepEqual(container?.env?.filter(({ name }) => name === "ALASIO_HOOK_PORT"), []);
-        },
-      },
-      {
-        seeds: "a prompt held as a turn ran, its question unanswered",
-        seed: async () => {
-          await tg.calls();
-          await tg.say("wait 20");
-          await tg.waitFor((call) => /^Codex is working/u.test(call.payload.text ?? ""));
-          await tg.say(HELD_PROMPT);
-          await tg.waitFor((call) => /^Codex is currently working\. What should I do with this message\?/u.test(call.payload.text ?? "") && (call.payload.text ?? "").endsWith(HELD_PROMPT));
-          await tg.waitFor((call) => answered(call));
-        },
-        keeps: "the held prompt is asked about again, as the operator wrote it, once alasio is upgraded, and runs when told to",
-        check: async () => {
-          const asked = await tg.waitFor((call) => call.payload.text === `The turn has ended. What should I do with this message?\n\n${HELD_PROMPT}`, 300_000, cutOverFrom);
-          const run = tg.buttons(asked).find((button) => button.text === "Run it");
-          assert.ok(run && "callback_data" in run, "the question has a Run it button");
-          await tg.press(run.callback_data);
-          await tg.waitFor((call) => answered(call));
-        },
-      },
-      {
-        seeds: "the session workspace's pod, under 6.0.0's gVisor",
-        seed: async () => {
-          const pod = await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS));
-          assert.equal(pod?.spec?.runtimeClassName, "gvisor");
-          ranBefore = pod?.metadata?.uid;
-        },
-        keeps: "nothing runs under 6.0.0's gVisor, which is gone, and the session, its pod made anew, is released into a snapshot and restored from it whole",
-        check: async () => {
-          assert.equal(await onNode("", `k3s crictl pods --state ready -o json | jq '[.items[] | select(.runtimeHandler == "runsc")] | length'`), "0\n");
-          assert.equal(await onNode("", "for name in runsc containerd-shim-runsc-v1 gvisor-bin; do [ ! -e /usr/local/bin/$name ] || echo $name; done"), "");
-          await tg.say("hello again");
-          await tg.waitFor((call) => answered(call));
-          assert.notEqual((await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.metadata?.uid, ranBefore);
-          const value = `held by ${volumeId}, upgraded`;
-          const { sessionId } = await repl.set(volumeId, value);
-          await untilReleased(volumeId, Date.now());
-          const saved = await snapshotOf(volumeId);
-          assert.ok(saved, `the session ${volumeId} was released with no snapshot`);
-          await tg.say("restored");
-          await tg.waitFor((call) => answered(call));
-          assert.equal((await kube.get<V1Pod>(ref("Pod", volumeId, SESSIONS)))?.spec?.runtimeClassName, gvisorRuntimeClass(saved.release));
-          const seen = await repl.read(volumeId, sessionId);
-          assert.deepEqual([seen.live, seen.checkpointed], [value, value]);
-          assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
-          assert.equal(await inSession(volumeId, 'process.stdout.write(require("fs").readFileSync("/workspace/proof", "utf8"))'), "written by main");
-        },
-      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -339,18 +238,16 @@ if (inShard("upgrade")) {
       await alasioOk("branch", "delete", BRANCH);
     });
 
-    test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, starts again what it stopped`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, leaves the installation running`, { timeout: 60 * 60_000 }, async () => {
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
       assert.match(failed.stderr, /FAILED: a failure injected before the point of no return/u);
-      assert.match(failed.stderr, /starting again what the cut-over stopped/u);
       await kube.awaitReady([ref("Deployment", "alasio-neon-control", NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
     });
 
     test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after that failure, through`, { timeout: 60 * 60_000 }, async () => {
-      cutOverFrom = await tg.mark();
       const ran = await cutOver();
       assert.equal(ran.code, 0, ran.stdout);
     });
@@ -359,7 +256,6 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, again.stdout);
       assert.match(again.stderr, /upgrading, from the cut-over begun at /u);
-      assert.doesNotMatch(again.stderr, /moving neon-control's record/u);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);

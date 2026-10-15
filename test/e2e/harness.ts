@@ -516,8 +516,6 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       env: {
         TELEGRAM_API_ROOT: urlOf(TELEGRAM),
         ALASIO_CODEX_BIN: CODEX_STAND_IN,
-        // Where 6.0.0's workflow hook server listened, as the box's configuration says, which the cut-over removes.
-        ...(of === "previous" ? { ALASIO_HOOK_PORT: "8789" } : {}),
       },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
@@ -529,8 +527,8 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
       resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { cpu: "1", memory: SHARD === "snapshots" ? "3Gi" : "1Gi" } },
       // Never released within the run but in the snapshots and upgrade shards: the other suites
       // reach sessions by exec in their pods, which is no exec of bayma's, and a release would end
-      // their pods under them. 6.0.0 releases none, and has no such setting.
-      ...(of === "release" ? { snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" ? `${RELEASE_AFTER_SECONDS}s` : "24h" } } : {}),
+      // their pods under them.
+      snapshots: { releaseAfter: SHARD === "snapshots" || SHARD === "upgrade" ? `${RELEASE_AFTER_SECONDS}s` : "24h" },
       // On one agent, but in the snapshots shard, where a session runs on any node, as it may be restored on another than it was saved on.
       ...(SHARD === "snapshots" ? {} : on("agent-0")),
     },
@@ -713,8 +711,8 @@ const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`
 
 /**
  * The upgrade shard's cut-over, as the box runs it: upgrades/from-<PREVIOUS>.sh, as root,
- * kubectl reaching the cluster by the run's kubeconfig, its CONFIG the run's configuration's
- * file, its UPGRADE this checkout's `alasio upgrade` as this user, the run's install
+ * kubectl reaching the cluster by the run's kubeconfig, its UPGRADE this checkout's
+ * `alasio upgrade` as this user, the run's install
  * configuration of this checkout laid over the configuration first (./release-config.ts), as
  * this checkout's command line, of no release, pins no images of its own, and its
  * UPGRADE_CHECK this checkout's `alasio upgrade --check` as this user and sudo asking this
@@ -735,7 +733,7 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   const check = `${command(...asOwner, release, "upgrade", "--check")} && ${command("sudo", "-u", user, "sudo", "-n", "true")}`;
   const out = join(work, "cut-over");
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;
