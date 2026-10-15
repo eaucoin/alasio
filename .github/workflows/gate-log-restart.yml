@@ -44,9 +44,12 @@ jobs:
           PRODUCER: ${{ matrix.producer }}
           ROUNDS: ${{ inputs.rounds || '18' }}
           OUT: ${{ runner.temp }}/gate-log-restart
+      # The containers are removed once their logs are kept: a broker still running deletes
+      # its segments' files while the artifact is zipped.
       - if: always()
         run: |
           for name in broker collector s3; do docker logs "$name" >"$RUNNER_TEMP/gate-log-restart/$name-final.log" 2>&1 || true; done
+          docker rm -f broker collector s3 >/dev/null 2>&1 || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
