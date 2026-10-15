@@ -77,7 +77,7 @@ const manifestOf = (podTemplate: V1PodTemplateSpec, release = CURRENT, cpuFeatur
 });
 
 /** Node agents in memory: the current snapshot, each node's holdings, and how a prepare goes on each; what they were asked. */
-function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null, held = [], kept = () => [] }: {
+function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null, abandoned = null, held = [], kept = () => [] }: {
   /** The workspaces the bucket holds anything of. */
   readonly held?: readonly string[];
   /** The images a collection keeps of a workspace. */
@@ -89,6 +89,8 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
   readonly read?: NodeAgentError;
   /** Why the agent does not resume a restored sandbox, or null when it does. */
   readonly resumed?: string | null;
+  /** Why the agent does not abandon a refused restore, or null when it does. */
+  readonly abandoned?: string | null;
 } = {}) {
   const asked: string[] = [];
   const checkpoints: (readonly [string, CheckpointRequest])[] = [];
@@ -121,6 +123,13 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
       Effect.suspend(() => {
         asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}${request.policies.length > 0 ? ` through ${request.policies.join(",")}` : ""}`);
         return resumed === null ? Effect.void : Effect.fail(new NodeAgentError({ node, call: "resume alasio-sessions/fs-abc123", status: 504, reason: resumed }));
+      }),
+    abandon: (node, request) =>
+      Effect.suspend(() => {
+        asked.push(`abandon on ${node} ${request.environment}/${request.workspace} in ${request.namespace}/${request.pod}`);
+        return abandoned === null
+          ? Effect.succeed([{ containerId: "b".repeat(64), pid: 4321 }])
+          : Effect.fail(new NodeAgentError({ node, call: "abandon alasio-sessions/fs-abc123's restore", status: 500, reason: abandoned }));
       }),
     holdings: (node) => Effect.succeed(holdings.find((holding) => holding.node === node) as Holdings),
     workspaces: () => Effect.succeed(held),
@@ -399,6 +408,23 @@ test("a restore that fails for what may pass is deferred, its snapshot kept, as 
     "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1,
     "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=unreadable": 1,
   });
+});
+
+test("a restore refused before its sandbox resumed is abandoned on its node before it is deferred, whether or not the agent can; one refused after is not", async () => {
+  const desired = sessionOf(profile());
+  const refuse = (resumed: boolean, abandoned: string | null = null) => {
+    const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], abandoned });
+    return run(fakeKube(), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      const plan = yield* snapshotted.restore(stored(desired), desired);
+      assert.ok(plan && "podTemplate" in plan);
+      const came = yield* plan.failed({ why: "its pod did not run within 3 minutes", resumed });
+      return { came, asked: asked.slice(1) };
+    }));
+  };
+  assert.deepEqual(await refuse(false), { came: "deferred", asked: ["abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123"] });
+  assert.deepEqual(await refuse(false, "runsc list of the node's failed"), { came: "deferred", asked: ["abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123"] });
+  assert.deepEqual(await refuse(true), { came: "fallen back", asked: ["forget alasio-sessions/fs-abc123"] });
 });
 
 test("a session is restored only from the snapshot its Sandbox was released into: one it moved on from is stale, and forgotten", async () => {
