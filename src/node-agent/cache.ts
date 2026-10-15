@@ -10,14 +10,24 @@
  * what the cache holds is always whole; what a stopped agent left half written is removed as
  * the next one starts.
  *
+ * Beside the images, in `<root>/<environment>/<workspace>/stamps/<digest>.json`, each
+ * image's stamp: its files as they were checked as they were written, each by its SHA-256,
+ * and its size, inode and modification time then. An image whose files are of those still
+ * is taken as the one checked, without reading it again (stamped). A modification time is of
+ * the filesystem's granularity, so a file put in its place of the same size, on an inode used
+ * again, within one tick of it, is not seen: what holds the image whole there is runsc's
+ * verify of it as it is prepared and the SHA-256 of each file as it is downloaded.
+ *
  * The cache holds at most `budget` bytes, its least recently used workspaces evicted whole
- * first, but for any used within `grace`, which a restore may still be reading. When a
- * workspace was last used is its directory's modification time, so it outlasts the agent.
+ * first, but for any used within `grace`, which a restore may still be reading, and any its
+ * caller spares, as the agent spares those an operation of its runs on. When a workspace was
+ * last used is its directory's modification time, so it outlasts the agent; a workspace is
+ * used as an image is staged in it, as it is committed, and as a snapshot of it is prepared.
  * Whatever the budget, nothing is written to it that would leave the node's disk with less
  * than RESERVE_BYTES free: room is made first, workspaces evicted as they would be over the
  * budget, and what it cannot be made for is refused.
  */
-import { link, mkdir, readdir, rename, rm, stat, statfs, symlink, utimes } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 
 import { Clock, Effect, Schema } from "effect";
@@ -38,6 +48,21 @@ export const RESERVE_BYTES = 2 * 1024 ** 3;
 
 /** The directory of a workspace's images, each in one named by its digest; and of a snapshot's, its layers. */
 export const LAYERS_DIR = "layers";
+
+/** The directory of a workspace's images' stamps, each named by its image's digest. */
+export const STAMPS_DIR = "stamps";
+
+/** A file of an image as it was checked: its path in the image, its size, and its SHA-256, in hex. */
+export interface CheckedFile {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+/** An image's stamp, as the cache keeps it: each of its files as checked, and its inode and modification time then, in nanoseconds, in decimal. */
+const Stamp = Schema.fromJsonString(Schema.Struct({
+  files: Schema.Array(Schema.Struct({ path: Schema.String, bytes: Schema.Number, sha256: Schema.String, inode: Schema.String, modifiedNs: Schema.String })),
+}));
 
 /** An image's digest, as runsc names it: the SHA-256 of its pages metadata, in hex. */
 export const DIGEST = /^[0-9a-f]{64}$/u;
@@ -68,18 +93,33 @@ export class CacheError extends Schema.TaggedError<CacheError>()("CacheError", {
   }
 }
 
+/** Whether the cache is to spare a workspace, whatever its budget, as one being written or read is. */
+export type Spared = (workspace: { readonly environment: string; readonly workspace: string }) => boolean;
+
 /** The node's snapshot cache; see makeSnapshotCache. */
 export interface SnapshotCache {
   /** The directory of the workspace's images, where the agent keeps beside them what they are. */
   readonly workspace: (environment: string, workspace: string) => string;
   /** Where the image `digest` of the workspace is once it is whole. */
   readonly image: (environment: string, workspace: string, digest: string) => string;
-  /** Where an image is written until it is whole and its digest known, `name` the snapshot it is of, emptied first. */
+  /** Where an image is written until it is whole and its digest known, `name` the snapshot it is of, emptied first. The workspace is used now. */
   readonly stage: (environment: string, workspace: string, name: string) => Effect.Effect<string, CacheError>;
   /** Removes the image staged as `name`, as a save that failed left it. */
   readonly unstage: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
   /** Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the staged one removed. */
   readonly commit: (environment: string, workspace: string, name: string, digest: string) => Effect.Effect<void, CacheError>;
+  /**
+   * Records the image `digest` of the workspace as `files`, its files as they were checked
+   * as they were written: each by its SHA-256, and its size, inode and modification time now.
+   */
+  readonly stamp: (environment: string, workspace: string, digest: string, files: readonly CheckedFile[]) => Effect.Effect<void, CacheError>;
+  /**
+   * The files of the image `digest` of the workspace as its stamp records them, if they are
+   * the files it holds, each of the size, inode and modification time recorded; null where
+   * it has no stamp, or one of them has changed since, as what changes a file does. None of
+   * its files is read.
+   */
+  readonly stamped: (environment: string, workspace: string, digest: string) => Effect.Effect<readonly CheckedFile[] | null, CacheError>;
   /** Whether the image `digest` of the workspace is whole in the cache. */
   readonly holds: (environment: string, workspace: string, digest: string) => Effect.Effect<boolean, CacheError>;
   /**
@@ -99,13 +139,13 @@ export interface SnapshotCache {
   readonly discard: (environment: string, workspace: string, keep: readonly string[]) => Effect.Effect<boolean, CacheError>;
   /** The workspaces the cache holds images of. */
   readonly list: Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Evicts workspaces, least recently used first, until the cache is within its budget: those evicted. */
-  readonly evict: Effect.Effect<readonly CachedWorkspace[], CacheError>;
+  /** Evicts workspaces, least recently used first, but those `spared` says to spare, until the cache is within its budget: those evicted. */
+  readonly evict: (spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
   /**
    * Makes room on the disk for `bytes` more, RESERVE_BYTES left beside them, evicting
-   * workspaces as `evict` does but `keep`: those evicted. Fails, saying so, where it cannot.
+   * workspaces as `evict` does: those evicted. Fails, saying so, where it cannot.
    */
-  readonly room: (bytes: number, keep: { readonly environment: string; readonly workspace: string }) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
+  readonly room: (bytes: number, spared: Spared) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
   /** Removes what was left half written. */
   readonly clean: Effect.Effect<void, CacheError>;
 }
@@ -163,6 +203,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     return join(workspaceDir(environment, workspace), LAYERS_DIR, digest);
   };
 
+  const stampOf = (environment: string, workspace: string, digest: string): string => {
+    checked(environment, workspace, null, [digest]);
+    return join(workspaceDir(environment, workspace), STAMPS_DIR, `${digest}.json`);
+  };
+
   const use = (environment: string, workspace: string): Effect.Effect<void, CacheError> =>
     Clock.currentTimeMillis.pipe(
       Effect.flatMap((now) => attempt(() => utimes(workspaceDir(environment, workspace), now / 1000, now / 1000))),
@@ -198,7 +243,7 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       return attempt(async () => {
         await rm(directory, { recursive: true, force: true });
         await mkdir(directory, { recursive: true });
-      }).pipe(Effect.as(directory));
+      }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
     },
 
     unstage: (environment, workspace, name) => {
@@ -214,6 +259,41 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         Effect.andThen(use(environment, workspace)),
       );
     },
+
+    stamp: (environment, workspace, digest, files) =>
+      attempt(async () => {
+        const directory = image(environment, workspace, digest);
+        const stamped = await Promise.all(files.map(async (file) => {
+          const { ino, mtimeNs } = await stat(join(directory, file.path), { bigint: true });
+          return { ...file, inode: String(ino), modifiedNs: String(mtimeNs) };
+        }));
+        const path = stampOf(environment, workspace, digest);
+        // Written beside it, then moved in, so a stamp is always whole.
+        const writing = join(workspaceDir(environment, workspace), STAMPS_DIR, `.${digest}.json`);
+        await mkdir(join(workspaceDir(environment, workspace), STAMPS_DIR), { recursive: true });
+        await writeFile(writing, JSON.stringify({ files: stamped }));
+        await rename(writing, path);
+      }),
+
+    stamped: (environment, workspace, digest) =>
+      attempt(async () => {
+        const text = await readFile(stampOf(environment, workspace, digest), "utf8").catch(() => null);
+        const decoded = text === null ? null : Schema.decodeUnknownOption(Stamp)(text);
+        if (decoded === null || decoded._tag === "None") return null;
+        const { files } = decoded.value;
+        const directory = image(environment, workspace, digest);
+        // The files it holds, every one of them the stamp's.
+        const held = (await readdir(directory, { withFileTypes: true, recursive: true }).catch(() => []))
+          .filter((entry) => !entry.isDirectory())
+          .map((entry) => relative(directory, join(entry.parentPath, entry.name)))
+          .sort();
+        if (JSON.stringify(held) !== JSON.stringify(files.map(({ path }) => path).toSorted())) return null;
+        for (const { path, bytes, inode, modifiedNs } of files) {
+          const found = await stat(join(directory, path), { bigint: true }).catch(() => null);
+          if (found === null || found.size !== BigInt(bytes) || String(found.ino) !== inode || String(found.mtimeNs) !== modifiedNs) return null;
+        }
+        return files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 }));
+      }),
 
     holds,
 
@@ -233,7 +313,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
     },
 
-    drop: (environment, workspace, digest) => attempt(() => rm(image(environment, workspace, digest), { recursive: true, force: true })),
+    drop: (environment, workspace, digest) =>
+      attempt(async () => {
+        await rm(stampOf(environment, workspace, digest), { force: true });
+        await rm(image(environment, workspace, digest), { recursive: true, force: true });
+      }),
 
     clear: (environment, workspace) => attempt(() => rm(workspaceDir(environment, workspace), { recursive: true, force: true })),
 
@@ -247,7 +331,9 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         yield* attempt(async () => {
           for (const snapshot of (await directories(directory)).filter((name) => SNAPSHOT.test(name))) await rm(join(directory, snapshot), { recursive: true, force: true });
           for (const digest of await directories(join(directory, LAYERS_DIR))) {
-            if (!keep.includes(digest)) await rm(join(directory, LAYERS_DIR, digest), { recursive: true, force: true });
+            if (keep.includes(digest)) continue;
+            await rm(join(directory, STAMPS_DIR, `${digest}.json`), { force: true });
+            await rm(join(directory, LAYERS_DIR, digest), { recursive: true, force: true });
           }
           // Removing them used it, which it was not.
           await utimes(directory, usedAt / 1000, usedAt / 1000);
@@ -257,28 +343,29 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
 
     list,
 
-    evict: Effect.gen(function*() {
-      const now = yield* Clock.currentTimeMillis;
-      const held = [...(yield* list)].sort((a, b) => a.usedAt - b.usedAt);
-      let total = held.reduce((sum, { bytes }) => sum + bytes, 0);
-      const evicted: CachedWorkspace[] = [];
-      for (const cached of held) {
-        if (total <= budget) break;
-        if (now - cached.usedAt < graceMs) continue;
-        yield* remove(cached);
-        total -= cached.bytes;
-        evicted.push(cached);
-      }
-      return evicted;
-    }),
+    evict: (spared) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis;
+        const held = [...(yield* list)].sort((a, b) => a.usedAt - b.usedAt);
+        let total = held.reduce((sum, { bytes }) => sum + bytes, 0);
+        const evicted: CachedWorkspace[] = [];
+        for (const cached of held) {
+          if (total <= budget) break;
+          if (now - cached.usedAt < graceMs || spared(cached)) continue;
+          yield* remove(cached);
+          total -= cached.bytes;
+          evicted.push(cached);
+        }
+        return evicted;
+      }),
 
-    room: (bytes, keep) =>
+    room: (bytes, spared) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis;
         let available = yield* attempt(() => free(root));
         const evicted: CachedWorkspace[] = [];
         const evictable = [...(yield* list)]
-          .filter((cached) => (cached.environment !== keep.environment || cached.workspace !== keep.workspace) && now - cached.usedAt >= graceMs)
+          .filter((cached) => !spared(cached) && now - cached.usedAt >= graceMs)
           .sort((a, b) => a.usedAt - b.usedAt);
         for (const cached of evictable) {
           if (available >= bytes + RESERVE_BYTES) break;
@@ -296,9 +383,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     clean: attempt(async () => {
       for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
         for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
-          const layers = join(workspaceDir(environment, workspace), LAYERS_DIR);
-          const entries = await readdir(layers).catch(() => [] as string[]);
-          await Promise.all(entries.filter((name) => name.startsWith(".")).map((name) => rm(join(layers, name), { recursive: true, force: true })));
+          for (const under of [LAYERS_DIR, STAMPS_DIR]) {
+            const directory = join(workspaceDir(environment, workspace), under);
+            const entries = await readdir(directory).catch(() => [] as string[]);
+            await Promise.all(entries.filter((name) => name.startsWith(".")).map((name) => rm(join(directory, name), { recursive: true, force: true })));
+          }
         }
       }
     }),
