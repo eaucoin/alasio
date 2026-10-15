@@ -35,10 +35,10 @@
  * this checkout by the cut-over the box runs (cutOver).
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -214,8 +214,13 @@ export function alasio(...args: string[]): Promise<Ran> {
 
 /** Runs this checkout's `alasio ...args`, which the upgrade shard upgrades to, whichever the run runs: what it came to. */
 export function releaseAlasio(...args: string[]): Promise<Ran> {
-  const { release, env } = current();
-  return capture(spawn(release, args, { env, stdio: ["ignore", "pipe", "pipe"] }));
+  return releaseAlasioWith({}, ...args);
+}
+
+/** Runs this checkout's `alasio ...args` as releaseAlasio does, with `env` over the run's environment. */
+export function releaseAlasioWith(env: NodeJS.ProcessEnv, ...args: string[]): Promise<Ran> {
+  const { release } = current();
+  return capture(spawn(release, args, { env: { ...current().env, ...env }, stdio: ["ignore", "pipe", "pipe"] }));
 }
 
 /** Runs `alasio ...args`, which must succeed: what it printed. */
@@ -738,12 +743,30 @@ async function trustTelegramStandIn(): Promise<void> {
 const shellWord = (word: string): string => `'${word.replaceAll("'", `'\\''`)}'`;
 
 /**
+ * The run's configuration's directory (XDG_CONFIG_HOME) copied, the copy's configuration given
+ * this release's settings as the cut-over gives them before it upgrades, by its own step
+ * (upgrades/from-<PREVIOUS>.sh release-settings): the copy's directory.
+ */
+export async function releaseSettings(): Promise<string> {
+  const { configFile } = current();
+  const configHome = dirname(dirname(configFile));
+  const copy = `${configHome}-release`;
+  rmSync(copy, { recursive: true, force: true });
+  cpSync(configHome, copy, { recursive: true });
+  const file = join(copy, "alasio", "config.json");
+  const { stdout } = await promisify(execFile)("bash", [join(root, "upgrades", `from-${PREVIOUS}.sh`), "release-settings", file]);
+  writeFileSync(file, stdout, { mode: 0o600 });
+  return copy;
+}
+
+/**
  * The upgrade shard's cut-over, as the box runs it: upgrades/from-<PREVIOUS>.sh, as root,
- * kubectl reaching the cluster by the run's kubeconfig, its UPGRADE this checkout's
- * `alasio upgrade` as this user, the run's install
+ * kubectl reaching the cluster by the run's kubeconfig, its CONFIG the run's configuration's
+ * file, its UPGRADE this checkout's `alasio upgrade` as this user, the run's install
  * configuration of this checkout laid over the configuration first (./release-config.ts), as
- * this checkout's command line, of no release, pins no images of its own, and its
- * UPGRADE_CHECK this checkout's `alasio upgrade --check` as this user and sudo asking this
+ * this checkout's command line, of no release, pins no images of its own, and its UPGRADE_CHECK
+ * this checkout's `alasio upgrade --check` as this user, on a copy of the configuration laid
+ * over so, as the configuration itself is laid over only as UPGRADE runs, and sudo asking this
  * user for no password; failing at `failAt`, a point the script names, when given. What it
  * came to; from its success on, the run runs this checkout's `alasio`.
  */
@@ -754,14 +777,23 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   const installFile = join(work, "release-install.json");
   writeFileSync(installFile, JSON.stringify(installation("release")), { mode: 0o600 });
   const user = userInfo().username;
-  const asOwner = ["sudo", "-u", user, "env", ...["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME"].map((name) => `${name}=${env[name] ?? ""}`)];
+  const owner = (configHome: string) => ["sudo", "-u", user, "env", ...["HOME", "PATH", "XDG_DATA_HOME"].map((name) => `${name}=${env[name] ?? ""}`), `XDG_CONFIG_HOME=${configHome}`];
   const command = (...words: string[]) => words.map(shellWord).join(" ");
-  const configured = command(...asOwner, process.execPath, join(root, "test", "e2e", "release-config.ts"), configFile, installFile);
-  const upgrade = `${configured} && ${command(...asOwner, release, "upgrade", "--timeout", "30m")}`;
-  const check = `${command(...asOwner, release, "upgrade", "--check")} && ${command("sudo", "-u", user, "sudo", "-n", "true")}`;
+  const configured = (configHome: string) =>
+    command(...owner(configHome), process.execPath, join(root, "test", "e2e", "release-config.ts"), join(configHome, "alasio", "config.json"), installFile);
+  const configHome = env["XDG_CONFIG_HOME"] ?? "";
+  const upgrade = `${configured(configHome)} && ${command(...owner(configHome), release, "upgrade", "--timeout", "30m")}`;
+  const copy = join(work, "check-config");
+  const check = [
+    command(...owner(configHome), "rm", "-rf", copy),
+    command(...owner(configHome), "cp", "-a", configHome, copy),
+    configured(copy),
+    command(...owner(copy), release, "upgrade", "--check"),
+    command("sudo", "-u", user, "sudo", "-n", "true"),
+  ].join(" && ");
   const out = join(work, "cut-over");
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;

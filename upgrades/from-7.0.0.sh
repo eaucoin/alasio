@@ -6,7 +6,8 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> OUT=<dir> [FAIL_AT=<point>] upgrades/from-7.0.0.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-7.0.0.sh
+#   upgrades/from-7.0.0.sh release-settings <file>
 #
 # UPGRADE runs the release's upgrade as the configuration's owner, which restarts alasio,
 # ending the turn it runs; UPGRADE_CHECK proves, before the upgrade, that it can, and that the
@@ -18,7 +19,9 @@
 #   UPGRADE_CHECK="$as npx --yes alasio@<v> upgrade --check && sudo -u <owner> sudo -n true"
 #
 # the last proving that the owner's sudo asks for no password, which the upgrade does what it
-# does as root through. FAIL_AT=before-the-point-of-no-return fails the run there, once every
+# does as root through. CONFIG is that configuration's file
+# (/home/<owner>/.config/alasio/config.json), which the cut-over changes in place before
+# UPGRADE_CHECK reads it. FAIL_AT=before-the-point-of-no-return fails the run there, once every
 # step before the upgrade has run, FAIL_AT=after-the-storage-controller-stopped past it, with
 # the storage controller stopped for node 1 to be registered anew, and
 # FAIL_AT=after-the-pageserver-registered-anew once it is, as the upgrade shard rehearses a
@@ -46,7 +49,18 @@
 # deleted. Once past it (OUT/point-of-no-return), a run again goes on from there.
 set -euo pipefail
 umask 077
-: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${OUT:?where to record}"
+# The configuration $1 in this release's settings, on stdout: the collector's resources gone,
+# as this release has its gateway's and its scraper's. What the cut-over gives the configuration
+# before UPGRADE_CHECK reads it; and what `from-7.0.0.sh release-settings <file>` says alone, as
+# the upgrade shard gives a copy of the configuration it.
+release_settings() {
+  jq 'del(.install.telemetry.collector.resources)' "$1"
+}
+if [ "${1:-}" = release-settings ]; then
+  release_settings "${2:?the configuration file to give them}"
+  exit 0
+fi
+: "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${CONFIG:?the configuration UPGRADE reads}" "${OUT:?where to record}"
 NS=alasio
 PAGESERVERS=alasio-neon-pageserver
 CONTROLLER=alasio-neon-storage-controller
@@ -92,9 +106,14 @@ restore() {
 
 for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
+[ -f "$CONFIG" ] && jq -e '.install | type == "object"' "$CONFIG" >/dev/null 2>&1 || fail "CONFIG, $CONFIG, is not alasio's configuration"
 
 if [ ! -e "$OUT/point-of-no-return" ]; then
-  trap 'status=$?; [ "$status" -eq 0 ] || [ -e "$OUT/point-of-no-return" ] || restore' EXIT
+  # The configuration as 7.0.0 reads it, kept in OUT the first time: what the changes below are
+  # made from, so a run again makes the same, and what a failure before the point of no return
+  # puts back, as 7.0.0 reads none of them.
+  [ -e "$OUT/config.json" ] || cp -p "$CONFIG" "$OUT/config.json"
+  trap 'status=$?; [ "$status" -eq 0 ] || [ -e "$OUT/point-of-no-return" ] || { cat "$OUT/config.json" >"$CONFIG"; restore; }' EXIT
   log "checking that the storage controller has node 1 registered as 7.0.0's setup named it"
   [ -e "$OUT/pageserver-registered" ] || { on_controller_db "$NODE1" >"$OUT/pageserver-registered.part" || unanswered; mv "$OUT/pageserver-registered.part" "$OUT/pageserver-registered"; }
   [ "$(cat "$OUT/pageserver-registered")" = "$REGISTERED" ] ||
@@ -116,6 +135,13 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
       k delete statefulset "$PAGESERVERS" --cascade=orphan >/dev/null
     fi
   fi
+  # The configuration in this release's settings, rewritten whole, its owner and mode kept,
+  # before UPGRADE_CHECK reads it.
+  log "giving $CONFIG this release's settings"
+  release_settings "$OUT/config.json" >"$CONFIG.part"
+  chown --reference="$CONFIG" "$CONFIG.part"
+  chmod --reference="$CONFIG" "$CONFIG.part"
+  mv "$CONFIG.part" "$CONFIG"
   bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1 || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"
@@ -167,7 +193,7 @@ fi
 log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
 printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
 bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
-  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again"
+  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: write $OUT/config.json back to $CONFIG; stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again"
 # Given pod 0's, or asleep, as it then fetches its spec, with it, as it wakes.
 given() {
   local replicas layout

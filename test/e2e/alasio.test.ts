@@ -63,6 +63,8 @@ import {
   PREVIOUS,
   ref,
   releaseAlasio,
+  releaseAlasioWith,
+  releaseSettings,
   RELEASE_AFTER_SECONDS,
   SESSIONS,
   setUp,
@@ -170,6 +172,10 @@ interface Scenario {
   readonly check: () => Promise<void>;
 }
 
+/** The collector's settings, as the configuration `config` has them. */
+const collectorOf = (config: { readonly install?: { readonly telemetry?: { readonly collector?: Readonly<Record<string, unknown>> } } }): Readonly<Record<string, unknown>> =>
+  config.install?.telemetry?.collector ?? {};
+
 /** Whether `call` is the answer of a turn on Codex, the stand-in's, in the chat `chat`, the operator's unless given. */
 const answered = (call: RecordedCall, chat?: number) =>
   call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER && (chat === undefined || Number(call.payload.chat_id) === chat);
@@ -217,6 +223,10 @@ if (inShard("upgrade")) {
       (await kube.get(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.metadata?.uid,
       (await kube.get(ref("Pod", `${neonName("pageserver")}-0`, NAMESPACE)))?.metadata?.uid,
     ];
+    /** When the telemetry the lake held was counted, and how many of alasio's spans it held then; and when the cut-over was through. */
+    let counted: number;
+    let spans: number;
+    let upgraded: number;
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -231,7 +241,9 @@ if (inShard("upgrade")) {
         },
         keeps: "main's conversations go on where they were mounted, in the session workspace and in the folder, each file as it was",
         check: async () => {
-          assert.match(await alasioOk("status"), new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
+          // What status says of the compute alone: the lake's intake, which KEDA scales from none as the log
+          // fills, may be starting as it runs, not yet ready.
+          assert.match((await alasio("status")).stdout, new RegExp(`^ {2}Deployment ${NAMESPACE}/alasio-neon-compute: awake`, "mu"));
           assert.equal(await onDatabase(NAMESPACE, "select working_directory from state.conversations where id = 'telegram:1001'"), `sessionfs:${volumeId}`);
           assert.equal(await onDatabase(NAMESPACE, `select working_directory from state.conversations where id = 'telegram:${FOLDER_CHAT}'`), folder);
           await tg.say("again");
@@ -277,6 +289,32 @@ if (inShard("upgrade")) {
           await untilInLake("main's turn, loaded through its read replica", `select count(*) as n from codex.turns where epoch_ms(completed_at) >= ${since}`, 600_000);
         },
       },
+      {
+        seeds: "the stack's telemetry in the lake, as the collector wrote it to the lake's intake",
+        seed: async () => {
+          const traces = "select count(*) as n from otel.traces where ServiceName = 'alasio'";
+          await untilInLake("trace of alasio's", traces);
+          counted = Date.now();
+          spans = Number((await lakeQuery(traces))[0]?.["n"]);
+        },
+        keeps: "the lake keeps the telemetry it held, and takes the stack's through the log",
+        check: async () => {
+          const before = Number((await lakeQuery(`select count(*) as n from otel.traces where ServiceName = 'alasio' and Timestamp < make_timestamp(${counted * 1000})`))[0]?.["n"]);
+          assert.ok(before >= spans, `the lake holds ${before} of alasio's spans of before the upgrade, not the ${spans} it held`);
+          await untilInLake("trace of alasio's, through the log", `select count(*) as n from otel.traces where ServiceName = 'alasio' and Timestamp > make_timestamp(${upgraded * 1000})`);
+          assert.ok(Number((await lakeQuery("select count(*) as n from otel.intake_offsets"))[0]?.["n"]) > 0, "the lake's intake reads the log");
+        },
+      },
+      {
+        seeds: "a configuration that sets the collector's resources, as 7.0.0's may",
+        seed: async () => {
+          assert.ok(collectorOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["resources"]);
+        },
+        keeps: "the configuration without them, which this release has as its gateway's and its scraper's",
+        check: async () => {
+          assert.equal(collectorOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["resources"], undefined);
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -305,7 +343,13 @@ if (inShard("upgrade")) {
       const before = await pageservers();
       const alasioGeneration = async () => (await kube.get(ref("Deployment", RELEASE, NAMESPACE)))?.metadata?.generation;
       const generation = await alasioGeneration();
-      const refused = await releaseAlasio("upgrade");
+      // 7.0.0's configuration as it is, refused for what this release has no setting of.
+      const unedited = await releaseAlasio("upgrade");
+      assert.notEqual(unedited.code, 0, unedited.stdout);
+      assert.match(unedited.stderr, /install\.telemetry\.collector\.resources Expected no excess property/u);
+      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
+      // Given this release's settings, as the cut-over gives them, refused for the StatefulSet.
+      const refused = await releaseAlasioWith({ XDG_CONFIG_HOME: await releaseSettings() }, "upgrade");
       assert.notEqual(refused.code, 0, refused.stdout);
       assert.ok(refused.stderr.includes(`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`) && refused.stderr.includes(`upgrades/from-${PREVIOUS}.sh`), refused.stderr);
       assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
@@ -419,6 +463,7 @@ if (inShard("upgrade")) {
       assert.equal(ran.code, 0, ran.stdout);
       assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
       assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded\n$/u);
+      upgraded = Date.now();
     });
 
     test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
