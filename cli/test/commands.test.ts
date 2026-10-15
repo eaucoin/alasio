@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import { Cause, Exit } from "effect";
@@ -884,6 +884,58 @@ test("upgrade installs this version's k3s and gVisor in place of those installed
   assert.equal(setup.machine.read("/usr/local/bin/runsc"), "runsc 21000101.0\n");
   assert.equal(setup.machine.read("/usr/local/bin/k3s"), "k3s v1.100.0+k3s1\n");
   assert.deepEqual(rootSteps(await runAlasio(["up"], { env: setup.env, machine: setup.machine, releases: newer })), []);
+});
+
+test("an up or upgrade alasio refuses changes nothing of the machine first: no k3s or gVisor installed anew, nothing run as root", async (t) => {
+  const setup = await onHost(t);
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: "21000101.0" });
+  const run = (command: string) => runAlasio(command.split(" "), { env: setup.env, machine: setup.machine, releases: newer });
+  const ran = setup.machine.ran.length;
+  setup.kube.put("persistentvolumeclaims", { apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "data-alasio-seaweedfs-0", namespace: "alasio" }, spec: {} });
+  for (const command of ["up", "upgrade", "upgrade --check"]) {
+    const refused = await run(command);
+    assert.match(failure(refused), /^the object store still keeps its data on the volume of its one pod, the claim data-alasio-seaweedfs-0, /u);
+    assert.deepEqual(rootSteps(refused), []);
+  }
+  setup.kube.objects.delete("/api/v1/namespaces/alasio/persistentvolumeclaims/data-alasio-seaweedfs-0");
+  // A branch environment another release made.
+  setup.kube.put("namespaces", { apiVersion: "v1", kind: "Namespace", metadata: { name: "alasio-branch-try", labels: { "alasio.dev/branch": "try" } } });
+  setup.kube.put("deployments", { apiVersion: "apps/v1", kind: "Deployment", metadata: { name: "alasio", namespace: "alasio-branch-try", labels: { "app.kubernetes.io/version": "6.0.0" } }, spec: {} });
+  for (const command of ["upgrade", "upgrade --check"]) {
+    const refused = await run(command);
+    assert.match(failure(refused), /^alasio upgrades main alone, and a branch environment another release made would not run on what upgrading changes: try, which alasio 6\.0\.0 made\. /u);
+    assert.deepEqual(rootSteps(refused), []);
+  }
+  setup.kube.objects.delete("/api/v1/namespaces/alasio-branch-try");
+  const checked = await run("upgrade --check");
+  succeeded(checked);
+  assert.deepEqual(checked.printed, ["alasio would upgrade k3s on this machine to 0.0.0-development: it refuses nothing there now; nothing was changed."]);
+  assert.deepEqual(rootSteps(checked), []);
+  assert.equal(setup.machine.ran.length, ran);
+  assert.equal(setup.machine.read("/usr/local/bin/k3s"), "k3s v1.99.0+k3s1\n");
+  assert.equal(setup.machine.read("/usr/local/bin/runsc"), "runsc 20990101.0\n");
+});
+
+test("upgrade refuses to change the machine for a cluster it made that does not answer, where up starts it", async (t) => {
+  const setup = await onHost(t);
+  const newer = fakeReleases({ k3s: "v1.100.0+k3s1", gvisor: "21000101.0" });
+  const run = (args: readonly string[]) => runAlasio(args, { env: setup.env, machine: setup.machine, releases: newer });
+  const kubeconfig = join(dirname(setup.configFile), "kubeconfig");
+  const written: { clusters: { cluster: { server: string } }[] } = JSON.parse(readFileSync(kubeconfig, "utf8"));
+  // The API as a stopped k3s leaves it: nothing listens where the kubeconfig points.
+  for (const { cluster } of written.clusters) cluster.server = "https://127.0.0.1:1";
+  writeFileSync(kubeconfig, JSON.stringify(written));
+  const ran = setup.machine.ran.length;
+  const refused = await run(["upgrade"]);
+  assert.equal(
+    failure(refused),
+    "k3s on this machine does not answer, so alasio cannot check whether it would refuse this upgrade before it changes this machine for it: " +
+      "start it as it is, with the alasio that made it (its alasio up), then upgrade",
+  );
+  assert.deepEqual(rootSteps(refused), []);
+  assert.equal(setup.machine.ran.length, ran);
+  assert.match(failure(await run(["upgrade", "--check"])), /^Kubernetes could not be reached for GET /u);
+  succeeded(await run(["up"]));
 });
 
 test("a download that is not what alasio pins is refused before anything is done as root", async (t) => {

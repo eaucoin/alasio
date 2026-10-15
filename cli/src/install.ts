@@ -53,11 +53,17 @@ export interface Installed {
   readonly claude: boolean;
 }
 
-/** Applies the installation `config` describes, once its bot is set, and waits until it runs. */
-export const install = Effect.fnUntraced(function*(
+/**
+ * The installation `config` describes, with its bot, refused where applying it would not do:
+ * with no bot set, against the cluster's own autoscalers, or its object store's layout and scale.
+ */
+export const checkInstallation = Effect.fnUntraced(function*(
   config: OperatorConfig,
-  options: WaitOptions,
-): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
+): Effect.fn.Return<
+  { readonly bot: TelegramBot; readonly settings: InstallConfig; readonly objects: readonly KubernetesObject[] },
+  KubeApiError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError,
+  KubeApi
+> {
   const bot = yield* readTelegramBot;
   if (!bot) return yield* new BotNotSet();
   const settings = yield* installConfig(config);
@@ -65,6 +71,15 @@ export const install = Effect.fnUntraced(function*(
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
+  return { bot, settings, objects };
+});
+
+/** Applies the installation `config` describes, once its bot is set, and waits until it runs. */
+export const install = Effect.fnUntraced(function*(
+  config: OperatorConfig,
+  options: WaitOptions,
+): Effect.fn.Return<Installed, ApplyError | AutoscalerMismatch | ObjectStoreScaleRefused | BotNotSet | OperatorConfigError, KubeApi> {
+  const { bot, settings, objects } = yield* checkInstallation(config);
   yield* applyInstallation(objects, options);
   return { bot, claude: settings.alasio.claude.existingSecret !== "" };
 });

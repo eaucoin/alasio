@@ -1,5 +1,5 @@
 /** `alasio up`: makes or starts the cluster on this machine, applies alasio, and waits until it runs. */
-import { Console, Effect } from "effect";
+import { Console, Effect, Schema } from "effect";
 import { Command } from "effect/cli";
 
 import { DockerCluster } from "../cluster/docker.ts";
@@ -7,7 +7,9 @@ import { HostCluster } from "../cluster/host.ts";
 import { inotifyStep, requireLocalMachine } from "../cluster/machine.ts";
 import { Root } from "../cluster/root.ts";
 import { loadConfig, type OperatorConfig } from "../config.ts";
-import { install, type Installed } from "../install.ts";
+import { checkInstallation, install, type Installed } from "../install.ts";
+import { kind, KubeApi } from "../kube/api.ts";
+import { NAMESPACE } from "../manifests/common.ts";
 import { VERSION } from "../release.ts";
 import { describeTarget, dockerCluster, kubeApi, type ResolvedTarget, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
@@ -30,6 +32,40 @@ export const ensureCluster = (target: ResolvedTarget) =>
     yield* Effect.provide(Effect.flatMap(DockerCluster, (cluster) => cluster.up(target.kubeconfig.path)), dockerCluster(target.cluster));
   });
 
+/** The cluster on this machine alasio made is stopped, so what an upgrade would refuse cannot be checked before it changes the machine. */
+export class ClusterStopped extends Schema.TaggedError<ClusterStopped>()("ClusterStopped", {
+  cluster: Schema.String,
+}) {
+  override get message(): string {
+    return `${this.cluster} does not answer, so alasio cannot check whether it would refuse this upgrade before it changes this machine ` +
+      "for it: start it as it is, with the alasio that made it (its alasio up), then upgrade";
+  }
+}
+
+/**
+ * Runs `check`, which refuses what is not to be done, before `ensureCluster` changes anything
+ * of this machine for the cluster on it (k3s, gVisor, alasio's stamp of them), where that
+ * cluster answers. One alasio has not made yet holds nothing of alasio's to refuse. One it
+ * made, its kubeconfig written, that does not answer, as it is stopped, holds an
+ * installation: `whenStopped` says whether to go on, as up does, which starts it and checks
+ * as it applies alasio, or to refuse, as an upgrade does, which would change the machine
+ * before it could check. A cluster a kubeconfig reaches, which ensureCluster leaves alone, is
+ * checked as alasio is applied.
+ */
+export const refuseFirst = <E>(target: ResolvedTarget, check: Effect.Effect<void, E, KubeApi>, whenStopped: "go on" | "refuse") =>
+  Effect.gen(function*() {
+    if (target._tag === "Kubeconfig") return;
+    const answers = Effect.flatMap(KubeApi, (kube) => kube.get({ ...kind("Namespace"), name: NAMESPACE })).pipe(
+      Effect.as(true),
+      Effect.catchIf((error) => error.status === undefined, () => Effect.succeed(false)),
+    );
+    const checked = Effect.gen(function*() {
+      if (yield* answers) return yield* check;
+      if (whenStopped === "refuse") return yield* new ClusterStopped({ cluster: describeTarget(target) });
+    });
+    yield* Effect.provide(checked, kubeApi(target)).pipe(Effect.catchTag("KubeconfigUnusable", () => Effect.void));
+  });
+
 /** Where alasio runs, and what the operator does next. */
 export const announce = (target: ResolvedTarget, { bot, claude }: Installed): Effect.Effect<void> =>
   Console.log(
@@ -46,6 +82,7 @@ export const announce = (target: ResolvedTarget, { bot, claude }: Installed): Ef
 /** Brings up what `config` describes, waiting `timeout` at most for it to run. */
 export const bringUp = Effect.fnUntraced(function*(config: OperatorConfig, timeout: Parameters<typeof waitOptions>[0]) {
   const target = yield* resolveTarget(config);
+  yield* refuseFirst(target, Effect.asVoid(checkInstallation(config)), "go on");
   yield* ensureCluster(target);
   const installed = yield* Effect.provide(install(config, waitOptions(timeout)), kubeApi(target));
   yield* announce(target, installed);

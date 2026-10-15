@@ -1,18 +1,18 @@
 /** `alasio upgrade`: `up` with this version of the package's images, saying what changes; refused while a branch environment another release made exists. */
 import type { KubernetesObject, V1PodSpec } from "@kubernetes/client-node";
 import { Console, Effect } from "effect";
-import { Command } from "effect/cli";
+import { Command, Flag } from "effect/cli";
 
 import { refuseBranchesOfOtherReleases } from "../branches.ts";
-import { loadConfig } from "../config.ts";
-import { install, installationObjects, installConfig } from "../install.ts";
+import { loadConfig, type OperatorConfig } from "../config.ts";
+import { checkInstallation, install, installationObjects, installConfig } from "../install.ts";
 import { kind, KubeApi } from "../kube/api.ts";
 import { INSTALLATION_SELECTOR } from "../kube/apply.ts";
 import { RELEASE } from "../manifests/common.ts";
 import { VERSION } from "../release.ts";
-import { kubeApi, resolveTarget } from "../target.ts";
+import { describeTarget, kubeApi, resolveTarget } from "../target.ts";
 import { timeoutFlag, waitOptions } from "./common.ts";
-import { announce, ensureCluster } from "./up.ts";
+import { announce, ensureCluster, refuseFirst } from "./up.ts";
 
 const WORKLOADS = ["Deployment", "StatefulSet", "CronJob"] as const;
 
@@ -44,10 +44,24 @@ function imageChanges(before: { readonly version: string | null; readonly images
   ];
 }
 
-export const upgrade = Command.make("upgrade", { timeout: timeoutFlag }, ({ timeout }) =>
+/** What an upgrade to this version refuses: a branch environment another release made, or what applying alasio refuses. */
+const refusals = (config: OperatorConfig) => Effect.andThen(refuseBranchesOfOtherReleases(VERSION), Effect.asVoid(checkInstallation(config)));
+
+export const upgrade = Command.make("upgrade", {
+  timeout: timeoutFlag,
+  check: Flag.Boolean("check").pipe(
+    Flag.withDefault(false),
+    Flag.withDescription("Check only, changing nothing, that alasio would upgrade: fail with what it would refuse, if anything"),
+  ),
+}, ({ timeout, check }) =>
   Effect.gen(function*() {
     const config = yield* loadConfig;
     const target = yield* resolveTarget(config);
+    if (check) {
+      yield* Effect.provide(refusals(config), kubeApi(target));
+      return yield* Console.log(`alasio would upgrade ${describeTarget(target)} to ${VERSION}: it refuses nothing there now; nothing was changed.`);
+    }
+    yield* refuseFirst(target, refusals(config), "refuse");
     yield* ensureCluster(target);
     yield* Effect.provide(
       Effect.gen(function*() {
@@ -67,7 +81,9 @@ export const upgrade = Command.make("upgrade", { timeout: timeoutFlag }, ({ time
       "Does what alasio up does, with the images this version of alasio's package pins, after saying which images change " +
         "and from which version of alasio, and, for k3s on this machine, with the k3s and gVisor it pins, saying which it " +
         "installs in place of which. It upgrades main alone, and refuses while a branch environment another release of alasio " +
-        "made exists, which would not run on what it changes: delete each first, and make it again once upgraded. Run as npx " +
-        "alasio@latest upgrade to upgrade to the latest release.",
+        "made exists, which would not run on what it changes: delete each first, and make it again once upgraded. What it refuses " +
+        "it refuses before it changes anything, and with --check it checks for that alone, changing nothing; on this machine, of " +
+        "a cluster it made that does not answer, it can check nothing, so refuses. Run as npx alasio@latest upgrade to upgrade " +
+        "to the latest release.",
     ),
   );
