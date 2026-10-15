@@ -267,6 +267,7 @@ interface ServedComputeConfig {
 
 /** A volume of the object store's, as its master's /vol/status answers it, as far as this test reads it. */
 interface Volume {
+  readonly Id: number;
   readonly Collection: string;
   readonly CompactRevision: number;
   readonly DeletedByteCount: number;
@@ -459,12 +460,18 @@ export function neonStack(): void {
         const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
         const bucket = `replicated-${Date.now()}`;
         await onGateway(gateway, `s3api 127.0.0.1:8333 create-bucket --bucket ${bucket} >/dev/null; for n in $(seq 1 20); do head -c 65536 /dev/urandom > /tmp/$n; s3api 127.0.0.1:8333 put-object --bucket ${bucket} --key $n --body /tmp/$n >/dev/null; done`);
-        // A volume server holding the bucket's volumes, as the masters say.
+        // Each of the bucket's volumes on two volume servers, as the masters say: they grow a
+        // collection by another volume whenever none of its volumes takes a write at once, and
+        // two volumes' servers need not be the same two.
         const status: VolumeStatus = JSON.parse(await onMaster("/vol/status"));
-        const holders = Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.entries(nodes))
-          .filter(([, volumes]) => volumes.some(({ Collection }) => Collection === bucket)).map(([address]) => address);
-        assert.equal(holders.length, 2, `the bucket's volumes are on ${holders.join(", ")}`);
-        const away = podOfAddress(holders[0] ?? "");
+        const holders = new Map<number, string[]>();
+        for (const [address, volumes] of Object.values(status.Volumes.DataCenters).flatMap((racks) => Object.values(racks)).flatMap((nodes) => Object.entries(nodes))) {
+          for (const { Id } of volumes.filter(({ Collection }) => Collection === bucket)) holders.set(Id, [...(holders.get(Id) ?? []), address]);
+        }
+        const placed = [...holders].map(([id, on]) => `${id} on ${on.join(", ")}`).join("; ");
+        assert.ok(holders.size > 0 && [...holders.values()].every((on) => on.length === 2), `the bucket's volumes: ${placed || "none"}`);
+        // A volume server holding some of them.
+        const away = podOfAddress([...holders.values()][0]?.[0] ?? "");
         const node = (await kube.get<V1Pod>(ref("Pod", away, NAMESPACE)))?.spec?.nodeName ?? assert.fail(`${away} runs on no node`);
         const registered = async () => dataNodes(JSON.parse(await onMaster("/dir/status"))).map(({ Url }) => podOfAddress(Url));
         // Its node takes no pod, and its pod, made anew, is placed nowhere else, beside another volume server.
