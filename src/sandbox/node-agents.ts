@@ -8,7 +8,7 @@ import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
-import { type CheckpointRequest, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
+import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
@@ -49,6 +49,8 @@ const Refusal = Schema.Struct({ error: Schema.String });
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 const Collected = Schema.Struct({ kept: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Boolean });
+/** What an agent answers an abandon with: the processes of runsc's it killed. */
+const Abandoned = Schema.Struct({ killed: Schema.Array(Schema.Struct({ containerId: Schema.String, pid: Schema.Number })) });
 
 /** How an agent says a checkpoint or a prepare of a workspace stands (../node-agent/operations.ts), its value as `value` reads it. */
 const OutcomeOf = <A, I>(value: Schema.Codec<A, I>) =>
@@ -86,6 +88,12 @@ export interface NodeAgents {
    * not in force within its wait with 504, the sandbox left paused.
    */
   readonly resume: (node: string, request: ResumeRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Abandons the restore `request` names, into its pod on `node`, refused before its
+   * sandbox resumed: the agent kills what runsc runs for the pod's containers there, so
+   * that its teardown waits on none of it. What it killed.
+   */
+  readonly abandon: (node: string, request: AbandonRequest) => Effect.Effect<readonly Killed[], NodeAgentError | KubeApiError>;
   /** What `node` holds. */
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` the bucket holds anything of. */
@@ -233,6 +241,10 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
         ),
     resume: (node, request) =>
       send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: RESUME_CALL }).pipe(Effect.asVoid),
+    abandon: (node, request) =>
+      ask(node, `abandon ${request.environment}/${request.workspace}'s restore`, { method: "POST", path: "/abandon", body: request, timeout: SHORT_CALL }, Abandoned).pipe(
+        Effect.map(({ killed }) => killed),
+      ),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
     workspaces: (environment) =>
       Effect.flatMap(anyNode, (node) =>
