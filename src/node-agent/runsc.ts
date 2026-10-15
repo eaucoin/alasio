@@ -134,6 +134,18 @@ export interface CheckpointOptions {
   readonly live?: boolean;
 }
 
+/**
+ * How an image is compacted: which image, where runsc finds its layers, and into which
+ * directory, which runsc makes, the new image is written.
+ */
+export interface CompactOptions {
+  readonly imagePath: string;
+  /** A directory of images, each in one named by its digest, among which runsc finds the image's layers. */
+  readonly layerPath: string;
+  /** The directory of the new image, which must not exist. */
+  readonly output: string;
+}
+
 /** The node's releases and their runsc; see makeRunsc. */
 export interface Runsc {
   /** The releases installed on this node, in order. */
@@ -146,8 +158,22 @@ export interface Runsc {
   /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
   readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
+  /**
+   * Checks that the image `imagePath` is whole, as `runsc image verify` does: the checksums
+   * and consistency of its pages metadata, and the identity and size of each of its layers,
+   * which it finds in its `layers/`. Fails, saying what is not, otherwise. It reads none of
+   * its pages.
+   */
+  readonly verify: (release: string, imagePath: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** The digests of the images an image holds pages of besides its own, its layers, which a restore of it reads too. */
   readonly layers: (release: string, imagePath: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
+  /**
+   * Writes an image of the memory the image `imagePath` holds, its layers' pages copied into
+   * its own, but none written over since, and the working set the image recorded first, as
+   * a restore loads it: an image of no layers. It runs at the node's lowest CPU and disk
+   * priorities, as nothing waits on it.
+   */
+  readonly compact: (release: string, options: CompactOptions) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   /** The CPU features of this node, by the names `release` gives them. */
   readonly cpuFeatures: (release: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
   /**
@@ -209,6 +235,9 @@ interface Ran {
 /** The most a run of runsc may print. */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
+/** What runs a command at the node's lowest CPU priority, then at its lowest disk priority of those served in turn. */
+const LOWEST_PRIORITY = ["nice", "-n", "19", "ionice", "-c", "2", "-n", "7"] as const;
+
 /**
  * A process's start time, from its stat: its 22nd field, counted after its name, which is
  * the second, in parentheses, and may hold anything, so the fields after it begin past the
@@ -256,8 +285,8 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
   const installed = (release: string): Effect.Effect<void, ReleaseNotInstalled> =>
     releases.pipe(Effect.filterOrFail((names) => names.includes(release), () => new ReleaseNotInstalled({ release })), Effect.asVoid);
 
-  /** Runs `release`'s runsc's `command` with its shim's flags and `args`. */
-  const run = (release: string, command: readonly string[], args: readonly string[]): Effect.Effect<Ran, RunscError | ReleaseNotInstalled> =>
+  /** Runs `release`'s runsc's `command` with its shim's flags and `args`, at the lowest priority if `lowest`. */
+  const run = (release: string, command: readonly string[], args: readonly string[], lowest = false): Effect.Effect<Ran, RunscError | ReleaseNotInstalled> =>
     installed(release).pipe(
       Effect.andThen(Effect.tryPromise({
         try: async (signal) => {
@@ -265,8 +294,10 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
           const flags = runscFlags(await readFile(options, "utf8").catch((cause: unknown) => {
             throw new Error(`its runtime's options file ${options} is not readable: ${cause instanceof Error ? cause.message : String(cause)}`);
           }));
+          const argv = [join(releasesDir, release, "runsc"), `--root=${root}`, ...flags, ...command, ...args];
+          const [file = "", ...rest] = lowest ? [...LOWEST_PRIORITY, ...argv] : argv;
           return new Promise<Ran>((resolve, reject) => {
-            execFile(join(releasesDir, release, "runsc"), [`--root=${root}`, ...flags, ...command, ...args], { signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
+            execFile(file, rest, { signal, maxBuffer: MAX_OUTPUT_BYTES }, (error, stdout, stderr) => {
               if (error) reject(new Error(stderr.trim() || error.message));
               else resolve({ stdout });
             });
@@ -325,7 +356,12 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         })),
       ),
 
+    verify: (release, imagePath) => run(release, ["image", "verify"], [imagePath]).pipe(Effect.asVoid),
+
     layers: (release, imagePath) => run(release, ["image", "layers"], [imagePath]).pipe(Effect.map(({ stdout }) => stdout.split("\n").filter(Boolean))),
+
+    compact: (release, { imagePath, layerPath, output }) =>
+      run(release, ["image", "compact"], [`--output=${output}`, `--layer-path=${layerPath}`, "--working-set-first", imagePath], true).pipe(Effect.asVoid),
 
     container: (containerId) =>
       Effect.gen(function*() {

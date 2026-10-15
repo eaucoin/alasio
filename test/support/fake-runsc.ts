@@ -9,12 +9,22 @@
  *   ID into DIR, of runsc's three files: its state file, its pages, and its pages metadata,
  *   which here names the images it holds pages of besides its own, its layers: none, or
  *   PARENT's digest and PARENT's layers, failing as runsc does without PARENT's pages
- *   metadata. Or it fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
+ *   metadata, its pages 4096 bytes, or a delta's 512 unless a file `delta-pages-bytes`
+ *   beside it says how many. Or it fails, saying so, while a file `fail-checkpoint` is beside it, or takes a
  *   minute while one `hang-checkpoint` is, or waits while one `hold-checkpoint` is;
  * - `image inspect --json DIR`: describes the image, as saved by the release's runsc, whose
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
  *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's;
  * - `image layers DIR`: its layers' digests, a line each;
+ * - `image verify DIR`: says the image is whole where each of its layers is in DIR/layers,
+ *   of the digest it is named by, as runsc checks each layer's identity; fails, saying which
+ *   is not, otherwise, or while a file `fail-verify` is beside it;
+ * - `image compact --output=OUT --layer-path=LAYERS [--working-set-first] DIR`: writes into
+ *   OUT, which must not exist, an image of DIR's state whose pages are its own and each of
+ *   its layers', which it finds in DIR/layers or LAYERS, failing as runsc does where one is
+ *   in neither, and which refers to no layer, noting beside it, in `compact-priority`, the
+ *   nice value it ran at; or it fails, saying so, while a file
+ *   `fail-compact` is beside it, or waits while one `hold-compact` is;
  * - `resume ID`: says nothing; or fails, saying so, while a file `fail-resume` is beside it;
  * - `cpu-features`: the node's, from `cpu-features`, comma-separated;
  * - `state ID`: the container's sandbox's process and its pod's annotations, as
@@ -63,7 +73,8 @@ const checkpoint = () => {
   const state = "state of " + id + " at " + process.hrtime.bigint();
   writeFileSync(join(image, "checkpoint.img"), state);
   writeFileSync(join(image, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers }));
-  writeFileSync(join(image, "pages.img"), Buffer.alloc(4096, id));
+  // A delta holds what the sandbox wrote since its parent: an eighth of its memory, or what a file delta-pages-bytes says.
+  writeFileSync(join(image, "pages.img"), Buffer.alloc(parent === undefined ? 4096 : Number(read("delta-pages-bytes", "512")), id));
 };
 if (rest[0] === "checkpoint") {
   if (existsSync(join(here, "fail-checkpoint"))) { process.stderr.write("checkpoint failed: the sandbox is gone\\n"); process.exit(128); }
@@ -86,6 +97,41 @@ if (rest[0] === "checkpoint") {
 } else if (rest[0] === "image" && rest[1] === "layers") {
   const image = rest[rest.length - 1];
   for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");
+} else if (rest[0] === "image" && rest[1] === "verify") {
+  const image = rest[rest.length - 1];
+  if (existsSync(join(here, "fail-verify"))) { process.stderr.write("verify failed: the pages metadata of " + image + " fails its checksum\\n"); process.exit(1); }
+  const meta = readFileSync(join(image, "pages_meta.img"));
+  const { layers } = JSON.parse(meta);
+  for (const digest of layers) {
+    const layer = join(image, "layers", digest, "pages_meta.img");
+    if (!existsSync(layer) || sha256(readFileSync(layer)) !== digest) { process.stderr.write("verify failed: layer " + digest + " is not the image of its digest\\n"); process.exit(1); }
+  }
+  process.stdout.write("Image " + sha256(meta) + ": metadata and " + layers.length + " layers OK\\n");
+} else if (rest[0] === "image" && rest[1] === "compact") {
+  const image = rest[rest.length - 1];
+  const output = flag("output");
+  const compact = () => {
+    // How nice it runs, as the agent runs it.
+    writeFileSync(join(here, "compact-priority"), String(require("node:os").getPriority()));
+    if (existsSync(join(here, "fail-compact"))) { process.stderr.write("compact failed: no space left on device\\n"); process.exit(128); }
+    if (existsSync(output)) { process.stderr.write("compact failed: " + output + " exists\\n"); process.exit(1); }
+    const pages = [readFileSync(join(image, "pages.img"))];
+    for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) {
+      const found = [join(image, "layers", digest), join(flag("layer-path"), digest)].find((each) => existsSync(join(each, "pages_meta.img")));
+      if (found === undefined) { process.stderr.write("compact failed: layer " + digest + " not found\\n"); process.exit(1); }
+      pages.push(readFileSync(join(found, "pages.img")));
+    }
+    mkdirSync(output);
+    const state = readFileSync(join(image, "checkpoint.img"));
+    writeFileSync(join(output, "checkpoint.img"), state);
+    writeFileSync(join(output, "pages_meta.img"), JSON.stringify({ state: sha256(state), layers: [], compacted: true }));
+    writeFileSync(join(output, "pages.img"), Buffer.concat(pages));
+  };
+  if (existsSync(join(here, "hold-compact"))) {
+    const held = setInterval(() => { if (!existsSync(join(here, "hold-compact"))) { clearInterval(held); compact(); } }, 20);
+    return;
+  }
+  compact();
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "state") {
