@@ -81,8 +81,11 @@ export const SNAPSHOT_ANNOTATION = "alasio.dev/snapshot";
 export const SNAPSHOT_RELEASE_ANNOTATION = "alasio.dev/snapshot-release";
 /** Where a node agent keeps the snapshots it prepares, as `<environment>/<workspace>/<snapshot>` (../node-agent/cache.ts). */
 export const SNAPSHOT_CACHE_DIR = "/var/lib/alasio/snapshots";
-/** A snapshot's id, as a node agent names it: when it was taken, then 32 random bits. */
-export const SNAPSHOT_ID = "[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}";
+/**
+ * A snapshot's id, as a node agent names it: when it was taken, to the millisecond, so a
+ * workspace's ids sort as its snapshots were taken, then 32 random bits.
+ */
+export const SNAPSHOT_ID = "[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}";
 /** A DNS label: an environment's name (its sessions' namespace) and a workspace's (its Sandbox's), as the snapshot cache's directories are named. */
 export const NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u;
 
