@@ -1,0 +1,66 @@
+name: gate-12-live
+
+# 12's first gate, on its track's branch alone, whenever what it runs changes: a thousand live
+# checkpoints of bayma, in a sandbox of the gVisor release alasio pins, while execs start
+# threads in each of its runtimes (gate/12/live.test.ts), in four jobs of 250.
+on:
+  push:
+    branches: [track/live-lazy-gate]
+    paths: [.github/workflows/gate-12-live.yml, gate/12/live.test.ts]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      # The release alasio pins first, where alasio installs it, a runtime of Docker's that runs
+      # its shim with the options a session's runtime has (cli/src/cluster/k3s.ts) and 12's:
+      # dirty tracking by write-protection, and working sets recorded. Docker restores a
+      # container only with its experimental features on; runsc's sandboxes make user
+      # namespaces, which Ubuntu's AppArmor refuses by default.
+      - name: Install gVisor as alasio does, a runtime of Docker's
+        shell: bash
+        run: |
+          release=$(jq -r '.gvisor.releases[0].release' cluster/node/pins.json)
+          sha512=$(jq -r '.gvisor.releases[0].sha512' cluster/node/pins.json)
+          directory=/usr/local/lib/alasio/gvisor/$release
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://github.com/eaucoin/gvisor/releases/download/release-$release/gvisor-x86_64.tar.zstd"
+          echo "$sha512  $RUNNER_TEMP/gvisor.tar.zstd" | sha512sum -c -
+          sudo mkdir -p "$directory"
+          zstd -dc "$RUNNER_TEMP/gvisor.tar.zstd" | sudo tar -x -C "$directory"
+          sudo mkdir -p /etc/containerd
+          node --input-type=module -e '
+            import { gvisorRuntimeFiles } from "./cli/src/cluster/k3s.ts";
+            const [, options] = [...gvisorRuntimeFiles([process.argv[1]], { systemd: false })].find(([path]) => path.endsWith(".toml"));
+            process.stdout.write(options + "  dirty-tracking = \"wp\"\n  working-set-window = \"3s\"\n");
+          ' "$release" | sudo tee /etc/containerd/runsc.toml
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          { sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}'; } |
+            jq --arg shim "$directory/containerd-shim-runsc-v1" '. + {experimental: true, runtimes: {runsc: {runtimeType: $shim, options: {TypeUrl: "io.containerd.runsc.v1.options", ConfigPath: "/etc/containerd/runsc.toml"}}}}' |
+            sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          echo "RUNSC=$directory/runsc" >>"$GITHUB_ENV"
+      - run: docker build --tag alasio-agent:gate sandbox/agent
+      - run: node --test --test-timeout=10800000 gate/12/live.test.ts
+        env:
+          CHECKPOINTS: 250
+          OUT: ${{ runner.temp }}/gate-12-live
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-12-live-${{ matrix.part }}
+          path: ${{ runner.temp }}/gate-12-live
