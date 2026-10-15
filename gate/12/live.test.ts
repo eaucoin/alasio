@@ -11,8 +11,8 @@
  *
  * It needs root through sudo, Docker with the runtime `runsc` (the release's shim, its options
  * in RUNSC_OPTIONS), the release's runsc at RUNSC, the image GATE_IMAGE (sandbox/agent, built),
- * and writes its record to OUT/evidence.json: gate-12.yml sets them up. CHECKPOINTS is how many
- * this run takes.
+ * and writes its record to OUT/evidence.json: gate-12-live.yml sets them up. CHECKPOINTS is how
+ * many this run takes; CHAIN, PRECOPY and PROFILE_EVERY vary it, to tell what a failure comes from.
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -36,8 +36,12 @@ const OUT = process.env["OUT"] ?? mkdtempSync(join(tmpdir(), "gate-12-"));
 const CHECKPOINTS = Number(process.env["CHECKPOINTS"] ?? 1000);
 /** Where runsc keeps the state of the sandboxes Docker's containerd starts through gVisor's shim. */
 const RUNSC_ROOT = "/run/containerd/runsc/moby";
-/** The longest chain of deltas, as 12's compaction keeps them: the next checkpoint is full. */
-const CHAIN = 16;
+/** The longest chain of deltas, as 12's compaction keeps them: the next checkpoint is full. 1: every one is. */
+const CHAIN = Number(process.env["CHAIN"] ?? 16);
+/** Whether checkpoints pre-copy, as live ones will: PRECOPY=off takes them without. */
+const PRECOPY = process.env["PRECOPY"] !== "off";
+/** Every how many checkpoints the Sentry's heap profile is written to OUT (0: never); runsc's `profile` must be on. */
+const PROFILE_EVERY = Number(process.env["PROFILE_EVERY"] ?? 0);
 /** How long each cycle's execs run, starting threads. */
 const WAVE_MS = 3000;
 /** bayma's port in the session pod. */
@@ -250,6 +254,22 @@ interface Cycle {
   readonly diskFreeBytes: number;
   /** The host's available memory after it (MemAvailable). */
   readonly memoryAvailableBytes: number;
+  /** The Sentry's memory after it: its own (anonymous), the sandbox's memory file it maps (shared), and swapped. */
+  readonly sentry: SentryMemory;
+}
+
+interface SentryMemory {
+  readonly anonBytes: number;
+  readonly sharedBytes: number;
+  readonly swapBytes: number;
+}
+
+/** The memory of the sandbox's Sentry, the largest of the processes named for it (the others are its stubs). */
+async function sentryMemory(): Promise<SentryMemory> {
+  const statuses = await run("sudo", ["sh", "-c", "for pid in $(pgrep -x gvisor_sentry); do grep -E '^(VmRSS|RssAnon|RssShmem|VmSwap):' /proc/$pid/status; echo; done"]);
+  const kib = (status: string, field: string): number => Number(new RegExp(`^${field}:\\s+(\\d+) kB$`, "mu").exec(status)?.[1] ?? 0) * 1024;
+  const sentry = statuses.split("\n\n").reduce((largest, status) => (kib(status, "VmRSS") > kib(largest, "VmRSS") ? status : largest), "");
+  return { anonBytes: kib(sentry, "RssAnon"), sharedBytes: kib(sentry, "RssShmem"), swapBytes: kib(sentry, "VmSwap") };
 }
 
 /** The bytes free on the filesystem of `path`. */
@@ -300,7 +320,8 @@ async function answers(client: Client, runtime: Runtime, sessionId: string, code
 
 test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each of its runtimes: none aborts, every session answers after each`, { timeout: 4 * 60 * 60_000 }, async () => {
   const flags = runscFlags(readFileSync(RUNSC_OPTIONS, "utf8"));
-  assert.ok(flags.includes("--dirty-tracking=wp"), `${RUNSC_OPTIONS} gives runsc ${flags.join(" ")}`);
+  // A delta needs dirty tracking.
+  assert.ok(CHAIN === 1 || flags.includes("--dirty-tracking=wp"), `${RUNSC_OPTIONS} gives runsc ${flags.join(" ")}`);
   const scratch = mkdtempSync(join(tmpdir(), "gate-12-live-"));
   const home = join(scratch, "home");
   const workspace = join(scratch, "workspace");
@@ -312,6 +333,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
   mkdirSync(images);
   const name = `gate-12-live-${process.pid}`;
   const cycles: Cycle[] = [];
+  let sentryBefore: SentryMemory | undefined;
   let failure: string | undefined;
   try {
     // As the session pod runs bayma: its command, arguments, environment and working directory.
@@ -352,6 +374,12 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       await answers(client, runtime, session.session_id, RUNTIME_CODE[runtime].run(200), "7");
     }
 
+    sentryBefore = await sentryMemory();
+    const profile = async (label: string): Promise<void> => {
+      if (PROFILE_EVERY > 0) await run("sudo", [RUNSC, `--root=${RUNSC_ROOT}`, ...flags, "debug", `--profile-heap=${join(OUT, `heap-${label}.pprof`)}`, id]);
+    };
+    mkdirSync(OUT, { recursive: true });
+    await profile("before");
     let parent: string | undefined;
     let chain: string[] = [];
     for (let index = 0; index < CHECKPOINTS; index++) {
@@ -368,14 +396,15 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       await run("sudo", [
         RUNSC, `--root=${RUNSC_ROOT}`, ...flags, "checkpoint",
         `--image-path=${image}`, "--compression=none", "--direct", "--leave-running",
-        "--precopy=auto", "--precopy-throttle=on",
+        ...(PRECOPY ? ["--precopy=auto", "--precopy-throttle=on"] : []),
         ...(parent ? [`--parent-image-path=${parent}`] : []),
         `--save-restore-exec-argv=${hook}`, "--save-restore-exec-timeout=60s",
         id,
       ]);
       const checkpointMs = Date.now() - began - afterMs;
       const bytes = Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]);
-      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable() });
+      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory() });
+      if (PROFILE_EVERY > 0 && (index + 1) % PROFILE_EVERY === 0) await profile(String(index));
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);
         assert.deepEqual({ index, runtime, status: done.status, error: done.error_text, result: done.result_text.trim() }, { index, runtime, status: "ok", error: "", result: "7" });
@@ -391,7 +420,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
         chain.push(image);
         parent = image;
       }
-      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk`);
+      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk, the Sentry's own ${cycles.at(-1)?.sentry.anonBytes} bytes`);
     }
     await client.close();
   } catch (error) {
@@ -401,7 +430,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     const logs = await run("docker", ["logs", name]).catch((error: unknown) => String(error));
     const aborts = logs.split("\n").filter((line) => /corrupted|malloc\(\)|double free|SIGABRT/u.test(line));
     mkdirSync(OUT, { recursive: true });
-    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, failure: failure ?? null, aborts, cycles }, null, 2)}\n`);
+    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, cycles }, null, 2)}\n`);
     writeFileSync(join(OUT, "bayma.log"), logs);
     // What the host says of a sandbox that ended: the kernel's log, its disk and its memory.
     const host = await Promise.all([
