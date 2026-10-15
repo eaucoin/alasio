@@ -126,6 +126,7 @@ function setup(config: InstallConfig): KubernetesObject[] {
               { name: "S3_REGION", value: objectStore.external.region },
               { name: "S3_BUCKET_NEON", value: objectStore.buckets.neon },
               { name: "S3_BUCKET_LAKE", value: objectStore.buckets.lake },
+              { name: "S3_BUCKET_BACKUPS", value: objectStore.buckets.backups },
               ...(workspaceStorage.enabled
                 ? [
                   { name: "WORKSPACES_NAME", value: workspaceStorage.name },
@@ -773,7 +774,8 @@ function backup(config: InstallConfig): V1CronJob {
       { name: "AWS_DEFAULT_REGION", value: objectStore.external.region },
       { name: "HOME", value: "/tmp" },
     ],
-    envFrom: [{ secretRef: { name: neonName("s3-admin") } }],
+    // Its own identity: it writes the backups' bucket and reads what it backs up, and no more.
+    envFrom: [{ secretRef: { name: neonName("s3-backups") } }],
     securityContext: restrictedContainer(),
     resources: { requests: { cpu: "50m", memory: "128Mi" }, limits: { memory: "512Mi" } },
     volumeMounts: [{ name: "backup", mountPath: "/backup" }, { name: "tmp", mountPath: "/tmp" }],

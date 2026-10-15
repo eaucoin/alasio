@@ -484,7 +484,8 @@ const ObjectStore = Schema.Struct({
    * Or an S3-compatible store of the operator's: its endpoint, region, and a Secret with
    * `accessKey` and `secretKey`; and, where sessions are snapshotted, a Secret of the same
    * keys for a key of the store's that reaches the snapshots bucket alone, which only the
-   * node agents hold, as what writes that bucket writes what they restore as root.
+   * node agents hold, as what writes that bucket writes what they restore as root: the
+   * first key may not write it, and Neon's setup, which tries, refuses one that can.
    */
   external: defaulted(
     Schema.Struct({

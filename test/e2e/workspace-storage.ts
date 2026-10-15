@@ -294,7 +294,7 @@ async function runJob(cronJob: string): Promise<string> {
 /**
  * A pod of alasio's labelled as its JuiceFS admin pods are, which reach Valkey and the
  * object store, placed where the stack runs: `s3`, the backup's uploader, with the
- * object store's admin keys and the backup's settings, and `juicefs`, JuiceFS's command
+ * backups' keys and the backup's settings, and `juicefs`, JuiceFS's command
  * line on the mount image, with the file system's credentials, privileged to mount it;
  * `/backup` is theirs to share. Removed once `use` is done with it.
  */

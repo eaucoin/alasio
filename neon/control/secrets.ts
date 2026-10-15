@@ -25,10 +25,11 @@ export const CLIENT_ROLES = [ROLE, LAKE_ROLE, LAKE_READER_ROLE, GRAFANA_ROLE] as
 export type ClientRole = (typeof CLIENT_ROLES)[number];
 
 /**
- * Who holds S3 credentials: Neon's storage, the stack's admin, the lake, its reader,
- * workspace storage's JuiceFS, and the node agents, which keep session sandboxes' snapshots.
+ * Who holds S3 credentials: Neon's storage, the stack's admin (of Neon's bucket), the
+ * backups, the lake, its reader, workspace storage's JuiceFS, and the node agents, which
+ * keep session sandboxes' snapshots.
  */
-export type S3Identity = "neon" | "admin" | "lake" | "lakeReader" | "workspaces" | "snapshots";
+export type S3Identity = "neon" | "admin" | "backups" | "lake" | "lakeReader" | "workspaces" | "snapshots";
 
 export interface S3Credentials {
   accessKey: string;
@@ -93,6 +94,7 @@ export interface RemoteStorageLocation {
 export interface Buckets {
   neon: string;
   lake: string;
+  backups: string;
   workspaces: string | null;
   snapshots: string | null;
 }
@@ -157,6 +159,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       ...s3,
       neon: kept(s3.neon, () => ({ accessKey: `neon${hexId().slice(0, 12)}`, secretKey: secret() })),
       admin: kept(s3.admin, () => ({ accessKey: `admin${hexId().slice(0, 12)}`, secretKey: secret() })),
+      backups: kept(s3.backups, () => ({ accessKey: `backups${hexId().slice(0, 12)}`, secretKey: secret() })),
       lake: kept(s3.lake, () => ({ accessKey: `lake${hexId().slice(0, 12)}`, secretKey: secret() })),
       lakeReader: kept(s3.lakeReader, () => ({ accessKey: `lakereader${hexId().slice(0, 12)}`, secretKey: secret() })),
       workspaces: kept(s3.workspaces, () => ({ accessKey: `workspaces${hexId().slice(0, 12)}`, secretKey: secret() })),
@@ -202,22 +205,30 @@ export function remoteStorage(prefix: string, { endpoint, bucket, region = "us-e
 /**
  * SeaweedFS's S3 identities: Neon, the lake, workspace storage when it is on and the
  * snapshots' when sandboxes are snapshotted, each on their own bucket of `buckets`; the
- * lake's reader, which may only read the lake's; and an admin, which makes the buckets
- * and keeps the backups.
+ * lake's reader, which may only read the lake's; the backups', which writes the backups'
+ * bucket and reads the workspaces' metadata it backs up; and an admin of Neon's bucket
+ * alone, which gives it its lifecycle rules. The snapshots' identity is its bucket's admin,
+ * giving it its rules itself: what may write that bucket writes the images the node agents
+ * restore as root, so nothing else may.
  */
 export function s3Identities(secrets: StackSecrets, buckets: Buckets): SeaweedS3Config {
   const on = (name: string) => [`Read:${name}`, `List:${name}`, `Tagging:${name}`, `Write:${name}`];
   return {
     identities: [
       { name: "neon", credentials: [secrets.s3.neon], actions: on(buckets.neon) },
-      { name: "admin", credentials: [secrets.s3.admin], actions: ["Admin", "Read", "List", "Tagging", "Write"] },
+      { name: "admin", credentials: [secrets.s3.admin], actions: [`Admin:${buckets.neon}`] },
+      {
+        name: "backups",
+        credentials: [secrets.s3.backups],
+        actions: [...on(buckets.backups), ...(buckets.workspaces === null ? [] : [`Read:${buckets.workspaces}`, `List:${buckets.workspaces}`])],
+      },
       // Branch environments' lakes are given it too: a branch's lake reads main's files where they are (DuckLake keeps
       // every file's path relative to one data path) and writes beside them, and SeaweedFS's Write, which writing
       // needs, deletes as well, so it cannot be narrowed to a branch's own files (cli/src/branches.ts).
       { name: "lake", credentials: [secrets.s3.lake], actions: on(buckets.lake) },
       { name: "lakeReader", credentials: [secrets.s3.lakeReader], actions: [`Read:${buckets.lake}`, `List:${buckets.lake}`] },
       ...(buckets.workspaces === null ? [] : [{ name: "workspaces" as const, credentials: [secrets.s3.workspaces], actions: on(buckets.workspaces) }]),
-      ...(buckets.snapshots === null ? [] : [{ name: "snapshots" as const, credentials: [secrets.s3.snapshots], actions: on(buckets.snapshots) }]),
+      ...(buckets.snapshots === null ? [] : [{ name: "snapshots" as const, credentials: [secrets.s3.snapshots], actions: [...on(buckets.snapshots), `Admin:${buckets.snapshots}`] }]),
     ],
   };
 }

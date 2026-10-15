@@ -410,7 +410,12 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
   const { scaling } = bundled.gateways;
   const snapshots = sandboxSnapshots(config);
   const made = [buckets.neon, buckets.lake, buckets.backups, ...(config.workspaceStorage.enabled ? [buckets.workspaces] : []), ...(snapshots ? [buckets.snapshots] : [])];
-  const lifecycles = [{ bucket: buckets.neon, rules: NEON_LIFECYCLE }, ...(snapshots ? [{ bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE }] : [])];
+  // Each bucket's rules given as its admin: Neon's as the admin's, the snapshots' as their own
+  // identity's, as nothing else may write that bucket (neon/control/secrets.ts s3Identities).
+  const lifecycles = [
+    { bucket: buckets.neon, rules: NEON_LIFECYCLE, as: "ADMIN" },
+    ...(snapshots ? [{ bucket: buckets.snapshots, rules: SNAPSHOTS_LIFECYCLE, as: "SNAPSHOTS" }] : []),
+  ];
   const image = imageReference(bundled.image);
   const ready = { exec: { command: ["test", "-f", "/tmp/ready"] }, periodSeconds: 5 };
   const service: V1Service = {
@@ -505,16 +510,28 @@ function gatewayObjects(config: InstallConfig): KubernetesObject[] {
                 "-c",
                 script(
                   "set -e",
-                  ...lifecycles.flatMap(({ bucket, rules }) => [
-                    `until aws s3api --endpoint-url http://127.0.0.1:8333 head-bucket --bucket ${bucket} 2>/dev/null; do sleep 2; done`,
-                    `aws s3api --endpoint-url http://127.0.0.1:8333 put-bucket-lifecycle-configuration --bucket ${bucket} --lifecycle-configuration '${JSON.stringify(rules)}'`,
-                  ]),
+                  ...lifecycles.flatMap(({ bucket, rules, as }) => {
+                    const aws = `AWS_ACCESS_KEY_ID="$${as}_KEY_ID" AWS_SECRET_ACCESS_KEY="$${as}_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333`;
+                    return [
+                      `until ${aws} head-bucket --bucket ${bucket} 2>/dev/null; do sleep 2; done`,
+                      `${aws} put-bucket-lifecycle-configuration --bucket ${bucket} --lifecycle-configuration '${JSON.stringify(rules)}'`,
+                    ];
+                  }),
                   "touch /tmp/ready",
                   "exec sleep infinity",
                 ),
               ],
-              env: [{ name: "AWS_DEFAULT_REGION", value: "us-east-1" }, { name: "HOME", value: "/tmp" }],
-              envFrom: [{ secretRef: { name: neonName("s3-admin") } }],
+              env: [
+                { name: "AWS_DEFAULT_REGION", value: "us-east-1" },
+                { name: "HOME", value: "/tmp" },
+                ...lifecycles.flatMap(({ as }) => {
+                  const secret = as === "ADMIN" ? neonName("s3-admin") : componentName("snapshots");
+                  return [
+                    { name: `${as}_KEY_ID`, valueFrom: { secretKeyRef: { name: secret, key: "AWS_ACCESS_KEY_ID" } } },
+                    { name: `${as}_SECRET`, valueFrom: { secretKeyRef: { name: secret, key: "AWS_SECRET_ACCESS_KEY" } } },
+                  ];
+                }),
+              ],
               readinessProbe: ready,
               securityContext: restrictedContainer(),
               resources: { requests: { cpu: "10m", memory: "64Mi" }, limits: { memory: "256Mi" } },

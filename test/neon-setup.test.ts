@@ -4,9 +4,11 @@ import { test } from "node:test";
 import type { KubernetesObject, V1Secret } from "@kubernetes/client-node";
 
 import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
-import { renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
+import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import type { SeaweedS3Config, StackSecrets, StoredSecrets } from "../neon/control/secrets.ts";
+import { makeS3Bucket } from "../src/node-agent/s3.ts";
+import { startFakeS3 } from "./support/fake-s3.ts";
 
 /** Whether `verifier` is a SCRAM verifier of `password`, made with its own salt. */
 function verifies(verifier: string | undefined, password: string | undefined): boolean {
@@ -130,7 +132,7 @@ test("the stack's secrets are made once, and every service's rendered from them 
   const metadata: { host: string } = JSON.parse(value(kube, names.pageserver, "metadata.json"));
   assert.equal(metadata.host, "q-neon-pageserver");
   const seaweed: SeaweedS3Config = JSON.parse(value(kube, names.seaweedfs, "s3.json"));
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces", "snapshots"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces", "snapshots"]);
   // The filers' store's users' passwords, each its own: the filers', the collector's and the backups'.
   assert.equal(value(kube, names.filerStoreFiler, "password"), root.filerStoreFilerPassword);
   assert.equal(value(kube, names.filerStoreCollector, "password"), root.filerStoreCollectorPassword);
@@ -178,13 +180,30 @@ test("the stack's secrets are made once, and every service's rendered from them 
     "Write:workspaces",
   ]);
 
-  // The node agents keep session sandboxes' snapshots in their bucket alone, which they find, with their keys, in their Secret.
+  // The node agents keep session sandboxes' snapshots in their bucket alone, which they find, with their keys, in their
+  // Secret, and give its lifecycle rules as its admin; no other identity may do anything with it.
   assert.deepEqual(seaweed.identities.find((identity) => identity.name === "snapshots")?.actions, [
     "Read:snapshots",
     "List:snapshots",
     "Tagging:snapshots",
     "Write:snapshots",
+    "Admin:snapshots",
   ]);
+  for (const { name, actions } of seaweed.identities) {
+    if (name !== "snapshots") assert.ok(actions.every((action) => action.includes(":") && !action.endsWith(":snapshots")), `${name}: ${actions.join(", ")}`);
+  }
+  // The admin, of Neon's bucket alone, gives it its lifecycle rules; the backups' writes the backups and reads the workspaces' metadata.
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "admin")?.actions, ["Admin:neon"]);
+  assert.deepEqual(seaweed.identities.find((identity) => identity.name === "backups")?.actions, [
+    "Read:backups",
+    "List:backups",
+    "Tagging:backups",
+    "Write:backups",
+    "Read:workspaces",
+    "List:workspaces",
+  ]);
+  assert.equal(value(kube, names.s3Backups, "AWS_ACCESS_KEY_ID"), root.s3.backups.accessKey);
+  assert.match(root.s3.backups.accessKey, /^backups[0-9a-f]{12}$/u);
   assert.deepEqual(Object.fromEntries(Object.keys(kube.secrets.get(names.snapshots)?.data ?? {}).map((key) => [key, value(kube, names.snapshots, key)])), {
     S3_ENDPOINT: "http://q-seaweedfs:8333",
     S3_REGION: "us-east-1",
@@ -247,7 +266,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
   return {
     tenantId: "tenant",
     timelineId: "timeline",
-    s3: { neon: s3, admin: s3, lake: s3, lakeReader: s3, workspaces: s3, snapshots: s3 },
+    s3: { neon: s3, admin: s3, backups: s3, lake: s3, lakeReader: s3, workspaces: s3, snapshots: s3 },
     controllerDbPassword: "c",
     alasioPassword: "q",
     lakePassword: "l",
@@ -322,7 +341,7 @@ test("without workspace storage, neither its Secrets nor its identity are made",
   assert.equal(rendered[names.valkey], undefined);
   assert.equal(rendered[names.workspaces], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "snapshots"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "snapshots"]);
 });
 
 test("without session sandboxes snapshotted, neither the snapshots' Secret, their identity nor the node agents' token's Secret are made", () => {
@@ -336,5 +355,26 @@ test("without session sandboxes snapshotted, neither the snapshots' Secret, thei
   assert.equal(rendered[names.snapshots], undefined);
   assert.equal(rendered[names.nodeAgent], undefined);
   const seaweed: SeaweedS3Config = JSON.parse(rendered[names.seaweedfs]?.["s3.json"] ?? "");
-  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "lake", "lakeReader", "workspaces"]);
+  assert.deepEqual(seaweed.identities.map((identity) => identity.name), ["neon", "admin", "backups", "lake", "lakeReader", "workspaces"]);
+});
+
+test("on an external store, the setup refuses a main key that can write the snapshots bucket, and leaves nothing there it wrote", async () => {
+  const credentials = { accessKeyId: "main-key", secretAccessKey: "main-secret" };
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...credentials });
+  try {
+    const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...credentials });
+    await assert.rejects(refuseMainKeyOnSnapshots(bucket), {
+      message: "the object store's main key (S3_ACCESS_KEY) can write the snapshots bucket, whose images the node agents restore as root: " +
+        "give it no right to that bucket, which the snapshots' own key alone may write",
+    });
+    assert.equal(s3.objects.size, 0);
+    // A key the store denies writing there is the one the setup goes on with.
+    s3.refuse = (method) => (method === "PUT" ? 403 : null);
+    await refuseMainKeyOnSnapshots(bucket);
+    // A store that cannot be asked is no answer.
+    s3.refuse = (method) => (method === "PUT" ? 503 : null);
+    await assert.rejects(refuseMainKeyOnSnapshots(bucket), /^Error: whether the object store's main key can write the snapshots bucket could not be told: 503 /u);
+  } finally {
+    await s3.close();
+  }
 });

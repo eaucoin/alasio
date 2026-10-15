@@ -7,11 +7,12 @@
  * Environment: NAMESPACE, SECRET_PREFIX (the installation's name, which every Secret's
  * name begins with); NEON_BROKER_URL, NEON_CONTROLLER_URL, NEON_PAGESERVER_HOST,
  * NEON_PROXY_HOST, NEON_CONTROLLER_DB_HOST; S3_ENDPOINT and S3_REGION, and
- * S3_BUCKET_NEON and S3_BUCKET_LAKE (neon and lake unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
+ * S3_BUCKET_NEON, S3_BUCKET_LAKE and S3_BUCKET_BACKUPS (neon, lake and backups unless set); S3_EXTERNAL=1 with S3_ACCESS_KEY and S3_SECRET_KEY
  * when the object store is the operator's own rather than the bundled SeaweedFS, whose
  * identities, and its filers' store's users' passwords, are made here otherwise, and with
  * sessions snapshotted, S3_SNAPSHOTS_ACCESS_KEY and S3_SNAPSHOTS_SECRET_KEY, the store's key
- * for the snapshots bucket alone. With workspace storage on, WORKSPACES_NAME (its JuiceFS
+ * for the snapshots bucket alone, which nothing but it may write: the setup refuses a main
+ * key that can (refuseMainKeyOnSnapshots). With workspace storage on, WORKSPACES_NAME (its JuiceFS
  * file system's), WORKSPACES_BUCKET and WORKSPACES_BUCKET_URL (its bucket's name
  * and URL), WORKSPACES_TRASH_DAYS, VALKEY_ADDRESS (its metadata engine's host:port), and
  * WORKSPACES_SECRET_LABELS (a JSON object of the labels its Secrets carry, by which
@@ -19,6 +20,9 @@
  * SNAPSHOTS_BUCKET (the bucket their snapshots are kept in).
  */
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
+import { Cause, Effect, Exit } from "effect";
+
+import { makeS3Bucket, type S3Bucket, S3Error } from "../../src/node-agent/s3.ts";
 
 import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
 import { generateKeyPair, type KeyPair, signToken } from "./jwt.ts";
@@ -54,6 +58,7 @@ export interface SecretNames {
   filerStoreCollector: string;
   filerStoreBackup: string;
   s3Admin: string;
+  s3Backups: string;
   compute: string;
   proxy: string;
   database: string;
@@ -95,6 +100,7 @@ interface SetupConfigBase {
   s3Region: string;
   neonBucket: string;
   lakeBucket: string;
+  backupsBucket: string;
   /** Null when workspace storage is off. */
   workspaces: WorkspacesConfig | null;
   /** Null when session sandboxes are not snapshotted. */
@@ -152,6 +158,7 @@ export function secretNames(prefix: string): SecretNames {
     filerStoreCollector: `${prefix}-seaweedfs-filer-store-collector`,
     filerStoreBackup: `${prefix}-seaweedfs-filer-store-backup`,
     s3Admin: `${prefix}-neon-s3-admin`,
+    s3Backups: `${prefix}-neon-s3-backups`,
     compute: `${prefix}-neon-compute`,
     proxy: `${prefix}-neon-proxy`,
     database: `${prefix}-database`,
@@ -222,6 +229,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     },
     [names.controllerDb]: { POSTGRES_PASSWORD: secrets.controllerDbPassword },
     [names.s3Admin]: aws("admin"),
+    [names.s3Backups]: aws("backups"),
     [names.compute]: { NEON_CONTROL_PLANE_TOKEN: secrets.computeControlToken },
     [names.proxy]: { NEON_PROXY_TO_CONTROLPLANE_TOKEN: token(PROXY_SCOPE) },
     [names.database]: {
@@ -288,7 +296,7 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config }: 
     rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
   }
   if (!config.external) {
-    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };
+    const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };
     rendered[names.seaweedfs] = { "s3.json": JSON.stringify(s3Identities(secrets, buckets), null, 2) + "\n" };
     // The filers' store's users', which its Valkey requires: the filers', each filer is
     // given, the collector's, which reads its metrics, and the backups'.
@@ -319,6 +327,7 @@ export function setupConfig(env: NodeJS.ProcessEnv = process.env): SetupConfig {
     s3Region: env["S3_REGION"]?.trim() || "us-east-1",
     neonBucket: env["S3_BUCKET_NEON"]?.trim() || "neon",
     lakeBucket: env["S3_BUCKET_LAKE"]?.trim() || "lake",
+    backupsBucket: env["S3_BUCKET_BACKUPS"]?.trim() || "backups",
     workspaces: env["WORKSPACES_NAME"]?.trim()
       ? {
         name: required("WORKSPACES_NAME"),
@@ -386,8 +395,30 @@ export async function setupKube({ kube, config, log = console.log }: SetupKubeOp
   }
 }
 
+/** What an external store's main key is refused for, should it write the snapshots bucket. */
+const MAIN_KEY_WRITES_SNAPSHOTS =
+  "the object store's main key (S3_ACCESS_KEY) can write the snapshots bucket, whose images the node agents restore as root: " +
+  "give it no right to that bucket, which the snapshots' own key alone may write";
+
+/**
+ * Refuses an external store's main key that can write the snapshots bucket, `bucket` as that
+ * key reaches it: whatever may write it writes the images the node agents restore as root.
+ * It writes an object there: refused (403), the key cannot; written, the object is deleted,
+ * and the setup fails, saying so, as it does when it cannot tell.
+ */
+export async function refuseMainKeyOnSnapshots(bucket: S3Bucket): Promise<void> {
+  const probe = ".alasio-setup-probe";
+  const written = await Effect.runPromiseExit(bucket.putJson(probe, { written: "by alasio's setup, to see whether the main key can" }));
+  if (Exit.isSuccess(written)) {
+    await Effect.runPromise(bucket.remove(probe)).catch(() => undefined);
+    throw new Error(MAIN_KEY_WRITES_SNAPSHOTS);
+  }
+  const error = Cause.squash(written.cause);
+  const reason = error instanceof S3Error ? error.reason : String(error);
+  if (!reason.startsWith("403")) throw new Error(`whether the object store's main key can write the snapshots bucket could not be told: ${reason}`);
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { Effect } = await import("effect");
   const { KubeClient } = await import("../../src/kube/client.ts");
   // The job is one call after another, each run as the promise setupKube awaits.
   const kube = Effect.runSync(Effect.provide(KubeClient, KubeClient.layer));
@@ -396,7 +427,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     create: (object) => Effect.runPromise(kube.create(object)),
     replace: (object) => Effect.runPromise(kube.replace(object)),
   };
-  setupKube({ kube: client, config: setupConfig() }).catch((error: unknown) => {
+  const config = setupConfig();
+  const refused = config.external && config.snapshotsBucket
+    ? refuseMainKeyOnSnapshots(makeS3Bucket({ endpoint: config.s3Endpoint, region: config.s3Region, bucket: config.snapshotsBucket, accessKeyId: config.accessKey, secretAccessKey: config.secretKey }))
+    : Promise.resolve();
+  refused.then(() => setupKube({ kube: client, config })).catch((error: unknown) => {
     console.error(`setting up the stack failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   });

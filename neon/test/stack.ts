@@ -70,6 +70,36 @@ async function gateways(): Promise<string[]> {
   return pods.filter((pod) => pod.status?.phase === "Running" && !pod.metadata?.deletionTimestamp).map((pod) => pod.metadata?.name ?? "");
 }
 
+/**
+ * The tests' own S3 identity, admin of every bucket, which no part of alasio is: each of
+ * the stack's identities reaches its own buckets alone, and the tests make buckets of their
+ * own. It is added as an operator would add one, through weed shell, to the filer's
+ * identities, which the gateways take beside those of their file, and removed after.
+ */
+const E2E_S3 = { user: "e2e", accessKey: `e2e${randomUUID().replaceAll("-", "").slice(0, 16)}`, secretKey: randomUUID() };
+
+/** A shell's prelude that makes its aws commands the tests' own identity's. */
+const AS_E2E = `export AWS_ACCESS_KEY_ID=${E2E_S3.accessKey} AWS_SECRET_ACCESS_KEY=${E2E_S3.secretKey}`;
+
+/** What weed shell answers `command`, run in a gateway's buckets container, as alasio makes its buckets there. */
+async function weedShell(command: string): Promise<string> {
+  const gateway = (await gateways())[0] ?? assert.fail("no gateway runs");
+  const shell = `printf '%s\\n' "$1" | weed shell -master=${componentName("seaweedfs-master")}:9333 -filer=${componentName("seaweedfs-filer")}:8888`;
+  return kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", shell, "sh", command], { container: "buckets" });
+}
+
+/** Adds the tests' own S3 identity, and waits until every gateway takes it. */
+async function addE2eIdentity(): Promise<void> {
+  await weedShell(`s3.configure -user=${E2E_S3.user} -actions=Admin -access_key=${E2E_S3.accessKey} -secret_key=${E2E_S3.secretKey} -apply`);
+  for (const gateway of await gateways()) {
+    const deadline = Date.now() + 120_000;
+    while (!(await kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", `${AS_E2E}; aws s3api --endpoint-url http://127.0.0.1:8333 list-buckets >/dev/null 2>&1 && echo taken || echo not`], { container: "lifecycle" })).includes("taken")) {
+      assert.ok(Date.now() < deadline, `the gateway ${gateway} did not take the tests' own S3 identity`);
+      await sleep(2000);
+    }
+  }
+}
+
 /** Waits until every workload of the stack is rolled out and ready, and the database answers. */
 async function up() {
   const workloads = [...await kube.list<V1Deployment>("Deployment", { namespace: NAMESPACE, labelSelector: STACK }), ...await kube.list<V1StatefulSet>("StatefulSet", { namespace: NAMESPACE, labelSelector: STACK })];
@@ -302,6 +332,7 @@ export function neonStack(): void {
       url.port = String(forward.port);
       databaseUrl = url.toString();
       await up();
+      await addE2eIdentity();
       pool = new pg.Pool({ connectionString: databaseUrl, max: 4 });
       pool.on("error", () => {});
     });
@@ -309,6 +340,7 @@ export function neonStack(): void {
     after(async () => {
       await pool?.end().catch(() => {});
       forward?.close();
+      await weedShell(`s3.configure -user=${E2E_S3.user} -delete -apply`).catch(() => {});
     });
 
     let schemas = 0;
@@ -495,7 +527,8 @@ export function neonStack(): void {
         const answered: { Rules: { ID: string }[] } = JSON.parse(await kube.execOk(
           NAMESPACE,
           await kube.runningPod(NAMESPACE, componentName("seaweedfs")),
-          ["aws", "s3api", "--endpoint-url", "http://127.0.0.1:8333", "get-bucket-lifecycle-configuration", "--bucket", "neon"],
+          // As the stack's admin, Neon's bucket's, which gave it them.
+          ["/bin/sh", "-c", 'AWS_ACCESS_KEY_ID="$ADMIN_KEY_ID" AWS_SECRET_ACCESS_KEY="$ADMIN_SECRET" aws s3api --endpoint-url http://127.0.0.1:8333 get-bucket-lifecycle-configuration --bucket neon'],
           { container: "lifecycle" },
         ));
         const rule = (id: string) => answered.Rules.find(({ ID }) => ID === id);
@@ -509,9 +542,9 @@ export function neonStack(): void {
         assert.ok(rule("expire-noncurrent"));
       });
 
-      /** Runs `script` in the gateway `pod`'s lifecycle container, with the stack's S3 admin, its `s3api` at `endpoint` (its own, unless another's). */
+      /** Runs `script` in the gateway `pod`'s lifecycle container, as the tests' own S3 identity, its `s3api` at `endpoint` (its own, unless another's). */
       const onGateway = (pod: string, script: string) =>
-        kube.execOk(NAMESPACE, pod, ["/bin/sh", "-c", `set -e; s3api() { endpoint=$1; shift; aws s3api --endpoint-url "http://$endpoint" "$@"; }; ${script}`], { container: "lifecycle" });
+        kube.execOk(NAMESPACE, pod, ["/bin/sh", "-c", `set -e; ${AS_E2E}; s3api() { endpoint=$1; shift; aws s3api --endpoint-url "http://$endpoint" "$@"; }; ${script}`], { container: "lifecycle" });
 
       /** The masters' pods that run now. */
       const masters = async () =>
@@ -626,7 +659,7 @@ export function neonStack(): void {
       test("the object store compacts a volume once a tenth of it is deleted", async () => {
         const gateway = await kube.runningPod(NAMESPACE, componentName("seaweedfs"));
         const bucket = `vacuum-${Date.now()}`;
-        const s3 = (script: string) => kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", `set -e; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
+        const s3 = (script: string) => kube.execOk(NAMESPACE, gateway, ["/bin/sh", "-c", `set -e; ${AS_E2E}; s3() { aws s3 --endpoint-url http://127.0.0.1:8333 "$@"; }; ${script}`], { container: "lifecycle" });
         const master = (path: string) => onMaster(path);
         const volumes = async () => {
           const status: VolumeStatus = JSON.parse(await master("/vol/status"));
@@ -685,7 +718,8 @@ export function neonStack(): void {
               `latest=$(aws s3 --endpoint-url ${s3} ls s3://${bucket}/ | awk '{print $4}' | grep '^alasio-.*\\.dump$' | sort | tail -1) && aws s3 --endpoint-url ${s3} cp "s3://${bucket}/$latest" /backup/alasio.dump`,
             ],
             env: [{ name: "HOME", value: "/tmp" }, { name: "AWS_DEFAULT_REGION", value: "us-east-1" }],
-            envFrom: [{ secretRef: { name: neonName("s3-admin") } }],
+            // As the backups' own identity, which wrote it.
+            envFrom: [{ secretRef: { name: neonName("s3-backups") } }],
             securityContext: restricted,
             volumeMounts: [{ name: "backup", mountPath: "/backup" }, { name: "tmp", mountPath: "/tmp" }],
           }],

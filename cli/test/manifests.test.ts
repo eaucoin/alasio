@@ -549,6 +549,15 @@ describe("neon", () => {
       Rules: [{ ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }],
     });
     assert.equal(made.setup, "snapshots");
+    // Its rules given as its own identity, the one that may write it, Neon's as the admin.
+    const lifecycle = one<V1Deployment>(install(), "Deployment", "alasio-seaweedfs").spec?.template.spec?.containers.find(({ name }) => name === "lifecycle");
+    assert.match(lifecycle?.command?.[2] ?? "", /AWS_ACCESS_KEY_ID="\$SNAPSHOTS_KEY_ID" AWS_SECRET_ACCESS_KEY="\$SNAPSHOTS_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket snapshots /u);
+    assert.match(lifecycle?.command?.[2] ?? "", /AWS_ACCESS_KEY_ID="\$ADMIN_KEY_ID" AWS_SECRET_ACCESS_KEY="\$ADMIN_SECRET" aws s3api --endpoint-url http:\/\/127\.0\.0\.1:8333 put-bucket-lifecycle-configuration --bucket neon /u);
+    assert.deepEqual(lifecycle?.env?.filter(({ name }) => name.endsWith("_KEY_ID")).map(({ name, valueFrom }) => [name, valueFrom?.secretKeyRef?.name]), [
+      ["ADMIN_KEY_ID", "alasio-neon-s3-admin"],
+      ["SNAPSHOTS_KEY_ID", "alasio-snapshots"],
+    ]);
+    assert.equal(lifecycle?.envFrom, undefined);
     assert.deepEqual(snapshots(install({ sessions: { runtimeClassName: "" } })), { buckets: "neon lake backups workspaces", rules: undefined, setup: undefined });
     assert.deepEqual(snapshots(install({ sessions: { enabled: false }, workspaceStorage: { enabled: false } })), { buckets: "neon lake backups", rules: undefined, setup: undefined });
   });
@@ -581,6 +590,8 @@ describe("neon", () => {
   test("backs JuiceFS's newest metadata dump up beside the database's, keeping as many of each", () => {
     const upload = one<V1CronJob>(install({ neon: { backup: { keep: 2 } } }), "CronJob", "alasio-neon-backup").spec?.jobTemplate.spec?.template.spec?.containers[0];
     assert.ok(upload);
+    // As an identity of its own, which writes the backups and reads what it backs up alone.
+    assert.deepEqual(upload.envFrom, [{ secretRef: { name: "alasio-neon-s3-backups" } }]);
     const env = Object.fromEntries((upload.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
     assert.equal(env["WORKSPACES_BUCKET"], "workspaces");
     assert.equal(env["WORKSPACES_NAME"], "workspaces");
