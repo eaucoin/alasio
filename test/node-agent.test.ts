@@ -27,7 +27,6 @@ import {
   type AbandonRequest,
   type CheckpointRequest,
   COLLECT_GRACE_MS,
-  HISTORY_BYTES,
   type Killed,
   type Layer as Image,
   makeNodeAgent,
@@ -37,6 +36,7 @@ import {
   PoliciesNotInForce,
   type ResumeRequest,
   SnapshotOutlived,
+  STATE_FILE_BYTES,
 } from "../src/node-agent/agent.ts";
 import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
@@ -69,12 +69,14 @@ const request = (workspace: string, containerId = CONTAINER): CheckpointRequest 
   podTemplate: POD_TEMPLATE,
 });
 
-/** The execs a live checkpoint catches running, in bayma's state directory, on the volume mounted at /home/agent. */
+/** bayma's state directory, on the volume mounted at /home/agent, where a live checkpoint saves it. */
 const STATE_DIR = "/home/agent/.bayma";
-const DURING = { stateDir: STATE_DIR, execs: [{ sessionId: "sess_1", execId: "exec_1" }] };
 
-/** A request to checkpoint the workspace's sandbox live, as DURING runs in it. */
-const live = (workspace: string, containerId = CONTAINER): CheckpointRequest => ({ ...request(workspace, containerId), during: DURING });
+/** A request to checkpoint the workspace's sandbox live. */
+const live = (workspace: string, containerId = CONTAINER): CheckpointRequest => ({ ...request(workspace, containerId), live: { stateDir: STATE_DIR } });
+
+/** What bayma's hook says a save caught, in last-save.json. */
+const CAUGHT = { generation: 5, running: [{ sessionId: "sess_1", execId: "exec_1" }] };
 
 const SESSIONS = "alasio-sessions";
 const POD = "fs-abc123";
@@ -469,16 +471,24 @@ test("a checkpoint that fails forgets the workspace's snapshot, which the worksp
     })
   ));
 
-test("a checkpoint taken live leaves its sandbox running, names the execs it caught, is the base of its next, and changes no snapshot where it fails", () =>
+test("a checkpoint taken live leaves its sandbox running, records what bayma said it caught, is the base of its next, and changes no snapshot where it fails", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      const stateDir = join(volume, ".bayma");
+      mkdirSync(stateDir);
+      const lastSave = join(stateDir, "last-save.json");
+      writeFileSync(lastSave, JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
       const here = yield* node("node-1");
+      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+
       const first = yield* here.agent.checkpoint(live("fs-abc"));
       const saved = here.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"));
       const LIVE_FLAGS = ["--leave-running", "--precopy=auto", "--precopy-throttle=on", "--direct"];
       assert.deepEqual(saved?.filter((arg) => LIVE_FLAGS.includes(arg)), LIVE_FLAGS);
-      assert.deepEqual(first.during, DURING);
+      assert.deepEqual(first.live, { stateDir: STATE_DIR, ...CAUGHT });
       assert.deepEqual(yield* here.agent.current(workspace), first);
       // Its sandbox runs on from the image it was saved to, so the next is a delta of it.
       const second = yield* here.agent.checkpoint(live("fs-abc"));
@@ -496,6 +506,14 @@ test("a checkpoint taken live leaves its sandbox running, names the execs it cau
       const whole = yield* here.agent.checkpoint(live("fs-abc"));
       assert.equal(whole.layers.length, 1);
 
+      // What bayma said the save caught cannot be told: no snapshot of it.
+      for (const said of ["{", JSON.stringify({ schemaVersion: 2, ...CAUGHT }), JSON.stringify({ schemaVersion: 1, ...CAUGHT, more: true })]) {
+        writeFileSync(lastSave, said);
+        assert.match(failure(yield* Effect.exit(here.agent.checkpoint(live("fs-abc")))), /: what its live save caught cannot be told: .*\/home\/agent\/\.bayma\/last-save\.json is none of bayma's: .*; its snapshot is kept/u);
+        assert.deepEqual(yield* here.agent.current(workspace), whole);
+      }
+      writeFileSync(lastSave, JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+
       // The commit fails, after runsc saved it: the snapshot it had is kept, what it staged goes, and the next is whole.
       s3.refuse = (method, key) => (method === "PUT" && key === "main/fs-abc/current.json" ? 500 : null);
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(live("fs-abc")))), /; its snapshot is kept, as a live checkpoint that fails changes nothing$/u);
@@ -506,35 +524,37 @@ test("a checkpoint taken live leaves its sandbox running, names the execs it cau
     })
   ));
 
-test("a sandbox restored from a snapshot taken live resumes only while each exec it caught runs on, as bayma's history on its volume says, read as untrusted", () =>
+test("a sandbox restored from a snapshot taken live resumes only while bayma's state generation is the one it caught, read on its volume as untrusted", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
       const outside = mkdtempSync(join(tmpdir(), "alasio-volume-"));
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(outside, { recursive: true, force: true })));
       // The volume mounted at /home/agent; beside it, outside it, what the sandbox may link to,
-      // a history that says the exec runs on: one read there would let the sandbox resume.
+      // a generation that matches: one read there would let the sandbox resume.
       const volume = join(outside, "volume");
       const elsewhere = join(outside, "elsewhere");
-      const runningOn = { schemaVersion: 1, history: [{ execId: "exec_0", status: "ok" }, { execId: "exec_1", status: "running", code: "while True: pass" }] };
-      mkdirSync(join(elsewhere, "histories"), { recursive: true });
-      writeFileSync(join(elsewhere, "histories", "sess_1.json"), JSON.stringify(runningOn));
+      const matching = JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation });
+      mkdirSync(elsewhere, { recursive: true });
+      writeFileSync(join(elsewhere, "generation.json"), matching);
       const stateDir = join(volume, ".bayma");
-      const histories = join(stateDir, "histories");
-      const file = join(histories, "sess_1.json");
+      const file = join(stateDir, "generation.json");
       const reset = () => {
         rmSync(stateDir, { recursive: true, force: true });
-        mkdirSync(histories, { recursive: true });
+        mkdirSync(stateDir, { recursive: true });
       };
-      const history = (written: unknown) => {
+      const generation = (written: string | Buffer) => {
         reset();
-        writeFileSync(file, typeof written === "string" || Buffer.isBuffer(written) ? written : JSON.stringify(written));
+        writeFileSync(file, written);
       };
+      const mounted = [{ destination: "/home/agent", source: volume }];
 
       const taker = yield* node("node-1");
+      taker.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, mounted);
+      reset();
+      writeFileSync(join(stateDir, "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
       const snapshot = yield* taker.agent.checkpoint(live("fs-abc"));
       const there = yield* node("node-2");
-      const mounted = [{ destination: "/home/agent", source: volume }];
       for (const id of [CONTAINER, OTHER_CONTAINER]) there.releases.runs(id, RELEASE, SESSIONS, POD, true, id === CONTAINER ? mounted : []);
       yield* there.agent.prepare(workspace);
       const resumes = () => there.releases.calls(RELEASE).filter((args) => args.includes("resume")).length;
@@ -546,65 +566,65 @@ test("a sandbox restored from a snapshot taken live resumes only while each exec
           assert.equal(resumes(), before);
         });
 
-      // The exec runs on: it resumes.
-      history(runningOn);
+      // Nothing its clients were told of happened since the save, as bayma's padding leaves it: it resumes.
+      generation(matching.padEnd(127) + "\n");
       yield* there.agent.resume(resumeRequest());
       assert.equal(resumes(), 2);
 
-      // The exec has ended, or the history names it not, or there is none.
-      history({ ...runningOn, history: [{ execId: "exec_1", status: "ok" }] });
-      yield* refused(there.agent, /the exec exec_1 of the session sess_1 has ended since, ok/u);
-      history({ ...runningOn, history: [{ execId: "exec_0", status: "running" }] });
-      yield* refused(there.agent, /\/home\/agent\/\.bayma\/histories\/sess_1\.json names no exec exec_1/u);
+      // The generation moved on, or there is none.
+      generation(JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation + 1 }));
+      yield* refused(there.agent, /bayma's state generation is 6, and was 5 as it was saved/u);
       reset();
-      yield* refused(there.agent, /.*\/volume\/\.bayma\/histories\/sess_1\.json cannot be opened: there is none/u);
+      yield* refused(there.agent, /.*\/volume\/\.bayma\/generation\.json cannot be opened: there is none/u);
 
       // A link at any name of its path, to what is outside the volume, or to the node's own files, is not followed.
-      const linked = /.*\/volume\/\.bayma(\/histories(\/sess_1\.json)?)? cannot be opened: it is a symbolic link, which is not followed, or no directory/u;
+      const linked = /.*\/volume\/\.bayma(\/generation\.json)? cannot be opened: it is a symbolic link, which is not followed, or no directory/u;
       reset();
-      symlinkSync(join(elsewhere, "histories", "sess_1.json"), file);
+      symlinkSync(join(elsewhere, "generation.json"), file);
       yield* refused(there.agent, linked);
       reset();
       symlinkSync("/etc/shadow", file);
       yield* refused(there.agent, linked);
       rmSync(stateDir, { recursive: true, force: true });
-      mkdirSync(stateDir);
-      symlinkSync(join(elsewhere, "histories"), histories);
-      yield* refused(there.agent, linked);
-      rmSync(stateDir, { recursive: true, force: true });
       symlinkSync(elsewhere, stateDir);
       yield* refused(there.agent, linked);
 
-      // A FIFO, which no one writes, is not waited on; a directory is no history either.
+      // A FIFO, which no one writes, is not waited on; a directory is no file either.
       reset();
       execFileSync("mkfifo", [file]);
-      yield* refused(there.agent, /.*\/sess_1\.json is not a regular file/u);
+      yield* refused(there.agent, /.*\/generation\.json is not a regular file/u);
       reset();
       mkdirSync(file);
-      yield* refused(there.agent, /.*\/sess_1\.json is not a regular file/u);
+      yield* refused(there.agent, /.*\/generation\.json is not a regular file/u);
 
       // One larger than the agent reads is not read.
-      history("");
-      truncateSync(file, HISTORY_BYTES + 1);
-      yield* refused(there.agent, new RegExp(`.*/sess_1\\.json is ${HISTORY_BYTES + 1} bytes, more than the ${HISTORY_BYTES} read of it`, "u"));
+      generation("");
+      truncateSync(file, STATE_FILE_BYTES + 1);
+      yield* refused(there.agent, new RegExp(`.*/generation\\.json is ${STATE_FILE_BYTES + 1} bytes, more than the ${STATE_FILE_BYTES} read of it`, "u"));
 
-      // One that is not bayma's history, as it says it, is none.
-      for (const malformed of ["{", JSON.stringify({ ...runningOn, schemaVersion: 2 }), JSON.stringify({ schemaVersion: 1, history: [{ execId: "exec_1" }] }), Buffer.from([0x7b, 0xff, 0x7d])]) {
-        history(malformed);
-        yield* refused(there.agent, /\/home\/agent\/\.bayma\/histories\/sess_1\.json is no history of bayma's: [^\n]+/u);
+      // One that is not bayma's generation, as it says it, of a schema it knows, is none.
+      for (const malformed of [
+        "{",
+        JSON.stringify({ schemaVersion: 2, generation: CAUGHT.generation }),
+        JSON.stringify({ schemaVersion: 1, generation: -1 }),
+        JSON.stringify({ schemaVersion: 1, generation: CAUGHT.generation, more: true }),
+        Buffer.from([0x7b, 0xff, 0x7d]),
+      ]) {
+        generation(malformed);
+        yield* refused(there.agent, /\/home\/agent\/\.bayma\/generation\.json is none of bayma's: [^\n]+/u);
       }
 
       // No volume of its pod holds bayma's state directory.
-      history(runningOn);
+      generation(matching);
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, []);
-      yield* refused(there.agent, /no volume of its pod holds \/home\/agent\/\.bayma\/histories\/sess_1\.json/u);
+      yield* refused(there.agent, /no volume of its pod holds \/home\/agent\/\.bayma\/generation\.json/u);
       there.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, mounted);
 
       // An agent started since the prepare tells the snapshot from the manifest its cache keeps beside it.
       const again = yield* there.restarted;
-      history({ ...runningOn, history: [{ execId: "exec_1", status: "error" }] });
-      yield* refused(again, /the exec exec_1 of the session sess_1 has ended since, error/u);
-      history(runningOn);
+      generation(JSON.stringify({ schemaVersion: 1, generation: 9 }));
+      yield* refused(again, /bayma's state generation is 9, and was 5 as it was saved/u);
+      generation(matching);
       yield* again.resume(resumeRequest());
     })
   ));
@@ -1318,7 +1338,7 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
 
       // One restored from a snapshot that holds the session no more answers 410.
-      const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "the exec exec_1 of the session sess_1 has ended since, ok" });
+      const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "bayma's state generation is 6, and was 5 as it was saved" });
       const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest()));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
     })
