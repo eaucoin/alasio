@@ -246,6 +246,21 @@ interface Cycle {
   readonly checkpointMs: number;
   /** The image's size on the disk. */
   readonly bytes: number;
+  /** What the disk holding the images has free after it. */
+  readonly diskFreeBytes: number;
+  /** The host's available memory after it (MemAvailable). */
+  readonly memoryAvailableBytes: number;
+}
+
+/** The bytes free on the filesystem of `path`. */
+async function diskFree(path: string): Promise<number> {
+  return Number((await run("df", ["--block-size=1", "--output=avail", path])).split("\n")[1]);
+}
+
+/** The host's available memory, in bytes. */
+function memoryAvailable(): number {
+  const kib = /^MemAvailable:\s+(\d+) kB$/mu.exec(readFileSync("/proc/meminfo", "utf8"));
+  return Number(kib?.[1]) * 1024;
 }
 
 function run(command: string, args: readonly string[]): Promise<string> {
@@ -360,7 +375,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       ]);
       const checkpointMs = Date.now() - began - afterMs;
       const bytes = Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]);
-      cycles.push({ index, depth, afterMs, checkpointMs, bytes });
+      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable() });
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);
         assert.deepEqual({ index, runtime, status: done.status, error: done.error_text, result: done.result_text.trim() }, { index, runtime, status: "ok", error: "", result: "7" });
@@ -376,7 +391,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
         chain.push(image);
         parent = image;
       }
-      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes`);
+      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk`);
     }
     await client.close();
   } catch (error) {
@@ -388,6 +403,13 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     mkdirSync(OUT, { recursive: true });
     writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, failure: failure ?? null, aborts, cycles }, null, 2)}\n`);
     writeFileSync(join(OUT, "bayma.log"), logs);
+    // What the host says of a sandbox that ended: the kernel's log, its disk and its memory.
+    const host = await Promise.all([
+      run("sudo", ["dmesg", "--ctime"]).then((log) => log.split("\n").slice(-300).join("\n")),
+      run("df", ["--block-size=1", scratch]),
+      run("free", ["--bytes"]),
+    ].map((read) => read.catch((error: unknown) => String(error))));
+    writeFileSync(join(OUT, "host.log"), `${host.join("\n\n")}\n`);
     await run("docker", ["rm", "--force", name]).catch(() => undefined);
     await run("sudo", ["rm", "-rf", scratch]).catch((error: unknown) => console.error(error));
   }
