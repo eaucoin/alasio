@@ -570,23 +570,28 @@ if (inShard("telemetry")) {
         assert.deepEqual(dashboards.map(({ folderTitle, title }) => `${folderTitle}/${title}`).sort(), ["alasio/Agents", "alasio/Conversations", "alasio/Stack health"]);
         // The Stack health dashboard's tables of services and of the object store's volume servers, as their panels query them.
         const stack: { panels: { title: string; targets?: object[] }[] } = JSON.parse(readFileSync(new URL("../../neon/grafana/dashboards/stack-health.json", import.meta.url), "utf8"));
-        const queryOf = (panel: string) => stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`);
+        // Each as Grafana's browser sends it: it fills in ${__interval_ms} (a minute here, the scrape's), which /api/ds/query
+        // takes as sent, the data source expanding ${__from} and ${__to} alone.
+        const queryOf = (panel: string): object =>
+          JSON.parse(JSON.stringify(stack.panels.find(({ title }) => title === panel)?.targets?.[0] ?? assert.fail(`no panel ${panel}`)).replaceAll("${__interval_ms}", "60000"));
         const services = queryOf("Services now");
         for (const panel of ["Services now", "The object store's volume servers", "The log's answers", "Telemetry waiting in the log"]) {
           let rows = 0;
+          let error: string | undefined;
           for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
             const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [queryOf(panel)] }) })).body as {
-              results: { A: { frames?: { data: { values: unknown[][] } }[] } };
+              results: { A: { frames?: { data: { values: unknown[][] } }[]; error?: string } };
             };
             rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+            error = answered.results.A.error;
           }
           if (rows === 0) {
-            // The metrics the panel reads, by their names' starts, as the lake has them.
+            // The metrics the panel may read, each name once, with how many of its points are of Produce requests, as the lake has them.
             const names = await lakeQuery(
-              "select ServiceName, MetricName, Attributes['type'] as type, count(*) as n from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
-                "and (MetricName like 'kafka_request_time%' or MetricName like 'kafka_stream_wal%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2, 3 limit 80",
-            ).catch((error: unknown) => String(error));
-            assert.fail(`${panel} answered with no row; the log's and the intake's metrics it reads: ${JSON.stringify(names)}`);
+              "select ServiceName, MetricName, count(*) as n, count(*) filter (where Attributes['type'] = 'Produce') as produce from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
+                "and (MetricName like 'kafka_request_time%' or MetricName like 'kafka_stream_wal%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2",
+            ).catch((failure: unknown) => String(failure));
+            assert.fail(`${panel} answered with no row${error ? `, and the error ${error}` : ""}; the log's and the intake's metrics it may read: ${JSON.stringify(names)}`);
           }
         }
         // A query the lake refuses says why, in Grafana.
@@ -693,15 +698,55 @@ if (inShard("telemetry")) {
         ].join("\n");
       };
 
-      /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each. */
-      const untilWritten = async (run: string, taken: readonly number[], timeoutMs = 600_000): Promise<Map<number, number>> => {
+      /**
+       * Where the spans exported around `at` are, for a failure's message: the records the
+       * log holds of otel.spans from 15 s before it to 45 s after (./log-records.ts), each
+       * partition's by offset, the run's marked with their seq; the offsets the intake's
+       * group was told and those the lake holds; and the spans of those records the lake
+       * lacks, and those the lake has, started in that window, that no record holds: what
+       * tells a span the log lost from one the intake skipped, and offsets the log gave
+       * twice.
+       */
+      const whereSpansAre = async (at: number): Promise<string> => {
+        const [from, to] = [at - 15_000, at + 45_000];
+        const script = readFileSync(join(import.meta.dirname, "log-records.ts"), "utf8");
+        const read = await kube.exec(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", String(from), String(to)], { container: "access", stdin: script })
+          .then(({ stdout, stderr }) => `${stdout}${stderr}`, (error: unknown) => String(error));
+        let log: { partitions: object[]; committed: object[]; records: { partition: number; offset: string; spans: { traceId: string; spanId: string; service?: string; name?: string; seq?: number }[] | string }[] };
+        try {
+          log = JSON.parse(read.trim().split("\n").at(-1) ?? "");
+        } catch {
+          return `the log's records could not be read: ${read}`;
+        }
+        const offsets = await lakeQuery("from otel.intake_offsets order by all").catch((error: unknown) => String(error));
+        const lake = await lakeQuery(`select TraceId, SpanId, ServiceName, SpanName from otel.traces where Timestamp >= make_timestamp(${(from - 300_000) * 1000})`).catch(() => []);
+        const inLake = new Set(lake.map((row) => `${String(row["TraceId"])}:${String(row["SpanId"])}`));
+        const logged = log.records.flatMap((record) => (typeof record.spans === "string" ? [] : record.spans.map((span) => ({ ...span, at: `${record.partition}@${record.offset}` }))));
+        const inLog = new Set(logged.map((span) => `${span.traceId}:${span.spanId}`));
+        const started = await lakeQuery(`select TraceId, SpanId, ServiceName, SpanName from otel.traces where Timestamp between make_timestamp(${(from + 20_000) * 1000}) and make_timestamp(${(to - 20_000) * 1000})`).catch(() => []);
+        const byPartition = new Map<number, string[]>();
+        for (const record of log.records) {
+          const seqs = typeof record.spans === "string" ? [record.spans] : record.spans.flatMap(({ seq }) => (seq === undefined ? [] : [`seq ${seq}`]));
+          byPartition.set(record.partition, [...(byPartition.get(record.partition) ?? []), `${record.offset}${seqs.length > 0 ? ` (${seqs.join(", ")})` : ""}`]);
+        }
+        return [
+          `the log: ${JSON.stringify(log.partitions)}; the intake's group told ${JSON.stringify(log.committed)}; the lake's offsets ${JSON.stringify(offsets)}`,
+          ...[...byPartition].map(([partition, records]) => `partition ${partition}'s records from ${new Date(from).toISOString()} to ${new Date(to).toISOString()}: ${records.join(" ")}`),
+          `their spans the lake lacks: ${JSON.stringify(logged.filter((span) => !inLake.has(`${span.traceId}:${span.spanId}`)))}`,
+          `spans the lake has, started from 5 s after the crash to 25 s after, that no record of the log holds: ${JSON.stringify(started.filter((row) => !inLog.has(`${String(row["TraceId"])}:${String(row["SpanId"])}`)))}`,
+          `the gateway's log:\n${await tail(kube.runningPod(NAMESPACE, componentName("collector")), "collector")}`,
+        ].join("\n");
+      };
+
+      /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each; `crashed`, where given, is when the log was made to crash. */
+      const untilWritten = async (run: string, taken: readonly number[], crashed?: number, timeoutMs = 600_000): Promise<Map<number, number>> => {
         const deadline = Date.now() + timeoutMs;
         for (;;) {
           const rows = await lakeQuery(`select SpanAttributes['e2e.seq'] as seq, count(*) as n from otel.traces where ServiceName = 'e2e-log' and SpanAttributes['e2e.run'] = '${run}' group by 1`).catch(() => []);
           const written = new Map(rows.map((row) => [Number(row["seq"]), Number(row["n"])]));
           if (taken.every((seq) => written.has(seq))) return written;
           if (Date.now() > deadline) {
-            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${await logState()}`);
+            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${crashed === undefined ? "" : `${await whereSpansAre(crashed)}\n`}${await logState()}`);
           }
           await sleep(5000);
         }
@@ -711,6 +756,7 @@ if (inShard("telemetry")) {
         const run = randomUUID();
         const before = await exportAll(run, 0, 40);
         assert.equal(before.length, 40, "the gateway took every span while the log ran");
+        const crashed = Date.now();
         await kube.kill(NAMESPACE, `${componentName("log")}-0`);
         // Each export sent on until one is taken again, as a producer sends what was refused again.
         const during: number[] = [];
@@ -718,7 +764,7 @@ if (inShard("telemetry")) {
           if (Date.now() > deadline) assert.fail("the gateway took no export again within ten minutes of the log's crash");
           if (await exported(run, seq)) during.push(seq);
         }
-        const written = await untilWritten(run, [...before, ...during]);
+        const written = await untilWritten(run, [...before, ...during], crashed);
         assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
       });
 
