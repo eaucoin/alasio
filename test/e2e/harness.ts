@@ -212,6 +212,12 @@ export function alasio(...args: string[]): Promise<Ran> {
   return capture(spawn(bin, args, { env, stdio: ["ignore", "pipe", "pipe"] }));
 }
 
+/** Runs this checkout's `alasio ...args`, which the upgrade shard upgrades to, whichever the run runs: what it came to. */
+export function releaseAlasio(...args: string[]): Promise<Ran> {
+  const { release, env } = current();
+  return capture(spawn(release, args, { env, stdio: ["ignore", "pipe", "pipe"] }));
+}
+
 /** Runs `alasio ...args`, which must succeed: what it printed. */
 export async function alasioOk(...args: string[]): Promise<string> {
   return alasioOkWith({}, ...args);

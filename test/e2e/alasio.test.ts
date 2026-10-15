@@ -19,12 +19,14 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
-import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "../../cli/src/manifests/common.ts";
+import { PAGESERVERS_NAME, pageserverName } from "../../cli/src/manifests/neon.ts";
+import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
@@ -59,6 +61,7 @@ import {
   paths,
   PREVIOUS,
   ref,
+  releaseAlasio,
   RELEASE_AFTER_SECONDS,
   SESSIONS,
   setUp,
@@ -196,6 +199,23 @@ if (inShard("upgrade")) {
     /** The folder mounted in the other chat, and what it holds. */
     let folder: string;
     let messages: number;
+    /** What Neon's storage held on PREVIOUS: the pageserver's claim, by its uid, the tenant's shards and the node each is attached to, and main's timeline. */
+    let held: string[];
+    /** Runs `sql` on the storage controller's database, neon-control's record among it: what psql printed. */
+    const onRecord = async (sql: string) =>
+      (await kube.execOk(NAMESPACE, `${neonName("controller-db")}-0`, ["psql", "-U", "storage_controller", "-d", "storage_controller", "-Atc", sql], { container: "postgres" })).trim();
+    const NODES = "select node_id, listen_http_addr, listen_http_port, listen_pg_addr, listen_pg_port, availability_zone_id from nodes order by node_id";
+    /** What Neon's storage holds: the pageserver's claim, by its uid, the tenant's shards and the node each is attached to, and main's timeline. */
+    const neonHeld = async () => [
+      (await kube.get(ref("PersistentVolumeClaim", `data-${neonName("pageserver")}-0`, NAMESPACE)))?.metadata?.uid ?? "",
+      await onRecord("select tenant_id, shard_number, generation_pageserver from tenant_shards order by shard_number"),
+      await onRecord("select branch->>'timelineId' from neon_control.branches where name = 'main'"),
+    ];
+    /** The pageservers' StatefulSet, and its pod, by their uids, as the cut-over finds them. */
+    const pageservers = async () => [
+      (await kube.get(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.metadata?.uid,
+      (await kube.get(ref("Pod", `${neonName("pageserver")}-0`, NAMESPACE)))?.metadata?.uid,
+    ];
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -222,40 +242,189 @@ if (inShard("upgrade")) {
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
         },
       },
+      {
+        seeds: "Neon's tenant on the one pageserver, holding main's work, node 1 registered as the setup named it, its StatefulSet starting its pods in order",
+        seed: async () => {
+          assert.equal(await onRecord(NODES), "1|alasio-neon-pageserver|9898|alasio-neon-pageserver|6400|az-pageserver");
+          assert.equal((await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.spec?.podManagementPolicy, "OrderedReady");
+          held = await neonHeld();
+        },
+        keeps: "the pageserver on its claim, holding the tenant and its timeline on node 1, registered anew at its pod's own Service, its StatefulSet made anew starting its pods at once, " +
+          "its one shard's layout recorded, and the lake loading main's turns through main's read replica",
+        check: async () => {
+          assert.deepEqual(await neonHeld(), held);
+          assert.equal(await onRecord(NODES), `1|${pageserverName(0)}|9898|${pageserverName(0)}|6400|az-pageserver`);
+          const statefulSet = await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE));
+          assert.equal(statefulSet?.spec?.podManagementPolicy, "Parallel");
+          // Governed by a headless Service of this release's, which pod 0, made anew, is named under.
+          assert.equal(statefulSet?.spec?.serviceName, PAGESERVERS_NAME);
+          assert.equal((await kube.get<V1Service>(ref("Service", PAGESERVERS_NAME, NAMESPACE)))?.spec?.clusterIP, "None");
+          assert.equal((await kube.get<V1Pod>(ref("Pod", pageserverName(0), NAMESPACE)))?.spec?.subdomain, PAGESERVERS_NAME);
+          const said = await alasioOk("status");
+          assert.match(said, /^Neon: 1 shard on 1 pageserver$/mu);
+          assert.match(said, new RegExp(`^ {2}pageserver 1 at ${pageserverName(0)}\\.${NAMESPACE}\\.svc\\.cluster\\.local:6400: Active, 1 shard$`, "mu"));
+          // Recorded by neon-control as it starts, and given to main's compute as it fetches its
+          // spec, or, as one that ran on was given 7.0.0's, by the round of the replica that leads.
+          assert.equal(await onRecord("select count(*) from neon_control.layout"), "1");
+          await until("neon-control recorded the layout it gave main's compute", async () =>
+            (await onRecord("select id from neon_control.compute_layouts")).split("\n").includes(computeId(MAIN)) || undefined, 180_000);
+          const lake = (await kube.get<V1Deployment>(ref("Deployment", `${RELEASE}-lake`, NAMESPACE)))?.spec?.template.spec?.containers.find(({ name }) => name === "lake");
+          assert.equal(lake?.env?.find(({ name }) => name === "LAKE_SOURCE_ENDPOINT")?.value, replicaId(MAIN));
+          const since = Date.now();
+          await tg.say("through the replica");
+          await tg.waitFor((call) => answered(call));
+          await untilInLake("main's turn, loaded through its read replica", `select count(*) as n from codex.turns where epoch_ms(completed_at) >= ${since}`, 600_000);
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
 
     // A branch environment another release made does not run on what an upgrade changes,
-    // so a cut-over refuses while one exists, before it changes anything.
+    // so the cut-over refuses while one exists, as its first checks find it, before the
+    // pageservers' StatefulSet is deleted.
     test(`on ${PREVIOUS}: a branch environment, which the cut-over refuses to go past, before it changes anything, until it is deleted`, { timeout: 60 * 60_000 }, async () => {
       await createBranch(branchTelegram?.base);
+      const [set, pod] = await pageservers();
+      const [claim] = await neonHeld();
       const refused = await cutOver();
       assert.notEqual(refused.code, 0, refused.stdout);
-      assert.match(refused.stderr, new RegExp(`\\(alasio branch delete ${BRANCH}\\)`, "u"));
+      assert.match(refused.stderr, new RegExp(`FAILED: alasio upgrades main alone[^\\n]*\\(alasio branch delete ${BRANCH}\\)`, "u"));
+      assert.doesNotMatch(refused.stderr, /deleting the pageservers' StatefulSet/u);
+      assert.deepEqual([...await pageservers(), (await neonHeld())[0]], [set, pod, claim]);
+      assert.equal((await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.spec?.podManagementPolicy, "OrderedReady");
       assert.ok(await runs("alasio-neon-control"), "neon-control runs as it did");
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await alasioOk("branch", "delete", BRANCH);
     });
 
-    test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, leaves the installation running`, { timeout: 60 * 60_000 }, async () => {
+    // This release cannot be applied over PREVIOUS's pageservers' StatefulSet, as the cut-over
+    // deletes it first: a plain upgrade refuses before anything changes.
+    test(`on ${PREVIOUS}: a plain upgrade, refused before it changes anything, as the cut-over is to make the pageservers' StatefulSet anew`, async () => {
+      const before = await pageservers();
+      const alasioGeneration = async () => (await kube.get(ref("Deployment", RELEASE, NAMESPACE)))?.metadata?.generation;
+      const generation = await alasioGeneration();
+      const refused = await releaseAlasio("upgrade");
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.ok(refused.stderr.includes(`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`) && refused.stderr.includes(`upgrades/from-${PREVIOUS}.sh`), refused.stderr);
+      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
+    });
+
+    test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, its pageservers' StatefulSet deleted, makes it again over its pod as it was, ` +
+      "or says last that it could not, and makes it run again", { timeout: 60 * 60_000 }, async () => {
+      const [, pod] = await pageservers();
+      // The cluster refusing to make it again, as the restore's failure the wrapper of the
+      // box's cut-over is to report as such, from the line the run ends with.
+      const held = { apiVersion: "admissionregistration.k8s.io/v1", metadata: { name: "e2e-pageservers-held" } };
+      const policy: V1ValidatingAdmissionPolicy = {
+        ...held,
+        kind: "ValidatingAdmissionPolicy",
+        spec: {
+          failurePolicy: "Fail",
+          matchConstraints: { resourceRules: [{ apiGroups: ["apps"], apiVersions: ["v1"], operations: ["CREATE"], resources: ["statefulsets"] }] },
+          validations: [{ expression: `object.metadata.name != '${neonName("pageserver")}'`, message: "held by the end-to-end run" }],
+        },
+      };
+      const binding: V1ValidatingAdmissionPolicyBinding = { ...held, kind: "ValidatingAdmissionPolicyBinding", spec: { policyName: held.metadata.name, validationActions: ["Deny"] } };
+      await kube.apply(policy);
+      await kube.apply(binding);
+      const stuck = await cutOver({ failAt: "before-the-point-of-no-return" });
+      await kube.remove(ref("ValidatingAdmissionPolicyBinding", held.metadata.name));
+      await kube.remove(ref("ValidatingAdmissionPolicy", held.metadata.name));
+      assert.notEqual(stuck.code, 0, stuck.stdout);
+      assert.match(stuck.stderr, /FAILED: the pageservers' StatefulSet is deleted, its pod running unowned, and could not be made again[^\n]*\n$/u);
+      assert.equal(await kube.get(ref("StatefulSet", neonName("pageserver"), NAMESPACE)), null);
       const failed = await cutOver({ failAt: "before-the-point-of-no-return" });
       assert.notEqual(failed.code, 0, failed.stdout);
-      assert.match(failed.stderr, /FAILED: a failure injected before the point of no return/u);
+      assert.match(failed.stderr, /FAILED: a failure injected before the point of no return[^]*making the pageservers' StatefulSet again/u);
+      assert.doesNotMatch(failed.stderr, /could not be made again/u);
+      const [set, podAfter] = await pageservers();
+      assert.ok(set);
+      assert.equal(podAfter, pod);
+      assert.equal((await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.spec?.podManagementPolicy, "OrderedReady");
       await kube.awaitReady([ref("Deployment", "alasio-neon-control", NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
     });
 
-    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after that failure, through`, { timeout: 60 * 60_000 }, async () => {
-      const ran = await cutOver();
+    const controllerReplicas = async () => (await kube.get<V1Deployment>(ref("Deployment", neonName("storage-controller"), NAMESPACE)))?.spec?.replicas;
+    let controllerRan: number | undefined;
+
+    test(`the cut-over from ${PREVIOUS}, failing past the point of no return with the storage controller stopped, leaves it stopped and node 1 as it was`, { timeout: 60 * 60_000 }, async () => {
+      controllerRan = await controllerReplicas();
+      assert.ok(controllerRan);
+      const failed = await cutOver({ failAt: "after-the-storage-controller-stopped" });
+      assert.notEqual(failed.code, 0, failed.stdout);
+      assert.match(failed.stderr, /registering node 1 anew at [^]*FAILED: a failure injected once the storage controller was stopped/u);
+      assert.equal(await controllerReplicas(), 0);
+      assert.equal(await onRecord(NODES), "1|alasio-neon-pageserver|9898|alasio-neon-pageserver|6400|az-pageserver");
+      // What it registered unread, as with its database stopped, is no registration either
+      // way: the run fails there, the upgrade not run.
+      const database = ref("StatefulSet", neonName("controller-db"), NAMESPACE);
+      await kube.patch(database, { spec: { replicas: 0 } });
+      await until("the storage controller's database stopped", async () => (await kube.get(ref("Pod", `${neonName("controller-db")}-0`, NAMESPACE))) === null || undefined, 300_000);
+      const unread = await cutOver();
+      await kube.patch(database, { spec: { replicas: 1 } });
+      await kube.awaitReady([database], "10 minutes");
+      assert.notEqual(unread.code, 0, unread.stdout);
+      assert.match(unread.stderr, /FAILED: the storage controller's database did not answer/u);
+      assert.doesNotMatch(unread.stderr, /registering node 1 anew|upgrading, from the cut-over/u);
+    });
+
+    test(`the cut-over from ${PREVIOUS}, run again, starts the storage controller with the replicas it ran, and, failing once node 1 is registered anew, leaves ${PREVIOUS} running on the pageserver at its new name`, { timeout: 60 * 60_000 }, async () => {
+      const failed = await cutOver({ failAt: "after-the-pageserver-registered-anew" });
+      assert.notEqual(failed.code, 0, failed.stdout);
+      assert.match(failed.stderr, /registering node 1 anew at [^]*starting the storage controller again[^]*FAILED: a failure injected once node 1 was registered anew/u);
+      assert.equal(await controllerReplicas(), controllerRan);
+      assert.equal(await onRecord(NODES), `1|${pageserverName(0)}|9898|${pageserverName(0)}|6400|az-pageserver`);
+      assert.equal(await kube.get(ref("StatefulSet", neonName("pageserver"), NAMESPACE)), null);
+      await tg.say("between the cut-overs, past their point of no return");
+      await tg.waitFor((call) => answered(call));
+    });
+
+    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through`, { timeout: 60 * 60_000 }, async () => {
+      // Each second it runs: whether main's compute, awake, has an address to read pages at,
+      // PREVIOUS's pageservers' Service or the one neon-control gave it; whether this release's
+      // pageservers' StatefulSet is applied, past which the upgrade's prune would delete
+      // PREVIOUS's Service, which the cut-over keeps until neon-control has given pod 0's; and
+      // whether pod 0 is ready.
+      const samples: { readonly at: number; readonly asleep: boolean; readonly service: boolean; readonly given: boolean; readonly applied: boolean; readonly ready: boolean }[] = [];
+      let running = true;
+      const sampling = (async () => {
+        while (running) {
+          const at = Date.now();
+          const asleep = await kube.get<V1Deployment>(ref("Deployment", neonName("compute"), NAMESPACE)).then((compute) => compute?.spec?.replicas === 0, () => false);
+          const service = await kube.get(ref("Service", neonName("pageserver"), NAMESPACE)).then((found) => found !== null, () => true);
+          const given = await onRecord(`select layout from neon_control.compute_layouts where id = '${computeId(MAIN)}'`).then((layout) => layout.includes(pageserverName(0)), () => false);
+          const applied = await kube.get(ref("StatefulSet", neonName("pageserver"), NAMESPACE)).then((found) => found !== null, () => false);
+          const pod = await kube.get<V1Pod>(ref("Pod", pageserverName(0), NAMESPACE)).catch(() => null);
+          samples.push({ at, asleep, service, given, applied, ready: pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True") ?? false });
+          await sleep(1000);
+        }
+      })();
+      const ran = await cutOver().finally(() => {
+        running = false;
+      });
+      await sampling;
+      // The seconds from each sample `pick` holds of to the next.
+      const spans = (pick: (sample: (typeof samples)[number]) => boolean) =>
+        samples.slice(1).reduce((sum, sample, index) => sum + (pick(samples[index]!) ? sample.at - samples[index]!.at : 0), 0) / 1000;
+      const unreachable = spans(({ asleep, service, given }) => !asleep && !service && !given);
+      const pruned = spans(({ asleep, given, applied }) => !asleep && applied && !given);
+      console.error(`# main's compute had no pageserver address for ${unreachable}s, where ${PREVIOUS}'s Service pruned with this release applied would have left it none for ${pruned}s; ` +
+        `pod 0 was not ready for ${spans(({ ready }) => !ready)}s, of the cut-over's ${(samples.at(-1)!.at - samples[0]!.at) / 1000}s`);
+      assert.equal(unreachable, 0);
+      assert.equal(await kube.get(ref("Service", neonName("pageserver"), NAMESPACE)), null);
       assert.equal(ran.code, 0, ran.stdout);
+      assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
+      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded\n$/u);
     });
 
     test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
       const again = await cutOver();
       assert.equal(again.code, 0, again.stdout);
       assert.match(again.stderr, /upgrading, from the cut-over begun at /u);
+      assert.doesNotMatch(again.stderr, /checking that the storage controller has node 1|deleting the pageservers' StatefulSet|registering node 1 anew|pageservers' Service through the upgrade|main's compute given pod 0's/u);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
