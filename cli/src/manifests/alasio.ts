@@ -185,7 +185,8 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
 /**
  * How session sandboxes are snapshotted as they are released (src/sandbox/snapshots.ts),
  * where the node agents run: once sessions.snapshots.releaseAfter has passed without an
- * exec or a turn, under the gVisor `releases` alasio keeps (../kept-releases.ts), the
+ * exec or a turn, and live every sessions.snapshots.liveEvery while execs run, under the
+ * gVisor `releases` alasio keeps (../kept-releases.ts), the
  * current one first, each restored with a RuntimeClass of its own, by the agents in
  * alasio's namespace.
  */
@@ -193,6 +194,7 @@ function sessionSnapshots(config: InstallConfig, releases: readonly string[]): N
   return {
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
+    liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
     releases: releases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
     agents: {
       namespace: NAMESPACE,

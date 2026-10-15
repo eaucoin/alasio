@@ -92,7 +92,8 @@ const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole 
 
 /**
  * Session sandboxes' whole-sandbox snapshots (../sandbox/snapshots.ts): how long a session
- * runs no exec and no turn before its Sandbox is snapshotted and released; the gVisor
+ * runs no exec and no turn before its Sandbox is snapshotted and released; how often one
+ * whose execs run is snapshotted live, running on; the gVisor
  * releases a snapshot is restored under, each by its RuntimeClass, the current one first;
  * and where the node agents that take and prepare the snapshots are, by their pods'
  * namespace and labels, and the port they serve on.
@@ -100,6 +101,7 @@ const Count = said(Schema.Number.check(Schema.isInt({ message: "must be a whole 
 const Snapshots = said(
   Schema.Struct({
     releaseAfterSeconds: Count,
+    liveEverySeconds: Count,
     releases: said(
       Schema.Array(Schema.Struct({ release: said(Schema.NonEmptyString, "must be a release"), runtimeClassName: said(Schema.NonEmptyString, "must be a RuntimeClass's name") }))
         .check(Schema.isMinLength(1, { message: "must name a release" })),

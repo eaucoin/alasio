@@ -475,7 +475,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     namespace: profile.namespace,
     port: profile.port,
     fault: brokenMount,
-    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore } : {}),
+    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live } : {}),
   });
   /** The turns running on each session, and when its last ended. */
   const turns = new Map<string, { readonly running: number; readonly endedAt: number }>();
