@@ -22,6 +22,9 @@
  *   its session, its branch and its data checked as before. The step `bytes` is a version
  *   read back as other bytes than before: the cut-over stopping at its checks, the rollback
  *   recording the old store's answer as differing, and bringing the stack back all the same.
+ *   The steps `stop-claim`, `stop-volume`, `stop-maxid` and `stop-listing` (STOPS) are the
+ *   rollback stopping, alasio still at none, where the old store would write or allocate
+ *   wrongly, and going on once that is put right.
  *
  * Folder workspaces are on, as on the box: a Sandbox of their bayma's pod template, which no
  * cut-over may stop, is checked untouched through every failure.
@@ -517,6 +520,86 @@ function sealed(): void {
 /** The step a cut-over recorded in `out`, which root's scripts keep to root. */
 const recorded = (out: string) => run("sudo", ["cat", join(out, "step")], { env: process.env }).trim();
 
+/** Runs `command` as root, as the scripts do: what it printed. */
+const asRoot = (command: string) => run("sudo", ["sh", "-c", command], { env: process.env });
+
+/**
+ * What the rollback stops at, the old store's writers stopped and it sealed, each made on a
+ * cut-over that failed after step 6 (the volume on the release's claim, the old store
+ * stopped), with what it says, and what puts it right again, after which the rollback goes
+ * on: the volume held by another claim; a volume the old store had missing from it; a volume
+ * id on the disk above any the old master would make; the old filer's metadata gone, its
+ * versions with it.
+ */
+const STOPS = {
+  "stop-claim": {
+    says: "is held by 'rehearsal-other'",
+    break: ({ pv }: Volume) => {
+      kubectl("-n", "alasio", "delete", "pvc", "data-alasio-seaweedfs-volume-0", "--wait=true");
+      const volume = JSON.parse(kubectl("get", "pv", pv, "-o", "json")) as { spec: { storageClassName: string; capacity: { storage: string }; accessModes: string[] } };
+      kubectl("patch", "pv", pv, "--type", "merge", "-p", JSON.stringify({ spec: { claimRef: { apiVersion: "v1", kind: "PersistentVolumeClaim", namespace: "alasio", name: "rehearsal-other", uid: null, resourceVersion: null } } }));
+      run("kubectl", ["--kubeconfig", kubeconfig, "apply", "-f", "-"], {
+        input: JSON.stringify({
+          apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: { name: "rehearsal-other", namespace: "alasio" },
+          spec: { volumeName: pv, storageClassName: volume.spec.storageClassName, accessModes: volume.spec.accessModes, resources: { requests: { storage: volume.spec.capacity.storage } } },
+        }),
+      });
+      kubectl("-n", "alasio", "wait", "pvc/rehearsal-other", "--for=jsonpath={.status.phase}=Bound", "--timeout=120s");
+    },
+    mend: () => kubectl("-n", "alasio", "delete", "pvc", "rehearsal-other", "--wait=true"),
+  },
+  "stop-volume": {
+    says: "lacks the volume",
+    break: ({ dir }: Volume) => asRoot(`f=$(ls ${dir} | grep -E '^[a-z]+_[0-9]+\\.dat$' | head -n 1); mv "${dir}/$f" '${WORK}/missing.dat'; echo "$f" > '${WORK}/missing.name'`),
+    mend: ({ dir }: Volume) => asRoot(`mv '${WORK}/missing.dat' "${dir}/$(cat '${WORK}/missing.name')"`),
+  },
+  "stop-maxid": {
+    says: "the old master would make volume",
+    break: ({ dir }: Volume) => asRoot(`: > '${dir}/9999.dat'`),
+    mend: ({ dir }: Volume) => asRoot(`rm -f '${dir}/9999.dat'`),
+  },
+  "stop-listing": {
+    says: "fewer versions than before the cut-over",
+    break: ({ dir }: Volume) => asRoot(`mv '${dir}/filerldb2' '${WORK}/filerldb2.aside'`),
+    // The old store, started on the metadata it made anew, stopped, its own put back, and started again.
+    mend: ({ dir }: Volume) => {
+      kubectl("-n", "alasio", "scale", "statefulset/alasio-seaweedfs", "--replicas=0");
+      kubectl("-n", "alasio", "wait", "pod/alasio-seaweedfs-0", "--for=delete", "--timeout=300s");
+      asRoot(`rm -rf '${dir}/filerldb2' && mv '${WORK}/filerldb2.aside' '${dir}/filerldb2'`);
+      kubectl("-n", "alasio", "scale", "statefulset/alasio-seaweedfs", "--replicas=1");
+    },
+  },
+} as const;
+
+/** The volume a cut-over recorded: its PV and its directory on this machine. */
+interface Volume {
+  readonly pv: string;
+  readonly dir: string;
+}
+
+async function stops(name: keyof typeof STOPS, tg: ReturnType<typeof operator>, kept: Kept, cutover: Readonly<Record<string, string>>): Promise<void> {
+  const out = cutover["OUT"] ?? fail("the cut-over has no OUT");
+  const stop = STOPS[name];
+  runningJobs(`at-${name}`);
+  say(`the cut-over, failing after step 6, then the store broken for ${name}`);
+  const cut = script("cutover.sh", { ...cutover, FAIL_AT: "6" });
+  if (cut.code === 0 || !cut.stderr.includes("a failure injected after step 6")) fail("the cut-over did not fail as injected after step 6");
+  const [pv = "", dir = ""] = run("sudo", ["cat", join(out, "volume.tsv")], { env: process.env }).trim().split("\t");
+  stop.break({ pv, dir });
+  const rollback = { RELEASE: cutover["RELEASE"] ?? "", OUT: out, PREVIOUS: PREVIOUS(), PREVIOUS_CHECK: PREVIOUS_CHECK() };
+  const stopped = script("rollback.sh", rollback);
+  if (stopped.code !== 1 || !stopped.stderr.includes(stop.says)) fail(`the rollback exited ${stopped.code}, not 1 saying "${stop.says}"`);
+  const writers = kubectl("-n", "alasio", "get", "deployment", "alasio", "-o", "jsonpath={.spec.replicas}");
+  if (writers !== "0") fail(`the rollback stopped with alasio at ${writers} replicas, not none`);
+  say(`the rollback stopped (${stop.says}), alasio still at none; put right, and run again`);
+  stop.mend({ pv, dir });
+  const back = script("rollback.sh", rollback);
+  if (back.code !== 0) fail(`the rollback, run again once ${name} was put right, exited ${back.code}`);
+  await check(tg, kept, previous);
+  folderUntouched(kept);
+  say(`rolled back once ${name} was put right`);
+}
+
 /**
  * A version read back whose bytes differ from what the old store read before: the cut-over,
  * stopped after its inventory, has the first digest it recorded made another, as a store or
@@ -539,7 +622,9 @@ async function bytesDiffer(tg: ReturnType<typeof operator>, kept: Kept, cutover:
   const back = script("rollback.sh", { RELEASE: cutover["RELEASE"] ?? "", OUT: out, PREVIOUS: PREVIOUS(), PREVIOUS_CHECK: PREVIOUS_CHECK() });
   if (back.code !== 3 || !back.stderr.includes("DIFFERS: versions read back hold other bytes than before the cut-over")) fail(`the rollback exited ${back.code}, not 3 with the bytes recorded as differing`);
   const differing = run("sudo", ["cat", join(out, "discrepancies.txt")], { env: process.env }).trim().split("\n");
-  if (differing.length !== 1) fail(`the rollback recorded ${differing.length} discrepancies, not the one: ${differing.join("; ")}`);
+  if (differing.length !== 2 || !differing[0]?.startsWith("# the rollback of ")) fail(`the rollback recorded ${differing.length - 1} discrepancies, not the one: ${differing.join("; ")}`);
+  if (kubectl("-n", "alasio", "get", "cronjob", "alasio-seaweedfs-lifecycle", "-o", "jsonpath={.spec.suspend}") !== "true") fail("the old store's lifecycle CronJob runs, with what differs not looked into");
+  kubectl("-n", "alasio", "patch", "cronjob", "alasio-seaweedfs-lifecycle", "-p", JSON.stringify({ spec: { suspend: false } }));
   await check(tg, kept, previous);
   folderUntouched(kept);
   say("rolled back from step 8, the discrepancy recorded");
@@ -558,6 +643,10 @@ async function main(): Promise<void> {
       const { release: releaseFile, csi } = render(out);
       if (step === "bytes") {
         await bytesDiffer(tg, kept, { RELEASE: releaseFile, CSI_NAMESPACE: csi, OUT: out, ...settings });
+        continue;
+      }
+      if (step in STOPS) {
+        await stops(step as keyof typeof STOPS, tg, kept, { RELEASE: releaseFile, CSI_NAMESPACE: csi, OUT: out, ...settings });
         continue;
       }
       const cutover = { RELEASE: releaseFile, CSI_NAMESPACE: csi, OUT: out, FAIL_AT: step, ...settings };

@@ -115,8 +115,8 @@ injected 3
 
 step 4 "the inventory, through the old store"
 if [ ! -e "$OUT/inventory-before.json" ]; then
-  inventory "$OLD_POD" lifecycle >"$OUT/inventory-before.part.json"
-  volumes old_shell volume-list-before.txt >"$OUT/volumes-before.txt"
+  inventory "$OLD_POD" lifecycle >"$OUT/inventory-before.part.json" || fail "the old store's inventory is not read"
+  volumes old_shell volume-list-before.txt >"$OUT/volumes-before.txt" || fail "the old store's masters do not answer (volume-list-before.txt)"
   [ -n "$(cat "$OUT/volumes-before.txt")" ] || fail "the old store's masters list no volumes (volume-list-before.txt)"
   [ "$(cat "$OUT/volumes-before.txt")" = "$(volumes_on_disk "$pv")" ] || fail "the old store's masters know volumes $(cat "$OUT/volumes-before.txt"), the disk holds $(volumes_on_disk "$pv")"
   entries old_shell /buckets entries-before-saved.txt >"$OUT/entries-before.txt"
@@ -128,7 +128,10 @@ if [ ! -e "$OUT/inventory-before.json" ]; then
   # back against, as it answered before anything of it was touched.
   read_back_set "$OUT/inventory-before.part.json" "$READ_BACK" >"$OUT/read-back.tsv"
   contents "$OLD_POD" <"$OUT/read-back.tsv" >"$OUT/contents-before.tsv" || fail "the old store does not read every version read back (read-back.tsv)"
+  # On the disk before the inventory is recorded whole, as what every store is read back against.
+  sync "$OUT/read-back.tsv" "$OUT/contents-before.tsv" "$OUT/inventory-before.part.json"
   mv "$OUT/inventory-before.part.json" "$OUT/inventory-before.json"
+  sync "$OUT"
 fi
 volumes_before=$(cat "$OUT/volumes-before.txt")
 entries_before=$(cat "$OUT/entries-before.txt")
@@ -245,7 +248,7 @@ done
 injected 7
 
 step 8 "the store checked, before any writer starts"
-volumes_after=$(volumes new_shell volume-list-after.txt)
+volumes_after=$(volumes new_shell volume-list-after.txt) || fail "the release's masters do not answer (volume-list-after.txt)"
 [ -n "$volumes_after" ] || fail "the release's masters list no volumes (volume-list-after.txt)"
 [ "$volumes_after" = "$(volumes_on_disk "$pv")" ] || fail "the release's masters know volumes $volumes_after, the disk holds $(volumes_on_disk "$pv")"
 highest=$(tr ' ' '\n' <<<"$stopped" | sed -n 's/^\([0-9]*\):.*/\1/p' | sort -n | tail -n 1)
@@ -261,8 +264,10 @@ comm -23 "$OUT/log-before.txt" "$OUT/log-after.txt" >"$OUT/log-missing.txt"
 [ ! -s "$OUT/log-missing.txt" ] || fail "the filers' log of changes lacks $(wc -l <"$OUT/log-missing.txt") of the old one's files (log-missing.txt)"
 # The inventory, a listing, against the old store's listing, which the same code answers in
 # both releases; each version read back against what the old store read it as.
-for gateway in $(k get pods -l app.kubernetes.io/component=seaweedfs -o jsonpath='{.items[*].metadata.name}'); do
-  inventory "$gateway" lifecycle >"$OUT/inventory-after-$gateway.json"
+gateways=$(k get pods -l app.kubernetes.io/component=seaweedfs -o jsonpath='{.items[*].metadata.name}')
+[ -n "$gateways" ] || fail "no gateway of the release's runs to read the store back through"
+for gateway in $gateways; do
+  inventory "$gateway" lifecycle >"$OUT/inventory-after-$gateway.json" || fail "the inventory through $gateway is not read"
   diff -u "$OUT/inventory-before.json" "$OUT/inventory-after-$gateway.json" >"$OUT/inventory-diff-$gateway.txt" || fail "the inventory through $gateway differs (inventory-diff-$gateway.txt)"
   contents "$gateway" <"$OUT/read-back.tsv" >"$OUT/contents-after-$gateway.tsv" || fail "$gateway does not read every version read back (read-back.tsv)"
   diff -u "$OUT/contents-before.tsv" "$OUT/contents-after-$gateway.tsv" >"$OUT/contents-diff-$gateway.txt" ||

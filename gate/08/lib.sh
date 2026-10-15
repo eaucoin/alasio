@@ -190,9 +190,10 @@ stop_writers() {
   wait_for "$WAIT" "the writers' pods, the sessions' and JuiceFS's mount pods, and the Jobs, to be gone ($(writer_pods | tr '\n' ' '))" none writer_pods
 }
 
-# Starts again what stop_writers stopped, as each was, from its mark.
+# Starts again what stop_writers stopped, as each was, from its mark; but the CronJobs named
+# (namespace/name) in "$@", which stay suspended, their marks gone, until someone resumes them.
 start_writers() {
-  local ref ns name was kind
+  local ref ns name was kind held=" $* "
   if served Sandbox; then
     kubectl get sandbox -A -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | while read -r ref; do
       ns=${ref%%/*} name=${ref#*/}
@@ -224,7 +225,11 @@ start_writers() {
     ns=${ref%%/*} name=${ref#*/}
     was=$(marked cronjob "$name" "$ns") || continue
     [ -n "$was" ] || continue
-    kubectl -n "$ns" patch cronjob "$name" -p "$(jq -c '{spec: .}' <<<"$was")" >/dev/null
+    if [ "${held#* "$ref" }" = "$held" ]; then
+      kubectl -n "$ns" patch cronjob "$name" -p "$(jq -c '{spec: .}' <<<"$was")" >/dev/null
+    else
+      log "the CronJob $ref is held suspended: kubectl -n $ns patch cronjob $name -p '$(jq -c '{spec: .}' <<<"$was")' resumes it"
+    fi
     unmark cronjob "$name" "$ns"
   done
 }
@@ -329,7 +334,10 @@ old_shell() { kx -i "$OLD_POD" -c seaweedfs -- weed shell -master=127.0.0.1:9333
 new_shell() { kx -i deployment/"$GATEWAY" -c buckets -- weed shell "-master=$MASTER-0.$MASTER.$NS.svc.cluster.local:9333" "-filer=$FILER:8888"; }
 
 # The volumes a shell's masters know, as id:collection, sorted, the listing written to $OUT/$2.
-volumes() { printf 'volume.list\n' | "$1" >"$OUT/$2"; sed -n 's/.*volume Id:\([0-9]*\), .*Collection:\([^,]*\),.*/\1:\2/p' "$OUT/$2" | sort -n | tr '\n' ' '; }
+volumes() {
+  printf 'volume.list\n' | "$1" >"$OUT/$2" || return 1
+  sed -n 's/.*volume Id:\([0-9]*\), .*Collection:\([^,]*\),.*/\1:\2/p' "$OUT/$2" | sort -n | tr '\n' ' '
+}
 
 # The entries under $2, as a shell $1 counts them, through a filer: "total N directories, M files".
 entries() { printf 'fs.meta.save -o /dev/null %s\n' "$2" | "$1" >"$OUT/$3"; grep -o 'total [0-9]* directories, [0-9]* files' "$OUT/$3" | tail -n 1; }
@@ -345,24 +353,30 @@ log_files() {
 # What a gateway's pod $1, in its container $2, answers at its own S3 port: every bucket's
 # every version and delete marker, with sizes and ETags, its versioning and lifecycle rules.
 # Each answer goes through a file, as a bucket's versions are megabytes, more than an
-# argument holds.
+# argument holds. Fails, saying which, where any answer is not had, but a bucket's having no
+# lifecycle rules: its status is checked by every caller, whom `set -e` does not cover here.
 inventory() {
-  local pod=$1 container=$2 bucket work
+  local pod=$1 container=$2 bucket buckets work status=0
   work=$(mktemp -d "$OUT/inventory.XXXXXX")
   mkdir "$work/buckets"
   s3api() { kx "$pod" -c "$container" -- aws --endpoint-url http://127.0.0.1:8333 s3api "$@"; }
-  for bucket in $(s3api list-buckets --query 'Buckets[].Name' --output text); do
-    s3api list-object-versions --bucket "$bucket" --output json >"$work/versions.json"
-    s3api get-bucket-versioning --bucket "$bucket" --output json >"$work/versioning.json"
-    s3api get-bucket-lifecycle-configuration --bucket "$bucket" --output json >"$work/lifecycle.json" 2>/dev/null || true
+  buckets=$(s3api list-buckets --query 'Buckets[].Name' --output text) || { log "$pod lists no buckets"; status=1; }
+  for bucket in $buckets; do
+    [ "$status" = 0 ] || break
+    s3api list-object-versions --bucket "$bucket" --output json >"$work/versions.json" || { log "$pod lists no versions of $bucket"; status=1; break; }
+    s3api get-bucket-versioning --bucket "$bucket" --output json >"$work/versioning.json" || { log "$pod says no versioning of $bucket"; status=1; break; }
+    if ! s3api get-bucket-lifecycle-configuration --bucket "$bucket" --output json >"$work/lifecycle.json" 2>"$work/lifecycle.err"; then
+      grep -q NoSuchLifecycleConfiguration "$work/lifecycle.err" || { log "$pod says no lifecycle of $bucket: $(cat "$work/lifecycle.err")"; status=1; break; }
+    fi
     for file in versions versioning lifecycle; do [ -s "$work/$file.json" ] || echo '{}' >"$work/$file.json"; done
     jq -n --arg bucket "$bucket" --slurpfile versions "$work/versions.json" --slurpfile versioning "$work/versioning.json" --slurpfile lifecycle "$work/lifecycle.json" \
       '{bucket: $bucket,
         versions: ([($versions[0].Versions // [])[] | {Key, VersionId, Size, ETag, IsLatest}] + [($versions[0].DeleteMarkers // [])[] | {Key, VersionId, IsLatest, deleteMarker: true}] | sort_by(.Key, .VersionId)),
-        versioning: $versioning[0], lifecycle: $lifecycle[0]}' >"$work/buckets/$bucket.json"
+        versioning: $versioning[0], lifecycle: $lifecycle[0]}' >"$work/buckets/$bucket.json" || { status=1; break; }
   done
-  find "$work/buckets" -name '*.json' -print0 | sort -z | xargs -0 cat | jq -S -s .
+  [ "$status" != 0 ] || find "$work/buckets" -name '*.json' -print0 | sort -z | xargs -0 cat | jq -S -s . || status=1
   rm -rf "$work"
+  return "$status"
 }
 
 # The versions of the inventory $1 to read back: of each bucket's, at most $2, those of more
@@ -397,6 +411,7 @@ contents() {
       digest=$({ aws --endpoint-url http://127.0.0.1:8333 s3api get-object --bucket "$bucket" --key "$key" --version-id "$version" /dev/fd/3 3>&1 >/dev/null </dev/null ||
         touch /tmp/read-back.failed; } | sha256sum | cut -d " " -f 1)
       [ ! -e /tmp/read-back.failed ] || { echo "$bucket/$key $version is not read" >&2; exit 1; }
+      printf "%s" "$digest" | grep -qE "^[0-9a-f]{64}$" || { echo "$bucket/$key $version is digested as \"$digest\"" >&2; exit 1; }
       printf "%s\t%s\t%s\t%s\n" "$bucket" "$key" "$version" "$digest"
     done'
 }

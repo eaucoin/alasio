@@ -6,7 +6,8 @@ name: gate-08-cutover
 # branch, its rows and versions, a folder workspace; then the cut-over failing after each step
 # and run again, its upgrade failing and run again, rolled forward; and, in two jobs, rolled back
 # from a failure after each of its steps before the upgrade, each run again first, and from a
-# version read back as other bytes than before. On its
+# version read back as other bytes than before; and, in a third, the rollback stopping where the
+# old store would write or allocate wrongly, then going on once that is put right. On its
 # branch alone, whenever what it runs changes.
 on:
   push:
@@ -24,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8 bytes"]
+        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8 bytes", "rollback stop-claim stop-volume stop-maxid stop-listing"]
     steps:
       # alasio's images and its cluster's take more disk than a runner starts with free, so
       # the software it comes with that this job does not use goes first, in the background,
