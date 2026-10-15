@@ -129,7 +129,7 @@ interface NodeOptions {
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
 async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: (name: string, options?: NodeOptions) => Effect.Effect<Node, never, Scope.Scope> }) => Effect.Effect<void, unknown, Scope.Scope>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, heads: true });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
   const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3 }: NodeOptions = {}) =>
     Effect.gen(function*() {
@@ -975,7 +975,7 @@ test("as the agent stops, an operation it runs is let end before what it runs in
   }).pipe(Effect.runPromise));
 
 test("the agent runs as its own process from its environment, and stops when told", async () => {
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, heads: true });
   const env = {
     PATH: process.env["PATH"],
     NODE_NAME: "node-1",

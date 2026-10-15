@@ -51,8 +51,8 @@ test("requests are signed as AWS's Signature Version 4 test suite signs them", (
 
 const CREDENTIALS = { accessKeyId: "snapshots0123", secretAccessKey: "a secret" };
 
-test("the bucket takes files and JSON, gives them back, copies them within itself, lists a prefix across pages, and deletes, every request signed", async () => {
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, pageSize: 2 });
+test("the bucket takes files and JSON, gives them back, says what it holds, copies within itself, lists a prefix across pages, and deletes, every request signed", async () => {
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, pageSize: 2, heads: true });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
     const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
@@ -62,8 +62,11 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
     const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
     // A key of characters a path encodes, streamed up unsigned and down with its hash.
-    await run(bucket.putFile("main/fs-abc/s1/a page+1.img", source));
+    const etag = await run(bucket.putFile("main/fs-abc/s1/a page+1.img", source));
     assert.deepEqual(s3.objects.get("main/fs-abc/s1/a page+1.img"), pages);
+    // What the bucket holds of it is what its upload was answered with.
+    assert.deepEqual(await run(bucket.head("main/fs-abc/s1/a page+1.img")), { bytes: pages.length, etag });
+    assert.equal(await run(bucket.head("main/fs-abc/s1/none")), null);
     const received = await run(bucket.getFile("main/fs-abc/s1/a page+1.img", join(directory, "copy.img"), pages.length));
     assert.deepEqual(received, { bytes: pages.length, sha256: createHash("sha256").update(pages).digest("hex") });
     assert.deepEqual(readFileSync(join(directory, "copy.img")), pages);
@@ -83,14 +86,18 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
 
     for (const name of ["s1/b", "s1/c", "s2/a"]) await run(bucket.putJson(`main/fs-abc/${name}`, {}));
     await run(bucket.putJson("main/fs-abcd/current.json", {}));
-    // Five keys under the prefix, two to a page.
-    assert.deepEqual(await run(bucket.list("main/fs-abc/")), [
+    // Five keys under the prefix, two to a page, each with when it was written.
+    s3.writtenAt.set("main/fs-abc/s1/b", Date.parse("2026-10-01T12:00:00.000Z"));
+    const listed = await run(bucket.list("main/fs-abc/"));
+    assert.deepEqual(listed.map(({ key }) => key), [
       "main/fs-abc/current.json",
       "main/fs-abc/s1/a page+1.img",
       "main/fs-abc/s1/b",
       "main/fs-abc/s1/c",
       "main/fs-abc/s2/a",
     ]);
+    assert.deepEqual(listed.map(({ key, writtenAt }) => [key, writtenAt]), listed.map(({ key }) => [key, s3.writtenAt.get(key)]));
+    assert.equal(listed[2]?.writtenAt, Date.parse("2026-10-01T12:00:00.000Z"));
     assert.equal(s3.requests.filter((request) => request.startsWith("GET ?")).length, 3);
 
     await run(bucket.remove("main/fs-abc/s2/a"));
@@ -112,7 +119,7 @@ test("the bucket takes files and JSON, gives them back, copies them within itsel
 });
 
 test("a file larger than a part is put in parts, some at a time, and got in ranges; one larger than a copy is copied in parts; an upload that fails is aborted", async () => {
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, heads: true });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
     const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300, copyBytes: 1500 });
@@ -122,11 +129,14 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
     writeFileSync(source, pages);
     const key = "main/fs-abc/s1/pages.img";
 
-    // Four parts, the last the rest, put together in order.
-    await run(bucket.putFile(key, source));
+    // Four parts, the last the rest, put together in order: the bucket's ETag of the whole,
+    // which is not its MD5, as it says it of the object.
+    const etag = await run(bucket.putFile(key, source));
     assert.deepEqual(s3.objects.get(key), pages);
     assert.deepEqual(s3.requests.filter((asked) => asked.startsWith(`PUT ${key} part`)).toSorted(), [1, 2, 3, 4].map((part) => `PUT ${key} part ${part}`));
     assert.deepEqual([s3.requests[0], s3.requests.at(-1)], [`POST ${key}?uploads`, `POST ${key} complete`]);
+    assert.match(etag, /^"[0-9a-f]{32}-4"$/u);
+    assert.deepEqual(await run(bucket.head(key)), { bytes: pages.length, etag });
     // A file of a part or less is put whole.
     writeFileSync(join(directory, "small.img"), pages.subarray(0, 1000));
     await run(bucket.putFile("main/fs-abc/s1/small.img", join(directory, "small.img")));
@@ -166,7 +176,7 @@ test("a file larger than a part is put in parts, some at a time, and got in rang
 });
 
 test("the bucket's gets go `parallel` at a time, every one of its files together, each written synced to the disk", async () => {
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, heads: true });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
     const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300 });
@@ -193,7 +203,7 @@ test("the bucket's gets go `parallel` at a time, every one of its files together
 });
 
 test("a get holds the bucket to the size its file is said to be, a JSON object to a manifest's, and one range that fails stops the rest and lets go of the budget", async () => {
-  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS, heads: true });
   const directory = mkdtempSync(join(tmpdir(), "alasio-node-agent-s3-"));
   try {
     const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS, partBytes: 1000, parallel: 2, syncBytes: 300 });

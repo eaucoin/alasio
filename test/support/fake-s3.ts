@@ -1,7 +1,7 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
- * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), DeleteObject,
- * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
+ * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject,
+ * DeleteObject, ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
  * CompleteMultipartUpload, AbortMultipartUpload), every
  * request's Signature Version 4 checked against the credentials it is given, with every
  * `x-amz-*` header signed, and a signed payload's hash against the payload. What it was
@@ -18,6 +18,11 @@ export interface FakeS3 {
   readonly endpoint: string;
   /** The bucket's objects, by key. */
   readonly objects: Map<string, Buffer>;
+  /**
+   * When each object was last written, in milliseconds since the epoch, by key: now as it
+   * is written, as the store would, but for one a test sets here.
+   */
+  readonly writtenAt: Map<string, number>;
   /**
    * What was asked, in order: `<METHOD> <key>`, a copy's as `PUT <key> from <source>`, the
    * bucket's own requests as `<METHOD> ?<query>`; of a multipart upload, `<METHOD> <key>?uploads`
@@ -41,6 +46,11 @@ export interface FakeS3Options extends S3Credentials {
   readonly bucket: string;
   readonly region: string;
   readonly pageSize?: number;
+  /**
+   * Whether it answers HeadObject, as the snapshots bucket's client asks it of an object;
+   * unless told, it answers 405, as the lake's tests of DuckDB's reads of it have it.
+   */
+  readonly heads?: boolean;
 }
 
 const AUTHORIZATION = /^AWS4-HMAC-SHA256 Credential=[^/]+\/\d{8}\/[^/]+\/s3\/aws4_request, SignedHeaders=([a-z0-9;-]+), Signature=[0-9a-f]{64}$/u;
@@ -58,8 +68,17 @@ async function bodyOf(request: IncomingMessage): Promise<Buffer> {
 }
 
 /** Starts the stand-in on a port of its own. */
-export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey, pageSize = 2 }: FakeS3Options): Promise<FakeS3> {
+export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey, pageSize = 2, heads = false }: FakeS3Options): Promise<FakeS3> {
   const objects = new Map<string, Buffer>();
+  const writtenAt = new Map<string, number>();
+  // What each object was answered with as it was written, as S3 does: a multipart one's
+  // is not its bytes' MD5.
+  const etags = new Map<string, string>();
+  const write = (key: string, bytes: Buffer, etag: string): void => {
+    objects.set(key, bytes);
+    etags.set(key, etag);
+    writtenAt.set(key, Date.now());
+  };
   const requests: string[] = [];
   const uploads = new Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>();
   let getting = 0;
@@ -139,9 +158,12 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         const parts = listed.map(([, number = "", etag = ""]) => ({ number: Number(number), etag: etag.replaceAll("&#34;", '"') }));
         const whole = parts.every(({ number, etag }, index) => number === index + 1 && upload.parts.has(number) && etagOf(upload.parts.get(number) ?? Buffer.alloc(0)) === etag);
         if (!whole || parts.length !== upload.parts.size) return error(response, 400, "InvalidPart", "One or more of the specified parts could not be found.");
-        objects.set(key, Buffer.concat(parts.map(({ number }) => upload.parts.get(number) ?? Buffer.alloc(0))));
+        const etag = `"${createHash("md5").update(Buffer.concat(parts.map(({ etag }) => Buffer.from(etag.slice(1, -1), "hex")))).digest("hex")}-${parts.length}"`;
+        write(key, Buffer.concat(parts.map(({ number }) => upload.parts.get(number) ?? Buffer.alloc(0))), etag);
         uploads.delete(uploadId);
-        response.writeHead(200, { "content-type": "application/xml" }).end(`<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Key>${escapeXml(key)}</Key></CompleteMultipartUploadResult>`);
+        response.writeHead(200, { "content-type": "application/xml" }).end(
+          `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Key>${escapeXml(key)}</Key><ETag>${escapeXml(etag)}</ETag></CompleteMultipartUploadResult>`,
+        );
         return;
       }
       if (method === "DELETE") {
@@ -158,7 +180,9 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
       const truncated = start + pageSize < keys.length;
       response.writeHead(200, { "content-type": "application/xml" }).end([
         `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>${bucket}</Name><Prefix>${escapeXml(prefix)}</Prefix>`,
-        ...page.map((name) => `<Contents><Key>${escapeXml(name)}</Key><Size>${objects.get(name)?.length}</Size></Contents>`),
+        ...page.map((name) =>
+          `<Contents><Key>${escapeXml(name)}</Key><LastModified>${new Date(writtenAt.get(name) ?? 0).toISOString()}</LastModified><Size>${objects.get(name)?.length}</Size></Contents>`
+        ),
         `<IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${start + pageSize}</NextContinuationToken>` : ""}</ListBucketResult>`,
       ].join(""));
       return;
@@ -166,15 +190,20 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     if (method === "PUT" && source !== null) {
       const object = objects.get(source);
       if (!object) return error(response, 404, "NoSuchKey", "The specified key does not exist.");
-      objects.set(key, Buffer.from(object));
+      write(key, Buffer.from(object), etagOf(object));
       response.writeHead(200, { "content-type": "application/xml" }).end(
-        `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"${createHash("md5").update(object).digest("hex")}"</ETag></CopyObjectResult>`,
+        `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>${escapeXml(etagOf(object))}</ETag></CopyObjectResult>`,
       );
       return;
     }
     if (method === "PUT") {
-      objects.set(key, body);
-      response.writeHead(200).end();
+      write(key, body, etagOf(body));
+      response.writeHead(200, { etag: etagOf(body) }).end();
+      return;
+    }
+    if (method === "HEAD" && heads) {
+      const object = objects.get(key);
+      response.writeHead(object ? 200 : 404, object ? { "content-length": object.length, etag: etags.get(key) ?? "" } : {}).end();
       return;
     }
     if (method === "GET") {
@@ -193,6 +222,8 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     }
     if (method === "DELETE") {
       objects.delete(key);
+      etags.delete(key);
+      writtenAt.delete(key);
       response.writeHead(204).end();
       return;
     }
@@ -206,6 +237,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
   const fake: FakeS3 = {
     endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     objects,
+    writtenAt,
     requests,
     uploads,
     refuse: () => null,

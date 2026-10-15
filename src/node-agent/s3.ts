@@ -3,7 +3,8 @@
  * (`<endpoint>/<bucket>/<key>`, as SeaweedFS serves them), every request signed with AWS
  * Signature Version 4 (sigV4Authorization). No SDK: the agent puts objects from files and
  * gets them into files, puts and reads small JSON objects, copies objects within the
- * bucket, deletes objects, and lists those under a prefix, and nothing else.
+ * bucket, says an object's size and ETag, deletes objects, and lists those under a
+ * prefix, and nothing else.
  *
  * A file larger than a part (`partBytes`) is put as a multipart upload, its parts sent
  * `parallel` at a time, and got in ranges of a part, as many at a time: one stream of
@@ -88,6 +89,21 @@ export class S3Error extends Schema.TaggedError<S3Error>()("S3Error", {
   }
 }
 
+/**
+ * An object as the bucket holds it: its size, and its ETag, which the request that wrote it
+ * was answered with, and which names what it wrote: a later write answers another.
+ */
+export interface StoredObject {
+  readonly bytes: number;
+  readonly etag: string;
+}
+
+/** An object under a prefix: its key, and when it was last written, in milliseconds since the epoch. */
+export interface ListedObject {
+  readonly key: string;
+  readonly writtenAt: number;
+}
+
 /** What getFile wrote: how many bytes, and their SHA-256 in hex. */
 export interface Received {
   readonly bytes: number;
@@ -96,8 +112,8 @@ export interface Received {
 
 /** The bucket, as makeS3Bucket reaches it. */
 export interface S3Bucket {
-  /** Puts the file at `path` as the object `key`, streamed. */
-  readonly putFile: (key: string, path: string) => Effect.Effect<void, S3Error>;
+  /** Puts the file at `path` as the object `key`, streamed: the ETag the bucket answered. */
+  readonly putFile: (key: string, path: string) => Effect.Effect<string, S3Error>;
   /** Writes the object `key`, of `bytes`, to the file at `path`, streamed: its size and SHA-256. */
   readonly getFile: (key: string, path: string, bytes: number) => Effect.Effect<Received, S3Error>;
   /** Puts `value` as the object `key`, as JSON. */
@@ -106,10 +122,12 @@ export interface S3Bucket {
   readonly getJson: (key: string) => Effect.Effect<unknown, S3Error>;
   /** Copies the object `from`, of `bytes`, as the object `to`, in the bucket, none of its bytes through this client. */
   readonly copy: (from: string, to: string, bytes: number) => Effect.Effect<void, S3Error>;
+  /** The object `key`'s size and ETag, or null when there is none. */
+  readonly head: (key: string) => Effect.Effect<StoredObject | null, S3Error>;
   /** Deletes the object `key`; one there is not is gone already. */
   readonly remove: (key: string) => Effect.Effect<void, S3Error>;
-  /** The keys of every object under `prefix`. */
-  readonly list: (prefix: string) => Effect.Effect<readonly string[], S3Error>;
+  /** Every object under `prefix`, in the order of their keys. */
+  readonly list: (prefix: string) => Effect.Effect<readonly ListedObject[], S3Error>;
 }
 
 /** The payload hash of a request whose payload is not signed, as a streamed upload's is. */
@@ -188,6 +206,11 @@ function xmlText(text: string): string {
 /** The text of every element `name` of `xml`, which holds no other element. */
 function elements(xml: string, name: string): string[] {
   return [...xml.matchAll(new RegExp(`<${name}>([^<]*)</${name}>`, "gu"))].map((match) => xmlText(match[1] ?? ""));
+}
+
+/** The XML within every element `name` of `xml`, which holds no element of its name. */
+function elementsXml(xml: string, name: string): string[] {
+  return [...xml.matchAll(new RegExp(`<${name}>(.*?)</${name}>`, "gsu"))].map((match) => match[1] ?? "");
 }
 
 /** A response's body, read whole up to `limit` bytes. */
@@ -367,13 +390,14 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
    * Puts the object `key` in `count` parts, each sent by `part(number, query, signal)`
    * (its number from 1, the query that names it, and what aborts it) and answering its
    * ETag, `parallel` at a time; aborted if any fails, the parts still being sent with it.
+   * The ETag of the object the parts make.
    */
   const multipart = async (
     key: string,
     count: number,
     part: (number: number, query: Readonly<Record<string, string>>, signal: AbortSignal) => Promise<string>,
     signal: AbortSignal,
-  ): Promise<void> => {
+  ): Promise<string> => {
     const created = await bodyText(await succeeded(await call("POST", key, { query: { uploads: "" } }, signal)), Number.POSITIVE_INFINITY);
     const [uploadId] = elements(created, "UploadId");
     if (!uploadId) throw new Error("it began no multipart upload");
@@ -387,6 +411,9 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
       // S3 may answer 200 with an error, the parts not put together.
       const completed = await bodyText(await succeeded(await call("POST", key, { query: { uploadId }, headers: { "content-type": "application/xml" }, body: { bytes } }, signal)), ERROR_BODY_BYTES);
       if (elements(completed, "Code").length > 0) throw new Error(`its parts were not put together: ${elements(completed, "Code").join(" ")} ${elements(completed, "Message").join(" ")}`);
+      const [etag] = elements(completed, "ETag");
+      if (!etag) throw new Error("its parts were put together with no ETag");
+      return etag;
     } catch (cause) {
       await call("DELETE", key, { query: { uploadId } }, AbortSignal.timeout(IDLE_TIMEOUT_MS)).then((response) => bodyText(response, 0), () => undefined);
       throw cause;
@@ -401,9 +428,15 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
     putFile: (key, path) =>
       attempt("upload", key, async (signal) => {
         const { size } = await stat(path);
-        if (size <= partBytes) return void (await bodyText(await succeeded(await call("PUT", key, { body: { file: path, size } }, signal)), 0));
+        if (size <= partBytes) {
+          const response = await succeeded(await call("PUT", key, { body: { file: path, size } }, signal));
+          await bodyText(response, 0);
+          const etag = response.headers.etag;
+          if (!etag) throw new Error("it was answered with no ETag");
+          return etag;
+        }
         const parts = ranges(size);
-        await multipart(key, parts.length, async (number, query, partSignal) => {
+        return multipart(key, parts.length, async (number, query, partSignal) => {
           const { start, length } = parts[number - 1] ?? { start: 0, length: 0 };
           const response = await succeeded(await call("PUT", key, { query, body: { file: path, size: length, start } }, partSignal));
           await bodyText(response, 0);
@@ -481,6 +514,16 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
         }, signal);
       }),
 
+    head: (key) =>
+      attempt("look", key, async (signal) => {
+        const response = await succeeded(await call("HEAD", key, {}, signal), [404]);
+        await bodyText(response, 0);
+        if (response.statusCode === 404) return null;
+        const etag = response.headers.etag;
+        if (!etag) throw new Error("it was answered with no ETag");
+        return { bytes: Number(response.headers["content-length"]), etag };
+      }),
+
     remove: (key) =>
       attempt("deletion", key, async (signal) => {
         await bodyText(await succeeded(await call("DELETE", key, {}, signal), [404]), 0);
@@ -488,15 +531,20 @@ export function makeS3Bucket(options: S3Options): S3Bucket {
 
     list: (prefix) =>
       attempt("listing", `${prefix}*`, async (signal) => {
-        const keys: string[] = [];
+        const listed: ListedObject[] = [];
         let token: string | undefined;
         do {
           const query = { "list-type": "2", prefix, ...(token === undefined ? {} : { "continuation-token": token }) };
           const page = await bodyText(await succeeded(await call("GET", null, { query }, signal)), Number.POSITIVE_INFINITY);
-          keys.push(...elements(page, "Key"));
+          for (const contents of elementsXml(page, "Contents")) {
+            const [key] = elements(contents, "Key");
+            const writtenAt = Date.parse(elements(contents, "LastModified")[0] ?? "");
+            if (key === undefined || Number.isNaN(writtenAt)) throw new Error(`it listed an object with no key or no time it was written: ${contents}`);
+            listed.push({ key, writtenAt });
+          }
           token = elements(page, "IsTruncated")[0] === "true" ? elements(page, "NextContinuationToken")[0] : undefined;
         } while (token !== undefined);
-        return keys;
+        return listed;
       }),
   };
 }
