@@ -2677,7 +2677,7 @@ describe("admission", () => {
     // The image is the Sandbox's own, of a snapshot its node prepared in its cache.
     const image = annotation("dev.gvisor.internal.restore.host-image-path");
     const own = '"/var/lib/alasio/snapshots/alasio-sessions/" + object.metadata.name + "/"';
-    assert.ok(session.includes(`${image}.startsWith(${own}) && ${image}.substring(size(${own})).matches("^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")`));
+    assert.ok(session.includes(`${image}.startsWith(${own}) && ${image}.substring(size(${own})).matches("^[0-9]{8}T[0-9]{9}Z-[0-9a-f]{8}$")`));
     // Under the sessions' runtime or a kept release's, on one node, ready once resumed.
     for (const { release } of NODE_PINS.gvisor.releases) assert.ok(session.includes(`["runtimeClassName"] == "gvisor-${release.split(".").join("-")}"`), release);
     assert.ok(session.includes('["conditionType"] == "alasio.dev/resumed"'));

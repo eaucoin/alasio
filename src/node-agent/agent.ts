@@ -447,9 +447,9 @@ const cachedSnapshots = meter.createObservableGauge("alasio.node_agent.cache.sna
 /** The release a cached manifest names, of all it says. */
 const CachedRelease = Schema.fromJsonString(Schema.Struct({ release: Schema.String }));
 
-/** A snapshot's id: when it was taken, sortable, and a random part. */
+/** A snapshot's id, as SNAPSHOT_ID says: when it was taken, to the millisecond, and a random part. */
 function snapshotId(takenAt: number): string {
-  return `${new Date(takenAt).toISOString().replace(/[-:]|\.\d{3}/gu, "")}-${randomBytes(4).toString("hex")}`;
+  return `${new Date(takenAt).toISOString().replace(/[-:.]/gu, "")}-${randomBytes(4).toString("hex")}`;
 }
 
 /** The SHA-256 of a file, in hex. */
