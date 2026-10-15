@@ -316,9 +316,9 @@ export const kube = {
   awaitReady: (refs: readonly ObjectRef[], timeout: Duration.Input): Promise<void> =>
     Effect.runPromise(Effect.provideService(awaitReady(refs, { timeout, poll: "2 seconds" }), KubeApi, kubeApi())),
 
-  /** What the container has logged. */
-  logs: (namespace: string, pod: string, container: string): Promise<string> =>
-    Effect.runPromise(kubeApi().logs(namespace, pod, { container }).pipe(Stream.decodeText(), Stream.mkString)),
+  /** What the container has logged, or, `previous`, its instance before this one, which ended. */
+  logs: (namespace: string, pod: string, container: string, { previous = false }: { readonly previous?: boolean } = {}): Promise<string> =>
+    Effect.runPromise(kubeApi().logs(namespace, pod, { container, previous }).pipe(Stream.decodeText(), Stream.mkString)),
 
   /** Runs `command` in the pod. */
   exec: async (namespace: string, pod: string, command: readonly string[], { container, stdin }: ExecOptions = {}): Promise<Ran> => {
@@ -704,7 +704,13 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   return ran;
 }
 
-/** What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods and latest events, and why each pod that is not ready is not, with its logs. */
+/**
+ * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods (each
+ * container's restarts with them) and latest events, why each pod that is not ready is
+ * not, with its logs, and the latest logs of the pods a compute's wake goes through, its
+ * proxy's, neon-control's and each compute's, ready or not: a compute's Postgres restarting
+ * within its container leaves its pod ready, and says why in its log alone.
+ */
 export async function dumpClusterState(): Promise<void> {
   if (!api) return;
   const said: string[] = ["::group::cluster state"];
@@ -716,7 +722,10 @@ export async function dumpClusterState(): Promise<void> {
     const pods = await kube.list<V1Pod>("Pod");
     for (const pod of pods) {
       const { namespace, name } = pod.metadata ?? {};
-      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}`);
+      const restarts = (pod.status?.containerStatuses ?? []).filter(({ restartCount }) => restartCount > 0).map(({ name: container, restartCount, lastState }) =>
+        `${container} restarted ${restartCount} times${lastState?.terminated ? `, last exiting with ${lastState.terminated.exitCode}${lastState.terminated.reason ? ` (${lastState.terminated.reason})` : ""}` : ""}`
+      );
+      say(`pod ${namespace}/${name} on ${pod.spec?.nodeName ?? "no node"}: ${pod.status?.phase}${ready(pod.status?.conditions) ? ", ready" : ""}${restarts.map((each) => `, ${each}`).join("")}`);
     }
     const events = [...(await kube.list<CoreV1Event>("Event"))]
       .sort((a, b) => new Date(a.lastTimestamp ?? a.eventTime ?? 0).getTime() - new Date(b.lastTimestamp ?? b.eventTime ?? 0).getTime());
@@ -732,6 +741,19 @@ export async function dumpClusterState(): Promise<void> {
         const logged = await kube.logs(namespace, name, container.name).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
         say(`logs of ${container.name}:`);
         for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+      }
+    }
+    const waking = new Set(["neon-proxy", "neon-control", "neon-compute"]);
+    for (const pod of pods.filter((each) => each.status?.phase === "Running" && waking.has(each.metadata?.labels?.["app.kubernetes.io/component"] ?? "") && podProblems(each).length === 0)) {
+      const { namespace = "", name = "" } = pod.metadata ?? {};
+      for (const container of pod.spec?.containers ?? []) {
+        // A container restarted, what it logged as it ended too, which is why.
+        const restarted = (pod.status?.containerStatuses ?? []).some(({ name: each, restartCount }) => each === container.name && restartCount > 0);
+        for (const previous of restarted ? [true, false] : [false]) {
+          const logged = await kube.logs(namespace, name, container.name, { previous }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+          say(`--- logs of ${container.name} of ${namespace}/${name}${previous ? ", before it restarted" : ""}:`);
+          for (const line of logged.trimEnd().split("\n").slice(-40)) say(`  ${line}`);
+        }
       }
     }
   } catch (error) {
