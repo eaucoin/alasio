@@ -39,6 +39,12 @@
  *   which address what was missing, its sandbox left paused; 410 when it was restored from
  *   a snapshot taken live that holds the session no more, an exec it caught ended since, or
  *   that cannot be told, its sandbox left paused; 500 when a command failed.
+ * - `POST /abandon`, `{ environment, workspace, namespace, pod }`: abandons the workspace's
+ *   restore into the pod `namespace`/`pod` on this node, which alasio refused before it
+ *   resumed its sandbox: kills each process runsc runs for the pod's containers, their
+ *   sandbox and gofers among them, that is still the one it found, so that the pod's
+ *   teardown waits on none of them: `{ killed: [{ containerId, pid }] }` (200). 500 when
+ *   runsc's containers, or the node's processes, could not be read, or one not killed.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
  * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshots, in the bucket and
@@ -69,6 +75,7 @@ import { type HttpServerError, HttpServerRequest, HttpServerResponse } from "eff
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken, sameToken } from "../shared/tokens.ts";
 import {
+  AbandonRequest,
   type CheckpointFailed,
   CheckpointRequest,
   CopyRequest,
@@ -191,6 +198,9 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/resume") {
       return body(ResumeRequest).pipe(Effect.flatMap(agent.resume), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    if (method === "POST" && url === "/abandon") {
+      return body(AbandonRequest).pipe(Effect.flatMap(agent.abandon), Effect.map((killed) => answer(200, { killed })));
     }
     if (method === "GET" && snapshot) {
       return workspaceOf(snapshot).pipe(

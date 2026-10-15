@@ -1,7 +1,8 @@
 /**
  * The node agent (src/node-agent/): its checkpoints, committed to a stand-in bucket and
  * forgotten when they fail, its copies, its prepared snapshots, its cache, its resumes of
- * restored sandboxes once kube-router's rules for their pods are in force, its API, as
+ * restored sandboxes once kube-router's rules for their pods are in force, its abandons of
+ * restores alasio refused, killing processes the test starts as runsc would, its API, as
  * alasio's client (src/sandbox/node-agents.ts) calls it too, and its process, with runsc a
  * stand-in of its own (./support/fake-runsc.ts) and the node's commands answered from
  * fixtures (./support/kube-router-rules.ts).
@@ -23,9 +24,11 @@ import { added, collected } from "./support/metrics.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { SNAPSHOT_ID } from "../src/kube/sandbox-shape.ts";
 import {
+  type AbandonRequest,
   type CheckpointRequest,
   COLLECT_GRACE_MS,
   HISTORY_BYTES,
+  type Killed,
   type Layer as Image,
   makeNodeAgent,
   type Manifest,
@@ -38,7 +41,7 @@ import {
 import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap } from "../src/node-agent/kube-router.ts";
-import { makeRunsc, runscFlags } from "../src/node-agent/runsc.ts";
+import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
@@ -144,10 +147,11 @@ interface Node {
   readonly restarted: Effect.Effect<NodeAgent, never, Scope.Scope>;
 }
 
-/** What a node of the test's has: its releases, and its cache's budget. */
+/** What a node of the test's has: its releases, its cache's budget, and the runsc its agent runs, the node's as `runsc` changes it. */
 interface NodeOptions {
   readonly releases?: readonly string[];
   readonly budget?: number;
+  readonly runsc?: (runsc: Runsc, releases: FakeReleases) => Runsc;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -155,12 +159,12 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3 }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
       const cache = makeSnapshotCache({ root: cacheDir, budget, graceMs: 0 });
-      const runsc = makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot });
+      const runsc = changed(makeRunsc({ releasesDir: releases.releasesDir, containerdDir: releases.containerdDir, root: RUNSC_ROOT, procRoot: releases.procRoot }), releases);
       // The pod's containers run under the node's first release.
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
@@ -1317,6 +1321,91 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
       const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000Z-00000001", reason: "the exec exec_1 of the session sess_1 has ended since, ok" });
       const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest()));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
+    })
+  ));
+
+const abandonRequest: AbandonRequest = { environment: "main", workspace: "fs-abc", namespace: SESSIONS, pod: POD };
+
+/** A process of the test's on `node`, started as runsc would start it, named `argv0`, and the signal that ends it, once one does; killed as the scope closes. */
+const runscProcess = (node: Node, argv0: string, args: readonly string[]) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const started = node.releases.starts(argv0, args);
+      const ended = new Promise<NodeJS.Signals | null>((resolve) => started.once("exit", (_code, signal) => resolve(signal)));
+      return { pid: started.pid ?? 0, ended, running: () => started.exitCode === null && started.signalCode === null, started };
+    }),
+    ({ started }) => Effect.sync(() => started.kill("SIGKILL")),
+  );
+
+/** The arguments runsc starts the sandbox of the container `id` with on `node`, under `root`, its bundle `bundle`. */
+const sandboxArgs = (node: Node, id: string, root = RUNSC_ROOT, bundle = node.releases.bundleOf(id)) => [`--root=${root}`, "--dirty-tracking=wp", "boot", `--bundle=${bundle}`, "--controller-fd=3", id];
+
+/** The arguments runsc starts the gofer of the container `id` with on `node`, which name no id but its bundle's. */
+const goferArgs = (node: Node, id: string) => [`--root=${RUNSC_ROOT}`, "--dirty-tracking=wp", "gofer", "--bundle", node.releases.bundleOf(id), "--gofer-mount-confs=lisafs:self"];
+
+test("an abandon kills what runsc runs for the pod's containers, their sandbox, their gofers and runsc's commands, and says what it killed", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      // The pod's first container's sandbox runs them all; each has its gofer; a restore of it waits on them.
+      const sandbox = yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER));
+      const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
+      const otherGofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
+      const restoring = yield* runscProcess(here, "runsc", [`--root=${RUNSC_ROOT}`, "restore", "--image-path=/var/lib/alasio/snapshots/main/fs-abc/s-1", "--bundle", here.releases.bundleOf(CONTAINER), CONTAINER]);
+      const byPid = (killed: readonly Killed[]) => killed.toSorted((a, b) => a.pid - b.pid);
+      let killed: readonly Killed[] = [];
+      const counted = yield* Effect.promise(() =>
+        added("alasio.node_agent.abandons", async () => {
+          killed = await Effect.runPromise(here.agent.abandon(abandonRequest));
+        })
+      );
+      assert.deepEqual(counted, { "alasio.node_agent.abandon.outcome=abandoned": 1 });
+      assert.deepEqual(byPid(killed), byPid([
+        { containerId: CONTAINER, pid: sandbox.pid },
+        { containerId: CONTAINER, pid: gofer.pid },
+        { containerId: OTHER_CONTAINER, pid: otherGofer.pid },
+        { containerId: CONTAINER, pid: restoring.pid },
+      ]));
+      for (const each of [sandbox, gofer, otherGofer, restoring]) assert.equal(yield* Effect.promise(() => each.ended), "SIGKILL");
+
+      // Asked by alasio, of a pod whose processes are gone, and then of one whose gofer runs on.
+      const agents = yield* agentsOf(here.agent);
+      assert.deepEqual(yield* agents.abandon("node-1", abandonRequest), []);
+      const left = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
+      assert.deepEqual(yield* agents.abandon("node-1", abandonRequest), [{ containerId: OTHER_CONTAINER, pid: left.pid }]);
+      assert.equal(yield* Effect.promise(() => left.ended), "SIGKILL");
+      const refused = yield* Effect.flip(agents.abandon("node-1", { ...abandonRequest, pod: "fs_abc123" }));
+      assert.equal(refused._tag === "NodeAgentError" && refused.status, 400);
+    })
+  ));
+
+test("an abandon kills no process of another pod's container, of no container's, of another root or bundle, or whose start time has changed since it was found", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // The node gives the pid of the process `restarting` names to another as the agent finds them.
+      let restarting = 0;
+      const here = yield* node("node-1", {
+        runsc: (runsc, releases) => ({ ...runsc, processes: (containers) => runsc.processes(containers).pipe(Effect.tap(() => Effect.sync(() => releases.restarted(restarting)))) }),
+      });
+      const OTHER_POD_CONTAINER = "0f".repeat(32);
+      const UNKNOWN = "c".repeat(64);
+      here.releases.runs(OTHER_POD_CONTAINER, RELEASE, SESSIONS, "fs-other");
+      const spared = [
+        yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, OTHER_POD_CONTAINER)),
+        yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, UNKNOWN)),
+        yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER, "/run/containerd/runsc/other")),
+        yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER, RUNSC_ROOT, here.releases.bundleOf(UNKNOWN))),
+        // Its bundle given another flag than --bundle.
+        yield* runscProcess(here, "runsc", [`--root=${RUNSC_ROOT}`, `--log=${here.releases.bundleOf(CONTAINER)}`, "events", CONTAINER]),
+      ];
+      const reused = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
+      restarting = reused.pid;
+      const gofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, CONTAINER));
+      assert.deepEqual(yield* here.agent.abandon(abandonRequest), [{ containerId: CONTAINER, pid: gofer.pid }]);
+      assert.equal(yield* Effect.promise(() => gofer.ended), "SIGKILL");
+      // Each would have been killed by now.
+      yield* Effect.sleep("200 millis");
+      for (const each of [...spared, reused]) assert.ok(each.running(), `${each.pid} runs on`);
     })
   ));
 

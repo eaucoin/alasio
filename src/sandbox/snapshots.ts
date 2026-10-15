@@ -21,6 +21,10 @@
  * A snapshot that cannot restore is never so silently: the session is resumed as one
  * without a snapshot, from bayma's checkpoints of its sessions, which bayma tells its next
  * exec of, and why it was not restored is logged and counted, the snapshot forgotten.
+ *
+ * A restore refused before its sandbox resumed is abandoned on its node first: the node's
+ * agent kills what runsc runs for the pod there, so that the pod's teardown, as its
+ * Sandbox is suspended, waits on none of it.
  */
 import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope } from "effect";
@@ -286,6 +290,23 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       );
     });
 
+  /**
+   * Has the agent of `node` abandon the restore of session `name` into its pod there,
+   * refused before its sandbox resumed: it kills what runsc runs for the pod, which a
+   * `runsc restore` that failed has left running, its shim tearing none of it down, and
+   * which the pod's teardown would wait on. It stays as defence should a restore leave
+   * runsc's processes behind. One the agent cannot do is said so, and changes nothing else.
+   */
+  const abandon = (name: string, node: string): Effect.Effect<void> =>
+    agents.abandon(node, { ...ref(name), namespace: profile.namespace, pod: name }).pipe(
+      Effect.flatMap((killed) =>
+        killed.length === 0
+          ? Effect.void
+          : Effect.logInfo(`killed what runsc left running of the restore of session ${name} on ${node}: ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}`)
+      ),
+      Effect.catch((error) => Effect.logWarning(`could not abandon the restore of session ${name} on ${node}: ${error.message}`)),
+    );
+
   const restore = (sandbox: StoredSandbox, desired: Sandbox): Effect.Effect<SandboxRestore | RestoreDeferred | null> => {
     const name = sandbox.metadata.name;
     return Effect.gen(function*() {
@@ -363,8 +384,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               ),
             ),
           ),
+          // Its sandbox never having run, its restore is abandoned, whatever comes of it.
           failed: ({ why, resumed }: RestoreFailure) =>
-            (resumed ? fallBack(name, "restore", why) : deferOr(name, "restore", why)).pipe(Effect.map((came) => (came === null ? "fallen back" : "deferred"))),
+            (resumed ? fallBack(name, "restore", why) : abandon(name, node).pipe(Effect.andThen(deferOr(name, "restore", why)))).pipe(
+              Effect.map((came) => (came === null ? "fallen back" : "deferred")),
+            ),
         };
       }
       // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
