@@ -82,7 +82,7 @@ if (rest[0] === "checkpoint") {
   const containers = existsSync(join(here, "..", "containers.json")) ? JSON.parse(readFileSync(join(here, "..", "containers.json"), "utf8")) : {};
   const running = containers[rest[rest.length - 1]];
   if (!running) { process.stderr.write("container does not exist\\n"); process.exit(1); }
-  process.stdout.write(JSON.stringify({ id: rest[rest.length - 1], pid: running.pid, annotations: running.annotations }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: rest[rest.length - 1], pid: running.pid, bundle: running.bundle, annotations: running.annotations }) + "\\n");
 } else if (rest[0] === "cpu-features") {
   process.stdout.write(read("cpu-features", "sse,avx,avx2") + "\\n");
 } else {
@@ -90,6 +90,12 @@ if (rest[0] === "checkpoint") {
   process.exit(2);
 }
 `;
+
+/** A mount of an OCI spec: where it is in the container, and what it mounts there, on the node. */
+export interface OciMount {
+  readonly destination: string;
+  readonly source: string;
+}
 
 /** A node's releases and options files, at `root`. */
 export interface FakeReleases {
@@ -103,9 +109,10 @@ export interface FakeReleases {
   readonly procRoot: string;
   /**
    * Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state
-   * says, its sandbox tracking its writes (`--dirty-tracking=wp`) unless `tracksWrites` is false.
+   * says, its sandbox tracking its writes (`--dirty-tracking=wp`) unless `tracksWrites` is
+   * false, and its spec, in its bundle, mounting `mounts`.
    */
-  readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean) => void;
+  readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[]) => void;
 }
 
 /** Installs `releases` under `root`, each with an options file giving runsc systemd's cgroups. */
@@ -123,7 +130,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
   const procRoot = join(root, "proc");
   const containers = join(releasesDir, "containers.json");
   let pid = 4000;
-  const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true) => {
+  const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true, mounts: readonly OciMount[] = []) => {
     const held = existsSync(containers) ? JSON.parse(readFileSync(containers, "utf8")) as Record<string, unknown> : {};
     pid += 1;
     mkdirSync(join(procRoot, String(pid)), { recursive: true });
@@ -131,7 +138,10 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     // As runsc starts a sandbox: its flags, then its command.
     const argv = ["runsc-sandbox", "--root=/run/containerd/runsc/k8s.io", `--dirty-tracking=${tracksWrites ? "wp" : "off"}`, "boot", containerId];
     writeFileSync(join(procRoot, String(pid), "cmdline"), `${argv.join("\0")}\0`);
-    held[containerId] = { pid, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
+    const bundle = join(root, "bundles", containerId);
+    mkdirSync(bundle, { recursive: true });
+    writeFileSync(join(bundle, "config.json"), JSON.stringify({ ociVersion: "1.2.0", mounts: mounts.map((mount) => ({ ...mount, type: "bind", options: ["rbind"] })) }));
+    held[containerId] = { pid, bundle, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
     writeFileSync(containers, JSON.stringify(held));
   };
   return {

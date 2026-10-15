@@ -6,15 +6,17 @@
  * route there is not.
  *
  * - `POST /checkpoints`, `{ environment, workspace, namespace, pod, containerId, hook,
- *   podTemplate }`: starts checkpointing the sandbox of the container `containerId`
- *   (containerd's id) of the pod `namespace`/`pod`, under the gVisor release that runs it,
- *   running `hook` (its arguments, none holding whitespace) in it first, which ends the
- *   sandbox, and making it the workspace's snapshot, recording `podTemplate` (202), unless
- *   one of the workspace's runs, which goes on.
+ *   podTemplate, during? }`: starts checkpointing the sandbox of the container
+ *   `containerId` (containerd's id) of the pod `namespace`/`pod`, under the gVisor release
+ *   that runs it, running `hook` (its arguments, none holding whitespace) in it first, which
+ *   ends the sandbox, and making it the workspace's snapshot, recording `podTemplate`
+ *   (202), unless one of the workspace's runs, which goes on. With `during`, `{ stateDir,
+ *   execs: [{ sessionId, execId }] }`, the execs running in it and bayma's state directory,
+ *   it is saved live, running on, and a restore from it resumes only while each runs on.
  * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200):
  *   `{ state: "running" }`; `{ state: "done", value }`, `value` the snapshot's manifest; or
  *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
- *   workspace's snapshot was forgotten, as it is. 404
+ *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept. 404
  *   when it has none the agent keeps (./operations.ts).
  * - `POST /prepare`, `{ environment, workspace }`: starts preparing the workspace's current
  *   snapshot in this node's cache, for a restore on this node (202), unless a prepare of
@@ -34,13 +36,16 @@
  *   force here for each of its addresses `podIPs` (./kube-router.ts): the connections tracked from
  *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
  *   (204). 504 when its policies were not in force within the agent's wait, saying for
- *   which address what was missing, its sandbox left paused; 500 when a command failed.
+ *   which address what was missing, its sandbox left paused; 410 when it was restored from
+ *   a snapshot taken live that holds the session no more, an exec it caught ended since, or
+ *   that cannot be told, its sandbox left paused; 500 when a command failed.
  * - `GET /snapshots/<environment>/<workspace>`: the manifest of its current snapshot (200),
  *   or 404.
  * - `DELETE /snapshots/<environment>/<workspace>`: forgets its snapshots, in the bucket and
  *   in this node's cache (204).
- * - `DELETE /snapshots/<environment>/<workspace>/current`: makes its current snapshot,
- *   which its sandbox was restored from, current no more, its images kept as the layers
+ * - `DELETE /snapshots/<environment>/<workspace>/current?snapshot=<snapshot>`: makes its
+ *   current snapshot current no more, if it is `snapshot` still, one its sandbox was
+ *   restored from, or one taken live whose exec has ended, its images kept as the layers
  *   of its next (204).
  * - `POST /collect`, `{ environment, workspace }`: collects what of the workspace's in the
  *   bucket no snapshot needs any more: `{ kept }`, the digests of the images it keeps (200).
@@ -105,11 +110,12 @@ const STATUS: Readonly<Record<string, number>> = {
   ContainerElsewhere: 409,
   SnapshotCorrupt: 422,
   S3Error: 502,
+  SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
-const SPENT = /^\/snapshots\/([^/]+)\/([^/]+)\/current$/u;
+const SPENT = /^\/snapshots\/([^/]+)\/([^/]+)\/current\?snapshot=([^&]+)$/u;
 const CHECKPOINT = /^\/checkpoints\/([^/]+)\/([^/]+)$/u;
 const PREPARE = /^\/prepare\/([^/]+)\/([^/]+)$/u;
 const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
@@ -194,7 +200,12 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "DELETE" && snapshot) return workspaceOf(snapshot).pipe(Effect.flatMap(agent.forget), Effect.as(HttpServerResponse.empty({ status: 204 })));
     const spent = SPENT.exec(url);
-    if (method === "DELETE" && spent) return workspaceOf(spent).pipe(Effect.flatMap(agent.spend), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    if (method === "DELETE" && spent) {
+      return workspaceOf(spent).pipe(
+        Effect.flatMap((ref) => agent.spend(ref, decodeURIComponent(spent[3] ?? ""))),
+        Effect.as(HttpServerResponse.empty({ status: 204 })),
+      );
+    }
     if (method === "POST" && url === "/collect") {
       return body(WorkspaceRef).pipe(Effect.flatMap(agent.collect), Effect.map((kept) => answer(200, { kept })));
     }
@@ -249,6 +260,8 @@ const BucketConfig = Config.all({
   secretAccessKey: Config.Redacted("AWS_SECRET_ACCESS_KEY"),
 });
 
+/** Where the agent, of the node's processes, sees the node's filesystem: as its first process does. */
+const NODE_ROOT = "/proc/1/root";
 /** The most the node's cache keeps unless told: 5 GiB. */
 const DEFAULT_CACHE_BYTES = 5 * 1024 ** 3;
 /** How long a snapshot used is kept in the cache whatever its budget: a restore on this node reads it meanwhile. */
@@ -269,6 +282,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   yield* cache.clean;
   const agent = yield* makeNodeAgent({
     node,
+    nodeRoot: NODE_ROOT,
     runsc: makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT }),
     cache,
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
