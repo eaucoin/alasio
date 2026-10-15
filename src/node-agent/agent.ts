@@ -34,6 +34,15 @@
  * forgets the connections tracked from its addresses, then resumes its containers; one
  * whose policies are not in force within POLICY_WAIT_MS leaves it paused.
  *
+ * A restore alasio refuses before it resumes the sandbox is abandoned: the agent kills
+ * what runsc runs for the pod's containers, their sandbox and gofers among it, so that the
+ * pod's teardown waits on none of it: a `runsc restore` that failed has left them running,
+ * its shim then tearing none of them down. A process is a container's only where its
+ * arguments name runsc's root, the container's bundle and its id, and is killed only while
+ * its start time is the one it was found with, so a pid the node has given another process
+ * since is left be (./runsc.ts). This stays as defence should a restore leave runsc's
+ * processes behind.
+ *
  * One operation on a workspace's snapshots runs at a time.
  */
 import { createHash, randomBytes } from "node:crypto";
@@ -189,6 +198,22 @@ export const ResumeRequest = Schema.Struct({
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
 
+/** A request to abandon a workspace's restore, which alasio refused before it resumed its sandbox, in a pod on this node. */
+export const AbandonRequest = Schema.Struct({
+  environment: Name,
+  workspace: Name,
+  /** The pod restored into, whose containers' processes of runsc's are killed. */
+  namespace: Name,
+  pod: PodName,
+});
+export type AbandonRequest = typeof AbandonRequest.Type;
+
+/** A process of runsc's an abandon killed: the container it ran for, by containerd's id, and its pid. */
+export interface Killed {
+  readonly containerId: string;
+  readonly pid: number;
+}
+
 /** A snapshot prepared on this node: what it is, and where its image is. */
 export interface Prepared {
   readonly manifest: Manifest;
@@ -326,6 +351,8 @@ export interface NodeAgent {
   readonly discard: (workspace: WorkspaceRef, keep: readonly string[]) => Effect.Effect<boolean, CacheError>;
   /** Resumes the workspace's sandbox, restored paused, once its pod's network policies are in force on this node, as the module says. */
   readonly resume: (request: ResumeRequest) => Effect.Effect<void, ResumeError>;
+  /** Abandons the workspace's restore into a pod on this node, alasio having refused it before its resume, as the module says: what it killed. */
+  readonly abandon: (request: AbandonRequest) => Effect.Effect<readonly Killed[], RunscError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
 }
 
@@ -403,6 +430,10 @@ const prepares = meter.createCounter("alasio.node_agent.prepares", {
 const resumes = meter.createCounter("alasio.node_agent.resumes", {
   description: "Restored sandboxes resumed by the node agent once their pods' network policies were in force, by outcome",
   unit: "{resume}",
+});
+const abandons = meter.createCounter("alasio.node_agent.abandons", {
+  description: "Restores alasio refused before their sandboxes resumed, abandoned by the node agent, what runsc ran for their pods killed, by outcome",
+  unit: "{abandon}",
 });
 const keptReleases = meter.createObservableGauge("alasio.node_agent.releases", {
   description: "The gVisor releases kept on the node, each of which restores the snapshots it took",
@@ -570,7 +601,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const ofPod = (containerId: string, namespace: string, pod: string): Effect.Effect<RunningContainer, RunscError | ContainerElsewhere> =>
     runsc.container(containerId).pipe(
       Effect.flatMap((running) => {
-        const found = `${running.annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${running.annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+        const found = podOf(running.annotations);
         return found === `${namespace}/${pod}` ? Effect.succeed(running) : Effect.fail(new ContainerElsewhere({ containerId, namespace, pod, found }));
       }),
     );
@@ -988,6 +1019,34 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
+  /** Kills what runsc runs for the containers of the pod `request` names, as the module says: what it killed, of how many it found. */
+  const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number], RunscError> =>
+    Effect.gen(function*() {
+      const containers = (yield* runsc.containers).filter(({ annotations }) => podOf(annotations) === `${request.namespace}/${request.pod}`);
+      const found = yield* runsc.processes(containers);
+      const killed = yield* Effect.forEach(found, (each) => runsc.kill(each).pipe(Effect.map((done) => (done ? [{ containerId: each.containerId, pid: each.pid }] : []))));
+      return [killed.flat(), found.length] as const;
+    });
+
+  const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
+    exclusive([request], abandonNow(request)).pipe(
+      Effect.tap(([killed, found]) =>
+        Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
+          Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length })),
+          Effect.andThen(Effect.logInfo(
+            `abandoned the restore of ${prefixOf(request)} in ${request.namespace}/${request.pod}: ${
+              killed.length === 0 ? "runsc ran nothing for it" : `killed ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}`
+            }${found > killed.length ? `; of those found, ${found - killed.length} had ended since, their pids gone or another process's` : ""}`,
+          )),
+        )
+      ),
+      Effect.map(([killed]) => killed),
+      Effect.tapError((error) => Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": error._tag })).pipe(Effect.andThen(Effect.logWarning(error.message)))),
+      withAlasioSpan("alasio.node_agent.abandon", {
+        attributes: { ...spanAttributes(request), "k8s.namespace.name": request.namespace, "k8s.pod.name": request.pod },
+      }),
+    );
+
   const holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError> = Effect.gen(function*() {
     const releases = yield* Effect.forEach(yield* runsc.releases, (release) => runsc.cpuFeatures(release).pipe(Effect.map((cpuFeatures) => ({ release, cpuFeatures }))));
     const cached = (yield* cache.list).map(({ usedAt, ...rest }) => ({ ...rest, usedAt: new Date(usedAt).toISOString() }));
@@ -1031,6 +1090,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         withLogScope("node-agent"),
       ),
     resume: (request) => resume(request).pipe(withLogScope("node-agent")),
+    abandon: (request) => abandon(request).pipe(withLogScope("node-agent")),
     holdings,
     workspaces: (environment) =>
       bucket.list(`${environment}/`).pipe(
@@ -1044,6 +1104,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       ),
   };
 });
+
+/** The pod a container is of, `<namespace>/<name>`, as the annotations containerd gives its spec say, `?` for what they do not. */
+function podOf(annotations: Readonly<Record<string, string>>): string {
+  return `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+}
 
 /** The attributes of a span of an operation on a workspace. */
 function spanAttributes({ environment, workspace }: WorkspaceRef): Record<string, string> {

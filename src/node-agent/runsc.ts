@@ -6,10 +6,13 @@
  * `[runsc_config]` table, the flags its shim passes it. The agent runs a release's runsc
  * exactly so, beside the shim: with the shim's root (`--root`) and those flags, so it
  * finds the sandboxes the shim made and tears them down as the shim would.
+ *
+ * It also finds, among the node's processes, those runsc runs for a container (makeRunsc
+ * says how), and kills them, as the agent does of a restore whose shim left them running.
  */
 import { execFile } from "node:child_process";
 import { readdir, readFile, readlink } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 
 import { Effect, Schema } from "effect";
 
@@ -59,6 +62,31 @@ const ContainerState = Schema.Struct({
   bundle: Schema.String,
   annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
+
+/** What `runsc list --format=json` says of the containers under the root, as far as the agent reads it: null for none, as runsc writes an empty list. */
+const ContainerList = Schema.NullOr(Schema.Array(Schema.Struct({
+  id: Schema.NonEmptyString,
+  bundle: Schema.NonEmptyString,
+  annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+})));
+
+/** A container runsc keeps under the root: its id, containerd's, its bundle, and its spec's annotations. */
+export interface ListedContainer {
+  readonly id: string;
+  readonly bundle: string;
+  readonly annotations: Readonly<Record<string, string>>;
+}
+
+/**
+ * A process runsc runs for a container: the container's id, the process's pid, and its
+ * start time, in clock ticks after the node booted, as its stat says (its 22nd field),
+ * which tells it from a process the node gives its pid later.
+ */
+export interface ContainerProcess {
+  readonly containerId: string;
+  readonly pid: number;
+  readonly startTime: string;
+}
 
 /**
  * A container as the node runs it: the release whose runsc runs its sandbox, its spec's
@@ -130,6 +158,12 @@ export interface Runsc {
    * runtime's options file when it started, which may have changed since).
    */
   readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError>;
+  /** The containers runsc keeps under the root, whichever release runs each, as `runsc list` says. */
+  readonly containers: Effect.Effect<readonly ListedContainer[], RunscError>;
+  /** The processes runsc runs for each of `containers` on the node, as makeRunsc finds them. */
+  readonly processes: (containers: readonly ListedContainer[]) => Effect.Effect<readonly ContainerProcess[], RunscError>;
+  /** Kills `process` (SIGKILL) if its pid is still its own, of the start time it was found with: whether it did. */
+  readonly kill: (process: ContainerProcess) => Effect.Effect<boolean, RunscError>;
 }
 
 /** An entry of a TOML table whose value is a basic string, its key bare or quoted. */
@@ -175,7 +209,39 @@ interface Ran {
 /** The most a run of runsc may print. */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-/** The node's releases and their runsc, at `options`' paths. */
+/**
+ * A process's start time, from its stat: its 22nd field, counted after its name, which is
+ * the second, in parentheses, and may hold anything, so the fields after it begin past the
+ * stat's last ")". Null for a stat that has none.
+ */
+function startTimeOf(stat: string): string | null {
+  // The state, the third field, is the first past the name.
+  const startTime = stat.slice(stat.lastIndexOf(")") + 1).trim().split(" ")[22 - 3];
+  return startTime !== undefined && /^[0-9]+$/u.test(startTime) ? startTime : null;
+}
+
+/**
+ * Whether `args`, a process's arguments, are those of a process runsc runs for `container`
+ * under `root`: they give runsc the root (`--root=<root>`), give `--bundle` the
+ * container's bundle (`--bundle=<bundle>`, as the sandbox's do, or `--bundle <bundle>`, as
+ * a gofer's), and name its id, as an argument of its own, as the sandbox's last does, or
+ * as its bundle's name, which containerd names for the container, as a gofer's do.
+ */
+function runsFor(args: readonly string[], root: string, { id, bundle }: ListedContainer): boolean {
+  const bundled = args.some((arg, index) => arg === `--bundle=${bundle}` || (arg === "--bundle" && args[index + 1] === bundle));
+  return args.includes(`--root=${root}`) && bundled && (args.includes(id) || basename(bundle) === id);
+}
+
+/**
+ * The node's releases and their runsc, at `options`' paths.
+ *
+ * The processes runsc runs for a container are those of the node's, as the agent sees
+ * them in `procRoot`, whose arguments are its (runsFor): its sandbox, its gofer, and any
+ * command of runsc's run on it, as a restore. Each is known by its pid and its start time,
+ * read before its arguments, so that a process given the pid after them has a start time
+ * other than the one it was found with; a kill reads it again just before, so it kills no
+ * process but the one found.
+ */
 export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc" }: RunscOptions): Runsc {
   const releases = Effect.promise(async () => {
     const entries = await readdir(releasesDir, { withFileTypes: true }).catch(() => []);
@@ -209,6 +275,19 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         catch: (cause) => new RunscError({ release, command: command.join(" "), reason: cause instanceof Error ? cause.message : String(cause) }),
       })),
     );
+
+  /** Runs any release's runsc's `command` with `args`: any reads the state every shim keeps under the one root. */
+  const runAny = (command: readonly string[], args: readonly string[]): Effect.Effect<Ran, RunscError> =>
+    Effect.gen(function*() {
+      const failed = (reason: string) => new RunscError({ release: "the node's", command: [...command, ...args].join(" "), reason });
+      const [any] = yield* releases;
+      if (any === undefined) return yield* failed("no gVisor release is installed here");
+      return yield* run(any, command, args).pipe(Effect.mapError((error) => (error._tag === "RunscError" ? error : failed(error.message))));
+    });
+
+  /** The start time of the node's process `pid`, as its stat says now, or null for one that is gone. */
+  const startTimeAt = (pid: string): Promise<string | null> =>
+    readFile(join(procRoot, pid, "stat"), "utf8").then(startTimeOf, () => null);
 
   // A node's CPU does not change while it runs.
   const features = new Map<string, readonly string[]>();
@@ -251,10 +330,7 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
     container: (containerId) =>
       Effect.gen(function*() {
         const failed = (reason: string) => new RunscError({ release: "the node's", command: `state ${containerId}`, reason });
-        // Any release reads the state every shim keeps under the one root.
-        const [any] = yield* releases;
-        if (any === undefined) return yield* failed("no gVisor release is installed here");
-        const { stdout } = yield* run(any, ["state"], [containerId]).pipe(Effect.mapError((error) => (error._tag === "RunscError" ? error : failed(error.message))));
+        const { stdout } = yield* runAny(["state"], [containerId]);
         const state = yield* Effect.try({ try: () => Schema.decodeUnknownSync(ContainerState)(JSON.parse(stdout)), catch: (cause) => failed(`its state is not one: ${String(cause)}`) });
         const program = yield* Effect.tryPromise({ try: () => readlink(join(procRoot, String(state.pid), "exe")), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
         const [release = "", ...under] = relative(releasesDir, program).split(sep);
@@ -262,6 +338,49 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         const argv = yield* Effect.tryPromise({ try: () => readFile(join(procRoot, String(state.pid), "cmdline"), "utf8"), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
         const tracking = argv.split("\0").findLast((arg) => arg.startsWith("--dirty-tracking="))?.slice("--dirty-tracking=".length);
         return { release, annotations: state.annotations ?? {}, tracksWrites: tracking !== undefined && tracking !== "off", bundle: state.bundle };
+      }),
+
+    containers: runAny(["list"], ["--format=json"]).pipe(
+      Effect.flatMap(({ stdout }) =>
+        Effect.try({
+          try: () => Schema.decodeUnknownSync(ContainerList)(JSON.parse(stdout)) ?? [],
+          catch: (cause) => new RunscError({ release: "the node's", command: "list --format=json", reason: `its list is not one: ${String(cause)}` }),
+        })
+      ),
+      Effect.map((listed) => listed.map(({ id, bundle, annotations }) => ({ id, bundle, annotations: annotations ?? {} }))),
+    ),
+
+    processes: (containers) =>
+      Effect.tryPromise({
+        try: async () => {
+          const found: ContainerProcess[] = [];
+          for (const pid of (await readdir(procRoot)).filter((name) => /^[0-9]+$/u.test(name))) {
+            const startTime = await startTimeAt(pid);
+            // Gone meanwhile, or no process's.
+            if (startTime === null) continue;
+            const args = (await readFile(join(procRoot, pid, "cmdline"), "utf8").catch(() => "")).split("\0");
+            const container = containers.find((each) => runsFor(args, root, each));
+            if (container !== undefined) found.push({ containerId: container.id, pid: Number(pid), startTime });
+          }
+          return found;
+        },
+        catch: (cause) => new RunscError({ release: "the node's", command: "list", reason: `the node's processes in ${procRoot} are not readable: ${String(cause)}` }),
+      }),
+
+    kill: ({ pid, startTime }) =>
+      Effect.tryPromise({
+        try: async () => {
+          if ((await startTimeAt(String(pid))) !== startTime) return false;
+          try {
+            process.kill(pid, "SIGKILL");
+            return true;
+          } catch (error) {
+            // Ended since its start time was read.
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+            throw error;
+          }
+        },
+        catch: (cause) => new RunscError({ release: "the node's", command: `kill ${pid}`, reason: cause instanceof Error ? cause.message : String(cause) }),
       }),
 
     cpuFeatures: (release) => {

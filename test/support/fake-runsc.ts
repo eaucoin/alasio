@@ -20,9 +20,17 @@
  * - `state ID`: the container's sandbox's process and its pod's annotations, as
  *   `containers.json` beside the releases says (FakeReleases.runs), or fails for one it
  *   does not hold; that process's program, in the stand-in's /proc, is the runsc of the
- *   release that runs it, and its arguments runsc's flags, which track its writes or not.
+ *   release that runs it, and its arguments runsc's flags, which track its writes or not;
+ * - `list --format=json`: each container `containers.json` holds, as `state` says it, or
+ *   null for none, as runsc writes an empty list.
+ *
+ * The stand-in's /proc holds besides, while they run, the processes the test starts as
+ * runsc would (FakeReleases.starts), which are real, and idle until killed: their
+ * arguments and their stat, as /proc says them, which the test may make say another start
+ * time (FakeReleases.restarted), as a process the node gave the pid since would have.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { gvisorHandler } from "../../src/node-agent/names.ts";
@@ -38,6 +46,8 @@ const read = (name, otherwise) => (existsSync(join(here, name)) ? readFileSync(j
 const rest = args.filter((arg) => !arg.startsWith("--root=") && !arg.startsWith("--systemd-cgroup="));
 const flag = (name) => rest.find((arg) => arg.startsWith("--" + name + "="))?.slice(name.length + 3);
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
+const containers = () => (existsSync(join(here, "..", "containers.json")) ? JSON.parse(readFileSync(join(here, "..", "containers.json"), "utf8")) : {});
+const stateOf = (id, { pid, bundle, annotations }) => ({ ociVersion: "1.0.2", id, status: "running", pid, bundle, annotations });
 const checkpoint = () => {
   const image = flag("image-path");
   const id = rest[rest.length - 1];
@@ -79,10 +89,12 @@ if (rest[0] === "checkpoint") {
 } else if (rest[0] === "resume") {
   if (existsSync(join(here, "fail-resume"))) { process.stderr.write("resume failed: the container is gone\\n"); process.exit(128); }
 } else if (rest[0] === "state") {
-  const containers = existsSync(join(here, "..", "containers.json")) ? JSON.parse(readFileSync(join(here, "..", "containers.json"), "utf8")) : {};
-  const running = containers[rest[rest.length - 1]];
+  const running = containers()[rest[rest.length - 1]];
   if (!running) { process.stderr.write("container does not exist\\n"); process.exit(1); }
-  process.stdout.write(JSON.stringify({ id: rest[rest.length - 1], pid: running.pid, bundle: running.bundle, annotations: running.annotations }) + "\\n");
+  process.stdout.write(JSON.stringify(stateOf(rest[rest.length - 1], running)) + "\\n");
+} else if (rest[0] === "list" && flag("format") === "json") {
+  const listed = Object.entries(containers()).map(([id, running]) => stateOf(id, running));
+  process.stdout.write(JSON.stringify(listed.length === 0 ? null : listed) + "\\n");
 } else if (rest[0] === "cpu-features") {
   process.stdout.write(read("cpu-features", "sse,avx,avx2") + "\\n");
 } else {
@@ -103,10 +115,16 @@ export interface FakeReleases {
   readonly containerdDir: string;
   /** The directory of a release's runsc, where its files of the stand-in go. */
   readonly dirOf: (release: string) => string;
-  /** The arguments of each run of a release's runsc, in order, but its reads of containers' state. */
+  /** The arguments of each run of a release's runsc, in order, but its reads of containers' state and its lists of them. */
   readonly calls: (release: string) => string[][];
-  /** The node's processes, as the agent reads them: each container's sandbox's, of its release's runsc. */
+  /** The node's processes, as the agent reads them: each container's sandbox's, of its release's runsc, and those the test starts. */
   readonly procRoot: string;
+  /** The bundle of a container that runs. */
+  readonly bundleOf: (containerId: string) => string;
+  /** Starts a process that idles, named `argv0`, of the arguments `args`, which the node's /proc shows while it runs. The test kills it. */
+  readonly starts: (argv0: string, args: readonly string[]) => ChildProcess;
+  /** Makes the node's /proc show the process `pid` the test started with a start time a tick later. */
+  readonly restarted: (pid: number) => void;
   /**
    * Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state
    * says, its sandbox tracking its writes (`--dirty-tracking=wp`) unless `tracksWrites` is
@@ -129,6 +147,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
   }
   const procRoot = join(root, "proc");
   const containers = join(releasesDir, "containers.json");
+  const bundleOf = (containerId: string) => join(root, "bundles", containerId);
   let pid = 4000;
   const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true, mounts: readonly OciMount[] = []) => {
     const held = existsSync(containers) ? JSON.parse(readFileSync(containers, "utf8")) as Record<string, unknown> : {};
@@ -138,11 +157,31 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     // As runsc starts a sandbox: its flags, then its command.
     const argv = ["runsc-sandbox", "--root=/run/containerd/runsc/k8s.io", `--dirty-tracking=${tracksWrites ? "wp" : "off"}`, "boot", containerId];
     writeFileSync(join(procRoot, String(pid), "cmdline"), `${argv.join("\0")}\0`);
-    const bundle = join(root, "bundles", containerId);
+    const bundle = bundleOf(containerId);
     mkdirSync(bundle, { recursive: true });
     writeFileSync(join(bundle, "config.json"), JSON.stringify({ ociVersion: "1.2.0", mounts: mounts.map((mount) => ({ ...mount, type: "bind", options: ["rbind"] })) }));
     held[containerId] = { pid, bundle, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
     writeFileSync(containers, JSON.stringify(held));
+  };
+  const starts = (argv0: string, args: readonly string[]) => {
+    // Its arguments after node's own, which end at "--".
+    const started = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { argv0, stdio: "ignore" });
+    const { pid: id } = started;
+    if (id === undefined) throw new Error(`${argv0} did not start`);
+    mkdirSync(join(procRoot, String(id)), { recursive: true });
+    for (const file of ["cmdline", "stat"]) writeFileSync(join(procRoot, String(id), file), readFileSync(join("/proc", String(id), file)));
+    // Gone from the node's /proc as it ends, as its pid may be given another's.
+    started.once("exit", () => rmSync(join(procRoot, String(id)), { recursive: true, force: true }));
+    return started;
+  };
+  const restarted = (id: number) => {
+    const file = join(procRoot, String(id), "stat");
+    const stat = readFileSync(file, "utf8");
+    // Its fields past its name, the third first: its start time is the 22nd.
+    const named = stat.lastIndexOf(")") + 1;
+    const fields = stat.slice(named + 1).split(" ");
+    fields[22 - 3] = String(BigInt(fields[22 - 3] ?? "0") + 1n);
+    writeFileSync(file, `${stat.slice(0, named)} ${fields.join(" ")}`);
   };
   return {
     releasesDir,
@@ -150,10 +189,13 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     procRoot,
     runs,
     dirOf,
+    bundleOf,
+    starts,
+    restarted,
     calls: (release) => {
       const log = join(dirOf(release), "calls.jsonl");
       const runs = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]) : [];
-      return runs.filter((args) => !args.includes("state"));
+      return runs.filter((args) => !args.includes("state") && !args.includes("list"));
     },
   };
 }
