@@ -6,13 +6,14 @@
  * route there is not.
  *
  * - `POST /checkpoints`, `{ environment, workspace, namespace, pod, containerId, hook,
- *   podTemplate, during? }`: starts checkpointing the sandbox of the container
+ *   podTemplate, live? }`: starts checkpointing the sandbox of the container
  *   `containerId` (containerd's id) of the pod `namespace`/`pod`, under the gVisor release
  *   that runs it, running `hook` (its arguments, none holding whitespace) in it first, which
  *   ends the sandbox, and making it the workspace's snapshot, recording `podTemplate`
- *   (202), unless one of the workspace's runs, which goes on. With `during`, `{ stateDir,
- *   execs: [{ sessionId, execId }] }`, the execs running in it and bayma's state directory,
- *   it is saved live, running on, and a restore from it resumes only while each runs on.
+ *   (202), unless one of the workspace's runs, which goes on. With `live`, `{ stateDir }`,
+ *   bayma's state directory in the container, it is saved live, running on; its manifest
+ *   records what bayma's hook said the save caught, and a restore from it resumes only
+ *   while bayma's state generation is that one.
  * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200):
  *   `{ state: "running" }`; `{ state: "done", value }`, `value` the snapshot's manifest; or
  *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
@@ -37,8 +38,8 @@
  *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
  *   (204). 504 when its policies were not in force within the agent's wait, saying for
  *   which address what was missing, its sandbox left paused; 410 when it was restored from
- *   a snapshot taken live that holds the session no more, an exec it caught ended since, or
- *   that cannot be told, its sandbox left paused; 500 when a command failed.
+ *   a snapshot taken live that holds the session no more, bayma's state generation having
+ *   moved on since, or that cannot be told, its sandbox left paused; 500 when a command failed.
  * - `POST /abandon`, `{ environment, workspace, namespace, pod }`: abandons the workspace's
  *   restore into the pod `namespace`/`pod` on this node, which alasio refused before it
  *   resumed its sandbox: kills each process runsc runs for the pod's containers, their

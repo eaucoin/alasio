@@ -1,8 +1,8 @@
 /**
  * Files a sandbox wrote on its volumes, read by the agent where the node mounts them, as
  * untrusted: the agent runs as the node's root, and what the sandbox can write, a symbolic
- * link, a FIFO or a file of any size among it, must lead the agent nowhere outside the
- * volume, hang it, or fill its memory.
+ * link, a FIFO, a device node or a file of any size among it, must lead the agent nowhere
+ * outside the volume, hang it, open a device of the node's, or fill its memory.
  */
 import { constants } from "node:fs";
 import { type FileHandle, open, readFile } from "node:fs/promises";
@@ -42,10 +42,19 @@ export async function hostPathOf(nodeRoot: string, bundle: string, path: string)
 }
 
 /**
+ * Linux's O_PATH, which node:fs does not name: a descriptor of a file that opens nothing of
+ * it, but tells what it is (fstat(2)), and is opened through /proc/self/fd as that file.
+ */
+const O_PATH = 0o10000000;
+
+/**
  * The file `names` under the directory `root`, read whole if it is a regular file of at
  * most `limit` bytes. Each name is opened relative to the directory before it, through
- * /proc/self/fd, as openat(2) opens one, and none may be a symbolic link; the file is
- * opened without waiting, as a FIFO would make it wait. Fails, saying why, otherwise.
+ * /proc/self/fd, as openat(2) opens one, and none may be a symbolic link. The file itself
+ * is opened first as a path (O_PATH), which opens nothing of it, and opened to be read only
+ * once that says it is a regular file, through that descriptor, so as the very file looked
+ * at: a device, whose opening may do what the device does, or a FIFO, whose opening waits
+ * for a writer, is never opened. Fails, saying why, otherwise.
  */
 export async function readUnder({ root, names }: UnderRoot, limit: number): Promise<Buffer> {
   const strange = names.find((name) => name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\0"));
@@ -71,10 +80,14 @@ export async function readUnder({ root, names }: UnderRoot, limit: number): Prom
     let directory = await open(root, constants.O_RDONLY | constants.O_DIRECTORY);
     opened.push(directory);
     for (let index = 0; index < names.length - 1; index += 1) directory = await openAt(directory, index, constants.O_RDONLY | constants.O_DIRECTORY);
-    const file = await openAt(directory, names.length - 1, constants.O_RDONLY | constants.O_NONBLOCK);
-    const found = await file.stat();
+    // O_NOFOLLOW with O_PATH opens a symbolic link itself, rather than failing.
+    const path = await openAt(directory, names.length - 1, O_PATH);
+    const found = await path.stat();
+    if (found.isSymbolicLink()) throw new Error(`${join(root, ...names)} cannot be opened: it is a symbolic link, which is not followed, or no directory`);
     if (!found.isFile()) throw new Error(`${join(root, ...names)} is not a regular file`);
     if (found.size > limit) throw new Error(`${join(root, ...names)} is ${found.size} bytes, more than the ${limit} read of it`);
+    const file = await open(`/proc/self/fd/${path.fd}`, constants.O_RDONLY);
+    opened.push(file);
     // To its end, which may be past what it was said to be: it may have grown since.
     const chunks: Buffer[] = [];
     let read = 0;
