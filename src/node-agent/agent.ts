@@ -437,7 +437,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       const prefix = prefixOf(ref);
       yield* cache.clear(ref.environment, ref.workspace, null);
       yield* bucket.remove(`${prefix}/${CURRENT_FILE}`);
-      yield* Effect.forEach(yield* bucket.list(`${prefix}/`), bucket.remove, { discard: true });
+      yield* Effect.forEach(yield* bucket.list(`${prefix}/`), ({ key }) => bucket.remove(key), { discard: true });
     });
 
   /**
@@ -500,7 +500,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   const settle = (manifest: Manifest, cached: Effect.Effect<void, CacheError>): Effect.Effect<void> =>
     Effect.gen(function*() {
       const prefix = prefixOf(manifest);
-      const stale = (yield* bucket.list(`${prefix}/`)).filter((key) => key !== `${prefix}/${CURRENT_FILE}` && !key.startsWith(`${prefix}/${manifest.snapshot}/`));
+      const stale = (yield* bucket.list(`${prefix}/`)).map(({ key }) => key).filter((key) => key !== `${prefix}/${CURRENT_FILE}` && !key.startsWith(`${prefix}/${manifest.snapshot}/`));
       yield* Effect.forEach(stale, bucket.remove, { discard: true });
       yield* cached;
     }).pipe(Effect.catch((error) => Effect.logWarning(`the snapshot ${manifest.snapshot} of ${prefixOf(manifest)} is committed, but ${error.message}`)));
@@ -755,7 +755,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     workspaces: (environment) =>
       bucket.list(`${environment}/`).pipe(
         // What else the bucket holds under it is no workspace's of the agent's.
-        Effect.map((keys) => [...new Set(keys.map((key) => key.slice(environment.length + 1).split("/")[0] ?? ""))].filter((name) => NAME.test(name)).sort()),
+        Effect.map((listed) => [...new Set(listed.map(({ key }) => key.slice(environment.length + 1).split("/")[0] ?? ""))].filter((name) => NAME.test(name)).sort()),
       ),
     discard: (ref, keep) =>
       exclusive([ref], cache.discard(ref.environment, ref.workspace, keep)).pipe(
