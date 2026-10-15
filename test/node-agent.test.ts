@@ -27,10 +27,12 @@ import {
   type AbandonRequest,
   type CheckpointRequest,
   COLLECT_GRACE_MS,
+  compactionDue,
   type Killed,
   type Layer as Image,
   makeNodeAgent,
   type Manifest,
+  MAX_CHAIN_DEPTH,
   memoryLimitOf,
   type NodeAgent,
   PoliciesNotInForce,
@@ -349,6 +351,150 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
       assert.equal((yield* there.agent.checkpoint(request("fs-abc", OTHER_CONTAINER))).layers.length, 1);
     })
   ));
+
+/** An image of `bytes` bytes, in one file, as a manifest says it. */
+const imageOf = (digit: string, bytes: number): Image => ({ digest: digit.repeat(64), files: [{ path: "pages.img", bytes, sha256: "0".repeat(64), etag: '"0"' }] });
+
+test("a snapshot is compacted once its deltas together are as large as its base, one is more than half of it, or it reads from more than 16 images", () => {
+  const base = imageOf("a", 4096);
+  assert.equal(compactionDue([base]), null);
+  assert.equal(compactionDue([imageOf("b", 512), base, imageOf("c", 512)]), null);
+  // Its base is its largest image, wherever runsc lists it.
+  assert.equal(compactionDue([imageOf("b", 2048), imageOf("c", 2048), base]), "its deltas are 4096 bytes together, as large as its base's 4096");
+  assert.equal(compactionDue([base, imageOf("b", 2049)]), "a delta of 2049 bytes is more than half its base's 4096");
+  assert.equal(compactionDue([base, imageOf("b", 2048)]), null);
+  const deep = [base, ...Array.from({ length: MAX_CHAIN_DEPTH }, (_, index) => imageOf(index.toString(16), 1))];
+  assert.equal(compactionDue(deep.slice(0, MAX_CHAIN_DEPTH)), null);
+  assert.equal(compactionDue(deep), "it reads from 17 images, more than 16");
+});
+
+/** The workspace's current snapshot, once it is one compacted from `from`. */
+const compactedFrom = (agent: NodeAgent, from: string) =>
+  agent.current({ environment: "main", workspace: "fs-abc" }).pipe(
+    Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (manifest) => manifest?.compactedFrom === from }),
+    Effect.timeout("10 seconds"),
+  );
+
+test("a release's snapshot whose chain is due is compacted into one image, at the node's lowest priority, which becomes current and the next delta's base", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const taker = yield* node("node-1");
+        yield* taker.agent.checkpoint(request("fs-abc"));
+        const there = yield* node("node-2");
+        const restored = () =>
+          Effect.gen(function*() {
+            const { manifest } = yield* there.agent.prepare(workspace);
+            yield* there.agent.spend(workspace, manifest.snapshot);
+            yield* there.agent.resume(resumeRequest());
+          });
+        yield* restored();
+        // The sandbox wrote over as much as its base holds.
+        writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
+        const delta = yield* there.agent.checkpoint(request("fs-abc"));
+        assert.equal(delta.layers.length, 2);
+        const compacted = yield* compactedFrom(there.agent, delta.snapshot);
+        assert.ok(compacted);
+        const [own] = delta.layers;
+        assert.ok(own);
+        const layersDir = join(there.cacheDir, "main", "fs-abc", "layers");
+        const staged = join(layersDir, `.${compacted.snapshot}`);
+        assert.deepEqual(there.releases.calls(RELEASE).find((args) => args.includes("compact")), [
+          `--root=${RUNSC_ROOT}`,
+          "--systemd-cgroup=true",
+          "image",
+          "compact",
+          `--output=${staged}`,
+          `--layer-path=${layersDir}`,
+          "--working-set-first",
+          join(layersDir, own.digest),
+        ]);
+        assert.equal(readFileSync(join(there.releases.dirOf(RELEASE), "compact-priority"), "utf8"), "19");
+        // One image, of the delta's memory and its base's, in place of both; the same sandbox at the same moment.
+        const [image] = compacted.layers;
+        assert.ok(image);
+        assert.equal(compacted.layers.length, 1);
+        assert.equal(image.files.find(({ path }) => path === "pages.img")?.bytes, 8192);
+        assert.ok(compacted.snapshot > delta.snapshot);
+        const { snapshot: _snapshot, layers: _layers, bytes, uploadMs: _uploadMs, compactedFrom: from, ...same } = compacted;
+        const { snapshot: _from, layers: _chain, bytes: _bytes, uploadMs: _taken, ...was } = delta;
+        assert.deepEqual(same, was);
+        assert.equal(from, delta.snapshot);
+        assert.equal(bytes, image.files.reduce((sum, file) => sum + file.bytes, 0));
+        assert.deepEqual(filesOf(join(layersDir, image.digest)), image.files);
+        // Committed as a checkpoint commits: the delta's manifest kept beside it, which a restore that read it reads within the grace.
+        assert.deepEqual(JSON.parse(s3.objects.get(`main/fs-abc/manifests/${compacted.snapshot}.json`)?.toString() ?? ""), compacted);
+        assert.ok(s3.objects.has(`main/fs-abc/manifests/${delta.snapshot}.json`));
+        assert.deepEqual(JSON.parse(readFileSync(join(there.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), compacted);
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        // Restored elsewhere, it reads one image; the next delta of the sandbox restored is of that image.
+        const third = yield* node("node-3");
+        const prepared = yield* third.agent.prepare(workspace);
+        assert.deepEqual(readdirSync(join(prepared.imagePath, "layers")), []);
+        writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "512");
+        yield* restored();
+        const next = yield* there.agent.checkpoint(request("fs-abc"));
+        assert.deepEqual(next.layers.slice(1).map(({ digest }) => digest), [image.digest]);
+        assert.ok(there.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"))?.includes(`--parent-image-path=${join(layersDir, image.digest)}`));
+        // Small, it is not compacted.
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(yield* there.agent.current(workspace), next);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
+
+test("a compaction the workspace moves on from meanwhile commits nothing, one that fails changes nothing, and a live snapshot is never compacted", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        const chained = (take: CheckpointRequest = request("fs-abc")) =>
+          Effect.gen(function*() {
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+            yield* here.agent.checkpoint(request("fs-abc"));
+            const { manifest } = yield* here.agent.prepare(workspace);
+            yield* here.agent.spend(workspace, manifest.snapshot);
+            yield* here.agent.resume(resumeRequest());
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+            return yield* here.agent.checkpoint(take);
+          });
+        const layersDir = join(here.cacheDir, "main", "fs-abc", "layers");
+        const compactions = () => here.releases.calls(RELEASE).filter((args) => args.includes("compact")).length;
+        // Restored, and so spent, as it compacts: its compacted image commits nothing.
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const moved = yield* chained();
+        yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 1 }));
+        yield* here.agent.spend(workspace, moved.snapshot);
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sync(() => readdirSync(layersDir).some((name) => name.startsWith("."))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (staging) => !staging }));
+        yield* Effect.sleep("200 millis");
+        assert.equal(yield* here.agent.current(workspace), null);
+        // One that fails leaves the snapshot as it was committed, and nothing it staged.
+        writeFileSync(join(runscDir, "fail-compact"), "");
+        const failed = yield* chained();
+        yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 2 }));
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(yield* here.agent.current(workspace), failed);
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        rmSync(join(runscDir, "fail-compact"));
+        // Taken live, the sandbox running on from it, it is not compacted, however large its delta.
+        const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+        mkdirSync(join(volume, ".bayma"));
+        writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+        here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+        yield* here.agent.checkpoint(live("fs-abc"));
+        const second = yield* here.agent.checkpoint(live("fs-abc"));
+        assert.equal(second.layers.length, 2);
+        yield* Effect.sleep("200 millis");
+        assert.equal(compactions(), 2);
+        assert.deepEqual(yield* here.agent.current(workspace), second);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
 
 test("a snapshot is committed only once each image it refers to is in the bucket as it was put, put again from the cache where it is not", () =>
   withBucket(({ s3, node }) =>

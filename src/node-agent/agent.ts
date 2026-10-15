@@ -22,6 +22,13 @@
  * from another restores what the other was: its images copied in the bucket, then its
  * manifest, then its commit, as a checkpoint writes them.
  *
+ * A snapshot a release's checkpoint commits whose chain of images is due (compactionDue)
+ * is compacted, after its commit and beside whatever else the agent does, one at a time on
+ * the node at its lowest priority: its images into one, the image of a new snapshot
+ * `compactedFrom` it, committed as the current one only if the workspace has not moved on
+ * from it meanwhile. It is the same sandbox at the same moment, so a Sandbox released into
+ * the one is restored from the other, which is the next delta's base.
+ *
  * What no snapshot needs any more is collected, by one caller (alasio's collection): the
  * images and manifests that neither the current snapshot, nor the latest, which a sandbox
  * restored from it may still extend, nor one superseded within COLLECT_GRACE_MS names, nor
@@ -47,7 +54,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
 import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -154,12 +161,42 @@ export const Manifest = Schema.Struct({
   uploadMs: Count,
   /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
   live: Schema.optional(Caught),
+  /**
+   * For a snapshot of a compacted image, the snapshot whose memory it holds, as a Sandbox
+   * released into that one names it: the same sandbox, at the same moment, in one image.
+   */
+  compactedFrom: Schema.optional(SnapshotId),
 }).check(Schema.makeFilter((manifest) => manifest.bytes === bytesOf(manifest.layers) || "its bytes must be its images' together"));
 export type Manifest = typeof Manifest.Type;
 
 /** The bytes of `layers`' files together. */
 function bytesOf(layers: readonly Layer[]): number {
   return layers.reduce((sum, { files }) => sum + files.reduce((each, { bytes }) => each + bytes, 0), 0);
+}
+
+/** The most images a snapshot reads from, its own and its layers, before it is compacted. */
+export const MAX_CHAIN_DEPTH = 16;
+
+/**
+ * Why a snapshot of `layers`, its image and those it holds pages of, is compacted, or null
+ * where it is not. Its base is the largest of them, as a chain's first image, saved whole,
+ * is, and the others its deltas: it is compacted once its deltas together are as large as
+ * its base, so that the chain stays within about twice the base on the disks that keep it;
+ * once one delta is larger than half its base, as one is of a sandbox that wrote over much
+ * of its memory, which the base then holds stale; or once it reads from more than
+ * MAX_CHAIN_DEPTH images, each a file a restore opens and looks pages up in.
+ */
+export function compactionDue(layers: readonly Layer[]): string | null {
+  if (layers.length < 2) return null;
+  if (layers.length > MAX_CHAIN_DEPTH) return `it reads from ${layers.length} images, more than ${MAX_CHAIN_DEPTH}`;
+  const sizes = layers.map((layer) => bytesOf([layer]));
+  const base = Math.max(...sizes);
+  const deltas = sizes.toSpliced(sizes.indexOf(base), 1);
+  const together = deltas.reduce((sum, bytes) => sum + bytes, 0);
+  if (together >= base) return `its deltas are ${together} bytes together, as large as its base's ${base}`;
+  const largest = Math.max(...deltas);
+  if (largest * 2 > base) return `a delta of ${largest} bytes is more than half its base's ${base}`;
+  return null;
 }
 
 /** A workspace, as each request names it. */
@@ -441,6 +478,14 @@ const abandons = meter.createCounter("alasio.node_agent.abandons", {
   description: "Restores alasio refused before their sandboxes resumed, abandoned by the node agent, what runsc ran for their pods killed, by outcome",
   unit: "{abandon}",
 });
+const compactions = meter.createCounter("alasio.node_agent.compactions", {
+  description: "Snapshots whose chains of images the node agent compacted into one, after a release's checkpoint committed them, by outcome: compacted, superseded as the workspace moved on meanwhile, or what failed",
+  unit: "{compaction}",
+});
+const compactionDuration = meter.createHistogram("alasio.node_agent.compaction.duration", {
+  description: "How long runsc took to compact a snapshot's chain of images into one",
+  unit: "s",
+});
 const keptReleases = meter.createObservableGauge("alasio.node_agent.releases", {
   description: "The gVisor releases kept on the node, each of which restores the snapshots it took",
   unit: "{release}",
@@ -515,6 +560,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const bases = new Map<string, Manifest>();
   /** The snapshot each workspace's restore on this node was last prepared from, which its resume makes its sandbox's base. */
   const prepared = new Map<string, Manifest>();
+  /** Compactions run in the agent's scope, one at a time on the node, beside whatever else it does. */
+  const scope = yield* Effect.scope;
+  const compacting = yield* Semaphore.make(1);
 
   /** How many workspaces the cache holds the images of under each release, as the manifests beside them say. */
   const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
@@ -721,6 +769,85 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return manifest;
     }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
 
+  /**
+   * Compacts the chain of images of `committed`, the snapshot a release's checkpoint has just
+   * committed, where compactionDue says to: its image and its layers into one image, the
+   * snapshot `compactedFrom` it, which becomes the workspace's current snapshot, and so the
+   * base of the next delta of a sandbox restored from it, if the workspace has not moved on
+   * from `committed` meanwhile. Its new snapshot, or null where it did not compact it.
+   * Nothing waits on it: it writes and uploads its image before it holds the workspace, then
+   * commits it once it holds it, as a checkpoint commits its own.
+   */
+  const compactNow = (committed: Manifest): Effect.Effect<Manifest | null, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.gen(function*() {
+      const why = compactionDue(committed.layers);
+      if (why === null) return null;
+      const { environment, workspace, release } = committed;
+      const [own] = committed.layers;
+      if (own === undefined) return null;
+      for (const { digest } of committed.layers) {
+        if (!(yield* cache.holds(environment, workspace, digest))) {
+          yield* Effect.logInfo(`not compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)}, though ${why}: this node's cache no longer holds its image ${digest}`);
+          return null;
+        }
+      }
+      const snapshot = snapshotId(yield* Clock.currentTimeMillis);
+      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.compacted_from": committed.snapshot, "alasio.snapshot.chain_depth": committed.layers.length });
+      // At most as large as the images it is compacted from.
+      yield* cache.room(committed.bytes, committed).pipe(Effect.flatMap(logEvicted));
+      const staged = yield* cache.stage(environment, workspace, snapshot);
+      return yield* Effect.gen(function*() {
+        // runsc writes the image into a directory it makes.
+        yield* onDisk(() => rm(staged, { recursive: true, force: true }));
+        const [compactMs] = yield* timed(runsc.compact(release, { imagePath: cache.image(environment, workspace, own.digest), layerPath: join(cache.workspace(environment, workspace), LAYERS_DIR), output: staged }));
+        yield* Effect.sync(() => compactionDuration.record(compactMs / 1000));
+        const image = yield* runsc.inspect(release, staged);
+        if (image.version !== runscVersion(release)) {
+          return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image says runsc ${image.version} wrote it, not ${runscVersion(release)}` });
+        }
+        const referred = yield* runsc.layers(release, staged);
+        if (referred.length > 0) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image refers to the images ${referred.join(", ")}, where it is to refer to none` });
+        yield* cache.commit(environment, workspace, snapshot, image.digest);
+        const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
+        const [uploadMs, uploaded] = yield* timed(upload(committed, image.digest, files));
+        if (!(yield* inBucket(committed, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its compacted image ${image.digest} is not in the bucket as it was put` });
+        const manifest: Manifest = { ...committed, snapshot, layers: [uploaded], bytes: bytesOf([uploaded]), uploadMs, compactedFrom: committed.snapshot };
+        // What it uploaded, should the workspace have moved on meanwhile, no manifest names, and is collected as any such image is.
+        const written = yield* exclusive(
+          [committed],
+          Effect.gen(function*() {
+            if ((yield* current(committed))?.snapshot !== committed.snapshot) return false;
+            yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
+            yield* bucket.putJson(manifestKey(committed, snapshot), manifest);
+            yield* bucket.putJson(`${prefixOf(committed)}/${CURRENT_FILE}`, manifest);
+            return true;
+          }),
+        );
+        if (!written) {
+          yield* Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "superseded" }));
+          yield* Effect.logInfo(`compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}, but the workspace moved on from it meanwhile: the compacted image is left to be collected`);
+          return null;
+        }
+        yield* Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": "compacted" }));
+        yield* Effect.logInfo(
+          `compacted the snapshot ${committed.snapshot} of ${prefixOf(committed)}, as ${why}: its ${committed.layers.length} images, ${committed.bytes} bytes, are the image of its snapshot ${snapshot}, ${manifest.bytes} bytes, in ${compactMs} ms, uploaded in ${uploadMs} ms`,
+        );
+        return manifest;
+      }).pipe(Effect.onError(() => cache.unstage(environment, workspace, snapshot).pipe(Effect.ignore)));
+    });
+
+  /** Compacts `committed` as compactNow does, once no other compaction runs on the node, in the agent's scope: what fails is said, and changes nothing. */
+  const compactLater = (committed: Manifest): Effect.Effect<void> =>
+    compactNow(committed).pipe(
+      compacting.withPermits(1),
+      Effect.tapError((error) => Effect.sync(() => compactions.add(1, { "alasio.node_agent.compaction.outcome": error._tag }))),
+      Effect.catch((error) => Effect.logWarning(`compacting the snapshot ${committed.snapshot} of ${prefixOf(committed)} failed, which changes nothing of it: ${error.message}`)),
+      withAlasioSpan("alasio.node_agent.compaction", { attributes: { ...spanAttributes(committed), "alasio.snapshot": committed.snapshot } }),
+      withLogScope("node-agent"),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
   /** Says which workspaces were evicted from the node's cache. */
   const logEvicted = (evicted: readonly CachedWorkspace[]) =>
     Effect.forEach(evicted, ({ environment, workspace, bytes }) =>
@@ -754,6 +881,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         Effect.mapError((error) => failed(`${error.message}; its snapshot is kept, as a live checkpoint that fails changes nothing`)),
       );
     return exclusive([request], committed.pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))))).pipe(
+      // A release's: compacted once it no longer holds the workspace, where its chain is due.
+      Effect.tap((manifest) => (request.live === undefined ? compactLater(manifest) : Effect.void)),
       Effect.tap((manifest) =>
         Effect.sync(() => {
           pauses.record(manifest.pauseMs / 1000);
