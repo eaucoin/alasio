@@ -18,6 +18,7 @@ import { writeFileSync } from "node:fs";
 import { Effect, Schema } from "effect";
 
 import { CURRENT_FILE, Manifest } from "../../src/node-agent/agent.ts";
+import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
 import { makeS3Bucket } from "../../src/node-agent/s3.ts";
 
 /** The file of the image overwritten: its snapshot, its path in the image, and its size. */
@@ -62,12 +63,13 @@ const said = await Effect.runPromise(Effect.gen(function*() {
     const done: Released = { snapshot: manifest.snapshot, release };
     return done;
   }
-  // The largest, which is the sandbox's memory, never all zeros.
-  const [file] = [...manifest.files].sort((a, b) => b.bytes - a.bytes);
-  if (!file) return yield* Effect.die(new Error(`the snapshot ${manifest.snapshot} of ${environment}/${workspace} has no file`));
+  // The largest file of its image, which is the sandbox's memory, never all zeros.
+  const [image] = manifest.layers;
+  const [file] = [...(image?.files ?? [])].sort((a, b) => b.bytes - a.bytes);
+  if (!image || !file) return yield* Effect.die(new Error(`the snapshot ${manifest.snapshot} of ${environment}/${workspace} has no file`));
   const zeros = "/tmp/e2e-corrupted";
   writeFileSync(zeros, Buffer.alloc(file.bytes));
-  yield* bucket.putFile(`${environment}/${workspace}/${manifest.snapshot}/${file.path}`, zeros);
+  yield* bucket.putFile(`${environment}/${workspace}/${LAYERS_DIR}/${image.digest}/${file.path}`, zeros);
   const done: Corrupted = { snapshot: manifest.snapshot, path: file.path, bytes: file.bytes };
   return done;
 }));

@@ -224,7 +224,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     error._tag === "KubeApiError" || error.status === undefined || error.status >= 500;
 
   /**
-   * The nodes that can restore `manifest`, those holding its image first: they have its
+   * The nodes that can restore `manifest`, those holding its images first: they have its
    * release, with every CPU feature it was saved with; and whether every agent said what
    * its node holds.
    */
@@ -240,7 +240,8 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       const able = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
-      const holds = (cached: (typeof able)[number]["cached"]) => cached.some(({ snapshot }) => snapshot === manifest.snapshot);
+      const holds = (cached: (typeof able)[number]["cached"]) =>
+        cached.some(({ environment: of, workspace, images }) => of === manifest.environment && workspace === manifest.workspace && manifest.layers.every(({ digest }) => images.includes(digest)));
       return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered };
     });
 
@@ -355,7 +356,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               restores.add(1, { "alasio.sandbox.restore.outcome": "restored" });
               restoreDuration.record((now - started) / 1000);
             }),
-            Effect.andThen(forget(name, "the session restored from it runs on")),
+            // The session moves on from it; its images go on as the layers of its next.
+            Effect.andThen(
+              agents.spend(ref(name)).pipe(
+                Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of session ${name}, which runs on from it: ${error.message}`)),
+              ),
+            ),
           ),
           failed: ({ why, resumed }: RestoreFailure) =>
             (resumed ? fallBack(name, "restore", why) : deferOr(name, "restore", why)).pipe(Effect.map((came) => (came === null ? "fallen back" : "deferred"))),
@@ -476,33 +482,37 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       yield* collect.pipe(Effect.repeat(Schedule.spaced(COLLECT_POLL)), Effect.forkScoped);
     }).pipe(withLogScope("snapshots"));
 
-  /** Forgets the session's snapshot in the bucket and in every node's cache that holds it. */
+  /** Forgets the session's snapshots in the bucket and in every node's cache that holds them. */
   const forgetEverywhere = (name: string): Effect.Effect<void, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       yield* agents.forget(ref(name));
-      for (const node of yield* agents.nodes) yield* agents.discard(node, ref(name), null);
+      for (const node of yield* agents.nodes) yield* agents.discard(node, ref(name), []);
     });
 
   /**
    * Collects what no Sandbox has a use for, whose images hold what the sessions held,
    * secrets among it: the snapshots in the bucket of sessions that are gone, which a
-   * deletion that could not forget them left, and the images a node caches but the one its
-   * Sandbox is released into (one restored, or stale), but those a restore may be reading.
+   * deletion that could not forget them left; of each session, what its agent says none of
+   * its snapshots needs any more (../node-agent/agent.ts), which alasio alone collects,
+   * one workspace at a time; and the images a node caches that none of them needs, but
+   * those a restore may be reading.
    */
   const collect: Effect.Effect<void> = Effect.gen(function*() {
     const listed = (yield* kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, "alasio.dev/workload=session")) as readonly StoredSandbox[];
-    const bound = new Map(listed.map((sandbox) => [sandbox.metadata.name, sandbox.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? null]));
+    const sessions = new Set(listed.map((sandbox) => sandbox.metadata.name));
+    const kept = new Map<string, readonly string[]>();
     for (const workspace of yield* agents.workspaces(environment)) {
-      if (!bound.has(workspace)) {
-        yield* agents.forget(ref(workspace));
-        yield* Effect.logInfo(`forgot the snapshot of session ${workspace}, which is gone`);
+      if (sessions.has(workspace)) {
+        kept.set(workspace, yield* agents.collect(ref(workspace)));
+        continue;
       }
+      yield* agents.forget(ref(workspace));
+      yield* Effect.logInfo(`forgot the snapshots of session ${workspace}, which is gone`);
     }
     for (const node of yield* agents.nodes) {
-      const cached = (yield* agents.holdings(node)).cached.filter((held) => held.environment === environment);
-      for (const workspace of new Set(cached.map((held) => held.workspace))) {
-        const keep = bound.get(workspace) ?? null;
-        if (cached.some((held) => held.workspace === workspace && held.snapshot !== keep)) yield* agents.discard(node, ref(workspace), keep);
+      for (const held of (yield* agents.holdings(node)).cached.filter((cached) => cached.environment === environment)) {
+        const keep = kept.get(held.workspace) ?? [];
+        if (held.images.some((digest) => !keep.includes(digest))) yield* agents.discard(node, ref(held.workspace), keep);
       }
     }
   }).pipe(Effect.catch((error) => Effect.logWarning(`could not collect sessions' snapshots: ${error.message}`)));
