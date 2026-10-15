@@ -893,7 +893,7 @@ test("checkpoints and prepares keep the node's cache within its budget, the leas
     })
   ));
 
-const S1 = "20261013T000000Z-00000001";
+const S1 = "20261013T000000000Z-00000001";
 const [D1, D2] = ["1".repeat(64), "2".repeat(64)];
 
 /** Puts an image of 1000 bytes, `digest`, in the cache, of `workspace`, used `minutesAgo`. */
@@ -1246,7 +1246,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       assert.deepEqual(yield* call("POST", "/collect", { environment: "main", workspace: "fs-abc" }), { status: 200, body: { kept: [image.digest] } });
       error(400, /workspace/u)(yield* call("POST", "/collect", { environment: "main" }));
       // Spent, it is current no more, but its images are kept; spending another spends nothing.
-      assert.deepEqual(yield* call("DELETE", "/snapshots/main/fs-abc/current?snapshot=20261013T000000Z-00000001"), { status: 204, body: null });
+      assert.deepEqual(yield* call("DELETE", "/snapshots/main/fs-abc/current?snapshot=20261013T000000000Z-00000001"), { status: 204, body: null });
       assert.equal((yield* call("GET", "/snapshots/main/fs-abc")).status, 200);
       assert.equal((yield* call("DELETE", "/snapshots/main/fs-abc/current")).status, 404);
       assert.deepEqual(yield* call("DELETE", `/snapshots/main/fs-abc/current?snapshot=${manifest.snapshot}`), { status: 204, body: null });
@@ -1348,7 +1348,7 @@ test("alasio has a restored sandbox resumed by its node's agent, or is told why 
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
 
       // One restored from a snapshot that holds the session no more answers 410.
-      const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000Z-00000001", reason: "the exec exec_1 of the session sess_1 has ended since, ok" });
+      const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "the exec exec_1 of the session sess_1 has ended since, ok" });
       const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest()));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
     })

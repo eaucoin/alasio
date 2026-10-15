@@ -1402,7 +1402,7 @@ if (inShard("snapshots")) {
           ...sandbox.spec.podTemplate.metadata,
           annotations: {
             ...sandbox.spec.podTemplate.metadata?.annotations,
-            "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000Z-0123abcd`,
+            "dev.gvisor.internal.restore.host-image-path": `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${workspace}/20261013T000000000Z-0123abcd`,
             ...(paused ? { "dev.gvisor.internal.restore.paused": "true" } : {}),
           },
         };
