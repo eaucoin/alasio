@@ -143,7 +143,7 @@ export function valkeyObjects(config: InstallConfig, instance: ValkeyInstance, s
       template: {
         metadata: { labels: labels(component), annotations: { "checksum/config": sha256(conf) } },
         spec: {
-          ...priority("floor"),
+          ...priority("bound"),
           ...valkeyPod(config),
           // Long enough for its last snapshot and fsync as it stops.
           terminationGracePeriodSeconds: 60,
