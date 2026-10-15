@@ -160,12 +160,20 @@ const sampler = setInterval(() => {
   for (const reader of readers) if (reader.process.pid) reader.peakKiB = Math.max(reader.peakKiB, residentKiB(reader.process.pid));
 }, 50);
 
+/** The queries asked of each reader and not answered yet: what its endpoint's queue counts. */
+const asked = new Map<number, number>(READER_PORTS.map((port) => [port, 0]));
+
 /** Asks `reader` for `sql`: how long it took, in seconds, and its status. */
 async function ask(reader: Reader, sql: string): Promise<{ seconds: number; status: number; text: string }> {
   const at = performance.now();
-  const response = await fetch(`http://127.0.0.1:${reader.port}/query`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: sql });
-  const text = await response.text();
-  return { seconds: (performance.now() - at) / 1000, status: response.status, text: text.slice(0, 300) };
+  asked.set(reader.port, (asked.get(reader.port) ?? 0) + 1);
+  try {
+    const response = await fetch(`http://127.0.0.1:${reader.port}/query`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: sql });
+    const text = await response.text();
+    return { seconds: (performance.now() - at) / 1000, status: response.status, text: text.slice(0, 300) };
+  } finally {
+    asked.set(reader.port, (asked.get(reader.port) ?? 0) - 1);
+  }
 }
 
 for (const reader of readers) {
@@ -228,6 +236,40 @@ for (const [name, slow] of Object.entries(SLOW)) {
   }
 }
 
+// A scaler that reads one reader's queue through the Service, as KEDA's metrics-api scaler
+// would, and takes it for each reader's, against the pool's real total: the search pinned
+// on one reader, as many as `pinned` at once, and as many on the other as `beside`.
+const estimates: Record<string, unknown>[] = [];
+for (const [pinned, beside] of [[6, 0], [6, 2], [3, 3]] as const) {
+  const [a, b] = readers as [Reader, Reader];
+  const search = SLOW["a search of the transcripts' text"];
+  const samples: { total: number; estimate: number }[] = [];
+  const asking = [...Array.from({ length: pinned }, () => ask(a, search)), ...Array.from({ length: beside }, () => ask(b, search))];
+  let done = false;
+  void Promise.all(asking).then(() => {
+    done = true;
+  });
+  while (!done) {
+    const total = [...asked.values()].reduce((sum, queries) => sum + queries, 0);
+    const sampled = asked.get(readers[Math.floor(Math.random() * readers.length)]!.port) ?? 0;
+    samples.push({ total, estimate: readers.length * sampled });
+    await sleep(50);
+  }
+  const errors = samples.map(({ total, estimate }) => estimate - total);
+  estimates.push({
+    pinned,
+    beside,
+    samples: samples.length,
+    meanTotal: Number((samples.reduce((sum, { total }) => sum + total, 0) / samples.length).toFixed(2)),
+    meanEstimate: Number((samples.reduce((sum, { estimate }) => sum + estimate, 0) / samples.length).toFixed(2)),
+    meanAbsoluteError: Number((errors.reduce((sum, error) => sum + Math.abs(error), 0) / errors.length).toFixed(2)),
+    worstOver: Math.max(...errors),
+    worstUnder: Math.min(...errors),
+    exact: Number((errors.filter((error) => error === 0).length / errors.length).toFixed(2)),
+  });
+  log("estimate", estimates.at(-1)!);
+}
+
 clearInterval(sampler);
 for (const reader of readers) reader.process.kill("SIGTERM");
 await admin.end();
@@ -235,7 +277,7 @@ await postgres.stop();
 rmSync(dataDir, { recursive: true, force: true });
 
 mkdirSync(OUT, { recursive: true });
-writeFileSync(join(OUT, "readers.json"), `${JSON.stringify({ scale: SCALE, entries: ENTRIES, points: POINTS, results }, null, 2)}\n`);
+writeFileSync(join(OUT, "readers.json"), `${JSON.stringify({ scale: SCALE, entries: ENTRIES, points: POINTS, results, estimates }, null, 2)}\n`);
 const table = [
   "| case | run | slow (s) | small alone (s) | small behind slow, one reader (s) | small on another reader (s) | both slow (s) | peak RSS each (MiB) |",
   "|---|---|---|---|---|---|---|---|",
@@ -244,6 +286,10 @@ const table = [
   ),
   "",
   `Idle, the lake open: ${idle.map((kib) => `${Math.round(kib / 1024)} MiB`).join(" / ")}.`,
+  "",
+  "| searches on one reader / the other | samples | mean total | mean estimate | mean absolute error | worst over / under | exact |",
+  "|---|---|---|---|---|---|---|",
+  ...estimates.map((row) => `| ${row["pinned"]} / ${row["beside"]} | ${row["samples"]} | ${row["meanTotal"]} | ${row["meanEstimate"]} | ${row["meanAbsoluteError"]} | ${row["worstOver"]} / ${row["worstUnder"]} | ${row["exact"]} |`),
 ];
 writeFileSync(join(OUT, "readers.md"), `${table.join("\n")}\n`);
 console.log(table.join("\n"));
