@@ -1,6 +1,6 @@
 {
   "name": "alasio-server",
-  "version": "6.0.0",
+  "version": "7.0.0",
   "private": true,
   "type": "module",
   "description": "alasio's server: the Telegram bridge that runs Claude Code and Codex, in alasio's image",
