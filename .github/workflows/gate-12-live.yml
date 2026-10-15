@@ -19,15 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Which of a live checkpoint's parts the Sentry's growth comes from: a delta of the one
-        # before (chain 16) or full (chain 1), pre-copied or not, dirty tracking by
-        # write-protection or none.
-        include:
-          - { part: 0, chain: 16, precopy: on, tracking: wp }
-          - { part: 1, chain: 16, precopy: off, tracking: wp }
-          - { part: 2, chain: 1, precopy: on, tracking: wp }
-          - { part: 3, chain: 1, precopy: off, tracking: wp }
-          - { part: 4, chain: 1, precopy: off, tracking: off }
+        part: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -54,8 +46,8 @@ jobs:
           node --input-type=module -e '
             import { gvisorRuntimeFiles } from "./cli/src/cluster/k3s.ts";
             const [, options] = [...gvisorRuntimeFiles([process.argv[1]], { systemd: false })].find(([path]) => path.endsWith(".toml"));
-            process.stdout.write(options + `  dirty-tracking = "${process.argv[2]}"\n  working-set-window = "3s"\n  profile = "true"\n`);
-          ' "$release" "${{ matrix.tracking }}" | sudo tee /etc/containerd/runsc.toml
+            process.stdout.write(options + "  dirty-tracking = \"wp\"\n  working-set-window = \"3s\"\n");
+          ' "$release" | sudo tee /etc/containerd/runsc.toml
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # Read whole before tee opens it: tee empties it as it starts.
           daemon=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
@@ -66,10 +58,7 @@ jobs:
       - run: docker build --tag alasio-agent:gate sandbox/agent
       - run: node --test --test-timeout=10800000 gate/12/live.test.ts
         env:
-          CHECKPOINTS: 40
-          CHAIN: ${{ matrix.chain }}
-          PRECOPY: ${{ matrix.precopy }}
-          PROFILE_EVERY: 10
+          CHECKPOINTS: 250
           OUT: ${{ runner.temp }}/gate-12-live
       - if: always()
         uses: actions/upload-artifact@v4
