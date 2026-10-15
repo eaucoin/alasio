@@ -82,6 +82,9 @@ const Release = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]
  */
 const ImagePath = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u), Schema.isMaxLength(1024));
 
+/** A count of bytes, or of milliseconds. */
+const Count = Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0));
+
 /** An ID of bayma's, a session's or an exec's, as bayma makes them. */
 const BaymaId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u));
 
@@ -91,19 +94,27 @@ const AbsolutePath = Schema.String.check(
   Schema.makeFilter((path) => path.split("/").every((name) => name !== "." && name !== "..") || "must name no . or .."),
 );
 
-/**
- * The execs that ran in a sandbox saved live, each by its session's and its own ID, and
- * the state directory, in the container, of the bayma that ran them: the snapshot holds
- * what the sandbox is only while each runs on, as bayma's history there says.
- */
-export const During = Schema.Struct({
-  stateDir: AbsolutePath,
-  execs: Schema.Array(Schema.Struct({ sessionId: BaymaId, execId: BaymaId })).check(Schema.isMinLength(1)),
-});
-export type During = typeof During.Type;
+/** How a checkpoint saves a sandbox live: the state directory, in the container, of the bayma it runs. */
+export const LiveSave = Schema.Struct({ stateDir: AbsolutePath });
+export type LiveSave = typeof LiveSave.Type;
 
-/** A count of bytes, or of milliseconds. */
-const Count = Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0));
+/** The execs a save caught running, each by its session's and its own ID, as bayma names them. */
+const Running = Schema.Array(Schema.Struct({ sessionId: BaymaId, execId: BaymaId }));
+
+/**
+ * What a snapshot taken live caught, as bayma's `sandbox-hook save` said it in its state
+ * directory's last-save.json: the state generation, which the snapshot may be restored at
+ * only while it is the one on the disk (bayma's generation.json), and the execs running,
+ * for whoever reads the manifest. So the snapshot holds what the sandbox is only while
+ * nothing its clients were told of has happened since.
+ */
+export const Caught = Schema.Struct({
+  stateDir: AbsolutePath,
+  generation: Count,
+  running: Running,
+});
+export type Caught = typeof Caught.Type;
+
 
 /**
  * A file of an image: its path in the image, its size, its SHA-256, in hex, and the ETag
@@ -141,8 +152,8 @@ export const Manifest = Schema.Struct({
   pauseMs: Count,
   /** How long its image took to upload. */
   uploadMs: Count,
-  /** For a snapshot taken live, the execs it caught running, while each of which it holds the session alone. */
-  during: Schema.optional(During),
+  /** For a snapshot taken live, what it caught: it holds the session only while bayma's state generation is that one. */
+  live: Schema.optional(Caught),
 }).check(Schema.makeFilter((manifest) => manifest.bytes === bytesOf(manifest.layers) || "its bytes must be its images' together"));
 export type Manifest = typeof Manifest.Type;
 
@@ -177,8 +188,8 @@ export const CheckpointRequest = Schema.Struct({
   /** The program run in the container before the save: its arguments, none holding whitespace, as runsc splits them at spaces. */
   hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)),
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
-  /** The execs running as the sandbox is saved live, which runs on: none at a release, which ends it. */
-  during: Schema.optional(During),
+  /** Where the sandbox is saved live, running on: never at a release, which ends it. */
+  live: Schema.optional(LiveSave),
 });
 export type CheckpointRequest = typeof CheckpointRequest.Type;
 
@@ -273,7 +284,7 @@ export class CheckpointFailed extends Schema.TaggedError<CheckpointFailed>()("Ch
 
 /**
  * A sandbox restored from a snapshot taken live is not let run, its snapshot holding the
- * session no more: an exec it caught has ended since, or whether one has cannot be told.
+ * session no more: bayma's state generation has moved on since, or cannot be told.
  */
 export class SnapshotOutlived extends Schema.TaggedError<SnapshotOutlived>()("SnapshotOutlived", {
   environment: Schema.String,
@@ -381,20 +392,20 @@ export const CURRENT_FILE = "current.json";
  */
 export const COLLECT_GRACE_MS = 60 * 60_000;
 /**
- * The most of a session's history in bayma's state directory the agent reads, as it tells
- * whether an exec a live snapshot caught runs on: one larger is not read, and the snapshot
- * is refused.
+ * The most of a file of bayma's state directory the agent reads: one larger is not read,
+ * and what it says is not told.
  */
-export const HISTORY_BYTES = 64 * 1024 * 1024;
+export const STATE_FILE_BYTES = 1024 * 1024;
 /**
- * What the agent reads of a session's history in bayma's state directory: each exec's ID
- * and status, one running on being "running" still. Anything else there is bayma's own.
+ * How long the agent waits for a file of bayma's state directory to be read: a file of
+ * STATE_FILE_BYTES at most, on a volume of the node's, is read well within it.
  */
-const History = Schema.fromJsonString(Schema.Struct({
-  schemaVersion: Schema.Literal(1),
-  history: Schema.Array(Schema.Struct({ execId: BaymaId, status: Schema.String })),
-}));
-/** How the agent reads a history's bytes as text: those that are not UTF-8 fail it. */
+export const STATE_READ_TIMEOUT_MS = 5_000;
+/** bayma's state generation, as its state directory's generation.json says it. */
+const StateGenerationFile = Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1), generation: Count }));
+/** What bayma's last save caught, as its state directory's last-save.json says it. */
+const LastSaveFile = Schema.fromJsonString(Schema.Struct({ schemaVersion: Schema.Literal(1), generation: Count, running: Running }));
+/** How the agent reads a state file's bytes as text: those that are not UTF-8 fail it. */
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 /** How long the hook may take to ready the sandbox for its save. */
 const HOOK_TIMEOUT = "30s";
@@ -646,7 +657,8 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
   const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, podTemplate } = request;
-      const { release, tracksWrites } = yield* ofPod(containerId, request.namespace, request.pod);
+      const running = yield* ofPod(containerId, request.namespace, request.pod);
+      const { tracksWrites } = running;
       const takenAt = yield* Clock.currentTimeMillis;
       const snapshot = snapshotId(takenAt);
       const base = bases.get(containerId);
@@ -655,16 +667,17 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.snapshot ?? "" });
       yield* cache.room(memoryLimitOf(podTemplate), request).pipe(Effect.flatMap(logEvicted));
       const staged = yield* cache.stage(environment, workspace, snapshot);
-      return yield* commit(request, snapshot, takenAt, staged, parent, release);
+      return yield* commit(request, snapshot, takenAt, staged, parent, running);
     });
 
   /**
    * Saves the sandbox `request` names into `staged`, a delta of `parent`'s image if given,
    * and commits it as the snapshot `snapshot`: its manifest. What it staged goes if it fails.
    */
-  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, release: string): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, container: RunningContainer): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
-      const { environment, workspace, containerId, hook, podTemplate, during } = request;
+      const { environment, workspace, containerId, hook, podTemplate, live } = request;
+      const { release } = container;
       const [own] = parent?.layers ?? [];
       const [pauseMs] = yield* timed(runsc.checkpoint(release, {
         containerId,
@@ -672,8 +685,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         hook,
         hookTimeout: HOOK_TIMEOUT,
         ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
-        live: during !== undefined,
+        live: live !== undefined,
       }));
+      // What the save caught, as bayma's hook wrote it as the sandbox was saved.
+      const caught = live === undefined ? undefined : yield* lastSave(request, live, [container]);
       const image = yield* runsc.inspect(release, staged);
       if (image.version !== runscVersion(release)) {
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
@@ -703,7 +718,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         takenAt: new Date(takenAt).toISOString(),
         pauseMs,
         uploadMs,
-        ...(during === undefined ? {} : { during }),
+        ...(caught === undefined ? {} : { live: caught }),
       };
       yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
       yield* bucket.putJson(manifestKey(request, snapshot), manifest);
@@ -722,7 +737,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     const failed = (reason: string) => new CheckpointFailed({ environment: request.environment, workspace: request.workspace, reason });
     const moved = "as the workspace has moved on since it was taken";
     const taken = take(request).pipe(Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))));
-    const committed = request.during === undefined
+    const committed = request.live === undefined
       ? taken.pipe(
         Effect.catch((error) =>
           forgetNow(request).pipe(
@@ -752,11 +767,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
           checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": "taken" });
         }).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.pause_ms": manifest.pauseMs, "alasio.snapshot.upload_ms": manifest.uploadMs })),
-          Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}${manifest.during === undefined ? "" : " live"}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
+          Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}${manifest.live === undefined ? "" : ` live, at bayma's generation ${manifest.live.generation}`}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
         )
       ),
       Effect.tapError((error) => Effect.logWarning(error.message)),
-      withAlasioSpan("alasio.node_agent.checkpoint", { attributes: { ...spanAttributes(request), "alasio.snapshot.live": request.during !== undefined } }),
+      withAlasioSpan("alasio.node_agent.checkpoint", { attributes: { ...spanAttributes(request), "alasio.snapshot.live": request.live !== undefined } }),
     );
   };
 
@@ -961,38 +976,51 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
-   * Whether `manifest`, taken live, holds the session still, a restored sandbox let run from
-   * it: each exec it caught runs on, as bayma's history in its state directory says, read
-   * on the volume of the pod's containers that holds it, as an untrusted file
-   * (./volume.ts). Fails where one has ended, or where that cannot be told.
+   * The file `name` of bayma's state directory `stateDir`, in the container, as `schema`
+   * decodes it, read on the volume of `containers` that holds it, as an untrusted file
+   * (./volume.ts), of STATE_FILE_BYTES at most, and of no property but the schema's, within
+   * STATE_READ_TIMEOUT_MS: one not read by then, as a volume that hangs leaves it, is unread,
+   * what it says not told. Fails saying why, as an Error.
    */
-  const holdsStill = (manifest: Manifest, during: During, containers: readonly RunningContainer[]): Effect.Effect<void, SnapshotOutlived> =>
-    Effect.forEach(during.execs, ({ sessionId, execId }) =>
-      Effect.tryPromise({
-        try: async () => {
-          const path = posix.join(during.stateDir, "histories", `${sessionId}.json`);
-          const held = (await Promise.all(containers.map(({ bundle }) => hostPathOf(nodeRoot, bundle, path)))).find((found): found is UnderRoot => found !== null);
-          if (held === undefined) throw new Error(`no volume of its pod holds ${path}`);
-          const bytes = await readUnder(held, HISTORY_BYTES);
-          const { history } = (() => {
-            try {
-              return Schema.decodeUnknownSync(History)(UTF8.decode(bytes));
-            } catch (error) {
-              throw new Error(`${path} is no history of bayma's: ${(error instanceof Error ? error.message : String(error)).replace(/\s*\n\s*/gu, " ")}`);
-            }
-          })();
-          const exec = history.find((record) => record.execId === execId);
-          if (exec === undefined) throw new Error(`${path} names no exec ${execId}`);
-          if (exec.status !== "running") throw new Error(`the exec ${execId} of the session ${sessionId} has ended since, ${exec.status}`);
-        },
-        catch: (cause) =>
-          new SnapshotOutlived({
-            environment: manifest.environment,
-            workspace: manifest.workspace,
-            snapshot: manifest.snapshot,
-            reason: cause instanceof Error ? cause.message : String(cause),
-          }),
-      }), { discard: true });
+  const stateFile = <A>(stateDir: string, name: string, schema: Schema.Decoder<A>, containers: readonly RunningContainer[]): Effect.Effect<A, Error> => {
+    const path = posix.join(stateDir, name);
+    return Effect.tryPromise({
+      try: async () => {
+        const held = (await Promise.all(containers.map(({ bundle }) => hostPathOf(nodeRoot, bundle, path)))).find((found): found is UnderRoot => found !== null);
+        if (held === undefined) throw new Error(`no volume of its pod holds ${path}`);
+        const bytes = await readUnder(held, STATE_FILE_BYTES);
+        try {
+          return Schema.decodeUnknownSync(schema, { onExcessProperty: "error" })(UTF8.decode(bytes));
+        } catch (error) {
+          throw new Error(`${path} is none of bayma's: ${(error instanceof Error ? error.message : String(error)).replace(/\s*\n\s*/gu, " ")}`);
+        }
+      },
+      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+    }).pipe(
+      Effect.timeoutOrElse({ duration: STATE_READ_TIMEOUT_MS, orElse: () => Effect.fail(new Error(`${path} was not read within ${STATE_READ_TIMEOUT_MS / 1000} s`)) }),
+    );
+  };
+
+  /** What the live save of the sandbox `request` names caught, as bayma's last-save.json says. */
+  const lastSave = (request: CheckpointRequest, { stateDir }: LiveSave, containers: readonly RunningContainer[]): Effect.Effect<Caught, SnapshotCorrupt> =>
+    stateFile(stateDir, "last-save.json", LastSaveFile, containers).pipe(
+      Effect.map(({ generation, running }) => ({ stateDir, generation, running })),
+      Effect.mapError((error) => new SnapshotCorrupt({ environment: request.environment, workspace: request.workspace, reason: `what its live save caught cannot be told: ${error.message}` })),
+    );
+
+  /**
+   * Whether `manifest`, taken live, holds the session still, a restored sandbox let run from
+   * it: bayma's state generation is the one the save caught, as its generation.json says on
+   * the volume of the pod's containers that holds it. Fails where it has moved on, or where
+   * it cannot be told.
+   */
+  const holdsStill = (manifest: Manifest, caught: Caught, containers: readonly RunningContainer[]): Effect.Effect<void, SnapshotOutlived> =>
+    stateFile(caught.stateDir, "generation.json", StateGenerationFile, containers).pipe(
+      Effect.flatMap(({ generation }) =>
+        generation === caught.generation ? Effect.void : Effect.fail(new Error(`bayma's state generation is ${generation}, and was ${caught.generation} as it was saved`))
+      ),
+      Effect.mapError((error) => new SnapshotOutlived({ environment: manifest.environment, workspace: manifest.workspace, snapshot: manifest.snapshot, reason: error.message })),
+    );
 
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
@@ -1000,7 +1028,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       const restoredFrom = prepared.get(prefixOf(request)) ?? (yield* lastCached(request));
-      if (restoredFrom?.during !== undefined) yield* holdsStill(restoredFrom, restoredFrom.during, containers);
+      if (restoredFrom?.live !== undefined) yield* holdsStill(restoredFrom, restoredFrom.live, containers);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot prepared of it, which its next checkpoint saves what changed since.
