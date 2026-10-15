@@ -532,17 +532,23 @@ const metricRows = (condition: string) =>
 
 /**
  * Waits until `sql`, a count as `n`, counts some of the lake's rows, as the collector
- * sends them within seconds, and the loader loads transcripts within its interval.
+ * sends them within seconds, and the loader loads transcripts within its interval. Should
+ * none arrive, the failure says what each of `parts` of what `sql` joins answers then as
+ * `n`, a count or what it lists, so one failure names the part that is missing.
  */
-async function untilInLake(what: string, sql: string, timeoutMs = 240_000): Promise<void> {
+async function untilInLake(what: string, sql: string, timeoutMs = 240_000, parts: Readonly<Record<string, string>> = {}): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  const answer = (query: string) => lakeQuery(query).then(([row]) => row?.["n"] ?? 0, (error: unknown) => error);
+  const said = (answered: unknown) => (answered instanceof Error ? answered.message : typeof answered === "string" && Number.isNaN(Number(answered)) ? answered : `${String(answered)} rows`);
   let last: unknown;
   while (Date.now() < deadline) {
-    last = await lakeQuery(sql).then(([row]) => Number(row?.["n"] ?? 0), (error: unknown) => error);
+    const answered = await answer(sql);
+    last = answered instanceof Error ? answered : Number(answered);
     if (typeof last === "number" && last > 0) return;
     await sleep(5000);
   }
-  assert.fail(`no ${what} arrived in the lake: ${last instanceof Error ? last.message : `${last} rows`}`);
+  const counted = await Promise.all(Object.entries(parts).map(async ([part, query]) => `\n  ${part}: ${said(await answer(query))}`));
+  assert.fail(`no ${what} arrived in the lake: ${said(last)}${counted.join("")}`);
 }
 
 /** Waits until the stand-in backend has received an export of `signal` that contains `needle`. */
@@ -667,6 +673,18 @@ if (inShard("telemetry")) {
           join otel.traces app on app.TraceId = turn.TraceId and app.SpanAttributes['turn.id'] = codex.turn_id
           where turn.SpanName = 'alasio.turn' and app.ServiceName = 'codex-app-server' and app.SpanName = 'turn/start' and codex.completed_at is not null`,
         600_000,
+        {
+          "alasio's turns naming a session": "select count(*) as n from otel.traces where SpanName = 'alasio.turn' and SpanAttributes['alasio.session.id'] is not null",
+          "Codex's turn/start spans": "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'turn/start'",
+          "of them, in the trace of an alasio turn": `select count(*) as n from otel.traces turn join otel.traces app on app.TraceId = turn.TraceId
+            where turn.SpanName = 'alasio.turn' and app.ServiceName = 'codex-app-server' and app.SpanName = 'turn/start'`,
+          "Codex's turns in the transcripts": "select count(*) as n from codex.turns",
+          "of them, completed": "select count(*) as n from codex.turns where completed_at is not null",
+          "completed turns of a thread an alasio turn names": `select count(*) as n from otel.traces turn join codex.turns codex on codex.thread_id = turn.SpanAttributes['alasio.session.id']
+            where turn.SpanName = 'alasio.turn' and codex.completed_at is not null`,
+          "the threads alasio's turns name": "select coalesce(string_agg(distinct SpanAttributes['alasio.session.id'], ', '), 'none') as n from otel.traces where SpanName = 'alasio.turn'",
+          "the transcripts' threads": "select coalesce(string_agg(distinct thread_id, ', '), 'none') as n from codex.turns",
+        },
       );
     });
 
