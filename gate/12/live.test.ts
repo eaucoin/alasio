@@ -42,6 +42,14 @@ const CHAIN = Number(process.env["CHAIN"] ?? 16);
 const PRECOPY = process.env["PRECOPY"] !== "off";
 /** Every how many checkpoints the Sentry's heap profile is written to OUT (0: never); runsc's `profile` must be on. */
 const PROFILE_EVERY = Number(process.env["PROFILE_EVERY"] ?? 0);
+/** The checkpoints the Sentry's memory settles over, which its trend leaves out. */
+const WARM_UP = 10;
+/**
+ * The most the Sentry's own memory may grow by a checkpoint, as its trend over the rest says:
+ * one that keeps what a checkpoint took ends the sandbox by the host's OOM killer (160 MB a
+ * checkpoint, run 38744966370).
+ */
+const MAX_SENTRY_GROWTH_BYTES = 2 * 1024 ** 2;
 /** How long each cycle's execs run, starting threads. */
 const WAVE_MS = 3000;
 /** bayma's port in the session pod. */
@@ -272,6 +280,15 @@ async function sentryMemory(): Promise<SentryMemory> {
   return { anonBytes: kib(sentry, "RssAnon"), sharedBytes: kib(sentry, "RssShmem"), swapBytes: kib(sentry, "VmSwap") };
 }
 
+/** The slope of the least-squares line through `points`. */
+function slope(points: readonly (readonly [number, number])[]): number {
+  const n = points.length;
+  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / n;
+  const x = mean(points.map(([px]) => px));
+  const y = mean(points.map(([, py]) => py));
+  return points.reduce((sum, [px, py]) => sum + (px - x) * (py - y), 0) / points.reduce((sum, [px]) => sum + (px - x) ** 2, 0);
+}
+
 /** The bytes free on the filesystem of `path`. */
 async function diskFree(path: string): Promise<number> {
   return Number((await run("df", ["--block-size=1", "--output=avail", path])).split("\n")[1]);
@@ -334,6 +351,8 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
   const name = `gate-12-live-${process.pid}`;
   const cycles: Cycle[] = [];
   let sentryBefore: SentryMemory | undefined;
+  /** How much the Sentry's own memory grows by a checkpoint, as its trend after WARM_UP says. */
+  let sentryGrowthBytes: number | undefined;
   let failure: string | undefined;
   try {
     // As the session pod runs bayma: its command, arguments, environment and working directory.
@@ -422,6 +441,9 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       }
       if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk, the Sentry's own ${cycles.at(-1)?.sentry.anonBytes} bytes`);
     }
+    // The Sentry gives back what each checkpoint takes.
+    sentryGrowthBytes = slope(cycles.slice(WARM_UP).map(({ index, sentry }) => [index, sentry.anonBytes]));
+    assert.ok(sentryGrowthBytes < MAX_SENTRY_GROWTH_BYTES, `the Sentry's own memory grows by ${Math.round(sentryGrowthBytes)} bytes a checkpoint`);
     await client.close();
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
@@ -430,7 +452,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     const logs = await run("docker", ["logs", name]).catch((error: unknown) => String(error));
     const aborts = logs.split("\n").filter((line) => /corrupted|malloc\(\)|double free|SIGABRT/u.test(line));
     mkdirSync(OUT, { recursive: true });
-    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, cycles }, null, 2)}\n`);
+    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, sentryGrowthBytes: sentryGrowthBytes ?? null, cycles }, null, 2)}\n`);
     writeFileSync(join(OUT, "bayma.log"), logs);
     // What the host says of a sandbox that ended: the kernel's log, its disk and its memory.
     const host = await Promise.all([
