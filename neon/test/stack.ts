@@ -12,9 +12,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, test } from "node:test";
 
-import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
+import type { CoreV1Event, V1ConfigMap, V1CronJob, V1Deployment, V1Job, V1Node, V1Pod, V1PodSpec, V1StatefulSet } from "@kubernetes/client-node";
 import pg, { type QueryResultRow } from "pg";
 
+import { cpuMillis } from "../../cli/src/capacity.ts";
 import type { ObjectRef } from "../../cli/src/kube/api.ts";
 import { dataNodes } from "../../cli/src/kube/object-store-scale.ts";
 import { selectorOf } from "../../cli/src/kube/rollout.ts";
@@ -220,6 +221,12 @@ async function runPod(name: string, spec: V1PodSpec, { timeoutMs = 300_000 }: { 
   }
 }
 
+/** The CPU a pod of `spec` requests, in millicores, as the scheduler counts it: its containers', or an init container's where more, and its runtime's overhead. */
+function cpuRequested({ containers, initContainers = [], overhead }: V1PodSpec): number {
+  const of = (each: readonly { readonly resources?: { readonly requests?: Record<string, string> } }[]) => each.map(({ resources }) => cpuMillis(resources?.requests?.["cpu"] ?? "0"));
+  return Math.max(of(containers).reduce((sum, millis) => sum + millis, 0), ...of(initContainers)) + cpuMillis(overhead?.["cpu"] ?? "0");
+}
+
 /** The image of the workload's first container. */
 const image = (workload: V1Deployment | V1StatefulSet | null) => workload?.spec?.template.spec?.containers[0]?.image ?? "";
 const restricted = { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } };
@@ -381,6 +388,66 @@ export function neonStack(): void {
         }
         assert.match(state, /flush_lsn/u);
         await query("insert into after_loss values (2)");
+      });
+
+      test("a safekeeper made again takes the place of a pod of the floor that may run elsewhere, which took its room on its node", async () => {
+        const set = ref("StatefulSet", neonName("safekeeper"), NAMESPACE);
+        const name = `${neonName("safekeeper")}-2`;
+        const pod = await kube.get<V1Pod>(ref("Pod", name, NAMESPACE));
+        const node = pod?.spec?.nodeName;
+        assert.ok(pod && node);
+        // Two of three keep the quorum while it is away.
+        await kube.patch(set, { spec: { replicas: 2 } });
+        await awaitReplaced([pod]);
+        // What its node has left, its room with it, taken by a pod of the floor that prefers its node and may run on any.
+        const allocatable = await kube.get<V1Node>(ref("Node", node));
+        const pods = await kube.list<V1Pod>("Pod", { fieldSelector: `spec.nodeName=${node},status.phase!=Succeeded,status.phase!=Failed` });
+        const requested = pods.reduce((sum, { spec }) => sum + (spec ? cpuRequested(spec) : 0), 0);
+        const free = cpuMillis(allocatable?.status?.allocatable?.["cpu"] ?? "0") - requested;
+        assert.ok(free > 0, `${node} has ${free}m of CPU free`);
+        const filler = `${RELEASE}-e2e-filler`;
+        const labels = { "app.kubernetes.io/name": "e2e-filler" };
+        const safekeepers = await kube.get<V1StatefulSet>(set);
+        const deployment: V1Deployment = {
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { name: filler, namespace: NAMESPACE, labels },
+          spec: {
+            replicas: 1,
+            selector: { matchLabels: labels },
+            template: {
+              metadata: { labels },
+              spec: {
+                priorityClassName: `${RELEASE}-floor`,
+                affinity: { nodeAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [{ weight: 100, preference: { matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] } }] } },
+                automountServiceAccountToken: false,
+                terminationGracePeriodSeconds: 0,
+                securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: { type: "RuntimeDefault" } },
+                containers: [{ name: "filler", image: image(safekeepers), command: ["sleep", "infinity"], securityContext: restricted, resources: { requests: { cpu: `${free}m` } } }],
+              },
+            },
+          },
+        };
+        try {
+          await kube.apply(deployment);
+          const placed = async () => (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(labels) })).find(({ spec, status }) => spec?.nodeName === node && status?.phase === "Running");
+          const deadline = Date.now() + 120_000;
+          let first = await placed();
+          while (!first) {
+            assert.ok(Date.now() < deadline, `the filler did not run on ${node}`);
+            await sleep(2000);
+            first = await placed();
+          }
+          await kube.patch(set, { spec: { replicas: 3 } });
+          await awaitPodReady(name, 180_000);
+          assert.equal((await kube.get<V1Pod>(ref("Pod", name, NAMESPACE)))?.spec?.nodeName, node);
+          // The filler gave its place, and is made again, elsewhere where there is room.
+          await awaitReplaced([first], 30_000);
+        } finally {
+          await kube.remove(ref("Deployment", filler, NAMESPACE)).catch(() => {});
+          await kube.patch(set, { spec: { replicas: 3 } });
+        }
+        await awaitPodReady(name);
       });
 
       test("garbage the pageserver collects is deleted from the object store, validated by the storage controller", async () => {

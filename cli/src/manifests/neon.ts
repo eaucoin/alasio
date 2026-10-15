@@ -165,7 +165,7 @@ function controllerDb(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          ...priority("floor"),
+          ...priority("bound"),
           ...stackPodSpec(config),
           containers: [{
             name: "postgres",
@@ -308,7 +308,7 @@ function safekeepers(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          ...priority("floor"),
+          ...priority("bound"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           ...given("initContainers", waitForObjectStore(config)),
@@ -390,7 +390,7 @@ function pageserver(config: InstallConfig): KubernetesObject[] {
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          ...priority("floor"),
+          ...priority("bound"),
           ...stackPodSpec(config),
           terminationGracePeriodSeconds: 30,
           initContainers: [

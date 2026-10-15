@@ -189,7 +189,7 @@ interface PartOptions {
   readonly strictly?: boolean;
 }
 
-/** The StatefulSet `name` of `component`, of `scale`, running `containers`, as every part of the store's is: on the floor, as the data stack's user. */
+/** The StatefulSet `name` of `component`, of `scale`, running `containers`, as every part of the store's is: on the floor, above it where its claims hold it to a node, as the data stack's user. */
 function partStatefulSet(
   config: InstallConfig,
   name: string,
@@ -211,7 +211,7 @@ function partStatefulSet(
       template: {
         metadata: { labels: stackLabels(component) },
         spec: {
-          ...priority("floor"),
+          ...priority(storage ? "bound" : "floor"),
           ...stackPodSpec(config),
           ...spread(component, scale, strictly),
           terminationGracePeriodSeconds: 30,

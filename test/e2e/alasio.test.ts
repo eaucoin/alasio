@@ -18,10 +18,11 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1PersistentVolume, V1Pod, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1PersistentVolume, V1Pod, V1StatefulSet, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
+import { selectorOf } from "../../cli/src/kube/rollout.ts";
 import { componentName, NAMESPACE, RELEASE } from "../../cli/src/manifests/common.ts";
 import { neonStack } from "../../neon/test/stack.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
@@ -186,6 +187,8 @@ if (inShard("upgrade")) {
     /** The folder mounted in the other chat, and what it holds. */
     let folder: string;
     let messages: number;
+    /** The StatefulSets of main's that keep their data on claims. */
+    let held: string[];
     const scenarios: readonly Scenario[] = [
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
@@ -210,6 +213,25 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call, FOLDER_CHAT));
           assert.equal(readFileSync(`${folder}/proof`, "utf8"), "written by main");
           assert.ok(Number(await onDatabase(NAMESPACE, "select count(*) from state.messages")) > messages);
+        },
+      },
+      {
+        seeds: "the stack's StatefulSets that keep their data on claims, which a local disk holds to its node",
+        seed: async () => {
+          held = (await kube.list<V1StatefulSet>("StatefulSet", { namespace: NAMESPACE }))
+            .filter(({ spec }) => (spec?.volumeClaimTemplates?.length ?? 0) > 0)
+            .map(({ metadata }) => metadata?.name ?? "");
+          assert.ok(held.includes(`${RELEASE}-neon-safekeeper`), held.join(", "));
+        },
+        keeps: "each of their pods runs under the class above the floor, the upgrade having made it again on its volume",
+        check: async () => {
+          for (const name of held) {
+            const set = await kube.get<V1StatefulSet>(ref("StatefulSet", name, NAMESPACE));
+            // One this release no longer has is another change's to prove gone.
+            if (!set) continue;
+            const pods = await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(set?.spec?.selector?.matchLabels ?? {}) });
+            assert.deepEqual(pods.map(({ spec }) => [spec?.priorityClassName, spec?.priority]), Array(set?.spec?.replicas ?? 1).fill([`${RELEASE}-bound`, 100_001]), name);
+          }
         },
       },
     ];

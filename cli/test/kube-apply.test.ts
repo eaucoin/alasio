@@ -317,6 +317,7 @@ test("a PriorityClass whose preemption changes, which cannot change, is made ane
   assert.equal(kube.get(floor)?.["preemptionPolicy"], "Never");
   const deleted = kube.changes.slice(before).filter(({ method }) => method === "DELETE").map(({ path }) => path);
   assert.deepEqual(deleted.filter((path) => path.includes("/priorityclasses/")).sort(), [
+    "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-bound",
     "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-component",
     floor,
     "/apis/scheduling.k8s.io/v1/priorityclasses/alasio-turn",

@@ -605,12 +605,18 @@ describe("object store", () => {
   const MASTERS = "alasio-seaweedfs-master-0.alasio-seaweedfs-master.alasio.svc.cluster.local:9333";
   const args = (objects: readonly KubernetesObject[], kind: "StatefulSet" | "Deployment", name: string) => container(one<V1StatefulSet>(objects, kind, name)).args ?? [];
 
-  test("runs SeaweedFS as its parts, each at one replica, under the names the stack reaches it by, on the floor", () => {
+  test("runs SeaweedFS as its parts, each at one replica, under the names the stack reaches it by, on the floor, above it those its claims hold to a node", () => {
     const objects = install();
-    const parts = [["StatefulSet", "alasio-seaweedfs-master"], ["StatefulSet", "alasio-seaweedfs-volume"], ["StatefulSet", "alasio-seaweedfs-filer"], ["StatefulSet", "alasio-seaweedfs-filer-store"], ["Deployment", "alasio-seaweedfs"]] as const;
-    for (const [kind, name] of parts) {
+    const parts = [
+      ["StatefulSet", "alasio-seaweedfs-master", "alasio-bound"],
+      ["StatefulSet", "alasio-seaweedfs-volume", "alasio-bound"],
+      ["StatefulSet", "alasio-seaweedfs-filer", "alasio-floor"],
+      ["StatefulSet", "alasio-seaweedfs-filer-store", "alasio-bound"],
+      ["Deployment", "alasio-seaweedfs", "alasio-floor"],
+    ] as const;
+    for (const [kind, name, priorityClassName] of parts) {
       const workload = one<V1StatefulSet>(objects, kind, name);
-      assert.deepEqual([workload.spec?.replicas, workload.spec?.template.spec?.priorityClassName], [1, "alasio-floor"], name);
+      assert.deepEqual([workload.spec?.replicas, workload.spec?.template.spec?.priorityClassName], [1, priorityClassName], name);
     }
     // No all-in-one server.
     assert.deepEqual(args(objects, "StatefulSet", "alasio-seaweedfs-master").slice(0, 1), ["master"]);
@@ -1964,11 +1970,12 @@ function podSpecs(objects: readonly KubernetesObject[]): [string, V1PodSpec][] {
 }
 
 describe("scaling", () => {
-  test("runs every pod under a PriorityClass: the floor's and what runs turns given up last, of one value, so neither takes the other's place; the headroom's first and preempting nothing", () => {
+  test("runs every pod under a PriorityClass: the floor's and what runs turns given up last, of one value, so neither takes the other's place, and the floor its claims hold to a node above both; the headroom's first and preempting nothing", () => {
     const objects = install({ host: { enabled: true } });
     const classes = new Map(all<V1PriorityClass>(objects, "PriorityClass").map((each) => [each.metadata?.name ?? "", each]));
     const value = (name: string) => classes.get(name)?.value ?? Number.NaN;
     assert.equal(value("alasio-floor"), value("alasio-turn"));
+    assert.ok(value("alasio-bound") > value("alasio-floor") && value("alasio-juicefs-mount") > value("alasio-bound"));
     assert.ok(value("alasio-turn") > value("alasio-component") && value("alasio-component") > value("alasio-headroom"));
     assert.ok(value("alasio-juicefs-mount") > value("alasio-floor"));
     assert.deepEqual([...classes.values()].filter(({ preemptionPolicy }) => preemptionPolicy === "Never").map(({ metadata }) => metadata?.name).sort(), ["alasio-headroom", "alasio-juicefs-mount"]);
@@ -1976,10 +1983,21 @@ describe("scaling", () => {
     for (const [name, priorityClassName] of [...tiers, ...podSpecs(branchObjects(configOf(), "try")).map(([name, spec]) => [name, spec.priorityClassName])]) {
       assert.ok(priorityClassName && (classes.has(priorityClassName) || priorityClassName.startsWith("system-")), name);
     }
-    assert.deepEqual(
-      ["alasio-neon-safekeeper", "alasio-neon-pageserver", "alasio-seaweedfs", "alasio-valkey", "alasio-grafana", "alasio-collector", "alasio-lake"].map((name) => tiers.get(name)),
-      Array(7).fill("alasio-floor"),
-    );
+    assert.deepEqual(["alasio-seaweedfs", "alasio-grafana", "alasio-collector", "alasio-lake"].map((name) => tiers.get(name)), Array(4).fill("alasio-floor"));
+    // Above the floor, exactly its StatefulSets whose claims hold them to a node; a branch has none.
+    const held = (of: readonly KubernetesObject[]) =>
+      all<V1StatefulSet>(of, "StatefulSet").filter(({ spec }) => (spec?.volumeClaimTemplates?.length ?? 0) > 0).map(({ metadata }) => metadata?.name).sort();
+    assert.deepEqual(held(objects), [
+      "alasio-neon-controller-db",
+      "alasio-neon-pageserver",
+      "alasio-neon-safekeeper",
+      "alasio-seaweedfs-filer-store",
+      "alasio-seaweedfs-master",
+      "alasio-seaweedfs-volume",
+      "alasio-valkey",
+    ]);
+    assert.deepEqual([...tiers].filter(([, priorityClassName]) => priorityClassName === "alasio-bound").map(([name]) => name).sort(), held(objects));
+    assert.deepEqual(held(branchObjects(configOf(), "try")), []);
     // Main's compute is alasio's database, which every turn needs.
     assert.equal(tiers.get("alasio-neon-compute"), "alasio-floor");
     assert.deepEqual(["alasio-neon-setup", "alasio-neon-backup", "clone"].map((name) => tiers.get(name)), Array(3).fill("alasio-component"));
@@ -1993,6 +2011,7 @@ describe("scaling", () => {
     const policies = (objects: readonly KubernetesObject[]) =>
       all<V1PriorityClass>(objects, "PriorityClass").filter(({ metadata }) => metadata?.name !== "alasio-juicefs-mount").map(({ metadata, preemptionPolicy }) => [metadata?.name, preemptionPolicy]);
     assert.deepEqual(policies(install()), [
+      ["alasio-bound", "PreemptLowerPriority"],
       ["alasio-floor", "PreemptLowerPriority"],
       ["alasio-turn", "PreemptLowerPriority"],
       ["alasio-component", "PreemptLowerPriority"],
