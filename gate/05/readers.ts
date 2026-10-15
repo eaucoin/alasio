@@ -71,7 +71,8 @@ const config = loadConfig({ ...env, LAKE_DATABASE_PASSWORD: LAKE_PASSWORD });
 
 /**
  * Appends `count` assistant entries of about 3 KB each, a session's hundred at a time, as
- * the session store keeps them: its JSON, its doc, alasio's mtime.
+ * the session store keeps them: its JSON, its doc, alasio's mtime. Their text is digests,
+ * which compress about as a transcript does: the box's 160 641 entries took 213 MB.
  */
 async function appendEntries(count: number, from: number): Promise<void> {
   await admin.query(
@@ -82,7 +83,7 @@ async function appendEntries(count: number, from: number): Promise<void> {
          'type', 'assistant', 'uuid', 'u' || i, 'timestamp', to_char(now() - make_interval(secs => $1 + $2 - i), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
          'sessionId', 'session-' || (i / 100), 'cwd', '/home/operator/gate',
          'message', json_build_object('id', 'msg_' || i, 'role', 'assistant', 'model', 'claude-opus-5-5',
-           'content', json_build_array(json_build_object('type', 'text', 'text', repeat(md5(i::text), 90))),
+           'content', json_build_array(json_build_object('type', 'text', 'text', (select string_agg(md5(i || '.' || k), '') from generate_series(1, 90) as k))),
            'usage', json_build_object('input_tokens', i % 977, 'output_tokens', i % 313)))::text as entry
        from generate_series($1::bigint, $1::bigint + $2::bigint - 1) as i
      ) entries`,
@@ -180,7 +181,8 @@ const SMALL = "select count(*) as n from otel.logs where Timestamp > now()::time
 /** What a dashboard asks of a day: slow. */
 const SLOW = {
   "a day of metrics, a minute at a time": "select time_bucket(interval 1 minute, TimeUnix) as t, ServiceName, avg(Value) as v from otel.metrics_gauge where TimeUnix > now()::timestamp - interval 24 hour group by all order by all limit 50000",
-  "every transcript entry read": "select count(*) as n, sum(length(entry)) as bytes, count(distinct md5(entry)) as distinct_entries from claude.entries",
+  "every transcript entry read": "select count(*) as n, sum(length(entry)) as bytes, count(*) filter (where entry like '%ffff%') as matching from claude.entries",
+  "a search of the transcripts' text": "select count(*) as n from claude.entries where json_extract_string(entry, '$.message.content[0].text') like '%00000%'",
 } as const;
 
 const results: Record<string, unknown>[] = [];
