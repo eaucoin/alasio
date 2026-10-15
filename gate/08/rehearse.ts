@@ -618,11 +618,20 @@ async function bytesDiffer(tg: ReturnType<typeof operator>, kept: Kept, cutover:
   const again = script("cutover.sh", cutover);
   if (again.code === 0 || !again.stderr.includes("hold other bytes than the old store's")) fail("the cut-over went on past a version read back as other bytes");
   if (recorded(out) !== "8") fail(`the cut-over recorded step ${recorded(out)}, not 8`);
-  say("the rollback records the old store's differing answer, and brings the stack back");
+  say("the rollback records the old store's differing answer, holds the lifecycle passes, and fails as it applies the previous release, past the seal");
+  const broken = script("rollback.sh", { RELEASE: cutover["RELEASE"] ?? "", OUT: out, PREVIOUS: asUser("previous-failing", "exit 1"), PREVIOUS_CHECK: PREVIOUS_CHECK() });
+  if (broken.code !== 1 || !broken.stderr.includes("DIFFERS: versions read back hold other bytes than before the cut-over") || !broken.stderr.includes("the previous release was not applied again")) {
+    fail(`the rollback with a failing previous release exited ${broken.code}, not 1 with the bytes recorded as differing`);
+  }
+  say("run again: the writers stopped and the old store sealed again before it is checked, and the stack brought back, the lifecycle passes still held");
   const back = script("rollback.sh", { RELEASE: cutover["RELEASE"] ?? "", OUT: out, PREVIOUS: PREVIOUS(), PREVIOUS_CHECK: PREVIOUS_CHECK() });
-  if (back.code !== 3 || !back.stderr.includes("DIFFERS: versions read back hold other bytes than before the cut-over")) fail(`the rollback exited ${back.code}, not 3 with the bytes recorded as differing`);
+  if (back.code !== 3 || !back.stderr.includes("a run before this one lifted the seal") || !back.stderr.includes("is held suspended until that is looked into")) {
+    fail(`the rollback run again exited ${back.code}, not 3, having sealed the old store again, its lifecycle held`);
+  }
   const differing = run("sudo", ["cat", join(out, "discrepancies.txt")], { env: process.env }).trim().split("\n");
-  if (differing.length !== 2 || !differing[0]?.startsWith("# the rollback of ")) fail(`the rollback recorded ${differing.length - 1} discrepancies, not the one: ${differing.join("; ")}`);
+  const runs = differing.filter((line) => line.startsWith("# the rollback of "));
+  const found = differing.filter((line) => !line.startsWith("#"));
+  if (runs.length !== 2 || found.length !== 2 || !found.every((line) => line.startsWith("versions read back hold other bytes"))) fail(`the rollbacks recorded ${differing.join("; ")}, not the bytes once each`);
   if (kubectl("-n", "alasio", "get", "cronjob", "alasio-seaweedfs-lifecycle", "-o", "jsonpath={.spec.suspend}") !== "true") fail("the old store's lifecycle CronJob runs, with what differs not looked into");
   kubectl("-n", "alasio", "patch", "cronjob", "alasio-seaweedfs-lifecycle", "-p", JSON.stringify({ spec: { suspend: false } }));
   await check(tg, kept, previous);

@@ -7,7 +7,8 @@
 # to the new store alone, which the old one lacks: it refuses then, and says to roll forward.
 #
 #   RELEASE=<file of gate/08/render.ts's List> OUT=<the cut-over's OUT> PREVIOUS=<command>
-#     PREVIOUS_CHECK=<command> [READ_BACK=50] [WAIT=900] [EXEC_TIMEOUT=1800] [UPGRADE_TIMEOUT=3600] gate/08/rollback.sh
+#     PREVIOUS_CHECK=<command> [READ_BACK=50] [WAIT=900] [CHECKS_WAIT=300] [JOBS_WAIT=2700]
+#     [EXEC_TIMEOUT=1800] [UPGRADE_TIMEOUT=3600] gate/08/rollback.sh
 #
 # PREVIOUS applies the previous release again, as the configuration's owner does (`sudo -u
 # <owner> env HOME=<their home> npx --yes alasio@<previous> upgrade`); PREVIOUS_CHECK, which
@@ -15,15 +16,18 @@
 # starts it records OUT/rolling-back, which the cut-over then refuses; run again, it goes on.
 # It stops, the writers stopped and the old store sealed, where the old store would write or
 # allocate wrongly: the recorded PV on another claim, a volume the old store had missing from
-# it (by id), the old store not starting, its masters listing no volumes, a volume id it
-# would make again, no bucket listed, or versions lost since the cut-over recorded them. What
-# else it answers otherwise than then, its volumes and versions whole (an inventory that
-# differs, the bytes of a version read back, a volume its masters forget, no new object
-# taken), is recorded in OUT/discrepancies.txt, each run's under a line of its own; the
-# stack comes back, the old store's lifecycle CronJob held suspended until someone looks, and
-# the rollback, done, exits 3 rather than 0 (and never 3 otherwise). The filer store's
-# Secrets and the root Secret's keys for them, which the cut-over made, are left: the previous
-# release reads neither, and the next cut-over takes them as they are.
+# it (by id), the old store not starting, its masters not listing every volume it had, a
+# volume id it would make again, no bucket listed, or versions lost since the cut-over
+# recorded them. What else it answers otherwise than then, its volumes and versions whole (an
+# inventory that differs, the bytes of a version read back, no new object taken), is
+# recorded in OUT/discrepancies.txt, each run's under a line of its own; the stack comes
+# back, the old store's lifecycle CronJob held suspended until someone looks (the hold
+# recorded in OUT/lifecycle-held from the first run that found anything, so a run again holds
+# it too), and the rollback, done, exits 3 rather than 0 (and never 3 otherwise). A run again
+# after one that lifted the seal stops the writers and seals the old store again before it
+# checks it. Each check of the old store just started is waited for, at most CHECKS_WAIT. The
+# filer store's Secrets and the root Secret's keys for them, which the cut-over made, are
+# left: the previous release reads neither, and the next cut-over takes them as they are.
 set -euo pipefail
 umask 077
 here=$(cd "$(dirname "$0")" && pwd)
@@ -31,6 +35,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 : "${PREVIOUS_CHECK:?how the command line of the previous release is proven runnable}"
 READ_BACK=${READ_BACK:-50}
 UPGRADE_TIMEOUT=${UPGRADE_TIMEOUT:-3600}
+JOBS_WAIT=${JOBS_WAIT:-2700}
+# The longest each check of the old store just started waits for it to answer as it should.
+CHECKS_WAIT=${CHECKS_WAIT:-300}
 # shellcheck source=gate/08/lib.sh
 . "$here/lib.sh"
 # 3 says a rollback done with discrepancies alone: any other 3, as a command in a pod may
@@ -104,13 +111,24 @@ log "4. the old store alone, started and checked before any writer starts"
 # Never on another volume than the one the cut-over recorded: one made anew is empty.
 [ -z "$pv" ] || [ "$(claim_of "$pv")" = "$OLD_CLAIM" ] || fail "$OLD_CLAIM does not hold the PV $pv the cut-over recorded: the old store is not started"
 # Never without each volume the old store had, by its id, on every run: the release's
-# volumes beside them would hide one lost from a count of the data files.
-had=$(cat "$OUT/volumes-stopped.txt" 2>/dev/null || cat "$OUT/volumes-before.txt" 2>/dev/null || true)
+# volumes beside them would hide one lost from a count of the data files. Those its masters
+# listed before the cut-over touched it, and those on the disk once it stopped it, each where
+# the cut-over recorded them.
+had=$(for list in volumes-before.txt volumes-stopped.txt; do [ ! -s "$OUT/$list" ] || tr ' ' '\n' <"$OUT/$list"; done | sed '/^$/d' | sort -u | sort -t: -k1,1n | tr '\n' ' ')
 if [ -n "$pv" ] && [ -n "$had" ]; then
   on_disk=$(volumes_on_disk "$pv")
   for volume in $had; do
     grep -qw -- "$volume" <<<"$on_disk" || fail "the PV $pv lacks the volume $volume the old store had: the old store is not started"
   done
+fi
+# A run that lifted the seal, then stopped, may have started writers: they are stopped, and
+# the old store sealed, again, as every check below takes them to be.
+if [ -e "$OUT/unsealed" ]; then
+  log "a run before this one lifted the seal: what writes to the store stopped again, and the old store sealed again, before it is checked"
+  [ -s "$OUT/csi-namespace" ] || fail "the cut-over recorded no JuiceFS driver's namespace (csi-namespace), which stopping the writers again needs"
+  stop_writers "$(cat "$OUT/csi-namespace")" "$JOBS_WAIT"
+  seal_old
+  rm "$OUT/unsealed"
 fi
 was=$(marked statefulset "$OLD" "$NS")
 if [ -n "$was" ]; then
@@ -129,23 +147,36 @@ differs() {
   printf '%s\n' "$*" >>"$OUT/discrepancies.txt"
   differing=$((differing + 1))
 }
+# Each of these waited for, for at most CHECKS_WAIT, as a store just started answers in parts:
+# its masters as its volume servers' first heartbeats reach them, an S3 call that failed once.
 if [ -n "$pv" ]; then
   highest=$(find "$dir" -maxdepth 1 -name '*.dat' -printf '%f\n' | sed 's/\.dat$//; s/.*_//' | sort -n | tail -n 1)
-  newest=$(kx "$OLD_POD" -c seaweedfs -- wget -q -O - http://127.0.0.1:9333/cluster/status | jq -r '.MaxVolumeId // 0') || fail "the old master's status is not read"
-  [[ "$newest" =~ ^[0-9]+$ ]] || fail "the old master's status says its highest volume id is '$newest'"
-  [ "$newest" -ge "${highest:-0}" ] || fail "the old master would make volume $((newest + 1)) again: the disk holds volume $highest"
+  newest=""
+  above() {
+    newest=$(kx "$OLD_POD" -c seaweedfs -- wget -q -O - http://127.0.0.1:9333/cluster/status | jq -r '.MaxVolumeId // 0') && [[ "$newest" =~ ^[0-9]+$ ]] && [ "$newest" -ge "${highest:-0}" ]
+  }
+  deadline=$((SECONDS + CHECKS_WAIT))
+  until above; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "the old master would make volume $((${newest:-0} + 1)) again: the disk holds volume $highest (its status said '$newest' for ${CHECKS_WAIT}s)"
+    sleep 5
+  done
 fi
 if [ -e "$OUT/inventory-before.json" ]; then
-  # The old store's volumes, as the cut-over found them on the disk once it stopped it, or as its masters said them before.
-  volumes_now=$(volumes old_shell volume-list-rolled-back.txt) || fail "the old store's masters do not answer (volume-list-rolled-back.txt)"
-  [ -n "$volumes_now" ] || fail "the old store's masters list no volumes (volume-list-rolled-back.txt)"
-  for volume in $had; do
-    grep -qw -- "$volume" <<<"$volumes_now" || differs "the old store's masters no longer know the volume $volume"
-  done
-  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json" || fail "the old store's inventory is not read"
-  lost=$(jq -n --slurpfile before "$OUT/inventory-before.json" --slurpfile now "$OUT/inventory-rolled-back.json" -r '
-    def versions($inventory): [$inventory[] | .bucket as $bucket | .versions[] | "\($bucket)/\(.Key) \(.VersionId // "null")"];
-    versions($before[0]) - versions($now[0]) | length')
+  # The old store's masters list every volume it had, as its volume servers report them.
+  listed() {
+    local now volume
+    now=$(volumes old_shell volume-list-rolled-back.txt) && [ -n "$now" ] || return 1
+    for volume in $had; do grep -qw -- "$volume" <<<"$now" || return 1; done
+  }
+  wait_for "$CHECKS_WAIT" "the old store's masters to list every volume it had, $had (volume-list-rolled-back.txt)" listed
+  read_whole() { inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json"; }
+  wait_for "$CHECKS_WAIT" "the old store's inventory to be read" read_whole
+  # The versions lost, by bucket, key and version, as sorted lists compare: a list of the
+  # box's tens of thousands of versions takes jq's array subtraction seconds to minutes.
+  keys() { jq -r '.[] | .bucket as $bucket | .versions[] | [$bucket, .Key, (.VersionId // "null")] | @json' "$1" | LC_ALL=C sort; }
+  keys "$OUT/inventory-before.json" >"$OUT/versions-before.txt"
+  keys "$OUT/inventory-rolled-back.json" >"$OUT/versions-rolled-back.txt"
+  lost=$(LC_ALL=C comm -23 "$OUT/versions-before.txt" "$OUT/versions-rolled-back.txt" | wc -l)
   [ "$(jq 'length' "$OUT/inventory-rolled-back.json")" -gt 0 ] || fail "the old store lists no bucket (inventory-rolled-back.json)"
   [ "$lost" = 0 ] || fail "the old store lists $lost fewer versions than before the cut-over (inventory-rolled-back.json)"
   diff -u "$OUT/inventory-before.json" "$OUT/inventory-rolled-back.json" >"$OUT/inventory-diff-rolled-back.txt" ||
@@ -160,40 +191,57 @@ if [ -e "$OUT/inventory-before.json" ]; then
 else
   # The cut-over stopped before its inventory, before anything of the store was touched: it is
   # read as it answers now.
-  inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json" || fail "the old store's inventory is not read"
+  read_whole() { inventory "$OLD_POD" lifecycle >"$OUT/inventory-rolled-back.json"; }
+  wait_for "$CHECKS_WAIT" "the old store's inventory to be read" read_whole
   read_back_set "$OUT/inventory-rolled-back.json" "$READ_BACK" >"$OUT/read-back-rolled-back.tsv"
   if ! contents "$OLD_POD" <"$OUT/read-back-rolled-back.tsv" >"$OUT/contents-rolled-back.tsv"; then
     differs "the old store does not read every version it lists (read-back-rolled-back.tsv)"
   fi
   checked="no inventory before (the cut-over stopped at step $reached), $(wc -l <"$OUT/contents-rolled-back.tsv") versions read now"
 fi
-probe=$(kx "$OLD_POD" -c lifecycle -- sh -c 'set -e
+probe() {
+  [ "$(kx "$OLD_POD" -c lifecycle -- sh -c 'set -e
   s3api() { aws --endpoint-url http://127.0.0.1:8333 s3api "$@"; }
   bucket=$(s3api list-buckets --query "Buckets[0].Name" --output text)
   head -c 4096 /dev/urandom > /tmp/probe
   s3api put-object --bucket "$bucket" --key rollback-probe --body /tmp/probe >/dev/null
   s3api get-object --bucket "$bucket" --key rollback-probe /tmp/probe-back >/dev/null
-  cmp -s /tmp/probe /tmp/probe-back && s3api delete-object --bucket "$bucket" --key rollback-probe >/dev/null && echo written') || true
-[ "$probe" = written ] || differs "the old store takes no new object"
+  cmp -s /tmp/probe /tmp/probe-back && s3api delete-object --bucket "$bucket" --key rollback-probe >/dev/null && echo written')" = written ]
+}
+taken=0
+deadline=$((SECONDS + CHECKS_WAIT))
+while [ "$taken" = 0 ] && [ "$SECONDS" -lt "$deadline" ]; do
+  if probe; then taken=1; else sleep 5; fi
+done
+[ "$taken" = 1 ] || differs "the old store takes no new object within ${CHECKS_WAIT}s"
 log "the old store: $checked; $differing discrepancies"
 
+# The lifecycle passes, which delete versions, wait for whoever looks into what differs: held
+# from the first run that found anything, recorded with how the CronJob was, until a run ends.
+if [ "$differing" != 0 ] && [ ! -e "$OUT/lifecycle-held" ]; then
+  was=$(marked cronjob "$OLD-lifecycle" "$NS")
+  printf '%s\n' "${was:-"{\"suspend\":false}"}" >"$OUT/lifecycle-held.part"
+  sync "$OUT/lifecycle-held.part"
+  mv "$OUT/lifecycle-held.part" "$OUT/lifecycle-held"
+fi
+
 log "5. the seal lifted, the previous release applied, and every writer started as it was"
+date -u +%FT%TZ >"$OUT/unsealed"
 unseal_old
 timeout "$UPGRADE_TIMEOUT" bash -c "$PREVIOUS" || fail "the previous release was not applied again: rollback.sh run again goes on"
-# The lifecycle passes, which delete versions, wait for whoever looks into what differs.
 held=()
-[ "$differing" = 0 ] || held=("$NS/$OLD-lifecycle")
+[ ! -e "$OUT/lifecycle-held" ] || held=("$NS/$OLD-lifecycle")
 start_writers "${held[@]}"
-[ "$differing" = 0 ] || k patch cronjob "$OLD-lifecycle" -p '{"spec":{"suspend":true}}' >/dev/null
+[ ! -e "$OUT/lifecycle-held" ] || k patch cronjob "$OLD-lifecycle" -p '{"spec":{"suspend":true}}' >/dev/null
 if [ -e "$OUT/writers.txt" ]; then
   while read -r ns kind; do
     kubectl -n "$ns" rollout status "$kind" --timeout="${WAIT}s" >/dev/null || fail "$ns $kind is not ready within ${WAIT}s"
   done <"$OUT/writers.txt"
 fi
 mv "$OUT/step" "$OUT/rolled-back-from-step"
-rm "$OUT/rolling-back"
-if [ "$differing" != 0 ]; then
-  log "rolled back from step $reached; the old store answers otherwise than before the cut-over in $differing ways (discrepancies.txt), and its lifecycle CronJob $OLD-lifecycle is held suspended until they are looked into"
+rm "$OUT/rolling-back" "$OUT/unsealed"
+if [ -e "$OUT/lifecycle-held" ]; then
+  log "rolled back from step $reached; the old store answered otherwise than before the cut-over (discrepancies.txt), and its lifecycle CronJob $OLD-lifecycle is held suspended until that is looked into: kubectl -n $NS patch cronjob $OLD-lifecycle -p '$(jq -c '{spec: .}' "$OUT/lifecycle-held")' resumes it"
   rolled_back_differing=1
   exit 3
 fi

@@ -98,6 +98,8 @@ free_gb=$(df --output=avail -BG "$dir" | tail -n 1 | tr -dc 0-9)
 injected 1
 
 step 2 "every writer stopped, the old store reached by nothing: the CronJobs suspended, their Jobs ended, the scalers paused, the workloads at none, the sessions suspended"
+# What a rollback run again after one that lifted the seal stops the writers with again.
+[ -s "$OUT/csi-namespace" ] || printf '%s\n' "$CSI_NAMESPACE" >"$OUT/csi-namespace"
 stop_writers "$CSI_NAMESPACE" "$JOBS_WAIT"
 seal_old
 # The old filer writes its log of changes out within a minute of them: none is left unwritten.
@@ -116,8 +118,10 @@ injected 3
 step 4 "the inventory, through the old store"
 if [ ! -e "$OUT/inventory-before.json" ]; then
   inventory "$OLD_POD" lifecycle >"$OUT/inventory-before.part.json" || fail "the old store's inventory is not read"
-  volumes old_shell volume-list-before.txt >"$OUT/volumes-before.txt" || fail "the old store's masters do not answer (volume-list-before.txt)"
-  [ -n "$(cat "$OUT/volumes-before.txt")" ] || fail "the old store's masters list no volumes (volume-list-before.txt)"
+  volumes old_shell volume-list-before.txt >"$OUT/volumes-before.part.txt" || fail "the old store's masters do not answer (volume-list-before.txt)"
+  [ -s "$OUT/volumes-before.part.txt" ] || fail "the old store's masters list no volumes (volume-list-before.txt)"
+  sync "$OUT/volumes-before.part.txt"
+  mv "$OUT/volumes-before.part.txt" "$OUT/volumes-before.txt"
   [ "$(cat "$OUT/volumes-before.txt")" = "$(volumes_on_disk "$pv")" ] || fail "the old store's masters know volumes $(cat "$OUT/volumes-before.txt"), the disk holds $(volumes_on_disk "$pv")"
   entries old_shell /buckets entries-before-saved.txt >"$OUT/entries-before.txt"
   log_files old_shell /topics/.system/log >"$OUT/log-before.txt"
@@ -229,7 +233,13 @@ unseal_old
 injected 6a
 # The old store stopped, its volumes are those on the disk: its masters may have made empty
 # ones since the inventory, for a collection with too few to write to.
-[ -e "$OUT/volumes-stopped.txt" ] || volumes_on_disk "$pv" >"$OUT/volumes-stopped.txt"
+if [ ! -s "$OUT/volumes-stopped.txt" ]; then
+  volumes_on_disk "$pv" >"$OUT/volumes-stopped.part.txt"
+  [ -s "$OUT/volumes-stopped.part.txt" ] || fail "the PV $pv holds no volume's data file once the old store stopped"
+  sync "$OUT/volumes-stopped.part.txt"
+  mv "$OUT/volumes-stopped.part.txt" "$OUT/volumes-stopped.txt"
+  sync "$OUT"
+fi
 stopped=$(cat "$OUT/volumes-stopped.txt")
 for volume in $volumes_before; do grep -qw -- "$volume" <<<"$stopped" || fail "the disk lacks the volume $volume the masters knew"; done
 [ "$stopped" = "$volumes_before" ] || log "the old masters made volumes since the inventory: $stopped (were $volumes_before)"

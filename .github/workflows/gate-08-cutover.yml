@@ -14,6 +14,11 @@ on:
     branches: [track/object-store-gate]
     paths: [.github/workflows/gate-08-cutover.yml, gate/**, cli/src/**, src/**, neon/grafana/**]
   workflow_dispatch:
+    inputs:
+      rehearsals:
+        description: "The rehearsals to run, as a JSON list of rehearse.ts's arguments (all if empty)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -25,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rehearsal: ["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8 bytes", "rollback stop-claim stop-volume stop-maxid stop-listing"]
+        rehearsal: ${{ fromJSON(inputs.rehearsals || '["forward", "rollback 1 2 3 4 5a", "rollback 5 6a 6b 6 7 8 bytes", "rollback stop-claim stop-volume stop-maxid stop-listing"]') }}
     steps:
       # alasio's images and its cluster's take more disk than a runner starts with free, so
       # the software it comes with that this job does not use goes first, in the background,
