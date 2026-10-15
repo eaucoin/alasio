@@ -58,26 +58,30 @@ const stored = (sandbox: Sandbox, operatingMode: "Running" | "Suspended" = "Susp
   spec: { ...sandbox.spec, operatingMode },
 });
 
+/** The digest of the image of the snapshots of the tests'. */
+const IMAGE = "a".repeat(64);
+
 /** A manifest of a snapshot of `podTemplate`, taken under `release`, saved with `cpuFeatures`. */
 const manifestOf = (podTemplate: V1PodTemplateSpec, release = CURRENT, cpuFeatures: readonly string[] = ["sse", "avx"]): Manifest => ({
   environment: "alasio-sessions",
   workspace: "fs-abc123",
   snapshot: "s-1",
   release,
-  image: "sha256:image",
   cpuFeatures,
   podTemplate: podTemplate as Readonly<Record<string, unknown>>,
-  files: [],
-  bytes: 1024,
+  layers: [{ digest: IMAGE, files: [] }],
+  bytes: 0,
   takenAt: "2026-10-12T20:00:00.000Z",
   pauseMs: 80,
   uploadMs: 120,
 });
 
 /** Node agents in memory: the current snapshot, each node's holdings, and how a prepare goes on each; what they were asked. */
-function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null, held = [] }: {
+function fakeAgents({ current = null, holdings = [], prepare = () => null, read, resumed = null, held = [], kept = () => [] }: {
   /** The workspaces the bucket holds anything of. */
   readonly held?: readonly string[];
+  /** The images a collection keeps of a workspace. */
+  readonly kept?: (workspace: string) => readonly string[];
   readonly current?: Manifest | null;
   readonly holdings?: readonly Holdings[];
   /** Why a prepare on the node fails, and with which status (409 unless said), or null when it does not. */
@@ -107,6 +111,12 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
+    spend: (workspace) => Effect.sync(() => void asked.push(`spend ${workspace.environment}/${workspace.workspace}`)),
+    collect: (workspace) =>
+      Effect.sync(() => {
+        asked.push(`collect ${workspace.environment}/${workspace.workspace}`);
+        return kept(workspace.workspace);
+      }),
     resume: (node, request) =>
       Effect.suspend(() => {
         asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}${request.policies.length > 0 ? ` through ${request.policies.join(",")}` : ""}`);
@@ -116,18 +126,18 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
     workspaces: () => Effect.succeed(held),
     discard: (node, workspace, keep) =>
       Effect.sync(() => {
-        asked.push(`discard ${workspace.environment}/${workspace.workspace} on ${node} but ${keep}`);
-        return [];
+        asked.push(`discard ${workspace.environment}/${workspace.workspace} on ${node} but ${keep.join(",")}`);
+        return true;
       }),
   };
   return { agents, asked, checkpoints };
 }
 
-/** A node holding `releases`, each with the features `cpuFeatures`, and caching `cached` snapshots. */
+/** A node holding `releases`, each with the features `cpuFeatures`, and caching the images `cached` of the session's. */
 const node = (name: string, releases: readonly string[], cpuFeatures: readonly string[] = ["sse", "avx", "avx2"], cached: readonly string[] = []): Holdings => ({
   node: name,
   releases: releases.map((release) => ({ release, cpuFeatures })),
-  cached: cached.map((snapshot) => ({ environment: "alasio-sessions", workspace: "fs-abc123", snapshot, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" })),
+  cached: cached.length === 0 ? [] : [{ environment: "alasio-sessions", workspace: "fs-abc123", images: cached, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" }],
 });
 
 /** A KubeClient of ConfigMaps and Pods in memory, which records what it writes. */
@@ -200,7 +210,7 @@ test("a session with a snapshot on the current template is restored on a node th
   const manifest = manifestOf(desired.spec.podTemplate);
   const { agents, asked } = fakeAgents({
     current: manifest,
-    holdings: [node("node-a", [CURRENT], ["sse"]), node("node-b", [PREVIOUS]), node("node-c", [CURRENT]), node("node-d", [CURRENT], undefined, ["s-1"])],
+    holdings: [node("node-a", [CURRENT], ["sse"]), node("node-b", [PREVIOUS]), node("node-c", [CURRENT]), node("node-d", [CURRENT], undefined, [IMAGE])],
     prepare: (on) => (on === "node-d" ? "its image does not match its manifest" : null),
   });
   const plan = await run(fakeKube(), Effect.gen(function*() {
@@ -222,7 +232,8 @@ test("a session with a snapshot on the current template is restored on a node th
     assert.deepEqual(await added("alasio.sandbox.restores", () => Effect.runPromise(plan.restored)), { "alasio.sandbox.restore.outcome=restored": 1 });
   });
   assert.deepEqual(timed, { "": 1 });
-  assert.deepEqual(asked.slice(2), ["forget alasio-sessions/fs-abc123"]);
+  // Its images go on as the layers of the next.
+  assert.deepEqual(asked.slice(2), ["spend alasio-sessions/fs-abc123"]);
 });
 
 test("a restored pod is let run once its containers run, by its node's agent, then made ready; one that ends, or that the agent does not resume, is refused", async () => {
@@ -416,17 +427,19 @@ test("a session is restored only from the snapshot its Sandbox was released into
   assert.equal(snapshotted.keeps(older), false);
 });
 
-test("what no Sandbox has a use for is collected: snapshots of sessions that are gone, and images nodes cache but the one each Sandbox is released into", async () => {
+test("what no Sandbox has a use for is collected: snapshots of sessions that are gone, what of each session's no snapshot of it needs, and the images nodes cache that none needs", async () => {
   const kept = stored(sessionOf(profile(), "fs-kept"), "Suspended", "s-2");
   const restored = stored(sessionOf(profile(), "fs-restored"), "Running");
   const kube = fakeKube(new Map<string, KubernetesObject>([["Sandbox/alasio-sessions/fs-kept", kept], ["Sandbox/alasio-sessions/fs-restored", restored]]));
-  const cachedOn = (name: string, entries: readonly (readonly [string, string])[]): Holdings => ({
+  const [K1, K2, R0, R1, G] = ["1".repeat(64), "2".repeat(64), "3".repeat(64), "4".repeat(64), "5".repeat(64)] as const;
+  const cachedOn = (name: string, entries: readonly (readonly [string, readonly string[]])[]): Holdings => ({
     ...node(name, [CURRENT]),
-    cached: entries.map(([workspace, snapshot]) => ({ environment: "alasio-sessions", workspace, snapshot, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" })),
+    cached: entries.map(([workspace, images]) => ({ environment: "alasio-sessions", workspace, images, bytes: 1024, usedAt: "2026-10-12T20:00:00.000Z" })),
   });
   const { agents, asked } = fakeAgents({
     held: ["fs-gone", "fs-kept", "fs-restored"],
-    holdings: [cachedOn("node-a", [["fs-kept", "s-2"], ["fs-restored", "s-1"]]), cachedOn("node-b", [["fs-kept", "s-1"], ["fs-gone", "s-9"]])],
+    kept: (workspace) => (workspace === "fs-kept" ? [K2] : [R1]),
+    holdings: [cachedOn("node-a", [["fs-kept", [K2]], ["fs-restored", [R0, R1]]]), cachedOn("node-b", [["fs-kept", [K1]], ["fs-gone", [G]]])],
   });
   await run(kube, Effect.scoped(Effect.gen(function*() {
     const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
@@ -435,17 +448,19 @@ test("what no Sandbox has a use for is collected: snapshots of sessions that are
   })));
   assert.deepEqual(asked, [
     "forget alasio-sessions/fs-gone",
-    "discard alasio-sessions/fs-restored on node-a but null",
-    "discard alasio-sessions/fs-kept on node-b but s-2",
-    "discard alasio-sessions/fs-gone on node-b but null",
+    "collect alasio-sessions/fs-kept",
+    "collect alasio-sessions/fs-restored",
+    `discard alasio-sessions/fs-restored on node-a but ${R1}`,
+    `discard alasio-sessions/fs-kept on node-b but ${K2}`,
+    "discard alasio-sessions/fs-gone on node-b but ",
   ]);
-  // A session deleted takes its snapshot with it, from the bucket and every node's cache.
+  // A session deleted takes its snapshots with it, from the bucket and every node's cache.
   const deleted = fakeAgents({ holdings: [node("node-a", [CURRENT]), node("node-b", [CURRENT])] });
   await run(fakeKube(), Effect.gen(function*() {
     const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents: deleted.agents, templates: templates(profile()) });
     yield* snapshotted.forget("fs-abc123");
   }));
-  assert.deepEqual(deleted.asked, ["forget alasio-sessions/fs-abc123", "discard alasio-sessions/fs-abc123 on node-a but null", "discard alasio-sessions/fs-abc123 on node-b but null"]);
+  assert.deepEqual(deleted.asked, ["forget alasio-sessions/fs-abc123", "discard alasio-sessions/fs-abc123 on node-a but ", "discard alasio-sessions/fs-abc123 on node-b but "]);
 });
 
 test("where one release is kept, a snapshot is restored under it alone, and one taken under the release before falls back", async () => {

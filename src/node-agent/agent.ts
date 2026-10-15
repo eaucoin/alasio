@@ -1,20 +1,32 @@
 /**
  * What a node agent does with snapshots: whole-sandbox gVisor checkpoints of session
- * pods on its node, kept in the snapshots bucket and in the node's cache, one per
- * workspace, the latest. A workspace is one session's, of one environment (main, or a
- * branch environment), and its snapshot is `<environment>/<workspace>/` in the bucket:
+ * pods on its node, kept in the snapshots bucket and in the node's cache. A workspace is
+ * one session's, of one environment (main, or a branch environment), and its snapshots are
+ * `<environment>/<workspace>/` in the bucket:
  *
- * - `<snapshot>/<file>`: the image's files, as runsc wrote them;
- * - `<snapshot>/manifest.json`: what the snapshot is (Manifest), written after its files;
+ * - `layers/<digest>/<file>`: each image of the workspace's, once, by its digest, as runsc
+ *   wrote its files. A snapshot's image holds the pages its sandbox wrote since the image
+ *   it was last saved to or restored from, when that one is in this node's cache and the
+ *   sandbox tracks its writes, and refers to that image and its layers for the rest; it
+ *   holds them all otherwise;
+ * - `manifests/<snapshot>.json`: what each snapshot is (Manifest): its image and its
+ *   layers, each of whose files is in the bucket as the manifest says before it is written;
  * - `current.json`: the manifest of the workspace's current snapshot, written last, which
- *   commits it. A workspace without one has no snapshot.
+ *   commits it. A workspace without one has no snapshot to restore.
  *
  * A checkpoint ends the sandbox it saves. Once it has begun, the workspace's current
  * snapshot no longer holds what the workspace is, whose files and processes have moved
  * on since it was taken, so a checkpoint that fails forgets it rather than leave it to be
- * restored. A copy gives a workspace another's current snapshot, as a session forked
- * from another restores what the other was: its files copied in the bucket under the
- * same snapshot id, then its manifest, then its commit, as a checkpoint writes them.
+ * restored. A snapshot restored is spent: no longer current, its images go on as the layers
+ * of the next. A copy gives a workspace another's current snapshot, as a session forked
+ * from another restores what the other was: its images copied in the bucket, then its
+ * manifest, then its commit, as a checkpoint writes them.
+ *
+ * What no snapshot needs any more is collected, by one caller (alasio's collection): the
+ * images and manifests that neither the current snapshot, nor the latest, which a sandbox
+ * restored from it may still extend, nor one superseded within COLLECT_GRACE_MS names, nor
+ * written within it, as a commit writes its images before its manifest. A restore or a
+ * copy that read a manifest just before it was superseded reads its images within that.
  *
  * A sandbox is restored paused, in a pod of a new address, whose network policies
  * kube-router puts in force on the node as it next syncs (./kube-router.ts): until then
@@ -22,7 +34,7 @@
  * forgets the connections tracked from its addresses, then resumes its containers; one
  * whose policies are not in force within POLICY_WAIT_MS leaves it paused.
  *
- * One operation on a workspace's snapshot runs at a time.
+ * One operation on a workspace's snapshots runs at a time.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -37,11 +49,11 @@ import { Clock, type Duration, Effect, RcMap, Schedule, Schema, type Scope, Sema
 import { NAME, SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
 import { withLogScope } from "../shared/log.ts";
-import { CacheError, type SnapshotCache } from "./cache.ts";
+import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { egressGap, type PodAddress } from "./kube-router.ts";
 import { runscVersion } from "./names.ts";
-import type { ReleaseNotInstalled, Runsc, RunscError } from "./runsc.ts";
+import type { ReleaseNotInstalled, Runsc, RunscError, RunningContainer } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
 
 /** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
@@ -63,15 +75,22 @@ const ImagePath = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_][A-Za-z0-9.
 /** A count of bytes, or of milliseconds. */
 const Count = Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0));
 
-/** A file of a snapshot's image: its path in the image, its size and its SHA-256, in hex. */
-const SnapshotFile = Schema.Struct({ path: ImagePath, bytes: Count, sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)) });
+/**
+ * A file of an image: its path in the image, its size, its SHA-256, in hex, and the ETag
+ * the bucket answered its upload with, which names what the bucket holds of it.
+ */
+const SnapshotFile = Schema.Struct({ path: ImagePath, bytes: Count, sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)), etag: Schema.String });
 export type SnapshotFile = typeof SnapshotFile.Type;
 
+/** An image, as runsc names it, by its digest, and its files, which the bucket keeps under `layers/<digest>/`. */
+const Layer = Schema.Struct({ digest: Schema.String.check(Schema.isPattern(DIGEST)), files: Schema.Array(SnapshotFile) });
+export type Layer = typeof Layer.Type;
+
 /**
- * What a snapshot is, as the bucket and the cache keep it beside its image. Whatever can
+ * What a snapshot is, as the bucket keeps it, and the cache beside its images. Whatever can
  * write the bucket writes it, so what names a place on a node is held to the names the
  * agent makes, the workspace it names to the one asked about (current), and its size, which
- * the node's disk is made room for, to its files'.
+ * the node's disk is made room for, to its images'.
  */
 export const Manifest = Schema.Struct({
   environment: Name,
@@ -79,21 +98,26 @@ export const Manifest = Schema.Struct({
   snapshot: SnapshotId,
   /** The gVisor release that saved it, the only one that restores it. */
   release: Release,
-  /** The image's identity, as runsc gives it. */
-  image: Schema.String,
   /** The CPU features the sandbox was saved with, which a node restoring it must have. */
   cpuFeatures: Schema.Array(Schema.String),
   /** The pod template the sandbox ran, as alasio gave it, which its restore runs again. */
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
-  files: Schema.Array(SnapshotFile),
+  /** Its image, then each image that one holds pages of, its layers, as runsc lists them: what a restore of it reads. */
+  layers: Schema.Array(Layer).check(Schema.isMinLength(1)),
+  /** The bytes of its images together. */
   bytes: Count,
   takenAt: Schema.String,
   /** How long runsc took to checkpoint the sandbox: its hook run in it, then its state saved, the sandbox paused. */
   pauseMs: Count,
-  /** How long its files took to upload. */
+  /** How long its image took to upload. */
   uploadMs: Count,
-}).check(Schema.makeFilter((manifest) => manifest.bytes === manifest.files.reduce((sum, { bytes }) => sum + bytes, 0) || "its bytes must be its files' together"));
+}).check(Schema.makeFilter((manifest) => manifest.bytes === bytesOf(manifest.layers) || "its bytes must be its images' together"));
 export type Manifest = typeof Manifest.Type;
+
+/** The bytes of `layers`' files together. */
+function bytesOf(layers: readonly Layer[]): number {
+  return layers.reduce((sum, { files }) => sum + files.reduce((each, { bytes }) => each + bytes, 0), 0);
+}
 
 /** A workspace, as each request names it. */
 export const WorkspaceRef = Schema.Struct({ environment: Name, workspace: Name });
@@ -146,11 +170,11 @@ export interface Prepared {
   readonly imagePath: string;
 }
 
-/** What this node holds: its gVisor releases with the CPU features each sees here, and the snapshots in its cache. */
+/** What this node holds: its gVisor releases with the CPU features each sees here, and the workspaces whose images its cache holds, by their digests. */
 export interface Holdings {
   readonly node: string;
   readonly releases: readonly { readonly release: string; readonly cpuFeatures: readonly string[] }[];
-  readonly cached: readonly { readonly environment: string; readonly workspace: string; readonly snapshot: string; readonly bytes: number; readonly usedAt: string }[];
+  readonly cached: readonly { readonly environment: string; readonly workspace: string; readonly images: readonly string[]; readonly bytes: number; readonly usedAt: string }[];
 }
 
 /** A workspace has no current snapshot. */
@@ -246,12 +270,16 @@ export interface NodeAgent {
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. One that fails as it writes leaves `to` without a snapshot. */
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError>;
-  /** Forgets the workspace's snapshot, in the bucket and in the cache. */
+  /** Makes the workspace's current snapshot, which its sandbox was restored from, current no more: its images go on as the layers of its next. */
+  readonly spend: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error>;
+  /** Forgets the workspace's snapshots, in the bucket and in the cache. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error | CacheError>;
+  /** Collects what of the workspace's in the bucket no snapshot needs any more, as the module says: the digests of the images it keeps. */
+  readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], S3Error | SnapshotCorrupt>;
   /** The workspaces of `environment` the bucket holds anything of. */
   readonly workspaces: (environment: string) => Effect.Effect<readonly string[], S3Error>;
-  /** Removes from this node's cache the workspace's snapshots but `keep` that no restore may still be reading: their ids. */
-  readonly discard: (workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], CacheError>;
+  /** Removes from this node's cache the workspace's images but `keep`, unless a restore may still be reading them: whether it did. */
+  readonly discard: (workspace: WorkspaceRef, keep: readonly string[]) => Effect.Effect<boolean, CacheError>;
   /** Resumes the workspace's sandbox, restored paused, once its pod's network policies are in force on this node, as the module says. */
   readonly resume: (request: ResumeRequest) => Effect.Effect<void, ResumeError>;
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
@@ -266,10 +294,17 @@ export interface NodeAgentOptions {
   readonly host: HostCommands;
 }
 
-/** The file of a snapshot's manifest, in the bucket and in the cache. */
+/** The directory of a workspace's manifests, in the bucket. */
+export const MANIFESTS_DIR = "manifests";
+/** The file of the manifest of the snapshot a cache last took or prepared of a workspace, beside its images. */
 export const MANIFEST_FILE = "manifest.json";
 /** The object of a workspace's current snapshot. */
 export const CURRENT_FILE = "current.json";
+/**
+ * How long what a snapshot superseded needs, and what a commit wrote, is kept: longer than
+ * a restore or a copy reads the images of a manifest it read, and than a commit takes.
+ */
+export const COLLECT_GRACE_MS = 60 * 60_000;
 /** How long the hook may take to ready the sandbox for its save. */
 const HOOK_TIMEOUT = "30s";
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
@@ -314,7 +349,7 @@ const cachedSnapshots = meter.createObservableGauge("alasio.node_agent.cache.sna
   unit: "{snapshot}",
 });
 
-/** The release a cached snapshot's manifest names, of all it says. */
+/** The release a cached manifest names, of all it says. */
 const CachedRelease = Schema.fromJsonString(Schema.Struct({ release: Schema.String }));
 
 /** A snapshot's id: when it was taken, sortable, and a random part. */
@@ -329,8 +364,11 @@ async function fileSha256(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
+/** A file of an image as it is on the disk, before the bucket holds it. */
+type ImageFile = Omit<SnapshotFile, "etag">;
+
 /** The files of an image directory, each with its size and SHA-256, by their paths in it, in order. */
-async function imageFiles(directory: string): Promise<SnapshotFile[]> {
+async function imageFiles(directory: string): Promise<ImageFile[]> {
   const entries = await readdir(directory, { withFileTypes: true, recursive: true });
   const paths = entries.filter((entry) => entry.isFile()).map((entry) => relative(directory, join(entry.parentPath, entry.name))).sort();
   return Promise.all(paths.map(async (path) => {
@@ -338,6 +376,10 @@ async function imageFiles(directory: string): Promise<SnapshotFile[]> {
     return { path, bytes: (await stat(file)).size, sha256: await fileSha256(file) };
   }));
 }
+
+/** Whether `found`, an image's files on the disk, are `layer`'s. */
+const sameFiles = (found: readonly ImageFile[], layer: Layer): boolean =>
+  JSON.stringify(found) === JSON.stringify(layer.files.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })));
 
 /** What each suffix of a Kubernetes quantity multiplies it by. */
 const QUANTITY_UNITS: Readonly<Record<string, number>> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
@@ -364,12 +406,21 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
 export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
+  /**
+   * The snapshot each sandbox running on this node, by the container checkpoints name, was
+   * last saved to or restored from, whose image the next checkpoint of it saves what changed
+   * since: in memory, as an agent that starts again takes a full one first.
+   */
+  const bases = new Map<string, Manifest>();
+  /** The snapshot each workspace's restore on this node was last prepared from, which its resume makes its sandbox's base. */
+  const prepared = new Map<string, Manifest>();
 
-  /** How many snapshots the cache holds of each release, as their manifests beside their images say. */
+  /** How many workspaces the cache holds the images of under each release, as the manifests beside them say. */
   const cachedByRelease: Effect.Effect<ReadonlyMap<string, number>, CacheError | Schema.SchemaError> = Effect.gen(function*() {
     const held = new Map<string, number>();
-    for (const { environment, workspace, snapshot } of yield* cache.list) {
-      const text = yield* onDisk(() => readFile(join(cache.path(environment, workspace, snapshot), MANIFEST_FILE), "utf8"));
+    for (const { environment, workspace } of yield* cache.list) {
+      const text = yield* onDisk(() => readFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), "utf8").catch(() => null));
+      if (text === null) continue;
       const { release } = yield* Schema.decodeUnknownEffect(CachedRelease)(text);
       held.set(release, (held.get(release) ?? 0) + 1);
     }
@@ -397,6 +448,10 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   );
 
   const prefixOf = ({ environment, workspace }: WorkspaceRef): string => `${environment}/${workspace}`;
+  /** The object of the file `path` of the workspace's image `digest`. */
+  const layerKey = (ref: WorkspaceRef, digest: string, path: string): string => `${prefixOf(ref)}/${LAYERS_DIR}/${digest}/${path}`;
+  /** The object of the manifest of the workspace's snapshot `snapshot`. */
+  const manifestKey = (ref: WorkspaceRef, snapshot: string): string => `${prefixOf(ref)}/${MANIFESTS_DIR}/${snapshot}.json`;
 
   /** `effect` once no other operation runs on the workspaces, each held in the order of its name, so that two operations never wait on each other. */
   const exclusive = <A, E>(workspaces: readonly WorkspaceRef[], effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
@@ -407,35 +462,38 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       ),
     );
 
-  /** How long `effect` took, in milliseconds. */
-  const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =>
+  /** How long `effect` took, in milliseconds, and what it came to. */
+  const timed = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<readonly [number, A], E> =>
     Effect.gen(function*() {
       const start = yield* Clock.currentTimeMillis;
-      yield* effect;
-      return (yield* Clock.currentTimeMillis) - start;
+      const value = yield* effect;
+      return [(yield* Clock.currentTimeMillis) - start, value] as const;
     });
 
-  /** The workspace's current snapshot, as its `current.json` says: one of another workspace's is no snapshot of it. */
-  const current = (ref: WorkspaceRef): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
-    bucket.getJson(`${prefixOf(ref)}/${CURRENT_FILE}`).pipe(
+  /** The manifest the object `key` holds, of the workspace `ref`'s: one of another workspace's is none of it. */
+  const manifestAt = (ref: WorkspaceRef, key: string): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> =>
+    bucket.getJson(key).pipe(
       Effect.flatMap((found) =>
         found === null
           ? Effect.succeed(null)
           : Schema.decodeUnknownEffect(Manifest)(found).pipe(
-            Effect.mapError((error) => new SnapshotCorrupt({ ...ref, reason: `its ${CURRENT_FILE} is not a manifest: ${error.message}` })),
+            Effect.mapError((error) => new SnapshotCorrupt({ ...ref, reason: `its ${key.slice(prefixOf(ref).length + 1)} is not a manifest: ${error.message}` })),
             Effect.filterOrFail(
               (manifest) => prefixOf(manifest) === prefixOf(ref),
-              (manifest) => new SnapshotCorrupt({ ...ref, reason: `its ${CURRENT_FILE} names ${prefixOf(manifest)}` }),
+              (manifest) => new SnapshotCorrupt({ ...ref, reason: `its ${key.slice(prefixOf(ref).length + 1)} names ${prefixOf(manifest)}` }),
             ),
           )
       ),
     );
 
-  /** Forgets the workspace's snapshot: the cache's copy, then in the bucket, uncommitted first and then its objects deleted. */
+  /** The workspace's current snapshot, as its `current.json` says. */
+  const current = (ref: WorkspaceRef): Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt> => manifestAt(ref, `${prefixOf(ref)}/${CURRENT_FILE}`);
+
+  /** Forgets the workspace's snapshots: the cache's copy, then in the bucket, uncommitted first and then its objects deleted. */
   const forgetNow = (ref: WorkspaceRef): Effect.Effect<void, S3Error | CacheError> =>
     Effect.gen(function*() {
       const prefix = prefixOf(ref);
-      yield* cache.clear(ref.environment, ref.workspace, null);
+      yield* cache.clear(ref.environment, ref.workspace);
       yield* bucket.remove(`${prefix}/${CURRENT_FILE}`);
       yield* Effect.forEach(yield* bucket.list(`${prefix}/`), ({ key }) => bucket.remove(key), { discard: true });
     });
@@ -443,72 +501,112 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   /**
    * The release that runs the container, which must be of the pod `namespace`/`pod`, as
    * the annotations containerd gives its spec say: a request names no container of
-   * another's.
+   * another's; and whether its sandbox tracks its writes.
    */
-  const ofPod = (containerId: string, namespace: string, pod: string): Effect.Effect<string, RunscError | ContainerElsewhere> =>
+  const ofPod = (containerId: string, namespace: string, pod: string): Effect.Effect<RunningContainer, RunscError | ContainerElsewhere> =>
     runsc.container(containerId).pipe(
-      Effect.flatMap(({ release, annotations }) => {
-        const found = `${annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
-        return found === `${namespace}/${pod}` ? Effect.succeed(release) : Effect.fail(new ContainerElsewhere({ containerId, namespace, pod, found }));
+      Effect.flatMap((running) => {
+        const found = `${running.annotations["io.kubernetes.cri.sandbox-namespace"] ?? "?"}/${running.annotations["io.kubernetes.cri.sandbox-name"] ?? "?"}`;
+        return found === `${namespace}/${pod}` ? Effect.succeed(running) : Effect.fail(new ContainerElsewhere({ containerId, namespace, pod, found }));
       }),
     );
 
-  /** Takes the snapshot and commits it, as the module says: its manifest. */
+  /** The files of the image `digest` the cache holds of the workspace, uploaded: each with the ETag its upload was answered with. */
+  const upload = (ref: WorkspaceRef, digest: string, files: readonly ImageFile[]): Effect.Effect<Layer, S3Error> =>
+    Effect.forEach(files, (file) =>
+      bucket.putFile(layerKey(ref, digest, file.path), join(cache.image(ref.environment, ref.workspace, digest), file.path)).pipe(
+        Effect.map((etag) => ({ ...file, etag })),
+      )).pipe(Effect.map((uploaded) => ({ digest, files: uploaded })));
+
+  /** Whether every file of `layer` of the workspace's is in the bucket as it was put: of its size, and of the ETag its upload was answered with. */
+  const inBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<boolean, S3Error> =>
+    Effect.forEach(layer.files, ({ path, bytes, etag }) =>
+      bucket.head(layerKey(ref, layer.digest, path)).pipe(
+        Effect.map((stored) => stored !== null && stored.bytes === bytes && stored.etag === etag),
+      )).pipe(Effect.map((each) => each.every(Boolean)));
+
+  /**
+   * `layer`, an image of the workspace's that a new snapshot refers to, as the bucket holds
+   * it: as it was put, checked; or put again from the cache, whose files must be the
+   * manifest's, where the bucket lost it or holds another of its digest.
+   */
+  const layerInBucket = (ref: WorkspaceRef, layer: Layer): Effect.Effect<Layer, S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.gen(function*() {
+      if (yield* inBucket(ref, layer)) return layer;
+      const reason = `its image ${layer.digest} is not in the bucket as it was put`;
+      if (!(yield* cache.holds(ref.environment, ref.workspace, layer.digest))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor in this node's cache` });
+      const files = yield* onDisk(() => imageFiles(cache.image(ref.environment, ref.workspace, layer.digest)));
+      if (!sameFiles(files, layer)) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, and this node's cache holds other files of it` });
+      yield* Effect.logWarning(`${reason}: it is put again from this node's cache`);
+      const again = yield* upload(ref, layer.digest, files);
+      if (!(yield* inBucket(ref, again))) return yield* new SnapshotCorrupt({ ...ref, reason: `${reason}, nor once put again` });
+      return again;
+    });
+
+  /**
+   * The snapshot of the sandbox `request` names, taken and committed as the module says:
+   * its manifest. A delta of its base, its sandbox tracking its writes and the base's image
+   * in the cache; whole otherwise.
+   */
   const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
       const { environment, workspace, containerId, hook, podTemplate } = request;
-      const release = yield* ofPod(containerId, request.namespace, request.pod);
+      const { release, tracksWrites } = yield* ofPod(containerId, request.namespace, request.pod);
       const takenAt = yield* Clock.currentTimeMillis;
       const snapshot = snapshotId(takenAt);
-      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
+      const base = bases.get(containerId);
+      const [own] = base?.layers ?? [];
+      const parent = base !== undefined && own !== undefined && tracksWrites && prefixOf(base) === prefixOf(request) && (yield* cache.holds(environment, workspace, own.digest)) ? base : null;
+      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.snapshot ?? "" });
       yield* cache.room(memoryLimitOf(podTemplate), request).pipe(Effect.flatMap(logEvicted));
-      const directory = yield* cache.stage(environment, workspace, snapshot);
-      const pauseMs = yield* timed(runsc.checkpoint(release, { containerId, imagePath: directory, hook, hookTimeout: HOOK_TIMEOUT }));
-      const image = yield* runsc.inspect(release, directory);
+      const staged = yield* cache.stage(environment, workspace, snapshot);
+      const [pauseMs] = yield* timed(runsc.checkpoint(release, {
+        containerId,
+        imagePath: staged,
+        hook,
+        hookTimeout: HOOK_TIMEOUT,
+        ...(parent === null || own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
+      }));
+      const image = yield* runsc.inspect(release, staged);
       if (image.version !== runscVersion(release)) {
         return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image says runsc ${image.version} saved it, not ${runscVersion(release)}` });
       }
-      const files = yield* onDisk(() => imageFiles(directory));
-      const prefix = `${prefixOf(request)}/${snapshot}`;
-      const uploadMs = yield* timed(Effect.forEach(files, ({ path }) => bucket.putFile(`${prefix}/${path}`, join(directory, path)), { discard: true }));
+      // Each image it holds pages of is one of its parent's, whose files its manifest says.
+      const known = new Map((parent?.layers ?? []).map((layer) => [layer.digest, layer]));
+      const referred = yield* Effect.forEach(yield* runsc.layers(release, staged), (digest) => {
+        const layer = known.get(digest);
+        return layer === undefined ? Effect.fail(new SnapshotCorrupt({ environment, workspace, reason: `its image refers to the image ${digest}, which is none of its parent's` })) : Effect.succeed(layer);
+      });
+      yield* cache.commit(environment, workspace, snapshot, image.digest);
+      const files = yield* onDisk(() => imageFiles(cache.image(environment, workspace, image.digest)));
+      const [uploadMs, layers] = yield* timed(Effect.gen(function*() {
+        const uploaded = yield* upload(request, image.digest, files);
+        if (!(yield* inBucket(request, uploaded))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${image.digest} is not in the bucket as it was put` });
+        return [uploaded, ...yield* Effect.forEach(referred, (layer) => layerInBucket(request, layer))];
+      }));
       const manifest: Manifest = {
         environment,
         workspace,
         snapshot,
         release,
-        image: image.digest,
         cpuFeatures: image.cpuFeatures,
         podTemplate,
-        files,
-        bytes: files.reduce((sum, { bytes }) => sum + bytes, 0),
+        layers,
+        bytes: bytesOf(layers),
         takenAt: new Date(takenAt).toISOString(),
         pauseMs,
         uploadMs,
       };
-      yield* onDisk(() => writeFile(join(directory, MANIFEST_FILE), JSON.stringify(manifest)));
-      yield* bucket.putJson(`${prefix}/${MANIFEST_FILE}`, manifest);
+      yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
+      yield* bucket.putJson(manifestKey(request, snapshot), manifest);
       yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
       return manifest;
     });
 
-  /**
-   * After a snapshot is committed: every other object of the workspace's deleted (its
-   * previous snapshot's, and any an operation that failed left), then `cached`, which
-   * makes the cache hold what it should of the workspace. What fails here leaves the
-   * snapshot committed.
-   */
-  const settle = (manifest: Manifest, cached: Effect.Effect<void, CacheError>): Effect.Effect<void> =>
-    Effect.gen(function*() {
-      const prefix = prefixOf(manifest);
-      const stale = (yield* bucket.list(`${prefix}/`)).map(({ key }) => key).filter((key) => key !== `${prefix}/${CURRENT_FILE}` && !key.startsWith(`${prefix}/${manifest.snapshot}/`));
-      yield* Effect.forEach(stale, bucket.remove, { discard: true });
-      yield* cached;
-    }).pipe(Effect.catch((error) => Effect.logWarning(`the snapshot ${manifest.snapshot} of ${prefixOf(manifest)} is committed, but ${error.message}`)));
-
-  /** Says which snapshots were evicted from the node's cache. */
-  const logEvicted = (evicted: readonly { readonly environment: string; readonly workspace: string; readonly snapshot: string; readonly bytes: number }[]) =>
-    Effect.forEach(evicted, ({ environment, workspace, snapshot, bytes }) =>
-      Effect.logInfo(`evicted the snapshot ${snapshot} of ${environment}/${workspace} (${bytes} bytes) from the node's cache`), { discard: true });
+  /** Says which workspaces were evicted from the node's cache. */
+  const logEvicted = (evicted: readonly CachedWorkspace[]) =>
+    Effect.forEach(evicted, ({ environment, workspace, bytes }) =>
+      Effect.logInfo(`evicted the images of ${environment}/${workspace} (${bytes} bytes) from the node's cache`), { discard: true });
 
   const evict: Effect.Effect<void, CacheError> = cache.evict.pipe(Effect.flatMap(logEvicted));
 
@@ -528,16 +626,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
           )
         ),
         Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
-        // Its image is the one the cache holds of the workspace.
-        Effect.tap((manifest) =>
-          settle(
-            manifest,
-            cache.commit(manifest.environment, manifest.workspace, manifest.snapshot).pipe(
-              Effect.andThen(cache.clear(manifest.environment, manifest.workspace, manifest.snapshot)),
-              Effect.andThen(evict),
-            ),
-          )
-        ),
+        // The sandbox it saved ended.
+        Effect.ensuring(Effect.sync(() => bases.delete(request.containerId))),
+        Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
       ),
     ).pipe(
       Effect.tap((manifest) =>
@@ -558,7 +649,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
 
   /**
    * Copies the current snapshot of `from` to `to` and commits it, as the module says:
-   * `to`'s manifest. Once it has begun writing, one that fails forgets `to`'s snapshot,
+   * `to`'s manifest. Once it has begun writing, one that fails forgets `to`'s snapshots,
    * rather than leave part of one, or one `to` was to move on from.
    */
   const copyNow = (from: WorkspaceRef, to: WorkspaceRef): Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError> =>
@@ -567,21 +658,28 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       if (source === null) return yield* new NoSnapshot(from);
       // A workspace's snapshot is its own already.
       if (prefixOf(from) === prefixOf(to)) return source;
-      const { snapshot } = source;
-      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
-      const manifest: Manifest = { ...source, environment: to.environment, workspace: to.workspace };
-      yield* Effect.gen(function*() {
-        yield* Effect.forEach(source.files, ({ path, bytes }) => bucket.copy(`${prefixOf(from)}/${snapshot}/${path}`, `${prefixOf(to)}/${snapshot}/${path}`, bytes), { discard: true });
-        yield* bucket.putJson(`${prefixOf(to)}/${snapshot}/${MANIFEST_FILE}`, manifest);
+      yield* Effect.annotateCurrentSpan({ "alasio.snapshot": source.snapshot });
+      const written = yield* Effect.gen(function*() {
+        yield* cache.clear(to.environment, to.workspace);
+        const layers = yield* Effect.forEach(source.layers, (layer) =>
+          Effect.forEach(layer.files, (file) =>
+            Effect.gen(function*() {
+              const key = layerKey(to, layer.digest, file.path);
+              yield* bucket.copy(layerKey(from, layer.digest, file.path), key, file.bytes);
+              const stored = yield* bucket.head(key);
+              if (stored === null || stored.bytes !== file.bytes) return yield* new SnapshotCorrupt({ ...to, reason: `its copy of ${key} is not in the bucket as it was copied` });
+              return { ...file, etag: stored.etag };
+            })).pipe(Effect.map((files) => ({ digest: layer.digest, files }))));
+        const manifest: Manifest = { ...source, environment: to.environment, workspace: to.workspace, layers };
+        yield* bucket.putJson(manifestKey(to, manifest.snapshot), manifest);
         yield* bucket.putJson(`${prefixOf(to)}/${CURRENT_FILE}`, manifest);
+        return manifest;
       }).pipe(
         Effect.onError(() =>
           forgetNow(to).pipe(Effect.catch((error) => Effect.logWarning(`copying a snapshot to ${prefixOf(to)} failed, and forgetting what it wrote failed too: ${error.message}`)))
         ),
       );
-      // This node's cache holds nothing of `to` until it is prepared here.
-      yield* settle(manifest, cache.clear(to.environment, to.workspace, null));
-      return manifest;
+      return written;
     });
 
   const copy = (from: WorkspaceRef, to: WorkspaceRef): Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError> =>
@@ -597,37 +695,34 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       }),
     );
 
-  /** The snapshot's image, from the bucket into the cache, each file checked against its manifest. */
-  const download = (manifest: Manifest): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
+  /** The image `layer` of the workspace's, from the bucket into the cache, each file checked against the manifest's. */
+  const download = (ref: WorkspaceRef, snapshot: string, layer: Layer): Effect.Effect<void, S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
-      const { environment, workspace, snapshot } = manifest;
-      yield* cache.room(manifest.bytes, manifest).pipe(Effect.flatMap(logEvicted));
+      const { environment, workspace } = ref;
       const directory = yield* cache.stage(environment, workspace, snapshot);
-      for (const file of manifest.files) {
+      for (const file of layer.files) {
         const target = join(directory, file.path);
         yield* onDisk(() => mkdir(dirname(target), { recursive: true }));
-        const received = yield* bucket.getFile(`${prefixOf(manifest)}/${snapshot}/${file.path}`, target, file.bytes);
+        const received = yield* bucket.getFile(layerKey(ref, layer.digest, file.path), target, file.bytes);
         if (received.bytes !== file.bytes || received.sha256 !== file.sha256) {
           return yield* new SnapshotCorrupt({
             environment,
             workspace,
-            reason: `its file ${file.path} is ${received.bytes} bytes of SHA-256 ${received.sha256}, where its manifest says ${file.bytes} bytes of ${file.sha256}`,
+            reason: `its image ${layer.digest}'s file ${file.path} is ${received.bytes} bytes of SHA-256 ${received.sha256}, where its manifest says ${file.bytes} bytes of ${file.sha256}`,
           });
         }
       }
-      yield* onDisk(() => writeFile(join(directory, MANIFEST_FILE), JSON.stringify(manifest)));
-      yield* cache.commit(environment, workspace, snapshot);
-    }).pipe(Effect.onError(() => cache.clear(manifest.environment, manifest.workspace, null).pipe(Effect.ignore)));
+      yield* cache.commit(environment, workspace, snapshot, layer.digest);
+    });
 
-  /** Whether the cache's copy of `manifest`'s image is what the manifest says, file by file; one that is not is removed, said so. */
-  const intact = (manifest: Manifest): Effect.Effect<boolean, CacheError> =>
+  /** Whether the cache's copy of the image `layer` of the workspace's is what the manifest says, file by file; one that is not is removed, said so. */
+  const intact = (ref: WorkspaceRef, layer: Layer): Effect.Effect<boolean, CacheError> =>
     Effect.gen(function*() {
-      const { environment, workspace, snapshot } = manifest;
-      const directory = cache.path(environment, workspace, snapshot);
-      const found = (yield* onDisk(() => imageFiles(directory))).filter(({ path }) => path !== MANIFEST_FILE);
-      if (JSON.stringify(found) === JSON.stringify(manifest.files)) return true;
-      yield* Effect.logWarning(`the node's cached copy of the snapshot ${snapshot} of ${prefixOf(manifest)} is not what its manifest says: it is read again from the bucket`);
-      yield* cache.clear(environment, workspace, null);
+      const { environment, workspace } = ref;
+      if (!(yield* cache.holds(environment, workspace, layer.digest))) return false;
+      if (sameFiles(yield* onDisk(() => imageFiles(cache.image(environment, workspace, layer.digest))), layer)) return true;
+      yield* Effect.logWarning(`the node's cached copy of the image ${layer.digest} of ${prefixOf(ref)} is not what its manifest says: it is read again from the bucket`);
+      yield* cache.clear(environment, workspace);
       return false;
     });
 
@@ -655,22 +750,54 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         if (why !== null) return yield* new Unrestorable({ environment, workspace, snapshot, reason: why });
         const started = yield* Clock.currentTimeMillis;
         // A copy the cache holds is read again against its manifest: what the disk keeps may have changed since it was written.
-        const cached = (yield* cache.holds(environment, workspace, snapshot)) && (yield* intact(manifest));
-        if (cached) yield* cache.use(environment, workspace, snapshot);
-        else yield* download(manifest);
+        const missing: Layer[] = [];
+        for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) missing.push(layer);
+        if (missing.length > 0) yield* cache.room(bytesOf(missing), ref).pipe(Effect.flatMap(logEvicted));
+        yield* Effect.forEach(missing, (layer) => download(ref, snapshot, layer), { discard: true }).pipe(
+          Effect.onError(() => cache.clear(environment, workspace).pipe(Effect.ignore)),
+        );
+        const imagePath = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
+        yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
+        prepared.set(prefixOf(ref), manifest);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
-        yield* cache.clear(environment, workspace, snapshot);
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
-        const source = cached ? "cache" : "bucket";
+        const source = missing.length === 0 ? "cache" : "bucket";
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
-        return { manifest, imagePath: cache.path(environment, workspace, snapshot) };
+        return { manifest, imagePath };
       }),
     ).pipe(
       Effect.tapError((error) => Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": error._tag }))),
       withAlasioSpan("alasio.node_agent.prepare", { attributes: spanAttributes(ref) }),
     );
+
+  /**
+   * Collects what of the workspace's no snapshot needs any more, as the module says: the
+   * digests of the images it keeps. The manifests, by their snapshots' ids, sort as they
+   * were taken; each is superseded as the one after it is written.
+   */
+  const collectNow = (ref: WorkspaceRef): Effect.Effect<readonly string[], S3Error | SnapshotCorrupt> =>
+    Effect.gen(function*() {
+      const prefix = prefixOf(ref);
+      const now = yield* Clock.currentTimeMillis;
+      const listed = yield* bucket.list(`${prefix}/`);
+      const recent = ({ writtenAt }: { readonly writtenAt: number }) => now - writtenAt < COLLECT_GRACE_MS;
+      const manifests = listed.filter(({ key }) => key.startsWith(`${prefix}/${MANIFESTS_DIR}/`));
+      const latest = manifests.at(-1);
+      const kept = manifests.filter((each, index) => each === latest || recent(manifests[index + 1] ?? each));
+      const named = yield* Effect.forEach(kept, ({ key }) => manifestAt(ref, key));
+      const committed = yield* current(ref);
+      const images = new Set([...named, committed].flatMap((manifest) => manifest?.layers.map(({ digest }) => digest) ?? []));
+      const stale = listed.filter((each) => {
+        if (each.key.startsWith(`${prefix}/${MANIFESTS_DIR}/`)) return !kept.includes(each);
+        const [, digest = ""] = each.key.slice(prefix.length + 1).split("/");
+        return each.key.startsWith(`${prefix}/${LAYERS_DIR}/`) && !images.has(digest) && !recent(each);
+      });
+      yield* Effect.forEach(stale, ({ key }) => bucket.remove(key), { discard: true });
+      if (stale.length > 0) yield* Effect.logInfo(`collected ${stale.length} objects of ${prefix} that no snapshot needs any more`);
+      return [...images].sort();
+    });
 
   /** What of its rules a pod's address lacks in its family's filter table on the node, as ./kube-router.ts says, or null. */
   const policyGap = (address: PodAddress): Effect.Effect<string | null, HostCommandError> =>
@@ -708,9 +835,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     Effect.gen(function*() {
       const waited = yield* policiesInForce(request);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
-      const releases = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
+      const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
-      yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(releases[index] ?? "", id), { discard: true });
+      yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
+      // Its sandbox runs from the snapshot prepared of it, which its next checkpoint saves what changed since.
+      const restoredFrom = prepared.get(prefixOf(request));
+      if (restoredFrom !== undefined) for (const id of request.containerIds) bases.set(id, restoredFrom);
       return waited;
     }).pipe(
       Effect.tap((waited) =>
@@ -744,10 +874,21 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     prepare: (ref) => prepare(ref).pipe(withLogScope("node-agent")),
     current,
     copy: (from, to) => copy(from, to).pipe(withLogScope("node-agent")),
+    spend: (ref) =>
+      exclusive([ref], bucket.remove(`${prefixOf(ref)}/${CURRENT_FILE}`)).pipe(
+        Effect.tap(() => Effect.logInfo(`the snapshot of ${prefixOf(ref)} is spent, its sandbox restored from it`)),
+        withAlasioSpan("alasio.node_agent.spend", { attributes: spanAttributes(ref) }),
+        withLogScope("node-agent"),
+      ),
     forget: (ref) =>
       exclusive([ref], forgetNow(ref)).pipe(
-        Effect.tap(() => Effect.logInfo(`forgot the snapshot of ${prefixOf(ref)}`)),
+        Effect.tap(() => Effect.logInfo(`forgot the snapshots of ${prefixOf(ref)}`)),
         withAlasioSpan("alasio.node_agent.forget", { attributes: spanAttributes(ref) }),
+        withLogScope("node-agent"),
+      ),
+    collect: (ref) =>
+      exclusive([ref], collectNow(ref)).pipe(
+        withAlasioSpan("alasio.node_agent.collect", { attributes: spanAttributes(ref) }),
         withLogScope("node-agent"),
       ),
     resume: (request) => resume(request).pipe(withLogScope("node-agent")),
@@ -759,10 +900,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       ),
     discard: (ref, keep) =>
       exclusive([ref], cache.discard(ref.environment, ref.workspace, keep)).pipe(
-        Effect.tap((discarded) =>
-          Effect.forEach(discarded, ({ snapshot, bytes }) => Effect.logInfo(`discarded the snapshot ${snapshot} of ${prefixOf(ref)} (${bytes} bytes) from the node's cache`), { discard: true })
-        ),
-        Effect.map((discarded) => discarded.map(({ snapshot }) => snapshot)),
+        Effect.tap((discarded) => (discarded ? Effect.logInfo(`discarded from the node's cache the images of ${prefixOf(ref)} no snapshot needs any more`) : Effect.void)),
         withLogScope("node-agent"),
       ),
   };

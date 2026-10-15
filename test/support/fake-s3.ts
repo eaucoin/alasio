@@ -67,12 +67,16 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
   const objects = new Map<string, Buffer>();
   const writtenAt = new Map<string, number>();
   // What each object was answered with as it was written, as S3 does: a multipart one's
-  // is not its bytes' MD5.
-  const etags = new Map<string, string>();
+  // is not its bytes' MD5. One a test sets in `objects` is its bytes'.
+  const etags = new Map<string, { readonly bytes: Buffer; readonly etag: string }>();
   const write = (key: string, bytes: Buffer, etag: string): void => {
     objects.set(key, bytes);
-    etags.set(key, etag);
+    etags.set(key, { bytes, etag });
     writtenAt.set(key, Date.now());
+  };
+  const etagHeld = (key: string, object: Buffer): string => {
+    const written = etags.get(key);
+    return written?.bytes === object ? written.etag : etagOf(object);
   };
   const requests: string[] = [];
   const uploads = new Map<string, { readonly key: string; readonly parts: Map<number, Buffer> }>();
@@ -198,7 +202,7 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
     }
     if (method === "HEAD") {
       const object = objects.get(key);
-      response.writeHead(object ? 200 : 404, object ? { "content-length": object.length, etag: etags.get(key) ?? "" } : {}).end();
+      response.writeHead(object ? 200 : 404, object ? { "content-length": object.length, etag: etagHeld(key, object) } : {}).end();
       return;
     }
     if (method === "GET") {

@@ -938,7 +938,7 @@ if (inShard("snapshots")) {
       const logged = (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
         .split("\n")
         .find((line) => line.includes(`session ${corrupt} is resumed from bayma's checkpoints, not from its snapshot: `));
-      assert.ok(logged?.includes(`its file ${corrupted.path} is ${corrupted.bytes} bytes of SHA-256 `), `alasio logged no fallback for its corrupted file ${corrupted.path}: ${logged}`);
+      assert.ok(logged?.includes(`'s file ${corrupted.path} is ${corrupted.bytes} bytes of SHA-256 `), `alasio logged no fallback for its corrupted file ${corrupted.path}: ${logged}`);
       const seen = await repl.read(corrupt, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);

@@ -59,10 +59,15 @@ const ContainerState = Schema.Struct({
   annotations: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
 
-/** A container as the node runs it: the release whose runsc runs its sandbox, and its spec's annotations. */
+/**
+ * A container as the node runs it: the release whose runsc runs its sandbox, its spec's
+ * annotations, and whether its sandbox tracks the pages it writes (`--dirty-tracking`), as
+ * a checkpoint that saves only what changed since its last needs it to.
+ */
 export interface RunningContainer {
   readonly release: string;
   readonly annotations: Readonly<Record<string, string>>;
+  readonly tracksWrites: boolean;
 }
 
 /** An image, as runsc describes it: its identity, the version of the runsc that saved it, and the CPU features it was saved with. */
@@ -72,7 +77,7 @@ export interface InspectedImage {
   readonly cpuFeatures: readonly string[];
 }
 
-/** How a checkpoint is taken: of which container, into which directory, running what first. */
+/** How a checkpoint is taken: of which container, into which directory, running what first, saving what changed since which image. */
 export interface CheckpointOptions {
   /** The container, by its runtime's id, whose sandbox is saved whole, and in which the hook runs. */
   readonly containerId: string;
@@ -81,6 +86,12 @@ export interface CheckpointOptions {
   readonly hook: readonly string[];
   /** How long the hook may take. */
   readonly hookTimeout: string;
+  /**
+   * The directory of the image the sandbox was last saved to or restored from, its pages
+   * metadata in it, of which the new image is a delta: it holds only the pages written since,
+   * and the others as that image's layers. A full image without.
+   */
+  readonly parentImagePath?: string;
 }
 
 /** The node's releases and their runsc; see makeRunsc. */
@@ -95,12 +106,16 @@ export interface Runsc {
   /** Resumes a container, by its runtime's id, of a sandbox restored paused; one that runs already is left so. */
   readonly resume: (release: string, containerId: string) => Effect.Effect<void, RunscError | ReleaseNotInstalled>;
   readonly inspect: (release: string, imagePath: string) => Effect.Effect<InspectedImage, RunscError | ReleaseNotInstalled>;
+  /** The digests of the images an image holds pages of besides its own, its layers, which a restore of it reads too. */
+  readonly layers: (release: string, imagePath: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
   /** The CPU features of this node, by the names `release` gives them. */
   readonly cpuFeatures: (release: string) => Effect.Effect<readonly string[], RunscError | ReleaseNotInstalled>;
   /**
    * The container, by its runtime's id, as the node runs it: which release runs its
    * sandbox, from the program its sandbox's process runs (whatever a pod's RuntimeClass
-   * names now, it ran what it named as it started), and its annotations.
+   * names now, it ran what it named as it started), its annotations, and whether its
+   * sandbox tracks its writes, as the flags its process was started with say (its
+   * runtime's options file when it started, which may have changed since).
    */
   readonly container: (containerId: string) => Effect.Effect<RunningContainer, RunscError>;
 }
@@ -189,10 +204,11 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
   return {
     releases,
 
-    checkpoint: (release, { containerId, imagePath, hook, hookTimeout }) =>
+    checkpoint: (release, { containerId, imagePath, hook, hookTimeout, parentImagePath }) =>
       run(release, ["checkpoint"], [
         `--image-path=${imagePath}`,
         "--compression=none",
+        ...(parentImagePath === undefined ? [] : [`--parent-image-path=${parentImagePath}`]),
         `--save-restore-exec-argv=${hook.join(" ")}`,
         `--save-restore-exec-timeout=${hookTimeout}`,
         containerId,
@@ -216,6 +232,8 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         })),
       ),
 
+    layers: (release, imagePath) => run(release, ["image", "layers"], [imagePath]).pipe(Effect.map(({ stdout }) => stdout.split("\n").filter(Boolean))),
+
     container: (containerId) =>
       Effect.gen(function*() {
         const failed = (reason: string) => new RunscError({ release: "the node's", command: `state ${containerId}`, reason });
@@ -227,7 +245,9 @@ export function makeRunsc({ releasesDir, containerdDir, root, procRoot = "/proc"
         const program = yield* Effect.tryPromise({ try: () => readlink(join(procRoot, String(state.pid), "exe")), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
         const [release = "", ...under] = relative(releasesDir, program).split(sep);
         if (under.length === 0 || release === ".." || !(yield* releases).includes(release)) return yield* failed(`its sandbox runs ${program}, of no release installed here`);
-        return { release, annotations: state.annotations ?? {} };
+        const argv = yield* Effect.tryPromise({ try: () => readFile(join(procRoot, String(state.pid), "cmdline"), "utf8"), catch: (cause) => failed(`its sandbox's process ${state.pid} is not readable: ${String(cause)}`) });
+        const tracking = argv.split("\0").findLast((arg) => arg.startsWith("--dirty-tracking="))?.slice("--dirty-tracking=".length);
+        return { release, annotations: state.annotations ?? {}, tracksWrites: tracking !== undefined && tracking !== "off" };
       }),
 
     cpuFeatures: (release) => {
