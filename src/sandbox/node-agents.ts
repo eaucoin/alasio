@@ -30,11 +30,11 @@ export class NodeAgentError extends Schema.TaggedError<NodeAgentError>()("NodeAg
   }
 }
 
-/** What a node holds, as its agent says: its gVisor releases, with the CPU features each sees there, and the snapshots it has on its disk. */
+/** What a node holds, as its agent says: its gVisor releases, with the CPU features each sees there, and the workspaces whose images it has on its disk, by digest. */
 export const Holdings = Schema.Struct({
   node: Schema.String,
   releases: Schema.Array(Schema.Struct({ release: Schema.String, cpuFeatures: Schema.Array(Schema.String) })),
-  cached: Schema.Array(Schema.Struct({ environment: Schema.String, workspace: Schema.String, snapshot: Schema.String, bytes: Schema.Number, usedAt: Schema.String })),
+  cached: Schema.Array(Schema.Struct({ environment: Schema.String, workspace: Schema.String, images: Schema.Array(Schema.String), bytes: Schema.Number, usedAt: Schema.String })),
 });
 export type Holdings = typeof Holdings.Type;
 
@@ -45,9 +45,10 @@ export type Prepared = typeof Prepared.Type;
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
-/** What an agent answers a listing of an environment's snapshots, and a discard, with. */
+/** What an agent answers a listing of an environment's snapshots, a collection, and a discard, with. */
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
-const Discarded = Schema.Struct({ discarded: Schema.Array(Schema.String) });
+const Collected = Schema.Struct({ kept: Schema.Array(Schema.String) });
+const Discarded = Schema.Struct({ discarded: Schema.Boolean });
 
 /** How an agent says a checkpoint or a prepare of a workspace stands (../node-agent/operations.ts), its value as `value` reads it. */
 const OutcomeOf = <A, I>(value: Schema.Codec<A, I>) =>
@@ -69,8 +70,12 @@ export interface NodeAgents {
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. An agent refuses one of `from` without a snapshot with 404. */
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
-  /** Forgets the workspace's current snapshot. */
+  /** Forgets the workspace's snapshots. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Makes the workspace's current snapshot, which its sandbox was restored from, current no more, its images the layers of its next. */
+  readonly spend: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** Collects what of the workspace's in the bucket no snapshot needs any more: the digests of the images kept. */
+  readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
    * Resumes the sandbox `request` names, restored paused in its pod on `node`, once the
    * pod's network policies are in force there. An agent refuses one whose policies are
@@ -81,8 +86,8 @@ export interface NodeAgents {
   readonly holdings: (node: string) => Effect.Effect<Holdings, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` the bucket holds anything of. */
   readonly workspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
-  /** Has `node`'s cache discard the workspace's snapshots but `keep` that no restore there may be reading: their ids. */
-  readonly discard: (node: string, workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** Has `node`'s cache discard the workspace's images but `keep`, unless a restore there may be reading them: whether it did. */
+  readonly discard: (node: string, workspace: WorkspaceRef, keep: readonly string[]) => Effect.Effect<boolean, NodeAgentError | KubeApiError>;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */
@@ -205,9 +210,19 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
           Manifest,
         )),
     forget: (workspace) =>
-      Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
+      Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshots`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
         Effect.asVoid,
       ),
+    spend: (workspace) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `spend ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: `${snapshotPath(workspace)}/current`, timeout: SHORT_CALL })).pipe(
+          Effect.asVoid,
+        ),
+    collect: (workspace) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(node, `collect ${workspace.environment}/${workspace.workspace}'s snapshots`, { method: "POST", path: "/collect", body: workspace, timeout: LONG_CALL }, Collected)).pipe(
+          Effect.map(({ kept }) => kept),
+        ),
     resume: (node, request) =>
       send(node, `resume ${request.environment}/${request.workspace}'s sandbox`, { method: "POST", path: "/resume", body: request, timeout: RESUME_CALL }).pipe(Effect.asVoid),
     holdings: (node) => ask(node, "say what it holds", { method: "GET", path: "/holdings", timeout: SHORT_CALL }, Holdings),
@@ -219,8 +234,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     discard: (node, workspace, keep) =>
       ask(
         node,
-        `discard ${workspace.environment}/${workspace.workspace}'s cached snapshots`,
-        { method: "DELETE", path: `/cache/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}?keep=${encodeURIComponent(keep ?? "")}`, timeout: SHORT_CALL },
+        `discard ${workspace.environment}/${workspace.workspace}'s cached images`,
+        { method: "DELETE", path: `/cache/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}?keep=${keep.join(",")}`, timeout: SHORT_CALL },
         Discarded,
       ).pipe(Effect.map(({ discarded }) => discarded)),
   };
