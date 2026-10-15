@@ -348,14 +348,15 @@ fi
 # 7.0.0's sessions' profile, which this release's alasio up carries as the template before
 # its own, for the sessions' snapshots taken on it to restore onto it, as each moved does:
 # this release reads a profile only where it says how often a session is snapshotted live,
-# which 7.0.0's does not, so it is given this release's default, 10 minutes, which 7.0.0's
-# alasio, reading it again, ignores.
+# and how long its bayma holds a stop for a snapshot, which 7.0.0's does not, so it is given
+# this release's defaults, 10 minutes and 60 s, which 7.0.0's alasio, reading it again,
+# ignores.
 templates=$(k get configmap alasio-sandbox-templates --ignore-not-found -o json)
-lacking='.data["templates.json"] | fromjson | any((.sessions, .previousSessions) | select(. != null and .snapshots != null) | .snapshots; has("liveEverySeconds") | not)'
+lacking='.data["templates.json"] | fromjson | any((.sessions, .previousSessions) | select(. != null and .snapshots != null) | .snapshots; (has("liveEverySeconds") and has("stopWaitSeconds")) | not)'
 if [ -n "$templates" ] && [ "$(jq "$lacking" <<<"$templates")" = true ]; then
-  log "giving 7.0.0's sessions' profile in its sandbox templates how often a session is snapshotted live, for this release's alasio up to carry it"
-  jq '.data["templates.json"] |= (fromjson | reduce ("sessions", "previousSessions") as $profile (.; if .[$profile].snapshots? != null and (.[$profile].snapshots | has("liveEverySeconds") | not) then .[$profile].snapshots.liveEverySeconds = 600 else . end) | tojson)' <<<"$templates" | k replace -f - >/dev/null ||
-    fail "7.0.0's sandbox templates could not be given how often a session is snapshotted live: the run again goes on with it"
+  log "giving 7.0.0's sessions' profile in its sandbox templates how often a session is snapshotted live, and how long its bayma holds a stop, for this release's alasio up to carry it"
+  jq '.data["templates.json"] |= (fromjson | reduce ("sessions", "previousSessions") as $profile (.; if .[$profile].snapshots? != null then .[$profile].snapshots |= ({ liveEverySeconds: 600, stopWaitSeconds: 60 } + .) else . end) | tojson)' <<<"$templates" | k replace -f - >/dev/null ||
+    fail "7.0.0's sandbox templates could not be given how often a session is snapshotted live, and how long its bayma holds a stop: the run again goes on with it"
 fi
 
 log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"

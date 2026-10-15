@@ -966,6 +966,49 @@ if (inShard("snapshots")) {
       }
     });
 
+    test("a session whose node is drained while it idles is released into a snapshot as its bayma holds its stop, and comes back on another node, its REPL whole", { skip: AGENTS < 2 && "a drain of the cluster's one node stops all of it" }, async (t) => {
+      const drained = await newSession("none");
+      const { sessionId: held } = await repl.set(drained, `drained with ${drained}`);
+      const node = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
+      assert.ok(node, `the session ${drained} runs on no node`);
+      const began = Date.now();
+      try {
+        // kubectl drain, of the session's pods alone, as the node's other pods are not this test's.
+        assert.match(await onNode(`${CLUSTER}-server-0`, `kubectl drain ${node} --pod-selector=app.kubernetes.io/component=session --delete-emptydir-data --timeout=300s`), /evicted/u);
+        const bound = await until("the drained session released into a snapshot", async () => {
+          const sandbox = await kube.get<KubernetesObject & { spec?: { operatingMode?: string } }>(ref("Sandbox", drained, SESSIONS));
+          const snapshot = sandbox?.metadata?.annotations?.[SNAPSHOT_ANNOTATION];
+          return sandbox?.spec?.operatingMode === "Suspended" && snapshot ? snapshot : undefined;
+        }, 180_000);
+        const manifest = await snapshotOf(drained);
+        assert.equal(manifest?.snapshot, bound);
+        // A release's snapshot, its sandbox ended by it, not one taken live.
+        assert.equal(manifest?.live, undefined);
+        t.diagnostic(`released ${Date.now() - began} ms after the drain began: ${manifest?.bytes} bytes, its sandbox paused ${manifest?.pauseMs} ms`);
+        await turn("hello after the drain");
+        const restoredOn = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
+        assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, the node drained`);
+        const seen = await repl.read(drained, held);
+        assert.deepEqual([seen.live, seen.checkpointed], [`drained with ${drained}`, `drained with ${drained}`]);
+        assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
+      } finally {
+        await onNode(`${CLUSTER}-server-0`, `kubectl uncordon ${node}`);
+      }
+    });
+
+    test("a session whose pod is deleted with no grace, as a hard eviction or a lost node ends one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
+      const killed = await newSession("none");
+      const { sessionId: kept } = await repl.set(killed, `checkpointed by ${killed}`);
+      const node = (await kube.get<V1Pod>(ref("Pod", killed, SESSIONS)))?.spec?.nodeName ?? "";
+      const deleted = kubectl(["delete", "pod", killed, "--namespace", SESSIONS, "--grace-period=0", "--force"]);
+      assert.ok(deleted.ok, deleted.said);
+      await turn("hello after the kill");
+      const seen = await repl.read(killed, kept);
+      assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${killed}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
+      assert.equal(await snapshotOf(killed), null, `a snapshot of ${killed} was taken as its pod on ${node} was killed`);
+    });
+
     test("a session whose snapshot's image is corrupted comes back from bayma's checkpoints, as alasio logs and bayma tells the next exec", async () => {
       const corrupt = await newSession("none");
       const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);

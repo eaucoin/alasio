@@ -122,6 +122,8 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
         // A pod that ends is ended: alasio brings the session up in a new one, and nothing
         // starts bayma again in a sandbox that a snapshot has just ended.
         restartPolicy: "Never",
+        // Ended by other than alasio, bayma holds its stop for alasio's snapshot, then stops.
+        ...(snapshotted ? { terminationGracePeriodSeconds: stopWaitSeconds(config) + BAYMA_STOP_SECONDS } : {}),
         securityContext: { ...restrictedPod(1000, 1000), ...ownership },
         ...imagePullSecrets(config),
         ...given("nodeSelector", { ...sessions.nodeSelector }),
@@ -148,7 +150,16 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
           image: agent,
           imagePullPolicy: config.images.pullPolicy,
           command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"],
-          args: ["mcp-http", "--host", "0.0.0.0", "--port", String(BAYMA_PORT), "--state-dir", "/home/agent/.bayma"],
+          args: [
+            "mcp-http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            String(BAYMA_PORT),
+            "--state-dir",
+            "/home/agent/.bayma",
+            ...(snapshotted ? ["--stop-wait-ms", String(stopWaitSeconds(config) * 1000)] : []),
+          ],
           workingDir: "/workspace",
           env: [
             { name: "HOME", value: "/home/agent" },
@@ -180,10 +191,20 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
   };
 }
 
+/** How long bayma takes to stop once it no longer holds its stop: it persists its sessions. */
+const BAYMA_STOP_SECONDS = 30;
+
+/** How long a session's bayma holds a stop alasio did not make (sessions.snapshots.stopWait). */
+function stopWaitSeconds(config: InstallConfig): number {
+  // A duration, as the configuration checks it.
+  return durationSeconds(config.sessions.snapshots.stopWait) ?? 0;
+}
+
 /**
  * How session sandboxes are snapshotted as they are released (src/sandbox/snapshots.ts),
  * where the node agents run: once sessions.snapshots.releaseAfter has passed without an
- * exec or a turn, and live every sessions.snapshots.liveEvery while execs run, under the
+ * exec or a turn, live every sessions.snapshots.liveEvery while execs run, and as their
+ * pods are ended by other than alasio, within sessions.snapshots.stopWait, under the
  * gVisor `releases` alasio keeps (../kept-releases.ts), the
  * current one first, each restored with a RuntimeClass of its own, by the agents in
  * alasio's namespace.
@@ -193,6 +214,7 @@ function sessionSnapshots(config: InstallConfig, releases: readonly string[]): N
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
     liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
+    stopWaitSeconds: stopWaitSeconds(config),
     releases: releases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
     agents: {
       namespace: NAMESPACE,

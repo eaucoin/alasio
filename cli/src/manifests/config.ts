@@ -209,6 +209,17 @@ const Snapshots = Schema.Struct({
    * state generation is still the one it caught. A duration such as 10m.
    */
   liveEvery: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 10m")), "10m"),
+  /**
+   * How long a session's bayma holds its stop when its pod is ended by other than alasio,
+   * as a drain, a soft eviction or a deletion ends it, for alasio to snapshot it first as it
+   * releases a session (bayma's --stop-wait-ms): its pod's grace period is this and 30 s
+   * more for bayma's own stop. The node agents run as a DaemonSet, which a drain leaves in
+   * place. A stop given no grace, as a hard eviction's or a lost node's, or one alasio is not
+   * running to see, as on a single node that a drain empties of alasio too, takes no
+   * snapshot: the session comes back from its live snapshot while that still holds it, and
+   * otherwise from bayma's checkpoints. A duration such as 60s.
+   */
+  stopWait: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 60s")), "60s"),
   /** The most of snapshots each node keeps on its disk, for restores there. */
   nodeCache: defaulted(Size, "5Gi"),
   /**

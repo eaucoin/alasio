@@ -15,7 +15,7 @@ import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
 import { sessionSandboxManifest } from "../src/sandbox/index.ts";
 import { type Holdings, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { CPU_FEATURES_ANNOTATION, RESUMED_CONDITION, SESSION_TEMPLATE_ANNOTATION } from "../src/kube/sandbox-shape.ts";
-import { hookOf, makeSessionSnapshots, sessionTemplateHash } from "../src/sandbox/snapshots.ts";
+import { hookOf, makeSessionSnapshots, sessionTemplateHash, stopHookOf } from "../src/sandbox/snapshots.ts";
 
 const CURRENT = "20260921.0-eaucoin.4";
 const PREVIOUS = "20260921.0-eaucoin.3";
@@ -23,6 +23,7 @@ const PREVIOUS = "20260921.0-eaucoin.3";
 const snapshots = {
   releaseAfterSeconds: 300,
   liveEverySeconds: 600,
+  stopWaitSeconds: 60,
   releases: [{ release: CURRENT, runtimeClassName: "gvisor-20260921-0-eaucoin-4" }, { release: PREVIOUS, runtimeClassName: "gvisor-20260921-0-eaucoin-3" }],
   agents: { namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port: 8484 },
 };
@@ -755,4 +756,51 @@ test("a restore bayma refuses, its state generation moved on from the snapshot t
     "forget alasio-sessions/fs-abc123",
   ]);
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 });
+});
+
+test("a session whose pod is ending though alasio did not end it is released into a release's snapshot, within the time its bayma holds its stop; one alasio ends is not", async () => {
+  const look = async (sandboxMode: "Running" | "Suspended", hang = false) => {
+    const objects = runningOnNodeA();
+    const pod = objects.get("Pod/alasio-sessions/fs-abc123") as V1Pod;
+    pod.metadata = { ...pod.metadata, deletionTimestamp: new Date(0) };
+    const sandbox = objects.get("Sandbox/alasio-sessions/fs-abc123") as StoredSandbox;
+    sandbox.spec = { ...sandbox.spec, operatingMode: sandboxMode };
+    const base = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
+    const agents: NodeAgents = hang ? { ...base.agents, checkpoint: () => Effect.never } : base.agents;
+    const released: string[] = [];
+    const sandboxes = {
+      token: () => Effect.succeed("token"),
+      release: () => Effect.die("no session is idle"),
+      releaseStopping: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<{ readonly snapshot: string } | null, unknown>) =>
+        save(sandbox).pipe(Effect.map((saved) => (released.push(`${name} into ${saved?.snapshot ?? "none"}`), true))),
+    } as unknown as Sandboxes;
+    const counted = await added("alasio.sandbox.stop_releases", () =>
+      run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+        const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots: { ...snapshots, stopWaitSeconds: 1 }, agents, templates: templates(profile()) });
+        yield* snapshotted.watch(sandboxes, () => null);
+        yield* Effect.sleep(hang ? "1500 millis" : "100 millis");
+      })), () => ({ execsRunning: 1, execsQueued: 0, idleSinceMs: null, generation: 0 })));
+    return { released, counted, checkpoints: base.checkpoints };
+  };
+  const stopped = await look("Running");
+  assert.deepEqual(stopped.released, ["fs-abc123 into s-1"]);
+  // A release's snapshot, the sandbox ending with it, not one taken live.
+  assert.equal(stopped.checkpoints.length, 1);
+  assert.equal(stopped.checkpoints[0]?.[1].live, undefined);
+  assert.deepEqual(stopped.counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
+  // Suspended, as alasio suspends a Sandbox before it ends its pod: alasio's own stop, snapshotted already or not to be.
+  const own = await look("Suspended");
+  assert.deepEqual(own.released, []);
+  assert.deepEqual(own.checkpoints, []);
+  // A snapshot that takes longer than its bayma holds its stop: none, and the session comes back from its checkpoints.
+  const slow = await look("Running", true);
+  assert.deepEqual(slow.released, ["fs-abc123 into none"]);
+  assert.deepEqual(slow.counted, { "alasio.sandbox.stop_release.outcome=timed out": 1 });
+});
+
+test("bayma's hook is told to go on with its held stop as the hook is told its other modes", () => {
+  const [bayma] = profile().podTemplate.spec?.containers ?? [];
+  assert.ok(bayma);
+  assert.deepEqual(stopHookOf(bayma), ["node", "/opt/bayma/bayma.js", "sandbox-hook", "stop", "--state-dir", "/home/agent/.bayma"]);
+  assert.equal(stopHookOf({ name: "bayma", command: ["bayma"], args: ["mcp-http"] }), null);
 });

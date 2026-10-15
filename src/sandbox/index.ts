@@ -64,6 +64,7 @@ import {
   type SandboxOperatingMode,
   sandboxManifest,
   snapshotBinding,
+  type StoredSandbox,
 } from "../kube/sandboxes.ts";
 import { withLogScope } from "../shared/log.ts";
 import { sameToken } from "../shared/tokens.ts";
@@ -71,7 +72,7 @@ import { overLimitNote } from "../telegram/rich-media.ts";
 import type { OtlpForwarder } from "../telemetry/forward.ts";
 import { assertValidVolumeId, SessionToken } from "./names.ts";
 import { makeNodeAgents } from "./node-agents.ts";
-import { makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash } from "./snapshots.ts";
+import { makeSessionSnapshots, type SessionSnapshots, sessionTemplateHash, stopHookOf } from "./snapshots.ts";
 import { sandboxBaymaTelemetryEnv, sandboxResource } from "./telemetry.ts";
 import { serveTelemetryReceiver } from "./telemetry-receiver.ts";
 
@@ -455,6 +456,24 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
       Effect.catch((error) => Effect.logWarning(`could not look at the workspace mount of session ${volumeId}: ${error.message}`).pipe(Effect.as(null))),
     );
 
+  /**
+   * Has the session's bayma go on with the stop it would hold for a snapshot, before alasio
+   * ends its pod for its own reasons: what it cannot is said, and its stop is then held.
+   */
+  const stopNow = (sandbox: StoredSandbox): Effect.Effect<void> => {
+    const name = sandbox.metadata.name;
+    const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
+    const command = bayma ? stopHookOf(bayma) : null;
+    if (!command) return Effect.void;
+    return kube.exec(profile.namespace, name, BAYMA_CONTAINER, command).pipe(
+      Effect.timeout(MOUNT_CHECK_TIMEOUT),
+      Effect.flatMap(({ exitCode, stderr }) =>
+        exitCode === 0 ? Effect.void : Effect.logWarning(`could not have session ${name}'s bayma stop at once (exit ${exitCode}): ${stderr.trim()}`)
+      ),
+      Effect.catch((error) => Effect.logWarning(`could not have session ${name}'s bayma stop at once: ${error.message}`)),
+    );
+  };
+
   /** The fault of a session whose mount is lost: `why`, and, where alasio's JuiceFS driver runs, its mount pods removed before it resumes. */
   const lostMount = (volumeId: string, why: string): Effect.Effect<SandboxFault> => {
     const mountPodNamespace = profile.mountPodNamespace;
@@ -475,7 +494,7 @@ const makeSessionSandboxes = Effect.fnUntraced(function*({
     namespace: profile.namespace,
     port: profile.port,
     fault: brokenMount,
-    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live } : {}),
+    ...(snapshots ? { keeps: snapshots.keeps, restore: snapshots.restore, live: snapshots.live, stopNow } : {}),
   });
   /** The turns running on each session, and when its last ended. */
   const turns = new Map<string, { readonly running: number; readonly endedAt: number }>();
