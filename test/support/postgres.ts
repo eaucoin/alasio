@@ -4,7 +4,9 @@
  * initdb'd in a temporary directory and started as a child of the test process, on a free
  * port of the loopback, with password logins (SCRAM) as Neon takes them. One server per
  * test process, started by the first startPostgres and stopped, its directory removed,
- * once every database it gave is stopped; each startPostgres gets a database of its own.
+ * once every database it gave is stopped, or else as the test file's tests end, so one that
+ * failed before it stopped its database leaves no server keeping the process alive; each
+ * startPostgres gets a database of its own.
  * Roles are the server's, and so shared by the databases of one test process.
  */
 import { randomBytes } from "node:crypto";
@@ -12,6 +14,7 @@ import { mkdtempSync } from "node:fs";
 import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { after } from "node:test";
 
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
@@ -27,10 +30,20 @@ interface Server {
   readonly postgres: EmbeddedPostgres;
   readonly url: URL;
   databases: number;
+  /** Whether it was stopped as the test file's tests ended, its databases with it. */
+  ended: boolean;
 }
 
 let server: Promise<Server> | undefined;
 let databases = 0;
+
+after(async () => {
+  const left = await server?.catch(() => null);
+  server = undefined;
+  if (!left) return;
+  left.ended = true;
+  await left.postgres.stop();
+});
 
 /** A port of the loopback no one listens on now. */
 async function freePort(): Promise<number> {
@@ -58,7 +71,7 @@ async function startServer(): Promise<Server> {
   });
   await postgres.initialise();
   await postgres.start();
-  return { postgres, url: new URL(`postgresql://postgres:${password}@127.0.0.1:${port}/postgres`), databases: 0 };
+  return { postgres, url: new URL(`postgresql://postgres:${password}@127.0.0.1:${port}/postgres`), databases: 0, ended: false };
 }
 
 /** Runs `sql` on the server's own database, as its superuser. */
@@ -88,6 +101,7 @@ export async function startPostgres(): Promise<TestPostgres> {
   return {
     url: url.toString(),
     stop: async () => {
+      if (running.ended) return;
       await onServer(running, `drop database ${name} with (force)`);
       if (--running.databases > 0) return;
       server = undefined;
