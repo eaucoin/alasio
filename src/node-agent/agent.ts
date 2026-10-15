@@ -40,7 +40,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isIP, isIPv6 } from "node:net";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, posix, relative } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import type { BatchObservableResult } from "@opentelemetry/api";
@@ -55,6 +55,7 @@ import { egressGap, type PodAddress } from "./kube-router.ts";
 import { runscVersion } from "./names.ts";
 import type { ReleaseNotInstalled, Runsc, RunscError, RunningContainer } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
+import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
 /** An environment's or a workspace's name: a DNS label, as their namespaces' and Sandboxes' names are. */
 const Name = Schema.String.check(Schema.isPattern(NAME));
@@ -71,6 +72,26 @@ const Release = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]
  * however a bucket's manifest writes it.
  */
 const ImagePath = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u), Schema.isMaxLength(1024));
+
+/** An ID of bayma's, a session's or an exec's, as bayma makes them. */
+const BaymaId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u));
+
+/** An absolute path, of names, none of them `.` or `..`. */
+const AbsolutePath = Schema.String.check(
+  Schema.isPattern(/^(\/[^/\0]+)+$/u),
+  Schema.makeFilter((path) => path.split("/").every((name) => name !== "." && name !== "..") || "must name no . or .."),
+);
+
+/**
+ * The execs that ran in a sandbox saved live, each by its session's and its own ID, and
+ * the state directory, in the container, of the bayma that ran them: the snapshot holds
+ * what the sandbox is only while each runs on, as bayma's history there says.
+ */
+export const During = Schema.Struct({
+  stateDir: AbsolutePath,
+  execs: Schema.Array(Schema.Struct({ sessionId: BaymaId, execId: BaymaId })).check(Schema.isMinLength(1)),
+});
+export type During = typeof During.Type;
 
 /** A count of bytes, or of milliseconds. */
 const Count = Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0));
@@ -111,6 +132,8 @@ export const Manifest = Schema.Struct({
   pauseMs: Count,
   /** How long its image took to upload. */
   uploadMs: Count,
+  /** For a snapshot taken live, the execs it caught running, while each of which it holds the session alone. */
+  during: Schema.optional(During),
 }).check(Schema.makeFilter((manifest) => manifest.bytes === bytesOf(manifest.layers) || "its bytes must be its images' together"));
 export type Manifest = typeof Manifest.Type;
 
@@ -145,6 +168,8 @@ export const CheckpointRequest = Schema.Struct({
   /** The program run in the container before the save: its arguments, none holding whitespace, as runsc splits them at spaces. */
   hook: Schema.Array(Schema.String.check(Schema.isPattern(/^\S+$/u))).check(Schema.isMinLength(1)),
   podTemplate: Schema.Record(Schema.String, Schema.Unknown),
+  /** The execs running as the sandbox is saved live, which runs on: none at a release, which ends it. */
+  during: Schema.optional(During),
 });
 export type CheckpointRequest = typeof CheckpointRequest.Type;
 
@@ -222,6 +247,21 @@ export class CheckpointFailed extends Schema.TaggedError<CheckpointFailed>()("Ch
 }
 
 /**
+ * A sandbox restored from a snapshot taken live is not let run, its snapshot holding the
+ * session no more: an exec it caught has ended since, or whether one has cannot be told.
+ */
+export class SnapshotOutlived extends Schema.TaggedError<SnapshotOutlived>()("SnapshotOutlived", {
+  environment: Schema.String,
+  workspace: Schema.String,
+  snapshot: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the snapshot ${this.snapshot} of ${this.environment}/${this.workspace}, taken live, holds the session no more: ${this.reason}; its sandbox is left paused`;
+  }
+}
+
+/**
  * How long a resume waits for a restored pod's network policies to be in force on its
  * node. kube-router syncs as the pod gets its address, a sync of the node's whole filter
  * table, which takes it well under a second on the nodes alasio makes; one that has not
@@ -258,7 +298,7 @@ export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()
 export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError;
 
 /** How resuming a sandbox fails. */
-export type ResumeError = PoliciesNotInForce | ContainerElsewhere | HostCommandError | RunscError | ReleaseNotInstalled;
+export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
 
 /** What a node agent does; see makeNodeAgent. */
 export interface NodeAgent {
@@ -270,8 +310,12 @@ export interface NodeAgent {
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, S3Error | SnapshotCorrupt>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. One that fails as it writes leaves `to` without a snapshot. */
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NoSnapshot | SnapshotCorrupt | S3Error | CacheError>;
-  /** Makes the workspace's current snapshot, which its sandbox was restored from, current no more: its images go on as the layers of its next. */
-  readonly spend: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error>;
+  /**
+   * Makes the workspace's current snapshot current no more, if it is `snapshot` still: one
+   * its sandbox was restored from, or one taken live whose exec has ended. Its images go on
+   * as the layers of its next.
+   */
+  readonly spend: (workspace: WorkspaceRef, snapshot: string) => Effect.Effect<void, S3Error | SnapshotCorrupt>;
   /** Forgets the workspace's snapshots, in the bucket and in the cache. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, S3Error | CacheError>;
   /** Collects what of the workspace's in the bucket no snapshot needs any more, as the module says: the digests of the images it keeps. */
@@ -285,9 +329,13 @@ export interface NodeAgent {
   readonly holdings: Effect.Effect<Holdings, RunscError | ReleaseNotInstalled | CacheError>;
 }
 
-/** What makeNodeAgent is given: this node's name, its releases, its cache, the bucket, and the commands it runs on the node. */
+/**
+ * What makeNodeAgent is given: this node's name, its releases, its cache, the bucket, the
+ * commands it runs on the node, and where it sees the node's filesystem.
+ */
 export interface NodeAgentOptions {
   readonly node: string;
+  readonly nodeRoot: string;
   readonly runsc: Runsc;
   readonly cache: SnapshotCache;
   readonly bucket: S3Bucket;
@@ -305,6 +353,22 @@ export const CURRENT_FILE = "current.json";
  * a restore or a copy reads the images of a manifest it read, and than a commit takes.
  */
 export const COLLECT_GRACE_MS = 60 * 60_000;
+/**
+ * The most of a session's history in bayma's state directory the agent reads, as it tells
+ * whether an exec a live snapshot caught runs on: one larger is not read, and the snapshot
+ * is refused.
+ */
+export const HISTORY_BYTES = 64 * 1024 * 1024;
+/**
+ * What the agent reads of a session's history in bayma's state directory: each exec's ID
+ * and status, one running on being "running" still. Anything else there is bayma's own.
+ */
+const History = Schema.fromJsonString(Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  history: Schema.Array(Schema.Struct({ execId: BaymaId, status: Schema.String })),
+}));
+/** How the agent reads a history's bytes as text: those that are not UTF-8 fail it. */
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
 /** How long the hook may take to ready the sandbox for its save. */
 const HOOK_TIMEOUT = "30s";
 /** How often the cache is looked at for what to evict, besides as checkpoints and prepares write to it. */
@@ -404,7 +468,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
   /**
    * The snapshot each sandbox running on this node, by the container checkpoints name, was
@@ -550,7 +614,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
    */
   const take = (request: CheckpointRequest): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | ContainerElsewhere | S3Error | CacheError | SnapshotCorrupt> =>
     Effect.gen(function*() {
-      const { environment, workspace, containerId, hook, podTemplate } = request;
+      const { environment, workspace, containerId, podTemplate } = request;
       const { release, tracksWrites } = yield* ofPod(containerId, request.namespace, request.pod);
       const takenAt = yield* Clock.currentTimeMillis;
       const snapshot = snapshotId(takenAt);
@@ -560,12 +624,24 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot, "alasio.snapshot.parent": parent?.snapshot ?? "" });
       yield* cache.room(memoryLimitOf(podTemplate), request).pipe(Effect.flatMap(logEvicted));
       const staged = yield* cache.stage(environment, workspace, snapshot);
+      return yield* commit(request, snapshot, takenAt, staged, parent, release);
+    });
+
+  /**
+   * Saves the sandbox `request` names into `staged`, a delta of `parent`'s image if given,
+   * and commits it as the snapshot `snapshot`: its manifest. What it staged goes if it fails.
+   */
+  const commit = (request: CheckpointRequest, snapshot: string, takenAt: number, staged: string, parent: Manifest | null, release: string): Effect.Effect<Manifest, RunscError | ReleaseNotInstalled | S3Error | CacheError | SnapshotCorrupt> =>
+    Effect.gen(function*() {
+      const { environment, workspace, containerId, hook, podTemplate, during } = request;
+      const [own] = parent?.layers ?? [];
       const [pauseMs] = yield* timed(runsc.checkpoint(release, {
         containerId,
         imagePath: staged,
         hook,
         hookTimeout: HOOK_TIMEOUT,
-        ...(parent === null || own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
+        ...(own === undefined ? {} : { parentImagePath: cache.image(environment, workspace, own.digest) }),
+        live: during !== undefined,
       }));
       const image = yield* runsc.inspect(release, staged);
       if (image.version !== runscVersion(release)) {
@@ -596,12 +672,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         takenAt: new Date(takenAt).toISOString(),
         pauseMs,
         uploadMs,
+        ...(during === undefined ? {} : { during }),
       };
       yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
       yield* bucket.putJson(manifestKey(request, snapshot), manifest);
       yield* bucket.putJson(`${prefixOf(request)}/${CURRENT_FILE}`, manifest);
       return manifest;
-    });
+    }).pipe(Effect.onError(() => cache.unstage(request.environment, request.workspace, snapshot).pipe(Effect.ignore)));
 
   /** Says which workspaces were evicted from the node's cache. */
   const logEvicted = (evicted: readonly CachedWorkspace[]) =>
@@ -613,10 +690,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
   const checkpoint = (request: CheckpointRequest): Effect.Effect<Manifest, CheckpointFailed> => {
     const failed = (reason: string) => new CheckpointFailed({ environment: request.environment, workspace: request.workspace, reason });
     const moved = "as the workspace has moved on since it was taken";
-    return exclusive(
-      [request],
-      take(request).pipe(
-        Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))),
+    const taken = take(request).pipe(Effect.tapError((error) => Effect.sync(() => checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": error._tag }))));
+    const committed = request.during === undefined
+      ? taken.pipe(
         Effect.catch((error) =>
           forgetNow(request).pipe(
             Effect.matchEffect({
@@ -628,9 +704,15 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
         Effect.onInterrupt(() => forgetNow(request).pipe(Effect.ignore)),
         // The sandbox it saved ended.
         Effect.ensuring(Effect.sync(() => bases.delete(request.containerId))),
-        Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
-      ),
-    ).pipe(
+      )
+      : taken.pipe(
+        // The sandbox runs on from the image it was saved to, which its next checkpoint saves what changed since.
+        Effect.tap((manifest) => Effect.sync(() => bases.set(request.containerId, manifest))),
+        // What runsc saved of the writes since its base, which the next would build on, is gone with it.
+        Effect.tapError(() => Effect.sync(() => bases.delete(request.containerId))),
+        Effect.mapError((error) => failed(`${error.message}; its snapshot is kept, as a live checkpoint that fails changes nothing`)),
+      );
+    return exclusive([request], committed.pipe(Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))))).pipe(
       Effect.tap((manifest) =>
         Effect.sync(() => {
           pauses.record(manifest.pauseMs / 1000);
@@ -639,11 +721,11 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
           checkpoints.add(1, { "alasio.node_agent.checkpoint.outcome": "taken" });
         }).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.pause_ms": manifest.pauseMs, "alasio.snapshot.upload_ms": manifest.uploadMs })),
-          Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
+          Effect.andThen(Effect.logInfo(`took the snapshot ${manifest.snapshot} of ${prefixOf(manifest)}${manifest.during === undefined ? "" : " live"}: ${manifest.bytes} bytes, paused ${manifest.pauseMs} ms, uploaded in ${manifest.uploadMs} ms`)),
         )
       ),
       Effect.tapError((error) => Effect.logWarning(error.message)),
-      withAlasioSpan("alasio.node_agent.checkpoint", { attributes: spanAttributes(request) }),
+      withAlasioSpan("alasio.node_agent.checkpoint", { attributes: { ...spanAttributes(request), "alasio.snapshot.live": request.during !== undefined } }),
     );
   };
 
@@ -831,16 +913,63 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
       ({ exitCode, stderr }) => exitCode === 0 || (exitCode === 1 && stderr.includes("0 flow entries have been deleted")),
     ).pipe(Effect.asVoid);
 
+  /**
+   * The manifest of the snapshot this node's cache last took or prepared of the workspace,
+   * as it keeps it beside its images, for a resume an agent started since its prepare runs:
+   * null where it holds none, or one that is no manifest of the workspace's.
+   */
+  const lastCached = (ref: WorkspaceRef): Effect.Effect<Manifest | null> =>
+    Effect.promise(() => readFile(join(cache.workspace(ref.environment, ref.workspace), MANIFEST_FILE), "utf8").catch(() => null)).pipe(
+      Effect.flatMap((text) => (text === null ? Effect.succeed(null) : Schema.decodeUnknownEffect(Schema.fromJsonString(Manifest))(text))),
+      Effect.map((manifest) => (manifest !== null && prefixOf(manifest) === prefixOf(ref) ? manifest : null)),
+      Effect.orElseSucceed(() => null),
+    );
+
+  /**
+   * Whether `manifest`, taken live, holds the session still, a restored sandbox let run from
+   * it: each exec it caught runs on, as bayma's history in its state directory says, read
+   * on the volume of the pod's containers that holds it, as an untrusted file
+   * (./volume.ts). Fails where one has ended, or where that cannot be told.
+   */
+  const holdsStill = (manifest: Manifest, during: During, containers: readonly RunningContainer[]): Effect.Effect<void, SnapshotOutlived> =>
+    Effect.forEach(during.execs, ({ sessionId, execId }) =>
+      Effect.tryPromise({
+        try: async () => {
+          const path = posix.join(during.stateDir, "histories", `${sessionId}.json`);
+          const held = (await Promise.all(containers.map(({ bundle }) => hostPathOf(nodeRoot, bundle, path)))).find((found): found is UnderRoot => found !== null);
+          if (held === undefined) throw new Error(`no volume of its pod holds ${path}`);
+          const bytes = await readUnder(held, HISTORY_BYTES);
+          const { history } = (() => {
+            try {
+              return Schema.decodeUnknownSync(History)(UTF8.decode(bytes));
+            } catch (error) {
+              throw new Error(`${path} is no history of bayma's: ${(error instanceof Error ? error.message : String(error)).replace(/\s*\n\s*/gu, " ")}`);
+            }
+          })();
+          const exec = history.find((record) => record.execId === execId);
+          if (exec === undefined) throw new Error(`${path} names no exec ${execId}`);
+          if (exec.status !== "running") throw new Error(`the exec ${execId} of the session ${sessionId} has ended since, ${exec.status}`);
+        },
+        catch: (cause) =>
+          new SnapshotOutlived({
+            environment: manifest.environment,
+            workspace: manifest.workspace,
+            snapshot: manifest.snapshot,
+            reason: cause instanceof Error ? cause.message : String(cause),
+          }),
+      }), { discard: true });
+
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
       const waited = yield* policiesInForce(request);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
+      const restoredFrom = prepared.get(prefixOf(request)) ?? (yield* lastCached(request));
+      if (restoredFrom?.during !== undefined) yield* holdsStill(restoredFrom, restoredFrom.during, containers);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
       // Its sandbox runs from the snapshot prepared of it, which its next checkpoint saves what changed since.
-      const restoredFrom = prepared.get(prefixOf(request));
-      if (restoredFrom !== undefined) for (const id of request.containerIds) bases.set(id, restoredFrom);
+      if (restoredFrom !== null) for (const id of request.containerIds) bases.set(id, restoredFrom);
       return waited;
     }).pipe(
       Effect.tap((waited) =>
@@ -874,9 +1003,15 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, runsc, cache, b
     prepare: (ref) => prepare(ref).pipe(withLogScope("node-agent")),
     current,
     copy: (from, to) => copy(from, to).pipe(withLogScope("node-agent")),
-    spend: (ref) =>
-      exclusive([ref], bucket.remove(`${prefixOf(ref)}/${CURRENT_FILE}`)).pipe(
-        Effect.tap(() => Effect.logInfo(`the snapshot of ${prefixOf(ref)} is spent, its sandbox restored from it`)),
+    spend: (ref, snapshot) =>
+      exclusive(
+        [ref],
+        current(ref).pipe(
+          Effect.flatMap((manifest) => (manifest?.snapshot === snapshot ? bucket.remove(`${prefixOf(ref)}/${CURRENT_FILE}`).pipe(Effect.as(true)) : Effect.succeed(false))),
+        ),
+      ).pipe(
+        Effect.tap((spent) => (spent ? Effect.logInfo(`the snapshot ${snapshot} of ${prefixOf(ref)} is spent`) : Effect.void)),
+        Effect.asVoid,
         withAlasioSpan("alasio.node_agent.spend", { attributes: spanAttributes(ref) }),
         withLogScope("node-agent"),
       ),

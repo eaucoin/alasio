@@ -76,6 +76,8 @@ export interface SnapshotCache {
   readonly image: (environment: string, workspace: string, digest: string) => string;
   /** Where an image is written until it is whole and its digest known, `name` the snapshot it is of, emptied first. */
   readonly stage: (environment: string, workspace: string, name: string) => Effect.Effect<string, CacheError>;
+  /** Removes the image staged as `name`, as a save that failed left it. */
+  readonly unstage: (environment: string, workspace: string, name: string) => Effect.Effect<void, CacheError>;
   /** Moves the image staged as `name` where an image of `digest` is, the workspace used now; one there already is kept, the staged one removed. */
   readonly commit: (environment: string, workspace: string, name: string, digest: string) => Effect.Effect<void, CacheError>;
   /** Whether the image `digest` of the workspace is whole in the cache. */
@@ -195,6 +197,11 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         await rm(directory, { recursive: true, force: true });
         await mkdir(directory, { recursive: true });
       }).pipe(Effect.as(directory));
+    },
+
+    unstage: (environment, workspace, name) => {
+      checked(environment, workspace, name);
+      return attempt(() => rm(join(workspaceDir(environment, workspace), LAYERS_DIR, staged(name)), { recursive: true, force: true }));
     },
 
     commit: (environment, workspace, name, digest) => {
