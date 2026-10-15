@@ -358,7 +358,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
             }),
             // The session moves on from it; its images go on as the layers of its next.
             Effect.andThen(
-              agents.spend(ref(name)).pipe(
+              agents.spend(ref(name), manifest.snapshot).pipe(
                 Effect.catch((error) => Effect.logWarning(`could not spend the snapshot of session ${name}, which runs on from it: ${error.message}`)),
               ),
             ),

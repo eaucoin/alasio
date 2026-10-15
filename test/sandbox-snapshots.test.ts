@@ -111,7 +111,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
     copy: () => Effect.die("nothing is copied"),
     forget: (workspace) => Effect.sync(() => void asked.push(`forget ${workspace.environment}/${workspace.workspace}`)),
-    spend: (workspace) => Effect.sync(() => void asked.push(`spend ${workspace.environment}/${workspace.workspace}`)),
+    spend: (workspace, snapshot) => Effect.sync(() => void asked.push(`spend ${workspace.environment}/${workspace.workspace} ${snapshot}`)),
     collect: (workspace) =>
       Effect.sync(() => {
         asked.push(`collect ${workspace.environment}/${workspace.workspace}`);
@@ -233,7 +233,7 @@ test("a session with a snapshot on the current template is restored on a node th
   });
   assert.deepEqual(timed, { "": 1 });
   // Its images go on as the layers of the next.
-  assert.deepEqual(asked.slice(2), ["spend alasio-sessions/fs-abc123"]);
+  assert.deepEqual(asked.slice(2), ["spend alasio-sessions/fs-abc123 s-1"]);
 });
 
 test("a restored pod is let run once its containers run, by its node's agent, then made ready; one that ends, or that the agent does not resume, is refused", async () => {

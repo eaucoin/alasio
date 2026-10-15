@@ -72,8 +72,12 @@ export interface NodeAgents {
   readonly copy: (from: WorkspaceRef, to: WorkspaceRef) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
   /** Forgets the workspace's snapshots. */
   readonly forget: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
-  /** Makes the workspace's current snapshot, which its sandbox was restored from, current no more, its images the layers of its next. */
-  readonly spend: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /**
+   * Makes the workspace's current snapshot current no more, if it is `snapshot` still: one
+   * its sandbox was restored from, or one taken live whose exec has ended. Its images go on
+   * as the layers of its next.
+   */
+  readonly spend: (workspace: WorkspaceRef, snapshot: string) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** Collects what of the workspace's in the bucket no snapshot needs any more: the digests of the images kept. */
   readonly collect: (workspace: WorkspaceRef) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
@@ -213,9 +217,13 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       Effect.flatMap(anyNode, (node) => send(node, `forget ${workspace.environment}/${workspace.workspace}'s snapshots`, { method: "DELETE", path: snapshotPath(workspace), timeout: SHORT_CALL })).pipe(
         Effect.asVoid,
       ),
-    spend: (workspace) =>
+    spend: (workspace, snapshot) =>
       Effect.flatMap(anyNode, (node) =>
-        send(node, `spend ${workspace.environment}/${workspace.workspace}'s snapshot`, { method: "DELETE", path: `${snapshotPath(workspace)}/current`, timeout: SHORT_CALL })).pipe(
+        send(node, `spend ${workspace.environment}/${workspace.workspace}'s snapshot ${snapshot}`, {
+          method: "DELETE",
+          path: `${snapshotPath(workspace)}/current?snapshot=${encodeURIComponent(snapshot)}`,
+          timeout: SHORT_CALL,
+        })).pipe(
           Effect.asVoid,
         ),
     collect: (workspace) =>
