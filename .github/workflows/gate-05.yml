@@ -1,0 +1,35 @@
+name: gate-05
+
+# 05's gate (gate/05/readers.ts), on its track's branch alone, whenever what it runs
+# changes: two of the lake's query endpoints reading a lake of the box's shape at once.
+on:
+  push:
+    branches: [track/lake-split-gate]
+    paths: [.github/workflows/gate-05.yml, gate/05/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix neon/lake
+      - run: node gate/05/readers.ts
+        env:
+          GATE_OUT: ${{ runner.temp }}/gate-05
+      - if: always()
+        run: cat "$RUNNER_TEMP/gate-05/readers.md" >>"$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-05
+          path: ${{ runner.temp }}/gate-05
