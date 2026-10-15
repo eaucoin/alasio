@@ -442,6 +442,17 @@ test("a session is restored only from the snapshot its Sandbox was released into
     }));
   };
   assert.ok((await restore("s-1")).plan);
+  // One its node's agent compacted from that one since is the same snapshot, restored, and spent, as itself.
+  const compacted = fakeAgents({ current: { ...manifestOf(desired.spec.podTemplate), snapshot: "s-2", compactedFrom: "s-1" }, holdings: [node("node-a", [CURRENT])] });
+  const fromCompacted = await run(fakeKube(), Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents: compacted.agents, templates: templates(profile()) });
+    const plan = yield* snapshotted.restore(stored(desired, "Suspended", "s-1"), desired);
+    assert.ok(plan && "podTemplate" in plan);
+    yield* plan.restored;
+    return plan.snapshot;
+  }));
+  assert.deepEqual(fromCompacted, { snapshot: "s-2", release: CURRENT });
+  assert.deepEqual(compacted.asked.slice(1), ["spend alasio-sessions/fs-abc123 s-2"]);
   for (const bound of [null, "s-0"]) {
     const fallbacks = await added("alasio.sandbox.restores", async () => {
       const { plan, asked } = await restore(bound);

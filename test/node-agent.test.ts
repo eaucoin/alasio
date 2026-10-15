@@ -10,7 +10,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, type PathLike, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -27,10 +28,12 @@ import {
   type AbandonRequest,
   type CheckpointRequest,
   COLLECT_GRACE_MS,
+  compactionDue,
   type Killed,
   type Layer as Image,
   makeNodeAgent,
   type Manifest,
+  MAX_CHAIN_DEPTH,
   memoryLimitOf,
   type NodeAgent,
   PoliciesNotInForce,
@@ -39,7 +42,7 @@ import {
   STATE_FILE_BYTES,
   STATE_READ_TIMEOUT_MS,
 } from "../src/node-agent/agent.ts";
-import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache } from "../src/node-agent/cache.ts";
+import { makeSnapshotCache, RESERVE_BYTES, type SnapshotCache, type Spared } from "../src/node-agent/cache.ts";
 import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "../src/node-agent/host.ts";
 import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
@@ -51,6 +54,9 @@ import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
+
+/** node:fs as CommonJS has it, whose exports node:fs's ESM ones are synced to (syncBuiltinESMExports). */
+const builtinFs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
 
 const RELEASE = "20260921.0-eaucoin.3";
 const CONTAINER = "0123456789abcdef".repeat(4);
@@ -203,6 +209,31 @@ const filesOf = (directory: string) =>
     const data = readFileSync(join(directory, path));
     return { path, bytes: data.length, sha256: sha256(data), etag: `"${md5(data)}"` };
   });
+
+/**
+ * What `effect` comes to, and the files under `directory` the process opened to read as a
+ * stream as it ran, as the agent reads an image's files to hash them: node:fs's
+ * createReadStream, which the agent's modules import, wrapped meanwhile.
+ */
+const readsUnder = <A, E>(directory: string, effect: Effect.Effect<A, E>): Effect.Effect<string[], E> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const opened: string[] = [];
+      const original = builtinFs.createReadStream;
+      builtinFs.createReadStream = ((path: PathLike, ...rest: never[]) => {
+        if (String(path).startsWith(`${directory}/`)) opened.push(String(path));
+        return original(path, ...rest);
+      }) as typeof original;
+      syncBuiltinESMExports();
+      return { opened, original };
+    }),
+    ({ opened }) => effect.pipe(Effect.as(opened)),
+    ({ original }) =>
+      Effect.sync(() => {
+        builtinFs.createReadStream = original;
+        syncBuiltinESMExports();
+      }),
+  );
 
 /** The bucket's keys under a prefix. */
 const keysOf = (s3: FakeS3, prefix: string): string[] => [...s3.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
@@ -380,6 +411,249 @@ test("a cached image that is not what its manifest says is read again from the b
       assert.deepEqual(manifest, base);
     })
   ));
+
+test("a prepared snapshot is verified by runsc, its images read again from the bucket where those the cache held fail it, and refused where those fail it too", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      const base = yield* taker.agent.checkpoint(request("fs-abc"));
+      const [baseImage] = base.layers;
+      assert.ok(baseImage);
+      const there = yield* node("node-2");
+      const { manifest } = yield* there.agent.prepare(workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest());
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      const [own] = delta.layers;
+      assert.ok(own);
+      const verified = () => there.releases.calls(RELEASE).filter((args) => args.includes("verify"));
+      // Prepared from the cache, verified there.
+      const prepared = yield* there.agent.prepare(workspace);
+      assert.deepEqual(verified().at(-1)?.slice(-3), ["image", "verify", prepared.imagePath]);
+      // Its base's pages metadata changed in place as its stamp does not see, its size and times kept, as a disk that rots changes it.
+      const meta = join(there.cacheDir, "main", "fs-abc", "layers", baseImage.digest, "pages_meta.img");
+      const written = readFileSync(meta, "utf8");
+      writeFileSync(meta, written.replace(/"state":"(.)/u, (_, first: string) => `"state":"${first === "0" ? "1" : "0"}`));
+      yield* there.cache.stamp("main", "fs-abc", baseImage.digest, baseImage.files);
+      const asked = s3.requests.length;
+      assert.deepEqual(yield* there.agent.prepare(workspace), prepared);
+      const downloaded = s3.requests.slice(asked).filter((each) => each.startsWith("GET main/fs-abc/layers/"));
+      assert.deepEqual(downloaded.toSorted(), [own, baseImage].flatMap(({ digest, files }) => files.map(({ path }) => `GET main/fs-abc/layers/${digest}/${path}`)).toSorted());
+      assert.equal(readFileSync(meta, "utf8"), written);
+      // What runsc does not verify, read from the bucket, is no snapshot to restore, and goes from the cache.
+      writeFileSync(join(there.releases.dirOf(RELEASE), "fail-verify"), "");
+      assert.match(failure(yield* Effect.exit(there.agent.prepare(workspace))), /^the snapshot of main\/fs-abc is corrupt: runsc does not verify its image: runsc image verify of [^ ]+ failed: verify failed: /u);
+      assert.equal(cachesAny(there, "fs-abc"), false);
+    })
+  ));
+
+/** An image of `bytes` bytes, in one file, as a manifest says it. */
+const imageOf = (digit: string, bytes: number): Image => ({ digest: digit.repeat(64), files: [{ path: "pages.img", bytes, sha256: "0".repeat(64), etag: '"0"' }] });
+
+test("a snapshot is compacted once its deltas together are as large as its base, one is more than half of it, or it reads from more than 16 images", () => {
+  const base = imageOf("a", 4096);
+  assert.equal(compactionDue([base]), null);
+  assert.equal(compactionDue([imageOf("b", 512), base, imageOf("c", 512)]), null);
+  // Its base is its largest image, wherever runsc lists it.
+  assert.equal(compactionDue([imageOf("b", 2048), imageOf("c", 2048), base]), "its deltas are 4096 bytes together, as large as its base's 4096");
+  assert.equal(compactionDue([base, imageOf("b", 2049)]), "a delta of 2049 bytes is more than half its base's 4096");
+  assert.equal(compactionDue([base, imageOf("b", 2048)]), null);
+  const deep = [base, ...Array.from({ length: MAX_CHAIN_DEPTH }, (_, index) => imageOf(index.toString(16), 1))];
+  assert.equal(compactionDue(deep.slice(0, MAX_CHAIN_DEPTH)), null);
+  assert.equal(compactionDue(deep), "it reads from 17 images, more than 16");
+  // With an image to be added to it, as a delta about to be taken would be: it counts to its depth alone.
+  assert.equal(compactionDue(deep.slice(0, MAX_CHAIN_DEPTH - 1), 1), null);
+  assert.equal(compactionDue(deep.slice(0, MAX_CHAIN_DEPTH), 1), "it reads from 17 images, more than 16");
+  assert.equal(compactionDue([base], 1), null);
+  assert.equal(compactionDue([base, imageOf("b", 2048), imageOf("c", 2048)], 1), "its deltas are 4096 bytes together, as large as its base's 4096");
+});
+
+test("a snapshot taken live is taken whole where a delta of its parent would make a chain due to be compacted, so the chain of a sandbox saved live as long as it runs is bounded", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+      mkdirSync(join(volume, ".bayma"));
+      writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+      const here = yield* node("node-1");
+      here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+      // Saved live every so often as its exec runs on, each save's delta of 512 bytes, its base 4096.
+      const taken: Manifest[] = [];
+      for (let count = 0; count < 12; count++) taken.push(yield* here.agent.checkpoint(live("fs-abc")));
+      const cut = taken.findIndex(({ layers }, index) => index > 0 && layers.length === 1);
+      assert.ok(cut > 1, `no snapshot was taken whole: ${taken.map(({ layers }) => layers.length).join(", ")}`);
+      // Each a delta of the one before, until a delta of the last would make a chain due, as the one cut is.
+      for (const [index, { layers }] of taken.slice(0, cut).entries()) assert.deepEqual(layers.slice(1), taken[index - 1]?.layers ?? []);
+      assert.equal(compactionDue(taken[cut - 2]?.layers ?? [], 1), null);
+      assert.notEqual(compactionDue(taken[cut - 1]?.layers ?? [], 1), null);
+      // The one after is a delta of the one taken whole.
+      assert.deepEqual(taken[cut + 1]?.layers.slice(1), taken[cut]?.layers);
+      assert.ok(taken.every(({ layers }) => layers.length <= MAX_CHAIN_DEPTH));
+    })
+  ));
+
+/** The workspace's current snapshot, once it is one compacted from `from`. */
+const compactedFrom = (agent: NodeAgent, from: string) =>
+  agent.current({ environment: "main", workspace: "fs-abc" }).pipe(
+    Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (manifest) => manifest?.compactedFrom === from }),
+    Effect.timeout("10 seconds"),
+  );
+
+test("a release's snapshot whose chain is due is compacted into one image, at the node's lowest priority, which becomes current and the next delta's base", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ s3, node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const taker = yield* node("node-1");
+        yield* taker.agent.checkpoint(request("fs-abc"));
+        const there = yield* node("node-2");
+        const restored = () =>
+          Effect.gen(function*() {
+            const { manifest } = yield* there.agent.prepare(workspace);
+            yield* there.agent.spend(workspace, manifest.snapshot);
+            yield* there.agent.resume(resumeRequest());
+          });
+        yield* restored();
+        // The sandbox wrote over as much as its base holds.
+        writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
+        const delta = yield* there.agent.checkpoint(request("fs-abc"));
+        assert.equal(delta.layers.length, 2);
+        const compacted = yield* compactedFrom(there.agent, delta.snapshot);
+        assert.ok(compacted);
+        const [own] = delta.layers;
+        assert.ok(own);
+        const layersDir = join(there.cacheDir, "main", "fs-abc", "layers");
+        const staged = join(layersDir, `.${compacted.snapshot}`);
+        assert.deepEqual(there.releases.calls(RELEASE).find((args) => args.includes("compact")), [
+          `--root=${RUNSC_ROOT}`,
+          "--systemd-cgroup=true",
+          "image",
+          "compact",
+          `--output=${staged}`,
+          `--layer-path=${layersDir}`,
+          "--working-set-first",
+          join(layersDir, own.digest),
+        ]);
+        assert.equal(readFileSync(join(there.releases.dirOf(RELEASE), "compact-priority"), "utf8"), "19");
+        // One image, of the delta's memory and its base's, in place of both; the same sandbox at the same moment.
+        const [image] = compacted.layers;
+        assert.ok(image);
+        assert.equal(compacted.layers.length, 1);
+        assert.equal(image.files.find(({ path }) => path === "pages.img")?.bytes, 8192);
+        assert.ok(compacted.snapshot > delta.snapshot);
+        const { snapshot: _snapshot, layers: _layers, bytes, uploadMs: _uploadMs, compactedFrom: from, ...same } = compacted;
+        const { snapshot: _from, layers: _chain, bytes: _bytes, uploadMs: _taken, ...was } = delta;
+        assert.deepEqual(same, was);
+        assert.equal(from, delta.snapshot);
+        assert.equal(bytes, image.files.reduce((sum, file) => sum + file.bytes, 0));
+        assert.deepEqual(filesOf(join(layersDir, image.digest)), image.files);
+        // Committed as a checkpoint commits: the delta's manifest kept beside it, which a restore that read it reads within the grace.
+        assert.deepEqual(JSON.parse(s3.objects.get(`main/fs-abc/manifests/${compacted.snapshot}.json`)?.toString() ?? ""), compacted);
+        assert.ok(s3.objects.has(`main/fs-abc/manifests/${delta.snapshot}.json`));
+        assert.deepEqual(JSON.parse(readFileSync(join(there.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), compacted);
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        // Restored elsewhere, it reads one image; the next delta of the sandbox restored is of that image.
+        const third = yield* node("node-3");
+        const prepared = yield* third.agent.prepare(workspace);
+        assert.deepEqual(readdirSync(join(prepared.imagePath, "layers")), []);
+        writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "512");
+        yield* restored();
+        const next = yield* there.agent.checkpoint(request("fs-abc"));
+        assert.deepEqual(next.layers.slice(1).map(({ digest }) => digest), [image.digest]);
+        assert.ok(there.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"))?.includes(`--parent-image-path=${join(layersDir, image.digest)}`));
+        // Small, it is not compacted.
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(yield* there.agent.current(workspace), next);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=compacted": 1 })));
+
+test("a spend of a snapshot spends the one compacted from it, which a compaction committed as its restore ran, and a collection keeps what it holds while the compacted one is the latest", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1");
+      yield* taker.agent.checkpoint(request("fs-abc"));
+      const there = yield* node("node-2");
+      const { manifest } = yield* there.agent.prepare(workspace);
+      yield* there.agent.spend(workspace, manifest.snapshot);
+      yield* there.agent.resume(resumeRequest());
+      writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
+      const delta = yield* there.agent.checkpoint(request("fs-abc"));
+      // A restore reads the delta as current, and prepares it; meanwhile its compaction commits.
+      const third = yield* node("node-3");
+      const restoring = yield* third.agent.prepare(workspace);
+      assert.equal(restoring.manifest.snapshot, delta.snapshot);
+      const compacted = yield* compactedFrom(there.agent, delta.snapshot);
+      assert.ok(compacted);
+      // The restore's spend of the delta spends the snapshot compacted from it, the same, which a later restore would read stale.
+      yield* third.agent.spend(workspace, delta.snapshot);
+      assert.equal(yield* there.agent.current(workspace), null);
+      // Its sandbox runs on from the delta, which its next delta refers to: kept by a collection however long ago it was superseded.
+      const longAgo = Date.now() - COLLECT_GRACE_MS - 1000;
+      for (const key of keysOf(s3, "main/fs-abc/")) s3.writtenAt.set(key, longAgo);
+      const kept = yield* there.agent.collect(workspace);
+      assert.deepEqual(kept, [...new Set([...delta.layers, ...compacted.layers].map(({ digest }) => digest))].sort());
+      for (const { digest, files } of delta.layers) for (const { path } of files) assert.ok(s3.objects.has(`main/fs-abc/layers/${digest}/${path}`), `${digest}/${path} was collected`);
+    })
+  ));
+
+test("a compaction the workspace moves on from meanwhile commits nothing, what it reads no collection discards meanwhile, one that fails changes nothing, and a live snapshot is never compacted", () =>
+  added("alasio.node_agent.compactions", () =>
+    withBucket(({ node }) =>
+      Effect.gen(function*() {
+        const workspace = { environment: "main", workspace: "fs-abc" };
+        const here = yield* node("node-1");
+        const runscDir = here.releases.dirOf(RELEASE);
+        const chained = (take: CheckpointRequest = request("fs-abc")) =>
+          Effect.gen(function*() {
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "512");
+            yield* here.agent.checkpoint(request("fs-abc"));
+            const { manifest } = yield* here.agent.prepare(workspace);
+            yield* here.agent.spend(workspace, manifest.snapshot);
+            yield* here.agent.resume(resumeRequest());
+            writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
+            return yield* here.agent.checkpoint(take);
+          });
+        const layersDir = join(here.cacheDir, "main", "fs-abc", "layers");
+        const compactions = () => here.releases.calls(RELEASE).filter((args) => args.includes("compact")).length;
+        // Restored, and so spent, as it compacts: its compacted image commits nothing.
+        writeFileSync(join(runscDir, "hold-compact"), "");
+        const moved = yield* chained();
+        yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 1 }));
+        // What it reads and writes beside the workspace's lock is discarded by no collection meanwhile.
+        const reading = imagesOf(here, "fs-abc");
+        assert.equal(yield* here.agent.discard(workspace, []), false);
+        assert.deepEqual(imagesOf(here, "fs-abc"), reading);
+        yield* here.agent.spend(workspace, moved.snapshot);
+        rmSync(join(runscDir, "hold-compact"));
+        yield* Effect.sync(() => readdirSync(layersDir).some((name) => name.startsWith("."))).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (staging) => !staging }));
+        yield* Effect.sleep("200 millis");
+        assert.equal(yield* here.agent.current(workspace), null);
+        // One that fails leaves the snapshot as it was committed, and nothing it staged.
+        writeFileSync(join(runscDir, "fail-compact"), "");
+        const failed = yield* chained();
+        yield* Effect.sync(compactions).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count === 2 }));
+        yield* Effect.sleep("200 millis");
+        assert.deepEqual(yield* here.agent.current(workspace), failed);
+        assert.deepEqual(readdirSync(layersDir).filter((name) => name.startsWith(".")), []);
+        rmSync(join(runscDir, "fail-compact"));
+        // Taken live, the sandbox running on from it, it is not compacted, however large its delta.
+        const volume = mkdtempSync(join(tmpdir(), "alasio-volume-"));
+        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(volume, { recursive: true, force: true })));
+        mkdirSync(join(volume, ".bayma"));
+        writeFileSync(join(volume, ".bayma", "last-save.json"), JSON.stringify({ schemaVersion: 1, ...CAUGHT }));
+        here.releases.runs(CONTAINER, RELEASE, SESSIONS, POD, true, [{ destination: "/home/agent", source: volume }]);
+        yield* here.agent.checkpoint(live("fs-abc"));
+        const second = yield* here.agent.checkpoint(live("fs-abc"));
+        assert.equal(second.layers.length, 2);
+        yield* Effect.sleep("200 millis");
+        assert.equal(compactions(), 2);
+        assert.deepEqual(yield* here.agent.current(workspace), second);
+      })
+    )
+  ).then((counted) => assert.deepEqual(counted, { "alasio.node_agent.compaction.outcome=superseded": 1, "alasio.node_agent.compaction.outcome=RunscError": 1 })));
 
 test("a snapshot is committed only once each image it refers to is in the bucket as it was put, put again from the cache where it is not", () =>
   withBucket(({ s3, node }) =>
@@ -687,7 +961,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
     })
   ));
 
-test("a snapshot is prepared from the node's cache, or from the bucket, checked file by file, and only where it restores", () =>
+test("a snapshot is prepared from the node's cache, as the stamps of its images say they were checked, or from the bucket, checked file by file, and only where it restores", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -710,13 +984,48 @@ test("a snapshot is prepared from the node's cache, or from the bucket, checked 
       assert.deepEqual(downloads(), files);
       assert.deepEqual(filesOf(prepared.imagePath), image.files);
       assert.deepEqual(JSON.parse(readFileSync(join(other.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), manifest);
-      yield* other.agent.prepare(workspace);
+      // Prepared again from the cache, none of the image's files is read, as its stamp says each is as it was checked.
+      const cachedImage = join(other.cacheDir, "main", "fs-abc", "layers", image.digest);
+      assert.deepEqual(yield* readsUnder(cachedImage, other.agent.prepare(workspace)), []);
       assert.deepEqual(downloads(), files);
-      // A cached copy that is no longer what its manifest says, as a disk may change it, is read again from the bucket.
-      writeFileSync(join(other.cacheDir, "main", "fs-abc", "layers", image.digest, "pages_meta.img"), "changed on the disk");
+      const times = (count: number) => Array.from({ length: count }, () => files).flat();
+      // A cached copy that is no longer what its manifest says, as a disk may change it, is read again from the bucket:
+      // one of another size, one whose modification time has changed, and one without its stamp.
+      writeFileSync(join(cachedImage, "pages_meta.img"), "changed on the disk");
       assert.deepEqual(yield* other.agent.prepare(workspace), prepared);
-      assert.deepEqual(downloads(), [...files, ...files]);
+      assert.deepEqual(downloads(), times(2));
       assert.deepEqual(filesOf(prepared.imagePath), image.files);
+      const later = new Date(Date.now() + 60_000);
+      utimesSync(join(cachedImage, "pages.img"), later, later);
+      assert.deepEqual(yield* other.agent.prepare(workspace), prepared);
+      assert.deepEqual(downloads(), times(3));
+      rmSync(join(other.cacheDir, "main", "fs-abc", "stamps", `${image.digest}.json`));
+      assert.deepEqual(yield* other.agent.prepare(workspace), prepared);
+      assert.deepEqual(downloads(), times(4));
+      assert.deepEqual(filesOf(prepared.imagePath), image.files);
+      // Stamped at a whole second, which the test can set a file's modification time back to exactly:
+      // one whose size has changed since, its modification time set back, or another file in its place, is read again too.
+      const pagesPath = join(cachedImage, "pages.img");
+      const stampedAt = new Date(1_790_000_000_000);
+      const restamped = (changed: () => void) =>
+        Effect.gen(function*() {
+          utimesSync(pagesPath, stampedAt, stampedAt);
+          yield* other.cache.stamp("main", "fs-abc", image.digest, image.files);
+          changed();
+          utimesSync(pagesPath, stampedAt, stampedAt);
+          return yield* other.agent.prepare(workspace);
+        });
+      const pages = readFileSync(pagesPath);
+      assert.deepEqual(yield* restamped(() => writeFileSync(pagesPath, Buffer.concat([pages, Buffer.from("more")]))), prepared);
+      assert.deepEqual(downloads(), times(5));
+      assert.deepEqual(yield* restamped(() => {
+        rmSync(pagesPath);
+        writeFileSync(pagesPath, pages);
+      }), prepared);
+      assert.deepEqual(downloads(), times(6));
+      // As it was stamped, it is taken as checked.
+      assert.deepEqual(yield* restamped(() => {}), prepared);
+      assert.deepEqual(downloads(), times(6));
 
       // A newer snapshot is prepared beside the older one's images, which a later collection discards.
       const newer = yield* taker.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
@@ -803,6 +1112,7 @@ test("what no snapshot needs any more is collected, but what a restore or a comm
       assert.deepEqual(imagesOf(here, "fs-abc"), [digestOf(first), digestOf(second)].sort());
       assert.equal(yield* here.agent.discard(workspace, [digestOf(second)]), true);
       assert.deepEqual(imagesOf(here, "fs-abc"), [digestOf(second)]);
+      assert.deepEqual(readdirSync(join(here.cacheDir, "main", "fs-abc", "stamps")), [`${digestOf(second)}.json`]);
     })
   ));
 
@@ -941,6 +1251,44 @@ test("checkpoints and prepares keep the node's cache within its budget, the leas
     })
   ));
 
+/** What spares no workspace, as the cache is told where nothing of the agent's runs. */
+const sparesNone: Spared = () => false;
+
+/** What spares the workspace `name`, as the cache is told where the agent writes to it. */
+const spares = (name: string): Spared => ({ workspace }) => workspace === name;
+
+test("a checkpoint's images, the one it stages and the parent it saves a delta of, are never evicted as another workspace's checkpoint makes room meanwhile", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // Room for about one workspace's snapshot of 4 KB; each workspace's sandbox under a release of its own, so one's checkpoint can be held as the other's runs.
+      const other = "20260921.0-eaucoin.4";
+      const here = yield* node("node-1", { releases: [RELEASE, other], budget: 6000 });
+      here.releases.runs(OTHER_CONTAINER, other, SESSIONS, POD);
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      // fs-abc's sandbox restored from its snapshot, so its next is a delta of the image the cache holds.
+      yield* here.agent.checkpoint(request("fs-abc"));
+      const { manifest } = yield* here.agent.prepare(workspace);
+      yield* here.agent.spend(workspace, manifest.snapshot);
+      yield* here.agent.resume(resumeRequest([POD_IP], [CONTAINER]));
+      const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
+      writeFileSync(held, "");
+      const checkpoints = () => here.releases.calls(RELEASE).filter((args) => args.includes("checkpoint")).length;
+      const before = checkpoints();
+      const delta = yield* Effect.forkChild(here.agent.checkpoint(request("fs-abc")));
+      yield* Effect.sync(checkpoints).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (count) => count > before }));
+      // Meanwhile fs-other's checkpoint commits, the cache over its budget, and the agent's eviction runs.
+      yield* Effect.sleep("20 millis");
+      const taken = yield* here.agent.checkpoint(request("fs-other", OTHER_CONTAINER));
+      assert.ok(cachesAny(here, "fs-abc"), "fs-abc was evicted as its checkpoint ran");
+      rmSync(held);
+      const saved = yield* Fiber.join(delta);
+      // Neither lost what it wrote: fs-abc's is a delta of the image its sandbox was restored from.
+      assert.deepEqual(saved.layers.slice(1), manifest.layers);
+      assert.deepEqual(yield* here.agent.current(workspace), saved);
+      assert.deepEqual(yield* here.agent.current({ environment: "main", workspace: "fs-other" }), taken);
+    })
+  ));
+
 const S1 = "20261013T000000000Z-00000001";
 const [D1, D2] = ["1".repeat(64), "2".repeat(64)];
 
@@ -968,16 +1316,16 @@ test("the node's cache keeps within its budget, evicting the least recently used
       writeFileSync(join(root, "main", "fs-new", "layers", `.${S1}`, "pages.img"), Buffer.alloc(5000));
       assert.equal((yield* cache.list).reduce((sum, { bytes }) => sum + bytes, 0), 3000);
       assert.deepEqual((yield* cache.list).map(({ images }) => images), [[D1], [D1], [D1]]);
-      assert.deepEqual(names(yield* cache.evict), ["fs-older"]);
+      assert.deepEqual(names(yield* cache.evict(sparesNone)), ["fs-older"]);
       assert.deepEqual(names(yield* cache.list), ["fs-new", "fs-old"]);
       // Prepared just now, the older is kept, and the newer one goes.
       const prepared = yield* cache.prepare("main", "fs-old", S1, [D1]);
       assert.deepEqual(readdirSync(prepared).sort(), ["layers", "pages.img"]);
       const tighter = makeSnapshotCache({ root, budget: 500, graceMs: 5 * 60_000 });
-      assert.deepEqual(names(yield* tighter.evict), []);
+      assert.deepEqual(names(yield* tighter.evict(sparesNone)), []);
       const longAgo = (Date.now() - 10 * 60_000) / 1000;
       utimesSync(cache.workspace("main", "fs-new"), longAgo, longAgo);
-      assert.deepEqual(names(yield* tighter.evict), ["fs-new"]);
+      assert.deepEqual(names(yield* tighter.evict(sparesNone)), ["fs-new"]);
       assert.deepEqual(names(yield* tighter.list), ["fs-old"]);
       // An image prepared is counted once, however many links it has.
       assert.equal((yield* tighter.list)[0]?.bytes, 1000);
@@ -988,10 +1336,21 @@ test("the node's cache keeps within its budget, evicting the least recently used
       assert.equal(yield* tighter.discard("main", "fs-old", [D2]), true);
       assert.deepEqual((yield* tighter.list).map(({ images }) => images), [[D2]]);
       assert.equal(existsSync(prepared), false);
-      // What a stopped agent left half written goes as the next starts.
+      // What a stopped agent left half written goes as the next starts: an image, and a stamp.
       mkdirSync(join(root, "main", "fs-old", "layers", `.${S1}`));
+      mkdirSync(join(root, "main", "fs-old", "stamps"), { recursive: true });
+      writeFileSync(join(root, "main", "fs-old", "stamps", `.${D2}.json`), "{");
       yield* tighter.clean;
       assert.equal(existsSync(join(root, "main", "fs-old", "layers", `.${S1}`)), false);
+      assert.equal(existsSync(join(root, "main", "fs-old", "stamps", `.${D2}.json`)), false);
+      // An image staged uses its workspace, which a checkpoint writing it does; one the cache is told to spare is kept, whenever it was used.
+      const none = makeSnapshotCache({ root, budget: 0, graceMs: 5 * 60_000 });
+      utimesSync(cache.workspace("main", "fs-old"), longAgo, longAgo);
+      yield* none.stage("main", "fs-old", S1);
+      assert.deepEqual(names(yield* none.evict(sparesNone)), []);
+      utimesSync(cache.workspace("main", "fs-old"), longAgo, longAgo);
+      assert.deepEqual(names(yield* none.evict(spares("fs-old"))), []);
+      assert.deepEqual(names(yield* none.evict(sparesNone)), ["fs-old"]);
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1018,13 +1377,13 @@ test("the node's cache makes room on its disk for what it writes, its reserve ke
       yield* cacheImage(cache, "fs-b", D1, 90);
       yield* cacheImage(cache, "fs-c", D1, 1);
       // 500 bytes free besides the reserve: room for 400 as it is; for 1200, the least recently used goes, but not one used within the grace.
-      assert.deepEqual(names(yield* cache.room(400, { environment: "main", workspace: "fs-d" })), []);
-      assert.deepEqual(names(yield* cache.room(1200, { environment: "main", workspace: "fs-d" })), ["fs-b"]);
+      assert.deepEqual(names(yield* cache.room(400, spares("fs-d"))), []);
+      assert.deepEqual(names(yield* cache.room(1200, spares("fs-d"))), ["fs-b"]);
       // Nor one of the workspace written to.
-      const refused = yield* Effect.flip(cache.room(2000, { environment: "main", workspace: "fs-a" }));
+      const refused = yield* Effect.flip(cache.room(2000, spares("fs-a")));
       assert.equal(refused.message, `the node's snapshot cache failed: its disk has ${RESERVE_BYTES + 1500} bytes free, and 2000 more would leave less than the ${RESERVE_BYTES} it keeps free`);
       assert.deepEqual(names(yield* cache.list), ["fs-a", "fs-c"]);
-      assert.deepEqual(names(yield* cache.room(2000, { environment: "main", workspace: "fs-d" })), ["fs-a"]);
+      assert.deepEqual(names(yield* cache.room(2000, spares("fs-d"))), ["fs-a"]);
     }));
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1262,7 +1621,8 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       const { cached, ...held } = holdings.body as { readonly cached: readonly { readonly usedAt: string }[] };
       assert.deepEqual(held, { node: "node-1", releases: [{ release: RELEASE, cpuFeatures: ["sse", "avx", "avx2"] }] });
       assert.deepEqual(cached.map(({ usedAt, ...rest }) => (assert.ok(Date.parse(usedAt) <= Date.now()), rest)), [
-        { environment: "main", workspace: "fs-abc", images: [manifest.layers[0]?.digest], bytes: manifest.bytes + JSON.stringify(manifest).length },
+        // Its image, its manifest beside it, and its image's stamp.
+        { environment: "main", workspace: "fs-abc", images: [manifest.layers[0]?.digest], bytes: manifest.bytes + JSON.stringify(manifest).length + statSync(join(here.cacheDir, "main", "fs-abc", "stamps", `${manifest.layers[0]?.digest}.json`)).size },
       ]);
 
       // Snapshots it cannot restore, or that are not what they say, and a bucket that fails.

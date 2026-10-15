@@ -347,10 +347,11 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       }
       const manifest = read.success;
       if (!manifest) return null;
-      // Only the snapshot its Sandbox was released into: one it has moved on from since,
-      // as a restore alasio stopped in the middle of, is stale.
+      // Only the snapshot its Sandbox was released into, or one its node's agent compacted
+      // from that one since, which is the same: one it has moved on from since, as a restore
+      // alasio stopped in the middle of, is stale.
       const bound = sandbox.metadata.annotations?.[SNAPSHOT_ANNOTATION];
-      if (bound !== manifest.snapshot) {
+      if (bound !== manifest.snapshot && (bound === undefined || bound !== manifest.compactedFrom)) {
         return yield* fallBack(name, "stale", `its snapshot ${manifest.snapshot} is not the one its Sandbox was released into (${bound ?? "none"})`);
       }
       const kept = snapshots.releases.find(({ release }) => release === manifest.release);
