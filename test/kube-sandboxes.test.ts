@@ -40,6 +40,7 @@ import {
   sandboxManifest,
   sandboxReady,
   SNAPSHOT_ANNOTATION,
+  SNAPSHOT_RELEASE_ANNOTATION,
   type StoredSandbox,
   tokenSecretManifest,
 } from "../src/kube/sandboxes.ts";
@@ -543,6 +544,43 @@ test("ensure restarts a Sandbox whose pod has ended, which agent-sandbox never r
   ]);
   assert.equal(controller.pods.length, 1);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.metadata.uid, created.metadata?.uid);
+});
+
+test("a Sandbox whose pod has ended is released into the snapshot taken of it live, which its restore is then asked for, and one with none into none", async () => {
+  const restartedFrom = async (live: { readonly snapshot: string; readonly release: string } | null) => {
+    const kube = fakeKube();
+    const manifest = () => sandboxManifest({ name: "fs-abc123", namespace: "alasio-sessions", template: profile() });
+    kube.create(manifest());
+    const sandbox = kube.objects.get("Sandbox/alasio-sessions/fs-abc123");
+    assert.ok(sandbox);
+    sandbox.status = { conditions: [{ ...readyCondition(sandbox.metadata.generation), status: "False", reason: "PodFailed", message: "Pod failed" }] };
+    kube.calls.length = 0;
+    const asked: string[] = [];
+    // The snapshot each restore the Sandbox comes back through is asked for, as it is bound; none is restored here.
+    const bound: (string | null)[] = [];
+    const controller = kube.control("alasio-sessions", "fs-abc123");
+    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+      const sandboxes = yield* makeSandboxes({
+        namespace: "alasio-sessions",
+        port: 7290,
+        poll: "5 millis",
+        live: (name) => Effect.sync(() => (asked.push(name), live)),
+        restore: (stored) => Effect.sync(() => (bound.push(stored.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? null), null)),
+      });
+      yield* sandboxes.ensure("fs-abc123", manifest);
+    })).finally(controller.stop);
+    return { asked, bound, suspended: kube.calls.filter(([verb]) => verb === "patch").map(([, , , change]) => change)[0] };
+  };
+  const lost = await restartedFrom({ snapshot: "20261015T201500123Z-0a1b2c3d", release: "20260921.0-eaucoin.7" });
+  assert.deepEqual(lost.asked, ["fs-abc123"]);
+  assert.deepEqual(lost.suspended, {
+    metadata: { annotations: { [SNAPSHOT_ANNOTATION]: "20261015T201500123Z-0a1b2c3d", [SNAPSHOT_RELEASE_ANNOTATION]: "20260921.0-eaucoin.7" } },
+    spec: { operatingMode: "Suspended" },
+  });
+  assert.deepEqual(lost.bound, ["20261015T201500123Z-0a1b2c3d"]);
+  const none = await restartedFrom(null);
+  assert.deepEqual(none.suspended, { spec: { operatingMode: "Suspended" } });
+  assert.deepEqual(none.bound, [null]);
 });
 
 test("ensure restarts a running Sandbox whose pod has a fault only a new pod mends, looking only at a pod that ran before, and does what the fault asks before it resumes", async () => {

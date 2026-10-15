@@ -91,6 +91,9 @@ const releases = meter.createCounter("alasio.sandbox.releases", {
 const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
 });
+const liveCheckpoints = meter.createCounter("alasio.sandbox.live_checkpoints", {
+  description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken, or failed; and spent, as the session moved on from one",
+});
 const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration", {
   description: "How long a session restored from its snapshot took to come back, which the prompt bringing it up waits: from its snapshot looked up to its pod ready",
   unit: "s",
@@ -108,8 +111,18 @@ export interface KeptTemplates {
 /** A restored pod does not run its containers yet. */
 class PodNotRunning extends Schema.TaggedError<PodNotRunning>()("PodNotRunning", {}) {}
 
-/** What bayma's /status says: its execs running and queued, and since when none has run, if none does. */
-const BaymaStatus = Schema.Struct({ execsRunning: Schema.Number, execsQueued: Schema.Number, idleSinceMs: Schema.NullOr(Schema.Number) });
+/**
+ * What bayma's /status says: its execs running and queued, since when none has run, if none
+ * does, and its state generation, which a snapshot taken of it live holds the session only
+ * while it stays (bayma's sandbox-hook help).
+ */
+const BaymaStatus = Schema.Struct({
+  execsRunning: Schema.Number,
+  execsQueued: Schema.Number,
+  idleSinceMs: Schema.NullOr(Schema.Number),
+  generation: Schema.Number,
+});
+type BaymaStatus = typeof BaymaStatus.Type;
 
 /** The hash of the profile's template that `podTemplate` was made from, as it records it. */
 const sessionTemplateOf = (podTemplate: V1PodTemplateSpec | Readonly<Record<string, unknown>>): string | undefined =>
@@ -123,9 +136,14 @@ const sessionTemplateOf = (podTemplate: V1PodTemplateSpec | Readonly<Record<stri
 export function hookOf(bayma: V1Container): string[] | null {
   const command = bayma.command ?? [];
   const program = command.includes("--") ? command.slice(command.indexOf("--") + 1) : command;
+  const stateDir = stateDirOf(bayma);
+  return program.length > 0 && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
+}
+
+/** The state directory bayma's container runs bayma with, or null for none. Pure, for tests. */
+export function stateDirOf(bayma: V1Container): string | null {
   const args = bayma.args ?? [];
-  const stateDir = args[args.indexOf("--state-dir") + 1];
-  return program.length > 0 && args.includes("--state-dir") && stateDir ? [...program, "sandbox-hook", "--state-dir", stateDir] : null;
+  return args.includes("--state-dir") ? (args[args.indexOf("--state-dir") + 1] ?? null) : null;
 }
 
 /**
@@ -164,6 +182,12 @@ export interface SessionSnapshots {
    */
   readonly restore: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | RestoreDeferred | null>;
   /**
+   * The snapshot taken live of the session, which its Sandbox is released into as its pod
+   * ended is restarted (../kube/sandboxes.ts), so that `restore` brings it back; null when
+   * its current snapshot is none taken live, or cannot be read.
+   */
+  readonly live: (name: string) => Effect.Effect<SavedSnapshot | null>;
+  /**
    * Releases each running session once it has run no exec and no turn for long enough,
    * looking every RELEASE_POLL, for as long as the scope lasts; `lastTurn(name)` is when
    * the session's last turn ended, Infinity while one runs, null when none has since
@@ -184,6 +208,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const fetch = yield* FetchHttpClient.Fetch;
   const environment = profile.namespace;
   const releaseAfterMs = snapshots.releaseAfterSeconds * 1000;
+  const liveEveryMs = snapshots.liveEverySeconds * 1000;
   const ref = (name: string) => ({ environment, workspace: name });
 
   /** Forgets the session's snapshot, saying why; one that cannot be forgotten is said so too. */
@@ -281,8 +306,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: false })),
       );
       // Its agent leaves it paused where its network policies are not in force (504); of any other failure, its sandbox may have run.
+      // Its agent leaves it paused, too, where it was restored from a snapshot taken live
+      // that holds the session no more (410), which no try restores.
       yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds, policies }).pipe(
-        Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: !(error._tag === "NodeAgentError" && error.status === 504) })),
+        Effect.mapError((error) => {
+          const status = error._tag === "NodeAgentError" ? error.status : undefined;
+          return new SandboxRestoreRefused({ reason: error.message, resumed: status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
+        }),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
       yield* kube.patchPodStatus(profile.namespace, name, { status: { conditions: [{ type: RESUMED_CONDITION, status: "True", lastTransitionTime: now }] } }).pipe(
@@ -384,11 +414,14 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               ),
             ),
           ),
-          // Its sandbox never having run, its restore is abandoned, whatever comes of it.
-          failed: ({ why, resumed }: RestoreFailure) =>
-            (resumed ? fallBack(name, "restore", why) : abandon(name, node).pipe(Effect.andThen(deferOr(name, "restore", why)))).pipe(
-              Effect.map((came) => (came === null ? "fallen back" : "deferred")),
-            ),
+          // Its sandbox never having run, its restore is abandoned, whatever comes of it; one of
+          // a snapshot that holds the session no more falls back at once.
+          failed: ({ why, resumed, stale }: RestoreFailure) =>
+            (resumed
+              ? fallBack(name, "restore", why)
+              : abandon(name, node).pipe(Effect.andThen(stale ? fallBack(name, "stale", why) : deferOr(name, "restore", why)))).pipe(
+                Effect.map((came) => (came === null ? "fallen back" : "deferred")),
+              ),
         };
       }
       // Gone or corrupt (404, 422), or of no node's (409), it never restores; otherwise it may yet.
@@ -437,12 +470,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     });
   };
 
-  /** Whether the session's bayma has run no exec for releaseAfter, as it says. */
-  const idle = (sandboxes: Sandboxes, sandbox: StoredSandbox, now: number): Effect.Effect<boolean> => {
+  /** What the session's bayma says of its execs and its state generation, or null where it cannot be asked. */
+  const statusOf = (sandboxes: Sandboxes, sandbox: StoredSandbox): Effect.Effect<BaymaStatus | null> => {
     const name = sandbox.metadata.name;
     return Effect.gen(function*() {
       const token = yield* sandboxes.token(name);
-      if (!token) return false;
+      if (!token) return null;
       const host = sandbox.status?.serviceFQDN ?? `${name}.${profile.namespace}.svc`;
       const text = yield* Effect.tryPromise({
         try: async (signal) => {
@@ -452,31 +485,130 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         },
         catch: (cause) => new Error(cause instanceof Error ? cause.message : String(cause)),
       });
-      const status = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text);
-      return status.execsRunning === 0 && status.execsQueued === 0 && status.idleSinceMs !== null && now - status.idleSinceMs >= releaseAfterMs;
-    }).pipe(Effect.catch((error) => Effect.logDebug(`could not ask session ${name}'s bayma whether it is idle: ${error.message}`).pipe(Effect.as(false))));
+      return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text);
+    }).pipe(Effect.catch((error) => Effect.logDebug(`could not ask session ${name}'s bayma how it stands: ${error.message}`).pipe(Effect.as(null))));
   };
+
+  /**
+   * Saves the running session's sandbox live by its node's agent, the sandbox running on: the
+   * snapshot it took and the state generation that snapshot holds the session at, or null
+   * where none was taken, said why.
+   */
+  const saveLive = (sandbox: StoredSandbox): Effect.Effect<{ readonly snapshot: string; readonly generation: number } | null, KubeApiError> => {
+    const name = sandbox.metadata.name;
+    const counted = (outcome: string) => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": outcome }));
+    return Effect.gen(function*() {
+      // A core Pod, as the API server returns one.
+      const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
+      const containerId = pod?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.containerID?.replace(/^containerd:\/\//u, "");
+      const bayma = sandbox.spec.podTemplate.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
+      const hook = bayma ? hookOf(bayma) : null;
+      const stateDir = bayma ? stateDirOf(bayma) : null;
+      const node = pod?.spec?.nodeName;
+      if (!node || !containerId || pod?.spec?.runtimeClassName === undefined || !hook || !stateDir) return null;
+      const taken = yield* agents.checkpoint(node, {
+        ...ref(name),
+        namespace: profile.namespace,
+        pod: name,
+        containerId,
+        hook,
+        podTemplate: { ...sandbox.spec.podTemplate },
+        live: { stateDir },
+      }).pipe(Effect.result);
+      if (taken._tag === "Failure" || taken.success.live === undefined) {
+        yield* counted("failed");
+        yield* Effect.logWarning(`could not snapshot session ${name} live, which runs on: ${taken._tag === "Failure" ? taken.failure.message : "its manifest says nothing of the save"}`);
+        return null;
+      }
+      const { snapshot, bytes, pauseMs, live } = taken.success;
+      yield* counted("taken");
+      yield* Effect.logInfo(`snapshotted session ${name} live as ${snapshot} on ${node}, at bayma's generation ${live.generation}: ${bytes} bytes, paused ${pauseMs} ms`);
+      return { snapshot, generation: live.generation };
+    });
+  };
+
+  /** Whether `status` says its bayma has run no exec for releaseAfter, at `now`. */
+  const idleBy = (status: BaymaStatus | null, now: number): boolean =>
+    status !== null && status.execsRunning === 0 && status.execsQueued === 0 && status.idleSinceMs !== null && now - status.idleSinceMs >= releaseAfterMs;
+
+  /** Whether the session's bayma has run no exec for releaseAfter, as it says. */
+  const idle = (sandboxes: Sandboxes, sandbox: StoredSandbox, now: number): Effect.Effect<boolean> =>
+    statusOf(sandboxes, sandbox).pipe(Effect.map((status) => idleBy(status, now)));
 
   const watch = (sandboxes: Sandboxes, lastTurn: (name: string) => number | null): Effect.Effect<void, never, Scope.Scope> =>
     Effect.gen(function*() {
       const releasing = yield* FiberMap.make<string>();
-      // How many releases run on each node, which its agent checkpoints one beside the other.
+      const saving = yield* FiberMap.make<string>();
+      // How many releases and live saves run on each node, which its agent checkpoints one beside the other.
       const onNode = new Map<string, number>();
+      // Of each running session: since when its execs have run, when it was last saved live,
+      // or asked to be, and the snapshot taken of it live that holds it still, with the
+      // generation it holds it at. In memory: alasio's start begins them anew.
+      const busySince = new Map<string, number>();
+      const savedLiveAt = new Map<string, number>();
+      const takenLive = new Map<string, { readonly snapshot: string; readonly generation: number }>();
+      /** Runs `effect` for the session on its node, if the node runs fewer than RELEASES_PER_NODE: whether it does. */
+      const onItsNode = (name: string, map: FiberMap.FiberMap<string>, effect: Effect.Effect<void>): Effect.Effect<boolean, KubeApiError> =>
+        Effect.gen(function*() {
+          // A core Pod, as the API server returns one.
+          const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
+          const node = pod?.spec?.nodeName;
+          if (!node || (onNode.get(node) ?? 0) >= RELEASES_PER_NODE) return false;
+          onNode.set(node, (onNode.get(node) ?? 0) + 1);
+          const done = Effect.sync(() => onNode.set(node, (onNode.get(node) ?? 1) - 1));
+          yield* FiberMap.run(map, name, effect.pipe(Effect.ensuring(done)), { onlyIfMissing: true });
+          return true;
+        });
+      /**
+       * Keeps the snapshot taken live of the running session true to it: spent once bayma's
+       * generation moves on from it; and, while its execs run, a snapshot taken live every
+       * liveEvery, from liveEvery after they began.
+       */
+      const keepLive = (sandbox: StoredSandbox, status: BaymaStatus, now: number): Effect.Effect<void, KubeApiError> =>
+        Effect.gen(function*() {
+          const name = sandbox.metadata.name;
+          const taken = takenLive.get(name);
+          if (taken && taken.generation !== status.generation) {
+            takenLive.delete(name);
+            yield* agents.spend(ref(name), taken.snapshot).pipe(
+              Effect.tap(() => Effect.sync(() => liveCheckpoints.add(1, { "alasio.sandbox.live_checkpoint.outcome": "spent" }))),
+              Effect.tap(() => Effect.logInfo(`spent the snapshot ${taken.snapshot} of session ${name}, taken live, which has moved on from it`)),
+              Effect.catch((error) => Effect.logWarning(`could not spend the snapshot ${taken.snapshot} of session ${name}, which has moved on from it: ${error.message}`)),
+            );
+          }
+          if (status.execsRunning === 0) {
+            busySince.delete(name);
+            return;
+          }
+          const since = busySince.get(name) ?? now;
+          busySince.set(name, since);
+          if (now - Math.max(since, savedLiveAt.get(name) ?? since) < liveEveryMs) return;
+          if ((yield* FiberMap.has(saving, name)) || (yield* FiberMap.has(releasing, name))) return;
+          const running = yield* onItsNode(
+            name,
+            saving,
+            saveLive(sandbox).pipe(
+              Effect.tap((saved) => Effect.sync(() => (saved ? takenLive.set(name, saved) : undefined))),
+              Effect.catch((error) => Effect.logWarning(`could not snapshot session ${name} live: ${error.message}`)),
+              Effect.asVoid,
+              withAlasioSpan("alasio.sandbox.live_checkpoint", { attributes: { "alasio.sandbox.name": name } }),
+            ),
+          );
+          if (running) savedLiveAt.set(name, now);
+        });
       const look = Effect.gen(function*() {
         const listed = yield* kube.list(SANDBOX_API_VERSION, SANDBOX_KIND, profile.namespace, "alasio.dev/workload=session");
         const now = yield* Clock.currentTimeMillis;
+        const running = new Set<string>();
         for (const sandbox of listed as readonly StoredSandbox[]) {
           const name = sandbox.metadata.name;
           if (sandbox.spec.operatingMode === "Suspended" || !sandboxReady(sandbox) || (yield* FiberMap.has(releasing, name))) continue;
+          running.add(name);
+          const status = yield* statusOf(sandboxes, sandbox);
+          if (status === null) continue;
+          yield* keepLive(sandbox, status, now);
           const turned = lastTurn(name);
-          if (turned !== null && now - turned < releaseAfterMs) continue;
-          if (!(yield* idle(sandboxes, sandbox, now))) continue;
-          // A node runs RELEASES_PER_NODE at a time, its disk, CPU and uplink shared: the others wait for a later look.
-          const pod = (yield* kube.read("v1", "Pod", profile.namespace, name)) as V1Pod | null;
-          const node = pod?.spec?.nodeName;
-          if (!node || (onNode.get(node) ?? 0) >= RELEASES_PER_NODE) continue;
-          onNode.set(node, (onNode.get(node) ?? 0) + 1);
-          const done = Effect.sync(() => onNode.set(node, (onNode.get(node) ?? 1) - 1));
+          if ((turned !== null && now - turned < releaseAfterMs) || !idleBy(status, now) || (yield* FiberMap.has(saving, name))) continue;
           // Looked at again once nothing else may bring it up: a turn may have begun meanwhile.
           const stillIdle = (held: StoredSandbox): Effect.Effect<Saved, KubeApiError> =>
             Effect.gen(function*() {
@@ -485,9 +617,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               if ((since !== null && at - since < releaseAfterMs) || !(yield* idle(sandboxes, held, at))) return "keep" as const;
               return yield* save(held);
             });
-          yield* FiberMap.run(
-            releasing,
+          // A node runs RELEASES_PER_NODE at a time, its disk, CPU and uplink shared: the others wait for a later look.
+          yield* onItsNode(
             name,
+            releasing,
             sandboxes.release(name, stillIdle).pipe(
               Effect.tap((released) => (released ? Effect.logInfo(`released session ${name}`) : Effect.void)),
               Effect.catch((error) =>
@@ -495,12 +628,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
                   Effect.andThen(Effect.sync(() => releases.add(1, { "alasio.sandbox.release.outcome": "error" }))),
                 )
               ),
+              Effect.asVoid,
               withAlasioSpan("alasio.sandbox.release", { attributes: { "alasio.sandbox.name": name } }),
-              Effect.ensuring(done),
             ),
-            { onlyIfMissing: true },
           );
         }
+        // What a session that runs no more was, as its release or its end supersedes it.
+        for (const map of [busySince, savedLiveAt, takenLive]) for (const name of map.keys()) if (!running.has(name)) map.delete(name);
       }).pipe(Effect.catch((error) => Effect.logWarning(`could not look at sessions to release: ${error.message}`)));
       yield* look.pipe(Effect.repeat(Schedule.spaced(RELEASE_POLL)), Effect.forkScoped);
       yield* collect.pipe(Effect.repeat(Schedule.spaced(COLLECT_POLL)), Effect.forkScoped);
@@ -549,6 +683,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       return !restoring && template !== undefined && template !== templates.current && template === templates.previous;
     },
     restore,
+    live: (name) =>
+      agents.current(ref(name)).pipe(
+        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
+        Effect.catch((error) => Effect.logWarning(`could not read whether session ${name} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
+        withLogScope("snapshots"),
+      ),
     watch,
     forget: (name) =>
       forgetEverywhere(name).pipe(
