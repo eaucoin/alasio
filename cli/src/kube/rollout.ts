@@ -1,11 +1,12 @@
 /**
  * Waiting for what was applied to run: a CRD until it is established, a Job until it
- * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done; waiting
- * for what was deleted to be gone; and for volumes let go of to be deleted. A wait says
+ * completes, a Deployment, StatefulSet or DaemonSet until its rollout is done, and a
+ * StatefulSet until its pods are scheduled; waiting for what was deleted to be gone; and
+ * for volumes let go of to be deleted. A wait says
  * what it still waits for as that changes, and when it gives up, why each thing is not
  * ready, from its pods' state and the cluster's warnings about them.
  */
-import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
 import { Duration, Effect, Schedule, Schema } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
@@ -240,6 +241,32 @@ const current = (ref: ObjectRef): Effect.Effect<KubernetesObject | null, KubeApi
 /** Waits until every ref is ready (readiness). */
 export const awaitReady = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
   awaitAll(refs, (ref) => Effect.map(current(ref), (object) => (object ? readiness(object) : waiting("not found"))), diagnose, options);
+
+/**
+ * Waits until every StatefulSet ref has made a pod for each of its replicas and each is
+ * on a node: scheduled, ready or not. One whose pods start in order makes each only once
+ * the one before it is ready.
+ */
+export const awaitScheduled = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
+  awaitAll(
+    refs,
+    (ref) =>
+      Effect.gen(function*() {
+        const kube = yield* KubeApi;
+        const set = yield* kube.get<V1StatefulSet>(ref);
+        if (!set) return waiting("not found");
+        const replicas = set.spec?.replicas ?? 1;
+        const made = set.status?.replicas ?? 0;
+        if ((set.status?.observedGeneration ?? 0) < (set.metadata?.generation ?? 0)) return waiting("not yet rolled out");
+        if (made < replicas) return waiting(`${made} of ${replicas} pods made`);
+        const pods = yield* kube.list<V1Pod>(POD, { namespace: ref.namespace, labelSelector: selectorOf(set.spec?.selector?.matchLabels ?? {}) });
+        // Every replica's pod made, the pods listed are all of them.
+        const unscheduled = pods.filter((pod) => !pod.spec?.nodeName).length;
+        return unscheduled > 0 ? waiting(`${unscheduled} of ${pods.length} pods not yet scheduled`) : READY;
+      }),
+    diagnose,
+    options,
+  );
 
 /** Waits until every ref is gone, its deletion done. */
 export const awaitGone = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>

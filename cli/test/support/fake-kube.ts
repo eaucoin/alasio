@@ -302,6 +302,8 @@ export async function serveFakeKube(): Promise<FakeKube> {
       apiVersion: "v1",
       kind: "Pod",
       metadata: { name: pod, ...(namespace ? { namespace } : {}), labels: template?.metadata?.labels ?? {}, creationTimestamp: new Date().toISOString() },
+      // A pod stuck pulling its image is on the node, as one that runs is.
+      spec: { nodeName: "node-0" },
       status: blocked
         ? {
           phase: "Pending",

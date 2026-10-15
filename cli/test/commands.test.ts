@@ -581,6 +581,11 @@ test("restore-filer-store lists the filer store's backups, and puts one back wit
     "/jobs/alasio-seaweedfs-filer-store-restore",
   ].map(first);
   assert.ok(order.every((index, position) => index >= 0 && (position === 0 || index > (order[position - 1] ?? 0))), JSON.stringify(order));
+  // Started again, what its volumes hold to a node first: Neon's storage before what runs anywhere.
+  const last = (path: string) => changed.findLastIndex((change) => change.path.endsWith(path));
+  for (const [held, free] of [["/statefulsets/alasio-neon-pageserver", "/deployments/alasio-neon-compute"], ["/statefulsets/alasio-neon-safekeeper", "/deployments/alasio"]] as const) {
+    assert.ok(last(held) >= 0 && last(held) < last(free), `${held} before ${free}`);
+  }
   // Started again as each was: the replicas, the gateways' ScaledObject unpaused, the lake's paused as before, the lifecycle pass still suspended.
   for (const path of ["apps/v1/namespaces/alasio/deployments/alasio-seaweedfs", "apps/v1/namespaces/alasio-branch-feature/deployments/alasio", "apps/v1/namespaces/alasio/statefulsets/alasio-seaweedfs-filer-store"]) {
     const workload = at(path);

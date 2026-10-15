@@ -16,7 +16,7 @@ import { Argument, Command, Flag, Prompt } from "effect/cli";
 import { loadConfig } from "../config.ts";
 import { installConfig } from "../install.ts";
 import { type Kind, kind, KubeApi, type ObjectRef, refOf } from "../kube/api.ts";
-import { awaitEnded, awaitGone, awaitReady, selectorOf, type WaitOptions } from "../kube/rollout.ts";
+import { awaitEnded, awaitGone, awaitReady, awaitScheduled, selectorOf, type WaitOptions } from "../kube/rollout.ts";
 import { NAMESPACE, RELEASE } from "../manifests/common.ts";
 import type { InstallConfig } from "../manifests/config.ts";
 import {
@@ -49,7 +49,7 @@ const JOB_NAME = "batch.kubernetes.io/job-name";
 /** A backup's file, of its stamp. */
 const BACKUP_FILE = /^filer-store-(\d{8}T\d{6}Z)\.rdb$/u;
 
-type Workload = KubernetesObject & { spec?: { replicas?: number; selector?: { matchLabels?: Record<string, string> } } };
+type Workload = KubernetesObject & { spec?: { replicas?: number; selector?: { matchLabels?: Record<string, string> }; volumeClaimTemplates?: readonly unknown[] } };
 type Scaled = KubernetesObject & { spec?: { scaleTargetRef?: { kind?: string; name?: string } } };
 
 /** A restore alasio cannot make, and why. */
@@ -153,14 +153,27 @@ const stop = Effect.fnUntraced(function*(workloads: readonly Workload[], options
   yield* awaitGone(pods.flat().map(refOf), options);
 });
 
-/** Starts again what of `workloads` was stopped, as its mark says, and their ScaledObjects, and waits until they run. */
+/** Whether `workload`'s pods are held to a node by their volumes: a StatefulSet's claims, which a local disk binds to its node. */
+const held = (workload: Workload): boolean => workload.kind === "StatefulSet" && (workload.spec?.volumeClaimTemplates?.length ?? 0) > 0;
+
+/**
+ * Starts again what of `workloads` was stopped, as its mark says, and their ScaledObjects,
+ * and waits until they run. Those whose volumes hold them to a node start first, and are
+ * scheduled before the rest start: the rest, which run on any node, would otherwise take
+ * the room on theirs, where nothing else would do.
+ */
 const start = Effect.fnUntraced(function*(workloads: readonly Workload[], options: WaitOptions) {
   const kube = yield* KubeApi;
   const stopped = workloads.filter((workload) => markOf(workload) !== null);
-  for (const workload of stopped) {
-    const { replicas } = markOf<{ replicas: number }>(workload) ?? { replicas: 1 };
-    yield* kube.patch(refOf(workload), { metadata: { annotations: { [MARK]: null } }, spec: { replicas } }, MANAGER);
-  }
+  const scaled = (each: readonly Workload[]) =>
+    Effect.forEach(each, (workload) => {
+      const { replicas } = markOf<{ replicas: number }>(workload) ?? { replicas: 1 };
+      return kube.patch(refOf(workload), { metadata: { annotations: { [MARK]: null } }, spec: { replicas } }, MANAGER);
+    });
+  const first = stopped.filter(held);
+  yield* scaled(first);
+  yield* awaitScheduled(first.map(refOf), options);
+  yield* scaled(stopped.filter((workload) => !held(workload)));
   for (const scaler of (yield* scalersOf(stopped)).filter((each) => markOf(each) !== null)) {
     yield* kube.patch(refOf(scaler), { metadata: { annotations: { ...markOf<Record<string, string | null>>(scaler), [MARK]: null } } }, MANAGER);
   }
