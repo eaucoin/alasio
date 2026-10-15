@@ -752,7 +752,9 @@ if (inShard("telemetry")) {
         }
       };
 
-      test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async () => {
+      test("a broker's crash loses nothing the gateway answered as taken, which it answers once the log is back", async (t) => {
+        for (let round = 1; round <= 20; round += 1) {
+        t.diagnostic(`round ${round} at ${new Date().toISOString()}`);
         const run = randomUUID();
         const before = await exportAll(run, 0, 40);
         assert.equal(before.length, 40, "the gateway took every span while the log ran");
@@ -766,6 +768,8 @@ if (inShard("telemetry")) {
         }
         const written = await untilWritten(run, [...before, ...during], crashed);
         assert.deepEqual([...written.values()].filter((n) => n > 1), [], "no span is written twice");
+        t.diagnostic(`round ${round}: taken during ${JSON.stringify(during)}`);
+        }
       });
 
       test("the intake's crash, as it gathers or writes a batch, loses nothing and writes nothing twice", async () => {
