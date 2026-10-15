@@ -3,7 +3,8 @@ name: gate-log-restart
 # The log's restart gate, 03's (gate/log-restart/run.sh): which log keeps every record it
 # acknowledged through its broker's restarts, each way a broker stops: AutoMQ with the
 # collector's idempotent producer, AutoMQ with a plain one, and Apache Kafka 4.2 with the
-# idempotent one. On its branch alone, whenever what it runs changes.
+# idempotent one, its segments on its volume, or tiered to SeaweedFS. On its branch alone,
+# whenever what it runs changes.
 on:
   push:
     branches: [track/log-restart-gate]
@@ -29,6 +30,7 @@ jobs:
           - { broker: automq, producer: idempotent }
           - { broker: automq, producer: plain }
           - { broker: kafka, producer: idempotent }
+          - { broker: kafka-tiered, producer: idempotent }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
