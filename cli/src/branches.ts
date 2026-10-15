@@ -312,6 +312,8 @@ export interface ListedBranch {
   readonly neon: string | null;
   /** Whether its alasio runs ready, or null when it has none. */
   readonly ready: boolean | null;
+  /** The release of alasio that made it, which it keeps, or null when it has no alasio. */
+  readonly version: string | null;
   /** The memory its workloads request, and what its pods use now, when that is measured. */
   readonly requested: number;
   readonly used: number | null;
@@ -334,6 +336,32 @@ const namespacesOfBranches: Effect.Effect<V1Namespace[], KubeApiError, KubeApi> 
 export const branchNamespaces: Effect.Effect<string[], KubeApiError, KubeApi> = Effect.map(namespacesOfBranches, (namespaces) =>
   namespaces.map(({ metadata }) => metadata?.labels?.[BRANCH_LABEL] ?? ""));
 
+/** The release of alasio that made the workload, as its labels say, or null where there is none. */
+const versionOf = (workload: KubernetesObject | null): string | null => workload?.metadata?.labels?.["app.kubernetes.io/version"] ?? null;
+
+/**
+ * Refuses an upgrade to `version` while a branch environment another release made exists. An
+ * upgrade upgrades main alone, and changes what main's and the branches' alasio share (Neon's
+ * record of the branches, its proxy and computes, the stack's settings) to what `version`
+ * makes of them, which a branch another release made does not run on: deleted first, and made
+ * again once upgraded, it is the upgraded release's.
+ */
+export const refuseBranchesOfOtherReleases = (version: string): Effect.Effect<void, BranchRefused | KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const kube = yield* KubeApi;
+    const names = (yield* branchNamespaces).toSorted();
+    const made = yield* Effect.forEach(names, (name) =>
+      Effect.map(kube.get({ ...DEPLOYMENT, namespace: branchNamespace(name), name: RELEASE }), (alasio) => ({ name, version: versionOf(alasio) })));
+    const others = made.filter((branch) => branch.version !== null && branch.version !== version);
+    if (others.length === 0) return;
+    const named = others.map((branch) => `${branch.name}, which alasio ${branch.version} made`).join("; ");
+    const deletes = others.map((branch) => `alasio branch delete ${branch.name}`).join(", ");
+    return yield* new BranchRefused({
+      message: `alasio upgrades main alone, and a branch environment another release made would not run on what upgrading changes: ${named}. ` +
+        `Delete ${others.length === 1 ? "it" : "each"} first (${deletes}), and make ${others.length === 1 ? "it" : "them"} again once alasio is upgraded`,
+    });
+  });
+
 /** Every branch environment, by Neon's branches and the namespaces made of them. */
 export const listBranches = Effect.gen(function*() {
   const kube = yield* KubeApi;
@@ -352,6 +380,7 @@ export const listBranches = Effect.gen(function*() {
         createdAt: branch?.createdAt ?? namespace?.metadata?.creationTimestamp?.toString() ?? null,
         neon: branch?.state ?? null,
         ready: alasio ? readiness(alasio)._tag === "Ready" : null,
+        version: versionOf(alasio),
         requested: namespace ? yield* requestedIn(branchNamespace(name)) : 0,
         used: pods ? pods.reduce((sum, pod) => sum + used(pod), 0) : null,
       } satisfies ListedBranch;

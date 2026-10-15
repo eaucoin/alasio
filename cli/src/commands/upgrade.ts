@@ -1,8 +1,9 @@
-/** `alasio upgrade`: `up` with this version of the package's images, saying what changes. */
+/** `alasio upgrade`: `up` with this version of the package's images, saying what changes; refused while a branch environment another release made exists. */
 import type { KubernetesObject, V1PodSpec } from "@kubernetes/client-node";
 import { Console, Effect } from "effect";
 import { Command } from "effect/cli";
 
+import { refuseBranchesOfOtherReleases } from "../branches.ts";
 import { loadConfig } from "../config.ts";
 import { install, installationObjects, installConfig } from "../install.ts";
 import { kind, KubeApi } from "../kube/api.ts";
@@ -55,6 +56,7 @@ export const upgrade = Command.make("upgrade", { timeout: timeoutFlag }, ({ time
         const version = running.find((object) => object.kind === "Deployment" && object.metadata?.name === RELEASE)?.metadata?.labels?.["app.kubernetes.io/version"] ?? null;
         const desired = installationObjects(yield* installConfig(config));
         yield* Console.log(imageChanges({ version, images: imagesOf(running) }, imagesOf(desired)).join("\n"));
+        yield* refuseBranchesOfOtherReleases(VERSION);
         yield* announce(target, yield* install(config, waitOptions(timeout)));
       }),
       kubeApi(target),
@@ -64,6 +66,8 @@ export const upgrade = Command.make("upgrade", { timeout: timeoutFlag }, ({ time
     Command.withDescription(
       "Does what alasio up does, with the images this version of alasio's package pins, after saying which images change " +
         "and from which version of alasio, and, for k3s on this machine, with the k3s and gVisor it pins, saying which it " +
-        "installs in place of which. Run as npx alasio@latest upgrade to upgrade to the latest release.",
+        "installs in place of which. It upgrades main alone, and refuses while a branch environment another release of alasio " +
+        "made exists, which would not run on what it changes: delete each first, and make it again once upgraded. Run as npx " +
+        "alasio@latest upgrade to upgrade to the latest release.",
     ),
   );

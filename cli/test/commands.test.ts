@@ -1204,7 +1204,27 @@ test("branch create warns when no node has the memory main's alasio, compute and
   assert.ok(run.printed.includes("Warning: a branch takes about 900 MiB, as main's alasio, compute and lake use now, and no node has more than 512 MiB free."), run.printed.join("\n"));
 });
 
-test("branch list says each branch, what it is a branch of, its age, its alasio, and the memory it requests", async (t) => {
+test("upgrade refuses while a branch environment another release made exists, naming it and how to go on, and upgrades once it is gone", async (t) => {
+  const { alasio, home, kube, telegram } = await branchable(t);
+  telegram.bots.set("456:branch", "branch_bot");
+  writeFileSync(join(home, "branch"), "456:branch");
+  succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
+  succeeded(await alasio(["upgrade"]));
+  const made = kube.get(BRANCH_DEPLOYMENT);
+  assert.ok(made?.metadata?.labels);
+  made.metadata.labels["app.kubernetes.io/version"] = "6.0.0";
+  kube.changes.length = 0;
+  assert.equal(
+    failure(await alasio(["upgrade"])),
+    "alasio upgrades main alone, and a branch environment another release made would not run on what upgrading changes: try, which alasio 6.0.0 made. " +
+      "Delete it first (alasio branch delete try), and make it again once alasio is upgraded",
+  );
+  assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
+  succeeded(await alasio(["branch", "delete", "try", "--force"]));
+  succeeded(await alasio(["upgrade"]));
+});
+
+test("branch list says each branch, what it is a branch of, its age, the release that made it, its alasio, and the memory it requests", async (t) => {
   const { alasio, home, telegram } = await branchable(t);
   assert.deepEqual((await alasio(["branch", "list"])).printed, ["alasio has no branch environments."]);
   telegram.bots.set("456:branch", "branch_bot");
@@ -1212,7 +1232,7 @@ test("branch list says each branch, what it is a branch of, its age, its alasio,
   succeeded(await alasio(["branch", "create", "try", "--bot-token-file", join(home, "branch")]));
   const listed = await alasio(["branch", "list"]);
   succeeded(listed);
-  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, its alasio ready, 1.6 GiB requested, 0 MiB used"]);
+  assert.deepEqual(listed.printed, ["try: a branch of main, 0m old, made by alasio 0.0.0-development, its alasio ready, 1.6 GiB requested, 0 MiB used"]);
 });
 
 test("branch delete refuses while the branch's alasio has a turn running unless --force, and deletes it whole: its alasio and lake, its sessions, its compute, its branch of Neon, its namespaces, its Sandboxes' policy", async (t) => {

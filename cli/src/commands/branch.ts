@@ -115,14 +115,18 @@ const list = Command.make("list", {}, () =>
       const now = Date.now();
       for (const branch of branches) {
         const old = branch.createdAt === null ? "of no age known" : `${age(new Date(branch.createdAt), now)} old`;
+        const made = branch.version === null ? "" : `, made by alasio ${branch.version}`;
         const alasio = branch.ready === null ? "no alasio" : branch.ready ? "its alasio ready" : "its alasio not ready";
         const memory = `${memoryText(branch.requested)} requested${branch.used === null ? "" : `, ${memoryText(branch.used)} used`}`;
-        yield* Console.log(`${branch.name}: a branch of ${branch.parent ?? "nothing Neon has"}, ${old}, ${alasio}, ${memory}${branch.neon && branch.neon !== "ready" ? `, Neon's branch ${branch.neon}` : ""}`);
+        yield* Console.log(`${branch.name}: a branch of ${branch.parent ?? "nothing Neon has"}, ${old}${made}, ${alasio}, ${memory}${branch.neon && branch.neon !== "ready" ? `, Neon's branch ${branch.neon}` : ""}`);
       }
     })
   )).pipe(
     Command.withShortDescription("List the branch environments"),
-    Command.withDescription("Says each branch environment's name, what it is a branch of, its age, whether its alasio runs, and the memory its alasio, compute and lake request and use."),
+    Command.withDescription(
+      "Says each branch environment's name, what it is a branch of, its age, the release of alasio that made it, " +
+        "whether its alasio runs, and the memory its alasio, compute and lake request and use.",
+    ),
   );
 
 const remove = Command.make(
@@ -166,7 +170,9 @@ export const branch = Command.make("branch").pipe(
       "cannot be narrowed: its lake has main's object store identity, as it reads main's files where they are and SeaweedFS's " +
       "write permission deletes too; and its compute has Neon's storage token, the tenant's, as Neon's storage has no " +
       "narrower one. A branch's pods reach main's storage services and nothing else of main's. A branch takes about the " +
-      "memory main's alasio, compute and lake take. Branches live until deleted.",
+      "memory main's alasio, compute and lake take. Branches live until deleted, each on the release of alasio that made it: " +
+      "alasio upgrade upgrades main alone, and refuses while a branch another release made exists, which would not run on what " +
+      "it changes; deleted first, a branch is made again on the upgraded release.",
   ),
 );
 
