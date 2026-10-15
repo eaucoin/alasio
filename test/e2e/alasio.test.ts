@@ -574,19 +574,21 @@ if (inShard("telemetry")) {
         const services = queryOf("Services now");
         for (const panel of ["Services now", "The object store's volume servers", "The log's answers", "Telemetry waiting in the log"]) {
           let rows = 0;
+          let error: string | undefined;
           for (const deadline = Date.now() + 180_000; rows === 0 && Date.now() < deadline; await sleep(5000)) {
             const answered = (await api("/api/ds/query", { method: "POST", body: JSON.stringify({ from: "now-1h", to: "now", queries: [queryOf(panel)] }) })).body as {
-              results: { A: { frames?: { data: { values: unknown[][] } }[] } };
+              results: { A: { frames?: { data: { values: unknown[][] } }[]; error?: string } };
             };
             rows = answered.results.A.frames?.[0]?.data.values[0]?.length ?? 0;
+            error = answered.results.A.error;
           }
           if (rows === 0) {
-            // The metrics the panel reads, by their names' starts, as the lake has them.
+            // The metrics the panel may read, each name once, with how many of its points are of Produce requests, as the lake has them.
             const names = await lakeQuery(
-              "select ServiceName, MetricName, Attributes['type'] as type, count(*) as n from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
-                "and (MetricName like 'kafka_request_time%' or MetricName like 'kafka_stream_wal%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2, 3 limit 80",
-            ).catch((error: unknown) => String(error));
-            assert.fail(`${panel} answered with no row; the log's and the intake's metrics it reads: ${JSON.stringify(names)}`);
+              "select ServiceName, MetricName, count(*) as n, count(*) filter (where Attributes['type'] = 'Produce') as produce from otel.metrics_gauge where ServiceName in ('log', 'lake-intake') " +
+                "and (MetricName like 'kafka_request_time%' or MetricName like 'kafka_stream_wal%' or MetricName like 'lake_telemetry%') and TimeUnix > now()::timestamp - interval 1 hour group by all order by 2",
+            ).catch((failure: unknown) => String(failure));
+            assert.fail(`${panel} answered with no row${error ? `, and the error ${error}` : ""}; the log's and the intake's metrics it may read: ${JSON.stringify(names)}`);
           }
         }
         // A query the lake refuses says why, in Grafana.
@@ -693,6 +695,23 @@ if (inShard("telemetry")) {
         ].join("\n");
       };
 
+      /**
+       * Where the run's spans are, for a failure's message: what the log holds of them
+       * (./log-records.ts), the offsets the intake's group was told, and those the lake
+       * holds, which tell a span the log lost from one the intake skipped.
+       */
+      const whereSpansAre = async (run: string): Promise<string> => {
+        const script = readFileSync(join(import.meta.dirname, "log-records.ts"), "utf8");
+        const read = await kube.exec(NAMESPACE, `${componentName("log")}-0`, ["sh", "-c", 'cd /opt/alasio && node --input-type=module-typescript - "$@"', "node", run], { container: "access", stdin: script })
+          .then(({ stdout, stderr }) => `${stdout}${stderr}`, (error: unknown) => String(error));
+        const lake = await lakeQuery("from otel.intake_offsets order by all").catch((error: unknown) => String(error));
+        return [
+          `the log's records of the run: ${read.trim()}`,
+          `the lake's offsets: ${JSON.stringify(lake)}`,
+          `the gateway's log:\n${await tail(kube.runningPod(NAMESPACE, componentName("collector")), "collector")}`,
+        ].join("\n");
+      };
+
       /** Waits until the lake has each of `taken` of the run's spans, and says how many it has of each. */
       const untilWritten = async (run: string, taken: readonly number[], timeoutMs = 600_000): Promise<Map<number, number>> => {
         const deadline = Date.now() + timeoutMs;
@@ -701,7 +720,7 @@ if (inShard("telemetry")) {
           const written = new Map(rows.map((row) => [Number(row["seq"]), Number(row["n"])]));
           if (taken.every((seq) => written.has(seq))) return written;
           if (Date.now() > deadline) {
-            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${await logState()}`);
+            assert.fail(`of the ${taken.length} spans the gateway took, the lake lacks ${JSON.stringify(taken.filter((seq) => !written.has(seq)))}\n${await whereSpansAre(run)}\n${await logState()}`);
           }
           await sleep(5000);
         }
