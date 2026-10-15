@@ -203,6 +203,12 @@ const Telemetry = Schema.Struct({
 const Snapshots = Schema.Struct({
   /** How long a session's bayma runs no exec before its sandbox is snapshotted and its pod let go: a duration such as 5m. */
   releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
+  /**
+   * How often a session whose execs run is snapshotted live, its sandbox running on, from
+   * that long after they began: the snapshot its pod, lost, is restored from, while bayma's
+   * state generation is still the one it caught. A duration such as 10m.
+   */
+  liveEvery: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 10m")), "10m"),
   /** The most of snapshots each node keeps on its disk, for restores there. */
   nodeCache: defaulted(Size, "5Gi"),
   /**

@@ -171,6 +171,7 @@ describe("configuration", () => {
     assert.deepEqual(config.alasio.resources, { requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "8Gi" } });
     assert.deepEqual(config.sessions.snapshots, {
       releaseAfter: "5m",
+      liveEvery: "10m",
       nodeCache: "5Gi",
       nodeAgent: { resources: { requests: { cpu: "20m", memory: "160Mi" }, limits: { memory: "512Mi" } } },
     });
@@ -203,6 +204,7 @@ describe("configuration", () => {
     assert.match(refused({ host: { mounts: [{ name: "home", hostPath: "home", mountPath: "/home" }] } }), /^host\.mounts\.0\.hostPath /u);
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "five minutes" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
     assert.match(refused({ sessions: { snapshots: { releaseAfter: "0s" } } }), /^sessions\.snapshots\.releaseAfter must be a duration such as 5m$/u);
+    assert.match(refused({ sessions: { snapshots: { liveEvery: "never" } } }), /^sessions\.snapshots\.liveEvery must be a duration such as 10m$/u);
     assert.match(refused({ sessions: { snapshots: { nodeCache: "lots" } } }), /^sessions\.snapshots\.nodeCache must be a storage size, such as 20Gi$/u);
   });
 
@@ -2026,14 +2028,15 @@ describe("security", () => {
     }
   });
 
-  test("snapshots main's sessions where the node agents run: after releaseAfter, under the kept gVisor releases, by the agents alasio presents its token to", () => {
+  test("snapshots main's sessions where the node agents run: after releaseAfter, live every liveEvery, under the kept gVisor releases, by the agents alasio presents its token to", () => {
     const sessions = (objects: readonly KubernetesObject[]): SessionsProfile => JSON.parse(templates(objects)).sessions;
     const sessionsRole = (objects: readonly KubernetesObject[]) =>
       all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio" && metadata.namespace === "alasio-sessions")?.rules ?? [];
     const tokenOf = (objects: readonly KubernetesObject[]) => container(one<V1Deployment>(objects, "Deployment", "alasio")).env?.find(({ name }) => name === "ALASIO_NODE_AGENT_TOKEN");
-    const objects = install({ sessions: { snapshots: { releaseAfter: "10m" } } });
+    const objects = install({ sessions: { snapshots: { releaseAfter: "10m", liveEvery: "15m" } } });
     assert.deepEqual(sessions(objects).snapshots, {
       releaseAfterSeconds: 600,
+      liveEverySeconds: 900,
       releases: NODE_PINS.gvisor.releases.map(({ release }) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}` })),
       agents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
     });

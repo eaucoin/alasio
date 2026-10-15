@@ -19,8 +19,10 @@
  *
  * A running Sandbox may be released: its pod saved, by its caller, and ended, and the
  * Sandbox suspended; a suspended one may be resumed from such a save, its pod brought
- * back, by the template the save gives. One change of a Sandbox's running happens at a
- * time: a bring-up waits for a release, and the other way round.
+ * back, by the template the save gives. A running Sandbox whose pod has ended is released
+ * into the save its caller took of it live, if any, as it is restarted, and brought back
+ * from it the same way. One change of a Sandbox's running happens at a time: a bring-up
+ * waits for a release, and the other way round.
  */
 import { createHash, randomBytes } from "node:crypto";
 
@@ -209,10 +211,15 @@ export interface SandboxRestore {
   readonly failed: (failure: RestoreFailure) => Effect.Effect<"fallen back" | "deferred">;
 }
 
-/** Why a restore's pod did not come back, and whether its sandbox ran meanwhile, so the snapshot no longer is the session. */
+/**
+ * Why a restore's pod did not come back, whether its sandbox ran meanwhile, so the
+ * snapshot no longer is the session, and whether the snapshot holds the session no more
+ * however often it is tried, `stale`, as one taken live whose session has moved on.
+ */
 export interface RestoreFailure {
   readonly why: string;
   readonly resumed: boolean;
+  readonly stale?: boolean;
 }
 
 /** A restore that cannot be done now, but may be later, the Sandbox left suspended, released into its snapshot: why. */
@@ -237,10 +244,14 @@ export const snapshotBinding = (snapshot: SavedSnapshot | null): Record<string, 
   [SNAPSHOT_RELEASE_ANNOTATION]: snapshot?.release ?? null,
 });
 
-/** A Sandbox restored from a snapshot of its pod is not let run: why, and whether its sandbox ran all the same. */
+/**
+ * A Sandbox restored from a snapshot of its pod is not let run: why, whether its sandbox ran
+ * all the same, and whether the snapshot holds the session no more (RestoreFailure).
+ */
 export class SandboxRestoreRefused extends Schema.TaggedError<SandboxRestoreRefused>()("SandboxRestoreRefused", {
   reason: Schema.String,
   resumed: Schema.Boolean,
+  stale: Schema.optional(Schema.Boolean),
 }) {
   override get message(): string {
     return this.reason;
@@ -312,6 +323,12 @@ export interface SandboxesOptions {
    * template first, when it is on another); or why it cannot be now, but may be later.
    */
   readonly restore?: (sandbox: StoredSandbox, desired: Sandbox) => Effect.Effect<SandboxRestore | RestoreDeferred | null>;
+  /**
+   * The snapshot taken live of the running Sandbox `name`, which a Sandbox whose pod has
+   * ended is released into as it is restarted, so that `restore` restores it; null when it
+   * has none.
+   */
+  readonly live?: (name: string) => Effect.Effect<SavedSnapshot | null>;
 }
 
 /** The annotation of a Sandbox that says which pod template it runs: podTemplateHash's. */
@@ -465,6 +482,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
   fault,
   keeps = () => false,
   restore,
+  live,
 }: SandboxesOptions): Effect.fn.Return<Sandboxes, never, KubeClient | Scope.Scope> {
   const kube = yield* KubeClient;
   const fetch = yield* FetchHttpClient.Fetch;
@@ -593,12 +611,21 @@ export const makeSandboxes = Effect.fnUntraced(function*({
    * `sandbox`, whose pod has ended or has a fault only a new pod mends, suspended:
    * agent-sandbox replaces no pod that has ended, so the Sandbox would never be ready
    * again, and the pod it resumes with is new. `why` says which, after "whose", and
-   * `beforeResume` is done once it is suspended.
+   * `beforeResume` is done once it is suspended. Released `into` a snapshot, the pod it
+   * resumes with is that snapshot's, as `restore` says.
    */
-  const restart = Effect.fnUntraced(function*(sandbox: StoredSandbox, why: string, beforeResume: Effect.Effect<void> = Effect.void): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
+  const restart = Effect.fnUntraced(function*(
+    sandbox: StoredSandbox,
+    why: string,
+    beforeResume: Effect.Effect<void> = Effect.void,
+    into: SavedSnapshot | null = null,
+  ): Effect.fn.Return<StoredSandbox, KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone> {
     const name = sandbox.metadata.name;
-    yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}`);
-    const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, { spec: { operatingMode: "Suspended" } }));
+    yield* Effect.logInfo(`restarting Sandbox ${namespace}/${name}, whose ${why}${into ? `, from its snapshot ${into.snapshot}, taken live` : ""}`);
+    const suspended = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
+      ...(into ? { metadata: { annotations: snapshotBinding(into) } } : {}),
+      spec: { operatingMode: "Suspended" },
+    }));
     const restarted = yield* awaitCondition(suspended, "Suspended");
     yield* beforeResume;
     return restarted;
@@ -628,7 +655,7 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     }));
     // Once resumed, its sandbox has run: what fails after is the session's, which has moved on.
     const back = yield* plan.resume.pipe(
-      Effect.catchTag("SandboxRestoreRefused", (error) => Effect.fail({ why: error.message, resumed: error.resumed })),
+      Effect.catchTag("SandboxRestoreRefused", (error) => Effect.fail({ why: error.message, resumed: error.resumed, ...(error.stale ? { stale: true } : {}) })),
       Effect.andThen(awaitCondition(restoring, "Ready").pipe(
         Effect.catchTags({
           SandboxNotReady: (error) => Effect.fail({ why: error.message, resumed: true }),
@@ -668,7 +695,9 @@ export const makeSandboxes = Effect.fnUntraced(function*({
       if (!current(sandbox) && !(keeps(sandbox) && !podEnded(sandbox))) {
         sandbox = yield* moveOnto(sandbox, desired);
       } else if (podEnded(sandbox)) {
-        sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`);
+        // Lost with what ran in it: a snapshot taken live of it, if any, brings it back.
+        const into = live ? yield* live(name) : null;
+        sandbox = yield* restart(sandbox, `pod ended (${condition(sandbox, "Ready")?.reason})`, Effect.void, into);
       } else if (fault && sandboxReady(sandbox)) {
         // Only a pod that ran before: one just made, or about to be resumed, is new.
         const found = yield* fault(name);
