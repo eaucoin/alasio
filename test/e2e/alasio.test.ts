@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 
 import type { InlineKeyboardButton } from "@grammyjs/types";
-import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
+import type { CoreV1Event, KubernetesObject, V1ConfigMap, V1Deployment, V1Job, V1Node, V1PersistentVolume, V1Pod, V1Secret, V1Service, V1StatefulSet, V1ValidatingAdmissionPolicy, V1ValidatingAdmissionPolicyBinding, V2HorizontalPodAutoscaler } from "@kubernetes/client-node";
 import pg from "pg";
 
 import { memoryBytes } from "../../cli/src/capacity.ts";
@@ -69,6 +69,7 @@ import {
   releaseAlasioWith,
   releaseSettings,
   RELEASE_AFTER_SECONDS,
+  routeAddress,
   SESSIONS,
   setUp,
   tcp,
@@ -230,7 +231,23 @@ if (inShard("upgrade")) {
     let counted: number;
     let spans: number;
     let upgraded: number;
+    /** The users main's bot allows, as its Secret says them. */
+    const allowed = async () => Buffer.from((await kube.get<V1Secret>(ref("Secret", `${RELEASE}-telegram`, NAMESPACE)))?.data?.["allowedUserIds"] ?? "", "base64").toString("utf8");
     const scenarios: readonly Scenario[] = [
+      {
+        seeds: "main's bot allowing no user, as 7.0.0 let in the first to write to it, kept in the store",
+        seed: async () => {
+          await kube.patch(ref("Secret", `${RELEASE}-telegram`, NAMESPACE), { data: { allowedUserIds: "" } });
+          await onDatabase(NAMESPACE, "insert into state.bot_state (key, value) values ('telegram_bootstrap_user_id', '1001') on conflict (key) do update set value = excluded.value");
+          assert.equal(await allowed(), "");
+        },
+        keeps: "main's bot allowing that user, as the cut-over gave it before its point of no return, and the other its owner gave it again after",
+        check: async () => {
+          assert.equal(await allowed(), `1001,${OTHER_OPERATOR}`);
+          await tg.say("allowed");
+          await tg.waitFor((call) => answered(call));
+        },
+      },
       {
         seeds: "main at work, in a session workspace and in a folder, a file in each",
         seed: async () => {
@@ -318,6 +335,22 @@ if (inShard("upgrade")) {
           assert.equal(collectorOf(JSON.parse(readFileSync(paths().configFile, "utf8")))["resources"], undefined);
         },
       },
+      {
+        seeds: "main's bot taking its updates by getUpdates, where it is in them kept in the store",
+        seed: async () => {
+          assert.match(await onDatabase(NAMESPACE, "select value from state.bot_state where key = 'telegram_update_offset'"), /^\d+$/u);
+        },
+        keeps: "Telegram delivers main's updates to the webhook intake, and the store keeps nothing of polling",
+        check: async () => {
+          const listed = (await (await fetch(`${telegram?.base}/control/calls`)).json()) as CallsListing;
+          assert.ok(listed.calls.some(({ method, payload }) => method === "setWebhook" && String(payload.url).includes("/telegram/main/")), "the upgrade registered main's bot");
+          // At the address the cut-over gave the configuration, the machine's, as alasio init offers it.
+          assert.equal(JSON.parse(readFileSync(paths().configFile, "utf8")).install.webhook.publicAddress, await routeAddress());
+          assert.equal(await onDatabase(NAMESPACE, "select count(*) from state.bot_state where key in ('telegram_update_offset', 'telegram_bootstrap_user_id')"), "0");
+          await tg.say("by webhook");
+          await tg.waitFor((call) => answered(call));
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -326,7 +359,8 @@ if (inShard("upgrade")) {
     // so the cut-over refuses while one exists, as its first checks find it, before the
     // pageservers' StatefulSet is deleted.
     test(`on ${PREVIOUS}: a branch environment, which the cut-over refuses to go past, before it changes anything, until it is deleted`, { timeout: 60 * 60_000 }, async () => {
-      await createBranch(branchTelegram?.base);
+      // Its users given, as main's bot allows none until the cut-over gives it 7.0.0's.
+      await createBranch(branchTelegram?.base, {}, "--allowed-user-ids", "1001");
       const [set, pod] = await pageservers();
       const [claim] = await neonHeld();
       const refused = await cutOver();
@@ -338,24 +372,6 @@ if (inShard("upgrade")) {
       assert.ok(await runs("alasio-neon-control"), "neon-control runs as it did");
       assert.ok(await runs(RELEASE), "alasio runs as it did");
       await alasioOk("branch", "delete", BRANCH);
-    });
-
-    // This release cannot be applied over PREVIOUS's pageservers' StatefulSet, as the cut-over
-    // deletes it first: a plain upgrade refuses before anything changes.
-    test(`on ${PREVIOUS}: a plain upgrade, refused before it changes anything, as the cut-over is to make the pageservers' StatefulSet anew`, async () => {
-      const before = await pageservers();
-      const alasioGeneration = async () => (await kube.get(ref("Deployment", RELEASE, NAMESPACE)))?.metadata?.generation;
-      const generation = await alasioGeneration();
-      // 7.0.0's configuration as it is, refused for what this release has no setting of.
-      const unedited = await releaseAlasio("upgrade");
-      assert.notEqual(unedited.code, 0, unedited.stdout);
-      assert.match(unedited.stderr, /install\.telemetry\.collector\.resources Expected no excess property/u);
-      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
-      // Given this release's settings, as the cut-over gives them, refused for the StatefulSet.
-      const refused = await releaseAlasioWith({ XDG_CONFIG_HOME: await releaseSettings() }, "upgrade");
-      assert.notEqual(refused.code, 0, refused.stdout);
-      assert.ok(refused.stderr.includes(`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`) && refused.stderr.includes(`upgrades/from-${PREVIOUS}.sh`), refused.stderr);
-      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
     });
 
     test(`the cut-over from ${PREVIOUS}, failing once each step before the upgrade has run, its pageservers' StatefulSet deleted, makes it again over its pod as it was, ` +
@@ -386,13 +402,39 @@ if (inShard("upgrade")) {
       assert.notEqual(failed.code, 0, failed.stdout);
       assert.match(failed.stderr, /FAILED: a failure injected before the point of no return[^]*making the pageservers' StatefulSet again/u);
       assert.doesNotMatch(failed.stderr, /could not be made again/u);
+      // Saying, before its point of no return, the address Telegram is to deliver to: the machine's, as the configuration names none.
+      assert.ok(failed.stderr.includes(`Telegram delivers to ${await routeAddress()} once upgraded`), failed.stderr);
       const [set, podAfter] = await pageservers();
       assert.ok(set);
       assert.equal(podAfter, pod);
       assert.equal((await kube.get<V1StatefulSet>(ref("StatefulSet", neonName("pageserver"), NAMESPACE)))?.spec?.podManagementPolicy, "OrderedReady");
+      // The bot that allowed no user given, before the point of no return, the one 7.0.0 let in, and
+      // left so, as 7.0.0 admits that user alone either way; then its other user again, by its owner,
+      // as alasio init gives it, 7.0.0's alasio reading its users as it started.
+      assert.equal(await allowed(), "1001");
+      await kube.patch(ref("Secret", `${RELEASE}-telegram`, NAMESPACE), { data: { allowedUserIds: Buffer.from(`1001,${OTHER_OPERATOR}`).toString("base64") } });
       await kube.awaitReady([ref("Deployment", "alasio-neon-control", NAMESPACE), ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
       await tg.say("between the cut-overs");
       await tg.waitFor((call) => answered(call));
+    });
+
+    // This release cannot be applied over PREVIOUS's pageservers' StatefulSet, as the cut-over
+    // deletes it first: a plain upgrade refuses before anything changes. Run once the bot allows
+    // its users again, as one that allows none is refused first.
+    test(`on ${PREVIOUS}: a plain upgrade, refused before it changes anything, as the cut-over is to make the pageservers' StatefulSet anew`, async () => {
+      const before = await pageservers();
+      const alasioGeneration = async () => (await kube.get(ref("Deployment", RELEASE, NAMESPACE)))?.metadata?.generation;
+      const generation = await alasioGeneration();
+      // 7.0.0's configuration as it is, refused for what this release has no setting of.
+      const unedited = await releaseAlasio("upgrade");
+      assert.notEqual(unedited.code, 0, unedited.stdout);
+      assert.match(unedited.stderr, /install\.telemetry\.collector\.resources Expected no excess property/u);
+      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
+      // Given this release's settings, as the cut-over gives them, refused for the StatefulSet.
+      const refused = await releaseAlasioWith({ XDG_CONFIG_HOME: await releaseSettings() }, "upgrade");
+      assert.notEqual(refused.code, 0, refused.stdout);
+      assert.ok(refused.stderr.includes(`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`) && refused.stderr.includes(`upgrades/from-${PREVIOUS}.sh`), refused.stderr);
+      assert.deepEqual([await pageservers(), await alasioGeneration()], [before, generation]);
     });
 
     const controllerReplicas = async () => (await kube.get<V1Deployment>(ref("Deployment", neonName("storage-controller"), NAMESPACE)))?.spec?.replicas;
@@ -465,15 +507,16 @@ if (inShard("upgrade")) {
       assert.equal(await kube.get(ref("Service", neonName("pageserver"), NAMESPACE)), null);
       assert.equal(ran.code, 0, ran.stdout);
       assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
-      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded\n$/u);
+      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded at \S+\n[^\n]* deleting what alasio kept of polling Telegram\n[^\n]* through\n$/u);
       upgraded = Date.now();
     });
 
-    test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS} run again, once it has upgraded, goes on with what follows the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
       const again = await cutOver();
       assert.equal(again.code, 0, again.stdout);
-      assert.match(again.stderr, /upgrading, from the cut-over begun at /u);
+      assert.doesNotMatch(again.stderr, /upgrading, from the cut-over begun at /u);
       assert.doesNotMatch(again.stderr, /checking that the storage controller has node 1|deleting the pageservers' StatefulSet|registering node 1 anew|pageservers' Service through the upgrade|main's compute given pod 0's/u);
+      assert.match(again.stderr, /upgraded at \S+\n[^\n]* deleting what alasio kept of polling Telegram\n[^\n]* through\n$/u);
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
@@ -2309,14 +2352,14 @@ async function workInMain(): Promise<string> {
 
 /**
  * Makes the run's branch environment by `alasio branch create`, with `overrides` over its
- * installation. Its alasio talks to its own bot's stand-in, which `base` forwards to here,
+ * installation, and `given`, flags of branch create's besides. Its alasio talks to its own bot's stand-in, which `base` forwards to here,
  * as the command line checks its token with it.
  */
-async function createBranch(base: string | undefined, overrides: Record<string, unknown> = {}): Promise<void> {
+async function createBranch(base: string | undefined, overrides: Record<string, unknown> = {}, ...given: string[]): Promise<void> {
   const work = mkdtempSync(join(tmpdir(), "alasio-e2e-branch-"));
   writeFileSync(join(work, "bot-token"), "456:branch", { mode: 0o600 });
   writeFileSync(join(work, "overrides.json"), JSON.stringify({ ...overrides, alasio: { env: { TELEGRAM_API_ROOT: urlOf(TELEGRAM_BRANCH) } } }));
-  await alasioOkWith({ TELEGRAM_API_ROOT: base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"));
+  await alasioOkWith({ TELEGRAM_API_ROOT: base }, "branch", "create", BRANCH, "--bot-token-file", join(work, "bot-token"), "--overrides", join(work, "overrides.json"), ...given);
 }
 
 /** Runs `sql` on alasio's database in `namespace` (main's, or a branch's), as the compute's own superuser, in its pod: what psql printed. */

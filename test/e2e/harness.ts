@@ -35,6 +35,7 @@
  * this checkout by the cut-over the box runs (cutOver).
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { createSocket } from "node:dgram";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
 import { tmpdir, userInfo } from "node:os";
@@ -781,6 +782,23 @@ export async function releaseSettings(): Promise<string> {
 }
 
 /**
+ * This machine's address on its default route, as the kernel picks it for a connection to
+ * the internet, which alasio init offers as the address Telegram delivers to: a socket
+ * connected, which sends nothing.
+ */
+export function routeAddress(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = createSocket("udp4");
+    socket.on("error", reject);
+    socket.connect(53, "1.1.1.1", () => {
+      const { address } = socket.address();
+      socket.close();
+      resolve(address);
+    });
+  });
+}
+
+/**
  * The upgrade shard's cut-over, as the box runs it: upgrades/from-<PREVIOUS>.sh, as root,
  * kubectl reaching the cluster by the run's kubeconfig, its CONFIG the run's configuration's
  * file, its UPGRADE this checkout's `alasio upgrade` as this user, the run's install
@@ -788,8 +806,9 @@ export async function releaseSettings(): Promise<string> {
  * this checkout's command line, of no release, pins no images of its own, and its UPGRADE_CHECK
  * this checkout's `alasio upgrade --check` as this user, on a copy of the configuration laid
  * over so, as the configuration itself is laid over only as UPGRADE runs, and sudo asking this
- * user for no password; failing at `failAt`, a point the script names, when given. What it
- * came to; from its success on, the run runs this checkout's `alasio`.
+ * user for no password; Telegram told this machine's address however private, as the
+ * stand-in, in the cluster, reaches it; failing at `failAt`, a point the script names, when
+ * given. What it came to; from its success on, the run runs this checkout's `alasio`.
  */
 export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
   const { work, env, configFile, kubeconfig, release } = current();
@@ -798,7 +817,9 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   const installFile = join(work, "release-install.json");
   writeFileSync(installFile, JSON.stringify(installation("release")), { mode: 0o600 });
   const user = userInfo().username;
-  const owner = (configHome: string) => ["sudo", "-u", user, "env", ...["HOME", "PATH", "XDG_DATA_HOME"].map((name) => `${name}=${env[name] ?? ""}`), `XDG_CONFIG_HOME=${configHome}`];
+  // The release's command line reaches the run's Telegram stand-in as the run's own does: it registers main's bot with it.
+  const owner = (configHome: string) =>
+    ["sudo", "-u", user, "env", ...["HOME", "PATH", "XDG_DATA_HOME", "TELEGRAM_API_ROOT"].map((name) => `${name}=${env[name] ?? ""}`), `XDG_CONFIG_HOME=${configHome}`];
   const command = (...words: string[]) => words.map(shellWord).join(" ");
   const configured = (configHome: string) =>
     command(...owner(configHome), process.execPath, join(root, "test", "e2e", "release-config.ts"), join(configHome, "alasio", "config.json"), installFile);
@@ -814,7 +835,7 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
   ].join(" && ");
   const out = join(work, "cut-over");
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, "PRIVATE_ADDRESS=allowed", ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
   if (ran.code === 0) current().bin = release;

@@ -6,8 +6,9 @@
 # for k3s on this machine). Everything is recorded in OUT, which is to be on a disk that
 # outlives a restart of the machine, as /tmp may not.
 #
-#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] upgrades/from-7.0.0.sh
+#   UPGRADE=<command> UPGRADE_CHECK=<command> CONFIG=<file> OUT=<dir> [FAIL_AT=<point>] [PRIVATE_ADDRESS=allowed] upgrades/from-7.0.0.sh
 #   upgrades/from-7.0.0.sh release-settings <file>
+#   upgrades/from-7.0.0.sh private-address <address>
 #
 # UPGRADE runs the release's upgrade as the configuration's owner, which restarts alasio,
 # ending the turn it runs; UPGRADE_CHECK proves, before the upgrade, that it can, and that the
@@ -25,7 +26,9 @@
 # step before the upgrade has run, FAIL_AT=after-the-storage-controller-stopped past it, with
 # the storage controller stopped for node 1 to be registered anew, and
 # FAIL_AT=after-the-pageserver-registered-anew once it is, as the upgrade shard rehearses a
-# failure at each.
+# failure at each. PRIVATE_ADDRESS=allowed lets Telegram be told a private address, as the
+# upgrade shard's Telegram, a stand-in in the cluster, reaches one; `private-address` exits 0
+# where the address is one the cut-over refuses as private, and 1 where not.
 #
 # It upgrades main alone, as alasio upgrade does, which refuses while a branch environment
 # 7.0.0 made exists: it refuses then too, before it changes anything. Delete each first
@@ -44,22 +47,57 @@
 # start for ever; and it keeps 7.0.0's Service of the pageservers, which main's compute reads
 # pages at, through the upgrade, until neon-control has given the compute pod 0's.
 #
+# Telegram delivers to the webhook intake now, at an address 7.0.0 has no setting of, to a bot
+# this release admits its allowed users alone to. So, before the point of no return, it gives
+# the configuration that address where it names none, this machine's on its route to the
+# internet, saying which, and, where the bot allows no user, allows the one 7.0.0 let in as the
+# first to write to it, refusing before it changes anything where it can find neither, or where
+# the address is private, which Telegram cannot reach; once upgraded, with main's bot given its
+# route, it deletes what 7.0.0 kept of polling Telegram.
+#
 # Run again, it goes on from where it stopped: what each step reads is kept in OUT and read
 # again from there, and a failure before the point of no return makes again what the steps
-# deleted. Once past it (OUT/point-of-no-return), a run again goes on from there.
+# deleted. Once past it (OUT/point-of-no-return), a run again goes on from there, and once the
+# upgrade went through (OUT/upgraded), with what follows it alone.
 set -euo pipefail
 umask 077
-# The configuration $1 in this release's settings, on stdout: the collector's resources gone,
-# as this release has its gateway's and its scraper's. What the cut-over gives the configuration
-# before UPGRADE_CHECK reads it; and what `from-7.0.0.sh release-settings <file>` says alone, as
-# the upgrade shard gives a copy of the configuration it.
-release_settings() {
-  jq 'del(.install.telemetry.collector.resources)' "$1"
+# This machine's address on its route to the internet, as alasio init offers it as the address
+# Telegram delivers to; none where it has no such route.
+routed() { ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'; }
+# The address Telegram delivers to, as the configuration $1 names it, or this machine's on its
+# route to the internet where it names none.
+delivered_to() {
+  local named
+  named=$(jq -r '.install.webhook.publicAddress // ""' "$1")
+  printf '%s\n' "${named:-$(routed)}"
 }
-if [ "${1:-}" = release-settings ]; then
-  release_settings "${2:?the configuration file to give them}"
-  exit 0
-fi
+# Whether the IPv4 address $1 is one Telegram cannot reach, being private: RFC 1918's, the
+# shared space carrier-grade NAT and tailnets use (100.64.0.0/10), link-local, loopback,
+# "this network" (0.0.0.0/8), the benchmarking space (198.18.0.0/15), or multicast and the
+# reserved space past it (224.0.0.0/3). A host name is none.
+private_address() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+  ((a == 0 || a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 100 && b >= 64 && b <= 127) || (a == 169 && b == 254) || (a == 198 && (b == 18 || b == 19)) || a >= 224))
+}
+# The configuration $1 in this release's settings, on stdout: the collector's resources gone,
+# as this release has its gateway's and its scraper's; the address Telegram delivers to $2.
+# What the cut-over gives the configuration before UPGRADE_CHECK reads it; and what
+# `from-7.0.0.sh release-settings <file>` says alone, the address the configuration's or this
+# machine's on its route, as the upgrade shard gives a copy of the configuration it.
+release_settings() {
+  jq --arg address "$2" 'del(.install.telemetry.collector.resources) | .install.webhook.publicAddress = $address' "$1"
+}
+case "${1:-}" in
+  release-settings)
+    release_settings "${2:?the configuration file to give them}" "$(delivered_to "$2")"
+    exit 0
+    ;;
+  private-address)
+    private_address "${2:?the address to classify}"
+    exit
+    ;;
+esac
 : "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${CONFIG:?the configuration UPGRADE reads}" "${OUT:?where to record}"
 NS=alasio
 PAGESERVERS=alasio-neon-pageserver
@@ -104,9 +142,17 @@ restore() {
     log "FAILED: the pageservers' StatefulSet is deleted, its pod running unowned, and could not be made again from $OUT/pageserver-statefulset.json: the cut-over run again goes on, the upgrade making it anew; to run 7.0.0 as it was instead, make it from there (kubectl create -f), its metadata.uid and metadata.resourceVersion deleted"
 }
 
-for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
+for tool in ip jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 [ -f "$CONFIG" ] && jq -e '.install | type == "object"' "$CONFIG" >/dev/null 2>&1 || fail "CONFIG, $CONFIG, is not alasio's configuration"
+# alasio's state in main's compute, as SQL $1 answers it: the compute awake, as alasio holds
+# its sessions on it. It waits for the compute to be awake, and wakes it not: a cut-over runs
+# with alasio running, which keeps main's compute awake while it holds sessions on it.
+in_state() {
+  awake() { [ "$(k get deploy alasio-neon-compute -o jsonpath='{.status.readyReplicas}')" = 1 ]; }
+  wait_for 300 "main's compute to be awake" awake
+  k exec deploy/alasio-neon-compute -c compute -- psql -h 127.0.0.1 -p 55433 -U cloud_admin -d alasio -v ON_ERROR_STOP=1 -Atqc "$1"
+}
 
 if [ ! -e "$OUT/point-of-no-return" ]; then
   # The configuration as 7.0.0 reads it, kept in OUT the first time: what the changes below are
@@ -124,6 +170,29 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   branches=$(kubectl get namespace -l alasio.dev/branch -o json | jq -r '.items[] | .metadata.labels["alasio.dev/branch"] as $branch | select(.metadata.name == "alasio-branch-\($branch)") | $branch')
   [ -z "$branches" ] ||
     fail "alasio upgrades main alone, and the branch environments 7.0.0 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
+  # The address Telegram delivers to, which 7.0.0 has no setting of: the one CONFIG names, as
+  # its owner sets it where a run before refused this machine's, or else this machine's on its
+  # route to the internet, as alasio init offers it; kept in OUT once taken, as a failure gives
+  # CONFIG back as 7.0.0 reads it.
+  if [ ! -e "$OUT/public-address" ]; then
+    address=$(delivered_to "$CONFIG")
+    [ -n "$address" ] ||
+      fail "this machine has no route to the internet whose address Telegram could deliver to: set install.webhook.publicAddress in $CONFIG, and run the cut-over again (it reads the address there until it has kept one in $OUT/public-address, and an edit of $CONFIG after that is ignored)"
+    if private_address "$address" && [ "${PRIVATE_ADDRESS:-}" != allowed ]; then
+      fail "Telegram would deliver to $address, a private address, which it cannot reach: set install.webhook.publicAddress in $CONFIG to the address Telegram reaches this machine at, and run the cut-over again (it reads the address there until it has kept one in $OUT/public-address, and an edit of $CONFIG after that is ignored)"
+    fi
+    printf '%s\n' "$address" >"$OUT/public-address.part"
+    mv "$OUT/public-address.part" "$OUT/public-address"
+  fi
+  address=$(cat "$OUT/public-address")
+  log "Telegram delivers to $address once upgraded (kept in $OUT/public-address)"
+  # The users the bot allows, whom this release admits alone: where 7.0.0's allows none, as
+  # 7.0.0 let in the first to write to it, that user, as 7.0.0 kept it in alasio's state.
+  first=
+  if [ -z "$(k get secret alasio-telegram -o jsonpath='{.data.allowedUserIds}' | base64 -d)" ]; then
+    first=$(in_state "select value from state.bot_state where key = 'telegram_bootstrap_user_id'")
+    [[ $first =~ ^[0-9]+$ ]] || fail "the bot allows no user, and 7.0.0 let none in: give it its users (alasio init --allowed-user-ids), and run the cut-over again"
+  fi
   statefulset=$(k get statefulset "$PAGESERVERS" --ignore-not-found -o name)
   if [ -n "$statefulset" ]; then
     pods=$(k get pod -l app.kubernetes.io/component=neon-pageserver -o jsonpath='{.items[*].metadata.name}')
@@ -138,10 +207,15 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   # The configuration in this release's settings, rewritten whole, its owner and mode kept,
   # before UPGRADE_CHECK reads it.
   log "giving $CONFIG this release's settings"
-  release_settings "$OUT/config.json" >"$CONFIG.part"
+  release_settings "$OUT/config.json" "$address" >"$CONFIG.part"
   chown --reference="$CONFIG" "$CONFIG.part"
   chmod --reference="$CONFIG" "$CONFIG.part"
   mv "$CONFIG.part" "$CONFIG"
+  # Left so on a failure, as 7.0.0 admits that user alone either way.
+  if [ -n "$first" ]; then
+    log "allowing the user 7.0.0 let in, $first, as the bot allows none"
+    k patch secret alasio-telegram --type merge -p "{\"data\":{\"allowedUserIds\":\"$(printf %s "$first" | base64 -w0)\"}}" >/dev/null
+  fi
   bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1 || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"
   date -u +%FT%TZ >"$OUT/point-of-no-return"
@@ -190,10 +264,14 @@ if [ -n "$installation" ]; then
   k label service "$PAGESERVERS" alasio.dev/installation- >/dev/null
 fi
 
-log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
-printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
-bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
-  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: write $OUT/config.json back to $CONFIG; stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again"
+# The upgrade, once: a run again once it went through goes on with what follows it alone.
+if [ ! -e "$OUT/upgraded" ]; then
+  log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
+  printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
+  bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
+    fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: write $OUT/config.json back to $CONFIG; stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again"
+  date -u +%FT%TZ >"$OUT/upgraded"
+fi
 # Given pod 0's, or asleep, as it then fetches its spec, with it, as it wakes.
 given() {
   local replicas layout
@@ -210,4 +288,12 @@ if [ -n "$kept" ]; then
 fi
 kept=$(k get service "$PAGESERVERS" --ignore-not-found -o name)
 [ -z "$kept" ] || fail "7.0.0's pageservers' Service is there still, where nothing is to read pages at it now: delete it (kubectl -n $NS delete service $PAGESERVERS)"
-log "upgraded"
+log "upgraded at $(cat "$OUT/upgraded")"
+
+# What 7.0.0 kept of polling Telegram, which nothing reads now that Telegram delivers to the
+# webhook intake: where it was in the bot's updates, and the user an empty allowlist let in,
+# once the upgrade has given main's bot its route.
+[ -n "$(k get secret alasio-webhook-routes -o jsonpath='{.data.main}')" ] || fail "main's bot has no route to the webhook intake: run alasio up as the owner of $CONFIG, which gives it one now that $OUT/upgraded is there, then the cut-over again, which upgrades no more"
+log "deleting what alasio kept of polling Telegram"
+in_state "delete from state.bot_state where key in ('telegram_update_offset', 'telegram_bootstrap_user_id')" >/dev/null
+log "through"
