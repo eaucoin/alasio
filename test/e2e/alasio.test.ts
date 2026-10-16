@@ -48,6 +48,7 @@ import {
   alasioRunning,
   CLUSTER,
   cutOver,
+  inCutOverRecord,
   dumpClusterState,
   type Forward,
   HOST_PROFILE,
@@ -533,6 +534,13 @@ if (inShard("upgrade")) {
     /** Main's session's REPL, live as the session is released, and the snapshot it is released into on PREVIOUS. */
     let releasedRepl: string;
     let releasedAs: string;
+    /** The keys of what PREVIOUS keeps of the sessions' snapshots in the bucket: each under a snapshot's id, to the second. */
+    const keptByPrevious = async () => {
+      const [node] = (await nodeAgents()).keys();
+      assert.ok(node, "no node agent runs ready");
+      return (await inNodeAgent<readonly string[]>(node, "./snapshot-bucket.ts", "keys", SESSIONS)).filter((key) => /^[^/]+\/[^/]+\/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\//u.test(key));
+    };
+    let keptBefore: readonly string[];
 
     test(`on ${PREVIOUS}: main's session released into a snapshot of its layout, a REPL live in it, which the cut-over moves`, { timeout: 30 * 60_000 }, async () => {
       ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
@@ -540,9 +548,79 @@ if (inShard("upgrade")) {
       releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
       // An id of PREVIOUS's, to the second.
       assert.match(releasedAs, /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/u);
+      keptBefore = await keptByPrevious();
+      assert.ok(keptBefore.includes(`${SESSIONS}/${volumeId}/${releasedAs}/manifest.json`), keptBefore.join(", "));
     });
 
-    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through`, { timeout: 60 * 60_000 }, async () => {
+    /** The JSON of the bucket's object `key`, as a node agent's client of it reads it, of whichever release; null for none. */
+    const bucketJson = async (key: string): Promise<unknown> => {
+      const [node] = (await nodeAgents()).keys();
+      assert.ok(node, "no node agent runs ready");
+      return inNodeAgent<unknown>(node, "./bucket-json.ts", "get", key);
+    };
+    /** Writes `value` as the JSON of the bucket's object `key`, by a node agent's client of it. */
+    const putBucketJson = async (key: string, value: unknown): Promise<void> => {
+      const [node] = (await nodeAgents()).keys();
+      assert.ok(node, "no node agent runs ready");
+      await inNodeAgent<unknown>(node, "./bucket-json.ts", "put", key, JSON.stringify(value));
+    };
+    /** The snapshot main's session's Sandbox is released into. */
+    const boundTo = async () => (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
+    /** Whether alasio is stopped, its Deployment of no replica and its pods gone. */
+    const alasioStopped = async () =>
+      (await kube.get<V1Deployment>(ref("Deployment", RELEASE, NAMESPACE)))?.spec?.replicas === 0 &&
+      (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: "app.kubernetes.io/component=alasio" })).length === 0;
+
+    test(`the cut-over from ${PREVIOUS}, failing once the sessions' snapshots are moved, moves them back with MOVE_BACK=1, stopping alasio first however it was started since, ` +
+      "binding a session back only while its snapshot is still the one moved, and setting the moves aside, so the cut-over run again moves them anew", { timeout: 60 * 60_000 }, async () => {
+      const current = `${SESSIONS}/${volumeId}/current.json`;
+      const kept = await bucketJson(`${SESSIONS}/${volumeId}/${releasedAs}/manifest.json`);
+      assert.ok(kept);
+      assert.deepEqual(await bucketJson(current), kept);
+      /** The cut-over, failing once the snapshots are moved: the snapshot main's session is moved to, and its manifest. */
+      const moved = async () => {
+        const failed = await cutOver({ failAt: "after-the-snapshots-moved" });
+        assert.notEqual(failed.code, 0, failed.stdout);
+        assert.match(failed.stderr, /moving the snapshots of the sessions of [^]*FAILED: a failure injected once the sessions' snapshots were moved\n$/u);
+        const movedAs = await boundTo();
+        assert.match(movedAs, new RegExp(`^${releasedAs.slice(0, 15)}[0-9]{3}${releasedAs.slice(15)}$`, "u"));
+        const manifest = (await bucketJson(current)) as Manifest;
+        assert.equal(manifest.snapshot, movedAs);
+        return { movedAs, manifest };
+      };
+      /** The move back, which succeeds: what it said. */
+      const movedBack = async () => {
+        const back = await cutOver({ moveBack: true });
+        assert.equal(back.code, 0, `${back.stdout}${back.stderr}`);
+        return back.stderr;
+      };
+
+      // Moved; then alasio started again, as the upgrade may start it before it fails, and the
+      // session's snapshot moved on from since, as one taken live of it would leave it.
+      const first = await moved();
+      await kube.patch(ref("Deployment", RELEASE, NAMESPACE), { spec: { replicas: 1 } });
+      await kube.awaitReady([ref("Deployment", RELEASE, NAMESPACE)], "10 minutes");
+      const movedOn = { ...first.manifest, snapshot: `${first.movedAs.slice(0, -8)}00000000` };
+      await putBucketJson(current, movedOn);
+      const left = await movedBack();
+      assert.match(left, new RegExp(`stopping alasio, which the upgrade may have started again[^]*left ${SESSIONS}/${volumeId} as it is: its current snapshot is ${movedOn.snapshot}, no longer ${first.movedAs}, the one moved\\n[^]*the sessions are bound back`, "u"));
+      assert.ok(await alasioStopped(), "alasio runs on");
+      assert.deepEqual(await bucketJson(current), movedOn);
+      assert.equal(await boundTo(), first.movedAs);
+
+      // Put back as ${PREVIOUS} had it, as a move back leaves it: the cut-over run again moves it
+      // anew, the moves before set aside, and a move back then binds the session back to its
+      // snapshot of ${PREVIOUS}'s layout.
+      await putBucketJson(current, kept);
+      await kube.patch(ref("Sandbox", volumeId, SESSIONS), { metadata: { annotations: { [SNAPSHOT_ANNOTATION]: releasedAs } } });
+      assert.equal((await moved()).movedAs, first.movedAs);
+      assert.match(await movedBack(), /binding the Sandbox [^\n]* to its snapshot [^\n]*, which was [^\n]*\n[^]*the sessions are bound back/u);
+      assert.deepEqual(await bucketJson(current), kept);
+      assert.equal(await boundTo(), releasedAs);
+      assert.ok(await alasioStopped(), "alasio runs on");
+    });
+
+    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through the upgrade, failing midway through the deletion of what ${PREVIOUS} kept of the snapshots`, { timeout: 60 * 60_000 }, async () => {
       // Each second it runs: whether main's compute, awake, has an address to read pages at,
       // PREVIOUS's pageservers' Service or the one neon-control gave it; whether this release's
       // pageservers' StatefulSet is applied, past which the upgrade's prune would delete
@@ -575,9 +653,14 @@ if (inShard("upgrade")) {
         `pod 0 was not ready for ${spans(({ ready }) => !ready)}s, of the cut-over's ${(samples.at(-1)!.at - samples[0]!.at) / 1000}s`);
       assert.equal(unreachable, 0);
       assert.equal(await kube.get(ref("Service", neonName("pageserver"), NAMESPACE)), null);
-      assert.equal(ran.code, 0, ran.stdout);
+      assert.notEqual(ran.code, 0, ran.stdout);
       assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
-      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded at \S+\n[^\n]* deleting what alasio kept of polling Telegram\n[^\n]* through\n$/u);
+      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* deleting what 7\.0\.0 kept of the sessions' snapshots, the upgrade through\n[^]*FAILED: what 7\.0\.0 kept of the snapshots could not all be deleted: the run again goes on with it\n$/u);
+      assert.match(ran.stderr, /a failure injected midway through the deletion of what 7\.0\.0 kept of the snapshots/u);
+      // What PREVIOUS kept, held through the upgrade, and one object of it deleted as the run failed.
+      const kept = await keptByPrevious();
+      assert.equal(kept.length, keptBefore.length - 1, kept.join(", "));
+      assert.ok(kept.every((key) => keptBefore.includes(key)), kept.join(", "));
       upgraded = Date.now();
     });
 
@@ -594,12 +677,35 @@ if (inShard("upgrade")) {
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
-    test(`the cut-over from ${PREVIOUS} run again, once it has upgraded, goes on with what follows the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS} run again, once it has upgraded, goes on with the deletion of what ${PREVIOUS} kept of the snapshots, and what follows the upgrade, alone`, { timeout: 60 * 60_000 }, async () => {
       const again = await cutOver();
       assert.equal(again.code, 0, again.stdout);
       assert.doesNotMatch(again.stderr, /upgrading, from the cut-over begun at /u);
+      assert.match(again.stderr, /deleting what 7\.0\.0 kept of the sessions' snapshots, the upgrade through\n[^]*deleted [0-9]+ objects 7\.0\.0 kept of the sessions' snapshots\n/u);
+      assert.deepEqual(await keptByPrevious(), []);
       assert.doesNotMatch(again.stderr, /checking that the storage controller has node 1|deleting the pageservers' StatefulSet|registering node 1 anew|pageservers' Service through the upgrade|main's compute given pod 0's/u);
       assert.match(again.stderr, /upgraded at \S+\n[^\n]* deleting what alasio kept of polling Telegram\n[^\n]* through\n$/u);
+      // Upgraded, this release reads the snapshots moved: none is moved back.
+      const back = await cutOver({ moveBack: true });
+      assert.notEqual(back.code, 0, back.stdout);
+      assert.match(back.stderr, /FAILED: the upgrade is through \(\S+\/upgraded\): this release reads the snapshots moved, and none is moved back/u);
+      // As a first run that found no session to move leaves its record, with main's session made
+      // since: a run again, as main's bot's route asks of one, moves nothing and stops no alasio;
+      // and a move back has nothing to do.
+      await inCutOverRecord("mkdir held-aside && mv snapshots-moved caches-emptied held-aside/");
+      try {
+        const rerun = await cutOver();
+        assert.equal(rerun.code, 0, `${rerun.stdout}${rerun.stderr}`);
+        assert.doesNotMatch(rerun.stderr, /stopping alasio|moving the snapshots|emptying the snapshot cache/u);
+        assert.match(rerun.stderr, / through\n$/u);
+        assert.ok(!(await alasioStopped()), "alasio was stopped");
+        const none = await cutOver({ moveBack: true });
+        assert.equal(none.code, 0, `${none.stdout}${none.stderr}`);
+        assert.match(none.stderr, /no snapshot was moved \(\S+\/snapshots-moved is not there\), so none is moved back\n$/u);
+        assert.ok(!(await alasioStopped()), "alasio was stopped");
+      } finally {
+        await inCutOverRecord("mv held-aside/snapshots-moved held-aside/caches-emptied . && rmdir held-aside");
+      }
     });
 
     for (const { keeps, check } of scenarios) test(`upgraded: ${keeps}`, check);
