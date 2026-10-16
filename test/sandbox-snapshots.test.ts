@@ -115,7 +115,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
         const refused = prepare(node);
         const { status, reason } = typeof refused === "string" ? { status: 409, reason: refused } : refused ?? { status: 0, reason: "" };
         return refused === null
-          ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1` })
+          ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1`, source: "cache" as const })
           : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status, reason }));
       }),
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),
@@ -384,7 +384,7 @@ test("a restored pod is let run once its containers run, by its node's agent, th
     const { asked } = base;
     const agents: NodeAgents = prepared === null ? base.agents : {
       ...base.agents,
-      prepare: (on) => Effect.sync(() => (asked.push(`prepare on ${on}`), { manifest: prepared, imagePath: "/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-2" })),
+      prepare: (on) => Effect.sync(() => (asked.push(`prepare on ${on}`), { manifest: prepared, imagePath: "/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-2", source: "cache" as const })),
     };
     const outcome = await run(kube, Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });

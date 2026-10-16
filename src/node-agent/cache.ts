@@ -5,7 +5,8 @@
  * restore on this node, `<root>/<environment>/<workspace>/<snapshot>/`, where the restore
  * reads it: its image's files, linked to the cache's, and in its `layers/<digest>/` each
  * image it holds pages of besides its own, its layers, linked to the cache's too, as runsc
- * finds an image's layers. An image is written in a directory of its own beside the layers,
+ * finds an image's layers; or, for one read from the bucket, the checkpoint gofer's options
+ * file alone. An image is written in a directory of its own beside the layers,
  * whose name begins with ".", and moved among them once it is whole and its digest known, so
  * what the cache holds is always whole; what a stopped agent left half written is removed as
  * the next one starts.
@@ -127,6 +128,13 @@ export interface SnapshotCache {
   readonly prepare: (environment: string, workspace: string, snapshot: string, digests: readonly string[]) => Effect.Effect<string, CacheError>;
   /** Removes the image `digest` of the workspace, as one that is not what its manifest says, and nothing else of it. */
   readonly drop: (environment: string, workspace: string, digest: string) => Effect.Effect<void, CacheError>;
+  /**
+   * The directory a restore of the snapshot reads from the bucket, made anew: the checkpoint
+   * gofer's options file `name` alone, holding `options`, which name the bucket and the
+   * agent's credentials, readable and writable by its owner only, as the gofer requires.
+   * The workspace is used now.
+   */
+  readonly prepareRemote: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError>;
   /** Removes everything of the workspace. */
   readonly clear: (environment: string, workspace: string) => Effect.Effect<void, CacheError>;
   /**
@@ -338,6 +346,17 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
         await rm(stampOf(environment, workspace, digest), { force: true });
         await rm(image(environment, workspace, digest), { recursive: true, force: true });
       }),
+    prepareRemote: (environment, workspace, snapshot, name, options) => {
+      checked(environment, workspace, snapshot);
+      if (!/^[a-z0-9_]+\.json$/u.test(name)) throw new Error(`the snapshot cache writes no options file ${JSON.stringify(name)}`);
+      const directory = join(workspaceDir(environment, workspace), snapshot);
+      return attempt(async () => {
+        await rm(directory, { recursive: true, force: true });
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        // Owner-only from its making: it holds credentials.
+        await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
+      }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
+    },
 
     clear: (environment, workspace) => attempt(() => rm(workspaceDir(environment, workspace), { recursive: true, force: true })),
 

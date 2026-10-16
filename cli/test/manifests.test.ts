@@ -2383,7 +2383,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their cache's budget in bytes", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name, their cache's budget in bytes, and the first gVisor release that restores from the bucket", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2391,6 +2391,7 @@ describe("node agents", () => {
       NODE_NAME: { fieldRef: { fieldPath: "spec.nodeName" } },
       ALASIO_NODE_AGENT_TOKEN: { secretKeyRef: { name: "alasio-node-agent", key: "token" } },
       ALASIO_SNAPSHOT_CACHE_BYTES: "5368709120",
+      ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",

@@ -16,9 +16,11 @@
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
  *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's;
  * - `image layers DIR`: its layers' digests, a line each;
- * - `image verify DIR`: says the image is whole where each of its layers is in DIR/layers,
- *   of the digest it is named by, as runsc checks each layer's identity; fails, saying which
- *   is not, otherwise, or while a file `fail-verify` is beside it;
+ * - `image verify --host DIR`: says nothing of an image DIR holds whose layers are each in
+ *   DIR/layers, of the digest it is named by, as runsc checks each layer's identity; fails
+ *   with 4 where one is not there, 3 where one is not the image of its digest, or with the
+ *   status and the words a file `verify-status` beside it holds (as "5 Not restorable here: ..."),
+ *   as runsc's verify exits;
  * - `image compact --output=OUT --layer-path=LAYERS [--working-set-first] DIR`: writes into
  *   OUT, which must not exist, an image of DIR's state whose pages are its own and each of
  *   its layers', which it finds in DIR/layers or LAYERS, failing as runsc does where one is
@@ -99,12 +101,14 @@ if (rest[0] === "checkpoint") {
   for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");
 } else if (rest[0] === "image" && rest[1] === "verify") {
   const image = rest[rest.length - 1];
-  if (existsSync(join(here, "fail-verify"))) { process.stderr.write("verify failed: the pages metadata of " + image + " fails its checksum\\n"); process.exit(1); }
+  const failing = read("verify-status", "");
+  if (failing !== "") { const [status, ...said] = failing.split(" "); process.stdout.write(said.join(" ") + "\\n"); process.exit(Number(status)); }
   const meta = readFileSync(join(image, "pages_meta.img"));
   const { layers } = JSON.parse(meta);
   for (const digest of layers) {
     const layer = join(image, "layers", digest, "pages_meta.img");
-    if (!existsSync(layer) || sha256(readFileSync(layer)) !== digest) { process.stderr.write("verify failed: layer " + digest + " is not the image of its digest\\n"); process.exit(1); }
+    if (!existsSync(layer)) { process.stderr.write("layer " + digest + " not found\\n"); process.exit(4); }
+    if (sha256(readFileSync(layer)) !== digest) { process.stderr.write("verify failed: layer " + digest + " is not the image of its digest\\n"); process.exit(3); }
   }
   process.stdout.write("Image " + sha256(meta) + ": metadata and " + layers.length + " layers OK\\n");
 } else if (rest[0] === "image" && rest[1] === "compact") {

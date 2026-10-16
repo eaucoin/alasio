@@ -1481,7 +1481,7 @@ if (inShard("snapshots")) {
       const corrupt = await newSession("none");
       const { sessionId: kept } = await repl.set(corrupt, `checkpointed by ${corrupt}`);
       await untilReleased(corrupt, Date.now());
-      // Read again from the bucket wherever it is restored, where a file of it is not what its manifest says.
+      // Restored straight from the bucket wherever it is, where a file of its image is not as it was put.
       const agents = await nodeAgents();
       for (const pod of agents.values()) await kube.execOk(NAMESPACE, pod, ["rm", "-rf", `${SNAPSHOT_CACHE_DIR}/${SESSIONS}/${corrupt}`], { container: "node-agent" });
       const [node = ""] = agents.keys();
@@ -1490,7 +1490,7 @@ if (inShard("snapshots")) {
       const logged = (await kube.logs(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE), "alasio"))
         .split("\n")
         .find((line) => line.includes(`session ${corrupt} is resumed from bayma's checkpoints, not from its snapshot: `));
-      assert.ok(logged?.includes(`'s file ${corrupted.path} is ${corrupted.bytes} bytes of SHA-256 `), `alasio logged no fallback for its corrupted file ${corrupted.path}: ${logged}`);
+      assert.ok(logged?.includes(`is corrupt: its image ${corrupted.image} is not in the bucket as it was put`), `alasio logged no fallback for its corrupted image ${corrupted.image}'s file ${corrupted.path}: ${logged}`);
       const seen = await repl.read(corrupt, kept);
       assert.deepEqual([seen.live, seen.checkpointed], [null, `checkpointed by ${corrupt}`]);
       assert.match(seen.notice ?? "", CAME_BACK_FROM_CHECKPOINT);
