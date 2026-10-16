@@ -709,6 +709,53 @@ test("a running session is snapshotted live every liveEvery while its execs run,
   assert.deepEqual(counted, { "alasio.sandbox.live_checkpoint.outcome=taken": 2, "alasio.sandbox.live_checkpoint.outcome=spent": 1 });
 });
 
+test("a snapshot taken live of a session whose Sandbox runs on, not ready, is spent once it runs again moved on from it, and not before; one whose Sandbox was suspended meanwhile is not", async () => {
+  const status = { execsRunning: 1, execsQueued: 0, idleSinceMs: null as number | null, generation: 5 };
+  const { agents, asked, checkpoints } = fakeAgents({ holdings: [node("node-a", [CURRENT])], generation: () => status.generation });
+  const sandboxes = { token: () => Effect.succeed("token"), release: () => Effect.die("no session is idle") } as unknown as Sandboxes;
+  const objects = runningOnNodeA();
+  const sandbox = objects.get("Sandbox/alasio-sessions/fs-abc123") as StoredSandbox;
+  const ready = (is: boolean) => {
+    sandbox.status = { ...sandbox.status, conditions: [{ type: "Ready", status: is ? "True" : "False", reason: is ? "Ready" : "PodNotReady", message: "", lastTransitionTime: new Date(0), observedGeneration: 0 }] };
+  };
+  const settle = TestClock.withLive(Effect.sleep("20 millis"));
+  const pass = (minutes: number) =>
+    Effect.gen(function*() {
+      for (let look = 0; look < minutes * 4; look++) {
+        yield* TestClock.adjust("15 seconds");
+        yield* settle;
+      }
+    });
+  await run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+    const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+    yield* snapshotted.watch(sandboxes, () => null);
+    yield* settle;
+    yield* pass(10);
+    assert.equal(checkpoints.length, 1);
+    // Its pod deleted, agent-sandbox makes it again, its bayma starting from its checkpoints at
+    // another generation: not ready meanwhile, its snapshot is not spent, as a pod that ended
+    // would be restored from it.
+    ready(false);
+    status.generation = 9;
+    yield* pass(1);
+    assert.deepEqual(asked, []);
+    // Running again, moved on from it: spent.
+    ready(true);
+    yield* pass(0.25);
+    assert.deepEqual(asked, ["spend alasio-sessions/fs-abc123 s-1"]);
+    // Saved live again, and then suspended, released, its Sandbox the one to hold what it is
+    // bound to: not spent as it runs again.
+    yield* pass(10);
+    assert.equal(checkpoints.length, 2);
+    sandbox.spec = { ...sandbox.spec, operatingMode: "Suspended" };
+    yield* pass(0.25);
+    sandbox.spec = { ...sandbox.spec, operatingMode: "Running" };
+    status.generation = 12;
+    yield* pass(0.25);
+    assert.deepEqual(asked, ["spend alasio-sessions/fs-abc123 s-1"]);
+  }).pipe(Effect.provide(TestClock.layer()))), () => status);
+});
+
 test("a session's snapshot taken live is the one its lost pod restarts into, and none other is", async () => {
   const desired = sessionOf(profile());
   const liveOf = (agents: NodeAgents) =>
@@ -758,14 +805,14 @@ test("a restore bayma refuses, its state generation moved on from the snapshot t
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 });
 });
 
-test("a session whose pod is ending though alasio did not end it is released into a release's snapshot, within the time its bayma holds its stop; one alasio ends is not", async () => {
-  const look = async (sandboxMode: "Running" | "Suspended", hang = false) => {
+test("a session whose pod is ending though alasio did not end it is released into a release's snapshot, within the time its bayma holds its stop, or else into its snapshot taken live, if any; one alasio ends is not", async () => {
+  const look = async (sandboxMode: "Running" | "Suspended", hang = false, current: Manifest | null = null) => {
     const objects = runningOnNodeA();
     const pod = objects.get("Pod/alasio-sessions/fs-abc123") as V1Pod;
     pod.metadata = { ...pod.metadata, deletionTimestamp: new Date(0) };
     const sandbox = objects.get("Sandbox/alasio-sessions/fs-abc123") as StoredSandbox;
     sandbox.spec = { ...sandbox.spec, operatingMode: sandboxMode };
-    const base = fakeAgents({ holdings: [node("node-a", [CURRENT])] });
+    const base = fakeAgents({ current, holdings: [node("node-a", [CURRENT])] });
     const agents: NodeAgents = hang ? { ...base.agents, checkpoint: () => Effect.never } : base.agents;
     const released: string[] = [];
     const sandboxes = {
@@ -796,6 +843,39 @@ test("a session whose pod is ending though alasio did not end it is released int
   const slow = await look("Running", true);
   assert.deepEqual(slow.released, ["fs-abc123 into none"]);
   assert.deepEqual(slow.counted, { "alasio.sandbox.stop_release.outcome=timed out": 1 });
+  // One taken live of it, current still: the session comes back from it while it holds it, as its restore checks.
+  const taken: Manifest = { ...manifestOf(sessionOf(profile()).spec.podTemplate), snapshot: "s-live", live: { stateDir: "/home/agent/.bayma", generation: 5, running: [] } };
+  const slowWithLive = await look("Running", true, taken);
+  assert.deepEqual(slowWithLive.released, ["fs-abc123 into s-live"]);
+  assert.deepEqual(slowWithLive.counted, { "alasio.sandbox.stop_release.outcome=live": 1 });
+  // A release's snapshot is current, not one taken live: none.
+  const slowWithRelease = await look("Running", true, manifestOf(sessionOf(profile()).spec.podTemplate));
+  assert.deepEqual(slowWithRelease.released, ["fs-abc123 into none"]);
+});
+
+test("a session whose pod is ending, and whose snapshot fails as it ends its sandbox, is released into its snapshot taken live", async () => {
+  const objects = runningOnNodeA();
+  const pod = objects.get("Pod/alasio-sessions/fs-abc123") as V1Pod;
+  pod.metadata = { ...pod.metadata, deletionTimestamp: new Date(0) };
+  pod.status = { ...pod.status, containerStatuses: [{ ...pod.status!.containerStatuses![0]!, ready: false, state: { terminated: { exitCode: 137 } } }] };
+  const taken: Manifest = { ...manifestOf(sessionOf(profile()).spec.podTemplate), snapshot: "s-live", live: { stateDir: "/home/agent/.bayma", generation: 5, running: [] } };
+  const base = fakeAgents({ current: taken, holdings: [node("node-a", [CURRENT])] });
+  const agents: NodeAgents = { ...base.agents, checkpoint: (on) => Effect.fail(new NodeAgentError({ node: on, call: "snapshot", status: 500, reason: "runsc checkpoint failed" })) };
+  const released: string[] = [];
+  const sandboxes = {
+    token: () => Effect.succeed("token"),
+    release: () => Effect.die("no session is idle"),
+    releaseStopping: (name: string, save: (sandbox: StoredSandbox) => Effect.Effect<{ readonly snapshot: string } | null, unknown>) =>
+      save(objects.get("Sandbox/alasio-sessions/fs-abc123") as StoredSandbox).pipe(Effect.map((saved) => (released.push(`${name} into ${saved?.snapshot ?? "none"}`), true))),
+  } as unknown as Sandboxes;
+  const counted = await added("alasio.sandbox.stop_releases", () =>
+    run(fakeKube(objects), Effect.scoped(Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      yield* snapshotted.watch(sandboxes, () => null);
+      yield* Effect.sleep("100 millis");
+    })), () => ({ execsRunning: 1, execsQueued: 0, idleSinceMs: null, generation: 5 })));
+  assert.deepEqual(released, ["fs-abc123 into s-live"]);
+  assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=live": 1 });
 });
 
 test("bayma's hook is told to go on with its held stop as the hook is told its other modes", () => {

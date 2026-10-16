@@ -996,7 +996,7 @@ if (inShard("snapshots")) {
       }
     });
 
-    test("a session whose pod is deleted with no grace, as a hard eviction or a lost node ends one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
+    test("a session whose pod is deleted outright, as kubectl delete --force or the removal of its Node deletes one, takes no snapshot, and comes back from bayma's checkpoints", async () => {
       const killed = await newSession("none");
       const { sessionId: kept } = await repl.set(killed, `checkpointed by ${killed}`);
       const node = (await kube.get<V1Pod>(ref("Pod", killed, SESSIONS)))?.spec?.nodeName ?? "";

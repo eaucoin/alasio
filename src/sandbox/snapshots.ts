@@ -92,7 +92,7 @@ const restores = meter.createCounter("alasio.sandbox.restores", {
   description: "Session sandboxes brought up with a snapshot, by outcome: restored, or not, by why",
 });
 const stopReleases = meter.createCounter("alasio.sandbox.stop_releases", {
-  description: "Session sandboxes released as their pods were ended by other than alasio, as a drain, an eviction or a deletion ends them, by outcome: snapshotted, unsnapshotted as their snapshot failed, timed out, as it took longer than their bayma holds its stop, or error",
+  description: "Session sandboxes released as their pods were ended by other than alasio, as a drain, an eviction or a deletion ends them, by outcome: snapshotted; live, released into the snapshot taken live of them as none was taken; unsnapshotted, as their snapshot failed; timed out, as it took longer than their bayma holds its stop; or error",
 });
 const liveCheckpoints = meter.createCounter("alasio.sandbox.live_checkpoints", {
   description: "Snapshots of running sessions taken live, their sandboxes running on, by outcome: taken, or failed; and spent, as the session moved on from one",
@@ -549,6 +549,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
   const idle = (sandboxes: Sandboxes, sandbox: StoredSandbox, now: number): Effect.Effect<boolean> =>
     statusOf(sandboxes, sandbox).pipe(Effect.map((status) => idleBy(status, now)));
 
+  /** The snapshot taken live of the session, if its current snapshot is one, or null; one that cannot be read, null too, as its restore would not find it either. */
+  const liveSnapshotOf = (name: string): Effect.Effect<SavedSnapshot | null> =>
+    agents.current(ref(name)).pipe(
+      Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
+      Effect.catch((error) => Effect.logWarning(`could not read whether session ${name} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
+    );
+
   const watch = (sandboxes: Sandboxes, lastTurn: (name: string) => number | null): Effect.Effect<void, never, Scope.Scope> =>
     Effect.gen(function*() {
       const releasing = yield* FiberMap.make<string>();
@@ -568,7 +575,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       /**
        * Releases the session whose pod is ending though alasio did not end it, on `node`, its
        * bayma holding its stop for stopWait: snapshotted as it is released for idling, within
-       * that, or into no snapshot, the session coming back from bayma's checkpoints.
+       * that; or, where no snapshot was taken, into its snapshot taken live, which brings it
+       * back while that still holds it, as its restore checks, and from bayma's checkpoints
+       * otherwise; or, where it has none, into no snapshot, the session coming back from
+       * bayma's checkpoints.
        */
       const releaseStopped = (name: string, node: string): Effect.Effect<void> => {
         const counted = (outcome: string) => Effect.sync(() => stopReleases.add(1, { "alasio.sandbox.stop_release.outcome": outcome }));
@@ -585,6 +595,17 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
               if (snapshot !== null) outcome = "snapshotted";
               return Effect.succeed(snapshot);
             }),
+            Effect.flatMap((snapshot) =>
+              snapshot !== null
+                ? Effect.succeed(snapshot)
+                : liveSnapshotOf(name).pipe(
+                  Effect.tap((live) =>
+                    live === null ? Effect.void : Effect.sync(() => {
+                      outcome = "live";
+                    }).pipe(Effect.andThen(Effect.logInfo(`session ${name} is released into its snapshot ${live.snapshot} taken live, as none was taken as its pod ends`)))
+                  ),
+                )
+            ),
           );
         return Effect.gen(function*() {
           const slot = yield* stopSlot(node);
@@ -701,7 +722,14 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           );
         }
         // What a session that runs no more was, as its release or its end supersedes it.
-        for (const map of [busySince, savedLiveAt, takenLive]) for (const name of map.keys()) if (!running.has(name)) map.delete(name);
+        for (const map of [busySince, savedLiveAt]) for (const name of map.keys()) if (!running.has(name)) map.delete(name);
+        // Its snapshot taken live is kept while its Sandbox runs, not ready as it may be, to be spent
+        // once it runs again moved on from it, as after agent-sandbox made its deleted pod again,
+        // whose bayma starts from its checkpoints; but not before, as the restart of a pod that
+        // ended restores from it, spending it. Once the Sandbox is suspended, released into another
+        // snapshot or into this one, which its restore spends, or gone, it is the Sandbox's to hold.
+        const unsuspended = new Set((listed as readonly StoredSandbox[]).filter((sandbox) => sandbox.spec.operatingMode !== "Suspended").map((sandbox) => sandbox.metadata.name));
+        for (const name of takenLive.keys()) if (!unsuspended.has(name)) takenLive.delete(name);
       }).pipe(Effect.catch((error) => Effect.logWarning(`could not look at sessions to release: ${error.message}`)));
       yield* look.pipe(Effect.repeat(Schedule.spaced(RELEASE_POLL)), Effect.forkScoped);
       yield* collect.pipe(Effect.repeat(Schedule.spaced(COLLECT_POLL)), Effect.forkScoped);
@@ -750,12 +778,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       return !restoring && template !== undefined && template !== templates.current && template === templates.previous;
     },
     restore,
-    live: (name) =>
-      agents.current(ref(name)).pipe(
-        Effect.map((manifest): SavedSnapshot | null => (manifest?.live === undefined ? null : { snapshot: manifest.snapshot, release: manifest.release })),
-        Effect.catch((error) => Effect.logWarning(`could not read whether session ${name} has a snapshot taken live: ${error.message}`).pipe(Effect.as(null))),
-        withLogScope("snapshots"),
-      ),
+    live: (name) => liveSnapshotOf(name).pipe(withLogScope("snapshots")),
     watch,
     forget: (name) =>
       forgetEverywhere(name).pipe(

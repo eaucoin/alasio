@@ -205,8 +205,8 @@ const Snapshots = Schema.Struct({
   releaseAfter: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 5m")), "5m"),
   /**
    * How often a session whose execs run is snapshotted live, its sandbox running on, from
-   * that long after they began: the snapshot its pod, lost, is restored from, while bayma's
-   * state generation is still the one it caught. A duration such as 10m.
+   * that long after they began: the snapshot its pod, ended where it is, is restored from,
+   * while bayma's state generation is still the one it caught. A duration such as 10m.
    */
   liveEvery: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 10m")), "10m"),
   /**
@@ -214,10 +214,16 @@ const Snapshots = Schema.Struct({
    * as a drain, a soft eviction or a deletion ends it, for alasio to snapshot it first as it
    * releases a session (bayma's --stop-wait-ms): its pod's grace period is this and 30 s
    * more for bayma's own stop. The node agents run as a DaemonSet, which a drain leaves in
-   * place. A stop given no grace, as a hard eviction's or a lost node's, or one alasio is not
-   * running to see, as on a single node that a drain empties of alasio too, takes no
-   * snapshot: the session comes back from its live snapshot while that still holds it, and
-   * otherwise from bayma's checkpoints. A duration such as 60s.
+   * place. A snapshot that fails, or takes longer than this, leaves the session to come
+   * back from its live snapshot while that still holds it, and otherwise from bayma's
+   * checkpoints. A pod that ends where it is, given no grace, as its sandbox's crash, an
+   * OOM kill or a hard eviction ends it, takes no snapshot: the next turn brings the
+   * session back from its live snapshot while that still holds it, and otherwise from
+   * bayma's checkpoints. A pod deleted outright, as kubectl delete --force or the removal
+   * of its Node deletes it, or one ended that alasio is not running to see, as on a single
+   * node that a drain empties of alasio too, agent-sandbox makes again: its bayma starts
+   * from its checkpoints, moving on from its live snapshot, which no restore takes after. A
+   * duration such as 60s.
    */
   stopWait: defaulted(Schema.String.check(Schema.makeFilter((duration) => (durationSeconds(duration) ?? 0) > 0 || "must be a duration such as 60s")), "60s"),
   /** The most of snapshots each node keeps on its disk, for restores there. */

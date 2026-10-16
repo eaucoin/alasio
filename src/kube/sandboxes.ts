@@ -300,8 +300,8 @@ export interface Sandboxes {
    * drain, an eviction or a deletion ends one, its bayma holding its stop meanwhile, with no
    * bring-up of it meanwhile: suspended first, so that agent-sandbox makes no pod in its
    * place, whose bayma would move the session's state on past any snapshot of it; then
-   * `save` given it; then bound to the snapshot it was saved into, or to none. Whether it
-   * was; a Sandbox not running, or whose pod is not ending, is left as it is.
+   * `save` given it; then bound to the snapshot it gives, or to none. Whether it was; a
+   * Sandbox not running, or whose pod is not ending, is left as it is.
    */
   readonly releaseStopping: <E>(name: string, save: (sandbox: StoredSandbox) => Effect.Effect<SavedSnapshot | null, E>) => Effect.Effect<boolean, E | KubeApiError>;
   readonly remove: (name: string) => Effect.Effect<void, KubeApiError>;
