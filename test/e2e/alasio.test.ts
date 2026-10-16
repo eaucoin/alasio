@@ -386,6 +386,13 @@ if (inShard("upgrade")) {
     /** Main's session's REPL, live as the session is released, and the snapshot it is released into on PREVIOUS. */
     let releasedRepl: string;
     let releasedAs: string;
+    /** The keys of what PREVIOUS keeps of the sessions' snapshots in the bucket: each under a snapshot's id, to the second. */
+    const keptByPrevious = async () => {
+      const [node] = (await nodeAgents()).keys();
+      assert.ok(node, "no node agent runs ready");
+      return (await inNodeAgent<readonly string[]>(node, "./snapshot-bucket.ts", "keys", SESSIONS)).filter((key) => /^[^/]+\/[^/]+\/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\//u.test(key));
+    };
+    let keptBefore: readonly string[];
 
     test(`on ${PREVIOUS}: main's session released into a snapshot of its layout, a REPL live in it, which the cut-over moves`, { timeout: 30 * 60_000 }, async () => {
       ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
@@ -393,9 +400,11 @@ if (inShard("upgrade")) {
       releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
       // An id of PREVIOUS's, to the second.
       assert.match(releasedAs, /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/u);
+      keptBefore = await keptByPrevious();
+      assert.ok(keptBefore.includes(`${SESSIONS}/${volumeId}/${releasedAs}/manifest.json`), keptBefore.join(", "));
     });
 
-    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through the upgrade, failing midway through the deletion of what ${PREVIOUS} kept of the snapshots`, { timeout: 60 * 60_000 }, async () => {
       // Each second it runs: whether main's compute, awake, has an address to read pages at,
       // PREVIOUS's pageservers' Service or the one neon-control gave it; whether this release's
       // pageservers' StatefulSet is applied, past which the upgrade's prune would delete
@@ -428,9 +437,14 @@ if (inShard("upgrade")) {
         `pod 0 was not ready for ${spans(({ ready }) => !ready)}s, of the cut-over's ${(samples.at(-1)!.at - samples[0]!.at) / 1000}s`);
       assert.equal(unreachable, 0);
       assert.equal(await kube.get(ref("Service", neonName("pageserver"), NAMESPACE)), null);
-      assert.equal(ran.code, 0, ran.stdout);
+      assert.notEqual(ran.code, 0, ran.stdout);
       assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
-      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded\n$/u);
+      assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* deleting what 7\.0\.0 kept of the sessions' snapshots, the upgrade through\n[^]*FAILED: what 7\.0\.0 kept of the snapshots could not all be deleted: the run again goes on with it\n$/u);
+      assert.match(ran.stderr, /a failure injected midway through the deletion of what 7\.0\.0 kept of the snapshots/u);
+      // What PREVIOUS kept, held through the upgrade, and one object of it deleted as the run failed.
+      const kept = await keptByPrevious();
+      assert.equal(kept.length, keptBefore.length - 1, kept.join(", "));
+      assert.ok(kept.every((key) => keptBefore.includes(key)), kept.join(", "));
     });
 
     test(`upgraded: main's session's snapshot moved to this release's layout, under its id to the millisecond, its Sandbox bound to it, and restored with its REPL whole`, { timeout: 30 * 60_000 }, async () => {
@@ -446,10 +460,11 @@ if (inShard("upgrade")) {
       assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
-    test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
+    test(`the cut-over from ${PREVIOUS} run again goes on with the upgrade, and the deletion of what ${PREVIOUS} kept of the snapshots, alone`, { timeout: 60 * 60_000 }, async () => {
       const again = await cutOver();
       assert.equal(again.code, 0, again.stdout);
-      assert.match(again.stderr, /upgrading, from the cut-over begun at /u);
+      assert.match(again.stderr, /upgrading, from the cut-over begun at [^]* deleting what 7\.0\.0 kept of the sessions' snapshots, the upgrade through\n[^]*deleted [0-9]+ objects 7\.0\.0 kept of the sessions' snapshots\n[^\n]* upgraded\n$/u);
+      assert.deepEqual(await keptByPrevious(), []);
       assert.doesNotMatch(again.stderr, /checking that the storage controller has node 1|deleting the pageservers' StatefulSet|registering node 1 anew|pageservers' Service through the upgrade|main's compute given pod 0's/u);
     });
 
