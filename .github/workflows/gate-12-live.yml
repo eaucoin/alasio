@@ -6,6 +6,7 @@ name: gate-12-live
 on:
   push:
     branches: [diag/live-memory]
+    paths: [.github/workflows/gate-12-live.yml, gate/12/live.test.ts]
   workflow_dispatch:
 
 permissions:
