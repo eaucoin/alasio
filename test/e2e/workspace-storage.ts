@@ -36,7 +36,7 @@ import { FILER, FILER_STORE, FILER_STORE_USERS, GATEWAY, MASTER, VOLUME_SERVER }
 import { JUICEFS_ADMIN, VALKEY, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
-import { AGENTS, inAlasio, inSession, kube, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
+import { AGENTS, inAlasio, inSession, kube, nodeAgents, onNode, type Ran, ref, SESSIONS, tcp } from "./harness.ts";
 import type { BroughtUp } from "./session-bring-up.ts";
 import type { Made } from "./session-volumes.ts";
 
@@ -631,6 +631,16 @@ export function workspaceStorage(): void {
         await until(`the pod ${pod.metadata?.uid} of ${full} gone`, async () => ((await kube.get<V1Pod>(ref("Pod", full, SESSIONS)))?.metadata?.uid === pod.metadata?.uid ? undefined : true), 180_000);
         const moved = await bringUp(full);
         assert.ok(moved.node && moved.node !== node, `the session stayed on ${node}`);
+        // Released into a snapshot on the cordoned node as its pod ended, it is restored on no
+        // node that takes no pod of it: the cordoned node prepares none of it. The node agents
+        // run where sessions do, which this run is one node, so no other node restores it, and
+        // the session comes back from bayma's checkpoints, its files on JuiceFS.
+        const agent = (await nodeAgents()).get(node);
+        assert.ok(agent, `no node agent runs ready on ${node}`);
+        const logged = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n");
+        const taken = logged.map((line) => new RegExp(`took the snapshot (\\S+) of ${SESSIONS}/${full}:`, "u").exec(line)?.[1]).filter(Boolean).at(-1);
+        assert.ok(taken, `${node}'s agent took no snapshot of ${full} as its pod ended`);
+        assert.deepEqual(logged.filter((line) => line.includes(`prepared the snapshot ${taken} of ${SESSIONS}/${full}`)), []);
         assert.equal((await inWorkspaceOk(full, `sha256sum < ${WORKDIR}/moving`)).trim(), written);
       } finally {
         await kube.patch(sandbox, { spec: { podTemplate: { spec: { nodeSelector } } } });
