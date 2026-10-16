@@ -102,18 +102,19 @@ const CONFIG_PATH = "/var/lib/juicefs/config";
 const CONTROLLER_SOCKET_DIR = "/var/lib/csi/sockets/pluginproxy/";
 
 /**
- * The driver's configuration, its ConfigMap's config.yaml: one patch, for the mount pods
- * of workspace storage's class. Mount options here take precedence over a volume's, and
- * reach mount pods made after a change.
+ * The driver's configuration, its ConfigMap's config.yaml: two patches. The first, of every
+ * pod the driver runs, pins its client and sizes it: mount pods, and the Job that deletes a
+ * volume's directory once its claim is gone, which no patch selecting by claim reaches, so
+ * that it ran on JuiceFS's defaults, a whole CPU and 1 GiB requested on its default image.
+ * The second, of the mount pods of workspace storage's class: their mount options, which
+ * take precedence over a volume's and reach mount pods made after a change, and readiness.
  */
 export function driverConfig({ workspaceStorage }: InstallConfig): object {
   const { csi, storageClassName, cacheSizeMiB, backupInterval } = workspaceStorage;
   return {
     enableNodeSelector: false,
-    mountPodPatch: [{
+    mountPodPatch: [{ ceMountImage: imageReference(csi.mountImage), resources: csi.mountPod.resources }, {
       pvcSelector: { matchStorageClassName: storageClassName },
-      ceMountImage: imageReference(csi.mountImage),
-      resources: csi.mountPod.resources,
       mountOptions: [
         // The read cache, bounded, and keeping a fifth of the node's disk free.
         `cache-size=${cacheSizeMiB}`,

@@ -680,6 +680,15 @@ export function workspaceStorage(): void {
       const volume = (await kube.get<V1PersistentVolumeClaim>(ref("PersistentVolumeClaim", name, NAMESPACE)))?.spec?.volumeName;
       assert.ok(volume, `the claim ${name} is bound to no volume`);
       await kube.remove(ref("PersistentVolumeClaim", name, NAMESPACE));
+      // Its Job, which knows no claim, on the client mount pods run and sized as they are, not on JuiceFS's defaults.
+      const client = (await mountPodOf(none))?.spec?.containers[0];
+      let job: V1Job | undefined;
+      for (const deadline = Date.now() + 120_000; !job; await sleep(500)) {
+        assert.ok(Date.now() < deadline, `no Job deleted ${volume}'s directory`);
+        job = (await kube.list<V1Job>("Job", { namespace: DRIVER_NAMESPACE })).find(({ metadata }) => metadata?.name?.endsWith("-delvol"));
+      }
+      const deleting = job.spec?.template.spec?.containers[0];
+      assert.deepEqual([deleting?.image, deleting?.resources], [client?.image, client?.resources]);
       await until(`the volume ${volume} deleted`, async () => ((await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume))) ? undefined : true), 300_000, async () => {
         const left = await kube.get<V1PersistentVolume>(ref("PersistentVolume", volume));
         const logged = await kube.logs(DRIVER_NAMESPACE, "juicefs-csi-controller-0", "juicefs-plugin").catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
