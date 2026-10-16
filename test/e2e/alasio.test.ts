@@ -390,7 +390,7 @@ if (inShard("upgrade")) {
     const keptByPrevious = async () => {
       const [node] = (await nodeAgents()).keys();
       assert.ok(node, "no node agent runs ready");
-      return (await inNodeAgent<readonly string[]>(node, "./snapshot-bucket.ts", "keys", SESSIONS)).filter((key) => /^[^/]+\/[^/]+\/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\//u.test(key));
+      return (await inNodeAgent<readonly string[]>(node, "./bucket-keys.ts", `${SESSIONS}/`)).filter((key) => /^[^/]+\/[^/]+\/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\//u.test(key));
     };
     let keptBefore: readonly string[];
 

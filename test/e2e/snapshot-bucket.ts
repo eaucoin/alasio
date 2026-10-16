@@ -9,8 +9,6 @@
  * - `release <environment> <workspace> <release>` says the workspace's current snapshot was
  *   taken by gVisor's `release`, as one taken by a release no longer kept says. Prints one
  *   JSON line of the snapshot and the release it said.
- * - `keys <environment>` prints one JSON line of the keys of the bucket's objects under the
- *   environment, in order.
  *
  * alasio's modules are imported by their paths in the repository, which inNodeAgent in
  * harness.ts rewrites to the image's as it pipes this in.
@@ -37,8 +35,8 @@ export interface Released {
 }
 
 const [verb, environment, workspace, release] = process.argv.slice(2);
-if (!(verb === "keys" || ((verb === "corrupt" || (verb === "release" && release)) && workspace)) || !environment) {
-  throw new Error("usage: snapshot-bucket.ts corrupt <environment> <workspace> | release <environment> <workspace> <release> | keys <environment>");
+if (!(verb === "corrupt" || (verb === "release" && release)) || !environment || !workspace) {
+  throw new Error("usage: snapshot-bucket.ts corrupt <environment> <workspace> | release <environment> <workspace> <release>");
 }
 
 /** The variable of the agent's environment `name`, which it is given. */
@@ -59,7 +57,6 @@ const bucket = makeS3Bucket({
 const current = `${environment}/${workspace}/${CURRENT_FILE}`;
 
 const said = await Effect.runPromise(Effect.gen(function*() {
-  if (verb === "keys") return (yield* bucket.list(`${environment}/`)).map(({ key }) => key).sort();
   const manifest = yield* Schema.decodeUnknownEffect(Manifest)(yield* bucket.getJson(current));
   if (verb === "release" && release) {
     yield* bucket.putJson(current, { ...manifest, release });
