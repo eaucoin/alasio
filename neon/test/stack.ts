@@ -691,6 +691,8 @@ export function neonStack(): void {
           await notified(control);
           assert.notEqual(await restartedAt(), restartedBefore, "neon-control did not restart the compute");
           await until("the compute did not come to run", async () => (await statusOf()) === "running", 300_000);
+          // compute_ctl says so before its pod's readiness probe has passed, which computePod waits for.
+          await kube.awaitReady([COMPUTE], "5 minutes");
           assert.notEqual((await computePod()).uid, stuck);
           assert.deepEqual(await computeReads(), await attachedTo());
           await query("select 1");
