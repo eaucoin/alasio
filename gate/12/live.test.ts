@@ -7,7 +7,10 @@
  * starting threads that allocate and end, each a new arena, and checkpoints the sandbox while
  * they run, beside the shim, as the node agent will: `--leave-running`, pre-copied, throttled,
  * a delta of the checkpoint before it (a full one every CHAIN). After each, every exec must end
- * with its answer, every session still hold its state, and the sandbox still run.
+ * with its answer, every session still hold its state, and the sandbox still run; but for a
+ * session whose runtime bayma started again past its runtime memory budget, as it does a C#
+ * or Go host that comes to hold 2 GiB more than it started with, which keeps only what it
+ * checkpointed, as the exec after says: the gate defines its code in it again, and records it.
  *
  * It needs root through sudo, Docker with the runtime `runsc` (the release's shim, its options
  * in RUNSC_OPTIONS), the release's runsc at RUNSC, the image GATE_IMAGE (sandbox/agent, built),
@@ -245,6 +248,17 @@ interface ExecSnapshot {
   readonly next_seq: number;
   readonly result_text: string;
   readonly error_text: string;
+  readonly notice?: string;
+}
+
+/** What bayma tells the exec after it started a session's runtime again past its runtime memory budget. */
+const RECYCLED = /^bayma: this session's runtime came to hold \d+ MiB more than it held as it started, past the server's runtime memory budget /u;
+
+/** A session's runtime bayma started again past its runtime memory budget: in which cycle, and what the exec after was told. */
+interface Recycle {
+  readonly index: number;
+  readonly runtime: Runtime;
+  readonly notice: string;
 }
 
 /** One checkpoint, as the record keeps it. */
@@ -341,10 +355,29 @@ async function settled(client: Client, sessionId: string, snapshot: ExecSnapshot
   return current;
 }
 
+/** Runs `code` in the session until it ends: what it answered. */
+async function ran(client: Client, sessionId: string, code: string): Promise<ExecSnapshot> {
+  return settled(client, sessionId, await call<ExecSnapshot>(client, "exec", { session_id: sessionId, code, yield_time_ms: 60_000 }));
+}
+
+/** Whether `done` ended with `answer`, or without error where none is given, as `runtime`'s exec. */
+function assertAnswered(runtime: Runtime, done: ExecSnapshot, answer?: string, index?: number): void {
+  assert.deepEqual(
+    { index, runtime, status: done.status, error: done.error_text, ...(answer === undefined ? {} : { result: done.result_text.trim() }) },
+    { index, runtime, status: "ok", error: "", ...(answer === undefined ? {} : { result: answer }) },
+  );
+}
+
 /** Runs `code` in the session until it ends, which must be with `answer`. */
 async function answers(client: Client, runtime: Runtime, sessionId: string, code: string, answer?: string): Promise<void> {
-  const done = await settled(client, sessionId, await call<ExecSnapshot>(client, "exec", { session_id: sessionId, code, yield_time_ms: 60_000 }));
-  assert.deepEqual({ runtime, status: done.status, error: done.error_text, ...(answer === undefined ? {} : { result: done.result_text.trim() }) }, { runtime, status: "ok", error: "", ...(answer === undefined ? {} : { result: answer }) });
+  assertAnswered(runtime, await ran(client, sessionId, code), answer);
+}
+
+/** Defines the gate's code in the session, and runs its wave once, so that what compiles is compiled. */
+async function define(client: Client, runtime: Runtime, sessionId: string): Promise<void> {
+  await answers(client, runtime, sessionId, RUNTIME_CODE[runtime].define);
+  await answers(client, runtime, sessionId, RUNTIME_CODE[runtime].wave);
+  await answers(client, runtime, sessionId, RUNTIME_CODE[runtime].run(200), "7");
 }
 
 test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without checkpoints, the baseline,"} of bayma while execs start threads in each of its runtimes: none aborts, every session answers after each`, { timeout: 4 * 60 * 60_000 }, async () => {
@@ -362,6 +395,14 @@ test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without che
   mkdirSync(images);
   const name = `gate-12-live-${process.pid}`;
   const cycles: Cycle[] = [];
+  const recycles: Recycle[] = [];
+  /** Whether bayma told `done` its runtime was started again, which the gate then defines its code in again, recording it. */
+  const definedAgainIfRecycled = async (client: Client, index: number, runtime: Runtime, sessionId: string, done: ExecSnapshot): Promise<boolean> => {
+    if (!RECYCLED.test(done.notice ?? "")) return false;
+    recycles.push({ index, runtime, notice: done.notice ?? "" });
+    await define(client, runtime, sessionId);
+    return true;
+  };
   let sentryBefore: SentryMemory | undefined;
   /** How much the Sentry's own memory grows by a checkpoint, as its trend after WARM_UP says. */
   let sentryGrowthBytes: number | undefined;
@@ -399,10 +440,7 @@ test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without che
     for (const runtime of RUNTIMES) {
       const { session } = await call<{ session: { session_id: string } }>(client, "session.create", { runtime, title: `gate-${runtime}`, cwd: "/workspace" });
       sessions.set(runtime, session.session_id);
-      await answers(client, runtime, session.session_id, RUNTIME_CODE[runtime].define);
-      await answers(client, runtime, session.session_id, RUNTIME_CODE[runtime].wave);
-      // Once before any checkpoint, so that what compiles is compiled.
-      await answers(client, runtime, session.session_id, RUNTIME_CODE[runtime].run(200), "7");
+      await define(client, runtime, session.session_id);
     }
 
     sentryBefore = await sentryMemory();
@@ -441,9 +479,14 @@ test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without che
       if (PROFILE_EVERY > 0 && (index + 1) % PROFILE_EVERY === 0) await profile(String(index));
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);
-        assert.deepEqual({ index, runtime, status: done.status, error: done.error_text, result: done.result_text.trim() }, { index, runtime, status: "ok", error: "", result: "7" });
+        if (!(await definedAgainIfRecycled(client, index, runtime, sessionId, done))) assertAnswered(runtime, done, "7", index);
       }
-      for (const runtime of RUNTIMES) await answers(client, runtime, sessions.get(runtime) ?? "", RUNTIME_CODE[runtime].read, "42");
+      for (const runtime of RUNTIMES) {
+        const sessionId = sessions.get(runtime) ?? "";
+        const read = await ran(client, sessionId, RUNTIME_CODE[runtime].read);
+        if (await definedAgainIfRecycled(client, index, runtime, sessionId, read)) await answers(client, runtime, sessionId, RUNTIME_CODE[runtime].read, "42");
+        else assertAnswered(runtime, read, "42", index);
+      }
       assert.equal(await run("docker", ["inspect", "--format", "{{.State.Running}}", name]), "true", `after checkpoint ${index}`);
       // The next a delta of this one, unless the chain is as long as compaction lets one be.
       if (chain.length + 1 >= CHAIN) {
@@ -454,7 +497,7 @@ test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without che
         chain.push(image);
         parent = image;
       }
-      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk, the Sentry's own ${cycles.at(-1)?.sentry.anonBytes} bytes`);
+      if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk, the Sentry's own ${cycles.at(-1)?.sentry.anonBytes} bytes, ${recycles.length} runtimes started again past bayma's memory budget`);
     }
     // Judged against the baseline's, by live-judge.test.ts: what the workload holds grows both.
     sentryGrowthBytes = trend(cycles, ({ sentry }) => sentry.anonBytes);
@@ -466,7 +509,7 @@ test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without che
     const logs = await run("docker", ["logs", name]).catch((error: unknown) => String(error));
     const aborts = logs.split("\n").filter((line) => /corrupted|malloc\(\)|double free|SIGABRT/u.test(line));
     mkdirSync(OUT, { recursive: true });
-    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpointing: CHECKPOINTING, checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, sentryGrowthBytes: sentryGrowthBytes ?? null, cycles }, null, 2)}\n`);
+    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpointing: CHECKPOINTING, checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, recycles, sentryBefore: sentryBefore ?? null, sentryGrowthBytes: sentryGrowthBytes ?? null, cycles }, null, 2)}\n`);
     writeFileSync(join(OUT, "bayma.log"), logs);
     // What the host says of a sandbox that ended: the kernel's log, its disk and its memory.
     const host = await Promise.all([
