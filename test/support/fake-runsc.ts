@@ -16,6 +16,9 @@
  *   version is `release-RELEASE` (or what a file `saved-by` beside it says), with the CPU
  *   features of `image-cpu-features`, its digest that of its pages metadata, as runsc's;
  * - `image layers DIR`: its layers' digests, a line each;
+ * - `image verify --host DIR`: says nothing of an image DIR holds, its layers in DIR/layers,
+ *   or fails with the status and the words a file `verify-status` beside it holds (as
+ *   "5 Not restorable here: ..."), as runsc's verify exits;
  * - `image compact --output=OUT --layer-path=LAYERS [--working-set-first] DIR`: writes into
  *   OUT, which must not exist, an image of DIR's state whose pages are its own and each of
  *   its layers', which it finds in DIR/layers or LAYERS, failing as runsc does where one is
@@ -94,6 +97,13 @@ if (rest[0] === "checkpoint") {
 } else if (rest[0] === "image" && rest[1] === "layers") {
   const image = rest[rest.length - 1];
   for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) process.stdout.write(digest + "\\n");
+} else if (rest[0] === "image" && rest[1] === "verify") {
+  const image = rest[rest.length - 1];
+  const failing = read("verify-status", "");
+  if (failing !== "") { const [status, ...said] = failing.split(" "); process.stdout.write(said.join(" ") + "\\n"); process.exit(Number(status)); }
+  for (const digest of JSON.parse(readFileSync(join(image, "pages_meta.img"), "utf8")).layers) {
+    if (!existsSync(join(image, "layers", digest, "pages_meta.img"))) { process.stderr.write("layer " + digest + " not found\\n"); process.exit(4); }
+  }
 } else if (rest[0] === "image" && rest[1] === "compact") {
   const image = rest[rest.length - 1];
   const output = flag("output");

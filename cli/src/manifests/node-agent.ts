@@ -28,10 +28,11 @@ import {
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   OPERATION_LIMIT_SECONDS,
+  RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "../../../src/node-agent/names.ts";
-import { currentGvisorRelease } from "../cluster/node.ts";
+import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRuns, otelEnv, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
@@ -117,6 +118,7 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
               { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
+              { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],

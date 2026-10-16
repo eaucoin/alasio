@@ -39,7 +39,7 @@ export const Holdings = Schema.Struct({
 export type Holdings = typeof Holdings.Type;
 
 /** A snapshot prepared on a node: what it is, and where its image is there. */
-const Prepared = Schema.Struct({ manifest: Manifest, imagePath: Schema.String });
+const Prepared = Schema.Struct({ manifest: Manifest, imagePath: Schema.String, source: Schema.Literals(["cache", "bucket"]) });
 export type Prepared = typeof Prepared.Type;
 
 /** What an agent answers a call that fails with. */

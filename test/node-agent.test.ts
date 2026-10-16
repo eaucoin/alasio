@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -45,7 +45,8 @@ import { type HostCommands, type HostRun, makeHostCommands, NODE_PATH } from "..
 import { egressGap } from "../src/node-agent/kube-router.ts";
 import { makeRunsc, type Runsc, runscFlags } from "../src/node-agent/runsc.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
-import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
+import { NODE_PINS } from "../cli/src/cluster/node.ts";
+import { NODE_AGENT_PORT, restoresFromBucket } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
@@ -53,7 +54,7 @@ import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
 
-const RELEASE = "20260921.0-eaucoin.3";
+const RELEASE = "20260921.0-eaucoin.8";
 const CONTAINER = "0123456789abcdef".repeat(4);
 const OTHER_CONTAINER = "fedcba9876543210".repeat(4);
 const HOOK = ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"];
@@ -173,7 +174,8 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
-      const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, host: host.host });
+      const store = Effect.succeed({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
+      const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, store, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince });
       return { releases, cacheDir, cache, host, agent: yield* restarted, restarted };
     });
   try {
@@ -192,6 +194,24 @@ const imagesOf = (node: Node, workspace: string): string[] => {
   const directory = join(node.cacheDir, "main", workspace, "layers");
   return existsSync(directory) ? readdirSync(directory).sort() : [];
 };
+
+/** Resolves once the node's cache holds every image of `manifest`, as the agent fetches them after a restore from the bucket began. */
+const fetched = (node: Node, manifest: Manifest) =>
+  Effect.sync(() => {
+    const directory = join(node.cacheDir, manifest.environment, manifest.workspace, "layers");
+    const held = existsSync(directory) ? readdirSync(directory) : [];
+    return manifest.layers.every(({ digest }) => held.includes(digest));
+  }).pipe(
+    Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: Boolean }),
+    Effect.timeout("10 seconds"),
+  );
+
+/** What the checkpoint gofer's options file of a snapshot prepared from the bucket holds, and its mode. */
+const goferOptionsOf = (imagePath: string) => ({
+  files: readdirSync(imagePath),
+  mode: (statSync(join(imagePath, "s3_opts.json")).mode & 0o777).toString(8),
+  options: JSON.parse(readFileSync(join(imagePath, "s3_opts.json"), "utf8")) as Record<string, unknown>,
+});
 
 /** The files of an image the stand-in's runsc writes, in order. */
 const IMAGE_FILES = ["checkpoint.img", "pages.img", "pages_meta.img"];
@@ -314,6 +334,8 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
           yield* there.agent.resume(resumeRequest());
         });
       yield* restored();
+      // Read from the bucket as it was restored, its image fetched into the cache meanwhile.
+      yield* fetched(there, base);
       const asked = s3.requests.length;
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
       const saved = there.releases.calls(RELEASE).findLast((args) => args.includes("checkpoint"));
@@ -330,9 +352,25 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
         `PUT main/fs-abc/manifests/${delta.snapshot}.json`,
         "PUT main/fs-abc/current.json",
       ]);
-      // Restored on a third node, it is prepared from both images: its own, and the one it refers to where runsc finds it.
+      // Restored on a third node, it is read from the bucket, its own image and its layers each under its digest.
       const third = yield* node("node-3");
+      const remote = yield* third.agent.prepare(workspace);
+      assert.equal(remote.source, "bucket");
+      const { files, mode, options } = goferOptionsOf(remote.imagePath);
+      assert.deepEqual([files, mode], [["s3_opts.json"], "600"]);
+      assert.deepEqual(options, {
+        endpoint: s3.endpoint,
+        region: "us-east-1",
+        bucket: "snapshots",
+        object_prefix: `main/fs-abc/layers/${own.digest}/`,
+        layers_prefix: "main/fs-abc/layers/",
+        addressing: "path",
+        credentials: { access_key_id: CREDENTIALS.accessKeyId, secret_access_key: CREDENTIALS.secretAccessKey },
+      });
+      // Restored there again once its images are fetched, from the cache: both images, its own, and the one it refers to where runsc finds it.
+      yield* fetched(third, delta);
       const prepared = yield* third.agent.prepare(workspace);
+      assert.equal(prepared.source, "cache");
       assert.deepEqual(readdirSync(prepared.imagePath).sort(), [...IMAGE_FILES, "layers"].sort());
       assert.equal(readlinkSync(join(prepared.imagePath, "layers", baseImage.digest)), join("..", "..", "layers", baseImage.digest));
       assert.deepEqual(filesOf(join(prepared.imagePath, "layers", baseImage.digest)), baseImage.files);
@@ -388,6 +426,7 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
             const { manifest } = yield* there.agent.prepare(workspace);
             yield* there.agent.spend(workspace, manifest.snapshot);
             yield* there.agent.resume(resumeRequest());
+            yield* fetched(there, manifest);
           });
         yield* restored();
         // The sandbox wrote over as much as its base holds.
@@ -431,7 +470,7 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
         // Restored elsewhere, it reads one image; the next delta of the sandbox restored is of that image.
         const third = yield* node("node-3");
         const prepared = yield* third.agent.prepare(workspace);
-        assert.deepEqual(readdirSync(join(prepared.imagePath, "layers")), []);
+        assert.equal(goferOptionsOf(prepared.imagePath).options["object_prefix"], `main/fs-abc/layers/${image.digest}/`);
         writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "512");
         yield* restored();
         const next = yield* there.agent.checkpoint(request("fs-abc"));
@@ -504,8 +543,9 @@ test("a snapshot is committed only once each image it refers to is in the bucket
       const there = yield* node("node-2");
       const restored = () =>
         Effect.gen(function*() {
-          yield* there.agent.prepare(workspace);
+          const { manifest } = yield* there.agent.prepare(workspace);
           yield* there.agent.resume(resumeRequest());
+          yield* fetched(there, manifest);
         });
       // Lost, or another of the same size there, as its ETag says: put again from this node's cache.
       for (const lose of [(key: string) => s3.objects.delete(key), (key: string) => s3.objects.set(key, Buffer.alloc(4096, "other"))]) {
@@ -775,7 +815,36 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
     })
   ));
 
-test("a snapshot is prepared from the node's cache, or from the bucket, checked file by file, and only where it restores", () =>
+test("only a release that restores straight from the bucket is given the bucket: a snapshot of one before is fetched into the cache first, and restored from there", () =>
+  withBucket(({ s3, node }) =>
+    Effect.gen(function*() {
+      // As cluster/node/pins.json has it: from the fork's .7 on, which the installation gives the agent.
+      assert.equal(NODE_PINS.gvisor.restoresFromBucketSince, "20260921.0-eaucoin.7");
+      assert.deepEqual(
+        ["20260921.0-eaucoin.6", "20260921.0-eaucoin.7", "20260921.0-eaucoin.10", "20260921.1-eaucoin.1", "20261020.0-eaucoin.1", "20260801.0-eaucoin.9", "20260921.0"].map((release) => restoresFromBucket(release, "20260921.0-eaucoin.7")),
+        [false, true, true, true, true, false, false],
+      );
+      // Where none is given, none does.
+      assert.equal(restoresFromBucket("20260921.0-eaucoin.8", ""), false);
+      const OLDER = "20260921.0-eaucoin.6";
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const taker = yield* node("node-1", { releases: [OLDER] });
+      const manifest = yield* taker.agent.checkpoint(request("fs-abc"));
+      assert.equal(manifest.release, OLDER);
+      const [image] = manifest.layers;
+      assert.ok(image);
+      const other = yield* node("node-2", { releases: [OLDER] });
+      const prepared = yield* other.agent.prepare(workspace);
+      // Read from the bucket, into the cache, which it is restored from: no gofer's options, its images there already.
+      assert.deepEqual(prepared, { manifest, imagePath: join(other.cacheDir, "main", "fs-abc", manifest.snapshot), source: "bucket" });
+      assert.deepEqual(filesOf(prepared.imagePath), image.files);
+      assert.ok(!readdirSync(prepared.imagePath).includes("s3_opts.json"));
+      assert.deepEqual(imagesOf(other, "fs-abc"), [image.digest]);
+      assert.deepEqual(s3.requests.filter((asked) => asked.startsWith("GET main/fs-abc/layers/")).length, image.files.length);
+    })
+  ));
+
+test("a snapshot is prepared from the node's cache where it holds it whole and its runsc restores it, and otherwise from the bucket, its images fetched meanwhile", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
@@ -787,40 +856,58 @@ test("a snapshot is prepared from the node's cache, or from the bucket, checked 
       const files = image.files.map(({ path }) => `GET main/fs-abc/layers/${image.digest}/${path}`);
       const downloads = () => s3.requests.filter((asked) => asked.startsWith("GET main/fs-abc/layers/"));
 
-      // The node that took it has it.
-      assert.deepEqual(yield* taker.agent.prepare(workspace), { manifest, imagePath: join(taker.cacheDir, "main", "fs-abc", manifest.snapshot) });
+      // The node that took it has it, which its runsc restores, as it says.
+      const linked = join(taker.cacheDir, "main", "fs-abc", manifest.snapshot);
+      assert.deepEqual(yield* taker.agent.prepare(workspace), { manifest, imagePath: linked, source: "cache" });
+      assert.deepEqual(taker.releases.calls(RELEASE).at(-1), [`--root=${RUNSC_ROOT}`, "--systemd-cgroup=true", "image", "verify", "--host", linked]);
       assert.deepEqual(downloads(), []);
 
-      // Another node downloads it, once.
+      // Another node reads it from the bucket, each of its images there as it was put, as the restore goes; and fetches it meanwhile, once.
       const other = yield* node("node-2");
-      const prepared = yield* other.agent.prepare(workspace);
-      assert.deepEqual(prepared, { manifest, imagePath: join(other.cacheDir, "main", "fs-abc", manifest.snapshot) });
+      const asked = s3.requests.length;
+      const remote = yield* other.agent.prepare(workspace);
+      assert.deepEqual(remote, { manifest, imagePath: join(other.cacheDir, "main", "fs-abc", manifest.snapshot), source: "bucket" });
+      assert.deepEqual(goferOptionsOf(remote.imagePath).files, ["s3_opts.json"]);
+      assert.deepEqual(s3.requests.slice(asked, asked + 1 + IMAGE_FILES.length), ["GET main/fs-abc/current.json", ...IMAGE_FILES.map((path) => `HEAD main/fs-abc/layers/${image.digest}/${path}`)]);
+      yield* fetched(other, manifest);
       assert.deepEqual(downloads(), files);
-      assert.deepEqual(filesOf(prepared.imagePath), image.files);
       assert.deepEqual(JSON.parse(readFileSync(join(other.cacheDir, "main", "fs-abc", "manifest.json"), "utf8")), manifest);
-      yield* other.agent.prepare(workspace);
+      const cached = yield* other.agent.prepare(workspace);
+      assert.equal(cached.source, "cache");
+      assert.deepEqual(filesOf(cached.imagePath), image.files);
       assert.deepEqual(downloads(), files);
-      // A cached copy that is no longer what its manifest says, as a disk may change it, is read again from the bucket.
+      // A cached copy that is no longer what its manifest says, as a disk may change it, is read from the bucket again, and fetched again.
       writeFileSync(join(other.cacheDir, "main", "fs-abc", "layers", image.digest, "pages_meta.img"), "changed on the disk");
-      assert.deepEqual(yield* other.agent.prepare(workspace), prepared);
+      assert.equal((yield* other.agent.prepare(workspace)).source, "bucket");
+      yield* fetched(other, manifest);
       assert.deepEqual(downloads(), [...files, ...files]);
-      assert.deepEqual(filesOf(prepared.imagePath), image.files);
+      // So is one its runsc finds no restorable image of, malformed (3) or missing a layer (4).
+      for (const status of ["3 Image of digest mismatch", "4 layer not found"]) {
+        writeFileSync(join(other.releases.dirOf(RELEASE), "verify-status"), status);
+        assert.equal((yield* other.agent.prepare(workspace)).source, "bucket");
+        rmSync(join(other.releases.dirOf(RELEASE), "verify-status"));
+        yield* fetched(other, manifest);
+      }
+      // One its runsc cannot restore on this node (5) is restored on none of its.
+      writeFileSync(join(other.releases.dirOf(RELEASE), "verify-status"), "5 Not restorable here: saved by runsc \"release-a\", this is runsc \"release-b\"");
+      assert.equal(
+        failure(yield* Effect.exit(other.agent.prepare(workspace))),
+        `this node cannot restore the snapshot ${manifest.snapshot} of main/fs-abc: this node's runsc does not restore it: Not restorable here: saved by runsc "release-a", this is runsc "release-b"`,
+      );
+      rmSync(join(other.releases.dirOf(RELEASE), "verify-status"));
 
-      // A newer snapshot is prepared beside the older one's images, which a later collection discards.
+      // A newer snapshot is fetched beside the older one's images, which a later collection discards.
       const newer = yield* taker.agent.checkpoint(request("fs-abc", OTHER_CONTAINER));
       yield* other.agent.prepare(workspace);
+      yield* fetched(other, newer);
       assert.deepEqual(imagesOf(other, "fs-abc"), [image.digest, newer.layers[0]?.digest].sort());
 
-      // A file that is not what the manifest says fails it, and leaves nothing of it.
+      // An image not in the bucket as it was put fails it, and leaves nothing of it.
       const [newerImage] = newer.layers;
       assert.ok(newerImage);
       s3.objects.set(`main/fs-abc/layers/${newerImage.digest}/pages_meta.img`, Buffer.from("something else"));
       const third = yield* node("node-3");
-      const expected = newerImage.files.find(({ path }) => path === "pages_meta.img");
-      assert.equal(
-        failure(yield* Effect.exit(third.agent.prepare(workspace))),
-        `the snapshot of main/fs-abc is corrupt: its image ${newerImage.digest}'s file pages_meta.img is 14 bytes of SHA-256 ${sha256("something else")}, where its manifest says ${expected?.bytes} bytes of ${expected?.sha256}`,
-      );
+      assert.equal(failure(yield* Effect.exit(third.agent.prepare(workspace))), `the snapshot of main/fs-abc is corrupt: its image ${newerImage.digest} is not in the bucket as it was put`);
       assert.equal(cachesAny(third, "fs-abc"), false);
 
       // A node without its release, or whose CPU lacks a feature it was saved with, cannot restore it.
@@ -918,9 +1005,13 @@ test("a copy gives a workspace another's snapshot, its images copied in the buck
       assert.deepEqual(JSON.parse(s3.objects.get(`br-1/fs-fork/manifests/${source.snapshot}.json`)?.toString() ?? ""), copied);
       assert.deepEqual(yield* here.agent.current(fork), copied);
       assert.deepEqual(yield* here.agent.current(from), source);
-      // Another node prepares it from the bucket, each file what the source's is.
+      // Another node prepares it from the bucket, at the fork's own prefix, and fetches each file of it, what the source's is.
       const other = yield* node("node-2");
-      assert.deepEqual(yield* other.agent.prepare(fork), { manifest: copied, imagePath: join(other.cacheDir, "br-1", "fs-fork", source.snapshot) });
+      const prepared = yield* other.agent.prepare(fork);
+      assert.deepEqual(prepared, { manifest: copied, imagePath: join(other.cacheDir, "br-1", "fs-fork", source.snapshot), source: "bucket" });
+      assert.equal(goferOptionsOf(prepared.imagePath).options["object_prefix"], `${prefix}/`);
+      yield* fetched(other, copied);
+      assert.deepEqual(filesOf(join(other.cacheDir, "br-1", "fs-fork", "layers", image.digest)), image.files);
 
       // A workspace's own snapshot is replaced, and what this node's cache held of it goes.
       const own = { environment: "main", workspace: "fs-own" };
@@ -1021,10 +1112,12 @@ test("checkpoints and prepares keep the node's cache within its budget, the leas
       yield* Effect.sleep("20 millis");
       yield* taker.agent.checkpoint(request("fs-other"));
       assert.deepEqual([cachesAny(taker, "fs-abc"), cachesAny(taker, "fs-other")], [false, true]);
+      // Read from the bucket, as their images are fetched.
       const other = yield* node("node-2", { budget: 6000 });
-      yield* other.agent.prepare({ environment: "main", workspace: "fs-other" });
+      yield* fetched(other, (yield* other.agent.prepare({ environment: "main", workspace: "fs-other" })).manifest);
       yield* Effect.sleep("20 millis");
-      yield* other.agent.prepare({ environment: "main", workspace: "fs-abc" });
+      yield* fetched(other, (yield* other.agent.prepare({ environment: "main", workspace: "fs-abc" })).manifest);
+      yield* Effect.sync(() => cachesAny(other, "fs-other")).pipe(Effect.repeat({ schedule: Schedule.spaced("10 millis"), until: (held) => !held }), Effect.timeout("5 seconds"));
       assert.deepEqual([cachesAny(other, "fs-abc"), cachesAny(other, "fs-other")], [true, false]);
     })
   ));
@@ -1382,7 +1475,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
 
       assert.deepEqual(yield* run("prepare", { environment: "main", workspace: "fs-abc" }), {
         status: 200,
-        body: { state: "done", value: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot) } },
+        body: { state: "done", value: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot), source: "cache" } },
       });
       failed(404, "main/fs-none has no snapshot")(yield* run("prepare", { environment: "main", workspace: "fs-none" }));
 

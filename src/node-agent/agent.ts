@@ -70,8 +70,8 @@ import { withLogScope } from "../shared/log.ts";
 import { CacheError, type CachedWorkspace, DIGEST, LAYERS_DIR, type SnapshotCache } from "./cache.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import { egressGap, type PodAddress } from "./kube-router.ts";
-import { runscVersion } from "./names.ts";
-import type { ReleaseNotInstalled, Runsc, RunscError, RunningContainer } from "./runsc.ts";
+import { restoresFromBucket, runscVersion } from "./names.ts";
+import { type ReleaseNotInstalled, type Runsc, type RunscError, type RunningContainer, VERIFY_STATUSES } from "./runsc.ts";
 import type { S3Bucket, S3Error } from "./s3.ts";
 import { hostPathOf, readUnder, type UnderRoot } from "./volume.ts";
 
@@ -268,6 +268,8 @@ export interface Killed {
 export interface Prepared {
   readonly manifest: Manifest;
   readonly imagePath: string;
+  /** Where the restore reads the image: the node's cache, or the bucket, as it goes. */
+  readonly source: "cache" | "bucket";
 }
 
 /** What this node holds: its gVisor releases with the CPU features each sees here, and the workspaces whose images its cache holds, by their digests. */
@@ -370,7 +372,7 @@ export class ContainerElsewhere extends Schema.TaggedError<ContainerElsewhere>()
 }
 
 /** How preparing a snapshot fails. */
-export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError;
+export type PrepareError = NoSnapshot | Unrestorable | SnapshotCorrupt | S3Error | CacheError | RunscError | StoreUnresolved;
 
 /** How resuming a sandbox fails. */
 export type ResumeError = PoliciesNotInForce | ContainerElsewhere | SnapshotOutlived | HostCommandError | RunscError | ReleaseNotInstalled | S3Error | SnapshotCorrupt;
@@ -416,8 +418,37 @@ export interface NodeAgentOptions {
   readonly runsc: Runsc;
   readonly cache: SnapshotCache;
   readonly bucket: S3Bucket;
+  /**
+   * The bucket as the checkpoint gofer of a restore reads it, from the node: an endpoint the
+   * node reaches, which the agent's own may not be, as a name in the cluster's DNS is not,
+   * and the agent's identity. Looked up as each restore from the bucket is prepared.
+   */
+  readonly store: Effect.Effect<GoferStore, StoreUnresolved>;
   readonly host: HostCommands;
+  /** The first gVisor release that restores straight from the bucket (restoresFromBucket); none where empty. */
+  readonly restoresFromBucketSince: string;
 }
+
+/** The bucket, as the checkpoint gofer reaches it from the node, and with whose credentials. */
+export interface GoferStore {
+  readonly endpoint: string;
+  readonly region: string;
+  readonly bucket: string;
+  readonly accessKeyId: string;
+  readonly secretAccessKey: string;
+}
+
+/** Where the checkpoint gofer reaches the bucket from the node could not be told. */
+export class StoreUnresolved extends Schema.TaggedError<StoreUnresolved>()("StoreUnresolved", {
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return `the snapshots bucket cannot be reached from the node: ${this.reason}`;
+  }
+}
+
+/** The checkpoint gofer's options file for an image in an S3 store (runsc's checkpoint_restore.md). */
+export const GOFER_OPTIONS_FILE = "s3_opts.json";
 
 /** The directory of a workspace's manifests, in the bucket. */
 export const MANIFESTS_DIR = "manifests";
@@ -469,6 +500,10 @@ const sizes = meter.createHistogram("alasio.node_agent.snapshot.size", {
 const copies = meter.createCounter("alasio.node_agent.copies", {
   description: "Snapshots copied from one workspace to another by the node agent, by outcome",
   unit: "{copy}",
+});
+const fetches = meter.createCounter("alasio.node_agent.fetches", {
+  description: "Images of a snapshot restored from the bucket fetched into the node's cache after its restore began, for the next checkpoint's delta, by outcome",
+  unit: "{image}",
 });
 const prepares = meter.createCounter("alasio.node_agent.prepares", {
   description: "Snapshots prepared for a restore by the node agent, by where their image came from, or why not",
@@ -554,7 +589,7 @@ const onDisk = <A>(run: () => Promise<A>): Effect.Effect<A, CacheError> =>
   Effect.tryPromise({ try: run, catch: (cause) => new CacheError({ reason: cause instanceof Error ? cause.message : String(cause) }) });
 
 /** The node agent of `options`, whose operations on a workspace run one at a time while the scope lasts. */
-export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, host }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
+export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc, cache, bucket, store, host, restoresFromBucketSince }: NodeAgentOptions): Effect.fn.Return<NodeAgent, never, Scope.Scope> {
   const locks = yield* RcMap.make({ lookup: (_workspace: string) => Semaphore.make(1) });
   /**
    * The snapshot each sandbox running on this node, by the container checkpoints name, was
@@ -994,34 +1029,109 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       return missing.length > 0 ? `this node's CPU lacks features it was saved with: ${missing.join(", ")}` : null;
     });
 
+  /** The checkpoint gofer's options for the image `own` of the workspace's, its layers under its own prefix of them, as the bucket keeps them. */
+  const goferOptions = (ref: WorkspaceRef, own: string, { endpoint, region, bucket: name, accessKeyId, secretAccessKey }: GoferStore): string =>
+    JSON.stringify({
+      endpoint,
+      region,
+      bucket: name,
+      object_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/${own}/`,
+      layers_prefix: `${prefixOf(ref)}/${LAYERS_DIR}/`,
+      addressing: "path",
+      credentials: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
+    });
+
+  /**
+   * Fetches into the cache, one at a time, each image of `manifest` it does not hold, after a
+   * restore from the bucket began, in the agent's scope: the next checkpoint of the restored
+   * sandbox is a delta of the snapshot's image once the cache holds it. Each holds the
+   * workspace while it is fetched; what fails is said, and leaves that checkpoint whole.
+   */
+  const fetchLater = (ref: WorkspaceRef, manifest: Manifest): Effect.Effect<void> =>
+    Effect.forEach(manifest.layers, (layer) =>
+      exclusive([ref], Effect.gen(function*() {
+        if (yield* intact(ref, layer)) return;
+        yield* cache.room(bytesOf([layer]), ref).pipe(Effect.flatMap(logEvicted));
+        yield* download(ref, manifest.snapshot, layer);
+        yield* Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": "fetched" }));
+      })).pipe(
+        Effect.tapError((error) => Effect.sync(() => fetches.add(1, { "alasio.node_agent.fetch.outcome": error._tag }))),
+      ), { discard: true }).pipe(
+      Effect.tap(() => Effect.logInfo(`fetched the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, for its next delta`)),
+      // Within its budget again, the least recently used workspace evicted.
+      Effect.tap(() => evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)))),
+      Effect.catch((error) => Effect.logWarning(`could not fetch the images of the snapshot ${manifest.snapshot} of ${prefixOf(ref)} into the node's cache, so its next checkpoint is whole: ${error.message}`)),
+      withAlasioSpan("alasio.node_agent.fetch", { attributes: { ...spanAttributes(ref), "alasio.snapshot": manifest.snapshot } }),
+      withLogScope("node-agent"),
+      Effect.forkIn(scope),
+      Effect.asVoid,
+    );
+
+  /**
+   * The snapshot of the workspace, prepared for a restore on this node: from the node's cache
+   * where it holds every image of it intact and this node's runsc restores it there, as
+   * `runsc image verify --host` says; otherwise from the bucket, which the restore reads as it
+   * goes, through the checkpoint gofer, its images fetched into the cache meanwhile.
+   */
   const prepare = (ref: WorkspaceRef): Effect.Effect<Prepared, PrepareError> =>
     exclusive(
       [ref],
       Effect.gen(function*() {
         const manifest = yield* current(ref);
         if (manifest === null) return yield* new NoSnapshot(ref);
-        const { environment, workspace, snapshot } = manifest;
+        const { environment, workspace, snapshot, release } = manifest;
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot": snapshot });
         const why = yield* unrestorable(manifest);
         if (why !== null) return yield* new Unrestorable({ environment, workspace, snapshot, reason: why });
         const started = yield* Clock.currentTimeMillis;
+        const [own] = manifest.layers;
+        if (own === undefined) return yield* new SnapshotCorrupt({ environment, workspace, reason: "its manifest names no image" });
         // A copy the cache holds is read again against its manifest: what the disk keeps may have changed since it was written.
-        const missing: Layer[] = [];
-        for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) missing.push(layer);
-        if (missing.length > 0) yield* cache.room(bytesOf(missing), ref).pipe(Effect.flatMap(logEvicted));
-        yield* Effect.forEach(missing, (layer) => download(ref, snapshot, layer), { discard: true }).pipe(
-          Effect.onError(() => cache.clear(environment, workspace).pipe(Effect.ignore)),
-        );
-        const imagePath = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
+        let cached = true;
+        for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) cached = false;
+        let imagePath: string | null = null;
+        if (cached) {
+          const linked = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
+          const verified = yield* runsc.verify(release, linked).pipe(
+            Effect.catchTag("ReleaseNotInstalled", (error) => Effect.fail(new Unrestorable({ environment, workspace, snapshot, reason: error.message }))),
+          );
+          if (verified.restorable) imagePath = linked;
+          else if (verified.status === VERIFY_STATUSES.notRestorable) {
+            return yield* new Unrestorable({ environment, workspace, snapshot, reason: `this node's runsc does not restore it: ${verified.said}` });
+          } else {
+            yield* Effect.logWarning(`the node's cached copy of the snapshot ${snapshot} of ${prefixOf(ref)} does not restore (runsc image verify exited ${verified.status}: ${verified.said}): it is read from the bucket`);
+            yield* cache.clear(environment, workspace);
+          }
+        }
+        const source: Prepared["source"] = imagePath === null ? "bucket" : "cache";
+        // A release that does not restore straight from the bucket restores from the cache,
+        // the images it does not hold intact fetched into it first.
+        const fetchedFirst = imagePath === null && !restoresFromBucket(release, restoresFromBucketSince);
+        if (fetchedFirst) {
+          const missing: Layer[] = [];
+          for (const layer of manifest.layers) if (!(yield* intact(ref, layer))) missing.push(layer);
+          if (missing.length > 0) yield* cache.room(bytesOf(missing), ref).pipe(Effect.flatMap(logEvicted));
+          yield* Effect.forEach(missing, (layer) => download(ref, snapshot, layer), { discard: true }).pipe(
+            Effect.onError(() => cache.clear(environment, workspace).pipe(Effect.ignore)),
+          );
+          imagePath = yield* cache.prepare(environment, workspace, snapshot, manifest.layers.map(({ digest }) => digest));
+        }
+        if (imagePath === null) {
+          // Read as the restore goes, each of its images must be in the bucket as it was put.
+          for (const layer of manifest.layers) {
+            if (!(yield* inBucket(ref, layer))) return yield* new SnapshotCorrupt({ environment, workspace, reason: `its image ${layer.digest} is not in the bucket as it was put` });
+          }
+        }
+        if (imagePath === null) imagePath = yield* cache.prepareRemote(environment, workspace, snapshot, GOFER_OPTIONS_FILE, goferOptions(ref, own.digest, yield* store));
         yield* onDisk(() => writeFile(join(cache.workspace(environment, workspace), MANIFEST_FILE), JSON.stringify(manifest)));
         prepared.set(prefixOf(ref), manifest);
+        if (source === "bucket" && !fetchedFirst) yield* fetchLater(ref, manifest);
         const preparedMs = (yield* Clock.currentTimeMillis) - started;
         yield* evict.pipe(Effect.catch((error) => Effect.logWarning(error.message)));
-        const source = missing.length === 0 ? "cache" : "bucket";
         yield* Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": "prepared", "alasio.node_agent.prepare.source": source }));
         yield* Effect.annotateCurrentSpan({ "alasio.snapshot.source": source, "alasio.snapshot.bytes": manifest.bytes, "alasio.snapshot.prepare_ms": preparedMs });
         yield* Effect.logInfo(`prepared the snapshot ${snapshot} of ${prefixOf(manifest)} from the ${source}: ${manifest.bytes} bytes in ${preparedMs} ms`);
-        return { manifest, imagePath };
+        return { manifest, imagePath, source };
       }),
     ).pipe(
       Effect.tapError((error) => Effect.sync(() => prepares.add(1, { "alasio.node_agent.prepare.outcome": error._tag }))),

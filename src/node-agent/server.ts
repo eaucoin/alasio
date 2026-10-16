@@ -20,13 +20,14 @@
  *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept. 404
  *   when it has none the agent keeps (./operations.ts).
  * - `POST /prepare`, `{ environment, workspace }`: starts preparing the workspace's current
- *   snapshot in this node's cache, for a restore on this node (202), unless a prepare of
- *   it runs, which goes on.
+ *   snapshot for a restore on this node (202), from this node's cache, or else from the
+ *   bucket, which the restore reads as it goes, unless a prepare of it runs, which goes on.
  * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
- *   checkpoint's does, `value` `{ manifest, imagePath }`; `status` 404 when it has no
- *   snapshot, 409 when this node cannot restore it (its release is not installed here, or
- *   this node's CPU lacks a feature it was saved with), 422 when its image is not what its
- *   manifest says, 502 when the bucket failed.
+ *   checkpoint's does, `value` `{ manifest, imagePath, source }`, `source` "cache" or
+ *   "bucket"; `status` 404 when it has no snapshot, 409 when this node cannot restore it (its
+ *   release is not installed here, or this node's CPU lacks a feature it was saved with, or
+ *   its runsc does not restore it, as `runsc image verify --host` says), 422 when its image is
+ *   not what its manifest says, 502 when the bucket failed or cannot be told from the node.
  * - `POST /copies`, `{ from: { environment, workspace }, to: { environment, workspace } }`:
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
@@ -67,7 +68,9 @@
  *
  * A manifest is ./agent.ts Manifest.
  */
+import { lookup } from "node:dns/promises";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 
 import { NodeHttpServer } from "@effect/platform-node";
 import { Cause, Config, Effect, Option, Redacted, Schema, type Scope } from "effect";
@@ -80,12 +83,14 @@ import {
   type CheckpointFailed,
   CheckpointRequest,
   CopyRequest,
+  type GoferStore,
   makeNodeAgent,
   type Manifest,
   type NodeAgent,
   type Prepared,
   type PrepareError,
   ResumeRequest,
+  StoreUnresolved,
   WorkspaceRef,
 } from "./agent.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
@@ -96,6 +101,7 @@ import {
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   RUNSC_ROOT,
+  RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "./names.ts";
@@ -118,6 +124,7 @@ const STATUS: Readonly<Record<string, number>> = {
   ContainerElsewhere: 409,
   SnapshotCorrupt: 422,
   S3Error: 502,
+  StoreUnresolved: 502,
   SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
 };
@@ -271,6 +278,22 @@ const BucketConfig = Config.all({
   secretAccessKey: Config.Redacted("AWS_SECRET_ACCESS_KEY"),
 });
 
+/**
+ * The bucket as a restore's checkpoint gofer reaches it, running on the node, outside the
+ * cluster's DNS: at the address the endpoint's name has, looked up as the agent looks names
+ * up, which the node reaches, as it does a Service's cluster IP.
+ */
+const storeOf = ({ endpoint, ...rest }: Omit<GoferStore, "endpoint"> & { readonly endpoint: string }): Effect.Effect<GoferStore, StoreUnresolved> =>
+  Effect.tryPromise({
+    try: async () => {
+      const url = new URL(endpoint);
+      const name = url.hostname.replace(/^\[|\]$/gu, "");
+      if (isIP(name) === 0) url.hostname = (await lookup(name)).address;
+      return { ...rest, endpoint: url.origin };
+    },
+    catch: (cause) => new StoreUnresolved({ reason: `${endpoint}: ${cause instanceof Error ? cause.message : String(cause)}` }),
+  });
+
 /** Where the agent, of the node's processes, sees the node's filesystem: as its first process does. */
 const NODE_ROOT = "/proc/1/root";
 /** The most the node's cache keeps unless told: 5 GiB. */
@@ -281,13 +304,16 @@ const EVICTION_GRACE_MS = 10 * 60_000;
 /**
  * The node agent of the node it runs on (NODE_NAME), as its environment configures it:
  * the bucket (BucketConfig), the token alasio presents (NODE_AGENT_TOKEN_VARIABLE), and
- * the cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE). What a stopped agent left
+ * the cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), and the first gVisor release
+ * that restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless
+ * given, every snapshot then fetched into the cache first). What a stopped agent left
  * half written in the cache is removed first. What stops it is logged.
  */
 export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError, Scope.Scope> = Effect.gen(function*() {
   const node = yield* Config.String("NODE_NAME");
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const budget = yield* Config.Int(SNAPSHOT_CACHE_BYTES_VARIABLE).pipe(Config.withDefault(DEFAULT_CACHE_BYTES));
+  const restoresFromBucketSince = yield* Config.String(RESTORES_FROM_BUCKET_SINCE_VARIABLE).pipe(Config.withDefault(""));
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
   yield* cache.clean;
@@ -297,7 +323,9 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     runsc: makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT }),
     cache,
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
+    store: storeOf({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
     host: makeHostCommands(),
+    restoresFromBucketSince,
   });
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent });
   yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, its cache within ${budget} bytes`);

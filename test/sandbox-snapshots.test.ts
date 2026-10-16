@@ -113,7 +113,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
         const refused = prepare(node);
         const { status, reason } = typeof refused === "string" ? { status: 409, reason: refused } : refused ?? { status: 0, reason: "" };
         return refused === null
-          ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1` })
+          ? Effect.succeed({ manifest: current as Manifest, imagePath: `/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-1`, source: "cache" as const })
           : Effect.fail(new NodeAgentError({ node, call: "prepare alasio-sessions/fs-abc123's snapshot", status, reason }));
       }),
     current: () => (read ? Effect.fail(read) : Effect.succeed(current)),

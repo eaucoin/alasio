@@ -21,9 +21,10 @@ import { CURRENT_FILE, Manifest } from "../../src/node-agent/agent.ts";
 import { LAYERS_DIR } from "../../src/node-agent/cache.ts";
 import { makeS3Bucket } from "../../src/node-agent/s3.ts";
 
-/** The file of the image overwritten: its snapshot, its path in the image, and its size. */
+/** The file of the image overwritten: its snapshot, its image, its path in the image, and its size. */
 export interface Corrupted {
   readonly snapshot: string;
+  readonly image: string;
   readonly path: string;
   readonly bytes: number;
 }
@@ -70,7 +71,7 @@ const said = await Effect.runPromise(Effect.gen(function*() {
   const zeros = "/tmp/e2e-corrupted";
   writeFileSync(zeros, Buffer.alloc(file.bytes));
   yield* bucket.putFile(`${environment}/${workspace}/${LAYERS_DIR}/${image.digest}/${file.path}`, zeros);
-  const done: Corrupted = { snapshot: manifest.snapshot, path: file.path, bytes: file.bytes };
+  const done: Corrupted = { snapshot: manifest.snapshot, image: image.digest, path: file.path, bytes: file.bytes };
   return done;
 }));
 console.log(JSON.stringify(said));

@@ -20,6 +20,31 @@ export const GVISOR_RELEASES = "/usr/local/lib/alasio/gvisor";
 /** The directory of gVisor's `release` on a node. */
 export const gvisorDirectory = (release: string): string => `${GVISOR_RELEASES}/${release}`;
 
+/**
+ * Whether gVisor's `release` restores a sandbox straight from the bucket, its images read
+ * through the checkpoint gofer as the restore goes: one of the fork's at or past `since`,
+ * the first release that does, as cluster/node/pins.json says it (restoresFromBucketSince)
+ * and the installation gives the node agent it (RESTORES_FROM_BUCKET_SINCE_VARIABLE), by
+ * its base's date and patch, then its own number. One before it, as the fork's
+ * 20260921.0-eaucoin.6, which ends the sandbox as it tries (`urpc method
+ * "containerManager.Restore" failed: EOF`), is fetched into the node's cache first and
+ * restored from there; so is one that names no release of the fork's, and every release
+ * where `since` names none.
+ */
+export function restoresFromBucket(release: string, since: string): boolean {
+  const parts = (named: string) => {
+    const matched = /^(\d{8})\.(\d+)-eaucoin\.(\d+)$/u.exec(named);
+    return matched ? matched.slice(1).map(Number) : null;
+  };
+  const [of, first] = [parts(release), parts(since)];
+  if (of === null || first === null) return false;
+  const differs = of.findIndex((part, index) => part !== first[index]);
+  return differs === -1 || (of[differs] ?? 0) > (first[differs] ?? 0);
+}
+
+/** The variable that gives the node agent the first gVisor release that restores straight from the bucket (restoresFromBucket). */
+export const RESTORES_FROM_BUCKET_SINCE_VARIABLE = "ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE";
+
 /** Where k3s's containerd reads its template, and runsc its options. */
 export const CONTAINERD = "/var/lib/rancher/k3s/agent/etc/containerd";
 
