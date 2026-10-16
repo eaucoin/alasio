@@ -18,7 +18,7 @@
  * budget, and what it cannot be made for is refused.
  */
 import { link, mkdir, readdir, rename, rm, stat, statfs, symlink, utimes } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { join } from "node:path";
 
 import { Clock, Effect, Schema } from "effect";
 
@@ -133,17 +133,37 @@ async function directories(directory: string): Promise<string[]> {
   return entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map((entry) => entry.name).sort();
 }
 
-/** The bytes of the files under `directory`, each once however many links it has there, but those being written. */
+/** `found`, or null where what it was asked of is gone, as what the agent removes meanwhile is. */
+async function unlessGone<A>(found: Promise<A>): Promise<A | null> {
+  return found.catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+}
+
+/**
+ * The bytes of the files under `directory`, each once however many links it has there, but
+ * those being written; what is removed as it is walked, as the agent moves an image or
+ * removes a workspace's meanwhile, counts for nothing.
+ */
 async function size(directory: string): Promise<number> {
   const seen = new Set<number>();
   let bytes = 0;
-  for (const entry of await readdir(directory, { withFileTypes: true, recursive: true })) {
-    if (!entry.isFile() || relative(directory, entry.parentPath).split(sep).some((name) => name.startsWith("."))) continue;
-    const { ino, size: fileBytes } = await stat(join(entry.parentPath, entry.name));
-    if (seen.has(ino)) continue;
-    seen.add(ino);
-    bytes += fileBytes;
-  }
+  const walk = async (under: string): Promise<void> => {
+    for (const entry of (await unlessGone(readdir(under, { withFileTypes: true }))) ?? []) {
+      const path = join(under, entry.name);
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith(".")) await walk(path);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const found = await unlessGone(stat(path));
+      if (found === null || seen.has(found.ino)) continue;
+      seen.add(found.ino);
+      bytes += found.size;
+    }
+  };
+  await walk(directory);
   return bytes;
 }
 
@@ -176,7 +196,10 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
         const directory = workspaceDir(environment, workspace);
         const images = (await directories(join(directory, LAYERS_DIR))).filter((name) => DIGEST.test(name));
-        found.push({ environment, workspace, images, bytes: await size(directory), usedAt: (await stat(directory)).mtimeMs });
+        const bytes = await size(directory);
+        // One removed meanwhile, as an eviction removes it, holds nothing.
+        const used = await unlessGone(stat(directory));
+        if (used !== null) found.push({ environment, workspace, images, bytes, usedAt: used.mtimeMs });
       }
     }
     return found;
