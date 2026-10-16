@@ -640,7 +640,7 @@ if (inShard("upgrade")) {
           await sleep(1000);
         }
       })();
-      const ran = await cutOver().finally(() => {
+      const ran = await cutOver({ failAt: "midway-through-the-old-snapshots-deleted" }).finally(() => {
         running = false;
       });
       await sampling;
