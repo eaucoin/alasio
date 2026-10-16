@@ -10,13 +10,13 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { ConfigProvider, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Logger, Schedule, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -924,6 +924,64 @@ test("a snapshot is prepared from the node's cache where it holds it whole and i
       );
     })
   ));
+
+test("the checkpoint gofer's options, which hold the agent's credentials, are root's alone along their whole path, said nowhere, and removed as the restore is resumed or abandoned, whatever comes of either", () =>
+  withBucket(({ node }) => {
+    const logged: string[] = [];
+    return Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const manifest = yield* (yield* node("node-1")).agent.checkpoint(request("fs-abc"));
+      const here = yield* node("node-2");
+      const modeOf = (path: string) => (statSync(path).mode & 0o777).toString(8);
+      // The agent makes its cache's root its own as it starts, cleaning it.
+      mkdirSync(here.cacheDir, { recursive: true });
+      chmodSync(here.cacheDir, 0o755);
+      yield* here.cache.clean;
+      assert.equal(modeOf(here.cacheDir), "700");
+      // Read from the bucket, the cache holding none of it; its images fetched meanwhile.
+      const prepared = () =>
+        Effect.gen(function*() {
+          yield* here.cache.clear("main", "fs-abc");
+          // Its directories as others may read them, as made before it.
+          mkdirSync(join(here.cacheDir, "main", "fs-abc"), { recursive: true });
+          for (const each of [here.cacheDir, join(here.cacheDir, "main"), join(here.cacheDir, "main", "fs-abc")]) chmodSync(each, 0o755);
+          const { imagePath, source } = yield* here.agent.prepare(workspace);
+          assert.equal(source, "bucket");
+          yield* fetched(here, manifest);
+          assert.deepEqual(readdirSync(imagePath), ["s3_opts.json"]);
+          return imagePath;
+        });
+
+      const first = yield* prepared();
+      assert.deepEqual(
+        [here.cacheDir, join(here.cacheDir, "main"), join(here.cacheDir, "main", "fs-abc"), first].map(modeOf),
+        ["700", "700", "700", "700"],
+      );
+      assert.equal(modeOf(join(first, "s3_opts.json")), "600");
+      // A resume that fails removes them.
+      writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
+      assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), /runsc resume of \S+ failed/u);
+      assert.deepEqual(readdirSync(first), []);
+      rmSync(join(here.releases.dirOf(RELEASE), "fail-resume"));
+      // An abandon does.
+      const second = yield* prepared();
+      yield* here.agent.abandon({ ...workspace, namespace: SESSIONS, pod: POD });
+      assert.deepEqual(readdirSync(second), []);
+      // A resume does.
+      const third = yield* prepared();
+      yield* here.agent.resume(resumeRequest());
+      assert.deepEqual(readdirSync(third), []);
+      // Of a prepare from the cache, none is written, and nothing is removed.
+      const cached = yield* here.agent.prepare(workspace);
+      assert.equal(cached.source, "cache");
+      const held = readdirSync(cached.imagePath).sort();
+      yield* here.agent.resume(resumeRequest());
+      assert.deepEqual(readdirSync(cached.imagePath).sort(), held);
+
+      assert.ok(logged.length > 0);
+      for (const line of logged) assert.ok(!line.includes(CREDENTIALS.secretAccessKey) && !line.includes(CREDENTIALS.accessKeyId), line);
+    }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => void logged.push(JSON.stringify(message)))])));
+  }));
 
 test("what no snapshot needs any more is collected, but what a restore or a commit may still read, and what the latest snapshot holds", () =>
   withBucket(({ s3, node }) =>

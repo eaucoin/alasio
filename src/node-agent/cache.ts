@@ -18,7 +18,7 @@
  * than RESERVE_BYTES free: room is made first, workspaces evicted as they would be over the
  * budget, and what it cannot be made for is refused.
  */
-import { link, mkdir, readdir, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, readdir, rename, rm, stat, statfs, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Clock, Effect, Schema } from "effect";
@@ -39,6 +39,9 @@ export const RESERVE_BYTES = 2 * 1024 ** 3;
 
 /** The directory of a workspace's images, each in one named by its digest; and of a snapshot's, its layers. */
 export const LAYERS_DIR = "layers";
+
+/** The mode of the cache's directories that lead to a gofer's options file: its owner's, root's, alone. */
+const OWNER_ONLY = 0o700;
 
 /** An image's digest, as runsc names it: the SHA-256 of its pages metadata, in hex. */
 export const DIGEST = /^[0-9a-f]{64}$/u;
@@ -92,10 +95,16 @@ export interface SnapshotCache {
   /**
    * The directory a restore of the snapshot reads from the bucket, made anew: the checkpoint
    * gofer's options file `name` alone, holding `options`, which name the bucket and the
-   * agent's credentials, readable and writable by its owner only, as the gofer requires.
-   * The workspace is used now.
+   * agent's credentials, readable and writable by its owner only, as the gofer requires,
+   * each directory that leads to it, from the cache's root, its owner's alone too. The
+   * workspace is used now.
    */
   readonly prepareRemote: (environment: string, workspace: string, snapshot: string, name: string, options: string) => Effect.Effect<string, CacheError>;
+  /**
+   * Removes the options file `name` from each snapshot prepared of the workspace, as its
+   * restore needs it no more: how many it removed.
+   */
+  readonly forget: (environment: string, workspace: string, name: string) => Effect.Effect<number, CacheError>;
   /** Removes everything of the workspace. */
   readonly clear: (environment: string, workspace: string) => Effect.Effect<void, CacheError>;
   /**
@@ -112,7 +121,7 @@ export interface SnapshotCache {
    * workspaces as `evict` does but `keep`: those evicted. Fails, saying so, where it cannot.
    */
   readonly room: (bytes: number, keep: { readonly environment: string; readonly workspace: string }) => Effect.Effect<readonly CachedWorkspace[], CacheError>;
-  /** Removes what was left half written. */
+  /** Removes what was left half written, and makes the cache's root its owner's alone. */
   readonly clean: Effect.Effect<void, CacheError>;
 }
 
@@ -213,6 +222,12 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
     return found;
   });
 
+  /** The options file `name`, which the cache writes of nothing else. */
+  const optionsFile = (name: string): string => {
+    if (!/^[a-z0-9_]+\.json$/u.test(name)) throw new Error(`the snapshot cache writes no options file ${JSON.stringify(name)}`);
+    return name;
+  };
+
   /** Removes `cached` whole. */
   const remove = (cached: CachedWorkspace): Effect.Effect<void, CacheError> =>
     attempt(() => rm(workspaceDir(cached.environment, cached.workspace), { recursive: true, force: true }));
@@ -264,14 +279,32 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
 
     prepareRemote: (environment, workspace, snapshot, name, options) => {
       checked(environment, workspace, snapshot);
-      if (!/^[a-z0-9_]+\.json$/u.test(name)) throw new Error(`the snapshot cache writes no options file ${JSON.stringify(name)}`);
+      const file = optionsFile(name);
       const directory = join(workspaceDir(environment, workspace), snapshot);
       return attempt(async () => {
         await rm(directory, { recursive: true, force: true });
-        await mkdir(directory, { recursive: true, mode: 0o700 });
+        await mkdir(directory, { recursive: true, mode: OWNER_ONLY });
+        // Those made before it were made as the process's umask has them.
+        for (const each of [root, join(root, environment), workspaceDir(environment, workspace), directory]) await chmod(each, OWNER_ONLY);
         // Owner-only from its making: it holds credentials.
-        await writeFile(join(directory, name), options, { mode: 0o600, flag: "wx" });
+        await writeFile(join(directory, file), options, { mode: 0o600, flag: "wx" });
       }).pipe(Effect.andThen(use(environment, workspace)), Effect.as(directory));
+    },
+
+    forget: (environment, workspace, name) => {
+      const file = optionsFile(name);
+      const directory = workspaceDir(environment, workspace);
+      return attempt(async () => {
+        let removed = 0;
+        for (const snapshot of (await directories(directory)).filter((each) => SNAPSHOT.test(each))) {
+          const path = join(directory, snapshot, file);
+          if ((await unlessGone(stat(path))) !== null) {
+            await rm(path, { force: true });
+            removed += 1;
+          }
+        }
+        return removed;
+      });
     },
 
     clear: (environment, workspace) => attempt(() => rm(workspaceDir(environment, workspace), { recursive: true, force: true })),
@@ -333,6 +366,10 @@ export function makeSnapshotCache({ root, budget, graceMs, free = freeOnDisk }: 
       }),
 
     clean: attempt(async () => {
+      // One not made yet is made as an options file is written in it, its owner's then.
+      await chmod(root, OWNER_ONLY).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
       for (const environment of (await directories(root)).filter((name) => NAME.test(name))) {
         for (const workspace of (await directories(join(root, environment))).filter((name) => NAME.test(name))) {
           const layers = join(workspaceDir(environment, workspace), LAYERS_DIR);

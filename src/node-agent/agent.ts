@@ -52,6 +52,13 @@
  * kills, until a scan kills nothing new. This stays as defence should a restore leave
  * runsc's processes behind.
  *
+ * A restore from the bucket reads its images through runsc's checkpoint gofer, whose
+ * options file (GOFER_OPTIONS_FILE) holds the agent's credentials: written owner-only in a
+ * directory of the cache that is root's alone along its whole path, read by `runsc
+ * restore` as it starts the gofer, which holds it open from then on, and removed as the
+ * restore is resumed or abandoned, whatever comes of either, as nothing reads it again.
+ * Nothing the agent says holds what it holds.
+ *
  * One operation on a workspace's snapshots runs at a time.
  */
 import { createHash, randomBytes } from "node:crypto";
@@ -1259,6 +1266,13 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
         }),
     });
 
+  /** Removes the gofer's options file from the workspace's restores, which need it no more, as the module says; one it cannot remove is said so. */
+  const forgetOptions = (ref: WorkspaceRef): Effect.Effect<void> =>
+    cache.forget(ref.environment, ref.workspace, GOFER_OPTIONS_FILE).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not remove the checkpoint gofer's options of ${prefixOf(ref)}, which hold the agent's credentials: ${error.message}`)),
+      Effect.asVoid,
+    );
+
   const resume = (request: ResumeRequest): Effect.Effect<void, ResumeError> =>
     Effect.gen(function*() {
       const waited = yield* policiesInForce(request);
@@ -1272,6 +1286,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       if (restoredFrom !== null) for (const id of request.containerIds) bases.set(id, restoredFrom);
       return waited;
     }).pipe(
+      Effect.ensuring(forgetOptions(request)),
       Effect.tap((waited) =>
         Effect.sync(() => resumes.add(1, { "alasio.node_agent.resume.outcome": "resumed" })).pipe(
           Effect.andThen(Effect.logInfo(`resumed the sandbox of ${prefixOf(request)} in ${request.namespace}/${request.pod}, its network policies in force after ${waited} ms`)),
@@ -1314,7 +1329,7 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     });
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
-    exclusive([request], abandonNow(request)).pipe(
+    exclusive([request], abandonNow(request).pipe(Effect.ensuring(forgetOptions(request)))).pipe(
       Effect.tap(([killed, found]) =>
         Effect.sync(() => abandons.add(1, { "alasio.node_agent.abandon.outcome": "abandoned" })).pipe(
           Effect.andThen(Effect.annotateCurrentSpan({ "alasio.abandon.killed": killed.length })),
