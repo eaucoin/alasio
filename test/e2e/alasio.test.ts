@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
@@ -114,13 +115,51 @@ async function forward(standIn: StandIn): Promise<Forward> {
   throw new Error(`the ${standIn.name} stand-in did not answer`);
 }
 
+/**
+ * `method` of `url`, through a forward, with `body` as JSON, its answer's JSON: on a
+ * connection of its own, and so a forward of its own, which no request after it reuses, as
+ * a kept-alive connection that the stand-in, or the forward through the API server, ends
+ * while idle may be closing as the next request is sent on it. One that closes under a
+ * read anyway is asked again, up to three times; a say or a press, which the stand-in may
+ * have taken, is not.
+ */
+async function throughForward(method: "GET" | "POST", url: string, body?: unknown): Promise<unknown> {
+  const once = () =>
+    new Promise<unknown>((resolve, reject) => {
+      const sent = body === undefined ? undefined : JSON.stringify(body);
+      const request = httpRequest(url, { method, agent: false, headers: sent === undefined ? {} : { "content-type": "application/json" } }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          } catch (error) {
+            reject(error);
+          }
+        });
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+      request.end(sent);
+    });
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await once();
+    } catch (error) {
+      const closed = (error as NodeJS.ErrnoException).code === "ECONNRESET" || (error as Error).message === "socket hang up";
+      if (method !== "GET" || attempt >= 3 || !closed) throw error;
+      await sleep(500);
+    }
+  }
+}
+
 /** The operator, through the Telegram stand-in: says things, presses buttons, reads replies. */
 function operator(base: string) {
   let seen = 0;
-  const post = async (path: string, body: ControlMessage | ControlCallback) => (await fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })).json();
+  const post = (path: string, body: ControlMessage | ControlCallback) => throughForward("POST", `${base}${path}`, body);
   const calls = async () => {
     // The stand-in answers what it was called with.
-    const listed = (await (await fetch(`${base}/control/calls?since=${seen}`)).json()) as CallsListing;
+    const listed = (await throughForward("GET", `${base}/control/calls?since=${seen}`)) as CallsListing;
     seen = listed.total;
     return listed.calls;
   };
