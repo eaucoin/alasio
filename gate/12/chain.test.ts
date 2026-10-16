@@ -178,6 +178,10 @@ async function restoreFrom(directory: string | null, { crashed = false }: { read
   }
 }
 
+/** bayma's state generation on the disk, as its state directory's generation.json says it, read beside bayma. */
+const generation = async (): Promise<unknown> =>
+  JSON.parse(await inSession(session.volumeId, 'process.stdout.write(require("node:fs").readFileSync("/home/agent/.bayma/generation.json", "utf8"))'));
+
 /** Lets the exec `start` began end. */
 const letEnd = () => inSession(session.volumeId, 'require("node:fs").writeFileSync("/workspace/gate-12-go", "")');
 /** Makes the next exec `start` begins wait again. */
@@ -376,7 +380,12 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     const first = await inGate<Started>("start", session.volumeId, session.replId);
     await sleep(2000);
     seen["L"] = await checkpoint("L", { live: true, parent: at("restore-E") });
-    const restored = await restoreFrom(await prepared("L", ["A", "B", "C", "D", "E"]), { crashed: true });
+    // bayma's state generation as L caught it, and as its pod crashes: one moved on since makes
+    // L outlived, which the restored bayma refuses, telling its exec nothing.
+    seen["generationAfterL"] = await generation();
+    const directory = await prepared("L", ["A", "B", "C", "D", "E"]);
+    seen["generationAtCrash"] = await generation();
+    const restored = await restoreFrom(directory, { crashed: true });
     seen["restore"] = restored;
     assert.ok(restored.ready, JSON.stringify(restored));
     await letEnd();
