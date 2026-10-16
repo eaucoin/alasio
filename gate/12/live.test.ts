@@ -40,6 +40,8 @@ const RUNSC_ROOT = "/run/containerd/runsc/moby";
 const CHAIN = Number(process.env["CHAIN"] ?? 16);
 /** Whether checkpoints pre-copy, as live ones will: PRECOPY=off takes them without. */
 const PRECOPY = process.env["PRECOPY"] !== "off";
+/** Whether it checkpoints at all: CHECKPOINTING=off runs the same cycles without, to tell what the workload holds from what checkpoints do. */
+const CHECKPOINTING = process.env["CHECKPOINTING"] !== "off";
 /** Every how many checkpoints the Sentry's heap profile is written to OUT (0: never); runsc's `profile` must be on. */
 const PROFILE_EVERY = Number(process.env["PROFILE_EVERY"] ?? 0);
 /** The checkpoints the Sentry's memory settles over, which its trend leaves out. */
@@ -58,6 +60,8 @@ const PORT = 8080;
 /** The runtimes bayma serves, as alasio's sessions may use them. */
 const RUNTIMES = ["bun", "python", "dotnet-script", "rust", "c", "cpp", "lean", "go"] as const;
 type Runtime = (typeof RUNTIMES)[number];
+/** The runtimes this run gives sessions: GATE_RUNTIMES, a list of them, or all. */
+const ACTIVE: readonly Runtime[] = process.env["GATE_RUNTIMES"] ? RUNTIMES.filter((runtime) => process.env["GATE_RUNTIMES"]!.split(",").includes(runtime)) : RUNTIMES;
 
 /**
  * In each runtime: what leaves 41 in a live variable and reads it plus one, and `wave(ms)`,
@@ -264,6 +268,16 @@ interface Cycle {
   readonly memoryAvailableBytes: number;
   /** The Sentry's memory after it: its own (anonymous), the sandbox's memory file it maps (shared), and swapped. */
   readonly sentry: SentryMemory;
+  /** The sandbox's memory, as its /proc/meminfo says it, by kind, in bytes. */
+  readonly sandbox: Readonly<Record<string, number>>;
+}
+
+/** The sandbox's /proc/meminfo, as the Sentry accounts its memory, of the fields that say by kind. */
+async function sandboxMemory(name: string): Promise<Record<string, number>> {
+  const meminfo = await run("docker", ["exec", name, "cat", "/proc/meminfo"]);
+  return Object.fromEntries(
+    [...meminfo.matchAll(/^(MemTotal|MemFree|Cached|Shmem|AnonPages|Mapped|Active\(file\)|Inactive\(file\)):\s+(\d+) kB$/gmu)].map(([, field, kib]) => [field!, Number(kib) * 1024]),
+  );
 }
 
 interface SentryMemory {
@@ -384,7 +398,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     const id = await run("docker", ["inspect", "--format", "{{.Id}}", name]);
 
     const sessions = new Map<Runtime, string>();
-    for (const runtime of RUNTIMES) {
+    for (const runtime of ACTIVE) {
       const { session } = await call<{ session: { session_id: string } }>(client, "session.create", { runtime, title: `gate-${runtime}`, cwd: "/workspace" });
       sessions.set(runtime, session.session_id);
       await answers(client, runtime, session.session_id, RUNTIME_CODE[runtime].define);
@@ -403,7 +417,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     let chain: string[] = [];
     for (let index = 0; index < CHECKPOINTS; index++) {
       const began = Date.now();
-      const execs = await Promise.all(RUNTIMES.map(async (runtime) => {
+      const execs = await Promise.all(ACTIVE.map(async (runtime) => {
         const sessionId = sessions.get(runtime) ?? "";
         return { runtime, sessionId, started: await call<ExecSnapshot>(client, "exec", { session_id: sessionId, code: RUNTIME_CODE[runtime].run(WAVE_MS), yield_time_ms: 0 }) };
       }));
@@ -412,7 +426,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       const depth = chain.length;
       const image = join(images, String(index));
       const afterMs = Date.now() - began;
-      await run("sudo", [
+      if (CHECKPOINTING) await run("sudo", [
         RUNSC, `--root=${RUNSC_ROOT}`, ...flags, "checkpoint",
         `--image-path=${image}`, "--compression=none", "--direct", "--leave-running",
         ...(PRECOPY ? ["--precopy=auto", "--precopy-throttle=on"] : []),
@@ -421,14 +435,14 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
         id,
       ]);
       const checkpointMs = Date.now() - began - afterMs;
-      const bytes = Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]);
-      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory() });
+      const bytes = CHECKPOINTING ? Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]) : 0;
+      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory(), sandbox: await sandboxMemory(name) });
       if (PROFILE_EVERY > 0 && (index + 1) % PROFILE_EVERY === 0) await profile(String(index));
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);
         assert.deepEqual({ index, runtime, status: done.status, error: done.error_text, result: done.result_text.trim() }, { index, runtime, status: "ok", error: "", result: "7" });
       }
-      for (const runtime of RUNTIMES) await answers(client, runtime, sessions.get(runtime) ?? "", RUNTIME_CODE[runtime].read, "42");
+      for (const runtime of ACTIVE) await answers(client, runtime, sessions.get(runtime) ?? "", RUNTIME_CODE[runtime].read, "42");
       assert.equal(await run("docker", ["inspect", "--format", "{{.State.Running}}", name]), "true", `after checkpoint ${index}`);
       // The next a delta of this one, unless the chain is as long as compaction lets one be.
       if (chain.length + 1 >= CHAIN) {

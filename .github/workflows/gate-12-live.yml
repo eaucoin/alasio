@@ -5,8 +5,7 @@ name: gate-12-live
 # threads in each of its runtimes (gate/12/live.test.ts), in four jobs of 250.
 on:
   push:
-    branches: [track/live-lazy-gate]
-    paths: [.github/workflows/gate-12-live.yml, gate/12/live.test.ts]
+    branches: [diag/live-memory]
   workflow_dispatch:
 
 permissions:
@@ -19,7 +18,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3]
+        include:
+          - { part: full, checkpointing: "on", runtimes: "" }
+          - { part: none, checkpointing: "off", runtimes: "" }
+          - { part: interpreted, checkpointing: "on", runtimes: "bun,python,dotnet-script" }
+          - { part: compiled, checkpointing: "on", runtimes: "rust,c,cpp,lean,go" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,7 +61,9 @@ jobs:
       - run: docker build --tag alasio-agent:gate sandbox/agent
       - run: node --test --test-timeout=10800000 gate/12/live.test.ts
         env:
-          CHECKPOINTS: 250
+          CHECKPOINTS: 80
+          CHECKPOINTING: ${{ matrix.checkpointing }}
+          GATE_RUNTIMES: ${{ matrix.runtimes }}
           OUT: ${{ runner.temp }}/gate-12-live
       - if: always()
         uses: actions/upload-artifact@v4
