@@ -8,7 +8,7 @@
  * fixtures (./support/kube-router-rules.ts).
  */
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1583,6 +1583,48 @@ test("an abandon kills what runsc runs for the pod's containers, their sandbox, 
       assert.equal(yield* Effect.promise(() => left.ended), "SIGKILL");
       const refused = yield* Effect.flip(agents.abandon("node-1", { ...abandonRequest, pod: "fs_abc123" }));
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 400);
+    })
+  ));
+
+test("an abandon kills what a process it found forks meanwhile, which a scan after its kills finds, scanning until one kills nothing new", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // As the agent's first scan returns, the restore it finds forks its gofer, which the
+      // scan did not see.
+      let fork = false;
+      let child: ChildProcess | undefined;
+      const scans: number[] = [];
+      const here = yield* node("node-1", {
+        runsc: (runsc, releases) => ({
+          ...runsc,
+          processes: (containers) =>
+            runsc.processes(containers).pipe(
+              Effect.tap((found) =>
+                Effect.sync(() => {
+                  scans.push(found.length);
+                  if (!fork) return;
+                  fork = false;
+                  child = releases.starts("runsc-gofer", goferArgs(here, CONTAINER));
+                })
+              ),
+            ),
+        }),
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(() => child?.kill("SIGKILL")));
+      const restoring = yield* runscProcess(here, "runsc", [`--root=${RUNSC_ROOT}`, "restore", "--image-path=/var/lib/alasio/snapshots/main/fs-abc/s-1", "--bundle", here.releases.bundleOf(CONTAINER), CONTAINER]);
+      fork = true;
+      const killed = yield* here.agent.abandon(abandonRequest);
+      const gofer = child;
+      assert.ok(gofer?.pid, "no gofer was forked");
+      const ended = new Promise<NodeJS.Signals | null>((resolve) => {
+        if (gofer.exitCode !== null || gofer.signalCode !== null) resolve(gofer.signalCode);
+        else gofer.once("exit", (_code, signal) => resolve(signal));
+      });
+      assert.deepEqual(killed, [{ containerId: CONTAINER, pid: restoring.pid }, { containerId: CONTAINER, pid: gofer.pid }]);
+      assert.equal(yield* Effect.promise(() => restoring.ended), "SIGKILL");
+      assert.equal(yield* Effect.promise(() => ended), "SIGKILL");
+      // The first scan found the restore, the second its gofer, and the third, killing nothing new, ended them.
+      assert.equal(scans.length, 3);
     })
   ));
 

@@ -47,8 +47,10 @@
  * its shim then tearing none of them down. A process is a container's only where its
  * arguments name runsc's root, the container's bundle and its id, and is killed only while
  * its start time is the one it was found with, so a pid the node has given another process
- * since is left be (./runsc.ts). This stays as defence should a restore leave runsc's
- * processes behind.
+ * since is left be (./runsc.ts). One forked meanwhile by a process the agent kills has the
+ * arguments of the one it forked from until it execs, so the agent scans again after its
+ * kills, until a scan kills nothing new. This stays as defence should a restore leave
+ * runsc's processes behind.
  *
  * One operation on a workspace's snapshots runs at a time.
  */
@@ -445,6 +447,8 @@ const HOOK_TIMEOUT = "30s";
 const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
 const POLICY_POLL = "250 millis";
+/** The most scans an abandon runs for what runsc runs for a pod, each after the kills of the one before (abandonNow). */
+const ABANDON_SCANS = 10;
 
 const checkpoints = meter.createCounter("alasio.node_agent.checkpoints", {
   description: "Whole-sandbox checkpoints taken by the node agent, by outcome: taken, or what failed",
@@ -1170,13 +1174,33 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
-  /** Kills what runsc runs for the containers of the pod `request` names, as the module says: what it killed, of how many it found. */
+  /**
+   * Kills what runsc runs for the containers of the pod `request` names, as the module says:
+   * what it killed, of how many it found. A process one of them forks is the container's
+   * from its fork on, as its arguments, until it execs, are those of the runsc it forked
+   * from, and its own after; so one forked as the scan before ran, or as the process it
+   * forked from was killed, is found by the scan after the kills. The scans go on until
+   * one kills nothing new, at most ABANDON_SCANS of them.
+   */
   const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number], RunscError> =>
     Effect.gen(function*() {
       const containers = (yield* runsc.containers).filter(({ annotations }) => podOf(annotations) === `${request.namespace}/${request.pod}`);
-      const found = yield* runsc.processes(containers);
-      const killed = yield* Effect.forEach(found, (each) => runsc.kill(each).pipe(Effect.map((done) => (done ? [{ containerId: each.containerId, pid: each.pid }] : []))));
-      return [killed.flat(), found.length] as const;
+      const killed: Killed[] = [];
+      // Each process found, by its pid and start time, killed or not.
+      const seen = new Set<string>();
+      for (let scan = 0; scan < ABANDON_SCANS; scan++) {
+        const found = (yield* runsc.processes(containers)).filter(({ pid, startTime }) => !seen.has(`${pid} ${startTime}`));
+        let killedNow = 0;
+        for (const each of found) {
+          seen.add(`${each.pid} ${each.startTime}`);
+          if (yield* runsc.kill(each)) {
+            killed.push({ containerId: each.containerId, pid: each.pid });
+            killedNow += 1;
+          }
+        }
+        if (killedNow === 0) break;
+      }
+      return [killed, seen.size] as const;
     });
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
