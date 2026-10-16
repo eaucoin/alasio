@@ -217,6 +217,13 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     const started = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { argv0, stdio: "ignore" });
     const { pid: id } = started;
     if (id === undefined) throw new Error(`${argv0} did not start`);
+    // spawn returns as the exec closes the pipe it waits on (begin_new_exec), before the kernel
+    // sets the process's arguments as it loads the program (create_elf_tables): until then its
+    // command line reads as none, which copied so would never say runsc's. It is copied once it
+    // says one, 2 s at most.
+    const cmdline = join("/proc", String(id), "cmdline");
+    const waited = new Int32Array(new SharedArrayBuffer(4));
+    for (const deadline = Date.now() + 2000; readFileSync(cmdline).length === 0 && Date.now() < deadline;) Atomics.wait(waited, 0, 0, 5);
     mkdirSync(join(procRoot, String(id)), { recursive: true });
     for (const file of ["cmdline", "stat"]) writeFileSync(join(procRoot, String(id), file), readFileSync(join("/proc", String(id), file)));
     // Gone from the node's /proc as it ends, as its pid may be given another's.
