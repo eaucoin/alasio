@@ -278,7 +278,7 @@ interface Cycle {
 
 /** Each process of the container, as its /proc says it: its resident memory and its command line. */
 async function processesOf(name: string): Promise<{ rssBytes: number; command: string }[]> {
-  const listed = await run("docker", ["exec", name, "sh", "-c", 'for d in /proc/[0-9]*; do r=$(grep "^VmRSS:" "$d/status" 2>/dev/null | tr -s " " | cut -d" " -f2); c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null | cut -c1-160); [ -n "$r" ] && echo "$r $c"; done']);
+  const listed = await run("docker", ["exec", name, "sh", "-c", 'for d in /proc/[0-9]*; do r=$(sed -n "s/^VmRSS:[^0-9]*\\([0-9]*\\) kB$/\\1/p" "$d/status" 2>/dev/null); c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null | cut -c1-160); [ -n "$r" ] && echo "$r $c"; done']);
   return listed.split("\n").filter(Boolean).map((line) => {
     const [rss, ...command] = line.split(" ");
     return { rssBytes: Number(rss) * 1024, command: command.join(" ") };
