@@ -1598,9 +1598,11 @@ if (inShard("scaling")) {
     });
 
     test("VPA resizes a workload's pod in place, without restarting it, under runc and under gVisor", async (t) => {
+      // Requests far under what VPA recommends at the least, so it resizes them at once: it may
+      // have by the time the pod is first read, so a resize is told from these, not from that read.
+      const asked = { cpu: "1m", memory: "4Mi" };
       const sized = (name: string, runtimeClassName?: string) => [
-        // Requests far under what VPA recommends at the least, so it resizes them at once.
-        deploymentOf(name, 1, pausePod({ "app.kubernetes.io/part-of": "alasio" }, { cpu: "1m", memory: "4Mi" }, runtimeClassName)),
+        deploymentOf(name, 1, pausePod({ "app.kubernetes.io/part-of": "alasio" }, asked, runtimeClassName)),
         {
           apiVersion: "autoscaling.k8s.io/v1",
           kind: "VerticalPodAutoscaler",
@@ -1630,9 +1632,9 @@ if (inShard("scaling")) {
         const before = befores[index] ?? assert.fail(name);
         const resized = await until(`${name}'s pod resized`, async () => {
           const now = await podOf(name);
-          return now.uid !== before.uid || now.memory !== before.memory ? now : undefined;
+          return now.uid !== before.uid || now.memory !== asked.memory ? now : undefined;
         }, 600_000);
-        t.diagnostic(`${name}: requests ${before.memory} to ${resized.memory}, restarts ${resized.restarts}, ${resized.resize}`);
+        t.diagnostic(`${name}: requests ${asked.memory} to ${resized.memory}, restarts ${resized.restarts}, ${resized.resize}`);
         assert.deepEqual([resized.uid, resized.restarts], [before.uid, 0], `${name}'s pod resized in place, not recreated or restarted`);
         assert.ok(memoryBytes(resized.memory ?? "0") >= 16 * 2 ** 20, resized.memory);
       }
