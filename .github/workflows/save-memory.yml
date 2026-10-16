@@ -1,0 +1,28 @@
+name: save-memory
+
+on:
+  push:
+    branches: [diag/live-memory]
+    paths: [.github/workflows/save-memory.yml, gate/12/fork/save_memory_test.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  save-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: The fork's release alasio pins first
+        shell: bash
+        run: |
+          release=$(jq -r '.gvisor.releases[0].release' cluster/node/pins.json)
+          sha512=$(jq -r '.gvisor.releases[0].sha512' cluster/node/pins.json)
+          curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://github.com/eaucoin/gvisor/releases/download/release-$release/gvisor-x86_64.tar.zstd"
+          echo "$sha512  $RUNNER_TEMP/gvisor.tar.zstd" | sha512sum -c -
+          mkdir -p "$RUNNER_TEMP/gvisor"
+          zstd -dc "$RUNNER_TEMP/gvisor.tar.zstd" | tar -x -C "$RUNNER_TEMP/gvisor"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: gate/12/fork/save_memory_test.sh "$RUNNER_TEMP/gvisor/runsc"
