@@ -12,7 +12,9 @@
  * It needs root through sudo, Docker with the runtime `runsc` (the release's shim, its options
  * in RUNSC_OPTIONS), the release's runsc at RUNSC, the image GATE_IMAGE (sandbox/agent, built),
  * and writes its record to OUT/evidence.json: gate-12-live.yml sets them up. CHECKPOINTS is how
- * many this run takes; CHAIN, PRECOPY and PROFILE_EVERY vary it, to tell what a failure comes from.
+ * many this run takes; CHAIN, PRECOPY and PROFILE_EVERY vary it, to tell what a failure comes from;
+ * CHECKPOINTING=off runs the cycles without checkpoints, the baseline live-judge.test.ts judges
+ * the checkpoints' cost of the Sentry's memory against.
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -28,6 +30,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
 import { runscFlags } from "../../src/node-agent/runsc.ts";
+import { trend } from "./live-memory.ts";
 
 const IMAGE = process.env["GATE_IMAGE"] ?? "alasio-agent:gate";
 const RUNSC = process.env["RUNSC"] ?? "runsc";
@@ -40,16 +43,13 @@ const RUNSC_ROOT = "/run/containerd/runsc/moby";
 const CHAIN = Number(process.env["CHAIN"] ?? 16);
 /** Whether checkpoints pre-copy, as live ones will: PRECOPY=off takes them without. */
 const PRECOPY = process.env["PRECOPY"] !== "off";
+/**
+ * Whether its cycles checkpoint: CHECKPOINTING=off runs them without, the baseline the
+ * checkpoints' cost is judged against (live-judge.test.ts).
+ */
+const CHECKPOINTING = process.env["CHECKPOINTING"] !== "off";
 /** Every how many checkpoints the Sentry's heap profile is written to OUT (0: never); runsc's `profile` must be on. */
 const PROFILE_EVERY = Number(process.env["PROFILE_EVERY"] ?? 0);
-/** The checkpoints the Sentry's memory settles over, which its trend leaves out. */
-const WARM_UP = 10;
-/**
- * The most the Sentry's own memory may grow by a checkpoint, as its trend over the rest says:
- * one that keeps what a checkpoint took ends the sandbox by the host's OOM killer (160 MB a
- * checkpoint, run 38744966370).
- */
-const MAX_SENTRY_GROWTH_BYTES = 2 * 1024 ** 2;
 /** How long each cycle's execs run, starting threads. */
 const WAVE_MS = 3000;
 /** bayma's port in the session pod. */
@@ -264,6 +264,27 @@ interface Cycle {
   readonly memoryAvailableBytes: number;
   /** The Sentry's memory after it: its own (anonymous), the sandbox's memory file it maps (shared), and swapped. */
   readonly sentry: SentryMemory;
+  /** The sandbox's memory after it, by kind, as its /proc/meminfo says it, in bytes. */
+  readonly sandbox: Readonly<Record<string, number>>;
+  /** Each process of the sandbox after it: its resident memory, in bytes, and its command line. */
+  readonly processes: readonly { readonly rssBytes: number; readonly command: string }[];
+}
+
+/** The sandbox's /proc/meminfo, as the Sentry accounts its memory, of the fields that say it by kind. */
+async function sandboxMemory(name: string): Promise<Record<string, number>> {
+  const meminfo = await run("docker", ["exec", name, "cat", "/proc/meminfo"]);
+  return Object.fromEntries(
+    [...meminfo.matchAll(/^(MemTotal|MemFree|Cached|Shmem|AnonPages|Mapped|Active\(file\)|Inactive\(file\)):\s+(\d+) kB$/gmu)].map(([, field, kib]) => [field!, Number(kib) * 1024]),
+  );
+}
+
+/** Each process of the sandbox, as its /proc says it: its resident memory and its command line; one gone as it is listed is left out. */
+async function processesOf(name: string): Promise<{ rssBytes: number; command: string }[]> {
+  const listed = await run("docker", ["exec", name, "sh", "-c", 'for d in /proc/[0-9]*; do r=$(sed -n "s/^VmRSS:[^0-9]*\\([0-9]*\\) kB$/\\1/p" "$d/status" 2>/dev/null); c=$(tr "\\0" " " 2>/dev/null < "$d/cmdline" | cut -c1-160); [ -n "$r" ] && echo "$r $c"; done; true']);
+  return listed.split("\n").filter(Boolean).map((line) => {
+    const [rss, ...command] = line.split(" ");
+    return { rssBytes: Number(rss) * 1024, command: command.join(" ") };
+  });
 }
 
 interface SentryMemory {
@@ -278,15 +299,6 @@ async function sentryMemory(): Promise<SentryMemory> {
   const kib = (status: string, field: string): number => Number(new RegExp(`^${field}:\\s+(\\d+) kB$`, "mu").exec(status)?.[1] ?? 0) * 1024;
   const sentry = statuses.split("\n\n").reduce((largest, status) => (kib(status, "VmRSS") > kib(largest, "VmRSS") ? status : largest), "");
   return { anonBytes: kib(sentry, "RssAnon"), sharedBytes: kib(sentry, "RssShmem"), swapBytes: kib(sentry, "VmSwap") };
-}
-
-/** The slope of the least-squares line through `points`. */
-function slope(points: readonly (readonly [number, number])[]): number {
-  const n = points.length;
-  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / n;
-  const x = mean(points.map(([px]) => px));
-  const y = mean(points.map(([, py]) => py));
-  return points.reduce((sum, [px, py]) => sum + (px - x) * (py - y), 0) / points.reduce((sum, [px]) => sum + (px - x) ** 2, 0);
 }
 
 /** The bytes free on the filesystem of `path`. */
@@ -335,7 +347,7 @@ async function answers(client: Client, runtime: Runtime, sessionId: string, code
   assert.deepEqual({ runtime, status: done.status, error: done.error_text, ...(answer === undefined ? {} : { result: done.result_text.trim() }) }, { runtime, status: "ok", error: "", ...(answer === undefined ? {} : { result: answer }) });
 }
 
-test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each of its runtimes: none aborts, every session answers after each`, { timeout: 4 * 60 * 60_000 }, async () => {
+test(`${CHECKPOINTS} ${CHECKPOINTING ? "live checkpoints" : "cycles, without checkpoints, the baseline,"} of bayma while execs start threads in each of its runtimes: none aborts, every session answers after each`, { timeout: 4 * 60 * 60_000 }, async () => {
   const flags = runscFlags(readFileSync(RUNSC_OPTIONS, "utf8"));
   // A delta needs dirty tracking.
   assert.ok(CHAIN === 1 || flags.includes("--dirty-tracking=wp"), `${RUNSC_OPTIONS} gives runsc ${flags.join(" ")}`);
@@ -412,7 +424,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       const depth = chain.length;
       const image = join(images, String(index));
       const afterMs = Date.now() - began;
-      await run("sudo", [
+      if (CHECKPOINTING) await run("sudo", [
         RUNSC, `--root=${RUNSC_ROOT}`, ...flags, "checkpoint",
         `--image-path=${image}`, "--compression=none", "--direct", "--leave-running",
         ...(PRECOPY ? ["--precopy=auto", "--precopy-throttle=on"] : []),
@@ -421,8 +433,11 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
         id,
       ]);
       const checkpointMs = Date.now() - began - afterMs;
-      const bytes = Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]);
-      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory() });
+      const bytes = CHECKPOINTING ? Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]) : 0;
+      cycles.push({
+        index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(),
+        sentry: await sentryMemory(), sandbox: await sandboxMemory(name), processes: await processesOf(name),
+      });
       if (PROFILE_EVERY > 0 && (index + 1) % PROFILE_EVERY === 0) await profile(String(index));
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);
@@ -441,9 +456,8 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       }
       if (index % 25 === 0) console.log(`checkpoint ${index}: depth ${depth}, ${checkpointMs} ms, ${bytes} bytes, ${cycles.at(-1)?.diskFreeBytes} free on disk, the Sentry's own ${cycles.at(-1)?.sentry.anonBytes} bytes`);
     }
-    // The Sentry gives back what each checkpoint takes.
-    sentryGrowthBytes = slope(cycles.slice(WARM_UP).map(({ index, sentry }) => [index, sentry.anonBytes]));
-    assert.ok(sentryGrowthBytes < MAX_SENTRY_GROWTH_BYTES, `the Sentry's own memory grows by ${Math.round(sentryGrowthBytes)} bytes a checkpoint`);
+    // Judged against the baseline's, by live-judge.test.ts: what the workload holds grows both.
+    sentryGrowthBytes = trend(cycles, ({ sentry }) => sentry.anonBytes);
     await client.close();
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
@@ -452,7 +466,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
     const logs = await run("docker", ["logs", name]).catch((error: unknown) => String(error));
     const aborts = logs.split("\n").filter((line) => /corrupted|malloc\(\)|double free|SIGABRT/u.test(line));
     mkdirSync(OUT, { recursive: true });
-    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, sentryGrowthBytes: sentryGrowthBytes ?? null, cycles }, null, 2)}\n`);
+    writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ checkpointing: CHECKPOINTING, checkpoints: cycles.length, asked: CHECKPOINTS, chain: CHAIN, precopy: PRECOPY, failure: failure ?? null, aborts, sentryBefore: sentryBefore ?? null, sentryGrowthBytes: sentryGrowthBytes ?? null, cycles }, null, 2)}\n`);
     writeFileSync(join(OUT, "bayma.log"), logs);
     // What the host says of a sandbox that ended: the kernel's log, its disk and its memory.
     const host = await Promise.all([
