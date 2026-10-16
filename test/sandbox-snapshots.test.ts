@@ -59,6 +59,9 @@ const stored = (sandbox: Sandbox, operatingMode: "Running" | "Suspended" = "Susp
   spec: { ...sandbox.spec, operatingMode },
 });
 
+/** The uid of the pod of session fs-abc123, as the API server gives it. */
+const POD_UID = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
 /** The digest of the image of the snapshots of the tests'. */
 const IMAGE = "a".repeat(64);
 
@@ -126,12 +129,12 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
       }),
     resume: (node, request) =>
       Effect.suspend(() => {
-        asked.push(`resume on ${node} ${request.podIPs.join(",")} ${request.containerIds.length}${request.policies.length > 0 ? ` through ${request.policies.join(",")}` : ""}`);
+        asked.push(`resume on ${node} from ${request.snapshot} ${request.podIPs.join(",")} ${request.containerIds.length}${request.policies.length > 0 ? ` through ${request.policies.join(",")}` : ""}`);
         return resumed === null ? Effect.void : Effect.fail(new NodeAgentError({ node, call: "resume alasio-sessions/fs-abc123", status: resumedStatus, reason: resumed }));
       }),
     abandon: (node, request) =>
       Effect.suspend(() => {
-        asked.push(`abandon on ${node} ${request.environment}/${request.workspace} in ${request.namespace}/${request.pod}`);
+        asked.push(`abandon on ${node} ${request.environment}/${request.workspace} in ${request.namespace}/${request.pod} of ${request.uid}`);
         return abandoned === null
           ? Effect.succeed([{ containerId: "b".repeat(64), pid: 4321 }])
           : Effect.fail(new NodeAgentError({ node, call: "abandon alasio-sessions/fs-abc123's restore", status: 500, reason: abandoned }));
@@ -270,7 +273,7 @@ test("a restored pod is let run once its containers run, by its node's agent, th
       }],
     },
   });
-  const resume = async (pod: V1Pod, resumed: string | null = null) => {
+  const resume = async (pod: V1Pod, resumed: string | null = null, prepared: Manifest | null = null, resumedStatus = 504) => {
     // The policies of its namespace, of which those that select it: all of its pods', its workload's, and none of full mode's or of another namespace.
     const policy = (name: string, podSelector: V1LabelSelector, namespace = "alasio-sessions"): [string, KubernetesObject] => [
       `NetworkPolicy/${namespace}/${name}`,
@@ -284,25 +287,41 @@ test("a restored pod is let run once its containers run, by its node's agent, th
       policy("not-folders", { matchExpressions: [{ key: "alasio.dev/workload", operator: "NotIn", values: ["folder"] }] }),
       policy("elsewhere", {}, "alasio"),
     ]));
-    const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], resumed });
+    const base = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], resumed, resumedStatus });
+    let ran: boolean | undefined;
+    const { asked } = base;
+    const agents: NodeAgents = prepared === null ? base.agents : {
+      ...base.agents,
+      prepare: (on) => Effect.sync(() => (asked.push(`prepare on ${on}`), { manifest: prepared, imagePath: "/var/lib/alasio/snapshots/alasio-sessions/fs-abc123/s-2" })),
+    };
     const outcome = await run(kube, Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
       const plan = yield* snapshotted.restore(stored(desired), desired);
       assert.ok(plan && "podTemplate" in plan);
       assert.equal(plan.podTemplate.metadata?.annotations?.["dev.gvisor.internal.restore.paused"], "true");
       assert.deepEqual(plan.podTemplate.spec?.readinessGates, [{ conditionType: RESUMED_CONDITION }]);
-      return yield* plan.resume.pipe(Effect.as("resumed"), Effect.catch((refused) => Effect.succeed(refused.message)));
+      return yield* plan.resume.pipe(Effect.as("resumed"), Effect.catch((refused) => Effect.sync(() => ((ran = refused.resumed), refused.message))));
     }));
-    return { outcome, asked, writes: kube.writes };
+    return { outcome, asked, writes: kube.writes, ran };
   };
   const ran = await resume(restoredPod("running"));
   assert.equal(ran.outcome, "resumed");
-  assert.deepEqual(ran.asked.slice(1), [`resume on node-a 10.42.0.7 1 through default-deny,sessions,not-folders`]);
+  assert.deepEqual(ran.asked.slice(1), [`resume on node-a from s-1 10.42.0.7 1 through default-deny,sessions,not-folders`]);
   assert.match(ran.writes.at(-1) ?? "", /^patch Pod\/fs-abc123's status .*"type":"alasio.dev\/resumed","status":"True"/u);
+  // A compaction of it, committed between alasio's read and the agent's prepare: the sandbox runs from what was prepared, which the resume names.
+  const compacted: Manifest = { ...manifestOf(desired.spec.podTemplate), snapshot: "s-2", compactedFrom: "s-1" };
+  const raced = await resume(restoredPod("running"), null, compacted);
+  assert.equal(raced.outcome, "resumed");
+  assert.deepEqual(raced.asked.slice(1), [`resume on node-a from s-2 10.42.0.7 1 through default-deny,sessions,not-folders`]);
   assert.equal((await resume(restoredPod("terminated"))).outcome, "its pod ended before it ran (terminated)");
   const unconfined = await resume(restoredPod("running"), "kube-router has not programmed 10.42.0.7 within 30s");
   assert.match(unconfined.outcome, /kube-router has not programmed 10\.42\.0\.7 within 30s$/u);
   assert.ok(!unconfined.writes.some((write) => write.startsWith("patch")));
+  assert.equal(unconfined.ran, false);
+  // Left paused where the bucket fails to give the agent the snapshot's manifest, which may pass, and where it is refused; run, maybe, where a command failed.
+  for (const [status, ran] of [[502, false], [410, false], [500, true]] as const) {
+    assert.equal((await resume(restoredPod("running"), "it failed", null, status)).ran, ran, String(status));
+  }
 });
 
 test("a snapshot on the template before the current one is restored into that one, and a session restored so stays on it while it runs", async () => {
@@ -415,11 +434,11 @@ test("a restore that fails for what may pass is deferred, its snapshot kept, as 
   });
 });
 
-test("a restore refused before its sandbox resumed is abandoned on its node before it is deferred, whether or not the agent can; one refused after is not", async () => {
+test("a restore refused before its sandbox resumed is abandoned on its node, its pod named by its uid, before it is deferred, whether or not the agent can; one refused after is not, nor one whose pod is gone", async () => {
   const desired = sessionOf(profile());
-  const refuse = (resumed: boolean, abandoned: string | null = null) => {
+  const refuse = (resumed: boolean, abandoned: string | null = null, objects = runningOnNodeA()) => {
     const { agents, asked } = fakeAgents({ current: manifestOf(desired.spec.podTemplate), holdings: [node("node-a", [CURRENT])], abandoned });
-    return run(fakeKube(), Effect.gen(function*() {
+    return run(fakeKube(objects), Effect.gen(function*() {
       const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
       const plan = yield* snapshotted.restore(stored(desired), desired);
       assert.ok(plan && "podTemplate" in plan);
@@ -427,9 +446,12 @@ test("a restore refused before its sandbox resumed is abandoned on its node befo
       return { came, asked: asked.slice(1) };
     }));
   };
-  assert.deepEqual(await refuse(false), { came: "deferred", asked: ["abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123"] });
-  assert.deepEqual(await refuse(false, "runsc list of the node's failed"), { came: "deferred", asked: ["abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123"] });
+  const abandoned = `abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123 of ${POD_UID}`;
+  assert.deepEqual(await refuse(false), { came: "deferred", asked: [abandoned] });
+  assert.deepEqual(await refuse(false, "runsc list of the node's failed"), { came: "deferred", asked: [abandoned] });
   assert.deepEqual(await refuse(true), { came: "fallen back", asked: ["forget alasio-sessions/fs-abc123"] });
+  // Its pod gone, torn down, there is nothing of it to abandon.
+  assert.deepEqual(await refuse(false, null, new Map()), { came: "deferred", asked: [] });
 });
 
 test("a session is restored only from the snapshot its Sandbox was released into: one it moved on from is stale, and forgotten", async () => {
@@ -656,7 +678,7 @@ const runningOnNodeA = (): Map<string, KubernetesObject> => {
   const pod: V1Pod = {
     apiVersion: "v1",
     kind: "Pod",
-    metadata: { name: "fs-abc123", namespace: "alasio-sessions" },
+    metadata: { name: "fs-abc123", namespace: "alasio-sessions", uid: POD_UID },
     spec: { nodeName: "node-a", runtimeClassName: "gvisor", containers: [] },
     status: { containerStatuses: [{ name: "bayma", containerID: `containerd://${"a".repeat(64)}`, image: "", imageID: "", ready: true, restartCount: 0 }] },
   };
@@ -750,8 +772,8 @@ test("a restore bayma refuses, its state generation moved on from the snapshot t
   );
   assert.equal(came, "fallen back");
   assert.deepEqual(asked.slice(1), [
-    "resume on node-a 10.42.0.7 1",
-    "abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123",
+    "resume on node-a from s-1 10.42.0.7 1",
+    `abandon on node-a alasio-sessions/fs-abc123 in alasio-sessions/fs-abc123 of ${POD_UID}`,
     "forget alasio-sessions/fs-abc123",
   ]);
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 });

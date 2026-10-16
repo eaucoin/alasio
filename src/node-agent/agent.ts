@@ -47,11 +47,15 @@
  * A restore alasio refuses before it resumes the sandbox is abandoned: the agent kills
  * what runsc runs for the pod's containers, their sandbox and gofers among it, so that the
  * pod's teardown waits on none of it: a `runsc restore` that failed has left them running,
- * its shim then tearing none of them down. A process is a container's only where its
+ * its shim then tearing none of them down. A container is the pod's only where the
+ * annotations containerd gives its spec name the pod and its uid, so that the containers of
+ * a pod of its name made since are left be. A process is a container's only where its
  * arguments name runsc's root, the container's bundle and its id, and is killed only while
  * its start time is the one it was found with, so a pid the node has given another process
- * since is left be (./runsc.ts). This stays as defence should a restore leave runsc's
- * processes behind.
+ * since is left be (./runsc.ts). One forked meanwhile by a process the agent kills has the
+ * arguments of the one it forked from until it execs, so the agent scans again after its
+ * kills, until a scan kills nothing new. This stays as defence should a restore leave
+ * runsc's processes behind.
  *
  * One operation on a workspace's snapshots runs at a time. The node's cache evicts nothing of
  * a workspace an operation runs on or waits to, nor of one a compaction writes, nor discards
@@ -222,6 +226,9 @@ const ContainerId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u));
 /** A pod's name: a DNS subdomain. */
 const PodName = Schema.String.check(Schema.isPattern(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/u), Schema.isMaxLength(253));
 
+/** A pod's uid, as Kubernetes gives one: a UUID. */
+const PodUid = Schema.String.check(Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u));
+
 /** A request to checkpoint a workspace's sandbox. */
 export const CheckpointRequest = Schema.Struct({
   environment: Name,
@@ -252,6 +259,8 @@ export const ResumeRequest = Schema.Struct({
   containerIds: Schema.Array(ContainerId).check(Schema.isMinLength(1)),
   /** The network policies of its namespace that select the pod, by name, which its rules must run what it sends through. */
   policies: Schema.Array(PodName).check(Schema.isMaxLength(64)),
+  /** The snapshot its sandbox was restored from, whose manifest says whether it may run. */
+  snapshot: SnapshotId,
 });
 export type ResumeRequest = typeof ResumeRequest.Type;
 
@@ -262,6 +271,8 @@ export const AbandonRequest = Schema.Struct({
   /** The pod restored into, whose containers' processes of runsc's are killed. */
   namespace: Name,
   pod: PodName,
+  /** That pod's uid, which tells it from a pod of its name made since. */
+  uid: PodUid,
 });
 export type AbandonRequest = typeof AbandonRequest.Type;
 
@@ -459,6 +470,8 @@ const HOOK_TIMEOUT = "30s";
 const EVICT_POLL: Duration.Input = "1 minute";
 /** How often a resume looks for a restored pod's rules. */
 const POLICY_POLL = "250 millis";
+/** The most scans an abandon runs for what runsc runs for a pod, each after the kills of the one before (abandonNow). */
+const ABANDON_SCANS = 10;
 
 const checkpoints = meter.createCounter("alasio.node_agent.checkpoints", {
   description: "Whole-sandbox checkpoints taken by the node agent, by outcome: taken, or what failed",
@@ -1185,6 +1198,31 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
     );
 
   /**
+   * The manifest of the snapshot `request` says its sandbox was restored from: as it was
+   * prepared on this node, or as the cache keeps it beside its images, or as the bucket keeps
+   * it (`manifests/<snapshot>.json`), which a resume after an agent started again, or after
+   * another prepare, reads. One that none of them holds, or that is no manifest of it, refuses
+   * the resume, the sandbox left paused: whether it may run cannot be told. One the bucket fails
+   * to give fails the resume so, the sandbox left paused, for a try after to read it.
+   */
+  const restoredFrom = (request: ResumeRequest): Effect.Effect<Manifest, SnapshotOutlived | S3Error> =>
+    Effect.gen(function*() {
+      const named = (manifest: Manifest | null | undefined) => (manifest?.snapshot === request.snapshot ? manifest : null);
+      const known = named(prepared.get(prefixOf(request))) ?? named(yield* lastCached(request));
+      if (known !== null) return known;
+      const read = yield* manifestAt(request, manifestKey(request, request.snapshot)).pipe(Effect.result);
+      if (read._tag === "Failure" && read.failure._tag === "S3Error") return yield* Effect.fail(read.failure);
+      const found = read._tag === "Success" ? named(read.success) : null;
+      if (found !== null) return found;
+      return yield* new SnapshotOutlived({
+        environment: request.environment,
+        workspace: request.workspace,
+        snapshot: request.snapshot,
+        reason: `its manifest cannot be read, so whether it may run cannot be told: ${read._tag === "Failure" ? read.failure.message : `neither this node nor the bucket holds it`}`,
+      });
+    });
+
+  /**
    * The file `name` of bayma's state directory `stateDir`, in the container, as `schema`
    * decodes it, read on the volume of `containers` that holds it, as an untrusted file
    * (./volume.ts), of STATE_FILE_BYTES at most, and of no property but the schema's, within
@@ -1236,12 +1274,12 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       const waited = yield* policiesInForce(request);
       yield* Effect.annotateCurrentSpan({ "alasio.resume.policy_wait_ms": waited });
       const containers = yield* Effect.forEach(request.containerIds, (id) => ofPod(id, request.namespace, request.pod));
-      const restoredFrom = prepared.get(prefixOf(request)) ?? (yield* lastCached(request));
-      if (restoredFrom?.live !== undefined) yield* holdsStill(restoredFrom, restoredFrom.live, containers);
+      const from = yield* restoredFrom(request);
+      if (from.live !== undefined) yield* holdsStill(from, from.live, containers);
       yield* Effect.forEach(request.podIPs, forgetConnections, { discard: true });
       yield* Effect.forEach(request.containerIds, (id, index) => runsc.resume(containers[index]?.release ?? "", id), { discard: true });
-      // Its sandbox runs from the snapshot prepared of it, which its next checkpoint saves what changed since.
-      if (restoredFrom !== null) for (const id of request.containerIds) bases.set(id, restoredFrom);
+      // Its sandbox runs from the snapshot it was restored from, which its next checkpoint saves what changed since.
+      for (const id of request.containerIds) bases.set(id, from);
       return waited;
     }).pipe(
       Effect.tap((waited) =>
@@ -1256,13 +1294,36 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       }),
     );
 
-  /** Kills what runsc runs for the containers of the pod `request` names, as the module says: what it killed, of how many it found. */
+  /**
+   * Kills what runsc runs for the containers of the pod `request` names, as the module says:
+   * what it killed, of how many it found. A process one of them forks is the container's
+   * from its fork on, as its arguments, until it execs, are those of the runsc it forked
+   * from, and its own after; so one forked as the scan before ran, or as the process it
+   * forked from was killed, is found by the scan after the kills. The scans go on until
+   * one kills nothing new, at most ABANDON_SCANS of them.
+   */
   const abandonNow = (request: AbandonRequest): Effect.Effect<readonly [readonly Killed[], number], RunscError> =>
     Effect.gen(function*() {
-      const containers = (yield* runsc.containers).filter(({ annotations }) => podOf(annotations) === `${request.namespace}/${request.pod}`);
-      const found = yield* runsc.processes(containers);
-      const killed = yield* Effect.forEach(found, (each) => runsc.kill(each).pipe(Effect.map((done) => (done ? [{ containerId: each.containerId, pid: each.pid }] : []))));
-      return [killed.flat(), found.length] as const;
+      // The pod's by its uid too: a pod of its name made since is another, whose processes are its own.
+      const containers = (yield* runsc.containers).filter(({ annotations }) =>
+        podOf(annotations) === `${request.namespace}/${request.pod}` && annotations[POD_UID_ANNOTATION] === request.uid
+      );
+      const killed: Killed[] = [];
+      // Each process found, by its pid and start time, killed or not.
+      const seen = new Set<string>();
+      for (let scan = 0; scan < ABANDON_SCANS; scan++) {
+        const found = (yield* runsc.processes(containers)).filter(({ pid, startTime }) => !seen.has(`${pid} ${startTime}`));
+        let killedNow = 0;
+        for (const each of found) {
+          seen.add(`${each.pid} ${each.startTime}`);
+          if (yield* runsc.kill(each)) {
+            killed.push({ containerId: each.containerId, pid: each.pid });
+            killedNow += 1;
+          }
+        }
+        if (killedNow === 0) break;
+      }
+      return [killed, seen.size] as const;
     });
 
   const abandon = (request: AbandonRequest): Effect.Effect<readonly Killed[], RunscError> =>
@@ -1351,6 +1412,9 @@ export const makeNodeAgent = Effect.fnUntraced(function*({ node, nodeRoot, runsc
       ),
   };
 });
+
+/** The annotation containerd gives a container's spec of its pod's uid. */
+const POD_UID_ANNOTATION = "io.kubernetes.cri.sandbox-uid";
 
 /** The pod a container is of, `<namespace>/<name>`, as the annotations containerd gives its spec say, `?` for what they do not. */
 function podOf(annotations: Readonly<Record<string, string>>): string {

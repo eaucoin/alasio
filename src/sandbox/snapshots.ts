@@ -275,13 +275,13 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     });
 
   /**
-   * Lets the restored pod of session `name`, on `node`, run, once its containers run,
-   * paused: its node's agent resumes its sandbox under `release` once the pod's egress is
+   * Lets the restored pod of session `name`, on `node`, restored from `snapshot`, run, once
+   * its containers run, paused: its node's agent resumes its sandbox under `release` once the pod's egress is
    * confined there, which kube-router does a moment after the pod has its address, and the
    * pod is then ready, by its readiness gate. A pod that ends meanwhile, whose sandbox
    * the agent does not resume, or whose readiness cannot be set, is refused.
    */
-  const resumeRestored = (name: string, node: string): Effect.Effect<void, SandboxRestoreRefused> =>
+  const resumeRestored = (name: string, node: string, snapshot: string): Effect.Effect<void, SandboxRestoreRefused> =>
     Effect.gen(function*() {
       const running = yield* kube.read("v1", "Pod", profile.namespace, name).pipe(
         Effect.flatMap((read): Effect.Effect<V1Pod, PodNotRunning | SandboxRestoreRefused> => {
@@ -305,13 +305,16 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
         Effect.map((found) => (found as V1NetworkPolicy[]).filter(({ spec }) => selects(spec?.podSelector, running.metadata?.labels ?? {})).flatMap(({ metadata }) => metadata?.name ?? [])),
         Effect.mapError((error) => new SandboxRestoreRefused({ reason: error.message, resumed: false })),
       );
-      // Its agent leaves it paused where its network policies are not in force (504); of any other failure, its sandbox may have run.
-      // Its agent leaves it paused, too, where it was restored from a snapshot taken live
-      // that holds the session no more (410), which no try restores.
-      yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds, policies }).pipe(
+      // Its agent leaves it paused where its network policies are not in force (504), or where
+      // the bucket it reads the manifest of the snapshot from fails (502), which may pass; of
+      // any other failure, its sandbox may have run. It leaves it paused, too, where it was
+      // restored from a snapshot taken live that holds the session no more (410), which no try
+      // restores.
+      // Named, so the agent reads the manifest of the very snapshot it was restored from.
+      yield* agents.resume(node, { ...ref(name), namespace: profile.namespace, pod: name, podIPs, containerIds, policies, snapshot }).pipe(
         Effect.mapError((error) => {
           const status = error._tag === "NodeAgentError" ? error.status : undefined;
-          return new SandboxRestoreRefused({ reason: error.message, resumed: status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
+          return new SandboxRestoreRefused({ reason: error.message, resumed: status !== 502 && status !== 504 && status !== 410, ...(status === 410 ? { stale: true } : {}) });
         }),
       );
       const now = new Date(yield* Clock.currentTimeMillis).toISOString();
@@ -325,15 +328,25 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
    * refused before its sandbox resumed: it kills what runsc runs for the pod, which a
    * `runsc restore` that failed has left running, its shim tearing none of it down, and
    * which the pod's teardown would wait on. It stays as defence should a restore leave
-   * runsc's processes behind. One the agent cannot do is said so, and changes nothing else.
+   * runsc's processes behind. The pod is named to the agent by its uid too, as the API
+   * server has it now, before the Sandbox is suspended: the restore's, which no other
+   * replaces meanwhile. One gone has been torn down, and leaves nothing to abandon. One the
+   * agent cannot do is said so, and changes nothing else.
    */
   const abandon = (name: string, node: string): Effect.Effect<void> =>
-    agents.abandon(node, { ...ref(name), namespace: profile.namespace, pod: name }).pipe(
-      Effect.flatMap((killed) =>
-        killed.length === 0
-          ? Effect.void
-          : Effect.logInfo(`killed what runsc left running of the restore of session ${name} on ${node}: ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}`)
-      ),
+    kube.read("v1", "Pod", profile.namespace, name).pipe(
+      Effect.flatMap((read) => {
+        // A core Pod, as the API server returns one.
+        const uid = (read as V1Pod | null)?.metadata?.uid;
+        if (!uid) return Effect.logInfo(`the restore of session ${name} on ${node} has no pod left, so nothing of it to abandon`);
+        return agents.abandon(node, { ...ref(name), namespace: profile.namespace, pod: name, uid }).pipe(
+          Effect.flatMap((killed) =>
+            killed.length === 0
+              ? Effect.void
+              : Effect.logInfo(`killed what runsc left running of the restore of session ${name} on ${node}: ${killed.map(({ containerId, pid }) => `${pid} of ${containerId}`).join(", ")}`)
+          ),
+        );
+      }),
       Effect.catch((error) => Effect.logWarning(`could not abandon the restore of session ${name} on ${node}: ${error.message}`)),
     );
 
@@ -378,7 +391,10 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           yield* Effect.logWarning(prepared.failure.message);
           continue;
         }
-        yield* Effect.logInfo(`restoring session ${name} on ${node} from its snapshot ${manifest.snapshot}, taken at ${manifest.takenAt} under gVisor ${manifest.release}`);
+        // What the agent prepared, which a compaction committed since alasio read the snapshot
+        // may have made the one compacted from it: the sandbox runs from that one.
+        const from = prepared.success.manifest;
+        yield* Effect.logInfo(`restoring session ${name} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
         const restoring: V1PodTemplateSpec = {
           ...base,
           // Left paused, until its node's agent sees its egress confined (resumeRestored).
@@ -400,7 +416,7 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           snapshot: { snapshot: manifest.snapshot, release: manifest.release },
           podTemplate: restoring,
           kept: base,
-          resume: resumeRestored(name, node),
+          resume: resumeRestored(name, node, from.snapshot),
           // The session moves on from it.
           restored: Clock.currentTimeMillis.pipe(
             Effect.map((now) => {
