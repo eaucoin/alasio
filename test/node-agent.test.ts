@@ -1560,6 +1560,11 @@ test("an abandon kills what runsc runs for the pod's containers, their sandbox, 
       const otherGofer = yield* runscProcess(here, "runsc-gofer", goferArgs(here, OTHER_CONTAINER));
       const restoring = yield* runscProcess(here, "runsc", [`--root=${RUNSC_ROOT}`, "restore", "--image-path=/var/lib/alasio/snapshots/main/fs-abc/s-1", "--bundle", here.releases.bundleOf(CONTAINER), CONTAINER]);
       const byPid = (killed: readonly Killed[]) => killed.toSorted((a, b) => a.pid - b.pid);
+      // Each as the node's /proc says it, running as runsc would.
+      for (const each of [sandbox, gofer, otherGofer, restoring]) {
+        const said = readFileSync(join(here.releases.procRoot, String(each.pid), "cmdline"), "utf8").split("\0");
+        assert.ok(each.running() && said[0]?.startsWith("runsc"), `${each.pid}: ${said.join(" ")}`);
+      }
       let killed: readonly Killed[] = [];
       const counted = yield* Effect.promise(() =>
         added("alasio.node_agent.abandons", async () => {
