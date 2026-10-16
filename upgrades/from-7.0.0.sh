@@ -225,12 +225,14 @@ const written = async (key, value) => {
   await run(bucket.putJson(key, value));
   if (!isDeepStrictEqual(await run(bucket.getJson(key)), JSON.parse(JSON.stringify(value)))) throw new Error(`${key} does not read back as it was written`);
 };
+// The keys under `prefix`: 7.0.0's client lists them, this release's the objects of them.
+const keysUnder = async (prefix) => (await run(bucket.list(prefix))).map((each) => (typeof each === "string" ? each : each.key));
 const moved = (process.env.MOVED ?? "").split("\n").filter(Boolean).map((line) => line.split(" "));
 
 const mode = required("MODE");
 if (mode === "move") {
   for (const environment of required("ENVIRONMENTS").split(" ")) {
-    const keys = await run(bucket.list(`${environment}/`));
+    const keys = await keysUnder(`${environment}/`);
     for (const workspace of [...new Set(keys.map((key) => key.split("/")[1]))]) {
       const prefix = `${environment}/${workspace}`;
       const current = await run(bucket.getJson(`${prefix}/current.json`));
@@ -257,7 +259,7 @@ if (mode === "move") {
 } else if (mode === "delete") {
   let deleted = 0;
   for (const environment of required("ENVIRONMENTS").split(" ")) {
-    const keys = await run(bucket.list(`${environment}/`));
+    const keys = await keysUnder(`${environment}/`);
     for (const workspace of [...new Set(keys.map((key) => key.split("/")[1]))]) {
       for (const key of keys.filter(ofOld(`${environment}/${workspace}`))) {
         await run(bucket.remove(key));
@@ -483,6 +485,19 @@ if [ ! -e "$OUT/upgraded" ] && [ -e "$OUT/snapshots-moved" ] && [ ! -e "$OUT/cac
   touch "$OUT/caches-emptied"
 fi
 [ "${FAIL_AT:-}" != after-the-snapshots-moved ] || fail "a failure injected once the sessions' snapshots were moved"
+
+# 7.0.0's sessions' profile, which this release's alasio up carries as the template before
+# its own, for the sessions' snapshots taken on it to restore onto it, as each moved does:
+# this release reads a profile only where it says how often a session is snapshotted live,
+# which 7.0.0's does not, so it is given this release's default, 10 minutes, which 7.0.0's
+# alasio, reading it again, ignores.
+templates=$(k get configmap alasio-sandbox-templates --ignore-not-found -o json)
+lacking='.data["templates.json"] | fromjson | any((.sessions, .previousSessions) | select(. != null and .snapshots != null) | .snapshots; has("liveEverySeconds") | not)'
+if [ -n "$templates" ] && [ "$(jq "$lacking" <<<"$templates")" = true ]; then
+  log "giving 7.0.0's sessions' profile in its sandbox templates how often a session is snapshotted live, for this release's alasio up to carry it"
+  jq '.data["templates.json"] |= (fromjson | reduce ("sessions", "previousSessions") as $profile (.; if .[$profile].snapshots? != null and (.[$profile].snapshots | has("liveEverySeconds") | not) then .[$profile].snapshots.liveEverySeconds = 600 else . end) | tojson)' <<<"$templates" | k replace -f - >/dev/null ||
+    fail "7.0.0's sandbox templates could not be given how often a session is snapshotted live: the run again goes on with it"
+fi
 
 # The upgrade, once: a run again once it went through goes on with what follows it alone.
 if [ ! -e "$OUT/upgraded" ]; then
