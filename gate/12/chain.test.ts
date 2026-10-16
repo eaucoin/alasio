@@ -10,16 +10,13 @@
  *   3. a chain of three (two live, one at release) restores through the adapter, its layers
  *      linked in the prepared directory's layers/<digest>/;
  *   4. a chain restores straight from the snapshots bucket, its gofer reaching the store from
- *      the node: from a directory holding s3_opts.json and the image's state file, which the
- *      shim reads (8. says why one holding s3_opts.json alone will not do);
+ *      the node, from a directory holding s3_opts.json alone, each image of the chain in the
+ *      bucket once, under layers/<digest>/, as the node agent keeps them;
  *   5. a delta after a restore from the bucket: whether its parent's pages_meta.img alone
  *      will do, or its pages too;
  *   6. a server-side copy of a 1 GiB layer in the bundled SeaweedFS: its time and bytes;
  *   7. a live snapshot restored after its pod went, during its exec, which goes on; and one
- *      whose held file changed since, which the restore refuses;
- *   8. a directory holding s3_opts.json alone: the shim refuses it, as it reads which containers
- *      the checkpoint holds from the image's state file (pkg/shim/v1/runsc/absent.go), which a
- *      pod with init containers asks of it.
+ *      whose held file changed since, which the restore refuses.
  *
  * What each records goes into $OUT/evidence.json.
  *
@@ -274,10 +271,11 @@ async function upload(image: string, prefix: string): Promise<void> {
   }
 }
 
-/** The options of the S3 gofer for the session's images in the bucket, as JSON. */
-const goferOptions = (prefix: string) => JSON.stringify({ endpoint: s3.endpoint, region: s3.region, bucket: s3.bucket, object_prefix: prefix, addressing: "path", credentials: { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey } });
+/** The options of the S3 gofer for the image at `objectPrefix` in the bucket, its layers each under `layersPrefix`, as JSON. */
+const goferOptions = (objectPrefix: string, layersPrefix: string) =>
+  JSON.stringify({ endpoint: s3.endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials: { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey } });
 
-test("4. a chain restores straight from the bucket, from a directory holding s3_opts.json and the image's state file", { timeout: 30 * 60_000 }, () =>
+test("4. a chain restores straight from the bucket, from a directory holding s3_opts.json alone", { timeout: 30 * 60_000 }, () =>
   recorded("bucket", async (seen) => {
     const secret = await kube.get<V1Secret>(ref("Secret", "alasio-snapshots", NAMESPACE));
     const value = (key: string) => Buffer.from(secret?.data?.[key] ?? "", "base64").toString("utf8");
@@ -290,19 +288,20 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
 
     await inGate("set", session.volumeId, session.replId, "4");
     seen["D"] = await checkpoint("D", { live: false, parent: at("restore-C") });
-    const prefix = `gate-12/${session.volumeId}/`;
+    // Each image once, by its digest, as the node agent keeps a workspace's.
+    const layersPrefix = `gate-12/${session.volumeId}/layers/`;
     const layers = (await runsc(["image", "layers", at("D")])).split("\n").filter(Boolean);
     seen["layers"] = layers;
     const byDigest = new Map(await Promise.all(["A", "B", "C"].map(async (name) => [await digest(at(name)), at(name)] as const)));
+    const own = await digest(at("D"));
     const uploadingAt = Date.now();
-    await upload(at("D"), prefix);
-    for (const layer of layers) await upload(byDigest.get(layer) ?? "", `${prefix}layers/${layer}/`);
+    await upload(at("D"), `${layersPrefix}${own}/`);
+    for (const layer of layers) await upload(byDigest.get(layer) ?? "", `${layersPrefix}${layer}/`);
     seen["uploadMs"] = Date.now() - uploadingAt;
 
-    // The state file, the object graph, a few MiB at most, for the shim; runsc reads every file, it too, from the bucket.
+    // runsc, and the shim through it, reads every file of the image from the bucket.
     const directory = at("bucket-D");
-    await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && cp ${q(`${at("D")}/checkpoint.img`)} ${q(directory)}/ && umask 077 && printf '%s' ${q(goferOptions(prefix))} >${q(`${directory}/s3_opts.json`)}`);
-    seen["stateFileBytes"] = Number((await node(`stat -c %s ${q(`${directory}/checkpoint.img`)}`)).trim());
+    await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix))} >${q(`${directory}/s3_opts.json`)}`);
     const restored = await restoreFrom(directory);
     seen["restore"] = restored;
     assert.ok(restored.ready, JSON.stringify(restored));
@@ -389,14 +388,4 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     assert.ok(afresh.ready, JSON.stringify(afresh));
     seen["afterwards"] = await inGate<Read>("read", session.volumeId, session.replId).catch((error: unknown) => String(error));
     seen["exec"] = second.execId;
-  }));
-
-test("8. a directory holding s3_opts.json alone is refused by the shim, which reads which containers the checkpoint holds", { timeout: 30 * 60_000 }, () =>
-  recorded("goferAlone", async (seen) => {
-    const directory = at("bucket-alone");
-    await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`gate-12/${session.volumeId}/`))} >${q(`${directory}/s3_opts.json`)}`);
-    const refused = await restoreFrom(directory);
-    seen["refused"] = refused;
-    assert.equal(refused.ready, false, JSON.stringify(refused));
-    assert.ok(refused.events.some((event) => event.includes("checkpoint.img: no such file or directory")), JSON.stringify(refused.events));
   }));
