@@ -146,9 +146,15 @@ async function events(): Promise<string[]> {
 /**
  * The session's Sandbox suspended, its pod gone, and running again, its new pod restored
  * from `directory`, or started afresh for null: whether bayma came up ready, in how long,
- * and the pod's states and events meanwhile.
+ * and the pod's states and events meanwhile. Where its pod `crashed`, its sandbox is killed
+ * first, as a node lost ends it: bayma stopped by SIGTERM persists its sessions, which moves
+ * its state generation on from a live snapshot, which it then refuses to restore, as it
+ * should (alasio takes a release snapshot of a pod it stops, before its SIGTERM).
  */
-async function restoreFrom(directory: string | null): Promise<{ readonly ready: boolean; readonly ms: number; readonly states: string[]; readonly events: string[] }> {
+async function restoreFrom(directory: string | null, { crashed = false }: { readonly crashed?: boolean } = {}): Promise<{ readonly ready: boolean; readonly ms: number; readonly states: string[]; readonly events: string[] }> {
+  // containerd stops a pod's sandbox by killing its containers at once, with no SIGTERM;
+  // the Sandbox is suspended before the kubelet makes it again.
+  if (crashed) await node(`k3s crictl stopp ${(await ids()).pod}`);
   await kube.patch(ref("Sandbox", session.volumeId, SESSIONS), { spec: { operatingMode: "Suspended" } });
   for (let waited = 0; (await podState()) !== "gone"; waited++) {
     assert.ok(waited < 120, `the pod of ${session.volumeId} is still there`);
@@ -366,7 +372,7 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     const first = await inGate<Started>("start", session.volumeId, session.replId);
     await sleep(2000);
     seen["L"] = await checkpoint("L", { live: true, parent: at("restore-E") });
-    const restored = await restoreFrom(await prepared("L", ["A", "B", "C", "D", "E"]));
+    const restored = await restoreFrom(await prepared("L", ["A", "B", "C", "D", "E"]), { crashed: true });
     seen["restore"] = restored;
     assert.ok(restored.ready, JSON.stringify(restored));
     await letEnd();
@@ -380,9 +386,12 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     await sleep(2000);
     seen["M"] = await checkpoint("M", { live: true, parent: at("restore-L") });
     await inSession(session.volumeId, 'require("node:fs").appendFileSync("/workspace/gate-12-held", " and changed")');
-    const refused = await restoreFrom(await prepared("M", ["A", "B", "C", "D", "E", "L"]));
+    const refused = await restoreFrom(await prepared("M", ["A", "B", "C", "D", "E", "L"]), { crashed: true });
     seen["refused"] = refused;
     assert.equal(refused.ready, false, JSON.stringify(refused));
+    // For the file it holds, which changed, and for nothing else.
+    assert.ok(refused.events.some((event) => event.includes("gate-12-held")), JSON.stringify(refused.events));
+    assert.ok(!refused.events.some((event) => event.includes("generation.json")), JSON.stringify(refused.events));
     const afresh = await restoreFrom(null);
     seen["afresh"] = afresh;
     assert.ok(afresh.ready, JSON.stringify(afresh));
