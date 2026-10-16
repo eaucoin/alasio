@@ -32,17 +32,19 @@
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
  *   when `from` has none; 502 when the bucket failed, which leaves `to` without a snapshot.
  * - `POST /resume`, `{ environment, workspace, namespace, pod, podIPs, containerIds,
- *   policies }`: resumes the workspace's sandbox, restored paused in the pod
- *   `namespace`/`pod` on this node, once the pod's network policies, `policies`, are in
+ *   policies, snapshot }`: resumes the workspace's sandbox, restored paused from
+ *   `snapshot` in the pod `namespace`/`pod` on this node, once the pod's network policies, `policies`, are in
  *   force here for each of its addresses `podIPs` (./kube-router.ts): the connections tracked from
  *   them forgotten, then each of its containers `containerIds` (containerd's ids) resumed
  *   (204). 504 when its policies were not in force within the agent's wait, saying for
  *   which address what was missing, its sandbox left paused; 410 when it was restored from
  *   a snapshot taken live that holds the session no more, bayma's state generation having
- *   moved on since, or that cannot be told, its sandbox left paused; 500 when a command failed.
- * - `POST /abandon`, `{ environment, workspace, namespace, pod }`: abandons the workspace's
- *   restore into the pod `namespace`/`pod` on this node, which alasio refused before it
- *   resumed its sandbox: kills each process runsc runs for the pod's containers, their
+ *   moved on since, or that cannot be told, or from one whose manifest no node or bucket
+ *   holds, its sandbox left paused; 502 when the bucket failed to give that manifest, its
+ *   sandbox left paused; 500 when a command failed.
+ * - `POST /abandon`, `{ environment, workspace, namespace, pod, uid }`: abandons the
+ *   workspace's restore into the pod `namespace`/`pod` of the uid `uid` on this node, which
+ *   alasio refused before it resumed its sandbox: kills each process runsc runs for the pod's containers, their
  *   sandbox and gofers among them, that is still the one it found, so that the pod's
  *   teardown waits on none of them: `{ killed: [{ containerId, pid }] }` (200). 500 when
  *   runsc's containers, or the node's processes, could not be read, or one not killed.
