@@ -19,8 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { part: go-runsc, sandbox: runsc, runtimes: go }
-          - { part: go-runc, sandbox: runc, runtimes: go }
+          - { part: full, runtimes: "", chain: 16, precopy: "on", tracking: wp }
+          - { part: python, runtimes: python, chain: 16, precopy: "on", tracking: wp }
+          - { part: dotnet, runtimes: dotnet-script, chain: 16, precopy: "on", tracking: wp }
+          - { part: full-chain1, runtimes: "", chain: 1, precopy: "on", tracking: wp }
+          - { part: full-noprecopy, runtimes: "", chain: 16, precopy: "off", tracking: wp }
+          - { part: full-notracking, runtimes: "", chain: 1, precopy: "on", tracking: "off" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,8 +51,8 @@ jobs:
           node --input-type=module -e '
             import { gvisorRuntimeFiles } from "./cli/src/cluster/k3s.ts";
             const [, options] = [...gvisorRuntimeFiles([process.argv[1]], { systemd: false })].find(([path]) => path.endsWith(".toml"));
-            process.stdout.write(options + "  dirty-tracking = \"wp\"\n  working-set-window = \"3s\"\n");
-          ' "$release" | sudo tee /etc/containerd/runsc.toml
+            process.stdout.write(options + `  dirty-tracking = "${process.argv[2]}"\n  working-set-window = "3s"\n  profile = "true"\n`);
+          ' "$release" "${{ matrix.tracking }}" | sudo tee /etc/containerd/runsc.toml
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # Read whole before tee opens it: tee empties it as it starts.
           daemon=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
@@ -59,11 +63,25 @@ jobs:
       - run: docker build --tag alasio-agent:gate sandbox/agent
       - run: node --test --test-timeout=10800000 gate/12/live.test.ts
         env:
-          CHECKPOINTS: 60
-          CHECKPOINTING: "off"
-          SANDBOX_RUNTIME: ${{ matrix.sandbox }}
+          CHECKPOINTS: 100
+          CHAIN: ${{ matrix.chain }}
+          PRECOPY: ${{ matrix.precopy }}
+          PROFILE_EVERY: 25
           GATE_RUNTIMES: ${{ matrix.runtimes }}
           OUT: ${{ runner.temp }}/gate-12-live
+      # What the Sentry's heap holds after the last checkpoint profiled beyond what it held after
+      # the first, by function, as Go's pprof says it.
+      - if: always()
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/gate-12-live"
+          sudo chmod -R a+rX .
+          if [ -f heap-24.pprof ] && [ -f heap-99.pprof ]; then
+            go tool pprof -top -nodecount=40 -sample_index=inuse_space -diff_base=heap-24.pprof "$RUNSC" heap-99.pprof >heap-inuse-diff.txt 2>&1 || true
+            go tool pprof -top -nodecount=40 -sample_index=alloc_space -diff_base=heap-24.pprof "$RUNSC" heap-99.pprof >heap-alloc-diff.txt 2>&1 || true
+            go tool pprof -top -nodecount=40 -sample_index=inuse_space "$RUNSC" heap-99.pprof >heap-inuse-99.txt 2>&1 || true
+            head -30 heap-inuse-diff.txt
+          fi
       - if: always()
         uses: actions/upload-artifact@v4
         with:
