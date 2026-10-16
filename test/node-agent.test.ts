@@ -1358,6 +1358,47 @@ test("the node's cache keeps within its budget, evicting the least recently used
   }
 });
 
+test("the node's cache lists what it holds as the agent moves and removes it meanwhile, which counts for nothing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "alasio-cache-churn-"));
+  try {
+    const cache = makeSnapshotCache({ root, budget: 1024 ** 4, graceMs: 0 });
+    const workspace = join(root, "main", "fs-abc");
+    const image = (index: number) => join(workspace, "layers", sha256(Buffer.from(String(index))));
+    const write = (index: number) => {
+      mkdirSync(image(index), { recursive: true });
+      writeFileSync(join(image(index), "pages.img"), "pages");
+    };
+    for (let index = 0; index < 64; index += 1) write(index);
+    // Each image removed and written again, and now and then the workspace whole, as the agent does while it lists.
+    let churning = true;
+    const churn = (async () => {
+      for (let round = 0; churning; round += 1) {
+        for (let index = 0; index < 64; index += 1) {
+          const whole = index % 16 === 0;
+          rmSync(whole ? workspace : image(index), { recursive: true, force: true });
+          // The workspace gone a while, as an eviction leaves it.
+          if (whole) await new Promise((resolve) => setImmediate(resolve));
+          write(index);
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+    })();
+    try {
+      for (let listing = 0; listing < 200; listing += 1) {
+        for (const { images, bytes } of await Effect.runPromise(cache.list)) assert.ok(images.length <= 64 && bytes <= 64 * 5, `${bytes} bytes of ${images.length} images`);
+      }
+    } finally {
+      churning = false;
+      await churn;
+    }
+    // At rest, each image written again, it holds each, and its bytes.
+    for (let index = 0; index < 64; index += 1) write(index);
+    assert.deepEqual((await Effect.runPromise(cache.list)).map(({ images, bytes }) => [images.length, bytes]), [[64, 64 * 5]]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a checkpoint makes room for as much as its pod may hold in memory, as its containers' limits say", () => {
   const limits = (...memory: (string | undefined)[]) => ({ spec: { containers: memory.map((each) => ({ resources: each === undefined ? {} : { limits: { memory: each } } })) } });
   assert.equal(memoryLimitOf(limits("3Gi")), 3 * 1024 ** 3);
