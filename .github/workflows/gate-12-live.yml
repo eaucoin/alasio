@@ -2,11 +2,13 @@ name: gate-12-live
 
 # 12's first gate, on its track's branch alone, whenever what it runs changes: a thousand live
 # checkpoints of bayma, in a sandbox of the gVisor release alasio pins, while execs start
-# threads in each of its runtimes (gate/12/live.test.ts), in four jobs of 250.
+# threads in each of its runtimes (gate/12/live.test.ts), in four jobs of 250, each beside its
+# baseline, the same cycles without checkpoints; then judged, each part's checkpoints' cost of
+# the Sentry's memory what it grows by beyond its baseline's (gate/12/live-judge.test.ts).
 on:
   push:
     branches: [track/live-lazy-gate]
-    paths: [.github/workflows/gate-12-live.yml, gate/12/live.test.ts]
+    paths: [.github/workflows/gate-12-live.yml, gate/12/live.test.ts, gate/12/live-memory.ts, gate/12/live-judge.test.ts]
   workflow_dispatch:
 
 permissions:
@@ -20,6 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0, 1, 2, 3]
+        kind: [checkpointed, baseline]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -59,9 +62,30 @@ jobs:
       - run: node --test --test-timeout=10800000 gate/12/live.test.ts
         env:
           CHECKPOINTS: 250
+          CHECKPOINTING: ${{ matrix.kind == 'checkpointed' && 'on' || 'off' }}
           OUT: ${{ runner.temp }}/gate-12-live
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-12-live-${{ matrix.part }}
+          name: gate-12-live-${{ matrix.kind }}-${{ matrix.part }}
           path: ${{ runner.temp }}/gate-12-live
+
+  judge:
+    needs: live
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-12-live-*
+          path: ${{ runner.temp }}/evidence
+      - run: node --test gate/12/live-judge.test.ts
+        env:
+          EVIDENCE: ${{ runner.temp }}/evidence
