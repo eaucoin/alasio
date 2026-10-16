@@ -40,8 +40,10 @@ const RUNSC_ROOT = "/run/containerd/runsc/moby";
 const CHAIN = Number(process.env["CHAIN"] ?? 16);
 /** Whether checkpoints pre-copy, as live ones will: PRECOPY=off takes them without. */
 const PRECOPY = process.env["PRECOPY"] !== "off";
+/** The runtime of Docker's that runs the sandbox: runsc, or runc to compare the workload's memory without gVisor (no checkpoints then). */
+const SANDBOX_RUNTIME = process.env["SANDBOX_RUNTIME"] ?? "runsc";
 /** Whether it checkpoints at all: CHECKPOINTING=off runs the same cycles without, to tell what the workload holds from what checkpoints do. */
-const CHECKPOINTING = process.env["CHECKPOINTING"] !== "off";
+const CHECKPOINTING = process.env["CHECKPOINTING"] !== "off" && SANDBOX_RUNTIME === "runsc";
 /** Every how many checkpoints the Sentry's heap profile is written to OUT (0: never); runsc's `profile` must be on. */
 const PROFILE_EVERY = Number(process.env["PROFILE_EVERY"] ?? 0);
 /** The checkpoints the Sentry's memory settles over, which its trend leaves out. */
@@ -270,6 +272,17 @@ interface Cycle {
   readonly sentry: SentryMemory;
   /** The sandbox's memory, as its /proc/meminfo says it, by kind, in bytes. */
   readonly sandbox: Readonly<Record<string, number>>;
+  /** Each process of the container: its resident memory, in bytes, and its command line. */
+  readonly processes: readonly { readonly rssBytes: number; readonly command: string }[];
+}
+
+/** Each process of the container, as its /proc says it: its resident memory and its command line. */
+async function processesOf(name: string): Promise<{ rssBytes: number; command: string }[]> {
+  const listed = await run("docker", ["exec", name, "sh", "-c", 'for d in /proc/[0-9]*; do r=$(grep "^VmRSS:" "$d/status" 2>/dev/null | tr -s " " | cut -d" " -f2); c=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null | cut -c1-160); [ -n "$r" ] && echo "$r $c"; done']);
+  return listed.split("\n").filter(Boolean).map((line) => {
+    const [rss, ...command] = line.split(" ");
+    return { rssBytes: Number(rss) * 1024, command: command.join(" ") };
+  });
 }
 
 /** The sandbox's /proc/meminfo, as the Sentry accounts its memory, of the fields that say by kind. */
@@ -371,7 +384,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
   try {
     // As the session pod runs bayma: its command, arguments, environment and working directory.
     await run("docker", [
-      "run", "--detach", "--runtime", "runsc", "--name", name, "--hostname", "bayma",
+      "run", "--detach", "--runtime", SANDBOX_RUNTIME, "--name", name, "--hostname", "bayma",
       "--user", "1000:1000", "--publish", `127.0.0.1::${PORT}`,
       "--env", "HOME=/home/agent", "--env", "USER=agent", "--env", "BAYMA_PAYLOAD_DIR=/opt/bayma/payload",
       "--volume", `${home}:/home/agent`, "--volume", `${workspace}:/workspace`, "--volume", `${tokens}:/run/alasio/bayma:ro`,
@@ -436,7 +449,7 @@ test(`${CHECKPOINTS} live checkpoints of bayma while execs start threads in each
       ]);
       const checkpointMs = Date.now() - began - afterMs;
       const bytes = CHECKPOINTING ? Number((await run("sudo", ["du", "-sb", image])).split(/\s/u)[0]) : 0;
-      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory(), sandbox: await sandboxMemory(name) });
+      cycles.push({ index, depth, afterMs, checkpointMs, bytes, diskFreeBytes: await diskFree(images), memoryAvailableBytes: memoryAvailable(), sentry: await sentryMemory(), sandbox: await sandboxMemory(name), processes: await processesOf(name) });
       if (PROFILE_EVERY > 0 && (index + 1) % PROFILE_EVERY === 0) await profile(String(index));
       for (const { runtime, sessionId, started } of execs) {
         const done = await settled(client, sessionId, started);

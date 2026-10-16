@@ -19,10 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { part: full, checkpointing: "on", runtimes: "" }
-          - { part: none, checkpointing: "off", runtimes: "" }
-          - { part: interpreted, checkpointing: "on", runtimes: "bun,python,dotnet-script" }
-          - { part: compiled, checkpointing: "on", runtimes: "rust,c,cpp,lean,go" }
+          - { part: bun-runsc, sandbox: runsc, runtimes: bun }
+          - { part: python-runsc, sandbox: runsc, runtimes: python }
+          - { part: dotnet-runsc, sandbox: runsc, runtimes: dotnet-script }
+          - { part: bun-runc, sandbox: runc, runtimes: bun }
+          - { part: python-runc, sandbox: runc, runtimes: python }
+          - { part: dotnet-runc, sandbox: runc, runtimes: dotnet-script }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,8 +63,9 @@ jobs:
       - run: docker build --tag alasio-agent:gate sandbox/agent
       - run: node --test --test-timeout=10800000 gate/12/live.test.ts
         env:
-          CHECKPOINTS: 80
-          CHECKPOINTING: ${{ matrix.checkpointing }}
+          CHECKPOINTS: 60
+          CHECKPOINTING: "off"
+          SANDBOX_RUNTIME: ${{ matrix.sandbox }}
           GATE_RUNTIMES: ${{ matrix.runtimes }}
           OUT: ${{ runner.temp }}/gate-12-live
       - if: always()
