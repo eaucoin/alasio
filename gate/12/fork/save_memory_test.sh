@@ -18,11 +18,12 @@
 # memory its saves take. A container whose memory grows, in many small pieces
 # as a busy application's does, is checkpointed, left running, after each step
 # of its growth; once the saves have ended, the Sentry's own (anonymous) memory
-# must come back near what it holds for a container grown the same way without
-# a save, its baseline, rather than stay at what the largest save held. It
-# also says how long the Sentry stopped the world to collect each save's
-# garbage, as its log says, and how long the container was held up after each
-# save.
+# hold no more than its baseline, what it holds for a container grown the same
+# way without a save, and the heap it goes on using, the heap holding no more
+# from the host than it uses: rather than stay at what the largest save held.
+# It also says how long the Sentry took to collect each save's garbage and
+# return it, how long it stopped the world for it, as its log says, and how
+# long the container was held up after each save.
 #
 # It needs root (through sudo), Docker, for a busybox root filesystem, and a C
 # compiler that links statically.
@@ -38,10 +39,12 @@ declare -ra FLAGS=("$@")
 # Each step of the container's growth, in MiB of address space, of which it
 # touches every other page, and how many steps, one save after each.
 readonly STEP_MIB=512 STEPS=6
-# What the Sentry may keep past its baseline once the saves have ended.
+# What the Sentry's heap may hold from the host past what it uses once a save's
+# garbage is collected, and what the Sentry may hold past its baseline and the
+# heap it goes on using.
 readonly KEPT_LIMIT_MIB=32
-# The longest the Sentry may stop the world to collect a save's garbage, and
-# the container may be held up after a save, in ms.
+# The longest a collection after a save may take, the Sentry stop the world
+# for one, and the container be held up after a save, in ms.
 readonly STALL_LIMIT_MS=100
 
 declare tmp
@@ -184,6 +187,12 @@ grown() {
     (( now >= settled )) && break
     settled="${now}"
   done
+  if [[ "${saved}" == saved ]]; then
+    runsc debug --profile-heap="${tmp}/heap.pprof" holder >&2
+    sudo chmod a+r "${tmp}/heap.pprof"
+    go tool pprof -top -nodecount=40 -sample_index=inuse_space "${RUNSC}" "${tmp}/heap.pprof" >&2 || true
+    go tool pprof -top -cum -nodecount=40 -sample_index=inuse_space "${RUNSC}" "${tmp}/heap.pprof" >&2 || true
+  fi
   runsc delete --force holder
   echo "${settled}"
 }
@@ -195,25 +204,38 @@ kept=$(( saved - baseline ))
 echo "grown so with a save after each step, it holds ${saved} MiB: ${kept} MiB past its baseline"
 
 worst_stall_us="$(sort -n "${tmp}/stalls" | tail -1)"
-# What the Sentry says of each collection after a save: how long it took, and
-# how long the world stopped, as Go prints durations.
+# What the Sentry says of each collection after a save: how long it took, how
+# long the world stopped, as Go prints durations, and the heap in use and held
+# from the host after it.
 collections="$(sudo find "${logs}" -type f -name '*.boot.txt' -exec grep -h "Collected the save's garbage" {} + || true)"
 echo "${collections}"
 count="$(grep -c . <<<"${collections}" || true)"
-stopped_us="$(sed -n "s/.*the world stopped for \([0-9.]*\)\([a-zµ]*\) of it.*/\1 \2/p" <<<"${collections}" |
-  awk '{ v = $1; if ($2 == "ns") v /= 1000; else if ($2 == "ms") v *= 1000; else if ($2 == "s") v *= 1000000; if (v > max) max = v } END { printf "%d", max }')"
-echo "the longest the Sentry stopped the world to collect a save's garbage: ${stopped_us} us, over ${count} collections; the longest the container was held up after a save: ${worst_stall_us} us"
+# Each collection as "took_us stopped_us in_use_after_mib held_after_mib".
+measured="$(sed -n "s/.* in \([0-9.]*\)\([a-zµ]*\), the world stopped for \([0-9.]*\)\([a-zµ]*\) of it: heap in use [0-9]* -> \([0-9]*\) bytes, held from the host [0-9]* -> \([0-9]*\) bytes.*/\1 \2 \3 \4 \5 \6/p" <<<"${collections}" |
+  awk 'function us(v, unit) { if (unit == "ns") return v / 1000; if (unit == "ms") return v * 1000; if (unit == "s") return v * 1000000; return v }
+       { printf "%d %d %d %d\n", us($1, $2), us($3, $4), $5 / 1048576, $6 / 1048576 }')"
+took_us="$(awk '$1 > m { m = $1 } END { printf "%d", m }' <<<"${measured}")"
+stopped_us="$(awk '$2 > m { m = $2 } END { printf "%d", m }' <<<"${measured}")"
+# What the heap held from the host past what it used, after each collection.
+spare_mib="$(awk '$4 - $3 > m { m = $4 - $3 } END { printf "%d", m }' <<<"${measured}")"
+in_use_mib="$(tail -1 <<<"${measured}" | cut -d" " -f3)"
+echo "the Sentry's collections after its saves took at most ${took_us} us, the world stopped for at most ${stopped_us} us, over ${count} collections; after each the heap held at most ${spare_mib} MiB from the host past what it used, and in use after the last ${in_use_mib:-0} MiB; the container was held up for at most ${worst_stall_us} us after a save"
 
-if (( kept > KEPT_LIMIT_MIB )); then
-  echo "the Sentry keeps the memory of its saves: ${kept} MiB past its baseline, past ${KEPT_LIMIT_MIB} MiB" >&2
-  exit 1
-fi
 if (( count < STEPS )); then
   echo "the Sentry collected the garbage of ${count} saves, not ${STEPS}, as its log says" >&2
   exit 1
 fi
-if (( stopped_us > STALL_LIMIT_MS * 1000 || worst_stall_us > STALL_LIMIT_MS * 1000 )); then
-  echo "the world stopped for ${stopped_us} us, the container was held up for ${worst_stall_us} us, after a save: past ${STALL_LIMIT_MS} ms" >&2
+if (( spare_mib > KEPT_LIMIT_MIB )); then
+  echo "the Sentry keeps the memory of its saves: its heap held ${spare_mib} MiB from the host past what it used, past ${KEPT_LIMIT_MIB} MiB" >&2
+  exit 1
+fi
+# What it holds past its baseline is the heap it goes on using, and no more.
+if (( kept > ${in_use_mib:-0} + KEPT_LIMIT_MIB )); then
+  echo "the Sentry holds ${kept} MiB past its baseline, past the ${in_use_mib} MiB its heap uses and ${KEPT_LIMIT_MIB} MiB more" >&2
+  exit 1
+fi
+if (( took_us > STALL_LIMIT_MS * 1000 || stopped_us > STALL_LIMIT_MS * 1000 || worst_stall_us > STALL_LIMIT_MS * 1000 )); then
+  echo "a collection after a save took ${took_us} us, the world stopped for ${stopped_us} us, the container was held up for ${worst_stall_us} us: past ${STALL_LIMIT_MS} ms" >&2
   exit 1
 fi
 echo "a save's memory given back: ok"

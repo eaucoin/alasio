@@ -25,4 +25,4 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gvisor"
           zstd -dc "$RUNNER_TEMP/gvisor.tar.zstd" | tar -x -C "$RUNNER_TEMP/gvisor"
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: gate/12/fork/save_memory_test.sh "$RUNNER_TEMP/gvisor/runsc"
+      - run: gate/12/fork/save_memory_test.sh "$RUNNER_TEMP/gvisor/runsc" --profile
