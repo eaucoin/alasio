@@ -391,6 +391,9 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     await letEnd();
     const finished = await inGate<Seen>("finish", session.volumeId, session.replId, first.execId);
     seen["finished"] = finished;
+    // Told nothing, the exec that ran on: the next, if it is told instead, as where the restored
+    // bayma heard of its restore, which gVisor runs its hook for once it runs, after it ended.
+    if (finished.notice === null) seen["next"] = await inGate<Read>("read", session.volumeId, session.replId).catch((error: unknown) => String(error));
     assert.equal(finished.result, "42");
     assert.match(finished.notice ?? "", CAME_BACK_WHOLE);
     await holdNext();
