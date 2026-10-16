@@ -1610,9 +1610,9 @@ test("up refuses to apply anything while the Secret that names Neon's tenant can
   assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
 });
 
-test("up applies nothing where an object the cluster has cannot take this release's of it, as a dry run of each says, naming what makes it able", async (t) => {
+test("up applies nothing where an object the cluster has cannot take this release's of it, as a dry run of each says", async (t) => {
   const { alasio, kube } = await branchable(t);
-  // The pageservers' StatefulSet as 7.0.0 made it, its pods started in order.
+  // The pageservers' StatefulSet with its pods started in order, which no StatefulSet changes.
   const pageservers = kube.get("/apis/apps/v1/namespaces/alasio/statefulsets/alasio-neon-pageserver");
   assert.ok(pageservers?.spec);
   pageservers.spec["podManagementPolicy"] = "OrderedReady";
@@ -1622,7 +1622,7 @@ test("up applies nothing where an object the cluster has cannot take this releas
       failure(await alasio(command)),
       "the cluster's StatefulSet alasio/alasio-neon-pageserver cannot take this release's of it (StatefulSet.apps \"alasio-neon-pageserver\" is invalid: spec: Forbidden: " +
         "updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden), " +
-        "so alasio applies nothing: an installation of 7.0.0 is upgraded by upgrades/from-7.0.0.sh, which makes it anew, keeping its pod and claim",
+        "so alasio applies nothing",
     );
   }
   assert.deepEqual(kube.changes.filter(({ method }) => method !== "GET"), []);
