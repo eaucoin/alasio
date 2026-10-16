@@ -723,16 +723,21 @@ export function neonStack(): void {
         const path = `/apis/apps/v1/namespaces/${NAMESPACE}/deployments/${neonName("compute")}`;
         const annotated = (annotations: Record<string, string>) => ({ spec: { template: { metadata: { annotations } } } });
         assert.equal((await patchedAsNeonControl(path, annotated({ "kubectl.kubernetes.io/restartedAt": new Date().toISOString() }))).status, 200);
-        const refused = [
-          annotated({ "e2e.alasio.dev/other": "x" }),
-          { spec: { template: { metadata: { generateName: "other-" } } } },
-          { spec: { template: { spec: { containers: [{ name: "compute", image: "registry.k8s.io/pause:3.10.1" }] } } } },
-          { spec: { minReadySeconds: 5 } },
-          { metadata: { labels: { "e2e.alasio.dev/other": "x" } } },
-        ];
-        for (const patch of refused) {
-          const { status, text } = await patchedAsNeonControl(path, patch);
-          assert.ok(status === 422 && text.includes("ValidatingAdmissionPolicy 'alasio-compute-restarts'"), `${JSON.stringify(patch)}: ${status} ${text}`);
+        try {
+          const refused = [
+            annotated({ "e2e.alasio.dev/other": "x" }),
+            { spec: { template: { metadata: { generateName: "other-" } } } },
+            { spec: { template: { spec: { containers: [{ name: "compute", image: "registry.k8s.io/pause:3.10.1" }] } } } },
+            { spec: { minReadySeconds: 5 } },
+            { metadata: { labels: { "e2e.alasio.dev/other": "x" } } },
+          ];
+          for (const patch of refused) {
+            const { status, text } = await patchedAsNeonControl(path, patch);
+            assert.ok(status === 422 && text.includes("ValidatingAdmissionPolicy 'alasio-compute-restarts'"), `${JSON.stringify(patch)}: ${status} ${text}`);
+          }
+        } finally {
+          // The restart it let through rolled the compute: done, its old pod gone, before the tests after it count the stack's pods.
+          await kube.awaitReady([ref("Deployment", neonName("compute"), NAMESPACE)], "5 minutes");
         }
       });
 
