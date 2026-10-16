@@ -19,13 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { part: bun-runc, sandbox: runc, runtimes: bun }
-          - { part: python-runc, sandbox: runc, runtimes: python }
-          - { part: dotnet-script-runc, sandbox: runc, runtimes: dotnet-script }
-          - { part: rust-runc, sandbox: runc, runtimes: rust }
-          - { part: c-runc, sandbox: runc, runtimes: c }
-          - { part: cpp-runc, sandbox: runc, runtimes: cpp }
-          - { part: lean-runc, sandbox: runc, runtimes: lean }
+          - { part: go-runsc, sandbox: runsc, runtimes: go }
           - { part: go-runc, sandbox: runc, runtimes: go }
     steps:
       - uses: actions/checkout@v4
