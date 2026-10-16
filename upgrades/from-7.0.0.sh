@@ -41,6 +41,9 @@
 # start for ever; and it keeps 7.0.0's Service of the pageservers, which main's compute reads
 # pages at, through the upgrade, until neon-control has given the compute pod 0's.
 #
+# Past it too, the sessions' snapshots are moved to this release's layout, alasio stopped
+# meanwhile, which the upgrade starts again (the step's own comment says how).
+#
 # Run again, it goes on from where it stopped: what each step reads is kept in OUT and read
 # again from there, and a failure before the point of no return makes again what the steps
 # deleted. Once past it (OUT/point-of-no-return), a run again goes on from there.
@@ -48,6 +51,7 @@ set -euo pipefail
 umask 077
 : "${UPGRADE:?the upgrade of the release, run as the owner of the configuration}" "${UPGRADE_CHECK:?a command proving UPGRADE can run}" "${OUT:?where to record}"
 NS=alasio
+RELEASE=alasio
 PAGESERVERS=alasio-neon-pageserver
 CONTROLLER=alasio-neon-storage-controller
 # Node 1, as 7.0.0's setup registered it, and as pod 0 registers itself now: its HTTP and
@@ -164,10 +168,125 @@ if [ -n "$installation" ]; then
   k label service "$PAGESERVERS" alasio.dev/installation- >/dev/null
 fi
 
+# The sessions' snapshots: 7.0.0 kept a workspace's one snapshot in the snapshots bucket as
+# <environment>/<workspace>/<snapshot>/, its manifest beside its files and current.json, by an
+# id to the second; this release keeps each image once, by its digest, under layers/, each
+# manifest under manifests/, and names snapshots to the millisecond. alasio, which restores and
+# releases sessions, is stopped first, so that none is restored or released meanwhile, as one
+# would fall back from a snapshot it could not read: the upgrade starts it again. In a node
+# agent of 7.0.0's, which reaches the bucket, each workspace's current snapshot is moved: its
+# files copied under layers/<image>/, each then looked at, as the agent checks what it puts;
+# its manifest written anew, under its new id, then its current.json; what 7.0.0 left of the
+# workspace's then deleted. Each Sandbox released into one is then bound to its new id. Run
+# again, a workspace moved already is told again, and what is left of it deleted. The nodes'
+# caches, of 7.0.0's layout, are emptied: the agents fill them anew as they restore.
+if [ ! -e "$OUT/snapshots-moved" ]; then
+  replicas=$(k get deploy "$RELEASE" -o jsonpath='{.spec.replicas}')
+  if [ "$replicas" != 0 ]; then
+    log "stopping alasio, which the upgrade starts again, so that no session is restored or released as the snapshots move"
+    k scale deploy/"$RELEASE" --replicas=0 >/dev/null
+  fi
+  stopped() {
+    local left
+    left=$(k get pod -l app.kubernetes.io/component=alasio -o name) && [ -z "$left" ]
+  }
+  wait_for 300 "alasio's pods to be gone" stopped
+  environments=$(kubectl get sandboxes.agents.x-k8s.io -A -l alasio.dev/workload=session -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u | paste -sd ' ')
+  if [ -n "$environments" ]; then
+    log "moving the snapshots of the sessions of $environments to this release's layout"
+    agent=$(k get pod -l app.kubernetes.io/component=node-agent --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}')
+    agent=${agent%% *}
+    [ -n "$agent" ] || fail "no node agent runs to move the snapshots with"
+    k exec -i "$agent" -c node-agent -- env ENVIRONMENTS="$environments" node --input-type=module - >"$OUT/snapshots-moved.part" <<'JS' || fail "the snapshots could not all be moved (the run again goes on with them): $(tail -n 3 "$OUT/snapshots-moved.part" 2>/dev/null)"
+import { createHash } from "node:crypto";
+import { request } from "node:http";
+import { Effect } from "effect";
+import { makeS3Bucket, sigV4Authorization } from "/opt/alasio/src/node-agent/s3.ts";
+
+const required = (name) => {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is not set`);
+  return value;
+};
+const options = {
+  endpoint: required("S3_ENDPOINT"),
+  region: required("S3_REGION"),
+  bucket: required("S3_BUCKET"),
+  accessKeyId: required("AWS_ACCESS_KEY_ID"),
+  secretAccessKey: required("AWS_SECRET_ACCESS_KEY"),
+};
+const bucket = makeS3Bucket(options);
+const run = (effect) => Effect.runPromise(effect);
+const endpoint = new URL(options.endpoint);
+const encoded = (value) => encodeURIComponent(value).replace(/[!'()*]/gu, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+// The object's size and ETag, as the bucket holds it: 7.0.0's client asks no HEAD.
+const head = (key) =>
+  new Promise((resolve, reject) => {
+    const path = `${endpoint.pathname.replace(/\/+$/u, "")}/${encoded(options.bucket)}/${key.split("/").map(encoded).join("/")}`;
+    const payloadHash = createHash("sha256").update("").digest("hex");
+    const headers = { host: endpoint.host, "x-amz-content-sha256": payloadHash, "x-amz-date": new Date().toISOString().replace(/[-:]|\.\d{3}/gu, "") };
+    const authorization = sigV4Authorization({ method: "HEAD", path, query: {}, headers, payloadHash }, { region: options.region, service: "s3" }, options);
+    const asked = request({ method: "HEAD", host: endpoint.hostname, port: endpoint.port, path, headers: { ...headers, authorization } }, (response) => {
+      response.resume();
+      if (response.statusCode === 200) resolve({ bytes: Number(response.headers["content-length"]), etag: String(response.headers.etag) });
+      else reject(new Error(`the bucket answered ${response.statusCode} to a HEAD of ${key}`));
+    });
+    asked.setTimeout(60_000, () => asked.destroy(new Error(`no answer to a HEAD of ${key} within 60 s`)));
+    asked.once("error", reject);
+    asked.end();
+  });
+// 7.0.0's id, to the second, as this release's, to the millisecond it was taken at.
+const anew = (snapshot, takenAt) => `${snapshot.slice(0, 15)}${String(Date.parse(takenAt) % 1000).padStart(3, "0")}${snapshot.slice(15)}`;
+const before = (snapshot) => `${snapshot.slice(0, 15)}${snapshot.slice(18)}`;
+
+for (const environment of required("ENVIRONMENTS").split(" ")) {
+  const keys = await run(bucket.list(`${environment}/`));
+  for (const workspace of [...new Set(keys.map((key) => key.split("/")[1]))]) {
+    const prefix = `${environment}/${workspace}`;
+    const left = keys.filter((key) => key.startsWith(`${prefix}/`) && key !== `${prefix}/current.json` && !key.startsWith(`${prefix}/layers/`) && !key.startsWith(`${prefix}/manifests/`));
+    const current = await run(bucket.getJson(`${prefix}/current.json`));
+    if (current && Array.isArray(current.layers)) {
+      process.stdout.write(`${environment} ${workspace} ${before(current.snapshot)} ${current.snapshot}\n`);
+    } else if (current) {
+      const { snapshot: was, image, files, environment: _environment, workspace: _workspace, ...rest } = current;
+      const snapshot = anew(was, current.takenAt);
+      const moved = [];
+      for (const file of files) {
+        const to = `${prefix}/layers/${image}/${file.path}`;
+        await run(bucket.copy(`${prefix}/${was}/${file.path}`, to, file.bytes));
+        const stored = await head(to);
+        if (stored.bytes !== file.bytes) throw new Error(`${to} is ${stored.bytes} bytes in the bucket, where the manifest of ${was} says ${file.bytes}`);
+        moved.push({ ...file, etag: stored.etag });
+      }
+      const manifest = { environment, workspace, snapshot, ...rest, layers: [{ digest: image, files: moved }] };
+      await run(bucket.putJson(`${prefix}/manifests/${snapshot}.json`, manifest));
+      await run(bucket.putJson(`${prefix}/current.json`, manifest));
+      process.stdout.write(`${environment} ${workspace} ${was} ${snapshot}\n`);
+    }
+    for (const key of left) await run(bucket.remove(key));
+  }
+}
+JS
+    while read -r environment workspace was snapshot; do
+      bound=$(kubectl -n "$environment" get sandboxes.agents.x-k8s.io "$workspace" --ignore-not-found -o jsonpath='{.metadata.annotations.alasio\.dev/snapshot}')
+      if [ "$bound" = "$was" ]; then
+        log "binding the Sandbox $environment/$workspace to its snapshot $snapshot, $was in 7.0.0's"
+        kubectl -n "$environment" annotate sandboxes.agents.x-k8s.io "$workspace" alasio.dev/snapshot="$snapshot" --overwrite >/dev/null
+      fi
+    done <"$OUT/snapshots-moved.part"
+  fi
+  for agent in $(k get pod -l app.kubernetes.io/component=node-agent -o jsonpath='{.items[*].metadata.name}'); do
+    log "emptying the snapshot cache of $agent, of 7.0.0's layout"
+    k exec "$agent" -c node-agent -- sh -c 'rm -rf /var/lib/alasio/snapshots/* /var/lib/alasio/snapshots/.[!.]*' || fail "the snapshot cache of $agent could not be emptied"
+  done
+  # Moved, the Sandboxes bound, the caches emptied: a run again goes on past it.
+  touch "$OUT/snapshots-moved.part" && mv "$OUT/snapshots-moved.part" "$OUT/snapshots-moved"
+fi
+
 log "upgrading, from the cut-over begun at $(cat "$OUT/point-of-no-return"): alasio restarts"
 printf '%s\n' "$UPGRADE" >"$OUT/upgrade"
 bash -c "$UPGRADE" 2>&1 | tee -a "$OUT/upgrade.log" ||
-  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again"
+  fail "the upgrade failed (upgrade.log): the cut-over run again goes on with it. To run 7.0.0 as it was instead: stop the storage controller (kubectl -n $NS scale deploy/$CONTROLLER --replicas=0), register node 1 back as $OUT/pageserver-registered has it (update nodes set listen_http_addr = 'alasio-neon-pageserver', listen_pg_addr = 'alasio-neon-pageserver' where node_id = 1, in its database), and start it again with the replicas it ran (kubectl -n $NS scale deploy/$CONTROLLER --replicas=$(cat "$OUT/controller-replicas")); where the pageservers' StatefulSet is made anew already (kubectl -n $NS get statefulset $PAGESERVERS finds it), delete it, its pod kept (kubectl -n $NS delete statefulset $PAGESERVERS --cascade=orphan); run 7.0.0's alasio up, which makes it again and takes the pod back; then restart main's compute (kubectl -n $NS rollout restart deploy/alasio-neon-compute), for it to reach the pageserver at 7.0.0's address again; 7.0.0 restores none of the snapshots moved to this release's layout ($OUT/snapshots-moved), whose sessions come back from bayma's checkpoints"
 # Given pod 0's, or asleep, as it then fetches its spec, with it, as it wakes.
 given() {
   local replicas layout
