@@ -8,7 +8,7 @@
  * fixtures (./support/kube-router-rules.ts).
  */
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, type PathLike, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { ConfigProvider, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
+import { Cause, ConfigProvider, Effect, Exit, Fiber, Layer, Option, Schedule, Scope } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -51,7 +51,7 @@ import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
-import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
+import { type FakeReleases, fakeReleases, POD_UID } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
 import { clusterDns, filterTable, sessionPod } from "./support/kube-router-rules.ts";
 
@@ -96,7 +96,8 @@ const POD_IPV6 = "fd00:42::f";
 /** The network policies that select a session's pod, as sessionPod's rules run it through them. */
 const SESSION_POLICIES = ["default-deny", "bayma-from-alasio", "telemetry-to-alasio"];
 
-const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
+/** A request to resume fs-abc's sandbox, restored from `snapshot`. */
+const resumeRequest = (snapshot: string, podIPs: readonly string[] = [POD_IP], containerIds: readonly string[] = [CONTAINER, OTHER_CONTAINER]): ResumeRequest => ({
   environment: "main",
   workspace: "fs-abc",
   namespace: SESSIONS,
@@ -104,7 +105,33 @@ const resumeRequest = (podIPs: readonly string[] = [POD_IP], containerIds: reado
   podIPs,
   containerIds,
   policies: SESSION_POLICIES,
+  snapshot,
 });
+
+/** The id of the snapshot of fs-abc `released` puts the manifest of in the bucket. */
+const RELEASED = "20261013T000000000Z-0000000a";
+
+/**
+ * Puts in the bucket the manifest of a snapshot of fs-abc a release took, RELEASED, as one
+ * the sandbox a resume names was restored from: its id.
+ */
+const released = (s3: FakeS3): string => {
+  const manifest: Manifest = {
+    environment: "main",
+    workspace: "fs-abc",
+    snapshot: RELEASED,
+    release: RELEASE,
+    cpuFeatures: [],
+    podTemplate: POD_TEMPLATE,
+    layers: [{ digest: "a".repeat(64), files: [] }],
+    bytes: 0,
+    takenAt: "2026-10-13T00:00:00.000Z",
+    pauseMs: 0,
+    uploadMs: 0,
+  };
+  s3.objects.set(`main/fs-abc/manifests/${RELEASED}.json`, Buffer.from(JSON.stringify(manifest)));
+  return RELEASED;
+};
 
 /** What conntrack says where it deleted no connection, as it exits 1. */
 const NO_CONNECTIONS: HostRun = { exitCode: 1, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted.\n" };
@@ -341,7 +368,7 @@ test("the checkpoint of a sandbox restored from a snapshot, which tracks its wri
         Effect.gen(function*() {
           const { manifest } = yield* there.agent.prepare(workspace);
           yield* there.agent.spend(workspace, manifest.snapshot);
-          yield* there.agent.resume(resumeRequest());
+          yield* there.agent.resume(resumeRequest(manifest.snapshot));
         });
       yield* restored();
       const asked = s3.requests.length;
@@ -394,7 +421,7 @@ test("a cached image that is not what its manifest says is read again from the b
       const there = yield* node("node-2");
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.spend(workspace, manifest.snapshot);
-      yield* there.agent.resume(resumeRequest());
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
       const [own] = delta.layers;
       assert.ok(own);
@@ -423,7 +450,7 @@ test("a prepared snapshot is verified by runsc, its images read again from the b
       const there = yield* node("node-2");
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.spend(workspace, manifest.snapshot);
-      yield* there.agent.resume(resumeRequest());
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
       const [own] = delta.layers;
       assert.ok(own);
@@ -512,7 +539,7 @@ test("a release's snapshot whose chain is due is compacted into one image, at th
           Effect.gen(function*() {
             const { manifest } = yield* there.agent.prepare(workspace);
             yield* there.agent.spend(workspace, manifest.snapshot);
-            yield* there.agent.resume(resumeRequest());
+            yield* there.agent.resume(resumeRequest(manifest.snapshot));
           });
         yield* restored();
         // The sandbox wrote over as much as its base holds.
@@ -578,7 +605,7 @@ test("a spend of a snapshot spends the one compacted from it, which a compaction
       const there = yield* node("node-2");
       const { manifest } = yield* there.agent.prepare(workspace);
       yield* there.agent.spend(workspace, manifest.snapshot);
-      yield* there.agent.resume(resumeRequest());
+      yield* there.agent.resume(resumeRequest(manifest.snapshot));
       writeFileSync(join(there.releases.dirOf(RELEASE), "delta-pages-bytes"), "4096");
       const delta = yield* there.agent.checkpoint(request("fs-abc"));
       // A restore reads the delta as current, and prepares it; meanwhile its compaction commits.
@@ -612,7 +639,7 @@ test("a compaction the workspace moves on from meanwhile commits nothing, what i
             yield* here.agent.checkpoint(request("fs-abc"));
             const { manifest } = yield* here.agent.prepare(workspace);
             yield* here.agent.spend(workspace, manifest.snapshot);
-            yield* here.agent.resume(resumeRequest());
+            yield* here.agent.resume(resumeRequest(manifest.snapshot));
             writeFileSync(join(runscDir, "delta-pages-bytes"), "4096");
             return yield* here.agent.checkpoint(take);
           });
@@ -663,8 +690,8 @@ test("a snapshot is committed only once each image it refers to is in the bucket
       const there = yield* node("node-2");
       const restored = () =>
         Effect.gen(function*() {
-          yield* there.agent.prepare(workspace);
-          yield* there.agent.resume(resumeRequest());
+          const { manifest } = yield* there.agent.prepare(workspace);
+          yield* there.agent.resume(resumeRequest(manifest.snapshot));
         });
       // Lost, or another of the same size there, as its ETag says: put again from this node's cache.
       for (const lose of [(key: string) => s3.objects.delete(key), (key: string) => s3.objects.set(key, Buffer.alloc(4096, "other"))]) {
@@ -830,7 +857,7 @@ test("a checkpoint taken live leaves its sandbox running, records what bayma sai
   ));
 
 test("a sandbox restored from a snapshot taken live resumes only while bayma's state generation is the one it caught, read on its volume as untrusted", () =>
-  withBucket(({ node }) =>
+  withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const workspace = { environment: "main", workspace: "fs-abc" };
       const outside = mkdtempSync(join(tmpdir(), "alasio-volume-"));
@@ -866,14 +893,14 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       const refused = (agent: NodeAgent, why: RegExp) =>
         Effect.gen(function*() {
           const before = resumes();
-          const said = failure(yield* Effect.exit(agent.resume(resumeRequest()).pipe(Effect.timeout("5 seconds"))));
+          const said = failure(yield* Effect.exit(agent.resume(resumeRequest(snapshot.snapshot)).pipe(Effect.timeout("5 seconds"))));
           assert.match(said, new RegExp(`^the snapshot ${snapshot.snapshot} of main/fs-abc, taken live, holds the session no more: ${why.source}; its sandbox is left paused$`, "u"));
           assert.equal(resumes(), before);
         });
 
       // Nothing its clients were told of happened since the save, as bayma's padding leaves it: it resumes.
       generation(matching.padEnd(127) + "\n");
-      yield* there.agent.resume(resumeRequest());
+      yield* there.agent.resume(resumeRequest(snapshot.snapshot));
       assert.equal(resumes(), 2);
 
       // The generation moved on, or there is none.
@@ -937,7 +964,7 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       rmSync(spec);
       execFileSync("mkfifo", [spec]);
       const resumed = resumes();
-      const slow = failure(yield* Effect.exit(there.agent.resume(resumeRequest()).pipe(Effect.timeout(STATE_READ_TIMEOUT_MS + 10_000))));
+      const slow = failure(yield* Effect.exit(there.agent.resume(resumeRequest(snapshot.snapshot)).pipe(Effect.timeout(STATE_READ_TIMEOUT_MS + 10_000))));
       // What waits on it is given it, and ends.
       const writing = openSync(spec, constants.O_WRONLY | constants.O_NONBLOCK);
       writeSync(writing, specified);
@@ -957,7 +984,23 @@ test("a sandbox restored from a snapshot taken live resumes only while bayma's s
       generation(JSON.stringify({ schemaVersion: 1, generation: 9 }));
       yield* refused(again, /bayma's state generation is 9, and was 5 as it was saved/u);
       generation(matching);
-      yield* again.resume(resumeRequest());
+      yield* again.resume(resumeRequest(snapshot.snapshot));
+      // One whose cache keeps no manifest of it reads the bucket's, and one neither holds is not let run either.
+      const unkept = yield* there.restarted;
+      rmSync(join(there.cacheDir, "main", "fs-abc", "manifest.json"));
+      generation(JSON.stringify({ schemaVersion: 1, generation: 9 }));
+      yield* refused(unkept, /bayma's state generation is 9, and was 5 as it was saved/u);
+      generation(matching);
+      // One the bucket fails to give is not let run either, but as the bucket's failure, which may pass, not as one refused.
+      const manifestKey = `main/fs-abc/manifests/${snapshot.snapshot}.json`;
+      s3.refuse = (method, key) => (method === "GET" && key === manifestKey ? 403 : null);
+      const before = resumes();
+      const unread = yield* Effect.exit(unkept.resume(resumeRequest(snapshot.snapshot)));
+      s3.refuse = () => null;
+      assert.ok(Exit.isFailure(unread) && Cause.findErrorOption(unread.cause).pipe(Option.map(({ _tag }) => _tag), Option.getOrUndefined) === "S3Error", failure(unread));
+      assert.equal(resumes(), before);
+      s3.objects.delete(manifestKey);
+      yield* refused(unkept, /its manifest cannot be read, so whether it may run cannot be told: neither this node nor the bucket holds it/u);
     })
   ));
 
@@ -1270,7 +1313,7 @@ test("a checkpoint's images, the one it stages and the parent it saves a delta o
       yield* here.agent.checkpoint(request("fs-abc"));
       const { manifest } = yield* here.agent.prepare(workspace);
       yield* here.agent.spend(workspace, manifest.snapshot);
-      yield* here.agent.resume(resumeRequest([POD_IP], [CONTAINER]));
+      yield* here.agent.resume(resumeRequest(manifest.snapshot, [POD_IP], [CONTAINER]));
       const held = join(here.releases.dirOf(RELEASE), "hold-checkpoint");
       writeFileSync(held, "");
       const checkpoints = () => here.releases.calls(RELEASE).filter((args) => args.includes("checkpoint")).length;
@@ -1487,13 +1530,14 @@ test("a pod's address has kube-router's rules once a jump of what it sends, comm
 });
 
 test("a resume waits for the pod's rules on every address, forgets the connections tracked from them, then resumes each container", () =>
-  withBucket(({ node }) =>
+  withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
+      const snapshot = released(s3);
       const { host } = here;
       const programmed = host.ipv4;
       host.ipv4 = filterTable([clusterDns("10.42.0.3"), sessionPod("fs-old999", POD_IP)]);
-      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest([POD_IP, POD_IPV6])));
+      const resuming = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot, [POD_IP, POD_IPV6])));
       yield* TestClock.adjust("1 second");
       // Looked for every 250 ms, its sandbox untouched meanwhile.
       assert.equal(resuming.pollUnsafe(), undefined);
@@ -1519,15 +1563,16 @@ test("a resume waits for the pod's rules on every address, forgets the connectio
   ));
 
 test("a resume whose pod's rules do not come within its wait, or whose commands fail, leaves the sandbox paused, saying why", () =>
-  withBucket(({ node }) =>
+  withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
+      const snapshot = released(s3);
       const { host } = here;
       const programmed = host.ipv6;
 
       // Its IPv6 address's rules do not come.
       host.ipv6 = filterTable([sessionPod("fs-old999", POD_IPV6)], { family: 6 });
-      const waiting = yield* Effect.forkChild(here.agent.resume(resumeRequest([POD_IP, POD_IPV6])));
+      const waiting = yield* Effect.forkChild(here.agent.resume(resumeRequest(snapshot, [POD_IP, POD_IPV6])));
       yield* TestClock.adjust("29 seconds");
       assert.equal(waiting.pollUnsafe(), undefined);
       yield* TestClock.adjust("1 second");
@@ -1542,14 +1587,14 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
       // The node has no ip6tables-save, as nsenter says.
       host.answer = ([program]) => (program === "ip6tables-save" ? { exitCode: 127, stdout: "", stderr: "nsenter: failed to execute ip6tables-save: No such file or directory\n" } : null);
       assert.equal(
-        failure(yield* Effect.exit(here.agent.resume(resumeRequest([POD_IPV6])))),
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot, [POD_IPV6])))),
         "ip6tables-save -t filter on the node failed: nsenter: failed to execute ip6tables-save: No such file or directory",
       );
 
       // conntrack fails, as it does deleting none.
       host.answer = ([program]) => (program === "conntrack" ? { exitCode: 1, stdout: "", stderr: "conntrack v1.4.8 (conntrack-tools): Operation failed: Operation not permitted\n" } : null);
       assert.equal(
-        failure(yield* Effect.exit(here.agent.resume(resumeRequest()))),
+        failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))),
         `conntrack -D -s ${POD_IP} on the node failed: conntrack v1.4.8 (conntrack-tools): Operation failed: Operation not permitted`,
       );
       assert.deepEqual(here.releases.calls(RELEASE), []);
@@ -1557,7 +1602,7 @@ test("a resume whose pod's rules do not come within its wait, or whose commands 
 
       // runsc fails.
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
-      assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), `runsc resume of ${RELEASE} failed: resume failed: the container is gone`);
+      assert.equal(failure(yield* Effect.exit(here.agent.resume(resumeRequest(snapshot)))), `runsc resume of ${RELEASE} failed: resume failed: the container is gone`);
     }).pipe(Effect.provide(TestClock.layer()))
   ));
 
@@ -1707,17 +1752,19 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
       assert.deepEqual(keysOf(s3, "main/fs-abc/"), []);
       assert.equal(cachesAny(here, "fs-abc"), false);
 
-      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(), podIPs: ["10.42.0.300"] }));
-      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(), podIPs: [] }));
-      error(400, /containerIds/u)(yield* call("POST", "/resume", { ...resumeRequest(), containerIds: ["short"] }));
-      error(400, /pod/u)(yield* call("POST", "/resume", { ...resumeRequest(), pod: "fs_abc123" }));
-      assert.deepEqual(yield* call("POST", "/resume", resumeRequest()), { status: 204, body: null });
+      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), podIPs: ["10.42.0.300"] }));
+      error(400, /podIPs/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), podIPs: [] }));
+      error(400, /containerIds/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), containerIds: ["short"] }));
+      error(400, /pod/u)(yield* call("POST", "/resume", { ...resumeRequest(RELEASED), pod: "fs_abc123" }));
+      assert.deepEqual(yield* call("POST", "/resume", resumeRequest(released(s3))), { status: 204, body: null });
       assert.deepEqual(here.releases.calls(RELEASE).slice(-2).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
 
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-checkpoint"), "");
       failed(500, /^checkpointing main\/fs-abc failed: .*its snapshot is forgotten/u)(yield* run("checkpoints", request("fs-abc")));
+      // Its snapshot forgotten, the manifest of the one a resume names cannot be read: refused.
+      error(410, /its manifest cannot be read, so whether it may run cannot be told/u)(yield* call("POST", "/resume", resumeRequest(RELEASED)));
       writeFileSync(join(here.releases.dirOf(RELEASE), "fail-resume"), "");
-      error(500, `runsc resume of ${RELEASE} failed: resume failed: the container is gone`)(yield* call("POST", "/resume", resumeRequest()));
+      error(500, `runsc resume of ${RELEASE} failed: resume failed: the container is gone`)(yield* call("POST", "/resume", resumeRequest(released(s3))));
       error(404, "there is no GET /snapshots")(yield* call("GET", "/snapshots"));
     })
   ));
@@ -1785,26 +1832,27 @@ test("a checkpoint alasio stops waiting for goes on, one asked for meanwhile is 
   ));
 
 test("alasio has a restored sandbox resumed by its node's agent, or is told why not", () =>
-  withBucket(({ node }) =>
+  withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
-      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest());
+      const snapshot = released(s3);
+      yield* (yield* agentsOf(here.agent)).resume("node-1", resumeRequest(snapshot));
       assert.deepEqual(here.releases.calls(RELEASE).map((args) => args.slice(-2)), [["resume", CONTAINER], ["resume", OTHER_CONTAINER]]);
 
       // An agent whose wait ended answers 504.
       const late = new PoliciesNotInForce({ namespace: SESSIONS, pod: POD, ip: POD_IP, reason: "KUBE-ROUTER-FORWARD has no jump of what it sends" });
-      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest()));
+      const refused = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(late) })).resume("node-1", resumeRequest(snapshot)));
       assert.equal(refused.message, `the node agent of node-1 could not resume main/fs-abc's sandbox: ${late.message}`);
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 504);
 
       // One restored from a snapshot that holds the session no more answers 410.
       const outlived = new SnapshotOutlived({ environment: "main", workspace: "fs-abc", snapshot: "20261013T000000000Z-00000001", reason: "bayma's state generation is 6, and was 5 as it was saved" });
-      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest()));
+      const gone = yield* Effect.flip((yield* agentsOf({ ...here.agent, resume: () => Effect.fail(outlived) })).resume("node-1", resumeRequest(snapshot)));
       assert.equal(gone._tag === "NodeAgentError" && gone.status, 410);
     })
   ));
 
-const abandonRequest: AbandonRequest = { environment: "main", workspace: "fs-abc", namespace: SESSIONS, pod: POD };
+const abandonRequest: AbandonRequest = { environment: "main", workspace: "fs-abc", namespace: SESSIONS, pod: POD, uid: POD_UID };
 
 /** A process of the test's on `node`, started as runsc would start it, named `argv0`, and the signal that ends it, once one does; killed as the scope closes. */
 const runscProcess = (node: Node, argv0: string, args: readonly string[]) =>
@@ -1856,10 +1904,54 @@ test("an abandon kills what runsc runs for the pod's containers, their sandbox, 
       assert.equal(yield* Effect.promise(() => left.ended), "SIGKILL");
       const refused = yield* Effect.flip(agents.abandon("node-1", { ...abandonRequest, pod: "fs_abc123" }));
       assert.equal(refused._tag === "NodeAgentError" && refused.status, 400);
+      const unnamed = yield* Effect.flip(agents.abandon("node-1", { ...abandonRequest, uid: "pod-1" }));
+      assert.equal(unnamed._tag === "NodeAgentError" && unnamed.status, 400);
     })
   ));
 
-test("an abandon kills no process of another pod's container, of no container's, of another root or bundle, or whose start time has changed since it was found", () =>
+test("an abandon kills what a process it found forks meanwhile, which a scan after its kills finds, scanning until one kills nothing new", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      // As the agent's first scan returns, the restore it finds forks its gofer, which the
+      // scan did not see.
+      let fork = false;
+      let child: ChildProcess | undefined;
+      const scans: number[] = [];
+      const here = yield* node("node-1", {
+        runsc: (runsc, releases) => ({
+          ...runsc,
+          processes: (containers) =>
+            runsc.processes(containers).pipe(
+              Effect.tap((found) =>
+                Effect.sync(() => {
+                  scans.push(found.length);
+                  if (!fork) return;
+                  fork = false;
+                  child = releases.starts("runsc-gofer", goferArgs(here, CONTAINER));
+                })
+              ),
+            ),
+        }),
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(() => child?.kill("SIGKILL")));
+      const restoring = yield* runscProcess(here, "runsc", [`--root=${RUNSC_ROOT}`, "restore", "--image-path=/var/lib/alasio/snapshots/main/fs-abc/s-1", "--bundle", here.releases.bundleOf(CONTAINER), CONTAINER]);
+      fork = true;
+      const killed = yield* here.agent.abandon(abandonRequest);
+      const gofer = child;
+      assert.ok(gofer?.pid, "no gofer was forked");
+      const ended = new Promise<NodeJS.Signals | null>((resolve) => {
+        if (gofer.exitCode !== null || gofer.signalCode !== null) resolve(gofer.signalCode);
+        else gofer.once("exit", (_code, signal) => resolve(signal));
+      });
+      assert.deepEqual(killed, [{ containerId: CONTAINER, pid: restoring.pid }, { containerId: CONTAINER, pid: gofer.pid }]);
+      assert.equal(yield* Effect.promise(() => restoring.ended), "SIGKILL");
+      assert.equal(yield* Effect.promise(() => ended), "SIGKILL");
+      // The first scan found the restore, the second its gofer, and the third, killing nothing new, ended them.
+      assert.equal(scans.length, 3);
+    })
+  ));
+
+test("an abandon kills no process of another pod's container, of a pod of its name made since, of no container's, of another root or bundle, or whose start time has changed since it was found", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
       // The node gives the pid of the process `restarting` names to another as the agent finds them.
@@ -1870,8 +1962,12 @@ test("an abandon kills no process of another pod's container, of no container's,
       const OTHER_POD_CONTAINER = "0f".repeat(32);
       const UNKNOWN = "c".repeat(64);
       here.releases.runs(OTHER_POD_CONTAINER, RELEASE, SESSIONS, "fs-other");
+      // Of a pod of its namespace and name, but another uid, as one made since is.
+      const RECREATED_CONTAINER = "1e".repeat(32);
+      here.releases.runs(RECREATED_CONTAINER, RELEASE, SESSIONS, POD, true, [], "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d");
       const spared = [
         yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, OTHER_POD_CONTAINER)),
+        yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, RECREATED_CONTAINER)),
         yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, UNKNOWN)),
         yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER, "/run/containerd/runsc/other")),
         yield* runscProcess(here, "runsc-sandbox", sandboxArgs(here, CONTAINER, RUNSC_ROOT, here.releases.bundleOf(UNKNOWN))),
@@ -1998,7 +2094,7 @@ test("a checkpoint is taken under the release that runs the container, whatever 
       // Another pod's container is refused, as is one no release runs.
       here.releases.runs(OTHER_CONTAINER, RELEASE, SESSIONS, "fs-other");
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER)))), /is not of the pod alasio-sessions\/fs-abc123, but of alasio-sessions\/fs-other/u);
-      assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), /is not of the pod alasio-sessions\/fs-abc123/u);
+      assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest(RELEASED)))), /is not of the pod alasio-sessions\/fs-abc123/u);
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", "c".repeat(64))))), /container does not exist/u);
     })
   ));

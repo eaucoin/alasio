@@ -174,10 +174,13 @@ export interface FakeReleases {
   /**
    * Makes the container run under `release`, in the pod `namespace`/`pod`, as runsc's state
    * says, its sandbox tracking its writes (`--dirty-tracking=wp`) unless `tracksWrites` is
-   * false, and its spec, in its bundle, mounting `mounts`.
+   * false, its spec, in its bundle, mounting `mounts`, and its pod's uid `uid`, POD_UID unless given.
    */
-  readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[]) => void;
+  readonly runs: (containerId: string, release: string, namespace: string, pod: string, tracksWrites?: boolean, mounts?: readonly OciMount[], uid?: string) => void;
 }
+
+/** The uid of the pod a container runs in, as containerd's annotations say it, unless FakeReleases.runs is given another. */
+export const POD_UID = "6f1c2b9e-3d4a-4e5f-8a7b-0c1d2e3f4a5b";
 
 /** Installs `releases` under `root`, each with an options file giving runsc systemd's cgroups. */
 export function fakeReleases(root: string, releases: readonly string[]): FakeReleases {
@@ -195,7 +198,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
   const containers = join(releasesDir, "containers.json");
   const bundleOf = (containerId: string) => join(root, "bundles", containerId);
   let pid = 4000;
-  const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true, mounts: readonly OciMount[] = []) => {
+  const runs = (containerId: string, release: string, namespace: string, pod: string, tracksWrites = true, mounts: readonly OciMount[] = [], uid = POD_UID) => {
     const held = existsSync(containers) ? JSON.parse(readFileSync(containers, "utf8")) as Record<string, unknown> : {};
     pid += 1;
     mkdirSync(join(procRoot, String(pid)), { recursive: true });
@@ -206,7 +209,7 @@ export function fakeReleases(root: string, releases: readonly string[]): FakeRel
     const bundle = bundleOf(containerId);
     mkdirSync(bundle, { recursive: true });
     writeFileSync(join(bundle, "config.json"), JSON.stringify({ ociVersion: "1.2.0", mounts: mounts.map((mount) => ({ ...mount, type: "bind", options: ["rbind"] })) }));
-    held[containerId] = { pid, bundle, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod } };
+    held[containerId] = { pid, bundle, annotations: { "io.kubernetes.cri.sandbox-namespace": namespace, "io.kubernetes.cri.sandbox-name": pod, "io.kubernetes.cri.sandbox-uid": uid } };
     writeFileSync(containers, JSON.stringify(held));
   };
   const starts = (argv0: string, args: readonly string[]) => {

@@ -89,8 +89,8 @@ export interface NodeAgents {
    */
   readonly resume: (node: string, request: ResumeRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
-   * Abandons the restore `request` names, into its pod on `node`, refused before its
-   * sandbox resumed: the agent kills what runsc runs for the pod's containers there, so
+   * Abandons the restore `request` names, into its pod on `node`, of the uid it names,
+   * refused before its sandbox resumed: the agent kills what runsc runs for the pod's containers there, so
    * that its teardown waits on none of it. What it killed.
    */
   readonly abandon: (node: string, request: AbandonRequest) => Effect.Effect<readonly Killed[], NodeAgentError | KubeApiError>;
