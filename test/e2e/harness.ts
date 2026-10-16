@@ -846,9 +846,11 @@ export function routeAddress(): Promise<string> {
  * over so, as the configuration itself is laid over only as UPGRADE runs, and sudo asking this
  * user for no password; Telegram told this machine's address however private, as the
  * stand-in, in the cluster, reaches it; failing at `failAt`, a point the script names, when
- * given. What it came to; from its success on, the run runs this checkout's `alasio`.
+ * given; with `moveBack`, as MOVE_BACK=1 runs it, moving the sessions' snapshots back alone.
+ * What it came to; from its success on, but for a move back, the run runs this checkout's
+ * `alasio`.
  */
-export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Promise<Ran> {
+export async function cutOver({ failAt, moveBack = false }: { readonly failAt?: string; readonly moveBack?: boolean } = {}): Promise<Ran> {
   const { work, env, configFile, kubeconfig, release } = current();
   const script = join(root, "upgrades", `from-${PREVIOUS}.sh`);
   if (!existsSync(script)) throw new Error(`no upgrades/from-${PREVIOUS}.sh says how an installation of ${PREVIOUS} upgrades to this release: write one, if only to run UPGRADE`);
@@ -871,13 +873,23 @@ export async function cutOver({ failAt }: { readonly failAt?: string } = {}): Pr
     command(...owner(copy), release, "upgrade", "--check"),
     command("sudo", "-u", user, "sudo", "-n", "true"),
   ].join(" && ");
-  const out = join(work, "cut-over");
+  const out = cutOverRecord();
   console.error(`# the cut-over from ${PREVIOUS}: upgrades/from-${PREVIOUS}.sh, recording in ${out}`);
-  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, "PRIVATE_ADDRESS=allowed", ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), "bash", script], {
+  const ran = await capture(spawn("sudo", ["-n", "env", `PATH=${process.env["PATH"] ?? ""}`, `KUBECONFIG=${kubeconfig}`, `CONFIG=${configFile}`, `OUT=${out}`, `UPGRADE=${upgrade}`, `UPGRADE_CHECK=${check}`, "PRIVATE_ADDRESS=allowed", ...(failAt === undefined ? [] : [`FAIL_AT=${failAt}`]), ...(moveBack ? ["MOVE_BACK=1"] : []), "bash", script], {
     stdio: ["ignore", "pipe", "pipe"],
   }));
-  if (ran.code === 0) current().bin = release;
+  if (ran.code === 0 && !moveBack) current().bin = release;
   return ran;
+}
+
+/** Where the upgrade shard's cut-over keeps its record (its OUT), which root owns. */
+function cutOverRecord(): string {
+  return join(current().work, "cut-over");
+}
+
+/** sh `script`, as root, in the record the upgrade shard's cut-over keeps, as its operator would change it: what it printed. */
+export async function inCutOverRecord(script: string): Promise<string> {
+  return (await sudo("sh", "-c", `cd ${shellWord(cutOverRecord())} && ${script}`)).stdout;
 }
 
 /**
