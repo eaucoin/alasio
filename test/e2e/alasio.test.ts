@@ -32,6 +32,7 @@ import { PAGESERVERS_NAME, pageserverName } from "../../cli/src/manifests/neon.t
 import { WEBHOOK_HEALTH_PORT } from "../../cli/src/manifests/webhook.ts";
 import { computeId, MAIN, replicaId } from "../../neon/control/branches.ts";
 import { neonStack } from "../../neon/test/stack.ts";
+import { SNAPSHOT_ANNOTATION } from "../../src/kube/sandbox-shape.ts";
 import type { Sandbox } from "../../src/kube/sandboxes.ts";
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
@@ -529,6 +530,18 @@ if (inShard("upgrade")) {
       await tg.waitFor((call) => answered(call));
     });
 
+    /** Main's session's REPL, live as the session is released, and the snapshot it is released into on PREVIOUS. */
+    let releasedRepl: string;
+    let releasedAs: string;
+
+    test(`on ${PREVIOUS}: main's session released into a snapshot of its layout, a REPL live in it, which the cut-over moves`, { timeout: 30 * 60_000 }, async () => {
+      ({ sessionId: releasedRepl } = await repl.set(volumeId, `released by ${volumeId}`));
+      await untilReleased(volumeId, Date.now());
+      releasedAs = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
+      // An id of PREVIOUS's, to the second.
+      assert.match(releasedAs, /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/u);
+    });
+
     test(`the cut-over from ${PREVIOUS}, upgrades/from-${PREVIOUS}.sh, as the box runs it, run again after those failures, through`, { timeout: 60 * 60_000 }, async () => {
       // Each second it runs: whether main's compute, awake, has an address to read pages at,
       // PREVIOUS's pageservers' Service or the one neon-control gave it; whether this release's
@@ -566,6 +579,19 @@ if (inShard("upgrade")) {
       assert.doesNotMatch(ran.stderr, /registering node 1 anew|starting the storage controller again/u);
       assert.match(ran.stderr, /deleting 7\.0\.0's pageservers' Service, main's compute given pod 0's\n[^\n]* upgraded at \S+\n[^\n]* deleting what alasio kept of polling Telegram\n[^\n]* through\n$/u);
       upgraded = Date.now();
+    });
+
+    test(`upgraded: main's session's snapshot moved to this release's layout, under its id to the millisecond, its Sandbox bound to it, and restored with its REPL whole`, { timeout: 30 * 60_000 }, async () => {
+      const bound = (await kube.get<Sandbox>(ref("Sandbox", volumeId, SESSIONS)))?.metadata.annotations?.[SNAPSHOT_ANNOTATION] ?? "";
+      assert.match(bound, new RegExp(`^${releasedAs.slice(0, 15)}[0-9]{3}${releasedAs.slice(15)}$`, "u"));
+      const moved = await snapshotOf(volumeId);
+      assert.equal(moved?.snapshot, bound);
+      assert.equal(moved?.layers.length, 1);
+      await tg.say("from the snapshot moved");
+      await tg.waitFor((call) => answered(call));
+      const seen = await repl.read(volumeId, releasedRepl);
+      assert.deepEqual([seen.live, seen.checkpointed], [`released by ${volumeId}`, `released by ${volumeId}`]);
+      assert.match(seen.notice ?? "", CAME_BACK_WHOLE);
     });
 
     test(`the cut-over from ${PREVIOUS} run again, once it has upgraded, goes on with what follows the upgrade alone`, { timeout: 60 * 60_000 }, async () => {
