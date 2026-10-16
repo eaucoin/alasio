@@ -20,7 +20,7 @@ import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline } from "./manifests/alasio.ts";
-import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.ts";
+import { labels, NAMESPACE, nodeAgentRuns } from "./manifests/common.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -82,21 +82,11 @@ export interface Installed {
  * applying it as a dry run said: nothing is applied, as one refused midway would leave the
  * installation half of one release, half of the other.
  */
-export class ObjectRefused extends Schema.TaggedError<ObjectRefused>()("ObjectRefused", { object: Schema.String, reason: Schema.String, remedy: Schema.String }) {
+export class ObjectRefused extends Schema.TaggedError<ObjectRefused>()("ObjectRefused", { object: Schema.String, reason: Schema.String }) {
   override get message(): string {
-    return `the cluster's ${this.object} cannot take this release's of it (${this.reason}), so alasio applies nothing${this.remedy ? `: ${this.remedy}` : ""}`;
+    return `the cluster's ${this.object} cannot take this release's of it (${this.reason}), so alasio applies nothing`;
   }
 }
-
-/**
- * What makes an object the cluster has able to take this release's, by the object, where an
- * upgrade to this release is to be made by hand: the pageservers' StatefulSet of 7.0.0,
- * whose pods start in order, as this release's start at once, a field Kubernetes changes of
- * no StatefulSet.
- */
-const REMEDIES: ReadonlyMap<string, string> = new Map([
-  [`StatefulSet ${NAMESPACE}/${neonName("pageserver")}`, "an installation of 7.0.0 is upgraded by upgrades/from-7.0.0.sh, which makes it anew, keeping its pod and claim"],
-]);
 
 /** Refuses `objects` where the cluster has one that cannot take this release's of it, each applied as a dry run. */
 const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<void, KubeApiError | ObjectRefused, KubeApi> =>
@@ -107,7 +97,7 @@ const checkApplicable = (objects: readonly KubernetesObject[]): Effect.Effect<vo
         live
           ? kube.dryApply(labelled(object)).pipe(
             Effect.asVoid,
-            Effect.catchIf(hasStatus(422), (error) => Effect.fail(new ObjectRefused({ object: describeRef(ref), reason: error.reason, remedy: REMEDIES.get(describeRef(ref)) ?? "" }))),
+            Effect.catchIf(hasStatus(422), (error) => Effect.fail(new ObjectRefused({ object: describeRef(ref), reason: error.reason }))),
           )
           : Effect.void);
     }, { concurrency: 8, discard: true }));
