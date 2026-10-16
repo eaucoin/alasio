@@ -38,7 +38,7 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
-import { tmpdir, userInfo } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -893,6 +893,53 @@ export async function inCutOverRecord(script: string): Promise<string> {
   return (await sudo("sh", "-c", `cd ${shellWord(cutOverRecord())} && ${script}`)).stdout;
 }
 
+/** A line k3s, containerd or kubelet logs as an error: logrus's level, or klog's E or F. */
+export const LOGGED_ERROR = /level=(?:error|fatal)|[EF]\d{4} \d{2}:/u;
+
+/**
+ * What each of the cluster's nodes that `which` names, or each when it names none, says of
+ * itself, which the API cannot say of a node that never joined: its container's state, in
+ * Docker, the errors k3s logged (its agent's kubelet's among them) and its last lines, and
+ * the last lines of its containerd's log, where gVisor's shim logs too.
+ */
+async function dumpNodes(which: ((node: string) => boolean) | undefined): Promise<string[]> {
+  const said: string[] = [];
+  const say = (line: string) => said.push(line);
+  const lastOf = (heading: string, logged: string, errorsOnly = false) => {
+    const lines = logged.trimEnd().split("\n").filter((line) => !errorsOnly || LOGGED_ERROR.test(line)).slice(errorsOnly ? -40 : -30);
+    say(`${heading}${lines.length === 0 ? ": none" : ":"}`);
+    for (const line of lines) say(`  ${line}`);
+  };
+  const failure = (error: unknown) => `could not be read: ${error instanceof Error ? error.message : String(error)}`;
+  const containerdLog = "tail -n 30 /var/lib/rancher/k3s/agent/containerd/containerd.log";
+  try {
+    if (TARGET === "host") {
+      if (which && !which(hostname())) return said;
+      const logged = await sudo("journalctl", "--unit=k3s", "--no-pager", "--lines=2000").then(({ stdout }) => stdout, failure);
+      say(`--- this machine, the node ${hostname()}`);
+      lastOf("k3s's errors", logged, true);
+      lastOf("k3s's last lines", logged);
+      lastOf("containerd's last lines", await sudo("sh", "-c", containerdLog).then(({ stdout }) => stdout, failure));
+      return said;
+    }
+    const { stdout } = await docker("ps", "--all", "--filter", `label=alasio.cluster=${CLUSTER}`, "--format", "{{.Names}}");
+    for (const node of stdout.split("\n").filter(Boolean).sort()) {
+      if (which && !which(node)) continue;
+      const state = await docker("inspect", "--format", "{{.State.Status}}, started {{.State.StartedAt}}, exit code {{.State.ExitCode}}{{if .State.Error}}, {{.State.Error}}{{end}}, restarted {{.RestartCount}} times", node)
+        .then(({ stdout: inspected }) => inspected.trim(), failure);
+      say(`--- node ${node}: its container ${state}`);
+      // k3s logs on stderr, which docker logs says as such.
+      const logged = await docker("logs", "--tail", "2000", node).then(({ stdout: out, stderr }) => `${out}${stderr}`, failure);
+      lastOf("k3s's errors", logged, true);
+      lastOf("k3s's last lines", logged);
+      lastOf("containerd's last lines", await docker("exec", node, "sh", "-c", containerdLog).then(({ stdout: out }) => out, failure));
+    }
+  } catch (error) {
+    say(`the cluster's nodes could not be listed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return said;
+}
+
 /**
  * What the cluster is doing, said on stderr, folded in GitHub's log: its nodes, pods (each
  * container's restarts with them) and latest events, why each pod that is not ready is
@@ -902,15 +949,27 @@ export async function inCutOverRecord(script: string): Promise<string> {
  * its intake's, whose queries and writes wait on the catalog there unseen; and of any
  * other ready pod a container of which restarted, as one killed for its memory is ready
  * again by the time this is said; and the warnings and errors of the object store's parts.
+ * Before the API answers, or for a node not ready, what the node itself logs, as dumpNodes
+ * says.
  */
 export async function dumpClusterState(): Promise<void> {
-  if (!api) return;
+  if (!setup) return;
+  if (!api) {
+    process.stderr.write(`${["::group::cluster state", ...await dumpNodes(undefined), "::endgroup::"].join("\n")}\n`);
+    return;
+  }
   const said: string[] = ["::group::cluster state"];
   const say = (line: string) => said.push(line);
   const ready = (conditions: readonly { readonly type: string; readonly status: string }[] | undefined) =>
     conditions?.find(({ type }) => type === "Ready")?.status === "True";
   try {
-    for (const node of await kube.list<V1Node>("Node")) say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : "not ready"}`);
+    const nodes = await kube.list<V1Node>("Node");
+    for (const node of nodes) {
+      const condition = node.status?.conditions?.find(({ type }) => type === "Ready");
+      say(`node ${node.metadata?.name}: ${ready(node.status?.conditions) ? "ready" : `not ready${condition ? ` (${condition.reason}: ${condition.message})` : ""}`}`);
+    }
+    const notReady = new Set(nodes.filter((node) => !ready(node.status?.conditions)).map((node) => node.metadata?.name ?? ""));
+    for (const line of await dumpNodes((node) => notReady.has(node) || !nodes.some((each) => each.metadata?.name === node))) say(line);
     const pods = await kube.list<V1Pod>("Pod");
     for (const pod of pods) {
       const { namespace, name } = pod.metadata ?? {};
