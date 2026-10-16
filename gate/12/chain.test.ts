@@ -183,7 +183,10 @@ const letEnd = () => inSession(session.volumeId, 'require("node:fs").writeFileSy
 /** Makes the next exec `start` begins wait again. */
 const holdNext = () => inSession(session.volumeId, 'require("node:fs").rmSync("/workspace/gate-12-go", { force: true })');
 
-/** Records what `run` sees under `name`, the error it throws too, dumping the cluster's state then. */
+/**
+ * Records what `run` sees under `name`, the error it throws too, and then what the session's
+ * bayma last logged, which says how its sandbox's hook went, dumping the cluster's state.
+ */
 async function recorded(name: string, run: (seen: Record<string, unknown>) => Promise<void>): Promise<void> {
   const seen: Record<string, unknown> = {};
   evidence[name] = seen;
@@ -191,6 +194,7 @@ async function recorded(name: string, run: (seen: Record<string, unknown>) => Pr
     await run(seen);
   } catch (error) {
     seen["error"] = error instanceof Error ? error.stack : String(error);
+    seen["baymaLogs"] = (await kube.logs(SESSIONS, session.volumeId, "bayma").catch((failed: unknown) => String(failed))).trimEnd().split("\n").slice(-80);
     await dumpClusterState();
     throw error;
   }
