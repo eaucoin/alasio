@@ -1,5 +1,5 @@
 /**
- * 12's gates on k3s (program/12-live-lazy.md, gates 2 to 7): alasio up on k3s on the runner,
+ * 12's gates on k3s (program/12-live-lazy.md, gates 2 to 8): alasio up on k3s on the runner,
  * the host target (test/e2e/harness.ts), its sessions' runtime with 12's options, as alasio
  * installs them (dirty tracking by write-protection, working sets recorded, restores in the
  * background), and a
@@ -19,7 +19,10 @@
  *      will do, or its pages too;
  *   6. a server-side copy of a 1 GiB layer in the bundled SeaweedFS: its time and bytes;
  *   7. a live snapshot restored after its pod went, during its exec, which goes on; and one
- *      whose held file changed since, which the restore refuses.
+ *      whose held file changed since, which the restore refuses;
+ *   8. a restore from the bucket whose proxy goes away during its background reads: for a
+ *      while, as long as a node agent takes to come back, and for good; what its sandbox does
+ *      then, and whether it can be saved again.
  *
  * What each records goes into $OUT/evidence.json.
  *
@@ -27,7 +30,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { type AddressInfo, connect, createServer } from "node:net";
+import { type AddressInfo, connect, createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
@@ -41,7 +44,7 @@ import { runscFlags } from "../../src/node-agent/runsc.ts";
 import { makeS3Bucket, type S3Bucket } from "../../src/node-agent/s3.ts";
 import { makeStoreProxy, type StoreProxy } from "../../src/node-agent/store-proxy.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
-import { dumpClusterState, inAlasio, inSession, kube, onNode, ref, SESSIONS, setUp, TARGET, tearDown } from "../../test/e2e/harness.ts";
+import { dumpClusterState, inAlasio, inSession, kube, nodeAgents, onNode, ref, SESSIONS, setUp, TARGET, tearDown } from "../../test/e2e/harness.ts";
 import type { Created, Read, Seen, Started } from "./session.ts";
 
 const OUT = process.env["OUT"] ?? "/tmp/gate-12";
@@ -293,17 +296,34 @@ async function upload(image: string, prefix: string): Promise<void> {
 const goferOptions = (objectPrefix: string, layersPrefix: string, endpoint = s3.endpoint, credentials = { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey }) =>
   JSON.stringify({ endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials });
 
+/** A relay to a store, as relayTo makes one. */
+interface Relay {
+  readonly endpoint: string;
+  /** What it carried back, and when it last did. */
+  readonly carried: () => { readonly bytes: number; readonly lastAt: number };
+  /** Ends what it carries and listens no more, as a proxy that stops does: its port refuses. */
+  readonly cut: () => Promise<void>;
+  /** Listens again on its port, as a proxy that came back there would. */
+  readonly back: () => Promise<void>;
+  readonly close: () => void;
+}
+
 /**
  * A relay on this machine to `target` (`http://host:port`), as the gofer, on the node, reaches
  * it: what it carries back, and when it last did, so that a restore's reads, its working set
  * first and the rest in the background after, are timed to their end, whatever they go through.
  */
-async function relayTo(target: string): Promise<{ readonly endpoint: string; readonly carried: () => { readonly bytes: number; readonly lastAt: number }; readonly close: () => void }> {
+async function relayTo(target: string): Promise<Relay> {
   const url = new URL(target);
   let bytes = 0;
   let lastAt = 0;
+  const carrying = new Set<Socket>();
   const server = createServer((client) => {
     const upstream = connect({ host: url.hostname, port: Number(url.port) || 80 });
+    for (const socket of [client, upstream]) {
+      carrying.add(socket);
+      socket.once("close", () => carrying.delete(socket));
+    }
     client.pipe(upstream);
     upstream.on("data", (chunk: Buffer) => {
       bytes += chunk.length;
@@ -313,12 +333,27 @@ async function relayTo(target: string): Promise<{ readonly endpoint: string; rea
     upstream.on("error", () => client.destroy());
     client.on("error", () => upstream.destroy());
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { endpoint: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, carried: () => ({ bytes, lastAt }), close: () => server.close() };
+  const listen = (port: number) => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  await listen(0);
+  const { port } = server.address() as AddressInfo;
+  return {
+    endpoint: `http://127.0.0.1:${port}`,
+    carried: () => ({ bytes, lastAt }),
+    cut: () => {
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const socket of carrying) socket.destroy();
+      return closed;
+    },
+    back: () => listen(port),
+    close: () => {
+      for (const socket of carrying) socket.destroy();
+      server.close();
+    },
+  };
 }
 
 /** How long a restore that began at `startedAt` read through `relay`, once its reads have stopped for `quietMs`: to its working set, and to its end. */
-async function readsOf(relay: Awaited<ReturnType<typeof relayTo>>, startedAt: number, quietMs = 5000): Promise<{ readonly bytes: number; readonly lastReadMs: number }> {
+async function readsOf(relay: Relay, startedAt: number, quietMs = 5000): Promise<{ readonly bytes: number; readonly lastReadMs: number }> {
   for (;;) {
     const { lastAt } = relay.carried();
     if (lastAt > 0 && Date.now() - lastAt >= quietMs) break;
@@ -326,6 +361,22 @@ async function readsOf(relay: Awaited<ReturnType<typeof relayTo>>, startedAt: nu
   }
   const { bytes, lastAt } = relay.carried();
   return { bytes, lastReadMs: lastAt - startedAt };
+}
+
+/** What `use` makes of the node agent's proxy of the bucket, in this process, on this machine, as long as it uses it. */
+async function throughProxy<A>(use: (proxy: StoreProxy) => Promise<A>): Promise<A> {
+  let release = () => {};
+  const proxy = await new Promise<StoreProxy>((resolve, reject) => {
+    Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+      resolve(yield* makeStoreProxy({ store: s3, host: "127.0.0.1", port: 0 }));
+      yield* Effect.promise(() => new Promise<void>((resolved) => (release = resolved)));
+    }))).catch(reject);
+  });
+  try {
+    return await use(proxy);
+  } finally {
+    release();
+  }
 }
 
 test("4. a chain restores straight from the bucket, from a directory holding s3_opts.json alone", { timeout: 30 * 60_000 }, () =>
@@ -384,19 +435,10 @@ test("4. a chain restores straight from the bucket, from a directory holding s3_
     };
     seen["direct"] = await restoredThrough("D0", await checkpointed("D0", at("restore-C")), s3.endpoint);
     const own = await checkpointed("D", at("D0"));
-    let release = () => {};
-    const proxy = await new Promise<StoreProxy>((resolve, reject) => {
-      Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-        resolve(yield* makeStoreProxy({ store: s3, host: "127.0.0.1", port: 0 }));
-        yield* Effect.promise(() => new Promise<void>((resolved) => (release = resolved)));
-      }))).catch(reject);
-    });
-    try {
+    seen["proxied"] = await throughProxy(async (proxy) => {
       const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
-      seen["proxied"] = await restoredThrough("D", own, proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
-    } finally {
-      release();
-    }
+      return restoredThrough("D", own, proxy.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey });
+    });
   }));
 
 test("5. a delta after a restore from the bucket, its parent's pages_meta.img alone on the node, or its pages too", { timeout: 30 * 60_000 }, () =>
@@ -487,4 +529,96 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
     assert.ok(afresh.ready, JSON.stringify(afresh));
     seen["afterwards"] = await inGate<Read>("read", session.volumeId, session.replId).catch((error: unknown) => String(error));
     seen["exec"] = second.execId;
+  }));
+
+/** The random bytes gate 8's session holds, which its restores read in the background, untouched. */
+const BALLAST_MIB = 512;
+/** How long gate 8 holds the proxy away for good: past the gofer's attempts of a read, 5, each at most 20 s after the one before. */
+const GONE_FOR_GOOD_MS = 150_000;
+/** How long gate 8 waits for an answer of a sandbox that may not give one. */
+const ANSWER_WITHIN_MS = 180_000;
+
+/** What `promise` came to within ANSWER_WITHIN_MS: its value, its error, or that it gave none. */
+const within = <A>(promise: Promise<A>): Promise<A | string> =>
+  Promise.race([promise.catch((error: unknown) => (error instanceof Error ? error.message : String(error))), sleep(ANSWER_WITHIN_MS).then(() => `no answer within ${ANSWER_WITHIN_MS / 1000} s`)]);
+
+/** How long the node agent's pod takes to be replaced, as a rollout or a crash replaces it: from its deletion to the new one ready. */
+async function agentReplaced(): Promise<{ readonly ms: number; readonly from: string; readonly to: string }> {
+  const [[nodeName, from] = ["", ""]] = [...(await nodeAgents())];
+  assert.ok(from, "no node agent runs");
+  const deletedAt = Date.now();
+  await kube.remove(ref("Pod", from, NAMESPACE));
+  for (;;) {
+    const to = (await nodeAgents()).get(nodeName);
+    const pod = to === undefined || to === from ? null : await kube.get<V1Pod>(ref("Pod", to, NAMESPACE));
+    if (to && pod?.status?.conditions?.some(({ type, status }) => type === "Ready" && status === "True")) return { ms: Date.now() - deletedAt, from, to };
+    assert.ok(Date.now() - deletedAt < 600_000, `no node agent replaced ${from} within 10 minutes`);
+    await sleep(250);
+  }
+}
+
+test("8. a restore from the bucket whose proxy goes away during its background reads, for a while and for good, and how long a node agent takes to come back", { timeout: 60 * 60_000 }, () =>
+  recorded("outage", async (seen) => {
+    seen["agentReplaced"] = await agentReplaced();
+    Object.assign(session, await inGate<Created>("create"));
+    seen["session"] = { ...session };
+    seen["ballast"] = await inGate("ballast", session.volumeId, session.replId, String(BALLAST_MIB));
+    const layersPrefix = `gate-12/${session.volumeId}/layers/`;
+    const restartMs = (seen["agentReplaced"] as { readonly ms: number }).ms;
+    // For a while, then back on the same port: briefly, and as long as an agent takes to come
+    // back; then for good. Each a whole image of the sandbox, which the restore reads every
+    // page of from the bucket.
+    const outages = [["brief", 10_000], ["restart", restartMs], ["forGood", null]] as const;
+    await throughProxy(async (proxy) => {
+      for (const [name, outageMs] of outages) {
+        const outcome: Record<string, unknown> = { outageMs };
+        seen[name] = outcome;
+        try {
+          const image = `outage-${name}`;
+          outcome["checkpoint"] = await checkpoint(image, { live: false });
+          const own = await digest(at(image));
+          await upload(at(image), `${layersPrefix}${own}/`);
+          const pagesBytes = Number((await node(`stat -c %s ${q(`${at(image)}/pages.img`)}`)).trim());
+          outcome["pagesBytes"] = pagesBytes;
+          const token = proxy.mint(`gate-12/${session.volumeId}`, layersPrefix);
+          const relay = await relayTo(proxy.endpoint);
+          try {
+            const directory = at(`bucket-${image}`);
+            await node(`rm -rf ${q(directory)} && mkdir -p ${q(directory)} && umask 077 && printf '%s' ${q(goferOptions(`${layersPrefix}${own}/`, layersPrefix, relay.endpoint, { access_key_id: token.accessKeyId, secret_access_key: token.secretAccessKey }))} >${q(`${directory}/s3_opts.json`)}`);
+            const startedAt = Date.now();
+            const restored = await restoreFrom(directory);
+            outcome["restore"] = restored;
+            assert.ok(restored.ready, JSON.stringify(restored));
+            // Cut as the background reads go on, a quarter of the pages read at least.
+            for (;;) {
+              const { bytes, lastAt } = relay.carried();
+              assert.ok(bytes < pagesBytes * 0.9, `the restore read ${bytes} of ${pagesBytes} bytes before the gate could cut it`);
+              if (bytes >= pagesBytes / 4 && Date.now() - lastAt < 1000) break;
+              assert.ok(Date.now() - startedAt < 300_000, `the restore read ${bytes} of ${pagesBytes} bytes in 5 minutes`);
+              await sleep(100);
+            }
+            outcome["cutAt"] = { bytes: relay.carried().bytes, ms: Date.now() - startedAt };
+            await relay.cut();
+            if (outageMs === null) await sleep(GONE_FOR_GOOD_MS);
+            else {
+              await sleep(outageMs);
+              await relay.back();
+            }
+            outcome["reads"] = await readsOf(relay, startedAt, 30_000);
+          } finally {
+            relay.close();
+          }
+          outcome["pod"] = await podState();
+          outcome["touched"] = await within(inGate("touch", session.volumeId, session.replId));
+          outcome["read"] = await within(inGate<Read>("read", session.volumeId, session.replId));
+          outcome["podAfter"] = await podState();
+          // Whether the sandbox can still be saved.
+          outcome["saved"] = await within(checkpoint(`${image}-after`, { live: true }));
+        } catch (error) {
+          outcome["error"] = error instanceof Error ? error.stack : String(error);
+        }
+      }
+    });
+    // Each outage cut the restore mid-background, or the gate saw nothing.
+    for (const [name] of outages) assert.ok((seen[name] as Record<string, unknown>)["cutAt"], `${name}: ${JSON.stringify(seen[name])}`);
   }));
