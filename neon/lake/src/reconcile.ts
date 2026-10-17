@@ -305,8 +305,26 @@ export async function bucketListed(store: StoreParts, dataPath: string): Promise
 }
 
 /**
+ * Runs `read` with DuckDB's cache of the store's files off, as it was before. DuckDB checks
+ * a cached file only by the store's HEAD of it, its size and ETag, and SeaweedFS answers
+ * HEAD from the filer's entry alone. So a file whose chunks are gone, with its entry still
+ * there or named again by a restore of the filer store, would be read from memory, though
+ * the store fails every GET of it.
+ */
+async function uncached<T>(db: DuckDBConnection, read: () => Promise<T>): Promise<T> {
+  const [setting] = await rows<{ cached: boolean }>(db, "select current_setting('enable_external_file_cache') as cached");
+  await db.run("set enable_external_file_cache = false");
+  try {
+    return await read();
+  } finally {
+    await db.run(`set enable_external_file_cache = ${setting?.cached === false ? "false" : "true"}`);
+  }
+}
+
+/**
  * Whether the store gives the data of the file at `path`, which it lists: its Parquet
- * footer read, again READ_ATTEMPTS times `retryMs` apart where the store's answer says its
+ * footer read from the store itself, never DuckDB's cache of it (uncached), again
+ * READ_ATTEMPTS times `retryMs` apart where the store's answer says its
  * data is gone (GONE), as a store may fail a read once. Where the store fails the read
  * (FAILED), whether it is gone is asked of the bundled store's parts (gone), which throws
  * where they do not show it; any other failure, as of the store not answering, is thrown,
@@ -319,7 +337,7 @@ export async function readable(
 ): Promise<boolean> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      await rows(db, "select num_rows from parquet_file_metadata($1)", [path]);
+      await uncached(db, () => rows(db, "select num_rows from parquet_file_metadata($1)", [path]));
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -2163,10 +2163,15 @@ describe("the lake", () => {
       await db.run("install httpfs");
       await db.run("load httpfs");
       await db.run(`create secret (type s3, key_id 'k', secret 's', region 'us-east-1', endpoint '${new URL(s3.endpoint).host}', url_style 'path', use_ssl false)`);
-      s3.objects.set("claude/entries/failing.parquet", Buffer.from("PAR1"));
-      // The store fails every read of it, as it does of an entry whose chunks are gone, and as it does for a moment while a volume server restarts.
-      s3.refuse = (method, key) => (key === "claude/entries/failing.parquet" && method === "GET" ? 500 : null);
+      const parquet = join(mkdtempSync(join(tmpdir(), "alasio-lake-failing-")), "failing.parquet");
+      await db.run(`copy (select 1 as i) to '${parquet}' (format parquet)`);
+      s3.objects.set("claude/entries/failing.parquet", readFileSync(parquet));
+      rmSync(dirname(parquet), { recursive: true, force: true });
       const path = "s3://lake/claude/entries/failing.parquet";
+      // Read once while the store gives it, as the lake reads its files, so DuckDB holds its footer, which the store's HEAD of it, still answered, says is current.
+      assert.deepEqual(await rows(db, "select num_rows::INTEGER as n from parquet_file_metadata($1)", [path]), [{ n: 1 }]);
+      // The store fails every GET of it, as SeaweedFS does of an entry whose chunks are gone, its HEAD answered from the entry, and as it does for a moment while a volume server restarts.
+      s3.refuse = (method, key) => (key === "claude/entries/failing.parquet" && method === "GET" ? 500 : null);
       const read = () => readable(db, path, { store, retryMs: 10, pulseMs: 10 });
       const unknown: [number, object] = [404, { volumeId: "7", error: "volume id 7 not found" }];
       // Its chunk's volume unknown to masters that know every volume server, its chunk gone from its volume, its entry gone, or an entry of bytes with no chunk: lost.

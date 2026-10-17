@@ -1,6 +1,6 @@
 /**
  * A stand-in for an S3 API, in process, serving one bucket by path-style URLs as
- * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), DeleteObject,
+ * SeaweedFS does: PutObject, CopyObject, GetObject (of a range too), HeadObject, DeleteObject,
  * ListObjectsV2, and multipart uploads (CreateMultipartUpload, UploadPart, UploadPartCopy,
  * CompleteMultipartUpload, AbortMultipartUpload), every
  * request's Signature Version 4 checked against the credentials it is given, with every
@@ -189,6 +189,12 @@ export async function startFakeS3({ bucket, region, accessKeyId, secretAccessKey
         return;
       }
       response.writeHead(200, { "content-length": object.length }).end(object);
+      return;
+    }
+    if (key && method === "HEAD") {
+      const object = objects.get(key);
+      if (!object) return error(response, 404, "NoSuchKey", "The specified key does not exist.");
+      response.writeHead(200, { "content-length": object.length, etag: etagOf(object), "last-modified": new Date(0).toUTCString() }).end();
       return;
     }
     if (method === "DELETE") {
