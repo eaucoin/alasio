@@ -83,7 +83,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     // Of the pools there are as each round begins.
     const setRight = Effect.flatMap(sessions.pools, (pools) =>
       Effect.forEach(pools, (pool) =>
-        reconcile(pool, (lease) => sessions.lost(pool, lease)).pipe(
+        reconcile(pool, (lease) => sessions.lost(pool, lease), (lease) => sessions.recordLost(pool, lease)).pipe(
           Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
           Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
         ), { discard: true }));
@@ -99,6 +99,11 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
         Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`looking at bound pods failed: ${error.message}`)),
       ),
+      Schedule.spaced(SWEEP_MS),
+    ));
+    // As often, each bound pod whose bayma ended, released, and the snapshot taken live of each that runs kept true to it.
+    yield* Effect.forkScoped(Effect.repeat(
+      sessions.live.pipe(Effect.catch((error) => Effect.logWarning(`looking at bound pods' sandboxes failed: ${error.message}`))),
       Schedule.spaced(SWEEP_MS),
     ));
     // As often, the bound pods ending though the gateway did not end them, each released in the background as its bayma holds its stop.

@@ -37,22 +37,23 @@
 import { lookup } from "node:dns/promises";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { Clock, Effect } from "effect";
+import { Clock, Effect, Schema } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
-import type { BindingLease } from "../binder/bindings.ts";
+import { type BindingLease, heldLeases } from "../binder/bindings.ts";
 import { BINDING_LABEL, KEY_ANNOTATION, type Pool, POOL_LABEL } from "../binder/names.ts";
 import { type Answer, type Operation, type Placement, PlacementRefused } from "../binder/server.ts";
 import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken, type TokenClaims } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { isValidVolumeId, volumeIdOfKey } from "../sandbox/names.ts";
 import type { Events, EventInput } from "../events/events.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
 import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
-import { makeGatewaySnapshots } from "./snapshots.ts";
+import { BaymaStatus, makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
 export const ATTACH_DURATION = "alasio.gateway.attach.duration";
@@ -63,7 +64,7 @@ const detachDuration = meter.createHistogram(DETACH_DURATION, { description: "Ho
 const releases = meter.createCounter(RELEASES, { description: "Bindings released, by why: idle, asked by their caller, lost as their pod went, or deleted as their pod was ended by other than the gateway" });
 
 /** Why a binding was released. */
-type ReleaseReason = "idle" | "asked" | "lost" | "deleted";
+type ReleaseReason = "idle" | "asked" | "lost" | "deleted" | "broken";
 const released = (pool: Pool, reason: ReleaseReason) => Effect.sync(() => releases.add(1, { "k8s.namespace.name": pool.namespace, "alasio.gateway.release.reason": reason }));
 
 /** `effect`, its duration, when it succeeds, recorded on `histogram` of `pool`'s namespace. */
@@ -119,6 +120,9 @@ function forkOf(body: Uint8Array): { readonly environment: string; readonly work
   }
 }
 
+/** How long an ask of a bayma's status may take. */
+const STATUS_TIMEOUT_MS = 5_000;
+
 /** How long a pod's containers are waited for to stop, once its deletion is asked. */
 const STOP_TIMEOUT_MS = 120_000;
 
@@ -136,6 +140,10 @@ export interface Sessions {
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
   /** Releases each bound pod of the gateway's pools that is ending though the gateway did not end it, as the module says, in the background: which keys, of those it began. */
   readonly drain: Effect.Effect<readonly string[], KubeApiError>;
+  /** Looks at each bound pod for one whose bayma ended, and keeps the snapshot taken live of each that runs true to it, as the module says. */
+  readonly live: Effect.Effect<void, KubeApiError>;
+  /** Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into, while its Lease holds still. */
+  readonly recordLost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
   /** Tells of the binding `lease` of `pool`, let go as its pod went while it was bound, as lost. */
   readonly lost: (pool: Pool, lease: BindingLease) => Effect.Effect<void>;
   /** Answers a caller's request of its workspaces, as the module says. */
@@ -273,6 +281,84 @@ export const makeSessions = Effect.fnUntraced(function*(
     return started;
   });
 
+  /** What a bound pod's bayma says of its execs and its state generation, asked with its binding's token; null where it cannot be asked. */
+  const statusOf = (lease: BindingLease, pod: V1Pod): Effect.Effect<BaymaStatus | null> => {
+    const address = pod.status?.podIP;
+    if (!address) return Effect.succeed(null);
+    const token = bindingToken(bindingKey, { key: lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "", binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
+    return Effect.tryPromise(async (signal) => {
+      const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
+      if (!response.ok) throw new Error(`it answered ${response.status}`);
+      return await response.text();
+    }).pipe(Effect.flatMap((text) => Schema.decodeUnknownEffect(Schema.fromJsonString(BaymaStatus))(text)), Effect.orElseSucceed(() => null));
+  };
+
+  /** Releases the binding of `key` of `pool`, its pod `pod`, as `before` says, telling of it, as released for `reason`. */
+  const releaseFor = (pool: Pool, key: string, pod: V1Pod, reason: "broken", before: (name: string) => Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed>) => {
+    let binding = "";
+    return binder.release(pool, key, (bound) => (bound.pod === pod.metadata?.name ? ((binding = bound.binding), before(bound.pod)) : Effect.void)).pipe(
+      Effect.tap((done) =>
+        done ? Effect.andThen(released(pool, reason), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason }))) : Effect.void
+      ),
+      Effect.catch((error) => Effect.logWarning(`releasing ${key} failed: ${error.message}`)),
+    );
+  };
+
+  /** Ends what of `pod`, a bound pod of `pool`, runs on, then detaches its workspace once its containers stopped. */
+  const endAndDetachUnsaved = (pool: Pool, pod: V1Pod) =>
+    Effect.gen(function*() {
+      const name = pod.metadata?.name ?? "";
+      yield* kube.remove("v1", "Pod", pool.namespace, name);
+      yield* stopped(pool, name);
+      yield* timed(detachDuration, pool, agents.detach(pod.spec?.nodeName ?? "", name, containerIdsOf(pod)));
+    });
+
+  /**
+   * Looks at each bound pod of the gateway's pools: one whose bayma ended, or was started again
+   * in it, which serves no more, is released into the snapshot taken of it live, if any, as
+   * broken; and of each that runs, the snapshot taken of it live is kept true to it
+   * (./snapshots.ts keepLive), one that can be saved no more released now.
+   */
+  const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
+    // The workspaces bound in each namespace, of all its pools.
+    const boundIn = new Map<string, Set<string>>();
+    for (const pool of yield* pools) {
+      const bound = boundIn.get(pool.namespace) ?? new Set<string>();
+      boundIn.set(pool.namespace, bound);
+      for (const lease of yield* Effect.provideService(heldLeases(pool), KubeClient, kube)) {
+        const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
+        const workspace = volumeIdOfKey(key);
+        const pod = (yield* kube.read("v1", "Pod", pool.namespace, lease.spec?.holderIdentity ?? "")) as V1Pod | null;
+        if (!workspace || !pod || pod.metadata?.deletionTimestamp !== undefined) continue;
+        bound.add(workspace);
+        const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
+        if (bayma && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined)) {
+          yield* Effect.logWarning(`${key}'s bayma ended in its pod ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
+          yield* Effect.forkDetach(releaseFor(pool, key, pod, "broken", () =>
+            Effect.andThen(
+              Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)),
+              endAndDetachUnsaved(pool, pod),
+            )));
+          continue;
+        }
+        const status = yield* statusOf(lease, pod);
+        if (status === null) continue;
+        const unsaveable = releaseFor(pool, key, pod, "broken", () => Effect.andThen(snapshots.endUnsaveable(pool, workspace, pod.metadata?.name ?? ""), endAndDetachUnsaved(pool, pod)));
+        yield* snapshots.keepLive(pool, workspace, pod, status, yield* Clock.currentTimeMillis, unsaveable);
+      }
+    }
+    for (const [namespace, bound] of boundIn) yield* snapshots.forgetLive(namespace, bound);
+  });
+
+  /** Records what the binding `lease` of `pool`, whose pod went while it was bound, is released into: the snapshot taken of it live, if any. Run while its Lease holds still. */
+  const recordLost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
+    const workspace = volumeIdOfKey(lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "");
+    if (!workspace) return Effect.void;
+    return Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)).pipe(
+      Effect.catch((error) => Effect.logWarning(`could not record what ${pool.namespace}/${workspace}, whose pod went, is released into: ${error.message}`)),
+    );
+  };
+
   const lost = (pool: Pool, lease: BindingLease): Effect.Effect<void> => {
     const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
     return Effect.andThen(released(pool, "lost"), tell(pool, (environment) => ({
@@ -341,5 +427,5 @@ export const makeSessions = Effect.fnUntraced(function*(
       }
     });
 
-  return { place, pools, sweep, drain, lost, operate };
+  return { place, pools, sweep, drain, live, recordLost, lost, operate };
 });
