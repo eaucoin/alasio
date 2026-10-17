@@ -38,6 +38,7 @@ import { POD_TEMPLATE_ANNOTATION, type Sandbox } from "../../src/kube/sandboxes.
 import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
+import { ANSWER as CLAUDE_ANSWER } from "./claude-stand-in.ts";
 import { ANSWER } from "./codex-stand-in.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
@@ -749,6 +750,14 @@ if (inShard("sessions")) {
       await tg.say("again");
       await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === ANSWER);
       await untilInLake("resumed thread of Codex's", "select count(*) as n from otel.traces where ServiceName = 'codex-app-server' and SpanName = 'thread/resume'");
+    });
+
+    test("a message runs a turn on Claude Code, the run's stand-in for it, whose answer reaches the operator, and its transcript the lake", async () => {
+      await tg.say("/service claude");
+      await tg.waitFor((call) => /^Active: Claude$/mu.test(call.payload.text ?? ""));
+      await tg.say("hello, Claude");
+      await tg.waitFor((call) => call.method === "sendRichMessage" && call.payload.rich_message?.markdown === CLAUDE_ANSWER);
+      await untilInLake("Claude Code's answer in its transcript", "select count(*) as n from claude.entries where type = 'assistant'");
     });
   });
 
