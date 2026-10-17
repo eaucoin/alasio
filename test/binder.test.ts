@@ -5,7 +5,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 
 import { BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
-import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL, readLease, reconcile, release, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
+import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, markReleasing, type Pool, POOL_LABEL, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -131,20 +131,6 @@ test("a claim passes over a free pod not serving, and one being deleted", async 
   await run(kube, withKube((client) => client.patch("v1", "Pod", of.namespace, ending!, { metadata: { finalizers: null } })));
 });
 
-test("a release deletes the bound pod, then the Lease", async () => {
-  const of = await pool();
-  await freePods(of, 1);
-  const kube = binder();
-  const key = "sessionfs:workspace";
-  assert.equal((await run(kube, takeLease(of, key, "binder"))).taken, true);
-  const pod = await run(kube, claim(of, key));
-  assert.ok(pod?.metadata?.name);
-  await run(kube, release(of, key));
-  const left = await run(kube, withKube((client) => Effect.all([client.read("v1", "Pod", of.namespace, pod.metadata?.name ?? ""), client.read("coordination.k8s.io/v1", "Lease", of.namespace, leaseName(key))])));
-  // A pod no node runs is gone at once, as nothing has containers of it to stop.
-  assert.deepEqual(left, [null, null]);
-});
-
 /** A binder's Binder, binds waiting up to `waitMs`, on a client of its own. */
 const binderOf = (options: Partial<BinderOptions> = {}): Layer.Layer<Binder | KubeClient> => Layer.provideMerge(Binder.layer({ waitMs: 10_000, ...options }), binder());
 
@@ -154,6 +140,7 @@ const bindIn = <A, E>(layer: Layer.Layer<Binder | KubeClient>, use: (binder: Bin
 /** The pods of `of` bound to any key. */
 const boundPods = async (of: Pool) =>
   ((await run(binder(), withKube((client) => client.list("v1", "Pod", of.namespace, BINDING_LABEL)))) as V1Pod[]).filter(({ metadata }) => !metadata?.deletionTimestamp);
+
 
 test("binders binding one key at once bind it to one pod, which each is routed to", async () => {
   const of = await pool();
@@ -264,4 +251,59 @@ test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease 
   assert.ok(await run(binder(), readLease(of, "sessionfs:under-way")));
   assert.equal((await run(binder(), readLease(of, "sessionfs:whole")))?.spec?.holderIdentity, whole.pod);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [whole.pod]);
+});
+
+test("a release runs what comes before it, its Lease renewed, then deletes the pod and its Lease; a bind meanwhile waits for it, and binds anew after", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf({ renewMs: 300, staleMs: 1_500 });
+  const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const happened: string[] = [];
+  const releasing = bindIn(layer, (each) =>
+    each.release(of, "sessionfs:workspace", ({ pod, binding }) =>
+      Effect.gen(function*() {
+        happened.push(`before ${pod} ${binding === first.binding}`);
+        // Longer than a release goes unrenewed before it is stale, as a checkpoint may be.
+        yield* Effect.sleep(3_000);
+        happened.push("checkpointed");
+      })
+    )
+  );
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const again = bindIn(binderOf({ renewMs: 300, staleMs: 1_500 }), (each) => Effect.tap(each.bind(of, "sessionfs:workspace"), () => Effect.sync(() => void happened.push("bound again"))));
+  assert.equal(await releasing, true);
+  const bound = await again;
+  assert.deepEqual(happened, [`before ${first.pod} true`, "checkpointed", "bound again"]);
+  assert.notEqual(bound.pod, first.pod);
+  assert.notEqual(bound.binding, first.binding);
+});
+
+test("of two releases of one binding at once one alone goes on, and one whose step before fails keeps the binding", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf();
+  const bound = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const failing = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.release(of, "sessionfs:workspace", () => Effect.fail("the checkpoint failed")))), layer));
+  assert.equal(failing, "the checkpoint failed");
+  const lease = await run(binder(), readLease(of, "sessionfs:workspace"));
+  assert.deepEqual([lease?.spec?.holderIdentity, lease?.metadata?.annotations?.["alasio.dev/releasing"]], [bound.pod, undefined]);
+  let before = 0;
+  const released = await Promise.all([binderOf(), binderOf()].map((each) => bindIn(each, (binderService) => binderService.release(of, "sessionfs:workspace", () => Effect.sleep(500).pipe(Effect.andThen(Effect.sync(() => void (before += 1))))))));
+  assert.deepEqual([released.toSorted(), before], [[false, true], 1]);
+  assert.equal(await run(binder(), readLease(of, "sessionfs:workspace")), null);
+  assert.equal(await bindIn(layer, (each) => each.release(of, "sessionfs:workspace")), false);
+});
+
+test("a bind of a key whose release was left unrenewed, its releaser ended, finishes the release and binds the key anew", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf({ staleMs: 1_500 });
+  const first = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  const lease = await run(binder(), readLease(of, "sessionfs:workspace"));
+  assert.ok(lease);
+  await run(binder(), markReleasing(lease, "ended"));
+  await new Promise((resolve) => setTimeout(resolve, 1_600));
+  const again = await bindIn(layer, (each) => each.bind(of, "sessionfs:workspace"));
+  assert.notEqual(again.pod, first.pod);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [again.pod]);
 });

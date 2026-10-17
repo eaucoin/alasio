@@ -16,7 +16,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Context, Effect, Fiber, Layer, Schema, Semaphore } from "effect";
 
 import { hasStatus, type KubeApiError, KubeClient } from "../kube/client.ts";
-import { BINDING_TIMEOUT_MS, type BindingLease, boundLabels, boundPod, claim, holdLease, KEY_ANNOTATION, type Pool, release, releaseLease, renewLease, serving, takeLease } from "./bindings.ts";
+import { BINDING_TIMEOUT_MS, type BindingLease, boundLabels, boundPod, claim, holdLease, KEY_ANNOTATION, markReleasing, type Pool, readLease, RELEASING_ANNOTATION, releaseLease, renewLease, serving, stale, takeLease, unmarkReleasing } from "./bindings.ts";
 
 /** How often a bind looks again, for a free pod, a binding another has under way, or its pod serving. */
 export const BIND_POLL_MS = 250;
@@ -67,8 +67,12 @@ export interface BindOptions {
 export class Binder extends Context.Service<Binder, {
   /** The key bound in the pool, as the module says. */
   readonly bind: (pool: Pool, key: string, options?: BindOptions) => Effect.Effect<Bound, KubeApiError | BindTimeout>;
-  /** Releases the key's binding: its pod, then its Lease. */
-  readonly release: (pool: Pool, key: string) => Effect.Effect<void, KubeApiError>;
+  /**
+   * Releases the key's binding, binds of it waiting meanwhile: `before` run, as a checkpoint
+   * of its pod, then its pod deleted, then its Lease. Whether it was released: false where it
+   * is not bound, or another binder is binding or releasing it.
+   */
+  readonly release: <E = never>(pool: Pool, key: string, before?: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>) => Effect.Effect<boolean, KubeApiError | E>;
   /** How many binds of the pool wait for a free pod now, in this binder. */
   readonly waiting: (pool: Pool) => Effect.Effect<number>;
 }>()("alasio/binder/Binder") {
@@ -127,33 +131,71 @@ export class Binder extends Context.Service<Binder, {
           });
 
         /**
+         * Runs `work` with the Lease `lease` this binder holds renewed every `renewMs` the while,
+         * however long it takes, as a restore or a checkpoint may take minutes, so that another
+         * binder takes it over only once this one has stopped renewing it; `work` is told
+         * whether a renewal found it taken over meanwhile. Then the renewals are stopped, none
+         * under way, and what `work` came to is given with the Lease as last renewed, or null
+         * where it was taken over; where `work` failed, `failed` is given the Lease as last
+         * renewed first.
+         */
+        const renewing = <A, E>(
+          lease: BindingLease,
+          work: (lost: () => boolean) => Effect.Effect<A, E>,
+          failed: (lease: BindingLease) => Effect.Effect<void>,
+        ): Effect.Effect<{ readonly value: A; readonly lease: BindingLease | null }, E> =>
+          Effect.gen(function*() {
+            let held = lease;
+            let lost = false;
+            const turn = yield* Semaphore.make(1);
+            const renew = Effect.gen(function*() {
+              const again = yield* provide(renewLease(held)).pipe(Effect.orElseSucceed(() => held));
+              if (again) held = again;
+              else lost = true;
+            }).pipe(Semaphore.withPermit(turn));
+            const renewer = yield* Effect.forkChild(Effect.forever(Effect.andThen(Effect.sleep(renewMs), renew)));
+            const value = yield* work(() => lost).pipe(
+              Effect.ensuring(Fiber.interrupt(renewer).pipe(Semaphore.withPermit(turn))),
+              Effect.tapError(() => failed(held)),
+            );
+            return { value, lease: lost ? null : held };
+          });
+
+        /**
          * Binds `key` with the Lease `taken` this bind took: a pod got for it (podFor), its
-         * Lease renewed every `renewMs` the while, however long that takes, as a restore may take
-         * minutes, so that another binder takes it over only once this one has stopped renewing
-         * it; then the pod named its holder, the renewals stopped first, none under way. The
-         * Lease and the pod's name, or null where another binder took the Lease over meanwhile,
-         * which then finds the pod bound to the key, and holds it. A bind that gets no pod lets
-         * the Lease go.
+         * Lease renewed the while (renewing), then the pod named its holder. The Lease and the
+         * pod's name, or null where another binder took the Lease over meanwhile, which then
+         * finds the pod bound to the key, and holds it. A bind that gets no pod lets the
+         * Lease go.
          */
         const underWay = (pool: Pool, key: string, taken: BindingLease, make: MakePod | undefined, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string } | null, KubeApiError | BindTimeout> =>
           Effect.gen(function*() {
-            let held = taken;
-            let lost = false;
-            const renewing = yield* Semaphore.make(1);
-            const renew = Effect.gen(function*() {
-              const again = yield* provide(renewLease(held));
-              if (again) held = again;
-              else lost = true;
-            }).pipe(Semaphore.withPermit(renewing));
-            const renewer = yield* Effect.forkChild(Effect.forever(Effect.andThen(Effect.sleep(renewMs), renew)).pipe(Effect.ignore));
-            const stopRenewing = Fiber.interrupt(renewer).pipe(Semaphore.withPermit(renewing));
-            const pod = yield* podFor(pool, key, make, deadline, () => lost).pipe(
-              Effect.ensuring(stopRenewing),
-              Effect.tapError(() => provide(releaseLease(held)).pipe(Effect.ignore)),
-            );
+            // A bind that gets no pod lets the Lease go, as last renewed, for the next to take.
+            const { value: pod, lease } = yield* renewing(taken, (lost) => podFor(pool, key, make, deadline, lost), (held) => provide(releaseLease(held)).pipe(Effect.ignore));
             const name = pod.metadata?.name ?? "";
-            const holding = lost ? null : yield* provide(holdLease(held, name));
+            const holding = lease ? yield* provide(holdLease(lease, name)) : null;
             return holding ? { lease: holding, name } : null;
+          });
+
+        /**
+         * Releases `key`'s binding: its Lease marked releasing, by an update conditioned on the
+         * version read, so of two releases one alone goes on, and binds of the key wait for it;
+         * `before` run, its Lease renewed the while; then its pod deleted, then its Lease.
+         * Where `before` fails, the binding is kept, no longer marked releasing, and the failure
+         * given. Whether it was released; false where it is not bound, or is being bound or
+         * released by another binder.
+         */
+        const releaseBinding = <E>(pool: Pool, key: string, before: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>): Effect.Effect<boolean, KubeApiError | E> =>
+          Effect.gen(function*() {
+            const lease = yield* provide(readLease(pool, key));
+            const pod = lease?.spec?.holderIdentity;
+            if (!lease || !pod || lease.metadata?.annotations?.[RELEASING_ANNOTATION]) return false;
+            const marked = yield* provide(markReleasing(lease, binder));
+            if (!marked) return false;
+            const { lease: held } = yield* renewing(marked, () => before({ pod, binding: marked.metadata?.uid ?? "" }), (renewed) => provide(unmarkReleasing(renewed)).pipe(Effect.ignore));
+            yield* kube.remove("v1", "Pod", pool.namespace, pod);
+            if (held) yield* provide(releaseLease(held)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
+            return true;
           });
 
         const bind = (pool: Pool, key: string, { make }: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout> =>
@@ -167,7 +209,15 @@ export class Binder extends Context.Service<Binder, {
                 return yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
               }
               const holder = taken.lease.spec?.holderIdentity;
-              if (holder) {
+              if (taken.lease.metadata?.annotations?.[RELEASING_ANNOTATION]) {
+                // Being released: waited for, so the key binds after, from what the release left;
+                // one whose releaser stopped renewing it, ended, its pod and Lease let go.
+                if (stale(taken.lease, staleMs, yield* Clock.currentTimeMillis)) {
+                  yield* kube.remove("v1", "Pod", pool.namespace, holder ?? "");
+                  yield* provide(releaseLease(taken.lease)).pipe(Effect.catchIf(hasStatus(409), () => Effect.void));
+                  continue;
+                }
+              } else if (holder) {
                 const pod = yield* provide(boundPod(pool, key));
                 if (pod?.metadata?.name === holder && !pod.metadata.deletionTimestamp) return yield* servingBy(pool, key, taken.lease.metadata?.uid ?? "", holder, deadline);
                 // Its pod gone, or going: its Lease let go, as it was read, and the key bound anew.
@@ -181,7 +231,7 @@ export class Binder extends Context.Service<Binder, {
 
         return Binder.of({
           bind,
-          release: (pool, key) => provide(release(pool, key)),
+          release: (pool, key, before = () => Effect.void) => releaseBinding(pool, key, before),
           waiting: (pool) => Effect.sync(() => waits.get(poolKey(pool)) ?? 0),
         });
       }),

@@ -33,6 +33,9 @@ export const BINDING_LABEL = "alasio.dev/binding";
 /** The annotation of a bound pod, and of its Lease: its key. */
 export const KEY_ANNOTATION = "alasio.dev/binding-key";
 
+/** The annotation of a binding's Lease while it is released: the releasing binder. */
+export const RELEASING_ANNOTATION = "alasio.dev/releasing";
+
 /** How long a binding under way may go unrenewed before another binder takes it over, by default. */
 export const BINDING_TIMEOUT_MS = 60_000;
 
@@ -89,6 +92,9 @@ const leaseUnderWay = (pool: Pool, key: string, binder: string, now: number, sta
   spec: { renewTime: microTime(now), leaseDurationSeconds: Math.ceil(staleMs / 1000) },
 });
 
+/** Whether `lease` has gone unrenewed for `staleMs` by `now`. */
+export const stale = (lease: BindingLease, staleMs: number, now: number): boolean => now - (Date.parse(lease.spec?.renewTime ?? "") || 0) >= staleMs;
+
 /** What taking a key's Lease came to: taken, by this binder; or held by another binding, bound to a pod or under way. */
 export type Taken = { readonly taken: true; readonly lease: BindingLease } | { readonly taken: false; readonly lease: BindingLease };
 
@@ -109,8 +115,7 @@ export const takeLease = Effect.fnUntraced(function*(pool: Pool, key: string, bi
     const held = yield* readLease(pool, key);
     // Released between the two: made anew.
     if (!held) continue;
-    const renewed = Date.parse(held.spec?.renewTime ?? "") || 0;
-    if (held.spec?.holderIdentity || now - renewed < staleMs) return { taken: false, lease: held };
+    if (held.spec?.holderIdentity || !stale(held, staleMs, now)) return { taken: false, lease: held };
     const fresh = leaseUnderWay(pool, key, binder, now, staleMs);
     const over = yield* kube.replace({ ...held, metadata: { ...held.metadata, annotations: fresh.metadata?.annotations ?? {} }, spec: fresh.spec ?? {} }).pipe(
       Effect.map((lease): Taken => ({ taken: true, lease })),
@@ -128,7 +133,26 @@ export const holdLease = Effect.fnUntraced(function*(lease: BindingLease, pod: s
   );
 });
 
-/** Renews the Lease `lease` of a binding under way, by an update conditioned on its version: the Lease, or null where another binder took it over meanwhile. */
+/** Marks the Lease `lease` of a binding released by `binder`, renewed now, by an update conditioned on its version: the Lease, or null where it changed meanwhile. */
+export const markReleasing = Effect.fnUntraced(function*(lease: BindingLease, binder: string): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  const now = yield* Clock.currentTimeMillis;
+  return yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations: { ...lease.metadata?.annotations, [RELEASING_ANNOTATION]: binder } }, spec: { ...lease.spec, renewTime: microTime(now) } }).pipe(
+    Effect.catchIf((error) => hasStatus(409)(error) || hasStatus(404)(error), () => Effect.succeed(null)),
+  );
+});
+
+/** Takes the releasing mark off the Lease `lease`, by an update conditioned on its version: the Lease, or null where it changed meanwhile. */
+export const unmarkReleasing = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  const annotations = { ...lease.metadata?.annotations };
+  delete annotations[RELEASING_ANNOTATION];
+  return yield* kube.replace({ ...lease, metadata: { ...lease.metadata, annotations } }).pipe(
+    Effect.catchIf((error) => hasStatus(409)(error) || hasStatus(404)(error), () => Effect.succeed(null)),
+  );
+});
+
+/** Renews the Lease `lease` of a binding under way, or being released, by an update conditioned on its version: the Lease, or null where another binder took it over meanwhile. */
 export const renewLease = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
   const now = yield* Clock.currentTimeMillis;
@@ -174,14 +198,6 @@ export const boundPod = Effect.fnUntraced(function*(pool: Pool, key: string): Ef
 export const releaseLease = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<void, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
   yield* kube.remove("coordination.k8s.io/v1", "Lease", lease.metadata?.namespace ?? "", lease.metadata?.name ?? "", lease.metadata?.resourceVersion);
-});
-
-/** Releases `key`'s binding in `pool`: its pod deleted, then its Lease, so the pod is never bound again. */
-export const release = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<void, KubeApiError, KubeClient> {
-  const kube = yield* KubeClient;
-  const pod = yield* boundPod(pool, key);
-  if (pod?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, pod.metadata.name);
-  yield* kube.remove("coordination.k8s.io/v1", "Lease", pool.namespace, leaseName(key));
 });
 
 /** How many of `pool`'s pods are free and serving, and how many of its keys are bound. */
