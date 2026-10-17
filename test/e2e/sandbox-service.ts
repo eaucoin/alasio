@@ -20,7 +20,8 @@ import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src
 import { PROXY_PORT } from "../../cli/src/manifests/neon.ts";
 import { GATEWAY, GATEWAY_PORT, RECEIVER, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { VALKEY } from "../../cli/src/manifests/workspace-storage.ts";
-import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
+import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
+import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
@@ -48,12 +49,12 @@ async function mainToken(workspace: string): Promise<string> {
 }
 
 /** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
-async function gatewayCall(token: string, method: string, path: string, body?: string): Promise<{ readonly status: number; readonly said: string }> {
+async function gatewayCall(token: string, method: string, path: string, body?: string, { bind = true } = {}): Promise<{ readonly status: number; readonly said: string }> {
   const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
   const printed = await kube.execOk(NAMESPACE, alasioPod, [
     "sh",
     "-c",
-    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
+    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${bind ? "" : ` -H '${NO_BIND_HEADER}: never'`}${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
     "sh",
     token,
     path,
@@ -67,6 +68,62 @@ async function boundPod(workspace: string): Promise<{ readonly name: string; rea
   const [bound] = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
   assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}`);
   return { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" };
+}
+
+/** The components of main's sandbox service, in alasio's namespace, which serve every environment. */
+const SERVICE_COMPONENTS = ["sandbox-gateway", "receiver", "workspace-mount", "node-agent"] as const;
+
+/**
+ * What of main's sandbox service runs, as a branch environment made or deleted must leave it:
+ * each pod of its gateway, receiver, nodes' mount and node agents, and of main's pools, by its
+ * uid and its containers' restarts, and each of their workloads by its generation.
+ */
+export async function mainSandboxService(): Promise<string[]> {
+  const pods = [
+    ...(await Promise.all(SERVICE_COMPONENTS.map((component) => kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels(component)) })))).flat(),
+    ...(await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: POOL_LABEL })),
+  ];
+  assert.ok(pods.some(({ metadata }) => metadata?.labels?.["app.kubernetes.io/component"] === "sandbox-gateway"), "the sandbox gateway does not run");
+  const restarts = ({ status }: V1Pod) => (status?.containerStatuses ?? []).reduce((sum, { restartCount }) => sum + restartCount, 0);
+  const workloads = [
+    ...[GATEWAY, RECEIVER].map((name) => ref("Deployment", name, NAMESPACE)),
+    ...[WORKSPACE_MOUNT, componentName("node-agent")].map((name) => ref("DaemonSet", name, NAMESPACE)),
+    ...["sandboxes-none", "sandboxes-full"].map((name) => ref("Deployment", name, SESSIONS)),
+  ];
+  const generations = await Promise.all(workloads.map(async (each) => `${each.kind} ${each.name}: generation ${(await kube.get(each))?.metadata?.generation}`));
+  return [...pods.map((pod) => `Pod ${pod.metadata?.namespace}/${pod.metadata?.name} ${pod.metadata?.uid}: ${restarts(pod)} restarts`).sort(), ...generations];
+}
+
+/** A token of a workspace of the branch environment `branch`, by its own key: as branch create wrote it, or, once it is deleted, derived as one kept would be. */
+async function branchToken(branch: string, workspace: string): Promise<string> {
+  const master = Buffer.from(await kube.secret(NAMESPACE, GATEWAY, "caller-key"));
+  const written = await kube.secret(`alasio-branch-${branch}`, componentName("sessions-caller"), "caller-key").catch(() => null);
+  if (written !== null) assert.deepEqual(Buffer.from(written), environmentKey(master, branch));
+  return mintToken(environmentKey(master, branch), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: branch, mode: "none" } });
+}
+
+/** Whether main's gateway serves the branch environment `branch`: its answer to a request that binds nothing, 409 where it does, 403 where it does not. */
+export async function servesBranch(branch: string): Promise<{ readonly status: number; readonly said: string }> {
+  return gatewayCall(await branchToken(branch, "fs-e2ebranch"), "GET", "/status", undefined, { bind: false });
+}
+
+/**
+ * Binds a workspace of the branch environment `branch` through main's gateway, by a token of
+ * the branch's own key, as its alasio signs one, then releases and deletes it: the namespace of
+ * the pod it was bound to.
+ */
+export async function bindInBranch(branch: string): Promise<{ readonly namespace: string }> {
+  const workspace = "fs-e2ebranch";
+  const token = await branchToken(branch, workspace);
+  const made = await gatewayCall(token, "POST", "/workspace");
+  assert.equal(made.status, 204, made.said);
+  await until("the gateway binding the branch's workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+  const sessions = `alasio-branch-${branch}-sessions`;
+  const [bound] = await kube.list<V1Pod>("Pod", { namespace: sessions, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
+  assert.ok(bound?.metadata?.name, "no pod of the branch's is bound to its workspace");
+  assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+  await until("the gateway deleting the branch's workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
+  return { namespace: bound.metadata.namespace ?? "" };
 }
 
 /** Makes the workspace `workspace` of the sessions' namespace through a node agent, of `quotaBytes`. */
