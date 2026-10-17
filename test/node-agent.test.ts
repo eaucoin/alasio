@@ -1894,6 +1894,8 @@ const unusedWorkspaces: Workspaces = {
   detach: () => Effect.die("no workspace is detached"),
   read: () => Effect.die("no workspace's file is read"),
   write: () => Effect.die("no workspace's file is written"),
+  released: () => Effect.die("no workspace's release is read"),
+  setReleased: () => Effect.die("no workspace's release is recorded"),
 };
 
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
@@ -2458,5 +2460,14 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       assert.deepEqual(yield* agents.listWorkspaces("main"), ["fs-abc123", "fs-fork", "fs-made"]);
       yield* agents.removeWorkspace(fork);
       assert.equal(yield* agents.quota(fork), null);
+      // The snapshot one was released into, recorded and read back through any agent, and cleared.
+      const into = { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" };
+      assert.equal(yield* agents.released(made), null);
+      yield* agents.setReleased(made, into);
+      assert.deepEqual(yield* agents.released(made), into);
+      yield* agents.setReleased(made, null);
+      assert.equal(yield* agents.released(made), null);
+      const unrecorded = yield* Effect.flip(agents.setReleased(fork, into));
+      assert.equal(unrecorded._tag === "NodeAgentError" && unrecorded.status, 404);
     })
   ));

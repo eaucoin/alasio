@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -214,6 +214,32 @@ test("a FIFO in a workspace is neither read nor written, nor waited on", async (
     assert.equal(await refusal(at.workspaces.read(ref, "workspace/pipe", 100)), 403);
     assert.equal(await refusal(at.workspaces.write(ref, "workspace/pipe", Buffer.from("x"))), 403);
     assert.ok(Date.now() - started < 5_000);
+  } finally {
+    at.done();
+  }
+});
+
+test("a workspace records the snapshot it was released into beside its files, out of its sandbox's reach, replaced whole, and none once cleared", async () => {
+  const at = workspacesNode();
+  try {
+    const ref = { environment: "main", workspace: "fs-released" };
+    const files = at.files("fs-released");
+    assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
+    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" }));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T120000000Z-0000000a", release: "20260921.0-eaucoin.8" });
+    await Effect.runPromise(at.workspaces.setReleased(ref, { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8" }));
+    assert.deepEqual(await Effect.runPromise(at.workspaces.released(ref)), { snapshot: "20261017T130000000Z-0000000b", release: "20260921.0-eaucoin.8" });
+    // Beside its files, which its sandbox sees, not among them; nothing staged left beside it.
+    assert.deepEqual(readdirSync(join(files, "..")).sort(), ["files", "released.json"]);
+    assert.deepEqual(readdirSync(files).sort(), ["home", "workspace"]);
+    await Effect.runPromise(at.workspaces.setReleased(ref, null));
+    assert.equal(await Effect.runPromise(at.workspaces.released(ref)), null);
+    await Effect.runPromise(at.workspaces.setReleased(ref, null));
+    // Of a workspace there is not, or by names that are none, refused; one whose record is none, refused too.
+    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-never" }, { snapshot: "20261017T120000000Z-0000000a", release: "r" })), 404);
+    assert.equal(await refusal(at.workspaces.released({ environment: "main", workspace: "../etc" })), 400);
+    writeFileSync(join(files, "..", "released.json"), "{\"snapshot\":\"../../x\"}");
+    assert.equal(await refusal(at.workspaces.released(ref)), 500);
   } finally {
     at.done();
   }
