@@ -1,7 +1,8 @@
 /**
  * 12's gates on k3s (program/12-live-lazy.md, gates 2 to 7): alasio up on k3s on the runner,
- * the host target (test/e2e/harness.ts), its sessions' runtime given 12's options (dirty
- * tracking by write-protection, working sets recorded, restores in the background), and a
+ * the host target (test/e2e/harness.ts), its sessions' runtime with 12's options, as alasio
+ * installs them (dirty tracking by write-protection, working sets recorded, restores in the
+ * background), and a
  * real session pod, checkpointed by runsc beside gVisor's shim as the node agent does, with
  * its flags, and restored into a new pod of its Sandbox through the fork's restore
  * annotation:
@@ -208,12 +209,8 @@ before(async () => {
   assert.equal(TARGET, "host", "12's gates on k3s run on the host target");
   try {
     await setUp();
-    // 12's options for the sessions' runtime, which each new shim reads as it starts.
-    await node([
-      `sed -i 's/^restore_direct = true$/restore_direct = true\\nrestore_background = true/' ${OPTIONS}`,
-      `printf '%s\\n' '  dirty-tracking = "wp"' '  working-set-window = "3s"' >>${OPTIONS}`,
-      `mkdir -p ${IMAGES}`,
-    ].join(" && "));
+    // 12's options for the sessions' runtime, as alasio installs them, which each new shim reads as it starts.
+    await node(`mkdir -p ${IMAGES}`);
     const options = await node(`cat ${OPTIONS}`);
     evidence["options"] = options;
     const flags = runscFlags(options);
