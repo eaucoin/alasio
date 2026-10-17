@@ -31,6 +31,8 @@ import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { NODE_AGENT_PORT } from "../src/node-agent/names.ts";
 import { makeOperations } from "../src/node-agent/operations.ts";
 import { serveNodeAgent } from "../src/node-agent/server.ts";
+import type { Workspaces } from "../src/node-agent/workspaces.ts";
+import { workspacesNode } from "./support/node-workspaces.ts";
 import { makeNodeAgents } from "../src/sandbox/node-agents.ts";
 import { type FakeReleases, fakeReleases } from "./support/fake-runsc.ts";
 import { type FakeS3, startFakeS3 } from "./support/fake-s3.ts";
@@ -763,11 +765,19 @@ test("commands run on the node enter its mounts and network from its PID 1, with
   }
 });
 
+/** Workspaces no test of snapshots reaches. */
+const unusedWorkspaces: Workspaces = {
+  attach: () => Effect.die("no workspace is attached"),
+  detach: () => Effect.die("no workspace is detached"),
+  read: () => Effect.die("no workspace's file is read"),
+  write: () => Effect.die("no workspace's file is written"),
+};
+
 test("the agent's API takes alasio's token alone, and answers each route as it says", () =>
   withBucket(({ s3, node }) =>
     Effect.gen(function*() {
       const here = yield* node("node-1");
-      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent });
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: unusedWorkspaces });
       const call = (method: string, path: string, body?: unknown, token = "the token") =>
         Effect.promise(async () => {
           const response = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -890,7 +900,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
 /** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes. */
 const agentsOf = (agent: NodeAgent) =>
   Effect.gen(function*() {
-    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent });
+    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces: unusedWorkspaces });
     const pod: V1Pod = {
       metadata: { name: "node-agent-1", namespace: "alasio" },
       spec: { nodeName: "node-1", containers: [] },
@@ -1069,5 +1079,32 @@ test("a checkpoint is taken under the release that runs the container, whatever 
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", OTHER_CONTAINER)))), /is not of the pod alasio-sessions\/fs-abc123, but of alasio-sessions\/fs-other/u);
       assert.match(failure(yield* Effect.exit(here.agent.resume(resumeRequest()))), /is not of the pod alasio-sessions\/fs-abc123/u);
       assert.match(failure(yield* Effect.exit(here.agent.checkpoint(request("fs-abc", "c".repeat(64))))), /container does not exist/u);
+    })
+  ));
+
+test("the agent's API attaches, detaches, reads and writes a workspace's files as its workspaces say, refusing as they refuse", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const at = workspacesNode();
+      yield* Effect.addFinalizer(() => Effect.sync(at.done));
+      at.files("fs-abc123");
+      const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent: here.agent, workspaces: at.workspaces });
+      const call = (method: string, path: string, body?: string) =>
+        Effect.promise(() => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { authorization: "Bearer the token" }, ...(body === undefined ? {} : { body }) }));
+      const json = (value: unknown) => JSON.stringify(value);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding" }))).status, 204);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding" }))).status, 409);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123" }))).status, 400);
+      assert.equal((yield* call("PUT", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt", "hello")).status, 204);
+      const read = yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=100");
+      assert.deepEqual([read.status, yield* Effect.promise(() => read.text())], [200, "hello"]);
+      assert.equal((yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=2")).status, 413);
+      assert.equal((yield* call("GET", "/files/main/fs-abc123?path=../../etc/passwd")).status, 400);
+      at.running.add("container-0");
+      assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
+      at.running.delete("container-0");
+      assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 204);
+      assert.deepEqual(at.mounts, []);
     })
   ));

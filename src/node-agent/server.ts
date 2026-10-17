@@ -42,6 +42,18 @@
  * - `GET /holdings`: `{ node, releases: [{ release, cpuFeatures }], cached: [{ environment,
  *   workspace, snapshot, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
  *   features each sees on it, and the snapshots in its cache.
+ * - `POST /attach`, `{ environment, workspace, pod, token }`: attaches the workspace's files
+ *   into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
+ *   beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
+ *   there is no such workspace.
+ * - `POST /detach`, `{ pod, containerIds }`: detaches what is attached into `pod`'s directory
+ *   (204); 409 while any of `containerIds`, its sandbox's containers, runs.
+ * - `GET /files/<environment>/<workspace>?path=<path>&max=<bytes>`: the workspace's file at
+ *   `path`, `workspace/...` or `home/...`, its bytes (200); 403 where any part of its path is
+ *   a symlink or it is no file, 404 where there is none, 413 where it is over `max` bytes.
+ * - `PUT /files/<environment>/<workspace>?path=<path>`: writes the body, of MAX_WRITE_BYTES at
+ *   most, as the workspace's file at `path`, its directories made (204); 403 where any part of
+ *   its path is a symlink, 413 where the body is over MAX_WRITE_BYTES.
  * - `GET /healthz`: 200 once it serves.
  *
  * A manifest is ./agent.ts Manifest.
@@ -69,6 +81,7 @@ import {
 } from "./agent.ts";
 import { type CacheError, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
+import { makeWorkspaces, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
 import {
   CONTAINERD,
   GVISOR_RELEASES,
@@ -82,13 +95,22 @@ import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
 
-/** What serveNodeAgent is given: where it listens, the token it takes, and the agent it serves. */
+/** What serveNodeAgent is given: where it listens, the token it takes, and the agent and workspaces it serves. */
 export interface NodeAgentServerOptions {
   readonly port: number;
   readonly host?: string;
   readonly token: string;
   readonly agent: NodeAgent;
+  readonly workspaces: Workspaces;
 }
+
+/** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
+export const MAX_WRITE_BYTES = 64 * 1024 ** 2;
+
+/** What `POST /attach` is given. */
+const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString });
+/** What `POST /detach` is given. */
+const DetachRequest = Schema.Struct({ pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
 
 /** The status each failure of the agent's is answered with; any other is 500. */
 const STATUS: Readonly<Record<string, number>> = {
@@ -105,6 +127,7 @@ const CHECKPOINT = /^\/checkpoints\/([^/]+)\/([^/]+)$/u;
 const PREPARE = /^\/prepare\/([^/]+)\/([^/]+)$/u;
 const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
 const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
+const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -146,6 +169,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   host = "0.0.0.0",
   token,
   agent,
+  workspaces,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
   const checkpoints = yield* makeOperations<Manifest, CheckpointFailed>(scope, failureOf);
@@ -202,6 +226,29 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
         Effect.map((discarded) => answer(200, { discarded })),
       );
     }
+    if (method === "POST" && url === "/attach") {
+      return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, ...ref }) => workspaces.attach(ref, pod, binding)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    if (method === "POST" && url === "/detach") {
+      return body(DetachRequest).pipe(Effect.flatMap(({ pod, containerIds }) => workspaces.detach(pod, containerIds)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    const files = FILES.exec(url);
+    if (files && (method === "GET" || method === "PUT")) {
+      const query = new URLSearchParams(files[3]);
+      const path = query.get("path") ?? "";
+      return workspaceOf(files).pipe(
+        Effect.flatMap((ref) =>
+          method === "GET"
+            ? workspaces.read(ref, path, Number(query.get("max") ?? MAX_WRITE_BYTES)).pipe(Effect.map((bytes) => HttpServerResponse.uint8Array(bytes, { contentType: "application/octet-stream" })))
+            : request.arrayBuffer.pipe(
+              Effect.mapError(() => new BadRequest({ message: "the body could not be read" })),
+              Effect.filterOrFail((bytes) => bytes.byteLength <= MAX_WRITE_BYTES, () => new WorkspaceRefused({ status: 413, reason: `a file written is ${MAX_WRITE_BYTES} bytes at most` })),
+              Effect.flatMap((bytes) => workspaces.write(ref, path, new Uint8Array(bytes))),
+              Effect.as(HttpServerResponse.empty({ status: 204 })),
+            )
+        ),
+      );
+    }
     return Effect.succeed(answer(404, { error: `there is no ${method} ${url}` }));
   };
 
@@ -213,7 +260,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     return yield* route(request);
   }).pipe(
     Effect.catch((error) => {
-      const status = error._tag === "BadRequest" ? 400 : STATUS[error._tag] ?? 500;
+      const status = error._tag === "BadRequest" ? 400 : error._tag === "WorkspaceRefused" ? error.status : STATUS[error._tag] ?? 500;
       return (status >= 500 ? Effect.logWarning(error.message) : Effect.void).pipe(Effect.as(answer(status, { error: error.message })));
     }),
     withLogScope("node-agent"),
@@ -252,14 +299,16 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
   yield* cache.clean;
+  const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT });
+  const host = makeHostCommands();
   const agent = yield* makeNodeAgent({
     node,
-    runsc: makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT }),
+    runsc,
     cache,
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
-    host: makeHostCommands(),
+    host,
   });
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc }) });
   yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, its cache within ${budget} bytes`);
 }).pipe(
   Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),
