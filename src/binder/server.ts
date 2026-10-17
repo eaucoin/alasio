@@ -5,6 +5,9 @@
  *
  * - `POST /bind`: binds the token's key ahead of any request (204), so its pod is got while
  *   nothing waits on it; 503 with a Retry-After where its pool had no pod for it in time.
+ * - `POST /release`: releases the token's key's binding, as its placement says what comes
+ *   before (204), as it does where it has none; 503 where it could not be released now, its
+ *   binding kept.
  * - `GET /counts/<namespace>/<pool>`: `{ free, bound, waiting }`, the pool's free pods running,
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
@@ -52,9 +55,10 @@ export class PlacementRefused extends Schema.TaggedError<PlacementRefused>()("Pl
   }
 }
 
-/** Where a key is bound: its pool, and how its pod is made, where it is not claimed. */
+/** Where a key is bound: its pool, how its pod is made, where it is not claimed, and what comes before its release. */
 export interface Placement extends BindOptions {
   readonly pool: Pool;
+  readonly release?: ((bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, { readonly message: string }>) | undefined;
 }
 
 /** What serveBinder is given; see the module. */
@@ -149,6 +153,18 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
+      if (incoming.method === "POST" && url === "/release") {
+        incoming.resume();
+        routes.delete(key);
+        const released = yield* poolOf(key, claims.options ?? {}).pipe(
+          Effect.flatMap(({ pool, release }) => binder.release(pool, key, release)),
+          Effect.result,
+        );
+        if (released._tag === "Success") return answer(outgoing, 204);
+        if (released.failure instanceof PlacementRefused) return answer(outgoing, 403, { error: released.failure.message });
+        yield* Effect.logWarning(`releasing ${key} failed: ${released.failure.message}`);
+        return answer(outgoing, 503, { error: `${key} could not be released now` }, { "retry-after": String(RETRY_AFTER_S) });
+      }
       const unbound = incoming.headers[NO_BIND_HEADER] === "never";
       delete incoming.headers[NO_BIND_HEADER];
       const routed = yield* routeOf(key, claims.options ?? {}, unbound).pipe(Effect.result);
