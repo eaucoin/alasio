@@ -621,3 +621,104 @@ groups:
               type: threshold
               expression: failed
               conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      # Pods the sandbox pods' policy refused to let be made in a sessions' namespace in the
+      # last fifteen minutes, as the sandbox gateway counts them: a pool's template the policy
+      # no longer admits, as after an upgrade that changed one and not the other, so its pool
+      # never warms and no session binds.
+      - uid: alasio-pod-policy-refusing
+        title: The sandbox pods' policy refuses pods
+        condition: refusing
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: "The sandbox pods' policy refused {{ $values.refused.Value }} pods in the last fifteen minutes: a pool whose pods it refuses never warms, and its sessions bind nowhere."
+        data:
+          - refId: refused
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: refused
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select coalesce(sum(added), 0) as refused
+                  from (
+                    select TimeUnix, Value - coalesce(lag(Value) over (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix), 0) as added
+                    from otel.metrics_sum
+                    where MetricName = 'alasio.gateway.pod_policy.refusals' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                  )
+                  where TimeUnix > now()::timestamp - interval 15 minute
+              root_selector: ""
+              columns:
+                - {selector: refused, text: refused, type: number}
+          - refId: refusing
+            datasourceUid: __expr__
+            model:
+              refId: refusing
+              type: threshold
+              expression: refused
+              conditions: [{evaluator: {type: gt, params: [0]}}]
+
+      # How long the sandbox gateway's warm binds took in the last half hour, on average: a
+      # free pod claimed at once, its workspace attached, and its bayma serving. Slow, the node
+      # agents' attaches or bayma's start keep every session's first request waiting. Cold
+      # binds, which wait for their pool to scale, and those whose pod is made, as a restore,
+      # count neither way.
+      - uid: alasio-binds-slow
+        title: Binds are slow
+        condition: slow
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "The sandbox gateway's binds of a free pod took {{ humanizeDuration $values.seconds.Value }} on average in the last half hour: each session's first request waits that long."
+        data:
+          - refId: seconds
+            relativeTimeRange: {from: 7200, to: 0}
+            datasourceUid: lake
+            model:
+              refId: seconds
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select sum(added_sum) / sum(added_count) as seconds
+                  from (
+                    select TimeUnix, Attributes['alasio.binder.start'] as start,
+                      Sum - coalesce(lag(Sum) over series, 0) as added_sum,
+                      Count::bigint - coalesce(lag(Count::bigint) over series, 0) as added_count
+                    from otel.metrics_histogram
+                    where MetricName = 'alasio.binder.bind.duration' and ServiceName = 'alasio-sandbox-gateway'
+                      and TimeUnix > now()::timestamp - interval 2 hour
+                    window series as (partition by ResourceAttributes, Attributes, StartTimeUnix order by TimeUnix)
+                  )
+                  where TimeUnix > now()::timestamp - interval 30 minute and start = 'warm'
+                  having sum(added_count) > 0
+              root_selector: ""
+              columns:
+                - {selector: seconds, text: seconds, type: number}
+          - refId: slow
+            datasourceUid: __expr__
+            model:
+              refId: slow
+              type: threshold
+              expression: seconds
+              conditions: [{evaluator: {type: gt, params: [10]}}]
