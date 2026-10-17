@@ -2297,7 +2297,7 @@ describe("workspace storage", () => {
     assert.equal(sessions(install({ workspaceStorage: { enabled: false } })).clone, undefined);
   });
 
-  test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the collector's scraper reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
+  test("admits JuiceFS's pods and its driver's Jobs' alone to Valkey, but for the node agents setting quotas and the collector's scraper reading its metrics, and to the object store's S3 port, with Valkey's, which formats the file system", () => {
     const objects = install();
     const policy = (name: string) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: Array<{ from: unknown[]; ports: unknown }> } }>(objects, "NetworkPolicy", name).spec;
@@ -2313,8 +2313,9 @@ describe("workspace storage", () => {
       { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio" } }, podSelector: { matchLabels: { "alasio.dev/workload": "juicefs-admin" } } },
     ];
     assert.deepEqual(policy("alasio-valkey").podSelector, { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "valkey" } });
+    const agents = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" } } };
     assert.deepEqual(policy("alasio-valkey").ingress, [
-      { from: peers, ports: [{ protocol: "TCP", port: 6379 }] },
+      { from: [...peers, agents], ports: [{ protocol: "TCP", port: 6379 }] },
       {
         from: [{ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector-scraper" } } }],
         ports: [{ protocol: "TCP", port: 6379 }],
@@ -2459,7 +2460,7 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, and how long a resumed restore may read it through them", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, how long a resumed restore may read it through them, and workspace storage's metadata engine", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
@@ -2471,6 +2472,7 @@ describe("node agents", () => {
       ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
       // A session's 2 GiB, at 4 MiB/s.
       ALASIO_BACKGROUND_READ_SECONDS: "512",
+      META_URL: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
@@ -2480,8 +2482,9 @@ describe("node agents", () => {
     assert.equal(env({ sessions: { resources: { limits: { memory: "8Gi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "2048");
     // A minute at least, however small a session.
     assert.equal(env({ sessions: { resources: { limits: { memory: "64Mi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "60");
-    // Without a collector, it exports nothing.
+    // Without a collector, it exports nothing; without workspace storage, it sets no quota.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
+    assert.equal(env({ workspaceStorage: { enabled: false } })["META_URL"], undefined);
   });
 
   test("run only where sessions run under gVisor, beside Neon, whose setup makes their Secrets", () => {
@@ -2519,7 +2522,7 @@ describe("node agents", () => {
     }
   });
 
-  test("take alasio's calls alone, and reach the cluster's DNS, the object store's S3 port and the collector alone", () => {
+  test("take alasio's calls alone, and the sandbox gateway's, and reach the cluster's DNS, the object store's S3 port, workspace storage's metadata engine and the collector alone", () => {
     const objects = install();
     const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
     const podOf = (component: string, namespace = "alasio") => ({
@@ -2543,15 +2546,17 @@ describe("node agents", () => {
     };
     const selected = (component: string) => ({ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } } });
     assert.deepEqual(egress({}).policyTypes, ["Ingress", "Egress"]);
+    const metadata = { to: [selected("valkey")], ports: [{ protocol: "TCP", port: 6379 }] };
     assert.deepEqual(egress({}).egress, [
       dns,
       { to: [selected("seaweedfs")], ports: [{ protocol: "TCP", port: 8333 }] },
+      metadata,
       { to: [selected("collector")], ports: [{ protocol: "TCP", port: 4318 }] },
     ]);
     // An operator's object store, on its endpoint's port at any address, and no collector to reach without one.
     const external = (endpoint: string) => ({ objectStore: { bundled: { enabled: false }, external: { endpoint, existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } });
-    assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }]);
-    assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }]);
+    assert.deepEqual(egress(external("https://s3.example.com")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 443 }] }, metadata]);
+    assert.deepEqual(egress(external("http://minio.lan:9000")).egress, [dns, { to: [{ ipBlock: { cidr: "0.0.0.0/0" } }], ports: [{ protocol: "TCP", port: 9000 }] }, metadata]);
     assert.deepEqual(all(install(external("http://minio.lan:9000")), "NetworkPolicy").filter(({ metadata }) => metadata?.name === "alasio-seaweedfs-snapshots"), []);
   });
 
@@ -3599,6 +3604,23 @@ describe("the sandbox service", () => {
     const mains = new Set(main.map(named));
     assert.deepEqual(branch.map(named).filter((each) => mains.has(each)), []);
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.namespace === "alasio").map(named), []);
+  });
+
+  test("gives the node agent the metadata engine alone, which it sets quotas on with JuiceFS's own command, of the very mount image the nodes mount with", () => {
+    const objects = install();
+    const [agent] = one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent").spec?.template.spec?.containers ?? [];
+    assert.deepEqual(agent?.env?.find(({ name }) => name === "META_URL")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-juicefs", key: "metaurl" });
+    // No key of workspace storage's object store.
+    assert.deepEqual((agent?.env ?? []).filter(({ valueFrom }) => valueFrom?.secretKeyRef?.name === "alasio-workspaces-juicefs").map(({ name }) => name), ["META_URL"]);
+    const { repository, tag, digest } = configOf().workspaceStorage.csi.mountImage;
+    const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+    assert.match(dockerfile, new RegExp(`^FROM ${repository}:${tag}@${digest} AS juicefs$`, "mu"));
+    assert.match(dockerfile, /^COPY --from=juicefs \/usr\/local\/bin\/juicefs \/usr\/local\/bin\/juicefs$/mu);
+    // And the metadata engine takes them, as they reach it.
+    const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+    const pod = (component: string): Pod => ({ namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } });
+    assert.equal(connects(policies, pod("node-agent"), pod("valkey"), 6379), true);
+    assert.equal(connects(policies, pod("sandbox-gateway"), pod("valkey"), 6379), false);
   });
 
   test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {
