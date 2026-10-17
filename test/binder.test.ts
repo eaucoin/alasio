@@ -402,3 +402,22 @@ test("each binding a binder makes is timed, by its pool and how its pod came: cl
   const of_ = (start: string) => `alasio.binder.pool=sandboxes,k8s.namespace.name=${of.namespace},alasio.binder.start=${start}`;
   assert.deepEqual(timed, { [of_("warm")]: 1, [of_("cold")]: 1, [of_("made")]: 1 });
 });
+
+test("a bind whose maker declines, as it finds under the binding's Lease, claims a free pod instead, its maker asked while it holds the Lease", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const layer = binderOf();
+  const held: (string | undefined)[] = [];
+  const bound = await bindIn(layer, (each) =>
+    each.bind(of, "sessionfs:declined", {
+      make: () =>
+        readLease(of, "sessionfs:declined").pipe(
+          Effect.map((lease) => (held.push(lease?.metadata?.annotations?.["alasio.dev/binder"]), null)),
+          Effect.provide(binder()),
+        ),
+    })
+  );
+  assert.equal(bound.pod, "free-0");
+  assert.equal(held.length, 1);
+  assert.ok(held[0]);
+});
