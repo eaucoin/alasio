@@ -121,6 +121,8 @@ export interface NodeAgents {
   readonly cloneWorkspace: (from: WorkspaceRef, to: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** Deletes the workspace, its quota with it, through any agent; one not there is not an error. */
   readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspaces of `environment` there are, by their names, through any agent. */
+  readonly listWorkspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /** The workspace's quota, and what it holds, through any agent; null where it has none. */
   readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
   /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
@@ -252,6 +254,11 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     cloneWorkspace: (from, to, quotaBytes) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `clone ${from.environment}/${from.workspace} into ${to.environment}/${to.workspace}`, { method: "POST", path: "/workspaces/clones", body: { from, to, quotaBytes }, timeout: LONG_CALL })).pipe(Effect.asVoid),
+    listWorkspaces: (environment) =>
+      Effect.flatMap(anyNode, (node) =>
+        ask(node, `list ${environment}'s workspaces`, { method: "GET", path: `/workspaces/${encodeURIComponent(environment)}`, timeout: SHORT_CALL }, Listed)).pipe(
+          Effect.map(({ workspaces }) => workspaces),
+        ),
     removeWorkspace: (workspace) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),

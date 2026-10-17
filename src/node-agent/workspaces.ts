@@ -29,7 +29,7 @@
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
  */
-import { chown, lstat, mkdir, rm, writeFile } from "node:fs/promises";
+import { chown, lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -95,6 +95,8 @@ export interface Workspaces {
   readonly remove: (ref: WorkspaceRef) => Effect.Effect<void, WorkspaceRefused | JuicefsError>;
   /** `ref`'s quota, and what it holds; null where it has none. */
   readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | JuicefsError>;
+  /** The workspaces of `environment` there are, by their names. */
+  readonly list: (environment: string) => Effect.Effect<readonly string[], WorkspaceRefused>;
   /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env` beside them. */
   readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
@@ -195,6 +197,13 @@ export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPAC
         if (!(yield* there(join(files, "..")))) return;
         yield* command.deleteQuota(quotaPath(ref)).pipe(Effect.catch((error) => Effect.logWarning(`${ref.environment}/${ref.workspace}'s quota was not deleted: ${error.message}`)));
         yield* onMount(`${ref.environment}/${ref.workspace} could not be deleted`, () => rm(join(files, ".."), { recursive: true, force: true }));
+      }),
+
+    list: (environment) =>
+      Effect.gen(function*() {
+        if (!ENVIRONMENT.test(environment)) return yield* refused(400, `${environment} is no environment's name`);
+        const names = yield* onMount(`the workspaces of ${environment} could not be listed`, () => readdir(join(workspacesRoot, environment)).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? [] : Promise.reject(error))));
+        return (names as string[]).filter(isValidVolumeId).sort();
       }),
 
     quota: (ref) =>

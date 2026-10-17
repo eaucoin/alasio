@@ -76,6 +76,7 @@
  *   409 where `to` is.
  * - `DELETE /workspaces/<environment>/<workspace>`: deletes the workspace, its quota with it
  *   (204), as it does one that is not there.
+ * - `GET /workspaces/<environment>`: `{ workspaces }`, the names of the environment's workspaces.
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
@@ -188,6 +189,7 @@ const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
 const QUOTA = /^\/workspaces\/([^/]+)\/([^/]+)\/quota$/u;
 const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
+const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -305,6 +307,10 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "POST" && url === "/workspaces/clones") {
       return body(CloneRequest).pipe(Effect.flatMap(({ from, to, quotaBytes }) => workspaces.clone(from, to, quotaBytes)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    const listed = WORKSPACES.exec(url);
+    if (method === "GET" && listed) {
+      return workspaces.list(decodeURIComponent(listed[1] ?? "")).pipe(Effect.map((names) => answer(200, { workspaces: names })));
     }
     const workspace = WORKSPACE.exec(url);
     if (method === "DELETE" && workspace) return workspaceOf(workspace).pipe(Effect.flatMap(workspaces.remove), Effect.as(HttpServerResponse.empty({ status: 204 })));

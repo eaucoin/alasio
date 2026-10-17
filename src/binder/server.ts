@@ -38,7 +38,7 @@ import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from 
 import { counts, touchLease } from "./bindings.ts";
 import { type Pool } from "./names.ts";
 import { proxy, type Route } from "./proxy.ts";
-import { bindingToken, verifyToken } from "./tokens.ts";
+import { bindingToken, type TokenClaims, verifyToken } from "./tokens.ts";
 
 /** The header of a request that binds nothing: passed on where its key is bound, and otherwise answered as unbound. */
 export const NO_BIND_HEADER = "x-alasio-bind";
@@ -65,8 +65,8 @@ export interface Placement extends BindOptions {
 export interface BinderServerOptions {
   readonly port: number;
   readonly host?: string;
-  /** The key caller's tokens are signed with. */
-  readonly callerKey: Buffer;
+  /** The key caller's tokens are signed with, or which, of what each says (./tokens.ts verifyToken). */
+  readonly callerKey: Buffer | ((claims: TokenClaims) => Buffer | null);
   /** The key the binding's tokens, which bound pods take requests with, are signed with. */
   readonly bindingKey: Buffer;
   /** The port bound pods serve on. */
