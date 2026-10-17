@@ -217,19 +217,23 @@ export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<
 /**
  * Sets `pool`'s bindings right where a binder ended between their steps: a bound pod no Lease
  * of its key names is deleted, as one claimed by a bind that then gave up; and a Lease naming
- * a pod gone is let go, as it was read, and told of (`letGo`), as a binding whose pod went while
- * it was bound, which what binds may say lost. A binding under way, its pod not yet named, is
- * left to its binder, or to the next to take it over. What was set right, as names.
+ * a pod gone is let go, as it was read, `before` run while it holds still, as what binds may
+ * record of it, then told of (`letGo`), as a binding whose pod went while it was bound, which
+ * what binds may say lost. A pod being deleted is not gone while it is there, as its binder may
+ * be saving it as it ends. A binding under way, its pod not yet named, is left to its binder,
+ * or to the next to take it over. What was set right, as names.
  */
 export const reconcile = Effect.fnUntraced(function*(
   pool: Pool,
   letGo: (lease: BindingLease) => Effect.Effect<void> = () => Effect.void,
+  before: (lease: BindingLease) => Effect.Effect<void> = () => Effect.void,
 ): Effect.fn.Return<{ readonly pods: string[]; readonly leases: string[] }, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
   const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as BindingLease[];
-  const pods = ((yield* kube.list("v1", "Pod", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as V1Pod[]).filter(({ metadata }) => !metadata?.deletionTimestamp);
+  const there = (yield* kube.list("v1", "Pod", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as V1Pod[];
+  const pods = there.filter(({ metadata }) => !metadata?.deletionTimestamp);
   const held = new Map(leases.map((lease) => [lease.metadata?.labels?.[BINDING_LABEL] ?? "", lease]));
-  const running = new Set(pods.map(({ metadata }) => metadata?.name ?? ""));
+  const running = new Set(there.map(({ metadata }) => metadata?.name ?? ""));
   const orphans = pods.filter(({ metadata }) => {
     const lease = held.get(metadata?.labels?.[BINDING_LABEL] ?? "");
     return !lease || (lease.spec?.holderIdentity && lease.spec.holderIdentity !== metadata?.name);
@@ -237,7 +241,7 @@ export const reconcile = Effect.fnUntraced(function*(
   const stale = leases.filter(({ spec }) => spec?.holderIdentity && !running.has(spec.holderIdentity));
   yield* Effect.forEach(orphans, ({ metadata }) => kube.remove("v1", "Pod", pool.namespace, metadata?.name ?? ""), { discard: true });
   // One changed since it was read, as by its binder, is no more this one's to let go, nor to tell of.
-  const released = yield* Effect.forEach(stale, (lease) => releaseLease(lease).pipe(Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
+  const released = yield* Effect.forEach(stale, (lease) => before(lease).pipe(Effect.andThen(releaseLease(lease)), Effect.as(true), Effect.catchIf(hasStatus(409), () => Effect.succeed(false))));
   yield* Effect.forEach(stale.filter((_, n) => released[n]), letGo, { discard: true });
   return { pods: orphans.map(({ metadata }) => metadata?.name ?? ""), leases: stale.filter((_, n) => released[n]).map(({ metadata }) => metadata?.name ?? "") };
 });
