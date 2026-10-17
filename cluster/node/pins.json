@@ -9,6 +9,7 @@
     }
   },
   "gvisor": {
+    "restoresFromBucketSince": "20260921.0-eaucoin.7",
     "releases": [
       {
         "release": "20260921.0-eaucoin.8",

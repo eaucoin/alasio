@@ -291,8 +291,10 @@ export interface Sandboxes {
   /**
    * Releases the Sandbox, ready and running, with no bring-up of it meanwhile: `save` is
    * given it, then, as `save` says, it is suspended, its pod ended, bound to the snapshot
-   * it was saved into (SNAPSHOT_ANNOTATION), or to none, or left running. Whether it was
-   * suspended; a Sandbox not ready and running is left as it is.
+   * it was saved into (SNAPSHOT_ANNOTATION), or to none, or left running. One saved into
+   * none whose bayma runs still, as one that can be saved no more, has it go on with the stop
+   * it would hold for a save first. Whether it was suspended; a Sandbox not ready and running
+   * is left as it is.
    */
   readonly release: <E>(name: string, save: (sandbox: StoredSandbox) => Effect.Effect<Saved, E>) => Effect.Effect<boolean, E | KubeApiError | SandboxNotReady | SandboxPodEnded | SandboxGone>;
   /**
@@ -712,6 +714,16 @@ export const makeSandboxes = Effect.fnUntraced(function*({
     return { restored };
   });
 
+  /** Whether the Sandbox `name`'s pod is there, its bayma not ended, as its status says. */
+  const baymaRuns = (name: string): Effect.Effect<boolean, KubeApiError> =>
+    // A core Pod, as the API server returns one.
+    kube.read("v1", "Pod", namespace, name).pipe(
+      Effect.map((read) => {
+        const pod = read as V1Pod | null;
+        return pod !== null && pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated === undefined;
+      }),
+    );
+
   /** The pod of the Sandbox `name`, if it is ending, or null. */
   const endingPod = (name: string): Effect.Effect<V1Pod | null, KubeApiError> =>
     // A core Pod, as the API server returns one.
@@ -840,6 +852,8 @@ export const makeSandboxes = Effect.fnUntraced(function*({
           if (!sandbox || sandbox.spec?.operatingMode === "Suspended" || !sandboxReady(sandbox)) return false;
           const saved = yield* save(sandbox);
           if (saved === "keep") return false;
+          // Its bayma would hold its stop for a save that never comes.
+          if (saved.saved === null && (yield* baymaRuns(name))) yield* stopNow(sandbox);
           const suspending = stored(yield* kube.patch(SANDBOX_API_VERSION, SANDBOX_KIND, namespace, name, {
             metadata: { annotations: snapshotBinding(saved.saved) },
             spec: { operatingMode: "Suspended" },

@@ -22,16 +22,21 @@
 import type { KubernetesObject, V1DaemonSet, V1Volume, V1VolumeMount } from "@kubernetes/client-node";
 
 import {
+  BACKGROUND_READ_SECONDS_VARIABLE,
+  backgroundReadSeconds,
   CONTAINERD,
   CPU_FEATURES_CONTAINER,
   GVISOR_RELEASES,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
-  OPERATION_LIMIT_SECONDS,
+  nodeAgentStopSeconds,
+  POD_IP_VARIABLE,
+  RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
 } from "../../../src/node-agent/names.ts";
-import { currentGvisorRelease } from "../cluster/node.ts";
+import { memoryBytes } from "../capacity.ts";
+import { currentGvisorRelease, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { componentName, given, imagePullSecrets, labels, NAMESPACE, nodeAgentRuns, otelEnv, selectorLabels } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
@@ -65,6 +70,8 @@ function sizeBytes(size: string): number {
 /** The node agents' DaemonSet. */
 function daemonSet(config: InstallConfig): V1DaemonSet {
   const { sessions } = config;
+  // The largest sandbox of the node's: a session's, at its memory limit.
+  const sandboxBytes = memoryBytes(sessions.resources.limits["memory"] ?? "0");
   const volumes: V1Volume[] = HOST_PATHS.map(({ name, path, type }) => ({ name, hostPath: { path, type } }));
   const volumeMounts: V1VolumeMount[] = HOST_PATHS.map(({ name, path, readOnly }) => ({
     name,
@@ -87,9 +94,11 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
         spec: {
           // A restore waits on it, as a turn does.
           ...priority("floor"),
-          // Stopped, it lets the checkpoints and prepares it runs end, rather than end a
-          // sandbox unsaved or leave its cache half written (src/node-agent/operations.ts).
-          terminationGracePeriodSeconds: OPERATION_LIMIT_SECONDS,
+          // Stopped, it lets the restores that read the bucket through it read all they need
+          // (src/node-agent/store-proxy.ts), then the checkpoints and prepares it runs end,
+          // rather than leave a resumed sandbox without the rest of its pages, end one
+          // unsaved, or leave its cache half written (src/node-agent/operations.ts).
+          terminationGracePeriodSeconds: nodeAgentStopSeconds(sandboxBytes),
           hostPID: true,
           // It speaks to nothing of the cluster's but alasio, which calls it.
           automountServiceAccountToken: false,
@@ -115,8 +124,12 @@ function daemonSet(config: InstallConfig): V1DaemonSet {
             command: ["node", "/opt/alasio/src/node-agent/main.ts"],
             env: [
               { name: "NODE_NAME", valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } },
+              // Its pod's address, which it serves the bucket to its node's restores on (src/node-agent/store-proxy.ts).
+              { name: POD_IP_VARIABLE, valueFrom: { fieldRef: { fieldPath: "status.podIP" } } },
               { name: NODE_AGENT_TOKEN_VARIABLE, valueFrom: { secretKeyRef: { name: NODE_AGENT_SECRET, key: "token" } } },
               { name: SNAPSHOT_CACHE_BYTES_VARIABLE, value: String(sizeBytes(sessions.snapshots.nodeCache)) },
+              { name: RESTORES_FROM_BUCKET_SINCE_VARIABLE, value: NODE_PINS.gvisor.restoresFromBucketSince },
+              { name: BACKGROUND_READ_SECONDS_VARIABLE, value: String(backgroundReadSeconds(sandboxBytes)) },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: "alasio-node-agent" }, ...otelEnv(config)] : []),
             ],
             envFrom: [{ secretRef: { name: SNAPSHOTS_SECRET } }],

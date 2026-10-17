@@ -50,6 +50,7 @@ import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
+import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */
@@ -2361,8 +2362,12 @@ describe("node agents", () => {
     const pod = agent.spec?.template.spec;
     assert.equal(pod?.hostPID, true);
     assert.equal(pod?.automountServiceAccountToken, false);
-    // Stopped, or replaced one node at a time, it lets what it runs end first, within the longest an operation may take.
-    assert.equal(pod?.terminationGracePeriodSeconds, 900);
+    // Stopped, or replaced one node at a time, it lets what it runs end first: the restores that
+    // read the bucket through it, the last prepared just before taking as long as one takes to
+    // its resume (5 minutes), then to read a session's 2 GiB at 4 MiB/s (512 s); then its
+    // operations, within the longest one may take (15 minutes).
+    assert.equal(pod?.terminationGracePeriodSeconds, 300 + 512 + 900);
+    assert.equal(agentOf(install({ sessions: { resources: { limits: { memory: "8Gi" } } } })).spec?.template.spec?.terminationGracePeriodSeconds, 300 + 2048 + 900);
     assert.deepEqual(agent.spec?.updateStrategy, { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 1, maxSurge: 0 } });
     assert.deepEqual(pod?.nodeSelector, { "alasio.dev/sessions": "true" });
     assert.deepEqual(pod?.tolerations, [{ key: "sessions", operator: "Exists" }]);
@@ -2395,20 +2400,27 @@ describe("node agents", () => {
     assert.deepEqual(features?.volumeMounts, container?.volumeMounts?.filter(({ name }) => name !== "snapshots"));
   });
 
-  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their cache's budget in bytes", () => {
+  test("take their bucket from its Secret whole, alasio's token from theirs, their node's name and their pod's address, their cache's budget in bytes, the first gVisor release that restores from the bucket, and how long a resumed restore may read it through them", () => {
     const container = (file: Record<string, unknown> = {}) => agentOf(install(file)).spec?.template.spec?.containers[0];
     const env = (file: Record<string, unknown> = {}) => Object.fromEntries((container(file)?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom]));
     assert.deepEqual(container()?.envFrom, [{ secretRef: { name: "alasio-snapshots" } }]);
     assert.deepEqual(env(), {
       NODE_NAME: { fieldRef: { fieldPath: "spec.nodeName" } },
+      POD_IP: { fieldRef: { fieldPath: "status.podIP" } },
       ALASIO_NODE_AGENT_TOKEN: { secretKeyRef: { name: "alasio-node-agent", key: "token" } },
       ALASIO_SNAPSHOT_CACHE_BYTES: "5368709120",
+      ALASIO_GVISOR_RESTORES_FROM_BUCKET_SINCE: "20260921.0-eaucoin.7",
+      // A session's 2 GiB, at 4 MiB/s.
+      ALASIO_BACKGROUND_READ_SECONDS: "512",
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
     });
     assert.equal(env({ sessions: { snapshots: { nodeCache: "1.5G" } } })["ALASIO_SNAPSHOT_CACHE_BYTES"], "1500000000");
     assert.equal(env({ sessions: { snapshots: { nodeCache: "750Mi" } } })["ALASIO_SNAPSHOT_CACHE_BYTES"], "786432000");
+    assert.equal(env({ sessions: { resources: { limits: { memory: "8Gi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "2048");
+    // A minute at least, however small a session.
+    assert.equal(env({ sessions: { resources: { limits: { memory: "64Mi" } } } })["ALASIO_BACKGROUND_READ_SECONDS"], "60");
     // Without a collector, it exports nothing.
     assert.deepEqual(Object.keys(env({ lake: { enabled: false } })).filter((name) => name.startsWith("OTEL_")), []);
   });
@@ -2420,6 +2432,32 @@ describe("node agents", () => {
     assert.deepEqual(agents({ sessions: { enabled: false }, workspaceStorage: { enabled: false } }), []);
     assert.deepEqual(agents({ neon: { enabled: false, external: { existingSecret: "db" } }, workspaceStorage: { enabled: false } }), []);
     assert.deepEqual(all(install({ sessions: { runtimeClassName: "" } }), "NetworkPolicy").filter(({ metadata }) => /node-agent|snapshots/u.test(metadata?.name ?? "")), []);
+  });
+
+  test("admit no pod, of any of the installation's workloads, nor any address, as another node's is, to the port they serve the bucket to their node on", () => {
+    for (const file of [{}, { objectStore: { bundled: { enabled: false }, external: { endpoint: "https://s3.example.com", existingSecret: "s3", snapshotsSecret: "s3-snapshots" } }, lake: { enabled: false } }]) {
+      const objects = install(file);
+      const policies = all<NetworkPolicyObject>(objects, "NetworkPolicy");
+      const agent = { namespace: "alasio", namespaceLabels: { "kubernetes.io/metadata.name": "alasio" }, labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" } };
+      // Its ingress is held to rules of ports, none of them that one: an address block, as another node's host is, is admitted to none of it.
+      const selecting = policies.filter(({ metadata, spec }) => metadata?.namespace === "alasio" && (spec.policyTypes ?? ["Ingress"]).includes("Ingress") && selects(spec.podSelector, agent.labels));
+      assert.ok(selecting.length > 0);
+      for (const { metadata, spec } of selecting) {
+        for (const rule of spec.ingress ?? []) {
+          assert.ok(rule.ports !== undefined && rule.ports.every(({ port }) => port !== undefined && port !== STORE_PROXY_PORT), `${metadata?.name} admits ${JSON.stringify(rule)}`);
+        }
+      }
+      // Nor a pod of any workload the installation runs.
+      const templates = objects.flatMap((object) =>
+        ["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"].includes(object.kind ?? "")
+          ? [{ namespace: object.metadata?.namespace ?? "", labels: ((object as V1Deployment).spec?.template?.metadata?.labels ?? (object as V1CronJob).spec?.jobTemplate?.spec?.template?.metadata?.labels ?? {}) as Record<string, string> }]
+          : []
+      );
+      assert.ok(templates.length > 10);
+      for (const { namespace, labels } of templates) {
+        assert.equal(admits(policies, { namespace, namespaceLabels: { "kubernetes.io/metadata.name": namespace }, labels }, agent, STORE_PROXY_PORT), false, `${namespace} ${JSON.stringify(labels)}`);
+      }
+    }
   });
 
   test("take alasio's calls alone, and reach the cluster's DNS, the object store's S3 port and the collector alone", () => {

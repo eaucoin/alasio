@@ -111,8 +111,10 @@ export interface FakeKube {
   /** What a workload's pod's init container says as it ends, its termination message, by `<workload>/<container>`; one it says nothing of has not ended. */
   readonly said: Map<string, string>;
   readonly failing: Set<string>;
-  /** What a pod logs, by its name, or a container of it, by `<pod>/<container>`. */
+  /** What a pod logs, by its name, or a container of it, by `<pod>/<container>`; its last `tailLines` lines alone where a read asks so. */
   readonly logs: Map<string, string>;
+  /** The queries of the reads of pods' logs, in order. */
+  readonly logReads: URLSearchParams[];
   /**
    * The controllers that let go of what they finalize, by their finalizer: the path of the
    * workload that does, which lets go of an object it finalizes a moment (FINALIZE_MS)
@@ -244,6 +246,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
   const said = new Map<string, string>();
   const failing = new Set<string>();
   const logs = new Map<string, string>();
+  const logReads: URLSearchParams[] = [];
   const finalizers = new Map<string, string>();
   const forbidden = new Set<string>();
   const execs: KubeExec[] = [];
@@ -407,10 +410,12 @@ export async function serveFakeKube(): Promise<FakeKube> {
     const path = url.pathname;
     if (method === "GET" && forbidden.has(path)) return refuse(response, 403, `${target.plural} is forbidden`);
     if (method === "GET" && target.sub === "log") {
+      logReads.push(url.searchParams);
       const text = logs.get(`${target.name}/${url.searchParams.get("container")}`) ?? logs.get(target.name ?? "");
       if (text === undefined) return refuse(response, 404, `pods "${target.name}" not found`);
+      const tail = url.searchParams.get("tailLines");
       response.writeHead(200, { "Content-Type": "text/plain" });
-      return void response.end(text);
+      return void response.end(tail === null ? text : `${text.trimEnd().split("\n").slice(-Number(tail)).join("\n")}\n`);
     }
     if (method === "GET" && !target.name) {
       const prefix = target.namespace ? `${target.api}/namespaces/${target.namespace}/${target.plural}/` : undefined;
@@ -558,6 +563,7 @@ export async function serveFakeKube(): Promise<FakeKube> {
     said,
     failing,
     logs,
+    logReads,
     finalizers,
     forbidden,
     execs,

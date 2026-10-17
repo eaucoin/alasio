@@ -4,17 +4,24 @@
  * StatefulSet until its pods are scheduled; waiting for what was deleted to be gone; and
  * for volumes let go of to be deleted. A wait says
  * what it still waits for as that changes, and when it gives up, why each thing is not
- * ready, from its pods' state and the cluster's warnings about them.
+ * ready, from its pods' state and the cluster's warnings about them. A workload's pod that
+ * stops within its grace, as a node agent's does while restores read the bucket through
+ * it, holds the wait past its timeout until it is gone, and the timeout after: the wait says
+ * so, with what the pod last logged.
  */
 import type { CoreV1Event, KubernetesObject, V1ContainerStatus, V1PersistentVolume, V1Pod, V1StatefulSet } from "@kubernetes/client-node";
-import { Duration, Effect, Schedule, Schema } from "effect";
+import { Clock, Duration, Effect, Schedule, Schema, Stream } from "effect";
 
 import { describeRef, kind, KubeApi, type KubeApiError, type ObjectRef } from "./api.ts";
 
-/** Where a thing waited for is: ready, still waiting (and what it is at), or failed, which no wait mends. */
+/**
+ * Where a thing waited for is: ready, still waiting (and what it is at, and until when a pod
+ * of it may still be stopping, in milliseconds since the epoch), or failed, which no wait
+ * mends.
+ */
 export type Readiness =
   | { readonly _tag: "Ready" }
-  | { readonly _tag: "Waiting"; readonly status: string }
+  | { readonly _tag: "Waiting"; readonly status: string; readonly stoppingUntil?: number }
   | { readonly _tag: "Failed"; readonly reason: string };
 
 const READY: Readiness = { _tag: "Ready" };
@@ -124,8 +131,8 @@ export class RolloutFailed extends Schema.TaggedError<RolloutFailed>()("RolloutF
   }
 }
 
-/** A look found something still waiting; the wait's NotReadyInTime says what when it gives up. */
-class Pending extends Schema.TaggedError<Pending>()("Pending", {}) {}
+/** A look found something still waiting past the wait's time; the wait's NotReadyInTime says what. */
+class TimedOut extends Schema.TaggedError<TimedOut>()("TimedOut", {}) {}
 
 /** How long a wait may take, and how often it looks. */
 export interface WaitOptions {
@@ -213,7 +220,8 @@ export const diagnose = Effect.fnUntraced(function*(ref: ObjectRef): Effect.fn.R
 /**
  * Looks at every ref by `look` until each is ready, every `poll` for `timeout`, saying
  * what it still waits for whenever that changes; fails with why when one fails, or when
- * time runs out.
+ * time runs out. A ref one of whose pods is stopping within its grace holds the wait until
+ * it is gone, and for `timeout` after the last look that found one.
  */
 const awaitAll = Effect.fnUntraced(function*(
   refs: readonly ObjectRef[],
@@ -224,28 +232,32 @@ const awaitAll = Effect.fnUntraced(function*(
   // What the last look found still waiting, and what was last said of it.
   let pending: ReadonlyArray<readonly [ObjectRef, string]> = [];
   let said = "";
+  const timeoutMs = Duration.toMillis(Duration.fromInputUnsafe(timeout));
+  const startedAt = yield* Clock.currentTimeMillis;
+  let deadline = startedAt + timeoutMs;
   const once = Effect.gen(function*() {
     const states = yield* Effect.forEach(refs, (ref) => Effect.map(look(ref), (state) => [ref, state] as const), { concurrency: 8 });
     for (const [ref, state] of states) {
       if (state._tag === "Failed") return yield* new RolloutFailed({ failed: { object: describeRef(ref), status: state.reason, why: yield* why(ref) } });
     }
     pending = states.flatMap(([ref, state]) => (state._tag === "Waiting" ? [[ref, state.status] as const] : []));
-    if (pending.length === 0) return;
+    if (pending.length === 0) return true;
+    const now = yield* Clock.currentTimeMillis;
+    if (states.some(([, state]) => state._tag === "Waiting" && (state.stoppingUntil ?? 0) > now)) deadline = Math.max(deadline, now + timeoutMs);
     const saying = pending.map(([ref, status]) => `${ref.name} (${status})`).join(", ");
     if (saying !== said) {
       said = saying;
       yield* Effect.logInfo(`waiting for ${saying}`);
     }
-    return yield* new Pending();
+    if (now >= deadline) return yield* new TimedOut();
+    return false;
   });
   yield* once.pipe(
-    Effect.retry({
-      while: (error) => error._tag !== "RolloutFailed",
-      schedule: Schedule.max([Schedule.spaced(poll), Schedule.during(timeout)]),
-    }),
-    Effect.catchTag("Pending", () =>
+    Effect.retry({ while: (error) => error._tag === "KubeApiError" && Date.now() < deadline, schedule: Schedule.spaced(poll) }),
+    Effect.repeat({ schedule: Schedule.spaced(poll), until: (done) => done }),
+    Effect.catchTag("TimedOut", () =>
       Effect.forEach(pending, ([ref, status]) => Effect.map(why(ref), (lines) => ({ object: describeRef(ref), status, why: lines }))).pipe(
-        Effect.flatMap((notReady) => Effect.fail(new NotReadyInTime({ within: Duration.toSeconds(timeout), waiting: notReady }))),
+        Effect.flatMap((notReady) => Effect.fail(new NotReadyInTime({ within: (deadline - startedAt) / 1000, waiting: notReady }))),
       )),
   );
 });
@@ -253,9 +265,41 @@ const awaitAll = Effect.fnUntraced(function*(
 /** The object `ref`, or null when there is none. */
 const current = (ref: ObjectRef): Effect.Effect<KubernetesObject | null, KubeApiError, KubeApi> => Effect.flatMap(KubeApi, (kube) => kube.get(ref));
 
-/** Waits until every ref is ready (readiness). */
+/** What a pod last logged, of its first container: its last line, alone read, or nothing where it cannot be read. */
+const lastLogged = (pod: V1Pod): Effect.Effect<string, never, KubeApi> =>
+  Effect.flatMap(KubeApi, (kube) =>
+    kube.logs(pod.metadata?.namespace ?? "", pod.metadata?.name ?? "", { container: pod.spec?.containers[0]?.name ?? "", tailLines: 1 }).pipe(
+      Stream.decodeText,
+      Stream.mkString,
+      Effect.map((text) => text.trimEnd().split("\n").at(-1)?.trim() ?? ""),
+      Effect.orElseSucceed(() => ""),
+    ));
+
+/**
+ * Where `object`, a workload, is (readiness), and, while it waits, which of its pods stop,
+ * each as it may until its grace ends, and what it last logged.
+ */
+const workloadReadiness = (object: KubernetesObject & { spec?: { selector?: { matchLabels?: Record<string, string> } } }): Effect.Effect<Readiness, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const state = readiness(object);
+    const matchLabels = object.spec?.selector?.matchLabels;
+    if (state._tag !== "Waiting" || !matchLabels) return state;
+    const kube = yield* KubeApi;
+    const pods = yield* kube.list<V1Pod>(POD, { namespace: object.metadata?.namespace, labelSelector: selectorOf(matchLabels) });
+    const stopping = pods.filter(({ metadata }) => metadata?.deletionTimestamp !== undefined);
+    if (stopping.length === 0) return state;
+    const said = yield* Effect.forEach(stopping, (pod) =>
+      Effect.map(lastLogged(pod), (line) => {
+        const until = new Date(pod.metadata?.deletionTimestamp ?? 0).toISOString();
+        return `pod ${pod.metadata?.name} on ${pod.spec?.nodeName ?? "no node"} stopping, as it may until ${until}${line === "" ? "" : `, last saying: ${line}`}`;
+      }));
+    const stoppingUntil = Math.max(...stopping.map(({ metadata }) => new Date(metadata?.deletionTimestamp ?? 0).getTime()));
+    return { _tag: "Waiting", status: [state.status, ...said].join("; "), stoppingUntil };
+  });
+
+/** Waits until every ref is ready (readiness), a workload one of whose pods is stopping within its grace for as long as it may. */
 export const awaitReady = (refs: readonly ObjectRef[], options: WaitOptions): Effect.Effect<void, KubeApiError | NotReadyInTime | RolloutFailed, KubeApi> =>
-  awaitAll(refs, (ref) => Effect.map(current(ref), (object) => (object ? readiness(object) : waiting("not found"))), diagnose, options);
+  awaitAll(refs, (ref) => Effect.flatMap(current(ref), (object) => (object ? workloadReadiness(object) : Effect.succeed(waiting("not found")))), diagnose, options);
 
 /**
  * Waits until every StatefulSet ref has made a pod for each of its replicas and each is

@@ -36,6 +36,7 @@ import {
   type SandboxFault,
   type SandboxRestore,
   SandboxRestoreRefused,
+  type Saved,
   type Sandboxes,
   type SandboxesOptions,
   type SandboxSpec,
@@ -709,6 +710,37 @@ test("a bring-up of a running Sandbox whose pod is ending releases it first, und
   // Brought up in a pod of its own, not the one that was ending.
   assert.equal(controller.pods.length, 2);
   assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Running");
+});
+
+test("a release into no snapshot of a Sandbox whose bayma runs still, as one that can be saved no more, has its bayma stop at once before the Sandbox is suspended; one into a snapshot, or whose bayma ended with its save, does not", async () => {
+  /** What stopNow saw of the Sandbox, as the API server held it then, as `save` releases it, its bayma ended or not. */
+  const stoppedAs = async (saved: Saved, baymaEnded = false) => {
+    const kube = fakeKube();
+    const { manifest, controller } = runningSandbox(kube);
+    const seen: (string | undefined)[] = [];
+    await onKube(kube, fakeBayma(kube, "alasio-sessions"), Effect.gen(function*() {
+      const sandboxes = yield* makeSandboxes({
+        namespace: "alasio-sessions",
+        port: 7290,
+        poll: "5 millis",
+        stopNow: () => Effect.sync(() => void seen.push(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode)),
+      });
+      yield* sandboxes.ensure("fs-abc123", manifest);
+      if (baymaEnded) {
+        const pod = kube.objects.get("Pod/alasio-sessions/fs-abc123");
+        assert.ok(pod);
+        // A core Pod's status, as the kubelet reports one, which the fake keeps as it is given.
+        pod.status = { containerStatuses: [{ name: "bayma", state: { terminated: { exitCode: 0 } } }] } as unknown as NonNullable<typeof pod.status>;
+      }
+      assert.equal(yield* sandboxes.release("fs-abc123", () => Effect.succeed(saved)), true);
+      assert.equal(kube.peek("Sandbox", "alasio-sessions", "fs-abc123")?.spec?.operatingMode, "Suspended");
+    })).finally(controller.stop);
+    return seen;
+  };
+  // Told while its Sandbox runs, before it is suspended.
+  assert.deepEqual(await stoppedAs({ saved: null }), ["Running"]);
+  assert.deepEqual(await stoppedAs({ saved: SAVED }), []);
+  assert.deepEqual(await stoppedAs({ saved: null }, true), []);
 });
 
 test("alasio has its bayma stop at once before it ends a running Sandbox's pod itself, as it moves, restarts, suspends or deletes one, or suspends one whose restored sandbox ran, and not once its pod has ended, nor where it never ran", async () => {

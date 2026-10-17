@@ -163,6 +163,8 @@ export interface LogOptions {
   readonly sinceSeconds?: number | undefined;
   /** What the container's instance before this one logged, which ended, rather than this one's. */
   readonly previous?: boolean | undefined;
+  /** Its last lines alone, this many. */
+  readonly tailLines?: number | undefined;
 }
 
 /** A container a command is run in. */
@@ -406,11 +408,11 @@ function makeKubeApi(kubeConfig: KubeConfig): KubeApi["Service"] {
         Effect.asVoid,
         Effect.catchIf(hasStatus(404), () => Effect.void),
       ),
-    logs: (namespace, pod, { container, follow = false, sinceSeconds, previous = false }) => {
+    logs: (namespace, pod, { container, follow = false, sinceSeconds, previous = false, tailLines }) => {
       const call: KubeCall = {
         method: "GET",
         path: `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(pod)}/log`,
-        query: { container, follow: String(follow), sinceSeconds: sinceSeconds === undefined ? undefined : String(sinceSeconds), previous: previous ? "true" : undefined },
+        query: { container, follow: String(follow), sinceSeconds: sinceSeconds === undefined ? undefined : String(sinceSeconds), previous: previous ? "true" : undefined, tailLines: tailLines === undefined ? undefined : String(tailLines) },
       };
       return Stream.unwrap(
         Effect.map(open(call), (response) => NodeStream.fromReadable({ evaluate: () => response, onError: (cause) => unreachable(call, cause) })),

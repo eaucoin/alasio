@@ -17,16 +17,20 @@
  * - `GET /checkpoints/<environment>/<workspace>`: how its last checkpoint stands (200):
  *   `{ state: "running" }`; `{ state: "done", value }`, `value` the snapshot's manifest; or
  *   `{ state: "failed", status, error }`, `status` 500, whose error says why, and that the
- *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept. 404
- *   when it has none the agent keeps (./operations.ts).
+ *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept; 410 where its
+ *   sandbox can be saved no more, its restore having failed to read some of its pages, as
+ *   every checkpoint of it after will. 404 when it has none the agent keeps (./operations.ts).
  * - `POST /prepare`, `{ environment, workspace }`: starts preparing the workspace's current
- *   snapshot in this node's cache, for a restore on this node (202), unless a prepare of
- *   it runs, which goes on.
+ *   snapshot for a restore on this node (202), from this node's cache, or else from the
+ *   bucket, which the restore reads as it goes, unless a prepare of it runs, which goes on.
  * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
- *   checkpoint's does, `value` `{ manifest, imagePath }`; `status` 404 when it has no
- *   snapshot, 409 when this node cannot restore it (its release is not installed here, or
- *   this node's CPU lacks a feature it was saved with), 422 when its image is not what its
- *   manifest says, 502 when the bucket failed.
+ *   checkpoint's does, `value` `{ manifest, imagePath, source }`, `source` "cache" or
+ *   "bucket"; `status` 404 when it has no snapshot, 409 when this node cannot restore it (its
+ *   release is not installed here, or this node's CPU lacks a feature it was saved with, or
+ *   its runsc does not restore it, as `runsc image verify --host` says), 422 when its image is
+ *   not what its manifest says, 502 when the bucket failed or cannot be told from the node,
+ *   503 when it would be read from the bucket and the agent is stopping (its node's next
+ *   agent prepares it).
  * - `POST /copies`, `{ from: { environment, workspace }, to: { environment, workspace } }`:
  *   makes the current snapshot of `from` that of `to` too, copied in the bucket, as a
  *   session forked from another restores what the other was: `to`'s manifest (200). 404
@@ -68,6 +72,10 @@
  * - `GET /healthz`: 200 once it serves.
  *
  * A manifest is ./agent.ts Manifest.
+ *
+ * An agent that stops serves on until no restore reads the bucket through it (./store-proxy.ts
+ * drained), as a resumed sandbox reads the rest of its pages there, then lets the checkpoints,
+ * prepares and copies it runs end (./operations.ts).
  */
 import { createServer } from "node:http";
 
@@ -88,22 +96,28 @@ import {
   type Prepared,
   type PrepareError,
   ResumeRequest,
+  type SandboxUnsaveable,
   WorkspaceRef,
 } from "./agent.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
 import {
+  BACKGROUND_READ_SECONDS_VARIABLE,
   CONTAINERD,
   GVISOR_RELEASES,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
+  POD_IP_VARIABLE,
   RUNSC_ROOT,
+  RESTORES_FROM_BUCKET_SINCE_VARIABLE,
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
+  STORE_PROXY_PORT,
 } from "./names.ts";
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
 import { makeS3Bucket } from "./s3.ts";
+import { makeStoreProxy, type StoreProxyError } from "./store-proxy.ts";
 
 /** What serveNodeAgent is given: where it listens, the token it takes, and the agent it serves. */
 export interface NodeAgentServerOptions {
@@ -120,8 +134,10 @@ const STATUS: Readonly<Record<string, number>> = {
   ContainerElsewhere: 409,
   SnapshotCorrupt: 422,
   S3Error: 502,
+  AgentStopping: 503,
   SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
+  SandboxUnsaveable: 410,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
@@ -173,7 +189,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
   agent,
 }: NodeAgentServerOptions): Effect.fn.Return<{ readonly port: number }, HttpServerError.ServeError, Scope.Scope> {
   const scope = yield* Effect.scope;
-  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed>(scope, failureOf);
+  const checkpoints = yield* makeOperations<Manifest, CheckpointFailed | SandboxUnsaveable>(scope, failureOf);
   const prepares = yield* makeOperations<Prepared, PrepareError>(scope, failureOf);
   const started = answer(202, { state: "running" });
   /** How the operation of `operations` for the workspace a path names stands. */
@@ -282,27 +298,48 @@ const EVICTION_GRACE_MS = 10 * 60_000;
 
 /**
  * The node agent of the node it runs on (NODE_NAME), as its environment configures it:
- * the bucket (BucketConfig), the token alasio presents (NODE_AGENT_TOKEN_VARIABLE), and
- * the cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE). What a stopped agent left
- * half written in the cache is removed first. What stops it is logged.
+ * the bucket (BucketConfig), the token alasio presents (NODE_AGENT_TOKEN_VARIABLE), the
+ * cache's budget in bytes (SNAPSHOT_CACHE_BYTES_VARIABLE), the first gVisor release that
+ * restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless given,
+ * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),
+ * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
+ * and how long a resumed restore may read it there (BACKGROUND_READ_SECONDS_VARIABLE). What a
+ * stopped agent left half written in the cache is removed first. What stops it is logged,
+ * and its stop waits on its restores' reads, as the module says.
  */
-export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError, Scope.Scope> = Effect.gen(function*() {
+export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError.ServeError | CacheError | StoreProxyError, Scope.Scope> = Effect.gen(function*() {
   const node = yield* Config.String("NODE_NAME");
   const token = yield* Config.Redacted(NODE_AGENT_TOKEN_VARIABLE);
   const budget = yield* Config.Int(SNAPSHOT_CACHE_BYTES_VARIABLE).pipe(Config.withDefault(DEFAULT_CACHE_BYTES));
+  const restoresFromBucketSince = yield* Config.String(RESTORES_FROM_BUCKET_SINCE_VARIABLE).pipe(Config.withDefault(""));
+  const backgroundReadSeconds = yield* Config.Int(BACKGROUND_READ_SECONDS_VARIABLE);
   const { secretAccessKey, ...bucket } = yield* BucketConfig;
   const cache = makeSnapshotCache({ root: SNAPSHOT_CACHE_DIR, budget, graceMs: EVICTION_GRACE_MS });
   yield* cache.clean;
+  // The bucket, to the node's restores, on the pod's own address, which the node reaches.
+  const podIP = yield* Config.String(POD_IP_VARIABLE);
+  const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT });
   const agent = yield* makeNodeAgent({
     node,
     nodeRoot: NODE_ROOT,
     runsc: makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT }),
     cache,
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
+    storeProxy,
     host: makeHostCommands(),
+    restoresFromBucketSince,
+    backgroundReadMs: backgroundReadSeconds * 1000,
   });
   const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent });
-  yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, its cache within ${budget} bytes`);
+  // As it stops, before its API does: its restores' reads of the bucket done first.
+  yield* Effect.addFinalizer(() =>
+    Effect.gen(function*() {
+      const reading = storeProxy.reading();
+      if (reading > 0) yield* Effect.logInfo(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: ${reading} read it now`);
+      yield* storeProxy.drained;
+    })
+  );
+  yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, and the snapshots bucket to its node on ${new URL(storeProxy.endpoint).host}, its cache within ${budget} bytes`);
 }).pipe(
   Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),
   withLogScope("node-agent"),
