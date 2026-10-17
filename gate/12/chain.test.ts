@@ -20,9 +20,9 @@
  *   6. a server-side copy of a 1 GiB layer in the bundled SeaweedFS: its time and bytes;
  *   7. a live snapshot restored after its pod went, during its exec, which goes on; and one
  *      whose held file changed since, which the restore refuses;
- *   8. a restore from the bucket whose proxy goes away during its background reads: for a
- *      while, as long as a node agent takes to come back, and for good; what its sandbox does
- *      then, and whether it can be saved again.
+ *   8. a restore from the bucket whose proxy goes away during its background reads, for a
+ *      while: briefly, as long as a node agent takes to come back, and for five minutes; its
+ *      reads wait for the proxy, its memory comes back intact, and it saves again.
  *
  * What each records goes into $OUT/evidence.json.
  *
@@ -293,8 +293,9 @@ async function upload(image: string, prefix: string): Promise<void> {
  * The options of the S3 gofer for the image at `objectPrefix` in the bucket, its layers each
  * under `layersPrefix`, as JSON: at `endpoint` with `credentials`, the store's own unless said.
  */
+/** A restore's s3_opts.json, its reads of pages waiting for a store that is away for as long as the sandbox runs, as the node agent writes it for a release that can. */
 const goferOptions = (objectPrefix: string, layersPrefix: string, endpoint = s3.endpoint, credentials = { access_key_id: s3.accessKeyId, secret_access_key: s3.secretAccessKey }) =>
-  JSON.stringify({ endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials });
+  JSON.stringify({ endpoint, region: s3.region, bucket: s3.bucket, object_prefix: objectPrefix, layers_prefix: layersPrefix, addressing: "path", credentials, pages_retry: "while-running" });
 
 /** A relay to a store, as relayTo makes one. */
 interface Relay {
@@ -551,8 +552,8 @@ test("7. a live snapshot restores into a new pod while its exec runs, which goes
 const BALLAST_MIB = 512;
 /** How fast gate 8's relay carries a restore's reads: slow enough that its background lasts half a minute. */
 const OUTAGE_RELAY_BYTES_PER_SECOND = 16 * 1024 ** 2;
-/** How long gate 8 holds the proxy away for good: past the gofer's attempts of a read, 5, each at most 20 s after the one before. */
-const GONE_FOR_GOOD_MS = 150_000;
+/** How long gate 8's longest outage lasts: far past the gofer's attempts of a read, 5, each at most 20 s after the one before, which pages_retry outlasts. */
+const LONG_OUTAGE_MS = 300_000;
 /** How long gate 8 waits for an answer of a sandbox that may not give one. */
 const ANSWER_WITHIN_MS = 180_000;
 
@@ -575,14 +576,15 @@ async function agentReplaced(): Promise<{ readonly ms: number; readonly from: st
   }
 }
 
-test("8. a restore from the bucket whose proxy goes away during its background reads, for a while and for good, and how long a node agent takes to come back", { timeout: 60 * 60_000 }, () =>
+test("8. a restore from the bucket whose proxy goes away during its background reads, for a while, comes back intact and saves again; and how long a node agent takes to come back", { timeout: 60 * 60_000 }, () =>
   recorded("outage", async (seen) => {
     seen["agentReplaced"] = await agentReplaced();
     const restartMs = (seen["agentReplaced"] as { readonly ms: number }).ms;
-    // For a while, then back on the same port: briefly, and as long as an agent takes to come
-    // back; then for good. Each of a session of its own, a whole image of whose sandbox the
-    // restore reads every page of from the bucket.
-    const outages = [["brief", 10_000], ["restart", restartMs], ["forGood", null]] as const;
+    // For a while, then back on the same port: briefly, as long as an agent takes to come
+    // back, and for five minutes. Each of a session of its own, a whole image of whose
+    // sandbox the restore reads every page of from the bucket, its reads of pages waiting
+    // for the store as long as the sandbox runs (pages_retry).
+    const outages = [["brief", 10_000], ["restart", restartMs], ["long", LONG_OUTAGE_MS]] as const;
     await throughProxy(async (proxy) => {
       for (const [name, outageMs] of outages) {
         const outcome: Record<string, unknown> = { outageMs };
@@ -617,11 +619,8 @@ test("8. a restore from the bucket whose proxy goes away during its background r
             }
             outcome["cutAt"] = { bytes: relay.carried().bytes, ms: Date.now() - startedAt };
             await relay.cut();
-            if (outageMs === null) await sleep(GONE_FOR_GOOD_MS);
-            else {
-              await sleep(outageMs);
-              await relay.back();
-            }
+            await sleep(outageMs);
+            await relay.back();
             outcome["reads"] = await readsOf(relay, startedAt, 30_000);
           } finally {
             relay.close();
@@ -637,6 +636,17 @@ test("8. a restore from the bucket whose proxy goes away during its background r
         }
       }
     });
-    // Each outage cut the restore mid-background, or the gate saw nothing.
-    for (const [name] of outages) assert.ok((seen[name] as Record<string, unknown>)["cutAt"], `${name}: ${JSON.stringify(seen[name])}`);
+    for (const [name] of outages) {
+      const outcome = seen[name] as Record<string, unknown>;
+      const said = `${name}: ${JSON.stringify(outcome)}`;
+      // Each outage cut the restore mid-background, or the gate saw nothing; the restore then
+      // read the rest of its pages, the sandbox's memory is what it was, and it saves again.
+      assert.ok(outcome["cutAt"] && !outcome["error"], said);
+      assert.ok((outcome["reads"] as { readonly bytes: number }).bytes >= (outcome["pagesBytes"] as number), said);
+      assert.equal(outcome["touched"], "intact", said);
+      const read = outcome["read"] as Read | string;
+      assert.equal(typeof read === "string" ? read : read.marker, "42", said);
+      assert.equal(typeof outcome["saved"], "object", said);
+    }
   }));
+
