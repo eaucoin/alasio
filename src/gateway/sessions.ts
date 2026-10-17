@@ -33,7 +33,7 @@
  */
 import { lookup } from "node:dns/promises";
 
-import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
+import type { V1Pod } from "@kubernetes/client-node";
 import { Clock, Effect } from "effect";
 
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
@@ -44,12 +44,11 @@ import { baymaIdleness, IDLE_POLL_MS, makeSweep } from "../binder/sweep.ts";
 import { bindingToken, type TokenClaims } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
-import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { isValidVolumeId, volumeIdOfKey } from "../sandbox/names.ts";
-import { hookOf } from "../sandbox/snapshots.ts";
 import type { Events, EventInput } from "../events/events.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
+import { makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
 export const ATTACH_DURATION = "alasio.gateway.attach.duration";
@@ -141,6 +140,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient> {
   const kube = yield* KubeClient;
+  const snapshots = yield* makeGatewaySnapshots(agents);
   const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
@@ -188,12 +188,10 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   /**
    * Ends the sandbox of `name`, the bound pod of the workspace `volumeId`, so its workspace
-   * can be detached, then detaches it. Under gVisor, its node's agent saves it whole first
-   * (its release's snapshot, bayma told by its hook), which ends it, its pool's template
-   * recorded for its restore; a save that fails and leaves it running fails the release, which
-   * keeps the binding; one that ended it anyway lost what ran in it but bayma's checkpoints,
-   * and the release goes on. Under another runtime, its pod's deletion ends it. Then the
-   * workspace is detached, its containers stopped, for the binder to delete the pod.
+   * can be detached, then detaches it: saved whole first, its release recorded for its next
+   * bind (./snapshots.ts); a save that leaves it running fails the release, which keeps the
+   * binding. Then its pod's deletion ends what of it runs on, its containers stopped, and the
+   * workspace is detached, for the binder to delete the pod.
    */
   const endAndDetach = (pool: Pool, volumeId: string, name: string): Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed> =>
     Effect.gen(function*() {
@@ -201,29 +199,8 @@ export const makeSessions = Effect.fnUntraced(function*(
       if (!pod) return;
       const node = pod.spec?.nodeName ?? "";
       const containers = containerIdsOf(pod);
-      const bayma = pod.spec?.containers.find((container) => container.name === BAYMA_CONTAINER);
-      const containerId = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.containerID?.replace(/^[a-z]+:\/\//u, "");
-      const hook = bayma ? hookOf(bayma) : null;
-      if (pod.spec?.runtimeClassName && hook && containerId) {
-        const deployment = (yield* kube.read("apps/v1", "Deployment", pool.namespace, pool.name)) as V1Deployment | null;
-        const taken = yield* agents.checkpoint(node, {
-          environment: pool.namespace,
-          workspace: volumeId,
-          namespace: pool.namespace,
-          pod: name,
-          containerId,
-          hook,
-          podTemplate: { ...deployment?.spec?.template },
-        }).pipe(Effect.result);
-        if (taken._tag === "Failure") {
-          const after = (yield* kube.read("v1", "Pod", pool.namespace, name)) as V1Pod | null;
-          const ended = after?.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER)?.state?.terminated !== undefined;
-          if (!ended) return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on: ${taken.failure.message}` });
-          yield* Effect.logWarning(`${volumeId}'s sandbox was not saved, and ended: what ran in it comes back from bayma's checkpoints: ${taken.failure.message}`);
-        }
-      } else {
-        yield* kube.remove("v1", "Pod", pool.namespace, name);
-      }
+      if ((yield* snapshots.save(pool, volumeId, name)) === "keep") return yield* new BindStepFailed({ reason: `its sandbox was not saved, and runs on` });
+      yield* kube.remove("v1", "Pod", pool.namespace, name);
       yield* stopped(pool, name);
       yield* timed(detachDuration, pool, agents.detach(node, name, containers));
     });
