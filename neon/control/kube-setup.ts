@@ -47,6 +47,7 @@ import {
   type S3Identity,
   type StackSecrets,
   type StoredSecrets,
+  WORKSPACE_QUOTAS_USER,
 } from "./secrets.ts";
 
 const PUBLIC_KEY = "auth_public_key.pem";
@@ -72,6 +73,7 @@ export interface SecretNames {
   branches: string;
   valkey: string;
   workspaces: string;
+  workspaceQuotas: string;
   snapshots: string;
   nodeAgent: string;
   sandboxGateway: string;
@@ -188,6 +190,7 @@ export function secretNames(prefix: string): SecretNames {
     branches: `${prefix}-branches`,
     valkey: `${prefix}-valkey`,
     workspaces: `${prefix}-workspaces-juicefs`,
+    workspaceQuotas: `${prefix}-workspaces-quotas`,
     snapshots: `${prefix}-snapshots`,
     nodeAgent: `${prefix}-node-agent`,
     sandboxGateway: `${prefix}-sandbox-gateway`,
@@ -326,6 +329,12 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
       "access-key": s3("workspaces").accessKey,
       "secret-key": s3("workspaces").secretKey,
       "format-options": `trash-days=${workspaces.trashDays}`,
+    };
+    // The node agents', which set workspaces' quotas on its metadata as a Valkey user of their
+    // own, of no command Valkey calls dangerous but what JuiceFS asks, and no key of the object store.
+    rendered[names.workspaceQuotas] = {
+      password: secrets.valkeyQuotasPassword,
+      metaurl: `redis://${WORKSPACE_QUOTAS_USER}:${encodeURIComponent(secrets.valkeyQuotasPassword)}@${workspaces.valkeyAddress}/1`,
     };
   }
   const { snapshotsBucket } = config;

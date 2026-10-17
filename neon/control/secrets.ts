@@ -59,6 +59,9 @@ export interface S3Credentials {
   secretKey: string;
 }
 
+/** The Valkey user of workspace storage's metadata the node agents set quotas as (cli/src/manifests/workspace-storage.ts). */
+export const WORKSPACE_QUOTAS_USER = "quotas";
+
 /** The stack's secrets, as the root Secret's secrets.json keeps them. */
 export interface StackSecrets {
   tenantId: string;
@@ -68,8 +71,9 @@ export interface StackSecrets {
   alasioPassword: string;
   lakePassword: string;
   computeControlToken: string;
-  /** Workspace storage's Valkey's. */
+  /** Workspace storage's Valkey's, and its user the node agents set quotas as. */
   valkeyPassword: string;
+  valkeyQuotasPassword: string;
   /** The bundled object store's filer store's, its filers' Valkey: its users', the filers', the collector's and the backups'. */
   filerStoreFilerPassword: string;
   filerStoreCollectorPassword: string;
@@ -217,6 +221,7 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
     lakePassword: passwords.lakePassword,
     computeControlToken: kept(stored.computeControlToken, () => secret()),
     valkeyPassword: kept(stored.valkeyPassword, () => secret()),
+    valkeyQuotasPassword: kept(stored.valkeyQuotasPassword, () => secret()),
     lakeReaderPassword: passwords.lakeReaderPassword,
     lakeQueryToken: kept(stored.lakeQueryToken, () => secret()),
     grafanaPassword: passwords.grafanaPassword,

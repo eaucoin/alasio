@@ -15,8 +15,9 @@
  */
 import type { KubernetesObject, V1Container, V1CronJob, V1Job, V1StorageClass } from "@kubernetes/client-node";
 
+import { WORKSPACE_QUOTAS_USER } from "../../../neon/control/secrets.ts";
 import { imageReference } from "../images.ts";
-import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, restrictedContainer, restrictedPod, script } from "./common.ts";
+import { componentName, imagePullSecrets, type Labels, labels, NAMESPACE, nodeAgentRuns, restrictedContainer, restrictedPod, script } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { priority } from "./priorities.ts";
 import { CSI_DRIVER, juicefsCsiObjects, VOLUME_DRIVER } from "./juicefs-csi.ts";
@@ -24,6 +25,10 @@ import { VALKEY_PORT, valkeyObjects, valkeyPassword } from "./valkey.ts";
 
 /** The Secret of the file system's credentials. */
 export const WORKSPACES_CREDENTIALS = componentName("workspaces-juicefs");
+/** The Secret of the node agents' Valkey user, its password and the metadata engine's address as it logs in (neon/control/kube-setup.ts). */
+export const WORKSPACE_QUOTAS = componentName("workspaces-quotas");
+/** What the node agents' Valkey user may do, as Valkey's ACL rules say it. */
+export const QUOTAS_RULES = ["~*", "&*", "+@all", "-@dangerous", "+info"] as const;
 
 /**
  * The label of alasio's pods that run JuiceFS's command line against the file system, the
@@ -271,6 +276,15 @@ export function workspaceStorageObjects(config: InstallConfig): KubernetesObject
   if (!config.workspaceStorage.enabled) return [];
   const { valkey } = config.workspaceStorage;
   // JuiceFS's driver needs it to delete its volumes' data, so it is kept while they remain.
-  const instance = { name: VALKEY, component: "valkey", labels: VOLUME_DRIVER, ...valkey };
+  const instance = {
+    name: VALKEY,
+    component: "valkey",
+    labels: VOLUME_DRIVER,
+    ...valkey,
+    // The node agents', which set workspaces' quotas: every key, but no command Valkey calls
+    // dangerous, those that read or change its server whole, but INFO, which JuiceFS reads its
+    // settings in.
+    ...(nodeAgentRuns(config) ? { besideDefault: [{ name: WORKSPACE_QUOTAS_USER, secret: WORKSPACE_QUOTAS, rules: QUOTAS_RULES }] } : {}),
+  };
   return [...valkeyObjects(config, instance, [formatter(config)]), ...juicefsCsiObjects(config), storageClass(config), quotaCheck(config), collection(config)];
 }

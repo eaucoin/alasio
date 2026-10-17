@@ -193,6 +193,10 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // Workspace storage's JuiceFS reaches Valkey with its password, and its own bucket alone.
   assert.equal(value(kube, names.valkey, "password"), root.valkeyPassword);
   assert.equal(value(kube, names.workspaces, "metaurl"), `redis://:${encodeURIComponent(root.valkeyPassword)}@q-valkey.alasio.svc.cluster.local:6379/1`);
+  // The node agents', a Valkey user of their own, of a password of its own.
+  assert.equal(value(kube, names.workspaceQuotas, "password"), root.valkeyQuotasPassword);
+  assert.equal(value(kube, names.workspaceQuotas, "metaurl"), `redis://quotas:${encodeURIComponent(root.valkeyQuotasPassword)}@q-valkey.alasio.svc.cluster.local:6379/1`);
+  assert.notEqual(root.valkeyQuotasPassword, root.valkeyPassword);
   assert.equal(value(kube, names.workspaces, "name"), "workspaces");
   assert.equal(value(kube, names.workspaces, "storage"), "s3");
   assert.equal(value(kube, names.workspaces, "bucket"), "http://q-seaweedfs.alasio.svc.cluster.local:8333/workspaces");
@@ -336,6 +340,7 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     alasioPassword: "q",
     lakePassword: "l",
     computeControlToken: "t",
+    valkeyQuotasPassword: "vq",
     valkeyPassword: "v",
     lakeReaderPassword: "r",
     lakeQueryToken: "k",

@@ -12,8 +12,9 @@
  *   writes snapshots and for deletions once it is reached, and the policy `noeviction`, as
  *   an evicted key is lost metadata.
  *
- * Its clients log in as its default user, with the password in a Secret of its name; or, of
- * one with users of its own, as each of those, with the password in a Secret of that
+ * Its clients log in as its default user, with the password in a Secret of its name, and,
+ * beside it, any user of its own as narrow as its rules say; or, of one with users of its own
+ * alone, as each of those, with the password in a Secret of that
  * user's, its default user turned off. The stack's setup makes each (./neon.ts). None is of
  * the data stack, whose pods reach each other: each one's NetworkPolicy
  * (./network-policies.ts) admits its own clients alone, and the collector.
@@ -58,6 +59,8 @@ export interface ValkeyInstance {
   readonly maxmemory: string;
   /** Its users, its default user turned off; none, its clients log in as its default user, with the password of the Secret of its name. */
   readonly users?: readonly ValkeyUser[];
+  /** Of one whose clients log in as its default user, its users beside it, each as narrow as its rules say. */
+  readonly besideDefault?: readonly ValkeyUser[];
 }
 
 /** The configuration file of a Valkey that may hold `maxmemory`. */
@@ -94,10 +97,16 @@ const userVariable = (name: string) => `VALKEY_${name.toUpperCase().replaceAll("
  * default user's password; or its users, each with its password and rules, the default
  * user turned off, and the probe as the user that probes.
  */
-function access({ name, users = [] }: ValkeyInstance): { readonly args: string[]; readonly env: V1EnvVar[]; readonly cli: string } {
+function access({ name, users = [], besideDefault = [] }: ValkeyInstance): { readonly args: string[]; readonly env: V1EnvVar[]; readonly cli: string } {
+  const userArgs = (each: readonly ValkeyUser[]) => each.flatMap(({ name: user, rules }) => ["--user", user, "on", `>$(${userVariable(user)})`, ...rules]);
+  const userEnv = (each: readonly ValkeyUser[]) => each.map(({ name: user, secret }) => ({ name: userVariable(user), valueFrom: valkeyPassword(secret) }));
   if (users.length === 0) {
     const password = valkeyPassword(name);
-    return { args: ["--requirepass", "$(VALKEY_PASSWORD)"], env: [{ name: "VALKEY_PASSWORD", valueFrom: password }, { name: "VALKEYCLI_AUTH", valueFrom: password }], cli: "valkey-cli" };
+    return {
+      args: ["--requirepass", "$(VALKEY_PASSWORD)", ...userArgs(besideDefault)],
+      env: [{ name: "VALKEY_PASSWORD", valueFrom: password }, { name: "VALKEYCLI_AUTH", valueFrom: password }, ...userEnv(besideDefault)],
+      cli: "valkey-cli",
+    };
   }
   const probing = users.find(({ probes }) => probes) ?? users[0];
   return {
@@ -106,10 +115,10 @@ function access({ name, users = [] }: ValkeyInstance): { readonly args: string[]
       "--user",
       "default",
       "off",
-      ...users.flatMap(({ name: user, rules }) => ["--user", user, "on", `>$(${userVariable(user)})`, ...rules]),
+      ...userArgs(users),
     ],
     env: [
-      ...users.map(({ name: user, secret }) => ({ name: userVariable(user), valueFrom: valkeyPassword(secret) })),
+      ...userEnv(users),
       ...(probing ? [{ name: "VALKEYCLI_AUTH", valueFrom: valkeyPassword(probing.secret) }] : []),
     ],
   };

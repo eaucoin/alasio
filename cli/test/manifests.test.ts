@@ -1191,10 +1191,10 @@ describe("object store", () => {
       { name: "VALKEY_BACKUP_PASSWORD", valueFrom: secret("alasio-seaweedfs-filer-store-backup") },
       { name: "VALKEYCLI_AUTH", valueFrom: secret("alasio-seaweedfs-filer-store-collector") },
     ]);
-    // Its readiness probe logs in as the collector; workspace storage's Valkey, of no users of its own, as its default user.
+    // Its readiness probe logs in as the collector; workspace storage's Valkey, whose clients log in as its default user, the node agents' beside it, as its default user.
     assert.match(store.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli --user collector info persistence\)/u);
     const valkey = container(one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey"));
-    assert.deepEqual(valkey.command, ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
+    assert.deepEqual(valkey.command?.slice(0, 4), ["valkey-server", "/etc/valkey/valkey.conf", "--requirepass", "$(VALKEY_PASSWORD)"]);
     assert.match(valkey.readinessProbe?.exec?.command?.[2] ?? "", /^persistence=\$\(valkey-cli info persistence\)/u);
   });
 
@@ -2443,7 +2443,7 @@ describe("node agents", () => {
       NODE_NAME: { fieldRef: { fieldPath: "spec.nodeName" } },
       ALASIO_NODE_AGENT_TOKEN: { secretKeyRef: { name: "alasio-node-agent", key: "token" } },
       ALASIO_SNAPSHOT_CACHE_BYTES: "5368709120",
-      META_URL: { secretKeyRef: { name: "alasio-workspaces-juicefs", key: "metaurl" } },
+      META_URL: { secretKeyRef: { name: "alasio-workspaces-quotas", key: "metaurl" } },
       OTEL_SERVICE_NAME: "alasio-node-agent",
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://alasio-collector.alasio.svc:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
@@ -3557,9 +3557,14 @@ describe("the sandbox service", () => {
   test("gives the node agent the metadata engine alone, which it sets quotas on with JuiceFS's own command, of the very mount image the nodes mount with", () => {
     const objects = install();
     const [agent] = one<V1DaemonSet>(objects, "DaemonSet", "alasio-node-agent").spec?.template.spec?.containers ?? [];
-    assert.deepEqual(agent?.env?.find(({ name }) => name === "META_URL")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-juicefs", key: "metaurl" });
-    // No key of workspace storage's object store.
-    assert.deepEqual((agent?.env ?? []).filter(({ valueFrom }) => valueFrom?.secretKeyRef?.name === "alasio-workspaces-juicefs").map(({ name }) => name), ["META_URL"]);
+    // As a Valkey user of its own, of no command Valkey calls dangerous but INFO, and no key of workspace storage's object store.
+    assert.deepEqual(agent?.env?.find(({ name }) => name === "META_URL")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-quotas", key: "metaurl" });
+    assert.deepEqual((agent?.env ?? []).filter(({ valueFrom }) => valueFrom?.secretKeyRef?.name === "alasio-workspaces-juicefs"), []);
+    const [server] = one<V1StatefulSet>(objects, "StatefulSet", "alasio-valkey").spec?.template.spec?.containers ?? [];
+    const args = server?.command ?? [];
+    assert.deepEqual(args.slice(args.indexOf("--user")), ["--user", "quotas", "on", ">$(VALKEY_QUOTAS_PASSWORD)", "~*", "&*", "+@all", "-@dangerous", "+info"]);
+    assert.ok(args.includes("--requirepass"));
+    assert.deepEqual(server?.env?.find(({ name }) => name === "VALKEY_QUOTAS_PASSWORD")?.valueFrom?.secretKeyRef, { name: "alasio-workspaces-quotas", key: "password" });
     const { repository, tag, digest } = configOf().workspaceStorage.csi.mountImage;
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
     assert.match(dockerfile, new RegExp(`^FROM ${repository}:${tag}@${digest} AS juicefs$`, "mu"));
