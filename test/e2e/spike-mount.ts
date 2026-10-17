@@ -64,7 +64,7 @@ export function spikeMount(): void {
       const pod = "pool-g7";
       try {
         await kube.apply(mounter("spike-mounter-a", node, juicefs));
-        await until("the first mounter's mount", async () => ((await inMounter("spike-mounter-a", "stat -f -c %T /spike/jfs")).out.includes("fuse") ? true : undefined), 120_000);
+        await until("the first mounter's mount", async () => ((await inMounter("spike-mounter-a", "stat -f -c %T /spike/jfs").catch(() => ({ out: "" }))).out.includes("fuse") ? true : undefined), 120_000);
         said("G7", "juicefs version", (await inMounter("spike-mounter-a", "juicefs version")).out);
         await inMounter("spike-mounter-a", `mkdir -p /spike/jfs/spike/g7/files/workspace /spike/pods/${pod}/ws && chown -R 1000:1000 /spike/jfs/spike/g7 /spike/pods/${pod} && mount --bind /spike/jfs/spike/g7/files /spike/pods/${pod}/ws`);
         await kube.apply(poolPod(pod, node, template, image));

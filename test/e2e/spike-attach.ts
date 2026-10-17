@@ -187,9 +187,15 @@ export function spikeAttach(): void {
         // G6: a directory quota, its usage reported, and a write past it refused, in a pod.
         said("G6", "quota set", await inAttacher('juicefs quota set "$META_URL" --path /spike/a --capacity 1 2>&1 | tail -3'));
         const quota = "pool-3";
+        // Attached before its pod starts, as a restore would: is it seen?
         await inAttacher(`mkdir -p /spike/pods/${quota}/ws && chown 1000:1000 /spike/pods/${quota} /spike/pods/${quota}/ws && mount --bind /spike/jfs/spike/a/files /spike/pods/${quota}/ws`);
         await kube.apply(poolPod(quota, node, template, image));
         await until("the quota pod running", async () => (isReady(await kube.get<V1Pod>(ref("Pod", quota, SPIKE_NAMESPACE))) ? true : undefined));
+        said("G1", "attached before its pod started, seen", (await inPool(quota, "cat /attach/ws/workspace/marker; ls -la /attach/ws")).out);
+        // Attached again once it runs, over nothing it sees: as after a start.
+        said("G1", "node mounts of the pod's directory", (await inAttacher(`grep pods/${quota} /proc/self/mountinfo || echo none`)).out);
+        await inAttacher(`umount -l /spike/pods/${quota}/ws; mount --bind /spike/jfs/spike/a/files /spike/pods/${quota}/ws`);
+        await until("the quota pod's workspace", async () => ((await inPool(quota, "cat /attach/ws/workspace/marker")).out === "a" ? true : undefined), 60_000).catch(() => undefined);
         const filled = Date.now();
         said("G6", "write of 1.2 GiB", await inPool(quota, "dd if=/dev/zero of=/attach/ws/workspace/fill bs=1M count=1229 conv=fsync 2>&1 | tail -2; ls -la /attach/ws/workspace/fill"));
         said("G6", "write took ms", Date.now() - filled);
