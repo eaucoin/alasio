@@ -52,7 +52,7 @@ import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHIN
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
-import { hookOf } from "../../src/sandbox/snapshots.ts";
+import { hookOf } from "../../src/gateway/hook.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
 /** A NetworkPolicy as rendered, its ingress rules' peers under `from`. */

@@ -43,14 +43,27 @@ export function mintToken(secret: Buffer, claims: TokenClaims): string {
 export const bindingToken = (secret: Buffer, { key, binding, namespace }: { readonly key: string; readonly binding: string; readonly namespace: string }): string =>
   mintToken(secret, { key, binding, namespace });
 
-/** What `token` says, where `secret` signed it and it has not stopped by `now`; else null. */
-export function verifyToken(secret: Buffer, token: string, now: number): TokenClaims | null {
+/**
+ * What `token` says, where the key `secret` names of what it says signed it, as a key the
+ * claims choose (environmentKey's), and it has not stopped by `now`; else null. Its claims
+ * are trusted only once its signature is checked by the key they named.
+ */
+export function verifyToken(secret: Buffer | ((claims: TokenClaims) => Buffer | null), token: string, now: number): TokenClaims | null {
   const dot = token.indexOf(".");
   if (dot < 0) return null;
   const [encoded, signature] = [token.slice(0, dot), Buffer.from(token.slice(dot + 1), "base64url")];
-  const expected = signatureOf(secret, encoded);
-  if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
   const claims = decodeClaims(Buffer.from(encoded, "base64url").toString("utf8"));
   if (Option.isNone(claims)) return null;
+  const key = typeof secret === "function" ? secret(claims.value) : secret;
+  if (key === null) return null;
+  const expected = signatureOf(key, encoded);
+  if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
   return claims.value.expires !== undefined && claims.value.expires <= now ? null : claims.value;
 }
+
+/**
+ * The key of the environment `environment`'s callers, of the gateway's caller key `master`:
+ * its HMAC of the environment's name, so each environment's alasio, given its own alone, can
+ * sign tokens of its own environment's sessions alone (cli/src/branches.ts writes a branch's).
+ */
+export const environmentKey = (master: Buffer, environment: string): Buffer => createHmac("sha256", master).update(`environment:${environment}`).digest();

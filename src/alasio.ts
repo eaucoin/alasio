@@ -23,7 +23,7 @@ import { type FolderBayma, HostBayma } from "./mcp/bayma.ts";
 import { Mounts } from "./operator/mounts.ts";
 import type { StoreError } from "./persistence/sql.ts";
 import { Store } from "./persistence/store.ts";
-import { type Inheritance, SessionInheritError, SessionSandboxes } from "./sandbox/index.ts";
+import { type Inheritance, SessionInheritError, SessionSandboxes, SessionUnavailable } from "./sandbox/index.ts";
 import { serveTelegram, type TelegramAppConfig, type TelegramAppError } from "./telegram/app.ts";
 import { Authorizer } from "./telegram/authorizer.ts";
 import { TelegramClient } from "./telegram/client.ts";
@@ -111,8 +111,15 @@ function workspaceServices({ kubeTemplates, stateDir, branch }: AlasioOptions): 
     // Settings the deployment gives wrongly stop alasio as it starts.
     sessions
       ? Layer.unwrap(Effect.gen(function*() {
-        const inherit = branch ? inheritance(branch, yield* Store) : undefined;
-        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, previous: kubeTemplates?.previousSessions ?? null, stateDir, inherit }));
+        const store = yield* Store;
+        const inherit = branch ? inheritance(branch, store) : undefined;
+        // A session's internet, as the store records what it was made with.
+        const netModeOf = (volumeId: string) =>
+          store.listSessionWorkspaces.pipe(
+            Effect.map((workspaces) => workspaces.find((workspace) => workspace.volumeId === volumeId)?.netMode ?? null),
+            Effect.mapError((error) => new SessionUnavailable({ message: `the session ${volumeId}'s internet could not be read: ${error.message}` })),
+          );
+        return Layer.orDie(SessionSandboxes.layer({ profile: sessions, stateDir, inherit, netModeOf }));
       }))
       : Layer.empty,
     host ? HostBayma.layer(host) : Layer.empty,

@@ -26,7 +26,7 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { volumeIdOfKey } from "../sandbox/names.ts";
-import { hookOf } from "../sandbox/snapshots.ts";
+import { hookOf } from "./hook.ts";
 import type { Events, EventInput } from "../events/events.ts";
 import type { Environments } from "./environments.ts";
 

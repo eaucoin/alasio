@@ -22,7 +22,7 @@ import { folderRefusedOnBranch, harnessLabelOf, isHarnessName } from "../harness
 import type { HarnessName } from "../harness/names.ts";
 import type { StoreError } from "../persistence/sql.ts";
 import { Store } from "../persistence/store.ts";
-import { type NetMode, type SessionError, type SessionForkError, SessionSandboxes } from "../sandbox/index.ts";
+import { type NetMode, type SessionError, SessionForkError, SessionSandboxes } from "../sandbox/index.ts";
 import { isValidVolumeId, newVolumeId } from "../sandbox/names.ts";
 import { withLogScope } from "../shared/log.ts";
 import { isSessionFs, parseWorkspace, sessionFsWorkspace } from "../workspace/kind.ts";
@@ -236,7 +236,10 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
         if (!(yield* holdConversations(activeTurns, store, [...mounting], `forking session ${source.volumeId} into ${volumeId}`))) {
           return yield* new MountRefused({ message: "A turn runs on this session workspace now, which a fork would suspend. Fork it once that turn ends." });
         }
-        yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId));
+        // Of a new id, no fork is there before it.
+        yield* recorded(volumeId, source.volumeId, sandbox.volumes.fork(source.volumeId, volumeId).pipe(
+          Effect.catchTag("SessionExists", (error) => Effect.fail(new SessionForkError({ message: error.message }))),
+        ));
       })).pipe(Effect.ensuring(Effect.forEach(mounting, turns.schedule, { discard: true })));
       const change = yield* mountCreated(
         conversationId,
@@ -250,10 +253,11 @@ const makeMounts = Effect.fnUntraced(function*(workspaceRoot: string, branch: st
       const workspaces = yield* store.listSessionWorkspaces;
       const unmade = workspaces.filter(({ madeAt }) => madeAt === null).map(({ volumeId }) => volumeId);
       const made = new Set(workspaces.filter(({ madeAt }) => madeAt !== null).map(({ volumeId }) => volumeId));
-      const forks = yield* sandbox.volumes.forks.pipe(
-        Effect.catch((error) => Effect.logWarning(`could not list the forks' Sandboxes: ${error.message}`).pipe(Effect.as([]))),
+      // Whatever workspace there is of no session the store knows: one whose making, or a fork's, ended before it was recorded.
+      const listed = yield* sandbox.volumes.listed.pipe(
+        Effect.catch((error) => Effect.logWarning(`could not list the sessions' workspaces: ${error.message}`).pipe(Effect.as([]))),
       );
-      const orphans = forks.filter((volumeId) => !made.has(volumeId) && !unmade.includes(volumeId));
+      const orphans = listed.filter((volumeId) => !made.has(volumeId) && !unmade.includes(volumeId));
       for (const volumeId of [...unmade, ...orphans]) yield* discard(volumeId);
     }).pipe(withLogScope(LOG_SCOPE)),
   });
