@@ -9,6 +9,7 @@
  *   its bindings, and the binds waiting for a free pod in every replica of the binder, as
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
+ * - `GET /healthz`: 200 once it serves, asked without a token.
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
  *   it is not (./proxy.ts), with the binding's token for the caller's, the key's Lease
  *   stamped active now and then, as what releases it reads; 503 with a Retry-After
@@ -129,6 +130,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const handle = (incoming: IncomingMessage, outgoing: ServerResponse): Effect.Effect<void> =>
     Effect.gen(function*() {
       const url = incoming.url ?? "/";
+      if (incoming.method === "GET" && url === "/healthz") return answer(outgoing, 200, { ok: true });
       const asked = /^\/(counts|waiting)\/([a-z0-9-]+)\/([a-z0-9-]+)$/u.exec(url);
       if (incoming.method === "GET" && asked) {
         const pool = { namespace: asked[2]!, name: asked[3]! };

@@ -116,6 +116,7 @@ test("a request without a caller's token, with a binding's, or with one stopped,
   const served = await front(of, stand.port);
   try {
     const key = "sessionfs:workspace";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/healthz`)).status, 200);
     const refused = [
       undefined,
       "Bearer not-a-token",
