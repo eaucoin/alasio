@@ -13,9 +13,10 @@
  * what binds, carrying the binding's labels from the first (as a restore's pod is).
  *
  * A Lease whose binding is under way names no holder; one whose binder ended before it
- * named one is taken over once it has gone unrenewed for a while, BINDING_TIMEOUT_MS by default. A release
- * deletes the pod, then the Lease, so a pod once bound is never bound again, and nothing of
- * one key's can reach the next's.
+ * named one is taken over once it has gone unrenewed for a while, BINDING_TIMEOUT_MS by default. A pod
+ * serves one binding in its life: claimed, bound, released, deleted, never returned to its
+ * pool, nor claimed again whatever its labels come to say, so nothing of one key's can reach
+ * the next's.
  */
 import { createHash } from "node:crypto";
 
@@ -169,7 +170,11 @@ export const renewLease = Effect.fnUntraced(function*(lease: BindingLease): Effe
  */
 export const claim = Effect.fnUntraced(function*(pool: Pool, key: string): Effect.fn.Return<V1Pod | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
-  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter(serving);
+  // A pod that was ever bound is never claimed, whatever its labels came to say since: it
+  // serves one binding in its life, as a sandbox released can still reach what it was given.
+  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter((pod) =>
+    serving(pod) && pod.metadata?.labels?.[BINDING_LABEL] === undefined && pod.metadata?.annotations?.[KEY_ANNOTATION] === undefined
+  );
   const from = Math.floor(Math.random() * free.length);
   for (let n = 0; n < free.length; n += 1) {
     const pod = free[(from + n) % free.length]!;
