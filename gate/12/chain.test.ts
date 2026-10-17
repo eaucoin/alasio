@@ -425,7 +425,7 @@ test("D. diagnostic: a server-side copy of an image reads the same whole and in 
     const { own, layersPrefix } = uploadedD;
     const copiedPrefix = `gate-12/${session.volumeId}/copied/layers/`;
     // Each object of D and its layers, copied server-side, as the agent's fork and the cut-over's move copy them.
-    const objects = (await Effect.runPromise(bucket.list(layersPrefix))).map(({ key }) => key);
+    const objects = await Effect.runPromise(bucket.list(layersPrefix));
     // Each read through the AWS CLI on this machine: whole, and in ranges as a reader of pages reads, its SHA-256 and size.
     const credentials = `AWS_ACCESS_KEY_ID=${q(s3.accessKeyId)} AWS_SECRET_ACCESS_KEY=${q(s3.secretAccessKey)} AWS_DEFAULT_REGION=${q(s3.region)}`;
     const sizes = new Map<string, number>();
