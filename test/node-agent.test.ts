@@ -197,6 +197,8 @@ interface NodeOptions {
   readonly releases?: readonly string[];
   readonly budget?: number;
   readonly runsc?: (runsc: Runsc, releases: FakeReleases) => Runsc;
+  /** Whether its agent's proxy listens on a socket too, as on a node. */
+  readonly socket?: boolean;
 }
 
 /** A bucket and a directory of the test's, and nodes made on them, removed after `body`. */
@@ -204,7 +206,7 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
   const root = mkdtempSync(join(tmpdir(), "alasio-node-agent-"));
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
   const bucket = makeS3Bucket({ endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS });
-  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc }: NodeOptions = {}) =>
+  const node = (name: string, { releases: installed = [RELEASE], budget = 1024 ** 3, runsc: changed = (runsc) => runsc, socket = false }: NodeOptions = {}) =>
     Effect.gen(function*() {
       const releases = fakeReleases(join(root, name), installed);
       const cacheDir = join(root, name, "cache");
@@ -214,7 +216,10 @@ async function withBucket(body: (context: { readonly s3: FakeS3; readonly node: 
       const [running] = installed;
       if (running !== undefined) for (const id of [CONTAINER, OTHER_CONTAINER]) releases.runs(id, running, SESSIONS, POD);
       const host = fakeHost();
-      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0 }).pipe(Effect.orDie);
+      // Its socket in /tmp, short enough for a socket's path, whatever TMPDIR is.
+      const sockets = socket ? mkdtempSync(join("/tmp", "alasio-agent-")) : null;
+      if (sockets !== null) yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(sockets, { recursive: true, force: true })));
+      const storeProxy = yield* makeStoreProxy({ store: { endpoint: s3.endpoint, region: "us-east-1", bucket: "snapshots", ...CREDENTIALS }, host: "127.0.0.1", port: 0, ...(sockets === null ? {} : { socket: join(sockets, "store.sock") }) }).pipe(Effect.orDie);
       const restarted = makeNodeAgent({ node: name, nodeRoot: "/", runsc, cache, bucket, storeProxy, host: host.host, restoresFromBucketSince: NODE_PINS.gvisor.restoresFromBucketSince, backgroundReadMs: BACKGROUND_READ_MS });
       return { releases, cacheDir, cache, host, storeProxy, agent: yield* restarted, restarted };
     });
@@ -1166,6 +1171,61 @@ test("a restore from the bucket reads its own images through the agent by a toke
     })
   ));
 
+test("a restore that asks for its checkpoint gofer through the agent's socket, reading again pages a read of failed, is given options that say so, its token one the agent's drain does not wait on; one that asks for none reads over TCP as before", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const workspace = { environment: "main", workspace: "fs-abc" };
+      const here = yield* node("node-1");
+      const manifest = yield* here.agent.checkpoint(request("fs-abc"));
+      const [own] = manifest.layers;
+      assert.ok(own);
+      const there = yield* node("node-2", { socket: true });
+      const where = (options: Record<string, unknown>) => {
+        const { credentials: _, ...rest } = options;
+        return rest;
+      };
+      const through = yield* there.agent.prepare({ ...workspace, gofer: { transport: "socket", pagesRetry: true } });
+      assert.equal(through.source, "bucket");
+      assert.deepEqual(where(goferOptionsOf(through.imagePath).options), {
+        endpoint: "http://alasio-node-agent",
+        socket: there.storeProxy.socket,
+        region: "us-east-1",
+        bucket: "snapshots",
+        object_prefix: `main/fs-abc/layers/${own.digest}/`,
+        layers_prefix: "main/fs-abc/layers/",
+        addressing: "path",
+        pages_retry: "while-running",
+      });
+      // Through the socket, its restore waits for the agent that comes back: the drain does not wait on it.
+      assert.equal(there.storeProxy.reading(), 0);
+      // Over TCP, as a release before the first that restores through the socket asks, or none.
+      for (const gofer of [{ transport: "tcp", pagesRetry: false } as const, undefined]) {
+        const over = yield* there.agent.prepare({ ...workspace, ...(gofer === undefined ? {} : { gofer }) });
+        assert.deepEqual(where(goferOptionsOf(over.imagePath).options), {
+          endpoint: there.storeProxy.endpoint,
+          region: "us-east-1",
+          bucket: "snapshots",
+          object_prefix: `main/fs-abc/layers/${own.digest}/`,
+          layers_prefix: "main/fs-abc/layers/",
+          addressing: "path",
+        });
+        assert.equal(there.storeProxy.reading(), 1);
+      }
+      // Asked for the socket of an agent that serves none, it reads over TCP, said so.
+      const plain = yield* node("node-3");
+      const asked = yield* plain.agent.prepare({ ...workspace, gofer: { transport: "socket", pagesRetry: true } });
+      assert.deepEqual(where(goferOptionsOf(asked.imagePath).options), {
+        endpoint: plain.storeProxy.endpoint,
+        region: "us-east-1",
+        bucket: "snapshots",
+        object_prefix: `main/fs-abc/layers/${own.digest}/`,
+        layers_prefix: "main/fs-abc/layers/",
+        addressing: "path",
+        pages_retry: "while-running",
+      });
+    })
+  ));
+
 test("an agent that stops prepares no restore from the bucket, which would read through it after it stopped, its node's next agent preparing it; one from its cache it does", () =>
   withBucket(({ node }) =>
     Effect.gen(function*() {
@@ -1942,7 +2002,7 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
           Effect.repeat({ schedule: Schedule.spaced("20 millis"), while: ({ status, body }) => status === 200 && (body as { readonly state: string }).state === "running" }),
         );
       /** Starts the `operation` of `request`, which the agent answers it has, and how it ended. */
-      const run = (operation: string, request: { readonly environment: string; readonly workspace: string }) =>
+      const run = (operation: string, request: { readonly environment: string; readonly workspace: string; readonly [field: string]: unknown }) =>
         Effect.gen(function*() {
           assert.deepEqual(yield* call("POST", `/${operation === "checkpoints" ? "checkpoints" : "prepare"}`, request), { status: 202, body: { state: "running" } });
           return yield* ended(operation, request.workspace);
@@ -1991,6 +2051,10 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
         body: { state: "done", value: { manifest, imagePath: join(here.cacheDir, "main", "fs-abc", manifest.snapshot), source: "cache" } },
       });
       failed(404, "main/fs-none has no snapshot")(yield* run("prepare", { environment: "main", workspace: "fs-none" }));
+      // How its checkpoint gofer reads the bucket, as alasio asks it, or a bad request.
+      assert.equal((yield* run("prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "socket", pagesRetry: true } })).status, 200);
+      error(400, /transport/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "udp", pagesRetry: true } }));
+      error(400, /pagesRetry/u)(yield* call("POST", "/prepare", { environment: "main", workspace: "fs-abc", gofer: { transport: "socket" } }));
 
       const holdings = yield* call("GET", "/holdings");
       assert.equal(holdings.status, 200);
@@ -2304,7 +2368,10 @@ test("as the agent stops, an operation it runs is let end before what it runs in
 
 test("the agent runs as its own process from its environment, and stops when told", async () => {
   const s3 = await startFakeS3({ bucket: "snapshots", region: "us-east-1", ...CREDENTIALS });
+  // Its socket and tokens in /tmp, as the node's /run is not the test's to write.
+  const runDir = mkdtempSync(join("/tmp", "alasio-agent-"));
   const env = {
+    ALASIO_NODE_AGENT_RUN_DIR: runDir,
     PATH: process.env["PATH"],
     NODE_NAME: "node-1",
     POD_IP: "127.0.0.1",
@@ -2343,11 +2410,15 @@ test("the agent runs as its own process from its environment, and stops when tol
     const unsigned = await fetch(`http://127.0.0.1:${STORE_PROXY_PORT}/snapshots/main/fs-abc/current.json`);
     assert.equal(unsigned.status, 403);
     assert.match(await unsigned.text(), /<Code>AccessDenied<\/Code>/u);
+    // And on its socket, only root's.
+    assert.equal((statSync(join(runDir, "store.sock")).mode & 0o777).toString(8), "600");
     running.agent.kill("SIGTERM");
     assert.equal(await running.exited, 0);
     assert.match(running.output(), /\[node-agent\] the node agent of node-1 serves on port 8484, and the snapshots bucket to its node on 127\.0\.0\.1:8485, its cache within 5368709120 bytes/u);
+    assert.ok(!existsSync(join(runDir, "store.sock")));
   } finally {
     await s3.close();
+    rmSync(runDir, { recursive: true, force: true });
   }
 });
 

@@ -17,6 +17,27 @@ export const NODE_AGENT_PORT = 8484;
  */
 export const STORE_PROXY_PORT = 8485;
 
+/**
+ * Where a node agent keeps, on its node's /run, a tmpfs, what outlives it until the node
+ * restarts: the Unix domain socket it serves the snapshots bucket on to its node's restores
+ * too, which a restore's checkpoint gofer dials by its path, whatever pod the agent runs in
+ * (STORE_SOCKET), and those restores' tokens, read back as it starts again
+ * (STORE_TOKENS_FILE), each only root's. Of the pods alasio makes, the agent alone mounts the
+ * node's /run (cli/src/manifests/node-agent.ts), and the sessions' pods are held to their
+ * templates, which mount none of it (cli/src/manifests/admission.ts sandboxPodPolicy); the
+ * host profile's mounts, which the operator gives alasio and the folder's bayma, are the
+ * operator's to keep off it.
+ */
+export const NODE_AGENT_RUN_DIR = "/run/alasio/node-agent";
+/** The variable that moves NODE_AGENT_RUN_DIR, as a test of the agent's own process does. */
+export const NODE_AGENT_RUN_DIR_VARIABLE = "ALASIO_NODE_AGENT_RUN_DIR";
+/** The socket a node agent serves the snapshots bucket on, on its node, in `runDir` (NODE_AGENT_RUN_DIR). */
+export const storeSocket = (runDir: string): string => `${runDir}/store.sock`;
+/** The file a node agent keeps its restores' tokens in, on its node, in `runDir` (NODE_AGENT_RUN_DIR). */
+export const storeTokensFile = (runDir: string): string => `${runDir}/tokens.json`;
+/** The URL a restore's gofer names the store by through STORE_SOCKET, which it signs: no host's, as the socket alone is dialled. */
+export const STORE_SOCKET_ENDPOINT = "http://alasio-node-agent";
+
 /** The variable that gives a node agent its pod's address, which it serves the bucket to its node on. */
 export const POD_IP_VARIABLE = "POD_IP";
 
