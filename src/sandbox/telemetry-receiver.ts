@@ -88,8 +88,11 @@ export interface RateLimiter {
 export interface TelemetryReceiverOptions {
   readonly port: number;
   readonly host?: string;
-  /** The session (its volume id) a bearer token belongs to, or null. */
-  readonly authenticate: (token: string) => Effect.Effect<string | null>;
+  /**
+   * The session (its volume id) a bearer token belongs to, or null; failing with
+   * AuthenticationUnknown where that cannot be told now, to be asked again.
+   */
+  readonly authenticate: (token: string) => Effect.Effect<string | null, AuthenticationUnknown>;
   readonly forwarder: Pick<OtlpForwarder, "protocols" | "export">;
   readonly stampFor: (volumeId: string) => ResourceStamp;
   readonly limiter?: RateLimiter;
@@ -98,6 +101,9 @@ export interface TelemetryReceiverOptions {
   /** The most of them one session's may hold: a quarter of maxHeldBytes unless given. */
   readonly maxSessionHeldBytes?: number;
 }
+
+/** Whose a token is cannot be told now, as while the bindings it is checked against are not known: answered 503, to be sent again. */
+export class AuthenticationUnknown extends Schema.TaggedError<AuthenticationUnknown>()("AuthenticationUnknown", {}) {}
 
 /** A listening receiver. */
 export interface TelemetryReceiver {
@@ -214,12 +220,16 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     const signal = SIGNALS.find((name) => request.url === `/v1/${name}`);
     if (request.method !== "POST" || !signal) return status(404);
     const bearer = Schema.decodeUnknownOption(BearerToken)(request.headers["authorization"]);
-    const volumeId = Option.isSome(bearer) ? yield* authenticate(bearer.value[1]) : null;
-    if (!volumeId) {
+    const volumeId = Option.isSome(bearer) ? yield* authenticate(bearer.value[1]).pipe(Effect.option) : Option.some(null);
+    if (Option.isNone(volumeId)) {
+      yield* count("refused", { signal, reason: "unconfirmed" });
+      return retryLater(RETRY_AFTER_S);
+    }
+    if (!volumeId.value) {
       yield* count("refused", { reason: "unauthenticated" });
       return status(401);
     }
-    held.of(volumeId);
+    held.of(volumeId.value);
     const mediaType = Schema.decodeUnknownOption(OtlpMediaType)(mediaTypeOf(request.headers["content-type"]));
     if (Option.isNone(mediaType)) return status(415);
     const encoding = ENCODINGS[mediaType.value];
@@ -232,7 +242,7 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     if (read === "too large") return status(413);
     if (read === "busy") return yield* busy(signal);
     let body: Buffer = read;
-    const wait = yield* budgets.take(volumeId, body.length);
+    const wait = yield* budgets.take(volumeId.value, body.length);
     if (wait > 0) {
       yield* count("refused", { signal, reason: "rate" });
       return HttpServerResponse.empty({ status: 429, headers: { "retry-after": String(wait) } });
@@ -249,7 +259,7 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     }
     // A signal alasio does not export is accepted and let go, as the exporter expects.
     if (!forwarder.protocols[signal]) return ok;
-    const stamped = yield* stamp(signal, encoding, body, stampFor(volumeId));
+    const stamped = yield* stamp(signal, encoding, body, stampFor(volumeId.value));
     if (!stamped) {
       yield* count("dropped", { signal, reason: "malformed" });
       return status(400);
