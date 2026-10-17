@@ -2576,10 +2576,26 @@ describe("node agents", () => {
 });
 
 describe("security", () => {
-  test("enforces Pod Security restricted in the sessions namespace", () => {
-    const namespaces = all<V1Namespace>(install(), "Namespace");
-    assert.equal(namespaces.length, 1);
-    assert.equal(namespaces[0]?.metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
+  test("enforces Pod Security restricted in the sessions namespace, and, where the sandbox service's pools mount their directories, warns and audits of it, its pods held to the pools' templates instead", () => {
+    const levels = (file: Record<string, unknown>) => {
+      const namespaces = all<V1Namespace>(install(file), "Namespace");
+      assert.equal(namespaces.length, 1);
+      return Object.fromEntries(Object.entries(namespaces[0]?.metadata?.labels ?? {}).filter(([label]) => label.startsWith("pod-security.kubernetes.io/")));
+    };
+    assert.deepEqual(levels({}), {
+      "pod-security.kubernetes.io/enforce": "privileged",
+      "pod-security.kubernetes.io/audit": "restricted",
+      "pod-security.kubernetes.io/audit-version": "latest",
+      "pod-security.kubernetes.io/warn": "restricted",
+      "pod-security.kubernetes.io/warn-version": "latest",
+    });
+    assert.equal(one(install(), "ValidatingAdmissionPolicy", "alasio-sandbox-pods").kind, "ValidatingAdmissionPolicy");
+    assert.deepEqual(levels({ workspaceStorage: { enabled: false } }), {
+      "pod-security.kubernetes.io/enforce": "restricted",
+      "pod-security.kubernetes.io/enforce-version": "latest",
+      "pod-security.kubernetes.io/warn": "restricted",
+      "pod-security.kubernetes.io/warn-version": "latest",
+    });
   });
 
   test("makes the privileged host namespace only with the host profile", () => {
@@ -2732,7 +2748,9 @@ describe("branch environments", () => {
       ["alasio-branch-try", "try"],
       ["alasio-branch-try-sessions", "try"],
     ]);
-    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "restricted");
+    // Its pods held to the sandbox pools' templates, as main's are (./admission.ts sandboxPodPolicy).
+    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/enforce"], "privileged");
+    assert.equal(of<V1Namespace>("Namespace", "alasio-branch-try-sessions").metadata?.labels?.["pod-security.kubernetes.io/warn"], "restricted");
     assert.deepEqual(branch.filter(({ metadata }) => metadata?.labels?.["alasio.dev/branch"] !== "try"), []);
     // But its Sandboxes' admission policy, which is the cluster's.
     assert.deepEqual(branch.filter(({ kind, metadata }) => kind !== "Namespace" && !metadata?.namespace?.startsWith("alasio-branch-try")).map(({ kind, metadata }) => [kind, metadata?.name]), [

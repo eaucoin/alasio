@@ -32,6 +32,7 @@ import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
+import { sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
   BRANCH_FORK_SECRET,
@@ -567,8 +568,12 @@ function branchForksService(): V1Service {
 /**
  * The namespaces workspaces run in, which alasio makes unless told not to. Sessions'
  * enforces Pod Security "restricted": nothing privileged, no host paths, no added
- * capabilities. The host profile's is "privileged", as its pods mount the machine. A
- * branch environment always has its own, beside its own namespace.
+ * capabilities; but where the sandbox service runs, whose pools' pods mount their own
+ * directories on their nodes, a host path no level but "privileged" allows, it enforces that
+ * and warns and audits of "restricted", the sandbox pods' policy holding every pod of it to the
+ * pools' templates instead (./admission.ts sandboxPodPolicy). The host profile's is
+ * "privileged", as its pods mount the machine. A branch environment always has its own,
+ * beside its own namespace.
  */
 function namespaces(config: InstallConfig, environment: Environment): V1Namespace[] {
   const { sessions, host } = config;
@@ -585,9 +590,11 @@ function namespaces(config: InstallConfig, environment: Environment): V1Namespac
           labels: {
             ...labels("session"),
             ...branched,
-            "pod-security.kubernetes.io/enforce": "restricted",
-            "pod-security.kubernetes.io/enforce-version": "latest",
+            ...(sandboxServiceRuns(config)
+              ? { "pod-security.kubernetes.io/enforce": "privileged", "pod-security.kubernetes.io/audit": "restricted", "pod-security.kubernetes.io/audit-version": "latest" }
+              : { "pod-security.kubernetes.io/enforce": "restricted", "pod-security.kubernetes.io/enforce-version": "latest" }),
             "pod-security.kubernetes.io/warn": "restricted",
+            "pod-security.kubernetes.io/warn-version": "latest",
           },
         },
       }]
