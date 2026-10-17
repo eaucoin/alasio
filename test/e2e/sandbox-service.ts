@@ -18,7 +18,7 @@ import { componentName, NAMESPACE, RELEASE, selectorLabels } from "../../cli/src
 import { PROXY_PORT } from "../../cli/src/manifests/neon.ts";
 import { GATEWAY, GATEWAY_PORT, RECEIVER, WORKSPACE_MOUNT } from "../../cli/src/manifests/sandbox-gateway.ts";
 import { VALKEY } from "../../cli/src/manifests/workspace-storage.ts";
-import { BINDING_LABEL, keyHash } from "../../src/binder/names.ts";
+import { BINDING_LABEL, environmentKey, keyHash } from "../../src/binder/names.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
@@ -87,9 +87,9 @@ export function sandboxService(): void {
       const workspace = "fs-e2etakeover";
       const key = sessionKey(workspace);
       await createWorkspace(workspace, 1024 ** 3);
-      // Bound as alasio binds it: a caller's token of the key, through the gateway.
+      // Bound as alasio binds it: a caller's token of the key, signed by main's key, through the gateway.
       const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
-      const token = mintToken(Buffer.from(callerKey), { key, expires: Date.now() + 600_000, options: { environment: "main", mode: "none" } });
+      const token = mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 600_000, options: { environment: "main", mode: "none" } });
       const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
       await until("the gateway binding the workspace", async () => {
         const ran = await kube.exec(NAMESPACE, alasioPod, ["sh", "-c", `curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'authorization: Bearer ${token}' http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}/bind`], { container: "alasio" });

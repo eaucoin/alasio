@@ -9,6 +9,9 @@ import { createHmac } from "node:crypto";
 /** The label of a branch environment's objects and namespaces, whose value is its name. */
 export const BRANCH_LABEL = "alasio.dev/branch";
 
+/** The name of main's environment, as its sessions are told apart from a branch's. */
+export const MAIN_ENVIRONMENT_NAME = "main";
+
 /** The port an alasio forks its sessions for its branch environments on. */
 export const BRANCH_FORK_PORT = 4319;
 

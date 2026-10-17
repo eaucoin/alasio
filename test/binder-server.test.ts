@@ -10,9 +10,9 @@ import { Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
-import { freeLabels, type Pool } from "../src/binder/names.ts";
+import { environmentKey, freeLabels, type Pool } from "../src/binder/names.ts";
 import { type BinderServer, NO_BIND_HEADER, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
-import { mintToken, verifyToken } from "../src/binder/tokens.ts";
+import { mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -62,12 +62,18 @@ async function pods(): Promise<{ port: number; sent: IncomingHttpHeaders[]; clos
 async function front(
   of: Pool,
   podPort: number,
-  { waitMs = 5_000, peers = [] as string[], placed = [] as Readonly<Record<string, string>>[], release = undefined as Placement["release"] } = {},
+  {
+    waitMs = 5_000,
+    peers = [] as string[],
+    placed = [] as Readonly<Record<string, string>>[],
+    release = undefined as Placement["release"],
+    keyOf = callerKey as Buffer | ((claims: TokenClaims) => Buffer | null),
+  } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
   const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
   const served = await Effect.runPromise(
-    serveBinder({ port: 0, host: "127.0.0.1", callerKey, bindingKey, podPort, poolOf: (_key, options) =>
+    serveBinder({ port: 0, host: "127.0.0.1", callerKey: keyOf, bindingKey, podPort, poolOf: (_key, options) =>
       options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
@@ -281,6 +287,26 @@ test("a key is bound where the gateway places it, by what its caller's token say
     const nowhere = await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller("sessionfs:other", Date.now() + 60_000, { environment: "nowhere" }) } });
     assert.equal(nowhere.status, 403);
     assert.equal(await run(readLease(of, "sessionfs:other")), null);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a front that checks each environment's callers by its own key takes a token signed by the key of the environment it names alone", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const served = await front(of, stand.port, { keyOf: ({ options }) => (options?.["environment"] === undefined ? null : environmentKey(callerKey, options["environment"])) });
+  try {
+    const key = "sessionfs:workspace";
+    const signed = (signer: Buffer, environment: string) => `Bearer ${mintToken(signer, { key, expires: Date.now() + 60_000, options: { environment, mode: "none" } })}`;
+    const status = async (authorization: string) => (await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization }, body: "{}" })).status;
+    assert.equal(await status(signed(environmentKey(callerKey, "try"), "main")), 401);
+    assert.equal(await status(signed(callerKey, "main")), 401);
+    assert.equal(await status(caller(key)), 401);
+    assert.equal(stand.sent.length, 0);
+    assert.equal(await status(signed(environmentKey(callerKey, "main"), "main")), 200);
   } finally {
     await served.close();
     stand.close();

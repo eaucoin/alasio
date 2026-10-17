@@ -2,7 +2,8 @@
  * The sandbox gateway, a program of alasio's image on the floor: the binder's front
  * (../binder/server.ts) for session workspaces (./sessions.ts), as its configuration file
  * (GATEWAY_CONFIG_VARIABLE, which `alasio up` renders) and its keys (CALLER_KEY_VARIABLE,
- * BINDING_KEY_VARIABLE) say, reaching the node agents with their token, as alasio does, and
+ * BINDING_KEY_VARIABLE) say, a caller's token checked by the key of the environment it names,
+ * of the caller key (../binder/names.ts environmentKey), as its alasio signs it, reaching the node agents with their token, as alasio does, and
  * telling each environment's alasio of what happens to its sessions' bindings on the log
  * (../events/events.ts).
  * What a gateway that ended left between a binding's steps is set right as it starts, and
@@ -17,6 +18,7 @@ import { FetchHttpClient } from "effect/http";
 
 import { Binder } from "../binder/binder.ts";
 import { reconcile } from "../binder/bindings.ts";
+import { environmentKey } from "../binder/names.ts";
 import { serveBinder } from "../binder/server.ts";
 import { Events } from "../events/events.ts";
 import { KubeClient } from "../kube/client.ts";
@@ -91,7 +93,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     ));
     const served = yield* serveBinder({
       port: config.port,
-      callerKey,
+      callerKey: ({ options }) => (options?.["environment"] === undefined ? null : environmentKey(callerKey, options["environment"])),
       bindingKey,
       podPort: config.podPort,
       poolOf: sessions.place,

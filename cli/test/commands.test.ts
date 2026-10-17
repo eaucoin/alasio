@@ -17,6 +17,7 @@ import { Cause, Exit } from "effect";
 
 import { tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
+import { environmentKey } from "../../src/binder/names.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
@@ -1493,6 +1494,7 @@ async function branchable(t: TestContext): Promise<Rig & { readonly neon: FakeNe
   stackSecret(setup.kube, "alasio-neon-compute", { NEON_CONTROL_PLANE_TOKEN: "c" });
   stackSecret(setup.kube, "alasio-log-scaler", { sasl: "scram_sha512", username: "scaler", password: "s" });
   stackSecret(setup.kube, "alasio-branches", { "control-token": "admin", "fork-key": "key" });
+  stackSecret(setup.kube, "alasio-sandbox-gateway", { "caller-key": "master", "binding-key": "binding" });
   const neon: FakeNeon = { branches: [{ name: "main", parent: null, state: "ready", createdAt: "2026-10-07T00:00:00Z" }], asked: [], turns: "0", computes: [],
     tenant: ONE_SHARD,
     storage: { pageservers: 1, shards: 1, answering: true, databaseAnswering: true },
@@ -1854,6 +1856,8 @@ test("branch create branches Neon at main's latest commit, runs the branch's ala
   assert.deepEqual(keys("alasio-lake"), ["LAKE_DATABASE_PASSWORD", "LAKE_S3_KEY", "LAKE_S3_SECRET"]);
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-claude", "token"), "sk-ant-oat01-claude");
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branch-fork", "token"), forkToken("key", "try"));
+  // Its own key to the sandbox gateway, of the gateway's caller key, which signs its own sessions' tokens alone.
+  assert.equal(secretIn(kube, "alasio-branch-try", "alasio-sessions-caller", "caller-key"), environmentKey(Buffer.from("master"), "try").toString());
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-branches", "control-token"), undefined);
   // KEDA's principal on the log, which its loader's scaler reads as, and which may only describe how far behind it is.
   assert.equal(secretIn(kube, "alasio-branch-try", "alasio-log-scaler", "username"), "scaler");

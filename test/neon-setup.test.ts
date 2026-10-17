@@ -9,6 +9,7 @@ import { generateKeyPair, verifyToken } from "../neon/control/jwt.ts";
 import { refuseMainKeyOnSnapshots, renderSecrets, secretNames, setupConfig, setupKube, type StoredSecret } from "../neon/control/kube-setup.ts";
 import { scramVerifier } from "../neon/control/scram.ts";
 import { clusterId, type SeaweedS3Config, type StackSecrets, type StoredSecrets } from "../neon/control/secrets.ts";
+import { environmentKey } from "../src/binder/names.ts";
 import { makeS3Bucket } from "../src/node-agent/s3.ts";
 import { startFakeS3 } from "./support/fake-s3.ts";
 
@@ -251,6 +252,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // The sandbox gateway's keys, each its own.
   assert.deepEqual([value(kube, names.sandboxGateway, "caller-key"), value(kube, names.sandboxGateway, "binding-key")], [root.gatewayCallerKey, root.gatewayBindingKey]);
   assert.notEqual(root.gatewayCallerKey, root.gatewayBindingKey);
+  // main's alasio's key to it, of the caller key, not the caller key itself.
+  assert.equal(value(kube, names.sessionsCaller, "caller-key"), environmentKey(Buffer.from(root.gatewayCallerKey), "main").toString());
+  assert.notEqual(value(kube, names.sessionsCaller, "caller-key"), root.gatewayCallerKey);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });

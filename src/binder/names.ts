@@ -3,7 +3,7 @@
  * pool's pods and of their Leases, and how a key names them. Free of anything but Node's own,
  * so the command line, which renders the pools, takes it without the binder.
  */
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 import { BUSY_ANNOTATIONS } from "../kube/busy-label.ts";
 
@@ -21,6 +21,15 @@ export interface Pool {
   readonly name: string;
   readonly namespace: string;
 }
+
+/**
+ * The key of the environment `environment`'s callers, of the gateway's caller key `master`:
+ * its HMAC of the environment's name, hex, a key as the text its Secret holds is, as the
+ * master is; so each environment's alasio, given its own alone, signs tokens of its own
+ * environment's sessions alone (./tokens.ts).
+ */
+export const environmentKey = (master: Buffer, environment: string): Buffer =>
+  Buffer.from(createHmac("sha256", master).update(`environment:${environment}`).digest("hex"));
 
 /** The hash of `key` its Lease and pod are named and labelled by: a label's value at most. */
 export const keyHash = (key: string): string => createHash("sha256").update(key).digest("hex").slice(0, 40);
