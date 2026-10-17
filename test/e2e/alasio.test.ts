@@ -1425,6 +1425,11 @@ if (inShard("snapshots")) {
         await turn("hello after the drain");
         const restoredOn = (await kube.get<V1Pod>(ref("Pod", drained, SESSIONS)))?.spec?.nodeName;
         assert.ok(restoredOn && restoredOn !== node, `the session was restored on ${restoredOn}, the node drained`);
+        // The drained node, cordoned, alone held the snapshot: the node it was restored on read it from the bucket.
+        const agent = (await nodeAgents()).get(restoredOn);
+        assert.ok(agent, `no node agent runs ready on ${restoredOn}`);
+        const prepared = (await kube.logs(NAMESPACE, agent, "node-agent")).split("\n").filter((line) => line.includes(`prepared the snapshot ${bound} of ${SESSIONS}/${drained} from the `));
+        assert.ok(prepared.length > 0 && prepared.every((line) => line.includes(" from the bucket")), `${restoredOn}'s agent prepared ${bound} so: ${prepared.join(" | ") || "not at all"}`);
         const seen = await repl.read(drained, held);
         assert.deepEqual([seen.live, seen.checkpointed], [`drained with ${drained}`, `drained with ${drained}`]);
         assert.match(seen.notice ?? "", CAME_BACK_WHOLE);

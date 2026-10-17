@@ -26,7 +26,7 @@
  * agent kills what runsc runs for the pod there, so that the pod's teardown, as its
  * Sandbox is suspended, waits on none of it.
  */
-import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { V1Container, V1LabelSelector, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Taint, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Duration, Effect, FiberMap, Schedule, Schema, type Scope, Semaphore } from "effect";
 import { FetchHttpClient } from "effect/http";
 
@@ -119,6 +119,23 @@ export interface KeptTemplates {
   readonly current: string;
   readonly previous: string | null;
 }
+
+/**
+ * Whether `toleration` tolerates `taint`, as the scheduler has it: of the taint's effect, or
+ * of every effect; and of its key, of any value where it Exists, or of its value where it is
+ * Equal, as it is unless said; one that Exists of no key tolerates every taint.
+ */
+function tolerates(toleration: V1Toleration, taint: V1Taint): boolean {
+  if (toleration.effect && toleration.effect !== taint.effect) return false;
+  if (toleration.operator === "Exists") return !toleration.key || toleration.key === taint.key;
+  return toleration.key === taint.key && (toleration.value ?? "") === (taint.value ?? "");
+}
+
+/**
+ * The taints the node lifecycle controller gives a Node that is not Ready, or that it has
+ * not heard from: of its readiness, which comes back, not of what the Node is for.
+ */
+const READINESS_TAINTS: ReadonlySet<string> = new Set(["node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable"]);
 
 /** Whether bayma's container `bayma` holds a stop it is given for a snapshot: one run with STOP_WAIT_ARG. Pure, for tests. */
 export function holdsStop(bayma: V1Container | undefined): boolean {
@@ -296,11 +313,34 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
     error._tag === "KubeApiError" || error.status === undefined || error.status >= 500;
 
   /**
-   * The nodes that can restore `manifest`, those holding its images first: they have its
-   * release, with every CPU feature it was saved with; and whether every agent said what
-   * its node holds.
+   * Whether a pod of `tolerations` may be scheduled onto the node `name`, as its Node says:
+   * it takes it where it is not cordoned, is Ready, and has no taint of NoSchedule or
+   * NoExecute that the pod does not tolerate; it is unready where only its readiness, or the
+   * taints of it (READINESS_TAINTS), keep the pod off it, which may come back; it refuses it
+   * otherwise. A Node that cannot be read is taken as one that takes it, which the restore
+   * then finds out, so that no restore waits on reading it.
    */
-  const nodesFor = (manifest: Manifest) =>
+  const schedulable = (name: string, tolerations: readonly V1Toleration[]): Effect.Effect<"takes" | "unready" | "refuses"> =>
+    kube.read("v1", "Node", "", name).pipe(
+      Effect.map((read) => {
+        // A core Node, as the API server returns one.
+        const node = read as V1Node | null;
+        if (node === null) return "takes";
+        if (node.spec?.unschedulable === true) return "refuses";
+        const keeping = (node.spec?.taints ?? []).filter((taint) => (taint.effect === "NoSchedule" || taint.effect === "NoExecute") && !tolerations.some((toleration) => tolerates(toleration, taint)));
+        if (keeping.some(({ key }) => !READINESS_TAINTS.has(key))) return "refuses";
+        return node.status?.conditions?.find(({ type }) => type === "Ready")?.status === "True" && keeping.length === 0 ? "takes" : "unready";
+      }),
+      Effect.catch((error) => Effect.logWarning(`could not read whether node ${name} takes the session's pod, which is tried as one that does: ${error.message}`).pipe(Effect.as("takes" as const))),
+    );
+
+  /**
+   * The nodes that can restore `manifest` into a pod of `tolerations`, those holding its
+   * images first: they have its release, with every CPU feature it was saved with, and take
+   * the pod (schedulable); whether every agent said what its node holds; and whether a node
+   * that has them is kept from the pod only by its readiness.
+   */
+  const nodesFor = (manifest: Manifest, tolerations: readonly V1Toleration[]) =>
     Effect.gen(function*() {
       const found = yield* agents.nodes;
       const held = yield* Effect.forEach(found, (node) =>
@@ -309,12 +349,14 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
           Effect.catch((error) => Effect.logWarning(error.message).pipe(Effect.as([]))),
         ));
       const answered = found.length > 0 && held.every((each) => each.length > 0);
-      const able = held.flat().filter(({ releases: installed }) =>
+      const capable = held.flat().filter(({ releases: installed }) =>
         installed.some(({ release, cpuFeatures }) => release === manifest.release && manifest.cpuFeatures.every((feature) => cpuFeatures.includes(feature)))
       );
+      const takes = yield* Effect.forEach(capable, ({ node }) => schedulable(node, tolerations));
+      const able = capable.filter((_, index) => takes[index] === "takes");
       const holds = (cached: (typeof able)[number]["cached"]) =>
         cached.some(({ environment: of, workspace, images }) => of === manifest.environment && workspace === manifest.workspace && manifest.layers.every(({ digest }) => images.includes(digest)));
-      return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered };
+      return { nodes: [...able.filter(({ cached }) => holds(cached)), ...able.filter(({ cached }) => !holds(cached))].map(({ node }) => node), answered, unready: takes.includes("unready") };
     });
 
   /**
@@ -419,10 +461,12 @@ export const makeSessionSnapshots = Effect.fnUntraced(function*({ profile, snaps
       const own = recorded.metadata?.labels?.[SANDBOX_LABEL] === name;
       const base = template === templates.current ? desired.spec.podTemplate : template !== undefined && template === templates.previous && own ? recorded : null;
       if (!base) return yield* fallBack(name, "template", "the session template it was taken on is no longer kept");
-      const able = yield* nodesFor(manifest).pipe(Effect.result);
+      const able = yield* nodesFor(manifest, base.spec?.tolerations ?? []).pipe(Effect.result);
       if (able._tag === "Failure") return yield* deferOr(name, "unreadable", able.failure.message);
       if (able.success.nodes.length === 0) {
-        const none = `no node has gVisor ${manifest.release} and every CPU feature it was saved with`;
+        const none = `no node that takes its pod has gVisor ${manifest.release} and every CPU feature it was saved with`;
+        // A node that has them, not Ready for now, may be again.
+        if (able.success.unready) return yield* deferOr(name, "node", `${none}: one that has them is not Ready`);
         return yield* (able.success.answered ? fallBack(name, "node", none) : deferOr(name, "node", `${none} of the nodes whose agents answered`));
       }
       // Each node is tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.

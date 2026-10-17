@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { KubernetesObject, V1LabelSelector, V1Pod, V1PodTemplateSpec } from "@kubernetes/client-node";
+import type { KubernetesObject, V1LabelSelector, V1Node, V1Pod, V1PodTemplateSpec, V1Taint, V1Toleration } from "@kubernetes/client-node";
 import { Deferred, Effect, Fiber, Layer } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
@@ -158,11 +158,14 @@ const node = (name: string, releases: readonly string[], cpuFeatures: readonly s
 });
 
 /** A KubeClient of ConfigMaps and Pods in memory, which records what it writes. */
-function fakeKube(objects: Map<string, KubernetesObject> = new Map()) {
+function fakeKube(objects: Map<string, KubernetesObject> = new Map(), unreadable: ReadonlySet<string> = new Set()) {
   const writes: string[] = [];
   const key = (kind: string, namespace: string, name: string) => `${kind}/${namespace}/${name}`;
   const service = KubeClient.of({
-    read: (_apiVersion, kind, namespace, name) => Effect.sync(() => structuredClone(objects.get(key(kind, namespace, name)) ?? null)),
+    read: (_apiVersion, kind, namespace, name) =>
+      unreadable.has(key(kind, namespace, name))
+        ? Effect.fail(new KubeApiError({ status: 503, cause: new Error("the API server is unavailable") }))
+        : Effect.sync(() => structuredClone(objects.get(key(kind, namespace, name)) ?? null)),
     list: (_apiVersion, kind, namespace) => Effect.sync(() => [...objects.values()].filter((object) => object.kind === kind && object.metadata?.namespace === namespace)),
     create: (object) =>
       Effect.sync(() => {
@@ -220,6 +223,95 @@ test("the CPU baseline alasio up holds sessions to is part of their template, as
   };
   assert.notEqual(sessionTemplateHash(held), sessionTemplateHash(given));
   assert.equal(sessionOf(held).spec.podTemplate.metadata?.annotations?.[CPU_FEATURES_ANNOTATION], "avx2,sse");
+});
+
+test("a snapshot is restored on no node that takes no session pod: cordoned, not Ready, or of a taint the pod does not tolerate; one whose Node cannot be read is tried", async () => {
+  const desired = sessionOf(profile());
+  // The session's pods tolerate the taint dedicated=sessions:NoSchedule.
+  desired.spec.podTemplate.spec = { ...desired.spec.podTemplate.spec!, tolerations: [{ key: "dedicated", operator: "Equal", value: "sessions", effect: "NoSchedule" }] };
+  const manifest = manifestOf(desired.spec.podTemplate);
+  const nodeObject = (name: string, { unschedulable = false, ready = "True", taints = [] }: { unschedulable?: boolean; ready?: string; taints?: V1Taint[] } = {}): [string, KubernetesObject] => [
+    `Node//${name}`,
+    { apiVersion: "v1", kind: "Node", metadata: { name }, spec: { unschedulable, taints }, status: { conditions: [{ type: "Ready", status: ready }] } } as V1Node,
+  ];
+  const restoredOn = async (objects: Map<string, KubernetesObject>, unreadable: ReadonlySet<string> = new Set()) => {
+    const { agents, asked } = fakeAgents({
+      current: manifest,
+      // Each holds the snapshot's images, but node-free, which takes the pod.
+      holdings: ["node-cordoned", "node-unready", "node-tainted", "node-tolerated", "node-free"].map((name) => node(name, [CURRENT], undefined, name === "node-free" ? [] : [IMAGE])),
+    });
+    const plan = await run(fakeKube(objects, unreadable), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      return yield* snapshotted.restore(stored(desired), desired);
+    }));
+    assert.ok(plan && "podTemplate" in plan);
+    return asked.filter((each) => each.startsWith("prepare"));
+  };
+  const nodes = new Map([
+    nodeObject("node-cordoned", { unschedulable: true }),
+    nodeObject("node-unready", { ready: "Unknown" }),
+    nodeObject("node-tainted", { taints: [{ key: "maintenance", value: "true", effect: "NoExecute" }] }),
+    nodeObject("node-tolerated", { taints: [{ key: "dedicated", value: "sessions", effect: "NoSchedule" }, { key: "spare", effect: "PreferNoSchedule" }] }),
+    nodeObject("node-free"),
+  ]);
+  // The one that holds its images and takes the pod first, then the one that takes it.
+  assert.deepEqual(await restoredOn(nodes), ["prepare on node-tolerated"]);
+  nodes.delete("Node//node-tolerated");
+  nodes.set(...nodeObject("node-tolerated", { taints: [{ key: "dedicated", value: "batch", effect: "NoSchedule" }] }));
+  assert.deepEqual(await restoredOn(nodes), ["prepare on node-free"]);
+  // A Node that cannot be read is tried.
+  assert.deepEqual(await restoredOn(nodes, new Set(["Node//node-cordoned"])), ["prepare on node-cordoned"]);
+});
+
+test("a snapshot whose one node that has its release is not Ready for now is deferred, as that node may be again, and restored on it once it is; one whose node is cordoned, or tainted otherwise, falls back", async () => {
+  const desired = sessionOf(profile());
+  const manifest = manifestOf(desired.spec.podTemplate);
+  const restored = async (spec: V1Node["spec"], ready: string) => {
+    const objects = new Map<string, KubernetesObject>([["Node//node-a", { apiVersion: "v1", kind: "Node", metadata: { name: "node-a" }, spec, status: { conditions: [{ type: "Ready", status: ready }] } } as V1Node]]);
+    const { agents } = fakeAgents({ current: manifest, holdings: [node("node-a", [CURRENT])] });
+    return run(fakeKube(objects), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      return yield* snapshotted.restore(stored(desired), desired);
+    }));
+  };
+  const notReady: V1Taint = { key: "node.kubernetes.io/not-ready", effect: "NoSchedule" };
+  const unreachable: V1Taint = { key: "node.kubernetes.io/unreachable", effect: "NoExecute" };
+  // Not Ready, as the node lifecycle controller taints one, or not tainted yet, or tainted still once Ready again.
+  for (const [taints, ready] of [[[notReady], "False"], [[unreachable], "Unknown"], [[], "False"], [[notReady], "True"]] as const) {
+    const plan = await restored({ taints: [...taints] }, ready);
+    assert.ok(plan && "deferred" in plan, JSON.stringify(plan));
+    assert.match(plan.deferred, /one that has them is not Ready$/u);
+  }
+  // Ready: restored there.
+  const plan = await restored({}, "True");
+  assert.ok(plan && "podTemplate" in plan);
+  // Cordoned, or tainted against the pod as well: no restore on it is waited for.
+  assert.equal(await restored({ unschedulable: true }, "False"), null);
+  assert.equal(await restored({ taints: [notReady, { key: "maintenance", effect: "NoSchedule" }] }, "False"), null);
+});
+
+test("a taint is tolerated by a toleration of its key that Exists, or of its key and value, of its effect or of every effect; one that Exists of no key tolerates every taint", async () => {
+  const desired = sessionOf(profile());
+  const manifest = manifestOf(desired.spec.podTemplate);
+  const restoredOn = async (tolerations: V1Toleration[], taint: V1Taint) => {
+    desired.spec.podTemplate.spec = { ...desired.spec.podTemplate.spec!, tolerations };
+    const objects = new Map<string, KubernetesObject>([["Node//node-a", { apiVersion: "v1", kind: "Node", metadata: { name: "node-a" }, spec: { taints: [taint] }, status: { conditions: [{ type: "Ready", status: "True" }] } } as V1Node]]);
+    const { agents } = fakeAgents({ current: manifest, holdings: [node("node-a", [CURRENT])] });
+    const plan = await run(fakeKube(objects), Effect.gen(function*() {
+      const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
+      return yield* snapshotted.restore(stored(desired), desired);
+    }));
+    return plan !== null && "podTemplate" in plan;
+  };
+  const taint: V1Taint = { key: "dedicated", value: "sessions", effect: "NoSchedule" };
+  assert.equal(await restoredOn([{ key: "dedicated", operator: "Exists" }], taint), true);
+  assert.equal(await restoredOn([{ key: "dedicated", operator: "Exists", effect: "NoSchedule" }], taint), true);
+  assert.equal(await restoredOn([{ operator: "Exists" }], taint), true);
+  assert.equal(await restoredOn([{ key: "dedicated", value: "sessions" }], taint), true);
+  // Of another effect, key or value.
+  assert.equal(await restoredOn([{ key: "dedicated", operator: "Exists", effect: "NoExecute" }], taint), false);
+  assert.equal(await restoredOn([{ key: "other", operator: "Exists" }], taint), false);
+  assert.equal(await restoredOn([{ key: "dedicated", operator: "Equal", value: "batch" }], taint), false);
 });
 
 test("a session with a snapshot on the current template is restored on a node that can, the one holding it first, into what it is now", async () => {

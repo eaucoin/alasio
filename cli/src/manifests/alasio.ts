@@ -8,6 +8,8 @@ import { isDeepStrictEqual } from "node:util";
 
 import type {
   KubernetesObject,
+  V1ClusterRole,
+  V1ClusterRoleBinding,
   V1ConfigMap,
   V1Deployment,
   V1EnvVar,
@@ -611,9 +613,10 @@ function mountPodsRemoved({ workspaceStorage }: InstallConfig): boolean {
  * while turns run in them, as it does its own in its namespace (src/kube/busy.ts); where
  * it snapshots sessions, sets a restored session's readiness; where it forks
  * sessions, reads sessions' volume claims and runs the Jobs that clone them in its own;
- * where the node agents run, watches pods in its own, theirs among them; and, where it
- * installs JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount
- * pods; and nothing else.
+ * where the node agents run, watches pods in its own, theirs among them, and reads the
+ * cluster's nodes, for a restore to go to one that takes its pod; and, where it installs
+ * JuiceFS's driver, lists and deletes pods in the driver's namespace, its mount pods; and
+ * nothing else.
  */
 function identity(config: InstallConfig, environment: Environment): KubernetesObject[] {
   const main = environment.branch === null;
@@ -643,6 +646,21 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     ],
   };
   const serviceAccount: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RELEASE, namespace: environment.namespace, labels: labels("alasio") } };
+  // The nodes, read alone, for a restore to go to one that takes the session's pod (src/sandbox/snapshots.ts).
+  const nodes = { name: componentName("nodes"), labels: labels("alasio") };
+  const nodesRole: V1ClusterRole = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "ClusterRole",
+    metadata: nodes,
+    rules: [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }],
+  };
+  const nodesBinding: V1ClusterRoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "ClusterRoleBinding",
+    metadata: nodes,
+    subjects: [{ kind: "ServiceAccount", name: RELEASE, namespace: environment.namespace }],
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name: nodes.name },
+  };
   return [
     serviceAccount,
     ...workspaceNamespaces(config, environment).flatMap((namespace): KubernetesObject[] => {
@@ -670,6 +688,7 @@ function identity(config: InstallConfig, environment: Environment): KubernetesOb
     own,
     binding(inOwnNamespace),
     ...(main && mountPodsRemoved(config) ? [mountPods, binding(inDriverNamespace)] : []),
+    ...(main && nodeAgentRuns(config) ? [nodesRole, nodesBinding] : []),
     ...(config.host.enabled ? hostAgentIdentity(config) : []),
   ];
 }
