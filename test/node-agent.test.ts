@@ -1883,6 +1883,8 @@ test("commands run on the node enter its mounts and network from its PID 1, with
 
 /** Workspaces no test of snapshots reaches. */
 const unusedWorkspaces: Workspaces = {
+  create: () => Effect.die("no workspace is made"),
+  quota: () => Effect.die("no workspace's quota is read"),
   attach: () => Effect.die("no workspace is attached"),
   detach: () => Effect.die("no workspace is detached"),
   read: () => Effect.die("no workspace's file is read"),
@@ -2438,5 +2440,11 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       at.running.delete("container-0");
       yield* agents.detach("node-1", "pool-0", ["container-0"]);
       assert.deepEqual(at.mounts, []);
+      // A workspace made through any agent, its quota read back; one that has none, none.
+      const made = { environment: "main", workspace: "fs-made" };
+      yield* agents.createWorkspace(made, 5 * 1024 ** 3);
+      assert.deepEqual(yield* agents.quota(made), { capacityBytes: 5 * 1024 ** 3, usedBytes: 12 * 1024 ** 2 });
+      const refusedMade = yield* Effect.flip(agents.createWorkspace({ environment: "main", workspace: "../etc" }, 1024));
+      assert.equal(refusedMade._tag === "NodeAgentError" && refusedMade.status, 400);
     })
   ));
