@@ -3,14 +3,16 @@
  * of pods already running, each bound to one workspace while it has work, through the
  * gateway.
  *
- * - The gateway: alasio's image, as its own program, the one door to a pool's pod; its
- *   configuration, which pools it binds in, rendered here; its keys, made by the stack's
- *   setup (neon/control/kube-setup.ts); a Service of it, which alasio binds through and KEDA
- *   asks each pool's counts of, and a headless one its replicas find each other by. It may
- *   bind, claim and delete the pods of its pools' namespace, hold their Leases, and read their
- *   Deployments, whose templates a release's snapshot records; and find the node agents.
- * - A pool of each of a session's internets, `none` and `full`: a Deployment in the sessions'
- *   namespace of pods of the agent image under the sessions' runtime, each its own directory
+ * - The gateway: alasio's image, as its own program, the one door to a pool's pod, of main's
+ *   sessions and of every branch environment's, which it finds by their namespaces; its
+ *   configuration, rendered here; its keys, made by the stack's setup
+ *   (neon/control/kube-setup.ts); a Service of it, which alasio binds through and KEDA asks
+ *   each pool's counts of, and a headless one its replicas find each other by. In each
+ *   environment's sessions' namespace (sandboxPoolObjects) it may bind, claim and delete the
+ *   pods of its pools, hold their Leases, and read their Deployments, whose templates a
+ *   release's snapshot records; and it finds the node agents.
+ * - A pool of each of a session's internets, `none` and `full`, in each environment: a
+ *   Deployment in its sessions' namespace of pods of the agent image under the sessions' runtime, each its own directory
  *   on its node (src/node-agent/names.ts ATTACH_ROOT, by `subPathExpr` of its name) at /attach,
  *   where its workspace is attached once it is bound, its bayma started once its binding's
  *   token is beside it (sandbox/agent/start.sh). KEDA keeps `min` free, and makes more, to
@@ -19,18 +21,21 @@
  *   free pods go as the new come, as none is ready before it is bound. A bound pod is evicted
  *   by no drain (./disruption.ts boundBudget).
  * - The session telemetry receiver (src/receiver/): alasio's image, as its own program,
- *   watching the pools' Leases, which bound pods' bayma exports to.
+ *   watching the pools' Leases of every environment, which bound pods' bayma exports to.
  * - The node's mount of workspace storage, a pod of each node's own, held through upgrades of
  *   the node agent, which attaches workspaces from it: a new one takes its mount over before
  *   the old goes.
  */
 import type {
   KubernetesObject,
+  V1ClusterRole,
+  V1ClusterRoleBinding,
   V1ConfigMap,
   V1DaemonSet,
   V1Deployment,
   V1EnvVar,
   V1PodTemplateSpec,
+  V1PolicyRule,
   V1Role,
   V1RoleBinding,
   V1Service,
@@ -41,7 +46,7 @@ import { freeLabels, type Pool } from "../../../src/binder/bindings.ts";
 import { BINDING_KEY_VARIABLE, CALLER_KEY_VARIABLE, GATEWAY_CONFIG_VARIABLE, type GatewayConfig } from "../../../src/gateway/gateway.ts";
 import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
-import { BINDING_NAMESPACES_VARIABLE, RECEIVER_PORT_VARIABLE } from "../../../src/receiver/receiver.ts";
+import { RECEIVER_PORT_VARIABLE, SESSIONS_NAMESPACE_VARIABLE } from "../../../src/receiver/receiver.ts";
 import { imageReference } from "../images.ts";
 import { sessionsNamespace } from "./alasio.ts";
 import {
@@ -179,7 +184,7 @@ function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS
 }
 
 /** The gateway's configuration, as src/gateway/gateway.ts reads it. */
-function gatewayConfig(config: InstallConfig, environment: Environment): GatewayConfig {
+function gatewayConfig(config: InstallConfig): GatewayConfig {
   return {
     port: GATEWAY_PORT,
     peers: `${GATEWAY_PEERS}.${NAMESPACE}.svc.cluster.local`,
@@ -187,7 +192,7 @@ function gatewayConfig(config: InstallConfig, environment: Environment): Gateway
     waitSeconds: 120,
     // A duration, as the configuration checks it.
     releaseAfterSeconds: durationSeconds(config.sessions.snapshots.releaseAfter) ?? 0,
-    environments: [{ name: environment.branch ?? "main", namespace: sessionsNamespace(config, environment) }],
+    environment: { name: "main", namespace: sessionsNamespace(config, MAIN_ENVIRONMENT) },
     pools: { none: POOLS.none, full: POOLS.full },
     nodeAgents: {
       namespace: NAMESPACE,
@@ -197,37 +202,56 @@ function gatewayConfig(config: InstallConfig, environment: Environment): Gateway
   };
 }
 
-/** The gateway's identity: its ServiceAccount, what it may do in its pools' namespace, and the node agents it finds. */
-function gatewayIdentity(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  const namespace = sessionsNamespace(config, environment);
-  const account: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: GATEWAY, namespace: NAMESPACE, labels: labels(GATEWAY_COMPONENT) } };
-  const role = (where: string, rules: V1Role["rules"]): V1Role => ({ apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata: { name: GATEWAY, namespace: where, labels: labels(GATEWAY_COMPONENT) }, rules: rules ?? [] });
-  const binding = (where: string): V1RoleBinding => ({
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "RoleBinding",
-    metadata: { name: GATEWAY, namespace: where, labels: labels(GATEWAY_COMPONENT) },
-    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: GATEWAY },
-    subjects: [{ kind: "ServiceAccount", name: GATEWAY, namespace: NAMESPACE }],
-  });
+/** A Role in `namespace` of `rules`, named for the ServiceAccount `account` of alasio's namespace, and its binding to it. */
+function accountRole(account: string, component: string, namespace: string, rules: V1PolicyRule[]): [V1Role, V1RoleBinding] {
+  const metadata = { name: account, namespace, labels: labels(component) };
   return [
-    account,
-    role(namespace, [
-      // Its pools' pods, claimed by an update of the version read, and deleted as they are released.
-      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
-      { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
-      // Its pools' templates, which a release's snapshot records.
-      { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: [POOLS.none, POOLS.full] },
-    ]),
-    binding(namespace),
+    { apiVersion: "rbac.authorization.k8s.io/v1", kind: "Role", metadata, rules },
+    {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "RoleBinding",
+      metadata,
+      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: account },
+      subjects: [{ kind: "ServiceAccount", name: account, namespace: NAMESPACE }],
+    },
+  ];
+}
+
+/**
+ * What lets the ServiceAccount `account` find the branch environments, by their namespaces
+ * (src/gateway/environments.ts): a ClusterRole that reads namespaces, and nothing else of the
+ * cluster, and its binding.
+ */
+function environmentsFinder(account: string, component: string): [V1ClusterRole, V1ClusterRoleBinding] {
+  const metadata = { name: account, labels: labels(component) };
+  return [
+    { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", metadata, rules: [{ apiGroups: [""], resources: ["namespaces"], verbs: ["get", "list", "watch"] }] },
+    {
+      apiVersion: "rbac.authorization.k8s.io/v1",
+      kind: "ClusterRoleBinding",
+      metadata,
+      roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name: account },
+      subjects: [{ kind: "ServiceAccount", name: account, namespace: NAMESPACE }],
+    },
+  ];
+}
+
+/** The ServiceAccount `account` of alasio's namespace. */
+const serviceAccount = (account: string, component: string): V1ServiceAccount => ({ apiVersion: "v1", kind: "ServiceAccount", metadata: { name: account, namespace: NAMESPACE, labels: labels(component) } });
+
+/** The gateway's identity: its ServiceAccount, the node agents it finds, and the branch environments it finds; what it may do in each environment's pools is sandboxPoolObjects'. */
+function gatewayIdentity(): KubernetesObject[] {
+  return [
+    serviceAccount(GATEWAY, GATEWAY_COMPONENT),
     // The node agents, by their pods, which it attaches workspaces through.
-    role(NAMESPACE, [{ apiGroups: [""], resources: ["pods"], verbs: ["list"] }]),
-    binding(NAMESPACE),
+    ...accountRole(GATEWAY, GATEWAY_COMPONENT, NAMESPACE, [{ apiGroups: [""], resources: ["pods"], verbs: ["list"] }]),
+    ...environmentsFinder(GATEWAY, GATEWAY_COMPONENT),
   ];
 }
 
 /** The gateway's Deployment, its configuration's ConfigMap, and its Services. */
-function gatewayObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  const rendered = JSON.stringify(gatewayConfig(config, environment), null, 2);
+function gatewayObjects(config: InstallConfig): KubernetesObject[] {
+  const rendered = JSON.stringify(gatewayConfig(config), null, 2);
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: GATEWAY, namespace: NAMESPACE, labels: labels(GATEWAY_COMPONENT) }, data: { "config.json": rendered } };
   const key = (variable: string, field: string): V1EnvVar => ({ name: variable, valueFrom: { secretKeyRef: { name: GATEWAY, key: field } } });
   const deployment: V1Deployment = {
@@ -277,24 +301,9 @@ function gatewayObjects(config: InstallConfig, environment: Environment): Kubern
   return [configMap, deployment, verticalPodAutoscaler(deployment, "InPlace"), service(GATEWAY, false), service(GATEWAY_PEERS, true)];
 }
 
-/** The receiver: its identity, which watches the pools' Leases, its Deployment and its Service. */
-function receiverObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
-  const namespace = sessionsNamespace(config, environment);
+/** The receiver: its identity, which finds the branch environments, whose pools' Leases sandboxPoolObjects lets it watch, its Deployment and its Service. */
+function receiverObjects(config: InstallConfig): KubernetesObject[] {
   const port = config.telemetry.receiverPort;
-  const account: V1ServiceAccount = { apiVersion: "v1", kind: "ServiceAccount", metadata: { name: RECEIVER, namespace: NAMESPACE, labels: labels(RECEIVER_COMPONENT) } };
-  const role: V1Role = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "Role",
-    metadata: { name: RECEIVER, namespace, labels: labels(RECEIVER_COMPONENT) },
-    rules: [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }],
-  };
-  const binding: V1RoleBinding = {
-    apiVersion: "rbac.authorization.k8s.io/v1",
-    kind: "RoleBinding",
-    metadata: { name: RECEIVER, namespace, labels: labels(RECEIVER_COMPONENT) },
-    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: RECEIVER },
-    subjects: [{ kind: "ServiceAccount", name: RECEIVER, namespace: NAMESPACE }],
-  };
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -317,7 +326,7 @@ function receiverObjects(config: InstallConfig, environment: Environment): Kuber
             env: [
               { name: RECEIVER_PORT_VARIABLE, value: String(port) },
               { name: BINDING_KEY_VARIABLE, valueFrom: { secretKeyRef: { name: GATEWAY, key: "binding-key" } } },
-              { name: BINDING_NAMESPACES_VARIABLE, value: namespace },
+              { name: SESSIONS_NAMESPACE_VARIABLE, value: sessionsNamespace(config, MAIN_ENVIRONMENT) },
               ...(otelEnv(config).length > 0 ? [{ name: "OTEL_SERVICE_NAME", value: RECEIVER }, ...otelEnv(config)] : []),
             ],
             ports: [{ name: "otlp-http", containerPort: port }],
@@ -334,7 +343,7 @@ function receiverObjects(config: InstallConfig, environment: Environment): Kuber
     metadata: { name: RECEIVER, namespace: NAMESPACE, labels: labels(RECEIVER_COMPONENT) },
     spec: { selector: selectorLabels(RECEIVER_COMPONENT), ports: [{ name: "otlp-http", port, targetPort: "otlp-http" }] },
   };
-  return [account, role, binding, deployment, verticalPodAutoscaler(deployment, "InPlace"), service];
+  return [serviceAccount(RECEIVER, RECEIVER_COMPONENT), ...environmentsFinder(RECEIVER, RECEIVER_COMPONENT), deployment, verticalPodAutoscaler(deployment, "InPlace"), service];
 }
 
 /** Where a workspace mount's pod keeps what is its own: its juicefs's log and pid, and whether it has handed its mount over. */
@@ -438,18 +447,39 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
   };
 }
 
-/** The sandbox service's objects, of `environment`'s sessions: its gateway, its pools, its receiver, and the nodes' mount. */
-export function sandboxServiceObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): KubernetesObject[] {
+/**
+ * What the sandbox service has in `environment`'s sessions' namespace, main's or a branch
+ * environment's (./branch.ts): its pools, the budget of their bound pods, and what the gateway
+ * may do there, binding in its pools, and the receiver, watching their Leases.
+ */
+export function sandboxPoolObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
   if (!sandboxServiceRuns(config)) return [];
   const pools = poolsOf(config, environment);
-  const mount = workspaceMount(config);
+  const namespace = pools.none.namespace;
   return [
-    ...gatewayIdentity(config, environment),
-    ...gatewayObjects(config, environment),
+    ...accountRole(GATEWAY, GATEWAY_COMPONENT, namespace, [
+      // Its pools' pods, claimed by an update of the version read, and deleted as they are released.
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
+      { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
+      // Its pools' templates, which a release's snapshot records.
+      { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: [POOLS.none, POOLS.full] },
+    ]),
+    ...accountRole(RECEIVER, RECEIVER_COMPONENT, namespace, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]),
     ...poolObjects(config, pools.none, "none"),
     ...poolObjects(config, pools.full, "full"),
-    boundBudget(pools.none.namespace),
-    ...receiverObjects(config, environment),
+    boundBudget(namespace),
+  ];
+}
+
+/** The sandbox service's objects: its gateway, its receiver, and the nodes' mount, main's alone, which serve every environment, and main's pools. */
+export function sandboxServiceObjects(config: InstallConfig): KubernetesObject[] {
+  if (!sandboxServiceRuns(config)) return [];
+  const mount = workspaceMount(config);
+  return [
+    ...gatewayIdentity(),
+    ...gatewayObjects(config),
+    ...receiverObjects(config),
+    ...sandboxPoolObjects(config, MAIN_ENVIRONMENT),
     mount,
     // Sized as recommended alone, as a pod of it is only replaced, by one that takes its mount over.
     verticalPodAutoscaler(mount, "Recommended"),

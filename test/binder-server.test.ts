@@ -101,7 +101,7 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
     assert.ok(stamps[0] !== null && Date.now() - (stamps[0] ?? 0) < 30_000, String(stamps));
     assert.equal(stamps[1], stamps[0]);
     const tokens = stand.sent.map(({ authorization }) => verifyToken(bindingKey, String(authorization).slice("Bearer ".length), Date.now()));
-    assert.deepEqual(tokens, [{ key, binding: lease.metadata?.uid }, { key, binding: lease.metadata?.uid }]);
+    assert.deepEqual(tokens, Array(2).fill({ key, binding: lease.metadata?.uid, namespace: lease.metadata?.namespace }));
     assert.equal(served.inFlight(key), 0);
   } finally {
     await served.close();

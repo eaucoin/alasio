@@ -633,7 +633,12 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
   if (!config.networkPolicies.enabled) return [];
   const { sessions, host } = config;
   if (environment.branch !== null) {
-    return [...(sessions.enabled ? sessionPolicies(config, environment) : []), alasioPolicy(config, environment), ...neonPolicies(environment)];
+    return [
+      ...(sessions.enabled ? sessionPolicies(config, environment) : []),
+      ...(sandboxServiceRuns(config) ? poolPolicies(config, environment) : []),
+      alasioPolicy(config, environment),
+      ...neonPolicies(environment),
+    ];
   }
   return [
     ...(sessions.enabled ? sessionPolicies(config, environment) : []),

@@ -2557,7 +2557,7 @@ describe("node agents", () => {
     const binding = one<V1RoleBinding>(install({ workspaceStorage: { enabled: false } }).filter(({ metadata }) => metadata?.namespace === "alasio"), "RoleBinding", "alasio");
     assert.deepEqual(binding.subjects, [{ kind: "ServiceAccount", name: "alasio", namespace: "alasio" }]);
     // A branch environment's alasio calls none.
-    const branchRules = all<V1Role>(branchObjects(configOf(), "try"), "Role").flatMap(({ rules }) => rules ?? []);
+    const branchRules = all<V1Role>(branchObjects(configOf(), "try"), "Role").filter(({ metadata }) => metadata?.name === "alasio").flatMap(({ rules }) => rules ?? []);
     assert.ok(!branchRules.some(({ resources, verbs }) => resources?.includes("pods") && verbs.includes("watch")));
   });
 });
@@ -2726,7 +2726,8 @@ describe("branch environments", () => {
       ["ValidatingAdmissionPolicy", "alasio-branch-try-sandboxes"],
       ["ValidatingAdmissionPolicyBinding", "alasio-branch-try-sandboxes"],
     ]);
-    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro"]);
+    // Its sessions' pools beside, the sandbox service's (main's binds in them).
+    assert.deepEqual(all<V1Deployment>(branch, "Deployment").map(({ metadata }) => metadata?.name).sort(), ["alasio", "alasio-lake-loader", "alasio-neon-compute", "alasio-neon-compute-ro", "sandboxes-full", "sandboxes-none"]);
     // Named as main's are, as each namespace is the branch's own.
     assert.deepEqual(all<V1Service>(branch, "Service").map(({ metadata }) => metadata?.name).sort(), ["alasio-neon-compute", "alasio-neon-compute-ro", "alasio-telemetry"]);
   });
@@ -2743,7 +2744,8 @@ describe("branch environments", () => {
     assert.equal(variable(alasio, "ALASIO_LAKE_READER_VERIFIER_FILE"), undefined);
     assert.equal(variable(alasio, "ALASIO_GRAFANA_VERIFIER_FILE"), undefined);
     assert.deepEqual(alasio.spec?.template.spec?.volumes?.find(({ name }) => name === "database")?.secret?.items?.map(({ key }) => key), ["url", "lake-verifier"]);
-    for (const workload of all<V1Deployment>(branch, "Deployment")) {
+    // Its sandboxes' telemetry is tagged by main's receiver, as each binding's token names its namespace.
+    for (const workload of all<V1Deployment>(branch, "Deployment").filter(({ metadata }) => !metadata?.name?.startsWith("sandboxes-"))) {
       assert.equal(variable(workload, "OTEL_RESOURCE_ATTRIBUTES"), "alasio.branch=try", workload.metadata?.name);
     }
     const tagged = branchObjects(configOf({ telemetry: { resourceAttributes: "deployment.environment.name=prod" } }), "try");
@@ -2764,6 +2766,9 @@ describe("branch environments", () => {
       // main's neon-control, which wakes its compute and puts it to sleep.
       ["alasio-branch-try", "alasio-neon-control"],
       ["alasio-branch-try-sessions", "alasio-parent"],
+      // main's sandbox gateway and receiver, which bind in its pools and watch their Leases.
+      ["alasio-branch-try-sessions", "alasio-sandbox-gateway"],
+      ["alasio-branch-try-sessions", "alasio-receiver"],
     ]);
     assert.deepEqual(of<V1Role>("Role", "alasio", "alasio-branch-try").rules, [{ apiGroups: [""], resources: ["pods"], verbs: ["list", "patch"] }]);
     const binding = of<V1RoleBinding>("RoleBinding", "alasio", "alasio-branch-try-sessions");
@@ -3416,7 +3421,7 @@ describe("the sandbox service", () => {
       podPort: 7290,
       waitSeconds: 120,
       releaseAfterSeconds: 300,
-      environments: [{ name: "main", namespace: "alasio-sessions" }],
+      environment: { name: "main", namespace: "alasio-sessions" },
       pools: { none: "sandboxes-none", full: "sandboxes-full" },
       nodeAgents: { namespace: "alasio", selector: "app.kubernetes.io/name=alasio,app.kubernetes.io/instance=alasio,app.kubernetes.io/component=node-agent", port: 8484 },
     });
@@ -3433,7 +3438,7 @@ describe("the sandbox service", () => {
     const objects = install();
     const receiver = one<V1Deployment>(objects, "Deployment", "alasio-receiver");
     const env = Object.fromEntries((receiver.spec?.template.spec?.containers[0]?.env ?? []).map(({ name, value, valueFrom }) => [name, value ?? valueFrom?.secretKeyRef]));
-    assert.deepEqual([env["BINDING_NAMESPACES"], env["BINDING_KEY"]], ["alasio-sessions", { name: "alasio-sandbox-gateway", key: "binding-key" }]);
+    assert.deepEqual([env["SESSIONS_NAMESPACE"], env["BINDING_KEY"]], ["alasio-sessions", { name: "alasio-sandbox-gateway", key: "binding-key" }]);
     const watching = all<V1Role>(objects, "Role").find(({ metadata }) => metadata?.name === "alasio-receiver");
     assert.deepEqual([watching?.metadata?.namespace, watching?.rules], ["alasio-sessions", [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]]);
     const mount = one<V1DaemonSet>(objects, "DaemonSet", "alasio-workspace-mount");
@@ -3541,6 +3546,48 @@ describe("the sandbox service", () => {
       apiServerUnconfined(configOf({ networkPolicies: { enabled: false } }), null),
       apiServerUnconfined(configOf({ workspaceStorage: { enabled: false } }), null),
     ], [true, false, false, false]);
+  });
+
+  test("finds the branch environments by their namespaces, which the gateway and the receiver may read, and nothing else of the cluster", () => {
+    const objects = install();
+    for (const account of ["alasio-sandbox-gateway", "alasio-receiver"]) {
+      assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", account).rules, [{ apiGroups: [""], resources: ["namespaces"], verbs: ["get", "list", "watch"] }]);
+      const binding = one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", account);
+      assert.deepEqual([binding.roleRef.name, binding.subjects], [account, [{ kind: "ServiceAccount", name: account, namespace: "alasio" }]]);
+    }
+  });
+
+  test("binds a branch environment's sessions in pools of its own, in its sessions' namespace, through main's gateway and receiver, which nothing of a branch changes", () => {
+    const main = install();
+    const branch = branchObjects(configOf(), "try");
+    const namespace = "alasio-branch-try-sessions";
+    const ofBranch = <T extends KubernetesObject>(kind: string, name: string) => one<T>(branch.filter(({ metadata }) => metadata?.namespace === namespace), kind, name);
+    for (const mode of ["none", "full"] as const) {
+      const pool = ofBranch<V1Deployment>("Deployment", `sandboxes-${mode}`);
+      assert.deepEqual(pool.spec?.selector.matchLabels, { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/free": "true" });
+      assert.deepEqual(ofBranch<ScaledObject>("ScaledObject", `sandboxes-${mode}`).spec.triggers[0]?.metadata["url"], `http://alasio-sandbox-gateway.alasio.svc.cluster.local:8080/counts/${namespace}/sandboxes-${mode}`);
+    }
+    assert.deepEqual(ofBranch<V1Role>("Role", "alasio-sandbox-gateway").rules, one<V1Role>(main.filter(({ metadata }) => metadata?.namespace === "alasio-sessions"), "Role", "alasio-sandbox-gateway").rules);
+    assert.deepEqual(ofBranch<V1Role>("Role", "alasio-receiver").rules, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]);
+    assert.deepEqual(ofBranch<V1RoleBinding>("RoleBinding", "alasio-receiver").subjects, [{ kind: "ServiceAccount", name: "alasio-receiver", namespace: "alasio" }]);
+    assert.ok(ofBranch("PodDisruptionBudget", "alasio-bound"));
+    // Main's gateway reaches its pools, and they its receiver, as main's do.
+    const policies = [...all<NetworkPolicyObject>(main, "NetworkPolicy"), ...all<NetworkPolicyObject>(branch, "NetworkPolicy")];
+    const pod = (component: string, at: string, labels: Record<string, string> = {}, namespaceLabels: Record<string, string> = {}): Pod => ({
+      namespace: at,
+      namespaceLabels: { "kubernetes.io/metadata.name": at, ...namespaceLabels },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const pooled = pod("session", namespace, { "alasio.dev/pool": "sandboxes-none", "alasio.dev/net-mode": "none", "alasio.dev/free": "true" }, { "alasio.dev/branch": "try" });
+    assert.equal(connects(policies, pod("sandbox-gateway", "alasio"), pooled, 7290), true);
+    assert.equal(connects(policies, pod("alasio", "alasio-branch-try"), pooled, 7290), false);
+    assert.equal(connects(policies, pooled, pod("receiver", "alasio"), 4318), true);
+    assert.equal(connects(policies, pooled, pod("alasio", "alasio-branch-try"), 4318), false);
+    // Nothing of main's is a branch's, so a branch made or deleted changes, and restarts, nothing of main's.
+    const named = ({ kind, metadata }: KubernetesObject) => `${kind}/${metadata?.namespace ?? ""}/${metadata?.name ?? ""}`;
+    const mains = new Set(main.map(named));
+    assert.deepEqual(branch.map(named).filter((each) => mains.has(each)), []);
+    assert.deepEqual(branch.filter(({ metadata }) => metadata?.namespace === "alasio").map(named), []);
   });
 
   test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {

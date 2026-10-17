@@ -19,6 +19,7 @@ import { serveBinder } from "../binder/server.ts";
 import { KubeClient } from "../kube/client.ts";
 import { makeNodeAgents } from "../sandbox/node-agents.ts";
 import { withLogScope } from "../shared/log.ts";
+import { makeEnvironments } from "./environments.ts";
 import { makeSessions } from "./sessions.ts";
 
 /** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
@@ -42,8 +43,8 @@ export const GatewayConfig = Schema.Struct({
   /** How long a bind waits for a free pod, and an idle pod is kept. */
   waitSeconds: Schema.Number,
   releaseAfterSeconds: Schema.Number,
-  /** Each environment of sessions, by its name, and the namespace its pools are in. */
-  environments: Schema.Array(Schema.Struct({ name: Schema.String, namespace: Schema.String })),
+  /** main's environment of sessions, by its name, and the namespace its pools are in; branch environments' are found (./environments.ts). */
+  environment: Schema.Struct({ name: Schema.String, namespace: Schema.String }),
   /** Each pool's name, by its sessions' internet. */
   pools: Schema.Struct({ none: Schema.String, full: Schema.String }),
   /** Where the node agents are. */
@@ -70,12 +71,13 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
   yield* Effect.gen(function*() {
     const binder = yield* Binder;
     const agents = yield* makeNodeAgents(config.nodeAgents);
+    const environments = yield* makeEnvironments({ main: config.environment });
     const sessions = yield* makeSessions(
-      { environments: config.environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey },
+      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey },
       agents,
       binder,
     );
-    const setRight = Effect.forEach(sessions.pools, (pool) =>
+    const setRight = Effect.forEach(yield* sessions.pools, (pool) =>
       reconcile(pool).pipe(
         Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
         Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
@@ -102,7 +104,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
           Effect.orElseSucceed(() => []),
         ),
     });
-    yield* Effect.logInfo(`the sandbox gateway serves on port ${served.port}, for ${config.environments.map(({ name }) => name).join(", ")}`);
+    yield* Effect.logInfo(`the sandbox gateway serves on port ${served.port}, for ${(yield* environments.current).map(({ name }) => name).join(", ")}`);
   }).pipe(Effect.provide(context));
 }).pipe(
   Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),

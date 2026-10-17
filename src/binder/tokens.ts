@@ -5,22 +5,25 @@
  * key, base64url, compared in constant time.
  *
  * A caller's token names the key it may reach, when it stops, and what its key is bound with:
- * what the binder's callers present, which the binder checks and never forwards. A binding's token names the key and
- * the binding, its Lease's uid, so one minted for a binding is no other's, even of the same
- * key: what the bound pod is given, to take its calls, and its telemetry, by.
+ * what the binder's callers present, which the binder checks and never forwards. A binding's
+ * token names the key, the binding, its Lease's uid, so one minted for a binding is no
+ * other's, even of the same key, and the namespace its Lease is in: what the bound pod is
+ * given, to take its calls, and its telemetry, by (bindingToken).
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { Option, Schema } from "effect";
 
 /**
- * What a token says: the key it is for; the binding, for a binding's; and, for a caller's,
- * the time it stops, in ms, and what its key is bound with where it is not bound yet, which
- * the binder's gateway reads (as a session's environment and internet).
+ * What a token says: the key it is for; the binding, and its Lease's namespace, for a
+ * binding's; and, for a caller's, the time it stops, in ms, and what its key is bound with
+ * where it is not bound yet, which the binder's gateway reads (as a session's environment and
+ * internet).
  */
 export const TokenClaims = Schema.Struct({
   key: Schema.String,
   binding: Schema.optional(Schema.String),
+  namespace: Schema.optional(Schema.String),
   expires: Schema.optional(Schema.Number),
   options: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 });
@@ -35,6 +38,10 @@ export function mintToken(secret: Buffer, claims: TokenClaims): string {
   const encoded = Buffer.from(JSON.stringify(claims)).toString("base64url");
   return `${encoded}.${signatureOf(secret, encoded).toString("base64url")}`;
 }
+
+/** The token of the binding `binding` of `key`, its Lease in `namespace`: the same text wherever it is minted, as its pod compares it whole. */
+export const bindingToken = (secret: Buffer, { key, binding, namespace }: { readonly key: string; readonly binding: string; readonly namespace: string }): string =>
+  mintToken(secret, { key, binding, namespace });
 
 /** What `token` says, where `secret` signed it and it has not stopped by `now`; else null. */
 export function verifyToken(secret: Buffer, token: string, now: number): TokenClaims | null {
