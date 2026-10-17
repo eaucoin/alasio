@@ -62,7 +62,7 @@ async function bayma(): Promise<{ port: number; status: { execsRunning: number; 
  * Node agents that record what they are asked, in order; a checkpoint does what `checkpoint`
  * says to the pod it saves: ends it saved, fails ending it, or fails leaving it running.
  */
-function agents(checkpoint: "saves" | "fails, ending it" | "fails" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
+function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable" = "saves"): { agents: NodeAgents; attached: (AttachRequest & { node: string })[]; detached: string[]; asked: string[]; saved: CheckpointRequest[] } {
   const attached: (AttachRequest & { node: string })[] = [];
   const detached: string[] = [];
   const asked: string[] = [];
@@ -78,16 +78,23 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" = "saves"): {
     agents: {
       nodes: Effect.succeed(["node-a"]),
       prepare: unused, current: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
-      readFile: unused, writeFile: unused, released: unused, setReleased: unused, stop: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
+      readFile: unused, writeFile: unused, released: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
           asked.push(`checkpoint ${node} ${request.pod}`);
           saved.push(request);
+          if (checkpoint === "unsaveable") return yield* new NodeAgentError({ node, call: "snapshot", status: 410, reason: "its restore from the bucket failed to read some of its pages" });
           if (checkpoint !== "fails") yield* Effect.promise(() => end(request));
           if (checkpoint !== "saves") return yield* new NodeAgentError({ node, call: "snapshot", status: 500, reason: "runsc checkpoint failed" });
           return { snapshot: "s-1" } as unknown as Manifest;
         }),
       attach: (node, request) => Effect.sync(() => void attached.push({ node, ...request })),
+      setReleased: (ref, into) => Effect.sync(() => void asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`)),
+      // Its bayma, told to go on with its stop, ends.
+      stop: (node, request) =>
+        Effect.sync(() => void asked.push(`stop ${node} ${request.pod} ${request.hook.join(" ")}`)).pipe(
+          Effect.andThen(Effect.promise(() => end({ namespace: request.namespace, pod: request.pod, containerId: request.containerId } as CheckpointRequest))),
+        ),
       detach: (node, pod, containerIds) =>
         Effect.sync(() => {
           asked.push(`detach ${node} ${pod}`);
@@ -98,14 +105,16 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" = "saves"): {
 }
 
 /** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback. */
-async function environment(count: number, { gvisor = false } = {}): Promise<SessionsEnvironment & { none: Pool }> {
+async function environment(count: number, { gvisor = false, holdsStop = false } = {}): Promise<SessionsEnvironment & { none: Pool }> {
   const namespace = `sessions-${(namespaces += 1)}`;
   const none: Pool = { name: "sandboxes-none", namespace };
   await run(withKube((kube) =>
     Effect.gen(function*() {
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } });
       // The pool's template, as its snapshots record it.
-      const template = { metadata: { labels: { ...freeLabels(none) } }, spec: { ...BAYMA_SPEC, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
+      // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
+      const spec = holdsStop ? { containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) } : BAYMA_SPEC;
+      const template = { metadata: { labels: { ...freeLabels(none) } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
       for (let n = 0; n < count; n += 1) {
         const name = `none-${n}`;
@@ -243,7 +252,8 @@ test("a bound gVisor pod idle for its wait is saved whole by its node's agent fi
     const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
     stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
     assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]);
-    assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `detach node-a ${bound.pod}`]);
+    // Its release recorded with the workspace, for its next bind, before its workspace is detached.
+    assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into s-1`, `detach node-a ${bound.pod}`]);
     const [saved] = recorded.saved;
     assert.deepEqual([saved?.environment, saved?.workspace, saved?.namespace, saved?.containerId], [env.namespace, "fs-abc123", env.namespace, "c-0"]);
     assert.deepEqual(saved?.hook, ["node", "/opt/bayma/bayma.js", "sandbox-hook", "--state-dir", "/home/agent/.bayma"]);
@@ -272,7 +282,7 @@ test("a release whose save fails leaving the sandbox running keeps the binding, 
         assert.deepEqual(recorded.detached, [], outcome);
       } else {
         assert.equal(lease, null, outcome);
-        assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `detach node-a ${bound.pod}`], outcome);
+        assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-abc123 released into none`, `detach node-a ${bound.pod}`], outcome);
       }
     } finally {
       stand.close();
@@ -418,4 +428,28 @@ test("each attach and detach is timed, and each binding released counted by why:
   assert.deepEqual(detached, { [of]: 1 });
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": key } }, spec: { holderIdentity: "none-0" } };
   assert.deepEqual(await added(RELEASES, () => Effect.runPromise(sessions.lost(env.none, lease))), { [`${of},alasio.gateway.release.reason=lost`]: 1 });
+});
+
+test("a release whose sandbox can be saved no more has its bayma go on with the stop it holds, its node's agent running its hook, and is released into no snapshot", async () => {
+  const env = await environment(1, { gvisor: true, holdsStop: true });
+  const stand = await bayma();
+  const recorded = agents("unsaveable");
+  try {
+    const { binder, sessions } = await sessionsOf({ ...options(env, stand.port), releaseAfterMs: 0 }, recorded.agents);
+    const key = sessionKey("fs-abc123");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+    stand.status = { execsRunning: 0, execsQueued: 0, idleSinceMs: Date.now() - 600_000 };
+    const counted = await added("alasio.sandbox.releases", async () => assert.deepEqual(await Effect.runPromise(sessions.sweep), [key]));
+    assert.deepEqual(counted, { "alasio.sandbox.release.outcome=unsaveable": 1 });
+    assert.deepEqual(recorded.asked, [
+      `checkpoint node-a ${bound.pod}`,
+      `stop node-a ${bound.pod} node /opt/bayma/bayma.js sandbox-hook stop --state-dir /home/agent/.bayma`,
+      `record ${env.namespace}/fs-abc123 released into none`,
+      `detach node-a ${bound.pod}`,
+    ]);
+    assert.equal(await run(readLease(env.none, key)), null);
+  } finally {
+    stand.close();
+  }
 });
