@@ -19,6 +19,10 @@
  * unmounted lazily, as the sandbox's gofer keeps them busy to the last, then the directory is
  * removed, so its pod can be deleted: kubelet deletes no pod whose directory holds a mount.
  *
+ * A workspace is made as its session is (create): its directory, with its files' `workspace/`
+ * and `home/`, its agent's, and its quota set on the directory (./quotas.ts), at once; made
+ * again, it is as it was, its quota set anew. Its quota is read back as it is asked for.
+ *
  * A file read or written is reached by its path from the workspace's root alone, walked one
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
@@ -30,6 +34,7 @@ import { Effect, Schema } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
+import type { Quota, QuotaError, Quotas } from "./quotas.ts";
 import { ATTACH_ROOT, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
@@ -80,6 +85,10 @@ export function mountPoints(mountinfo: string): string[] {
 
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
+  /** Makes `ref`, as the module says, its quota `quotaBytes`. */
+  readonly create: (ref: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, WorkspaceRefused | QuotaError>;
+  /** `ref`'s quota, and what it holds; null where it has none. */
+  readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | QuotaError>;
   /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env` beside them. */
   readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
@@ -109,17 +118,18 @@ const confined = <A>(path: string, io: () => Promise<A>): Effect.Effect<A, Works
     },
   }).pipe(Effect.timeoutOrElse({ duration: FILE_TIMEOUT, orElse: () => Effect.fail(refused(504, `${path} was not reached within ${FILE_TIMEOUT}`)) }));
 
-/** What makeWorkspaces is given: the node's commands (mounts are made in its mount namespace), its runsc, and, but for tests, where its roots are and whose files are. */
+/** What makeWorkspaces is given: the node's commands (mounts are made in its mount namespace), its runsc, the quotas, none where workspace storage has none, and, but for tests, where its roots are and whose files are. */
 export interface WorkspacesOptions {
   readonly host: HostCommands;
   readonly runsc: Pick<Runsc, "container">;
+  readonly quotas: Quotas | null;
   readonly workspacesRoot?: string;
   readonly attachRoot?: string;
   readonly agentUid?: number;
 }
 
 /** The agent's workspaces, as the module says. */
-export function makeWorkspaces({ host, runsc, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+export function makeWorkspaces({ host, runsc, quotas, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -136,7 +146,33 @@ export function makeWorkspaces({ host, runsc, workspacesRoot = WORKSPACES_ROOT, 
       Effect.map(({ stdout }) => mountPoints(stdout).filter((point) => point === directory || point.startsWith(`${directory}/`)).toSorted((a, b) => b.length - a.length)),
     );
 
+  /** The quotas, refused where there are none. */
+  const quotasOr = quotas ? Effect.succeed(quotas) : Effect.fail(refused(501, "this node agent sets no quotas, as workspace storage is not given it"));
+  /** `ref`'s directory, as its quota names it, from the file system's root. */
+  const quotaPath = ({ environment, workspace }: WorkspaceRef): string => `/${environment}/${workspace}`;
+
   return {
+    create: (ref, quotaBytes) =>
+      Effect.gen(function*() {
+        const files = yield* filesOf(ref);
+        if (!Number.isSafeInteger(quotaBytes) || quotaBytes <= 0) return yield* refused(400, `${quotaBytes} is no quota`);
+        const quota = yield* quotasOr;
+        yield* Effect.tryPromise({
+          try: async () => {
+            for (const directory of [join(files, "workspace"), join(files, "home")]) await mkdir(directory, { recursive: true });
+            for (const directory of [files, join(files, "workspace"), join(files, "home")]) await chown(directory, agentUid, agentUid);
+          },
+          catch: (error) => refused(503, `${ref.environment}/${ref.workspace} could not be made: ${error instanceof Error ? error.message : String(error)}`),
+        });
+        yield* quota.set(quotaPath(ref), quotaBytes);
+      }),
+
+    quota: (ref) =>
+      Effect.gen(function*() {
+        yield* filesOf(ref);
+        return yield* (yield* quotasOr).get(quotaPath(ref));
+      }),
+
     attach: (ref, pod, token, env) =>
       Effect.gen(function*() {
         const files = yield* filesOf(ref);

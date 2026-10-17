@@ -45,6 +45,8 @@ export type Prepared = typeof Prepared.Type;
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
+/** What an agent answers a workspace's quota with. */
+const Quota = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 /** What an agent answers a listing of an environment's snapshots, and a discard, with. */
 const Listed = Schema.Struct({ workspaces: Schema.Array(Schema.String) });
 const Discarded = Schema.Struct({ discarded: Schema.Array(Schema.String) });
@@ -96,6 +98,10 @@ export interface NodeAgents {
   readonly detach: (node: string, pod: string, containerIds: readonly string[]) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspace's file at `path`, `workspace/...` or `home/...`, of `maxBytes` at most, as any agent reads it. */
   readonly readFile: (workspace: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Uint8Array, NodeAgentError | KubeApiError>;
+  /** Makes the workspace, its directory and its quota of `quotaBytes`, through any agent, each sees workspace storage as another; again, sets its quota anew. */
+  readonly createWorkspace: (workspace: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The workspace's quota, and what it holds, through any agent; null where it has none. */
+  readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
   /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
   readonly writeFile: (workspace: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, NodeAgentError | KubeApiError>;
 }
@@ -220,6 +226,19 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
       Effect.flatMap(anyNode, (node) => send(node, `read ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "GET", path: `${filePath(workspace, path)}&max=${maxBytes}`, timeout: SHORT_CALL })).pipe(
         Effect.map(({ bytes }) => bytes),
       ),
+    createWorkspace: (workspace, quotaBytes) =>
+      Effect.flatMap(anyNode, (node) => send(node, `make ${workspace.environment}/${workspace.workspace}`, { method: "POST", path: "/workspaces", body: { ...workspace, quotaBytes }, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    quota: (workspace) =>
+      Effect.gen(function*() {
+        const node = yield* anyNode;
+        const what = `read ${workspace.environment}/${workspace.workspace}'s quota`;
+        const path = `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}/quota`;
+        const { status, text } = yield* send(node, what, { method: "GET", path, timeout: SHORT_CALL, absent: true });
+        if (status === 404) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Quota))(text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        );
+      }),
     writeFile: (workspace, path, bytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `write ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "PUT", path: filePath(workspace, path), bytes, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),

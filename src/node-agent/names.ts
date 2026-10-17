@@ -97,6 +97,9 @@ export const NODE_AGENT_MEMORY_FLOOR = NODE_AGENT_OWN_BYTES + UNSYNCED_DOWNLOAD_
 /** The variable holding the token alasio presents to a node agent. */
 export const NODE_AGENT_TOKEN_VARIABLE = "ALASIO_NODE_AGENT_TOKEN";
 
+/** The variable holding workspace storage's metadata engine's address, its password in it, which the agent sets workspaces' quotas on alone. */
+export const META_URL_VARIABLE = "META_URL";
+
 /** The variable holding the most bytes the node's snapshot cache keeps. */
 export const SNAPSHOT_CACHE_BYTES_VARIABLE = "ALASIO_SNAPSHOT_CACHE_BYTES";
 

@@ -42,6 +42,10 @@
  * - `GET /holdings`: `{ node, releases: [{ release, cpuFeatures }], cached: [{ environment,
  *   workspace, snapshot, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
  *   features each sees on it, and the snapshots in its cache.
+ * - `POST /workspaces`, `{ environment, workspace, quotaBytes }`: makes the workspace, its
+ *   directory and its quota (./workspaces.ts) (204); again, sets its quota anew.
+ * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
+ *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
  *   files into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
  *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
@@ -81,10 +85,12 @@ import {
 } from "./agent.ts";
 import { type CacheError, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
+import { makeQuotas } from "./quotas.ts";
 import { makeWorkspaces, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
 import {
   CONTAINERD,
   GVISOR_RELEASES,
+  META_URL_VARIABLE,
   NODE_AGENT_PORT,
   NODE_AGENT_TOKEN_VARIABLE,
   RUNSC_ROOT,
@@ -107,6 +113,9 @@ export interface NodeAgentServerOptions {
 /** The most a file written into a workspace may be: a received file's, Telegram's largest a bot gets, with room. */
 export const MAX_WRITE_BYTES = 64 * 1024 ** 2;
 
+/** What `POST /workspaces` is given. */
+const CreateRequest = Schema.Struct({ ...WorkspaceRef.fields, quotaBytes: Schema.Number });
+
 /** What `POST /attach` is given. */
 const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String) });
 /** What `POST /detach` is given. */
@@ -120,6 +129,7 @@ const STATUS: Readonly<Record<string, number>> = {
   SnapshotCorrupt: 422,
   S3Error: 502,
   PoliciesNotInForce: 504,
+  QuotaError: 503,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
@@ -128,6 +138,7 @@ const PREPARE = /^\/prepare\/([^/]+)\/([^/]+)$/u;
 const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
 const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
+const QUOTA = /^\/workspaces\/([^/]+)\/([^/]+)\/quota$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -226,6 +237,16 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
         Effect.map((discarded) => answer(200, { discarded })),
       );
     }
+    if (method === "POST" && url === "/workspaces") {
+      return body(CreateRequest).pipe(Effect.flatMap(({ quotaBytes, ...ref }) => workspaces.create(ref, quotaBytes)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    const quota = QUOTA.exec(url);
+    if (method === "GET" && quota) {
+      return workspaceOf(quota).pipe(
+        Effect.flatMap(workspaces.quota),
+        Effect.map((held) => (held === null ? answer(404, { error: "the workspace has no quota" }) : answer(200, held))),
+      );
+    }
     if (method === "POST" && url === "/attach") {
       return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, ...ref }) => workspaces.attach(ref, pod, binding, env)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
@@ -308,7 +329,10 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     bucket: makeS3Bucket({ ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }),
     host,
   });
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc }) });
+  // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
+  const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
+  const quotas = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeQuotas({ metaUrl: Redacted.value(url) }) });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc, quotas }) });
   yield* Effect.logInfo(`the node agent of ${node} serves on port ${served.port}, its cache within ${budget} bytes`);
 }).pipe(
   Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),
