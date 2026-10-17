@@ -92,7 +92,7 @@ export function makeJuicefs({ metaUrl, juicefs = JUICEFS }: JuicefsOptions): Jui
     Effect.tryPromise({
       try: (signal) =>
         new Promise<string>((resolve, reject) => {
-          execFile(juicefs, args, { env: { META_PASSWORD: password, PATH: "/usr/bin:/bin" }, signal, timeout: COMMAND_TIMEOUT_MS }, (error, stdout, stderr) =>
+          execFile(juicefs, args, { env: { META_PASSWORD: password, PATH: "/usr/bin:/bin", HOME: "/tmp" }, signal, timeout: COMMAND_TIMEOUT_MS }, (error, stdout, stderr) =>
             error ? reject(new Error(stderr.trim().split("\n").at(-1) || error.message)) : resolve(stdout));
         }),
       catch: (cause) => new JuicefsError({ reason: `juicefs ${what} failed: ${cause instanceof Error ? cause.message : String(cause)}` }),

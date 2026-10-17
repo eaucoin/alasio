@@ -9,6 +9,16 @@
 # behave as they do on an ordinary Ubuntu host. Published as ghcr.io/eaucoin/alasio by
 # .github/workflows/release.yml.
 FROM juicedata/mount:ce-v1.4.1@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673 AS juicefs
+# Its juicefs loads FoundationDB's, Ceph's and Gluster's client libraries, as that image
+# installs them: it is taken with every library it loads, and the loader it was linked for,
+# under /opt/juicefs, and run by that loader on those alone, as it runs there.
+RUN mkdir -p /opt/juicefs/lib /opt/juicefs/bin \
+ && cp /usr/local/bin/juicefs /opt/juicefs/juicefs \
+ && ldd /usr/local/bin/juicefs | awk '$3 ~ /^\// { print $3 }' | xargs -I '{}' cp -L '{}' /opt/juicefs/lib/ \
+ && cp -L "$(ldd /usr/local/bin/juicefs | awk '$1 ~ /^\// { print $1 }')" /opt/juicefs/ld.so \
+ && printf '#!/bin/sh\nexec /opt/juicefs/ld.so --library-path /opt/juicefs/lib /opt/juicefs/juicefs "$@"\n' > /opt/juicefs/bin/juicefs \
+ && chmod 755 /opt/juicefs/bin/juicefs \
+ && /opt/juicefs/bin/juicefs version
 
 FROM ubuntu:24.04@sha256:a853f94d226358a79c740cfc7bce0c289748f3fe3488d921d038ccd752c61b60
 LABEL org.opencontainers.image.source=https://github.com/eaucoin/alasio \
@@ -35,8 +45,8 @@ RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-
  && rm /tmp/node.tar.xz \
  && node --version
 
-COPY --from=juicefs /usr/local/bin/juicefs /usr/local/bin/juicefs
-RUN juicefs version
+COPY --from=juicefs /opt/juicefs /opt/juicefs
+RUN ln -s /opt/juicefs/bin/juicefs /usr/local/bin/juicefs && juicefs version
 
 WORKDIR /opt/alasio
 COPY package.json package-lock.json ./
