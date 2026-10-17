@@ -93,8 +93,11 @@ export const makeSessions = Effect.fnUntraced(function*(
       if (!environment) return yield* new PlacementRefused({ reason: `there is no environment ${options["environment"] ?? "named"} of sessions` });
       const mode = options["mode"];
       if (mode !== "none" && mode !== "full") return yield* new PlacementRefused({ reason: `a session's internet is none or full, not ${mode ?? "unsaid"}` });
+      const pool = { name: poolNames[mode], namespace: environment.namespace };
       return {
-        pool: { name: poolNames[mode], namespace: environment.namespace },
+        pool,
+        // Released as it is when idle: saved whole first, then detached, then deleted.
+        release: ({ pod }) => endAndDetach(pool, volumeId, pod),
         // Its workspace attached, its binding's token beside it, on which its bayma starts.
         prepare: (pod, binding) =>
           Effect.gen(function*() {

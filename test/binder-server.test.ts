@@ -11,7 +11,7 @@ import { Effect, Exit, Layer, Scope } from "effect";
 import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, NO_BIND_HEADER, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, NO_BIND_HEADER, type Placement, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -62,13 +62,13 @@ async function pods(): Promise<{ port: number; sent: IncomingHttpHeaders[]; clos
 async function front(
   of: Pool,
   podPort: number,
-  { waitMs = 5_000, peers = [] as string[], placed = [] as Readonly<Record<string, string>>[] } = {},
+  { waitMs = 5_000, peers = [] as string[], placed = [] as Readonly<Record<string, string>>[], release = undefined as Placement["release"] } = {},
 ): Promise<BinderServer & { close: () => Promise<void> }> {
   const scope = await Effect.runPromise(Scope.make());
   const layer = Layer.provideMerge(Binder.layer({ waitMs }), Layer.fresh(KubeClient.layer));
   const served = await Effect.runPromise(
     serveBinder({ port: 0, host: "127.0.0.1", callerKey, bindingKey, podPort, poolOf: (_key, options) =>
-      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of })), peers: () => Effect.succeed(peers) }).pipe(
+      options["environment"] === "nowhere" ? Effect.fail(new PlacementRefused({ reason: "there is no environment nowhere" })) : Effect.sync(() => (placed.push(options), { pool: of, release })), peers: () => Effect.succeed(peers) }).pipe(
       Effect.provide(layer),
       Scope.provide(scope),
     ),
@@ -129,6 +129,35 @@ test("a no-bind request for an unbound key takes no Lease and claims no pod; one
     assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
     assert.equal((await ask("GET", "/status")).status, 200);
     assert.deepEqual(stand.sent.map((headers) => headers[NO_BIND_HEADER]), [undefined, undefined]);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a caller's release runs what its placement says comes before, then lets its binding go; one whose step fails keeps it; one of no binding is nothing", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const before: string[] = [];
+  let failing = true;
+  const served = await front(of, stand.port, {
+    release: ({ pod }) => Effect.suspend(() => (before.push(pod), failing ? Effect.fail({ message: "its sandbox was not saved, and runs on" }) : Effect.void)),
+  });
+  try {
+    const key = "sessionfs:released";
+    const call = (path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method: "POST", headers: { authorization: caller(key) } });
+    assert.equal((await call("/release")).status, 204);
+    assert.deepEqual(before, []);
+    assert.equal((await call("/bind")).status, 204);
+    const bound = await run(readLease(of, key));
+    const failed = await call("/release");
+    assert.deepEqual([failed.status, failed.headers.get("retry-after")], [503, "1"]);
+    assert.equal((await run(readLease(of, key)))?.metadata?.uid, bound?.metadata?.uid);
+    failing = false;
+    assert.equal((await call("/release")).status, 204);
+    assert.deepEqual(before, [bound?.spec?.holderIdentity, bound?.spec?.holderIdentity]);
+    assert.equal(await run(readLease(of, key)), null);
   } finally {
     await served.close();
     stand.close();
