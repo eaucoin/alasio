@@ -13,6 +13,7 @@ import { describe, test } from "node:test";
 import type {
   KubernetesObject,
   V1ClusterRole,
+  V1ClusterRoleBinding,
   V1ConfigMap,
   V1Container,
   V1CronJob,
@@ -1363,19 +1364,29 @@ describe("telemetry", () => {
 
   test("builds into its collector image every component and provider its gateway's and its scraper's configurations name", () => {
     const builder = readFileSync(new URL("../../neon/collector/builder.yaml", import.meta.url), "utf8");
-    const built = new Set([...builder.matchAll(/^ {2}- gomod: (\S+) v\S+$/gmu)].map(([, path]) => path?.split("/").at(-1)));
+    // Each module's component, its last segment, of the kind its path names, as receiver/receivercreator's receivercreatorreceiver.
+    const built = new Set([...builder.matchAll(/^ {2}- gomod: (\S+) v\S+$/gmu)].map(([, path = ""]) => {
+      const segments = path.split("/");
+      const name = segments.at(-1) ?? "";
+      const kind = segments.find((segment) => ["receiver", "processor", "exporter", "extension", "provider"].includes(segment)) ?? "";
+      return name.endsWith(kind) ? name : `${name}${kind}`;
+    }));
     const named = new Set<string>();
     for (const external of [{ otlpEndpoint: "https://otlp.example.com", otlpProtocol: "grpc", headersSecret: "headers" }, { otlpEndpoint: "https://otlp.example.com" }]) {
       const objects = install({ telemetry: external });
       for (const config of [collectorConfig(objects), scraperConfig(objects)]) {
         for (const kind of ["receivers", "processors", "exporters", "extensions"] as const) {
           for (const id of Object.keys(config[kind] ?? {})) named.add(`${id.split("/")[0]?.replaceAll("_", "")}${kind.slice(0, -1)}`);
+          // The receivers a receiver creator makes, as it finds what they read.
+          for (const created of Object.values<{ receivers?: object }>(config[kind] ?? {})) {
+            if (kind === "receivers") for (const id of Object.keys(created.receivers ?? {})) named.add(`${id.split("/")[0]}receiver`);
+          }
         }
         // The providers of the variables it reads, as ${env:...} and ${file:...}.
         for (const [, scheme] of JSON.stringify(config).matchAll(/\$\{(\w+):/gu)) named.add(`${scheme}provider`);
       }
     }
-    assert.ok(named.has("kafkaexporter") && named.has("redisreceiver") && named.has("fileprovider"), [...named].join(", "));
+    assert.ok(named.has("kafkaexporter") && named.has("redisreceiver") && named.has("kubeletstatsreceiver") && named.has("fileprovider"), [...named].join(", "));
     assert.deepEqual([...named].filter((component) => !built.has(component)), []);
   });
 
@@ -1414,7 +1425,10 @@ describe("telemetry", () => {
     // Its scraper sends what it scrapes to it, a minute's at a time, as the stack's.
     const scraper = scraperConfig(objects);
     assert.deepEqual(scraper.exporters, { "otlphttp/gateway": { endpoint: "http://alasio-collector:4318" } });
-    assert.deepEqual(scraper.service.pipelines, { metrics: { receivers: ["prometheus", "redis", "redis/filer-store"], processors: ["resource/stack", "batch"], exporters: ["otlphttp/gateway"] } });
+    assert.deepEqual(scraper.service.pipelines, {
+      "metrics/nodes": { receivers: ["receiver_creator/nodes"], processors: ["batch"], exporters: ["otlphttp/gateway"] },
+      metrics: { receivers: ["prometheus", "redis", "redis/filer-store"], processors: ["resource/stack", "batch"], exporters: ["otlphttp/gateway"] },
+    });
     assert.deepEqual(scraper.processors.batch, { send_batch_size: 10_000, send_batch_max_size: 10_000, timeout: "60s" });
     assert.equal(scraper.receivers.otlp, undefined);
     assert.equal(all(objects, "Service").find(({ metadata }) => metadata?.name === "alasio-collector-scraper"), undefined);
@@ -1440,6 +1454,30 @@ describe("telemetry", () => {
     const single = install();
     assert.equal(one<V1Deployment>(single, "Deployment", "alasio-collector").spec?.replicas, 1);
     assert.deepEqual(all(single, "ScaledObject").filter(({ metadata }) => metadata?.name === "alasio-collector"), []);
+  });
+
+  test("reads each node's filesystem from its kubelet, as a node the cluster lists, with its scraper's ServiceAccount, which may read nodes and their stats alone", () => {
+    const objects = install();
+    const config = scraperConfig(objects);
+    assert.deepEqual(config.extensions.k8s_observer, { auth_type: "serviceAccount", observe_nodes: true, observe_pods: false });
+    assert.deepEqual(config.service.extensions, ["health_check", "k8s_observer"]);
+    assert.deepEqual(config.receivers["receiver_creator/nodes"], {
+      watch_observers: ["k8s_observer"],
+      receivers: {
+        kubeletstats: {
+          rule: 'type == "k8s.node"',
+          config: { auth_type: "serviceAccount", endpoint: "`endpoint`:`kubelet_endpoint_port`", insecure_skip_verify: true, collection_interval: "60s", metric_groups: ["node"] },
+        },
+      },
+    });
+    assert.equal(one<V1Deployment>(objects, "Deployment", "alasio-collector-scraper").spec?.template.spec?.serviceAccountName, "alasio-collector-scraper");
+    assert.deepEqual(one<V1ClusterRole>(objects, "ClusterRole", "alasio-collector-scraper").rules, [
+      { apiGroups: [""], resources: ["nodes"], verbs: ["get", "list", "watch"] },
+      { apiGroups: [""], resources: ["nodes/stats"], verbs: ["get"] },
+    ]);
+    assert.deepEqual(one<V1ClusterRoleBinding>(objects, "ClusterRoleBinding", "alasio-collector-scraper").subjects, [{ kind: "ServiceAccount", name: "alasio-collector-scraper", namespace: "alasio" }]);
+    // The gateway reads none.
+    assert.equal(collectorConfig(objects).receivers["receiver_creator/nodes"], undefined);
   });
 
   test("sends it all to telemetry.otlpEndpoint too when one is set, in its protocol, the headers going there alone", () => {
