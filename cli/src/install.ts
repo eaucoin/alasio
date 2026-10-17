@@ -10,6 +10,7 @@
 import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
+import { type ApiServer, readApiServer } from "./api-server.ts";
 import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
@@ -21,6 +22,7 @@ import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRef
 import type { WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.ts";
+import { sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -70,12 +72,21 @@ export const installConfig = Effect.fnUntraced(function*(config: OperatorConfig)
   return install.success;
 });
 
-/** What an installation came to: its bot, whether Claude Code has a token, and, where sessions are snapshotted, their CPU baseline. */
+/**
+ * What an installation came to: its bot, whether Claude Code has a token, where sessions are
+ * snapshotted their CPU baseline, and whether what is to reach the API server alone reaches
+ * any address, as where the API server is could not be read.
+ */
 export interface Installed {
   readonly bot: TelegramBot;
   readonly claude: boolean;
   readonly cpuBaseline: BaselineDecision | null;
+  readonly apiServerUnconfined: boolean;
 }
+
+/** Whether the installation `settings` confines what reaches its API server to it, by NetworkPolicies, but could not, as `apiServer` was not read. */
+export const apiServerUnconfined = (settings: InstallConfig, apiServer: ApiServer | null): boolean =>
+  apiServer === null && settings.networkPolicies.enabled && sandboxServiceRuns(settings);
 
 /**
  * The cluster has an object of the installation that cannot take this release's of it, as
@@ -124,6 +135,8 @@ interface Checked {
   readonly gvisorReleases: readonly string[];
   /** The checksum of the bot's Secret alasio's pod carries (../secrets.ts botChecksum), null where the Secret has no key for it yet. */
   readonly checksum: string | null;
+  /** Where the cluster's API server is, null where it cannot be read (./api-server.ts). */
+  readonly apiServer: ApiServer | null;
 }
 
 /**
@@ -150,13 +163,14 @@ export const checkInstallation = Effect.fnUntraced(function*(
   // None where the bot's Secret has no key for it yet, as up gives it one before it checks (ensureBotChecksumKey).
   const key = yield* readBotChecksumKey;
   const checksum = key === null ? null : botChecksum(bot, key);
-  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum }));
+  const apiServer = yield* readApiServer;
+  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer }));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings);
   yield* checkApplicable(objects);
-  return { bot, settings, objects, live, recorded, gvisorReleases, checksum };
+  return { bot, settings, objects, live, recorded, gvisorReleases, checksum, apiServer };
 });
 
 /**
@@ -174,16 +188,16 @@ export const install = Effect.fnUntraced(function*(
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, live, recorded, gvisorReleases, checksum } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, recorded, gvisorReleases, checksum, apiServer } = yield* checkInstallation(config);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);
-  const installed = { bot, claude: settings.alasio.claude.existingSecret !== "" };
+  const installed = { bot, claude: settings.alasio.claude.existingSecret !== "", apiServerUnconfined: apiServerUnconfined(settings, apiServer) };
   if (!nodeAgentRuns(settings)) return { ...installed, cpuBaseline: null };
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {
-    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum })), options);
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer })), options);
   }
   return { ...installed, cpuBaseline: decision };
 });

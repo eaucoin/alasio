@@ -20,6 +20,7 @@ import { scramVerifier } from "../../neon/control/scram.ts";
 import { forkToken } from "../../src/branch/names.ts";
 import type { TenantView } from "../src/branches.ts";
 import { CODEX_LOGIN } from "../src/commands/login.ts";
+import { API_SERVER_UNCONFINED } from "../src/commands/up.ts";
 import { SYSCTL_FILE } from "../src/cluster/machine.ts";
 import { currentGvisorRelease, downloads } from "../src/cluster/node.ts";
 import { ROUTES_SECRET, TLS_SECRET, WEBHOOK, WEBHOOK_HEALTH_PORT } from "../src/manifests/webhook.ts";
@@ -377,9 +378,25 @@ test("init without what it needs, and nothing to ask, says how to give it; a tok
   assert.equal(kube.get("/api/v1/namespaces/alasio/secrets/alasio-telegram"), undefined);
 });
 
+/** The `kubernetes` Service's EndpointSlice, as a cluster's API server's: where it is, as up reads it (cli/src/api-server.ts). */
+const API_SERVER_SLICE = {
+  apiVersion: "discovery.k8s.io/v1",
+  kind: "EndpointSlice",
+  metadata: { name: "kubernetes", namespace: "default", labels: { "kubernetes.io/service-name": "kubernetes" } },
+  addressType: "IPv4",
+  endpoints: [{ addresses: ["172.18.0.2"] }],
+  ports: [{ name: "https", port: 6443, protocol: "TCP" }],
+};
+const API_SERVER_SLICE_PATH = "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/kubernetes";
+
+/** The egress rules of the sandbox service's receiver's NetworkPolicy, as applied. */
+const receiverEgress = (kube: FakeKube): unknown[] =>
+  (kube.get("/apis/networking.k8s.io/v1/namespaces/alasio/networkpolicies/alasio-receiver")?.spec as { egress?: unknown[] } | undefined)?.egress ?? [];
+
 test("up applies alasio, waits until it runs, and says what to do next", async (t) => {
   const setup = await rig(t);
   await initialize(setup);
+  setup.kube.put("endpointslices", API_SERVER_SLICE);
   const run = await setup.alasio(["up"]);
   succeeded(run);
   assert.deepEqual(run.printed, [
@@ -407,11 +424,21 @@ test("up applies alasio, waits until it runs, and says what to do next", async (
   });
   assert.ok(run.progress.includes(`Telegram delivers @${BOT}'s updates to the webhook intake, for main`));
 
+  // What reaches the API server alone reaches it where its Service's slices say.
+  assert.deepEqual(receiverEgress(setup.kube).at(-1), { to: [{ ipBlock: { cidr: "172.18.0.2/32" } }], ports: [{ protocol: "TCP", port: 6443 }] });
+
   // Run again, it keeps the route, and registers the bot again.
   setup.telegram.webhooks.clear();
   succeeded(await setup.alasio(["up"]));
   assert.equal(secretValue(setup.kube, ROUTES_SECRET, "main"), JSON.stringify(route));
   assert.equal(setup.telegram.webhooks.get(BOT_TOKEN)?.url, `https://${PUBLIC_ADDRESS}${route.path}`);
+
+  // Where it cannot read them, up confines nothing to the API server, and says so.
+  setup.kube.objects.delete(API_SERVER_SLICE_PATH);
+  const unread = await setup.alasio(["up"]);
+  succeeded(unread);
+  assert.ok(unread.printed[0]?.split("\n").includes(API_SERVER_UNCONFINED));
+  assert.deepEqual(receiverEgress(setup.kube).at(-1), {});
 });
 
 test("up replaces alasio's pod when the users its bot allows change, which alasio reads as it starts, and not when they stay", async (t) => {
