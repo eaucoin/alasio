@@ -28,7 +28,7 @@ import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
 import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
-import { kube, nodeAgents, ref, SESSIONS, tcp } from "./harness.ts";
+import { kube, nodeAgents, onNode, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
 
 /** What a node agent answers `method path` with, `body` as JSON: its status, and what it said. */
@@ -73,6 +73,29 @@ async function bindThrough(token: string, workspace: string, what: string, timeo
     last = await gatewayCall(token, "POST", "/bind");
     return last.status === 204 ? true : undefined;
   }, timeoutMs, async () => `; it last answered ${last.status} ${last.said}\n${await serviceLogs(workspace)}`);
+}
+
+/**
+ * What `node` holds of each restore's pod's directory as a restore goes, each look that differs
+ * from the one before: its entries, its workspace's, the node's mounts of it and of kubelet's
+ * subpaths, and where bayma's /attach comes from, as its runtime has it; until stopped.
+ */
+function watchRestore(node: string): { readonly stop: () => void; readonly said: () => string[] } {
+  const said: string[] = [];
+  let stopped = false;
+  const look = [
+    "for d in /var/lib/alasio/attach/sandboxes-none-restore-*; do [ -d \"$d\" ] || continue; echo \"== $d\"; ls -la \"$d\" \"$d/ws\" 2>&1 | head -12; done",
+    "grep -E 'alasio/attach/sandboxes-none-restore|volume-subpaths/attach' /proc/1/mountinfo | head -12",
+    "for c in $(k3s crictl ps -a --name bayma -q 2>/dev/null | head -3); do k3s crictl inspect \"$c\" 2>/dev/null | grep -B1 -A2 '\"containerPath\": \"/attach\"' | head -8; done",
+  ].join("; ");
+  void (async () => {
+    while (!stopped) {
+      const now = await onNode(node, look).catch((error: unknown) => String(error));
+      if (now.includes("== ") && now !== said.at(-1)) said.push(now);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  })();
+  return { stop: () => void (stopped = true), said: () => said.slice(-6) };
 }
 
 /** The pod of main's sessions bound to `workspace`, once it is: its name and node. */
@@ -307,9 +330,10 @@ export function sandboxService(): void {
       assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
       await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS))) === null ? true : undefined), 180_000);
       // Bound again: restored, by a pod of its own, its processes running on from where they were, their files held.
-      await bindThrough(token, workspace, "the gateway binding the workspace again", 300_000);
+      const seen = watchRestore(first.node);
+      await bindThrough(token, workspace, "the gateway binding the workspace again", 300_000).finally(seen.stop);
       const restored = await boundPod(workspace);
-      assert.match(restored.name, /^sandboxes-none-restore-/u, await serviceLogs(workspace));
+      assert.match(restored.name, /^sandboxes-none-restore-/u, `${await serviceLogs(workspace)}\nas its node held its restore's directory:\n${seen.said().join("\n---\n")}`);
       await new Promise((resolve) => setTimeout(resolve, 2_000));
       const held = await inSandbox(restored.name, [
         "cd /workspace/held",
