@@ -1,6 +1,6 @@
 /**
- * Workspace storage as JuiceFS's own command, of the agent's image, works on it: copied from
- * the very mount image the nodes mount workspace storage with (../../Dockerfile).
+ * Workspace storage as JuiceFS's own command, of the agent's image, works on it: its own
+ * release's static build, of the version the nodes mount workspace storage with (../../Dockerfile).
  *
  * - A workspace's directory's quota, set, read and deleted on the metadata engine alone
  *   (`juicefs quota`), as the agent's Valkey user there, which runs no command Valkey calls
