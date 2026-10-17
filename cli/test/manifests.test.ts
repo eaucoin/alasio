@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 import type {
   KubernetesObject,
@@ -153,8 +154,8 @@ function runScript(workload: { readonly command?: string[] | undefined }, env: R
   const bin = join(root, "bin");
   mkdirSync(bin);
   for (const [name, body] of Object.entries(commands)) writeFileSync(join(bin, name), `#!/bin/sh\n${body}`, { mode: 0o755 });
-  const run = (): string =>
-    execFileSync("/bin/sh", ["-c", text ?? ""], { env: { ...env, ROOT: root, PATH: `${bin}:${process.env["PATH"]}` }, encoding: "utf8" });
+  const run = (more: Readonly<Record<string, string>> = {}): string =>
+    execFileSync("/bin/sh", ["-c", text ?? ""], { env: { ...env, ...more, ROOT: root, PATH: `${bin}:${process.env["PATH"]}` }, encoding: "utf8" });
   return { root, run, remove: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -676,17 +677,23 @@ describe("neon", () => {
     const env = Object.fromEntries((upload.env ?? []).flatMap(({ name, value }) => (value === undefined ? [] : [[name, value]])));
     assert.equal(env["WORKSPACES_BUCKET"], "workspaces");
     assert.equal(env["WORKSPACES_NAME"], "workspaces");
-    // The object store, a directory of buckets, as aws s3 lists, copies to and deletes from it; the dump's volume under ROOT.
+    // The object store, a directory of buckets, as aws s3 lists, reads, writes and deletes from it; the dump's volume under ROOT.
+    // Its own copy, from a bucket to a bucket, the backup never asks for (CopyObject: SeaweedFS failed one, run after run);
+    // and a write it corrupts, where CORRUPT says, as one the store kept wrong.
     const aws = [
       "shift 3; verb=$1; shift",
-      'at() { printf "%s/%s" "$ROOT/store" "${1#s3://}"; }',
+      'at() { case $1 in s3://*) printf "%s/%s" "$ROOT/store" "${1#s3://}" ;; *) printf "%s" "$1" ;; esac; }',
       "case $verb in",
       '  ls) [ -d "$(at "$1")" ] || exit 1; for f in "$(at "$1")"*; do [ -e "$f" ] && echo "2026-10-05 03:17:00 1 ${f##*/}"; done; true ;;',
-      '  cp) from=$1; case $from in s3://*) from=$(at "$from") ;; *) from=$ROOT$from ;; esac; mkdir -p "$(dirname "$(at "$2")")"; cp "$from" "$(at "$2")" ;;',
+      '  cp) case "$1$2" in s3://*s3://*) echo "the object store\'s own copy" >&2; exit 1 ;; esac',
+      '      mkdir -p "$(dirname "$(at "$2")")"; cp "$(at "$1")" "$(at "$2")"',
+      '      case $2 in s3://*) [ -n "${CORRUPT:-}" ] && printf x >> "$(at "$2")" ;; esac; true ;;',
       '  rm) rm "$(at "$1")" ;;',
       "esac",
     ].join("\n");
-    const { root, run, remove } = runScript(upload, env, { aws });
+    const { root, run: runIn, remove } = runScript(upload, env, { aws });
+    // Its dumps' volume, the test's own.
+    const run = (more: Readonly<Record<string, string>> = {}) => runIn({ BACKUP_DIR: join(root, "backup"), ...more });
     try {
       const store = join(root, "store");
       const backups = () => readdirSync(join(store, "backups")).sort();
@@ -702,12 +709,17 @@ describe("neon", () => {
 
       const meta = join(store, "workspaces", "workspaces", "meta");
       mkdirSync(meta, { recursive: true });
-      writeFileSync(join(meta, "dump-2026-10-04-021000.json.gz"), "older");
-      writeFileSync(join(meta, "dump-2026-10-05-021000.json.gz"), "newest");
+      writeFileSync(join(meta, "dump-2026-10-04-021000.json.gz"), gzipSync("older"));
+      writeFileSync(join(meta, "dump-2026-10-05-021000.json.gz"), gzipSync("newest"));
+      // Copied by its bytes, read and written as any object is, not by the store's own copy.
       run();
       assert.deepEqual(backups().filter((name) => name.startsWith("workspaces-")), ["workspaces-dump-2026-10-04-021000.json.gz", "workspaces-dump-2026-10-05-021000.json.gz"]);
-      assert.equal(readFileSync(join(store, "backups", "workspaces-dump-2026-10-05-021000.json.gz"), "utf8"), "newest");
+      assert.equal(gunzipSync(readFileSync(join(store, "backups", "workspaces-dump-2026-10-05-021000.json.gz"))).toString(), "newest");
       assert.equal(backups().filter((name) => name.startsWith("alasio-")).length, 2);
+      // A copy the store keeps wrong fails the backup, saying so; as does a dump that is no whole gzip.
+      assert.throws(() => run({ CORRUPT: "1" }), /the copy of dump-2026-10-05-021000\.json\.gz in backups is not the dump read/u);
+      writeFileSync(join(meta, "dump-2026-10-06-021000.json.gz"), gzipSync("cut short").subarray(0, 12));
+      assert.throws(() => run(), /dump-2026-10-06-021000\.json\.gz is no whole gzip/u);
     } finally {
       remove();
     }
