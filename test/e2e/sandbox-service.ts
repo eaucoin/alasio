@@ -126,6 +126,19 @@ export async function bindInBranch(branch: string): Promise<{ readonly namespace
   return { namespace: bound.metadata.namespace ?? "" };
 }
 
+/** What the gateway and the node agents logged of `workspace`, for a failure to say. */
+async function serviceLogs(workspace: string): Promise<string> {
+  const pods = [
+    ...(await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("sandbox-gateway")) })).map((pod) => [pod, "sandbox-gateway"] as const),
+    ...(await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("node-agent")) })).map((pod) => [pod, "node-agent"] as const),
+  ];
+  const said = await Promise.all(pods.map(async ([pod, container]) => {
+    const logged = await kube.logs(NAMESPACE, pod.metadata?.name ?? "", container).catch((error: unknown) => String(error));
+    return `${pod.metadata?.name}:\n${logged.split("\n").filter((line) => line.includes(workspace)).slice(-20).join("\n")}`;
+  }));
+  return said.join("\n");
+}
+
 /** Makes the workspace `workspace` of the sessions' namespace through a node agent, of `quotaBytes`. */
 async function createWorkspace(workspace: string, quotaBytes: number): Promise<void> {
   const made = await agentCall("POST", "/workspaces", { environment: SESSIONS, workspace, quotaBytes });
@@ -251,7 +264,7 @@ export function sandboxService(): void {
       assert.deepEqual([reply.status, reply.said], [200, "a chart, drawn"]);
       // Released as its caller asks: its pod gone, and its binding, its workspace kept.
       const released = await gatewayCall(token, "POST", "/release");
-      assert.equal(released.status, 204, released.said);
+      assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
       await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", claimed.name, SESSIONS))) === null ? true : undefined), 180_000);
       assert.deepEqual(await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` }), []);
       assert.equal((await gatewayCall(token, "GET", "/workspace/quota")).status, 200);
