@@ -49,7 +49,8 @@ function retryDelayMs(item: OutboxEntry, error: TelegramError): number {
  * What alasio sends to Telegram, kept in the store until Telegram accepts it, so nothing
  * is lost to a failure or a restart: replies, and turns' status messages and their
  * edits. Delivery runs while the service does: every few seconds and whenever something
- * is queued, one pass at a time, each chat's in the order it was queued.
+ * is queued, one pass at a time, each chat's in the order it was queued, by one alasio at
+ * a time of all those on the store.
  */
 export class Outbox extends Context.Service<Outbox, {
   /** Queues a reply and wakes delivery; its delivery joins the trace it is queued in. The reply's id. */
@@ -124,19 +125,29 @@ export class Outbox extends Context.Service<Outbox, {
     // Telegram has taken any call of it (./client.ts): so a pass cut short, as alasio stops,
     // never leaves an entry sent, or a part of one, and not marked so, to be sent again
     // after the restart. Each call of it is bounded by its timeout.
+    //
+    // A chat's entry is delivered under the chat's delivery lock, which every alasio on the
+    // store takes for it, and read again once it is held: another's pass may have delivered
+    // it as this one waited. One pass at a time here, besides: a pass waiting on a lock
+    // holds a connection of the pool, so passes waiting at once could take all the pool's,
+    // and leave the lock's holder none to mark what it delivered.
     const deliverDue = passes.withPermit(Effect.gen(function*() {
       for (;;) {
         const due = yield* store.getDueOutbox(20);
         if (due.length === 0) return;
-        for (const item of due) {
-          const delivered = yield* deliver(item).pipe(
-            withAlasioSpan("alasio.delivery", {
-              parent: item.traceparent,
-              attributes: { "alasio.outbox.id": item.id, "alasio.outbox.kind": item.kind, "alasio.delivery.attempt": item.attempts + 1, "telegram.chat.id": item.chat_id },
-            }),
-            Effect.match({ onFailure: () => false, onSuccess: () => true }),
-            Effect.uninterruptible,
-          );
+        for (const { chat_id: chat } of due) {
+          const delivered = yield* store.withChatLock("delivery", chat, Effect.gen(function*() {
+            const item = yield* store.getDueOutboxOf(chat);
+            if (item === null) return true;
+            return yield* deliver(item).pipe(
+              withAlasioSpan("alasio.delivery", {
+                parent: item.traceparent,
+                attributes: { "alasio.outbox.id": item.id, "alasio.outbox.kind": item.kind, "alasio.delivery.attempt": item.attempts + 1, "telegram.chat.id": item.chat_id },
+              }),
+              Effect.match({ onFailure: () => false, onSuccess: () => true }),
+              Effect.uninterruptible,
+            );
+          }));
           // Deferred; the rest wait behind it so each chat's entries keep their order.
           if (!delivered) return;
         }

@@ -90,6 +90,19 @@ const repositories = (sql: Sql, schema: string, workingDirectory: string | null)
 type Stored<A> = Effect.Effect<A, StoreError>;
 
 /**
+ * A chat's locks, each taken by one alasio at a time of all those on the store: its
+ * updates' handling, and its replies' delivery, apart, so a reply Telegram is slow to take
+ * holds back no update.
+ */
+export type ChatLock = "handling" | "delivery";
+
+/**
+ * What names a chat's lock to Postgres, whose advisory locks are numbers: its text, of the
+ * store's schema, the lock and the chat, which Postgres hashes to one (hashtextextended).
+ */
+export const chatLockName = (schema: string, lock: ChatLock, chatId: string | number): string => `${schema}:${lock}:${chatId}`;
+
+/**
  * A turn's write refused, as another turn has claimed its conversation since
  * (./turn-repository.ts): a write of a turn superseded, not a failure of the store's.
  */
@@ -175,6 +188,12 @@ export class Store extends Context.Service<Store, {
 
   /** Keeps an update, unless it is kept already: whether it is yet to be processed. */
   readonly recordTelegramUpdate: (update: Update) => Stored<boolean>;
+  /**
+   * Runs `work` holding the chat's `lock`, waiting while another holds it: a transaction's
+   * advisory lock, the transaction open on a connection of its own while `work` runs on
+   * the pool's others, and let go of however `work` ends.
+   */
+  readonly withChatLock: <A, E, R>(lock: ChatLock, chatId: string | number, work: Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
   readonly markTelegramUpdateProcessed: (updateId: number) => Stored<void>;
   readonly insertMessage: (message: NewMessage) => Stored<string>;
   readonly insertFile: (file: NewFile) => Stored<string>;
@@ -219,6 +238,8 @@ export class Store extends Context.Service<Store, {
   /** Queues an edit of the status message `edits`. */
   readonly enqueueOutboxEdit: (edits: string, edit: NewOutboxStatus) => Stored<string>;
   readonly getDueOutbox: (limit?: number) => Stored<DueOutboxEntry[]>;
+  /** The chat's next entry, if it is due. */
+  readonly getDueOutboxOf: (chatId: string) => Stored<DueOutboxEntry | null>;
   /** The media a queued reply shows, kept with it until it is sent. */
   readonly getOutboxMedia: (id: string) => Stored<MediaAttachment[]>;
   /** Marks an entry delivered: a status message with its message's id, one given up on with why. */
@@ -316,6 +337,10 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     consumeCallbackAction: (id) => callbacks.consumeCallbackAction(id),
 
     recordTelegramUpdate: (update) => telegramContent.recordTelegramUpdate(update),
+    withChatLock: (lock, chatId, work) =>
+      database.transaction((sql) =>
+        sql.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [chatLockName(schema, lock, chatId)]).pipe(Effect.andThen(work))
+      ),
     markTelegramUpdateProcessed: (updateId) => telegramContent.markTelegramUpdateProcessed(updateId),
     insertMessage: (message) => telegramContent.insertMessage(message),
     insertFile: (file) => telegramContent.insertFile(file),
@@ -375,6 +400,7 @@ const makeStore = Effect.fnUntraced(function*({ pool, schema = DEFAULT_SCHEMA, w
     enqueueOutboxStatus: (status) => outbox.enqueueStatus(status),
     enqueueOutboxEdit: (edits, edit) => outbox.enqueueEdit(edits, edit),
     getDueOutbox: (limit) => outbox.getDue(limit),
+    getDueOutboxOf: (chatId) => outbox.getDueOf(chatId),
     getOutboxMedia: (id) => outbox.getMedia(id),
     markOutboxSent: (id, delivered) => outbox.markSent(id, delivered),
     rescheduleOutbox: (id, error, delayMs) => outbox.reschedule(id, error, delayMs),

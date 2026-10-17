@@ -167,6 +167,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   }).pipe(Effect.catch((error) => Effect.logWarning(`Linked session warmup failed: ${error.message}`)));
 
   /**
+   * A chat's update is handled holding the chat's handling lock (Store.withChatLock),
+   * which every alasio on the store takes for it, so one at a time handles its updates.
    * Each update starts a trace of its own, which everything it leads to joins: the
    * turn its prompt queues, however much later it runs, and the reply's delivery.
    * What it leads to runs on after it, so that consuming goes on meanwhile. One the store
@@ -178,7 +180,8 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
   const processUpdate = (update: Update): Effect.Effect<void, StoreError> =>
     Effect.suspend(() => {
       const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
-      return Effect.gen(function*() {
+      const underLock = <A, E, R>(handle: Effect.Effect<A, E, R>) => chatId === undefined ? handle : store.withChatLock("handling", chatId, handle);
+      return underLock(Effect.gen(function*() {
         if (!(yield* store.recordTelegramUpdate(update))) {
           return yield* Effect.logInfo(`Skipping update ${update.update_id}, processed already`);
         }
@@ -204,7 +207,7 @@ const startTelegram = Effect.fnUntraced(function*(config: TelegramAppConfig): Ef
           }
         }
         yield* store.markTelegramUpdateProcessed(update.update_id);
-      }).pipe(
+      })).pipe(
         Effect.tapError((error) => Effect.logError(`Failed to keep update ${update.update_id}: ${error}`)),
         withAlasioSpan("alasio.update", {
           kind: SpanKind.CONSUMER,

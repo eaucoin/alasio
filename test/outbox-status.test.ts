@@ -7,13 +7,14 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect";
 
 import { Store } from "../src/persistence/store.ts";
 import { Outbox } from "../src/telegram/outbox.ts";
 import { botApiError, botApiLayer } from "./support/bot-api.ts";
-import { testStore } from "./support/store.ts";
+import { newSchema, testStore } from "./support/store.ts";
 
 /** What the stand-in Bot API was asked: each call's method, the message it named, and its text. */
 interface Asked {
@@ -78,6 +79,31 @@ test("an edit Telegram refuses for good, or of a status message with no message,
     ["editMessageText", "Codex worked for a moment."],
     ["sendMessage", "Done"],
   ]);
+});
+
+test("two alasios on one store deliver each chat's replies once, in their order, each delivering a chat's by its lock", async () => {
+  const schema = newSchema();
+  const sent: { readonly chat: number; readonly text: string }[] = [];
+  // Telegram slow to take each, so both alasios' passes find the same entries due.
+  const telegram = botApiLayer(async (call) => {
+    const { chat_id: chat, text = "" } = call.params as { readonly chat_id: number; readonly text?: string };
+    await sleep(20);
+    sent.push({ chat: Number(chat), text });
+    return { message_id: 500, date: 0, chat: { id: Number(chat), type: "private", first_name: "Operator" } };
+  });
+  const outboxOf = async () => Outbox.layer.pipe(Layer.provideMerge(Layer.mergeAll(telegram, Layer.succeed(Store, await testStore({ schema })))));
+  const [first, second] = [await outboxOf(), await outboxOf()];
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const one = Context.get(yield* Layer.build(first), Outbox);
+    const other = Context.get(yield* Layer.build(second), Outbox);
+    for (const n of [1, 2, 3]) {
+      for (const chatId of [42, 43]) yield* one.enqueueText({ chatId, text: `${chatId}: ${n}`, options: { format: "plain" } });
+    }
+    yield* Effect.all([one.deliverDue, other.deliverDue, one.deliverDue, other.deliverDue], { concurrency: "unbounded", discard: true });
+  })));
+  for (const chat of [42, 43]) {
+    assert.deepEqual(sent.filter((each) => each.chat === chat).map(({ text }) => text), [1, 2, 3].map((n) => `${chat}: ${n}`));
+  }
 });
 
 test("a status message Telegram refuses for good is given up on, its edits with it, and the chat's reply after it is sent", async () => {
