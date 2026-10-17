@@ -2043,9 +2043,9 @@ test("the agent's API takes alasio's token alone, and answers each route as it s
   ));
 
 /** alasio's client of the agents, of which there is `agent`, of node-1, served until the scope closes. */
-const agentsOf = (agent: NodeAgent) =>
+const agentsOf = (agent: NodeAgent, workspaces: Workspaces = unusedWorkspaces) =>
   Effect.gen(function*() {
-    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces: unusedWorkspaces });
+    const { port } = yield* serveNodeAgent({ port: 0, host: "127.0.0.1", token: "the token", agent, workspaces });
     const pod: V1Pod = {
       metadata: { name: "node-agent-1", namespace: "alasio" },
       spec: { nodeName: "node-1", containers: [] },
@@ -2409,6 +2409,32 @@ test("the agent's API attaches, detaches, reads and writes a workspace's files a
       assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 409);
       at.running.delete("container-0");
       assert.equal((yield* call("POST", "/detach", json({ pod: "pool-0", containerIds: ["container-0"] }))).status, 204);
+      assert.deepEqual(at.mounts, []);
+    })
+  ));
+
+test("alasio attaches and detaches a workspace through the node's agent, and reads and writes its files through any, the bytes as they are", () =>
+  withBucket(({ node }) =>
+    Effect.gen(function*() {
+      const here = yield* node("node-1");
+      const at = workspacesNode();
+      yield* Effect.addFinalizer(() => Effect.sync(at.done));
+      at.files("fs-abc123");
+      const agents = yield* agentsOf(here.agent, at.workspaces);
+      const ref = { environment: "main", workspace: "fs-abc123" };
+      yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding" });
+      const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding" }));
+      assert.equal(again._tag === "NodeAgentError" && again.status, 409);
+      const bytes = Uint8Array.from([0, 255, 10, 13, 128]);
+      yield* agents.writeFile(ref, "home/.alasio/received/1/blob", bytes);
+      assert.deepEqual(yield* agents.readFile(ref, "home/.alasio/received/1/blob", 100), bytes);
+      const tooLarge = yield* Effect.flip(agents.readFile(ref, "home/.alasio/received/1/blob", 2));
+      assert.equal(tooLarge._tag === "NodeAgentError" && tooLarge.status, 413);
+      at.running.add("container-0");
+      const running = yield* Effect.flip(agents.detach("node-1", "pool-0", ["container-0"]));
+      assert.equal(running._tag === "NodeAgentError" && running.status, 409);
+      at.running.delete("container-0");
+      yield* agents.detach("node-1", "pool-0", ["container-0"]);
       assert.deepEqual(at.mounts, []);
     })
   ));
