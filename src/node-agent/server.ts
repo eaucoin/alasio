@@ -20,9 +20,11 @@
  *   workspace's snapshot was forgotten, as it is, or, of one saved live, kept; 410 where its
  *   sandbox can be saved no more, its restore having failed to read some of its pages, as
  *   every checkpoint of it after will. 404 when it has none the agent keeps (./operations.ts).
- * - `POST /prepare`, `{ environment, workspace }`: starts preparing the workspace's current
- *   snapshot for a restore on this node (202), from this node's cache, or else from the
- *   bucket, which the restore reads as it goes, unless a prepare of it runs, which goes on.
+ * - `POST /prepare`, `{ environment, workspace, gofer? }`: starts preparing the workspace's
+ *   current snapshot for a restore on this node (202), from this node's cache, or else from
+ *   the bucket, which the restore reads as it goes, unless a prepare of it runs, which goes
+ *   on; `gofer`, `{ transport: "socket" | "tcp", pagesRetry }`, says how its checkpoint gofer
+ *   reads the bucket through the agent (./agent.ts PrepareRequest), over TCP unless given.
  * - `GET /prepare/<environment>/<workspace>`: how its last prepare stands, as a
  *   checkpoint's does, `value` `{ manifest, imagePath, source }`, `source` "cache" or
  *   "bucket"; `status` 404 when it has no snapshot, 409 when this node cannot restore it (its
@@ -130,6 +132,7 @@ import {
   type NodeAgent,
   type Prepared,
   type PrepareError,
+  PrepareRequest,
   ResumeRequest,
   type SandboxUnsaveable,
   WorkspaceRef,
@@ -151,6 +154,10 @@ import {
   SNAPSHOT_CACHE_BYTES_VARIABLE,
   SNAPSHOT_CACHE_DIR,
   STORE_PROXY_PORT,
+  NODE_AGENT_RUN_DIR,
+  NODE_AGENT_RUN_DIR_VARIABLE,
+  storeSocket,
+  storeTokensFile,
 } from "./names.ts";
 import { type Failure, makeOperations, type Operations } from "./operations.ts";
 import { makeRunsc } from "./runsc.ts";
@@ -270,7 +277,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     }
     if (method === "GET" && checkpoint) return outcome(checkpoints, checkpoint);
     if (method === "POST" && url === "/prepare") {
-      return body(WorkspaceRef).pipe(Effect.flatMap((asked) => prepares.start(keyOf(asked), logged(agent.prepare(asked)))), Effect.as(started));
+      return body(PrepareRequest).pipe(Effect.flatMap((asked) => prepares.start(keyOf(asked), logged(agent.prepare(asked)))), Effect.as(started));
     }
     if (method === "GET" && prepare) return outcome(prepares, prepare);
     if (method === "POST" && url === "/copies") {
@@ -420,7 +427,9 @@ const EVICTION_GRACE_MS = 10 * 60_000;
  * restores straight from the bucket (RESTORES_FROM_BUCKET_SINCE_VARIABLE; none unless given,
  * every snapshot then fetched into the cache first), its pod's address (POD_IP_VARIABLE),
  * which it serves the bucket to its node's restores on (STORE_PROXY_PORT, ./store-proxy.ts),
- * and how long a resumed restore may read it there (BACKGROUND_READ_SECONDS_VARIABLE). What a
+ * as on its socket on the node, beside its restores' tokens (NODE_AGENT_RUN_DIR, unless
+ * NODE_AGENT_RUN_DIR_VARIABLE says), and how long a resumed restore may read it there
+ * (BACKGROUND_READ_SECONDS_VARIABLE). What a
  * stopped agent left half written in the cache is removed first. What stops it is logged,
  * and its stop waits on its restores' reads, as the module says.
  */
@@ -435,7 +444,10 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   yield* cache.clean;
   // The bucket, to the node's restores, on the pod's own address, which the node reaches.
   const podIP = yield* Config.String(POD_IP_VARIABLE);
-  const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT });
+  // And on its socket on the node, which a restore that asks for it dials whatever pod the
+  // agent runs in, its tokens kept beside it, as an agent that starts again reads them back.
+  const runDir = yield* Config.String(NODE_AGENT_RUN_DIR_VARIABLE).pipe(Config.withDefault(NODE_AGENT_RUN_DIR));
+  const storeProxy = yield* makeStoreProxy({ store: { ...bucket, secretAccessKey: Redacted.value(secretAccessKey) }, host: podIP, port: STORE_PROXY_PORT, socket: storeSocket(runDir), tokensFile: storeTokensFile(runDir) });
   const runsc = makeRunsc({ releasesDir: GVISOR_RELEASES, containerdDir: CONTAINERD, root: RUNSC_ROOT });
   const host = makeHostCommands();
   const agent = yield* makeNodeAgent({
@@ -458,6 +470,7 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
     Effect.gen(function*() {
       const reading = storeProxy.reading();
       if (reading > 0) yield* Effect.logInfo(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: ${reading} read it now`);
+      // Those through its socket wait for the agent that comes back, which reads their tokens back.
       yield* storeProxy.drained;
     })
   );

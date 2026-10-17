@@ -3503,7 +3503,7 @@ describe("the sandbox service", () => {
       // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
       snapshots: {
         liveEverySeconds: 600,
-        // Each restored through the checkpoint gofer as it restores best: over TCP, the agent's own way, as the pins name no release that restores through a socket.
+        // Each restored through the checkpoint gofer as it restores best: over TCP, the agent's own way, as every release kept is before the first that restores through a socket.
         releases: NOTHING_KEPT.gvisorReleases.map((release) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}`, gofer: null })),
         templates: Object.fromEntries((["none", "full"] as const).map((mode) => [mode, { current: JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)), previous: null }])),
       },

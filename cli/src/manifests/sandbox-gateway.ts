@@ -263,12 +263,6 @@ function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS
   return [deployment, ...scaledObject(deployment, config.sessions.pools, [waiting]), verticalPodAutoscaler(deployment, "Recommended")];
 }
 
-/**
- * The first gVisor release whose restores read their images through a socket, as
- * cluster/node/pins.json says it (gvisor.restoresThroughSocketSince); none where it names none.
- */
-const RESTORES_THROUGH_SOCKET_SINCE = "restoresThroughSocketSince" in NODE_PINS.gvisor ? String(NODE_PINS.gvisor.restoresThroughSocketSince) : "";
-
 /** The gateway's configuration, as src/gateway/gateway.ts reads it. */
 function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
@@ -287,7 +281,7 @@ function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
     snapshots: poolsSnapshotted(config, carried.cpuBaseline)
       ? {
         liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
-        releases: carried.gvisorReleases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release), gofer: goferOf(release, RESTORES_THROUGH_SOCKET_SINCE) })),
+        releases: carried.gvisorReleases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release), gofer: goferOf(release, NODE_PINS.gvisor.restoresThroughSocketSince) })),
         templates: { none: templates("none"), full: templates("full") },
       }
       : null,
