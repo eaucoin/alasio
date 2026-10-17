@@ -1,7 +1,8 @@
 /**
  * The sandbox gateway's session workspaces, on the binder (../binder/): a session's
  * workspace, `sessionfs:<volume id>`, bound to a pod of its environment's pool of its
- * internet (`none` or `full`), as its caller's token says (`environment`, `mode`); the pod
+ * internet (`none` or `full`), as its caller's token says (`environment`, `mode`), of the
+ * environments there are (./environments.ts); the pod
  * readied by the node agent of its node attaching the workspace into it, with the binding's
  * token beside it, which the pod's bayma starts on; and released once its bayma has run no
  * exec, and no request of it has come, for `releaseAfterMs`: its sandbox saved whole by its
@@ -21,25 +22,20 @@ import { Clock, Effect, Schema } from "effect";
 import { type Binder, BindStepFailed } from "../binder/binder.ts";
 import { activeAt, type BindingLease, heldLeases, KEY_ANNOTATION, type Pool } from "../binder/bindings.ts";
 import { type Placement, PlacementRefused } from "../binder/server.ts";
-import { mintToken } from "../binder/tokens.ts";
+import { bindingToken } from "../binder/tokens.ts";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { BAYMA_CONTAINER } from "../kube/sandbox-shape.ts";
 import { volumeIdOfKey } from "../sandbox/names.ts";
 import { hookOf } from "../sandbox/snapshots.ts";
+import type { Environments } from "./environments.ts";
 
 /** A session's internet. */
 export type NetMode = "none" | "full";
 
-/** An environment's sessions: its name, and the namespace its pools are in, which names its workspaces to the node agents. */
-export interface SessionsEnvironment {
-  readonly name: string;
-  readonly namespace: string;
-}
-
 /** What the gateway's sessions are given: its environments, each pool's name by its internet, and when a pod is released. */
 export interface SessionsOptions {
-  readonly environments: readonly SessionsEnvironment[];
+  readonly environments: Environments;
   readonly pools: Readonly<Record<NetMode, string>>;
   readonly releaseAfterMs: number;
   /** The port bound pods' bayma serves on. */
@@ -74,8 +70,8 @@ const containerIdsOf = (pod: V1Pod): string[] =>
 export interface Sessions {
   /** Where `key` is bound, by its caller's token's options, and how its pod is readied. */
   readonly place: (key: string, options: Readonly<Record<string, string>>) => Effect.Effect<Placement, PlacementRefused>;
-  /** Every pool the gateway binds in. */
-  readonly pools: readonly Pool[];
+  /** Every pool the gateway binds in now, of every environment there is. */
+  readonly pools: Effect.Effect<readonly Pool[]>;
   /** Releases each bound pod of the gateway's pools that is idle by `now`, as the module says, and says which. */
   readonly sweep: Effect.Effect<readonly string[], KubeApiError>;
 }
@@ -87,7 +83,7 @@ export const makeSessions = Effect.fnUntraced(function*(
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient> {
   const kube = yield* KubeClient;
-  const pools = environments.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace })));
+  const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
     Effect.tryPromise({ try: () => lookup(host), catch: (error) => new BindStepFailed({ reason: `${host} did not resolve: ${String(error)}` }) }).pipe(Effect.map(({ address }) => address));
@@ -99,7 +95,7 @@ export const makeSessions = Effect.fnUntraced(function*(
     Effect.gen(function*() {
       const volumeId = volumeIdOfKey(key);
       if (!volumeId) return yield* new PlacementRefused({ reason: `${key} is no session workspace's` });
-      const environment = environments.find(({ name }) => name === options["environment"]);
+      const environment = options["environment"] === undefined ? null : yield* environments.named(options["environment"]);
       if (!environment) return yield* new PlacementRefused({ reason: `there is no environment ${options["environment"] ?? "named"} of sessions` });
       const mode = options["mode"];
       if (mode !== "none" && mode !== "full") return yield* new PlacementRefused({ reason: `a session's internet is none or full, not ${mode ?? "unsaid"}` });
@@ -113,7 +109,7 @@ export const makeSessions = Effect.fnUntraced(function*(
               environment: environment.namespace,
               workspace: volumeId,
               pod: pod.metadata?.name ?? "",
-              token: mintToken(bindingKey, { key, binding }),
+              token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
               env,
             }).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
           }),
@@ -180,7 +176,7 @@ export const makeSessions = Effect.fnUntraced(function*(
       const key = lease.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
       const address = pod?.status?.podIP;
       if (!address) return { idle: false, askAt: now + idlePollMs } as const;
-      const token = mintToken(bindingKey, { key, binding: lease.metadata?.uid ?? "" });
+      const token = bindingToken(bindingKey, { key, binding: lease.metadata?.uid ?? "", namespace: lease.metadata?.namespace ?? "" });
       const status = yield* Effect.tryPromise({
         try: async (signal) => {
           const response = await fetch(`http://${address}:${podPort}/status`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(STATUS_TIMEOUT_MS)]) });
@@ -200,7 +196,7 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   const sweep: Effect.Effect<readonly string[], KubeApiError> = Effect.gen(function*() {
     const released: string[] = [];
-    for (const pool of pools) {
+    for (const pool of yield* pools) {
       for (const lease of yield* Effect.provideService(heldLeases(pool), KubeClient, kube)) {
         const key = lease.metadata?.annotations?.[KEY_ANNOTATION];
         const binding = lease.metadata?.uid ?? "";

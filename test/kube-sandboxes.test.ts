@@ -50,6 +50,9 @@ import { sameToken } from "../src/shared/tokens.ts";
 import type { Signal } from "../src/telemetry/config.ts";
 import { createOtlpForwarder, type ForwardResult, type OtlpEncoding, type OtlpForwarder } from "../src/telemetry/forward.ts";
 
+/** The session `volumeId`, as a receiver's authentication says it, stamped as a sandbox's is. */
+const stamped = (volumeId: string) => ({ session: volumeId, stamp: { "service.name": "bayma", "alasio.volume.id": volumeId } });
+
 const profile = (extra: Partial<SessionsProfile> = {}): SessionsProfile => ({
   namespace: "alasio-sessions",
   port: 7290,
@@ -1344,8 +1347,7 @@ test("the receiver takes a session's OTLP with its token only, stamped with what
       port: 0,
       host: "127.0.0.1",
       forwarder,
-      stampFor: (volumeId) => ({ "service.name": "bayma", "alasio.volume.id": volumeId }),
-      authenticate: (token) => Effect.succeed(token === "fs-abc123.good" ? "fs-abc123" : null),
+      authenticate: (token) => Effect.succeed(token === "fs-abc123.good" ? stamped("fs-abc123") : null),
       limiter: yield* makeRateLimiter({ rate: 1, burst: 100_000 }),
     });
     const url = (path: string) => `http://127.0.0.1:${receiver.port}${path}`;
@@ -1406,8 +1408,7 @@ const receiving = (forwarder: Pick<OtlpForwarder, "protocols" | "export">, limit
       port: 0,
       host: "127.0.0.1",
       forwarder,
-      stampFor: (volumeId) => ({ "service.name": "bayma", "alasio.volume.id": volumeId }),
-      authenticate: (token) => Effect.succeed(token.endsWith(".good") ? token.slice(0, -".good".length) : null),
+      authenticate: (token) => Effect.succeed(token.endsWith(".good") ? stamped(token.slice(0, -".good".length)) : null),
       limiter: yield* makeRateLimiter({ rate: 1, burst: 100_000_000 }),
       ...limits,
     });

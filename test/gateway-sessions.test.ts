@@ -12,6 +12,7 @@ import { Effect, Layer } from "effect";
 import { Binder } from "../src/binder/binder.ts";
 import { freeLabels, type Pool, readLease, touchLease } from "../src/binder/bindings.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
+import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
 import { makeSessions, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
@@ -115,8 +116,15 @@ async function environment(count: number, { gvisor = false } = {}): Promise<{ na
   return { name: `env-${namespaces}`, namespace, none };
 }
 
-const options = (env: { name: string; namespace: string }, podPort: number): SessionsOptions => ({
-  environments: [env],
+/** The environments `list`, as found: those alone. */
+const found = (list: readonly SessionsEnvironment[]): Environments => ({
+  current: Effect.succeed(list),
+  named: (name) => Effect.succeed(list.find((each) => each.name === name) ?? null),
+  ofNamespace: (namespace) => Effect.succeed(list.find((each) => each.namespace === namespace) ?? null),
+});
+
+const options = (env: SessionsEnvironment, podPort: number): SessionsOptions => ({
+  environments: found([env]),
   pools: { none: "sandboxes-none", full: "sandboxes-full" },
   releaseAfterMs: 60_000,
   podPort,
@@ -150,7 +158,7 @@ test("a session's workspace is placed in its environment's pool of its internet,
   const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
   const [attach] = recorded.attached;
   assert.deepEqual([attach?.node, attach?.environment, attach?.workspace, attach?.pod], ["node-a", env.namespace, "fs-abc123", bound.pod]);
-  assert.deepEqual(verifyToken(bindingKey, attach?.token ?? "", Date.now()), { key, binding: bound.binding });
+  assert.deepEqual(verifyToken(bindingKey, attach?.token ?? "", Date.now()), { key, binding: bound.binding, namespace: env.namespace });
   // Its bayma exports to the receiver by its address, as a session with no internet resolves no name.
   assert.deepEqual(attach?.env, { OTEL_TRACES_EXPORTER: "otlp", OTEL_EXPORTER_OTLP_ENDPOINT: `http://${(await lookup("localhost")).address}:4318` });
 });
@@ -169,7 +177,7 @@ test("a bound pod whose bayma runs an exec is kept, and its bayma asked again on
     assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.sweep, Layer.fresh(KubeClient.layer))), []);
     assert.deepEqual(await Effect.runPromise(Effect.provide(sessions.sweep, Layer.fresh(KubeClient.layer))), []);
     assert.equal(stand.asked.length, 1);
-    assert.deepEqual(verifyToken(bindingKey, stand.asked[0]?.slice("Bearer ".length) ?? "", Date.now()), { key, binding: bound.binding });
+    assert.deepEqual(verifyToken(bindingKey, stand.asked[0]?.slice("Bearer ".length) ?? "", Date.now()), { key, binding: bound.binding, namespace: env.namespace });
     assert.ok(await run(readLease(env.none, key)));
   } finally {
     stand.close();

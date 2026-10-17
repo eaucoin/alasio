@@ -89,17 +89,22 @@ export interface TelemetryReceiverOptions {
   readonly port: number;
   readonly host?: string;
   /**
-   * The session (its volume id) a bearer token belongs to, or null; failing with
-   * AuthenticationUnknown where that cannot be told now, to be asked again.
+   * The session a bearer token belongs to, or null; failing with AuthenticationUnknown where
+   * that cannot be told now, to be asked again.
    */
-  readonly authenticate: (token: string) => Effect.Effect<string | null, AuthenticationUnknown>;
+  readonly authenticate: (token: string) => Effect.Effect<Authenticated | null, AuthenticationUnknown>;
   readonly forwarder: Pick<OtlpForwarder, "protocols" | "export">;
-  readonly stampFor: (volumeId: string) => ResourceStamp;
   readonly limiter?: RateLimiter;
   /** The most bytes the requests being answered may hold at once (MAX_HELD_BYTES). */
   readonly maxHeldBytes?: number;
   /** The most of them one session's may hold: a quarter of maxHeldBytes unless given. */
   readonly maxSessionHeldBytes?: number;
+}
+
+/** The session a token is of: its volume id, which its rate and what its requests hold are counted by, and what its resources are stamped with. */
+export interface Authenticated {
+  readonly session: string;
+  readonly stamp: ResourceStamp;
 }
 
 /** Whose a token is cannot be told now, as while the bindings it is checked against are not known: answered 503, to be sent again. */
@@ -164,9 +169,8 @@ const retryLater = (seconds: number): HttpServerResponse.HttpServerResponse =>
 
 /**
  * Serves OTLP/HTTP on `port` until the scope closes. `authenticate(token)` is the
- * session (its volume id) a bearer token belongs to, or null; `forwarder` exports
- * (../telemetry/forward.ts); `stampFor(volumeId)` is what that session's resources are
- * stamped with. A request is answered as the module says. The port it listens on, once it
+ * session a bearer token belongs to, and what its resources are stamped with, or null;
+ * `forwarder` exports (../telemetry/forward.ts). A request is answered as the module says. The port it listens on, once it
  * does.
  */
 export const serveTelemetryReceiver = Effect.fnUntraced(function*({
@@ -174,7 +178,6 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
   host = "0.0.0.0",
   authenticate,
   forwarder,
-  stampFor,
   limiter,
   maxHeldBytes = MAX_HELD_BYTES,
   maxSessionHeldBytes = maxHeldBytes / 4,
@@ -220,16 +223,17 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     const signal = SIGNALS.find((name) => request.url === `/v1/${name}`);
     if (request.method !== "POST" || !signal) return status(404);
     const bearer = Schema.decodeUnknownOption(BearerToken)(request.headers["authorization"]);
-    const volumeId = Option.isSome(bearer) ? yield* authenticate(bearer.value[1]).pipe(Effect.option) : Option.some(null);
-    if (Option.isNone(volumeId)) {
+    const authenticated = Option.isSome(bearer) ? yield* authenticate(bearer.value[1]).pipe(Effect.option) : Option.some(null);
+    if (Option.isNone(authenticated)) {
       yield* count("refused", { signal, reason: "unconfirmed" });
       return retryLater(RETRY_AFTER_S);
     }
-    if (!volumeId.value) {
+    if (!authenticated.value) {
       yield* count("refused", { reason: "unauthenticated" });
       return status(401);
     }
-    held.of(volumeId.value);
+    const { session, stamp: resource } = authenticated.value;
+    held.of(session);
     const mediaType = Schema.decodeUnknownOption(OtlpMediaType)(mediaTypeOf(request.headers["content-type"]));
     if (Option.isNone(mediaType)) return status(415);
     const encoding = ENCODINGS[mediaType.value];
@@ -242,7 +246,7 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     if (read === "too large") return status(413);
     if (read === "busy") return yield* busy(signal);
     let body: Buffer = read;
-    const wait = yield* budgets.take(volumeId.value, body.length);
+    const wait = yield* budgets.take(session, body.length);
     if (wait > 0) {
       yield* count("refused", { signal, reason: "rate" });
       return HttpServerResponse.empty({ status: 429, headers: { "retry-after": String(wait) } });
@@ -259,7 +263,7 @@ export const serveTelemetryReceiver = Effect.fnUntraced(function*({
     }
     // A signal alasio does not export is accepted and let go, as the exporter expects.
     if (!forwarder.protocols[signal]) return ok;
-    const stamped = yield* stamp(signal, encoding, body, stampFor(volumeId.value));
+    const stamped = yield* stamp(signal, encoding, body, resource);
     if (!stamped) {
       yield* count("dropped", { signal, reason: "malformed" });
       return status(400);
