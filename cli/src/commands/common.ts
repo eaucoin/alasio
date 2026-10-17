@@ -149,10 +149,16 @@ export class NoRunningPod extends Schema.TaggedError<NoRunningPod>()("NoRunningP
   }
 }
 
-/** The newest of `pods`, of the component `name`, that runs ready. */
+/**
+ * The newest of `pods`, of the component `name`, that runs ready and is not stopping: one
+ * being deleted, as one a scale-in stops, runs ready until it has stopped, but takes no
+ * command run in it once its containers have.
+ */
 const readyPod = (name: string, pods: readonly V1Pod[]): Effect.Effect<string, NoRunningPod> => {
-  const running = pods.find((pod) => pod.status?.phase === "Running" && podProblems(pod).length === 0);
-  return running?.metadata?.name ? Effect.succeed(running.metadata.name) : Effect.fail(new NoRunningPod({ component: name, why: pods.flatMap(podProblems) }));
+  const stopping = (pod: V1Pod) => Boolean(pod.metadata?.deletionTimestamp);
+  const running = pods.find((pod) => pod.status?.phase === "Running" && !stopping(pod) && podProblems(pod).length === 0);
+  const why = pods.flatMap((pod) => (stopping(pod) ? [`pod ${pod.metadata?.name ?? ""} is stopping`] : podProblems(pod)));
+  return running?.metadata?.name ? Effect.succeed(running.metadata.name) : Effect.fail(new NoRunningPod({ component: name, why }));
 };
 
 /** The newest pod of the component `name` that runs ready. */

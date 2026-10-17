@@ -1016,6 +1016,27 @@ test("lake runs the query in the lake's query container and prints its answer, i
   assert.equal(refused.stderr, "Parser Error: syntax error\n");
 });
 
+test("lake runs the query in a reader that is not stopping, the newest of them, and says so where every one is", async (t) => {
+  const { alasio, kube } = await installed(t);
+  kube.onExec = () => ({ exitCode: 0, stdout: "count\n42\n" });
+  const reader = kube.get("/api/v1/namespaces/alasio/pods/alasio-lake-query-0");
+  assert.ok(reader?.metadata);
+  // A newer reader that a scale-in is stopping, running ready until it has: held by a
+  // finalizer, so the fake cluster keeps it meanwhile.
+  const stop = (pod: typeof reader) => Object.assign(pod.metadata, { deletionTimestamp: new Date().toISOString(), finalizers: ["test/stopping"] });
+  const newer = structuredClone(reader);
+  Object.assign(newer.metadata, { name: "alasio-lake-query-1", creationTimestamp: new Date(Date.now() + 60_000).toISOString() });
+  stop(newer);
+  kube.objects.set("/api/v1/namespaces/alasio/pods/alasio-lake-query-1", newer);
+  succeeded(await alasio(["lake", "SELECT 1"]));
+  assert.equal(kube.execs.at(-1)?.pod, "alasio-lake-query-0");
+  stop(reader);
+  assert.equal(
+    failure(await alasio(["lake", "SELECT 1"])),
+    "no pod of lake-query runs: pod alasio-lake-query-1 is stopping; pod alasio-lake-query-0 is stopping; alasio status says more",
+  );
+});
+
 test("lake reconcile runs an environment's reconciliation as its Job, in its namespace, says what its lake lost, and fails as the Job does", async (t) => {
   const { alasio, kube } = await installed(t);
   const job = (namespace: string) => kube.changes.findIndex(({ method, path }) => method !== "DELETE" && path.endsWith(`/namespaces/${namespace}/jobs/alasio-lake-reconcile`));
