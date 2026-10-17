@@ -23,7 +23,7 @@ import { VALKEY } from "../../cli/src/manifests/workspace-storage.ts";
 import { BINDING_LABEL, environmentKey, keyHash, POOL_LABEL } from "../../src/binder/names.ts";
 import { NO_BIND_HEADER } from "../../src/binder/server.ts";
 import { mintToken } from "../../src/binder/tokens.ts";
-import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../src/node-agent/names.ts";
+import { NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../src/node-agent/names.ts";
 import { sessionKey } from "../../src/sandbox/names.ts";
 import { kube, nodeAgents, ref, SESSIONS, tcp } from "./harness.ts";
 import { until } from "./workspace-storage.ts";
@@ -201,6 +201,12 @@ export function sandboxService(): void {
       assert.ok(outcomes.length > 500, `${outcomes.length} writes`);
       const kept = (await kube.execOk(SESSIONS, pod, ["sh", "-c", "ls /workspace/takeover | wc -l"], { container: "bayma" })).trim();
       assert.equal(Number(kept), outcomes.length);
+      // The node's mount whole after it: a workspace made since is made in workspace storage, as the node agent sees it, and the node.
+      const agent = (await nodeAgents()).get(node) ?? "";
+      const seen = async () =>
+        (await kube.exec(NAMESPACE, agent, ["sh", "-c", `stat -f -c 'agent sees %T' ${WORKSPACES_ROOT}; grep ' ${WORKSPACES_ROOT}' /proc/1/mountinfo || echo 'the node mounts nothing there'`], { container: "node-agent" })).stdout.trim();
+      const after = await gatewayCall(await mainToken("fs-e2eafter"), "POST", "/workspace");
+      assert.equal(after.status, 204, `${after.said}; ${await seen()}`);
     });
 
     test("a workspace is made, given a received file, bound, held to its quota, read back of what its session wrote, released and deleted through the gateway alone", async () => {
