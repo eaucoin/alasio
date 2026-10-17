@@ -460,51 +460,75 @@ function receiverObjects(config: InstallConfig): KubernetesObject[] {
 
 /** Where a workspace mount's pod keeps what is its own: its juicefs's log and pid, and whether it has handed its mount over. */
 export const MOUNT_RUN = "/run/alasio";
-/** Where JuiceFS keeps a mount's open handles on the node, which the mount that takes it over reads: every mount pod's on the node, at /tmp. */
+/** Where JuiceFS keeps a mount's open handles on the node, which the mount that takes it over reads. */
 export const JUICEFS_STATE = "/var/lib/alasio/juicefs-state";
+/** Where the node runs JuiceFS's command from: its static release, copied from alasio's image, under its digest. */
+export const JUICEFS_BIN = "/var/lib/alasio/bin";
+/** Where the node's mount of workspace storage caches its blocks. */
+export const JUICEFS_CACHE = "/var/lib/alasio/juicefs-cache";
 /** What JuiceFS's mount says once it has handed its FUSE session over to another mount of the same mount point, and ends. */
 export const HANDED_OVER = "transfer FUSE session to others";
 
+/** Where a workspace mount's script finds what it works with: but for tests, the node's and the image's own. */
+export interface MountPaths {
+  readonly run: string;
+  readonly bin: string;
+  readonly state: string;
+  readonly cache: string;
+  /** JuiceFS's command, of alasio's image: its static release, which runs as it is in the node's namespace. */
+  readonly juicefs: string;
+  /** The node's mount table, as the pod sees it, sharing the node's PIDs. */
+  readonly mountinfo: string;
+  /** What runs a command in the node's mount namespace. */
+  readonly inNode: string;
+}
+
+export const MOUNT_PATHS: MountPaths = {
+  run: MOUNT_RUN,
+  bin: JUICEFS_BIN,
+  state: JUICEFS_STATE,
+  cache: JUICEFS_CACHE,
+  juicefs: "/usr/local/bin/juicefs",
+  mountinfo: "/proc/1/mountinfo",
+  inNode: "nsenter -t 1 -m --",
+};
+
 /**
- * The script of a workspace mount's pod: JuiceFS's mount of workspace storage at `root`, its
- * log copied out; and, once it ends, idle where it ended by handing its mount over, as it
- * said, to the mount of the pod that replaces it, until its own pod is deleted, or, where it
- * ended any other way, a failure, so kubelet starts it again and it mounts anew. Asked to end
- * while it mounts, it has its mount end too. `run` is MOUNT_RUN but for tests. Handed over, it
- * makes its mounts of `root` its own (private), so the teardown of its container's mounts as it
- * ends takes none of the node's with it, which they would share otherwise (Bidirectional).
+ * The script of a workspace mount's pod: JuiceFS's mount of workspace storage at `root`, made
+ * in the node's own mount namespace, so it is the node's alone, and no container's mounts, torn
+ * down as their container ends, take it with them; its log copied out; and, once it ends, idle
+ * where it ended by handing its mount over, as it said, to the mount of the pod that replaces it,
+ * until its own pod is deleted, or, where it ended any other way, a failure, so kubelet starts it
+ * again and it mounts anew. Asked to end while it mounts, it has its mount end too.
  *
- * While its juicefs serves, it keeps the node's mount at `root`: a bind of it of its own, in
- * its own directory, which no other pod's going takes with it, and, where the node has lost
- * it, as it does once the pod that held it before a handover goes (its container's mounts
- * torn down, and with them the node's, which they share), binds that one back at `root`, the
- * node's again, every second it looks. A `root` that cannot be read, as a mount whose
- * session is lost, it leaves be.
+ * Its juicefs is JuiceFS's static release, of alasio's image, which runs as it is in the node's
+ * namespace: copied to the node, under its digest, never over the one a mount runs. A mount left
+ * at `root` whose juicefs is gone, as a pod killed with no successor leaves one, is unmounted
+ * first, lazily, so the next mounts afresh.
+ *
+ * Its juicefs, run in the node's mount namespace, is still this pod's process, of its cgroup: the
+ * pod's teardown kills it. So a pod hands its mount over before it is torn down, never after: the
+ * pod that replaces it starts beside it (maxSurge), takes its FUSE session over, and only then is
+ * it deleted, idle, its juicefs ended already. `paths` are MOUNT_PATHS but for tests.
  */
-export function workspaceMountScript(root: string, cacheSizeMiB: number, run = MOUNT_RUN): string {
+export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: MountPaths = MOUNT_PATHS): string {
+  const { run, bin, state, cache, juicefs, mountinfo, inNode } = paths;
   return [
     `run=${run}`,
-    `mkdir -p ${root} "$run"`,
+    `mkdir -p "$run" ${bin} ${state} ${cache}`,
     `rm -f "$run/handed-over"`,
     // Made, empty, before the mount starts or the log is followed, which would not find it yet.
     `: > "$run/juicefs.log"`,
-    `juicefs mount --no-bgjob --cache-size ${cacheSizeMiB} "$META_URL" ${root} >> "$run/juicefs.log" 2>&1 &`,
+    `node_juicefs="${bin}/juicefs-$(sha256sum ${juicefs} | cut -c1-16)"`,
+    `if [ ! -x "$node_juicefs" ]; then cp ${juicefs} "$node_juicefs.$$" && chmod 755 "$node_juicefs.$$" && mv "$node_juicefs.$$" "$node_juicefs"; fi`,
+    // A mount of a juicefs gone, which reads as nothing: unmounted, so this one mounts afresh.
+    `if awk -v root=${root} '$5 == root { found = 1 } END { exit !found }' ${mountinfo} && ! ${inNode} ls ${root} >/dev/null 2>&1; then`,
+    `  ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
+    "fi",
+    `${inNode} mkdir -p ${root}`,
+    `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$META_URL" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
     `echo "$pid" > "$run/juicefs.pid"`,
-    "keep() {",
-    `  kept="$run/kept"; bound=""`,
-    `  while kill -0 "$pid" 2>/dev/null; do`,
-    `    if type=$(stat -f -c %T ${root} 2>/dev/null); then`,
-    `      case "$type" in`,
-    `        fuse*) [ -n "$bound" ] || { mkdir -p "$kept" && mount --bind ${root} "$kept" && bound=1 && echo "it keeps a bind of the node's mount of its own"; } ;;`,
-    `        *) [ -n "$bound" ] && mount --bind "$kept" ${root} && echo "the node's mount was lost, as the pod that held it went: it is bound again from this pod's own" ;;`,
-    "      esac",
-    "    fi",
-    "    sleep 1",
-    "  done",
-    "}",
-    "keep &",
-    "keeper=$!",
     `tail -n +1 -f "$run/juicefs.log" &`,
     "tailer=$!",
     `trap 'kill -TERM "$pid"' TERM INT`,
@@ -512,11 +536,9 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
     // A TERM's wait ends as the trap runs; the mount's own end is waited for.
     `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
     "sleep 1",
-    `kill "$tailer" "$keeper" 2>/dev/null`,
+    `kill "$tailer" 2>/dev/null`,
     `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
     `  touch "$run/handed-over"`,
-    // Its own mounts of the node's mount kept from the node's: torn down as its container ends, they take the node's with them otherwise.
-    `  mount --make-rprivate ${root} && echo "its mounts are its own: its going leaves the node's mount whole"`,
     "  echo 'the mount is handed over to the pod that replaces this one, which is idle until it is deleted'",
     "  trap 'exit 0' TERM INT",
     "  while :; do sleep 3600 & wait $!; done",
@@ -527,23 +549,33 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, run = M
   ].join("\n");
 }
 
-/** The readiness of a workspace mount's pod: its own juicefs runs, it has not handed its mount over, and `root` is FUSE's. */
-export function workspaceMountReady(root: string, run = MOUNT_RUN): string {
-  return `[ ! -e ${run}/handed-over ] && kill -0 "$(cat ${run}/juicefs.pid)" 2>/dev/null && case "$(stat -f -c %T ${root})" in fuse*) true;; *) false;; esac`;
+/**
+ * The readiness of a workspace mount's pod: its own juicefs runs, it has not handed its mount
+ * over, and the node's mount table holds JuiceFS's mount at `root`: this pod's juicefs serves the
+ * node's mount point.
+ */
+export function workspaceMountReady(root: string, paths: Pick<MountPaths, "run" | "mountinfo"> = MOUNT_PATHS): string {
+  const { run, mountinfo } = paths;
+  return [
+    `[ ! -e ${run}/handed-over ]`,
+    `kill -0 "$(cat ${run}/juicefs.pid)" 2>/dev/null`,
+    `awk -v root=${root} '$5 == root { for (i = 6; i < NF; i += 1) if ($i == "-") { if ($(i + 1) == "fuse.juicefs") found = 1; break } } END { exit !found }' ${mountinfo}`,
+  ].join(" && ");
 }
 
 /**
- * The node's mount of workspace storage, at WORKSPACES_ROOT, its pod's own and the node's
- * (Bidirectional), which the node agent attaches workspaces from. A mount held by a pod that
- * goes takes every workspace attached from it with it, so a new pod of it starts beside the
- * old (maxSurge), and its mount of the same mount point takes the old's FUSE session over,
- * which needs them to share the node's PIDs and JuiceFS's state (JUICEFS_STATE); the old pod
- * idles once it has handed its mount over (workspaceMountScript), not ready, and is deleted
- * once the new is ready, which then keeps the node's mount itself, as the old one's going
- * takes the node's with it (workspaceMountScript).
+ * The node's mount of workspace storage, at WORKSPACES_ROOT, the node's own (workspaceMountScript),
+ * which the node agent attaches workspaces from. A mount held by a pod that goes takes every
+ * workspace attached from it with it, so a new pod of it starts beside the old (maxSurge), and
+ * its mount of the same mount point takes the old's FUSE session over, which needs them to share
+ * the node's PIDs and mount namespace; the old pod idles once it has handed its mount over, not
+ * ready, and is deleted once the new is ready. It runs alasio's image, for JuiceFS's static
+ * release, of the version the mount image is (../../../Dockerfile), privileged, as it enters
+ * the node's mount namespace.
  */
 function workspaceMount(config: InstallConfig): V1DaemonSet {
   const credential = (name: string, key: string): V1EnvVar => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
+  const nodePaths = [["bin", JUICEFS_BIN], ["state", JUICEFS_STATE], ["cache", JUICEFS_CACHE]] as const;
   return {
     apiVersion: "apps/v1",
     kind: "DaemonSet",
@@ -559,28 +591,21 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
           ...given("nodeSelector", { ...config.sessions.nodeSelector }),
           ...given("tolerations", [...config.sessions.tolerations]),
           automountServiceAccountToken: false,
-          // The mount that takes another's over signals it, by its PID on the node.
+          // The mount that takes another's over signals it, by its PID on the node; and it enters the node's mount namespace by PID 1's.
           hostPID: true,
           containers: [{
             name: WORKSPACE_MOUNT_COMPONENT,
-            image: imageReference(config.workspaceStorage.csi.mountImage),
-            imagePullPolicy: "IfNotPresent",
+            image: imageReference(config.images.alasio),
+            imagePullPolicy: config.images.pullPolicy,
             command: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
             env: [credential("META_URL", "metaurl"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
             readinessProbe: { exec: { command: ["sh", "-c", workspaceMountReady(WORKSPACES_ROOT)] }, periodSeconds: 2 },
             securityContext: { privileged: true },
             resources: config.workspaceStorage.mount.resources,
-            volumeMounts: [
-              { name: "workspaces", mountPath: WORKSPACES_ROOT, mountPropagation: "Bidirectional" },
-              { name: "state", mountPath: "/tmp" },
-              { name: "run", mountPath: MOUNT_RUN },
-            ],
+            // The node's directories, where the pod reaches them as the node does.
+            volumeMounts: [...nodePaths.map(([name, path]) => ({ name, mountPath: path })), { name: "run", mountPath: MOUNT_RUN }],
           }],
-          volumes: [
-            { name: "workspaces", hostPath: { path: WORKSPACES_ROOT, type: "DirectoryOrCreate" } },
-            { name: "state", hostPath: { path: JUICEFS_STATE, type: "DirectoryOrCreate" } },
-            { name: "run", emptyDir: {} },
-          ],
+          volumes: [...nodePaths.map(([name, path]) => ({ name, hostPath: { path, type: "DirectoryOrCreate" } })), { name: "run", emptyDir: {} }],
         },
       },
     },
