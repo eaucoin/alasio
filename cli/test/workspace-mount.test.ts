@@ -34,7 +34,7 @@ interface Mount {
  * line while it serves; where `left`, the table holds a mount of a juicefs gone at the root
  * already, which reads as nothing until it is unmounted.
  */
-function mount(t: TestContext, juicefs: Juicefs, { left = false } = {}): Mount {
+function mount(t: TestContext, juicefs: Juicefs, { left = false, env: given = {} as Record<string, string> } = {}): Mount {
   const directory = mkdtempSync(join(tmpdir(), "alasio-workspace-mount-"));
   const root = join(directory, "workspaces");
   const mountinfo = join(directory, "mountinfo");
@@ -59,10 +59,20 @@ function mount(t: TestContext, juicefs: Juicefs, { left = false } = {}): Mount {
     `if [ "$1" = umount ]; then rm -f ${dead}; : > ${mountinfo}; exit 0; fi`,
     'exec "$@"',
   ].join("\n"));
-  for (const file of [image, inNode]) chmodSync(file, 0o755);
-  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: image, mountinfo, inNode };
+  // The pod's DNS: the cluster's two Services, and nothing else.
+  const resolve = join(directory, "getent");
+  writeFileSync(resolve, [
+    "#!/bin/sh",
+    'case "$2" in',
+    "  alasio-valkey.alasio.svc.cluster.local) echo '10.43.0.7       alasio-valkey.alasio.svc.cluster.local';;",
+    "  alasio-seaweedfs.alasio.svc.cluster.local) echo '10.43.0.8       alasio-seaweedfs.alasio.svc.cluster.local';;",
+    "  *) exit 2;;",
+    "esac",
+  ].join("\n"));
+  for (const file of [image, inNode, resolve]) chmodSync(file, 0o755);
+  const paths: MountPaths = { run: join(directory, "run"), bin: join(directory, "bin"), state: join(directory, "state"), cache: join(directory, "cache"), juicefs: image, mountinfo, inNode, resolve: `${resolve} hosts` };
   mkdirSync(paths.run);
-  const env = { ...process.env, META_URL: "redis://valkey/1" };
+  const env = { ...process.env, META_URL: "redis://:a%40secret@alasio-valkey.alasio.svc.cluster.local:6379/1", BUCKET: "http://alasio-seaweedfs.alasio.svc.cluster.local:8333/workspaces", ...given };
   // A group of its own, so whatever it started is ended with it.
   const child = spawn("sh", ["-c", workspaceMountScript(root, 1024, paths)], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
   let out = "";
@@ -103,6 +113,9 @@ test("a mount that serves runs its image's juicefs, copied to the node under its
   assert.equal(readFileSync(join(serving.paths.bin, copied ?? ""), "utf8"), readFileSync(serving.paths.juicefs, "utf8"));
   assert.deepEqual(serving.inNode().at(-1)?.split(" ").slice(0, 2), [join(serving.paths.bin, copied ?? ""), "mount"]);
   assert.ok(serving.inNode().at(-1)?.includes(`--cache-dir ${serving.paths.cache}`));
+  // The cluster's names, which the node's namespace resolves none of, given as their addresses, by the pod's DNS.
+  assert.ok(serving.inNode().at(-1)?.includes("--bucket http://10.43.0.8:8333/workspaces"), serving.inNode().at(-1));
+  assert.ok(serving.inNode().at(-1)?.endsWith(`redis://:a%40secret@10.43.0.7:6379/1 ${serving.root}`), serving.inNode().at(-1));
   serving.child.kill("SIGTERM");
   assert.notEqual(await serving.ended, 0);
   assert.equal(existsSync(join(serving.paths.run, "handed-over")), false);
@@ -144,4 +157,15 @@ test("a mount is not ready while the node's table holds no mount of JuiceFS's at
   await until(() => serving.ready());
   writeFileSync(serving.paths.mountinfo, `37 1 0:51 / ${serving.root} rw - overlay overlay rw\n`);
   assert.equal(serving.ready(), false);
+});
+
+test("a mount whose metadata engine or bucket is no Service of the cluster's is given them as they are, and one whose Service's name resolves to nothing mounts nothing, a failure", async (t) => {
+  const outside = mount(t, "serves", { env: { META_URL: "rediss://:pw@valkey.example.com:6380/1", BUCKET: "https://s3.example.com/workspaces" } });
+  await until(() => outside.ready());
+  assert.ok(outside.inNode().at(-1)?.includes("--bucket https://s3.example.com/workspaces "), outside.inNode().at(-1));
+  assert.ok(outside.inNode().at(-1)?.includes(" rediss://:pw@valkey.example.com:6380/1 "), outside.inNode().at(-1));
+  const unresolved = mount(t, "serves", { env: { META_URL: "redis://:pw@alasio-gone.alasio.svc.cluster.local:6379/1" } });
+  assert.equal(await unresolved.ended, 1);
+  assert.match(unresolved.out(), /alasio-gone\.alasio\.svc\.cluster\.local resolves to no address/u);
+  assert.deepEqual(unresolved.inNode(), []);
 });

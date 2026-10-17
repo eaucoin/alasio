@@ -3549,8 +3549,10 @@ describe("the sandbox service", () => {
     ]);
     assert.deepEqual(mount.spec?.template.spec?.volumes?.[1], { name: "state", hostPath: { path: "/var/lib/alasio/juicefs-state", type: "DirectoryOrCreate" } });
     assert.deepEqual(juicefs?.command, ["sh", "-c", workspaceMountScript("/var/lib/alasio/workspaces", 1024)]);
-    assert.match(juicefs?.command?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces /u);
+    assert.match(juicefs?.command?.[2] ?? "", /nsenter -t 1 -m -- "\$node_juicefs" mount --no-bgjob --bucket "\$bucket" --cache-dir \/var\/lib\/alasio\/juicefs-cache --cache-size 1024 "\$meta" \/var\/lib\/alasio\/workspaces /u);
     assert.deepEqual(juicefs?.readinessProbe?.exec?.command, ["sh", "-c", workspaceMountReady("/var/lib/alasio/workspaces")]);
+    // Given the metadata engine's URL and the bucket's, which it resolves by the pod's DNS, and the bucket's keys.
+    assert.deepEqual(juicefs?.env?.map(({ name, valueFrom }) => `${name}=${valueFrom?.secretKeyRef?.key}`), ["META_URL=metaurl", "BUCKET=bucket", "ACCESS_KEY=access-key", "SECRET_KEY=secret-key"]);
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
   });
 

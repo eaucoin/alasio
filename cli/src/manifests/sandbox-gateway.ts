@@ -488,6 +488,8 @@ export interface MountPaths {
   readonly mountinfo: string;
   /** What runs a command in the node's mount namespace. */
   readonly inNode: string;
+  /** What resolves a name by the pod's DNS: its address first on the line it prints. */
+  readonly resolve: string;
 }
 
 export const MOUNT_PATHS: MountPaths = {
@@ -498,6 +500,7 @@ export const MOUNT_PATHS: MountPaths = {
   juicefs: "/usr/local/bin/juicefs",
   mountinfo: "/proc/1/mountinfo",
   inNode: "nsenter -t 1 -m --",
+  resolve: "getent hosts",
 };
 
 /**
@@ -513,14 +516,33 @@ export const MOUNT_PATHS: MountPaths = {
  * at `root` whose juicefs is gone, as a pod killed with no successor leaves one, is unmounted
  * first, lazily, so the next mounts afresh.
  *
+ * In the node's mount namespace its juicefs reads the node's resolv.conf, which resolves none of
+ * the cluster's names, its network the pod's still: so the metadata engine's and the bucket's,
+ * where they are a Service's, are resolved here, by the pod's DNS, and it is given their
+ * addresses. A Service's address lasts as long as it does; one made anew is reached once the pod
+ * is started again.
+ *
  * Its juicefs, run in the node's mount namespace, is still this pod's process, of its cgroup: the
  * pod's teardown kills it. So a pod hands its mount over before it is torn down, never after: the
  * pod that replaces it starts beside it (maxSurge), takes its FUSE session over, and only then is
  * it deleted, idle, its juicefs ended already. `paths` are MOUNT_PATHS but for tests.
  */
 export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: MountPaths = MOUNT_PATHS): string {
-  const { run, bin, state, cache, juicefs, mountinfo, inNode } = paths;
+  const { run, bin, state, cache, juicefs, mountinfo, inNode, resolve } = paths;
   return [
+    // `url`, its host a Service's name given as its address, by the pod's DNS.
+    "resolved() {",
+    '  scheme=${1%%://*}; rest=${1#*://}; auth=""',
+    '  case $rest in *@*) auth="${rest%@*}@"; rest=${rest##*@};; esac',
+    '  host=${rest%%[:/]*}; tail=${rest#"$host"}; address=$host',
+    "  case $host in *.svc|*.svc.cluster.local)",
+    `    address=$(${resolve} "$host" | awk '{ print $1; exit }')`,
+    '    [ -n "$address" ] || { echo "$host resolves to no address" >&2; return 1; };;',
+    "  esac",
+    `  printf '%s://%s%s%s\n' "$scheme" "$auth" "$address" "$tail"`,
+    "}",
+    'meta=$(resolved "$META_URL") || exit 1',
+    'bucket=$(resolved "$BUCKET") || exit 1',
     `run=${run}`,
     `mkdir -p "$run" ${bin} ${state} ${cache}`,
     `rm -f "$run/handed-over"`,
@@ -533,7 +555,7 @@ export function workspaceMountScript(root: string, cacheSizeMiB: number, paths: 
     `  ${inNode} umount -l ${root} && echo "unmounted the node's mount its juicefs left, which served nothing"`,
     "fi",
     `${inNode} mkdir -p ${root}`,
-    `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$META_URL" ${root} >> "$run/juicefs.log" 2>&1 &`,
+    `TMPDIR=${state} ${inNode} "$node_juicefs" mount --no-bgjob --bucket "$bucket" --cache-dir ${cache} --cache-size ${cacheSizeMiB} "$meta" ${root} >> "$run/juicefs.log" 2>&1 &`,
     "pid=$!",
     `echo "$pid" > "$run/juicefs.pid"`,
     `tail -n +1 -f "$run/juicefs.log" &`,
@@ -605,7 +627,7 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
             image: imageReference(config.images.alasio),
             imagePullPolicy: config.images.pullPolicy,
             command: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
-            env: [credential("META_URL", "metaurl"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
+            env: [credential("META_URL", "metaurl"), credential("BUCKET", "bucket"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
             readinessProbe: { exec: { command: ["sh", "-c", workspaceMountReady(WORKSPACES_ROOT)] }, periodSeconds: 2 },
             securityContext: { privileged: true },
             resources: config.workspaceStorage.mount.resources,
