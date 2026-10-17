@@ -557,6 +557,11 @@ test("up without a bot says to run init, and without the address Telegram delive
 
 test("status says each workload's state, and fails when one is not ready", async (t) => {
   const { alasio, kube, kubeconfig } = await installed(t);
+  // The sandbox gateway's counts of each pool, as it answers them in its pod.
+  kube.onExec = ({ container, command }) =>
+    container === "sandbox-gateway" && command[0] === "curl"
+      ? { exitCode: 0, stdout: JSON.stringify(command.at(-1)?.endsWith("/sandboxes-none") ? { free: 2, bound: 1, waiting: 0 } : { free: 0, bound: 3, waiting: 2 }) }
+      : { exitCode: 0 };
   const healthy = await alasio(["status"]);
   succeeded(healthy);
   assert.equal(healthy.printed[0], `alasio 0.0.0-development, in the cluster of the current context of ${kubeconfig} (${kube.server}):`);
@@ -565,8 +570,16 @@ test("status says each workload's state, and fails when one is not ready", async
   for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
     assert.ok(healthy.printed.includes(line), line);
   }
-  // A sandbox pool's, ready once its pods run, ready or not: as many warm.
-  for (const mode of ["none", "full"]) assert.ok(healthy.printed.includes(`  Deployment alasio-sessions/sandboxes-${mode}: pool, 1 warm`), healthy.printed.join("\n"));
+  // A sandbox pool's, ready once its pods run, ready or not: what it holds, as the gateway counts it.
+  assert.ok(healthy.printed.includes("  Deployment alasio-sessions/sandboxes-none: pool, 2 warm, 1 bound, 0 waiting"), healthy.printed.join("\n"));
+  assert.ok(healthy.printed.includes("  Deployment alasio-sessions/sandboxes-full: pool, 0 warm, 3 bound, 2 waiting"), healthy.printed.join("\n"));
+  assert.ok(kube.execs.some(({ namespace, container, command }) => namespace === "alasio" && container === "sandbox-gateway" && command.at(-1) === "http://127.0.0.1:8080/counts/alasio-sessions/sandboxes-none"));
+  // Where the gateway does not count them, as many warm as its Deployment says, and why not.
+  kube.onExec = () => ({ exitCode: 7, stderr: "curl: (7) Failed to connect to 127.0.0.1 port 8080" });
+  const uncounted = await alasio(["status"]);
+  succeeded(uncounted);
+  assert.ok(uncounted.printed.includes("  Deployment alasio-sessions/sandboxes-none: pool, 1 warm, its bindings not seen, as the sandbox gateway did not count them: curl: (7) Failed to connect to 127.0.0.1 port 8080"), uncounted.printed.join("\n"));
+  kube.onExec = () => ({ exitCode: 0 });
   // A compute neon-control has put to sleep sleeps, and is not unready.
   const compute = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute");
   assert.ok(compute?.spec);
