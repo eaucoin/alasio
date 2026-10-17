@@ -52,6 +52,7 @@ import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
 import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { apiServerUnconfined } from "../src/install.ts";
 import { hookOf } from "../../src/sandbox/snapshots.ts";
 
 /** The configuration `file`, with the Telegram Secret every configuration names. */
@@ -72,11 +73,23 @@ interface Peer {
   readonly ipBlock?: { readonly cidr: string; readonly except?: readonly string[] };
 }
 
-/** A pod, as NetworkPolicies select it: by its labels, and its namespace's. */
+/** A pod, as NetworkPolicies select it: by its labels, and its namespace's; and its address, a pod's of the cluster's unless it says. */
 interface Pod {
   readonly namespace: string;
   readonly namespaceLabels: Readonly<Record<string, string>>;
   readonly labels: Readonly<Record<string, string>>;
+  readonly address?: string;
+}
+
+/** A pod's address, where it says none: the cluster's, private. */
+const POD_ADDRESS = "10.42.0.9";
+
+/** Whether the IPv4 `address` is in `cidr`. */
+function within(address: string, cidr: string): boolean {
+  const [network = "", bits = "32"] = cidr.split("/");
+  const value = (each: string) => each.split(".").reduce((sum, octet) => sum * 256 + Number(octet), 0);
+  const size = 2 ** (32 - Number(bits));
+  return Math.floor(value(address) / size) === Math.floor(value(network) / size);
 }
 
 /** Whether `selector` selects what has `labels`. */
@@ -116,8 +129,8 @@ function admits(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, po
 /**
  * Whether `policies` let `from` connect to `to` on `port` on its way out, as Kubernetes
  * reads them: anywhere, where none of them selects `from` for egress; otherwise where a rule
- * of one that does reaches. A pod's address is the cluster's, private: an address block
- * reaches it unless it excepts any, as one that excepts the private networks does.
+ * of one that does reaches, an address block reaching what its address is in, and not in
+ * what it excepts.
  */
 function reaches(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean {
   const selecting = policies.filter(({ metadata, spec }) =>
@@ -125,7 +138,7 @@ function reaches(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, p
   );
   const peerReaches = (peer: Peer, namespace: string) =>
     peer.ipBlock !== undefined
-      ? (peer.ipBlock.except ?? []).length === 0
+      ? within(to.address ?? POD_ADDRESS, peer.ipBlock.cidr) && !(peer.ipBlock.except ?? []).some((cidr) => within(to.address ?? POD_ADDRESS, cidr))
       : (peer.namespaceSelector ? selects(peer.namespaceSelector, to.namespaceLabels) : to.namespace === namespace) &&
         (peer.podSelector ? selects(peer.podSelector, to.labels) : true);
   return selecting.length === 0 || selecting.some(({ metadata, spec }) =>
@@ -3478,6 +3491,46 @@ describe("the sandbox service", () => {
       selector: { matchExpressions: [{ key: "alasio.dev/binding", operator: "Exists" }] },
       unhealthyPodEvictionPolicy: "AlwaysAllow",
     }]);
+  });
+
+  test("lets the gateway and the receiver reach the cluster's DNS, what each talks to, and the API server alone, where up finds it, and anywhere where it cannot, which up warns of", () => {
+    const apiServer = { addresses: ["172.18.0.2", "172.18.0.3"], ports: [6443] };
+    const policies = all<NetworkPolicyObject>(manifests(configOf({}), { ...NOTHING_CARRIED, cpuBaseline: BASELINE, apiServer }), "NetworkPolicy");
+    const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
+      namespace,
+      namespaceLabels: { "kubernetes.io/metadata.name": namespace },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const elsewhere = (address: string): Pod => ({ namespace: "", namespaceLabels: {}, labels: {}, address });
+    const dns: Pod = { namespace: "kube-system", namespaceLabels: { "kubernetes.io/metadata.name": "kube-system" }, labels: { "k8s-app": "kube-dns" } };
+    const pooled = podOf("session", "alasio-sessions", { "alasio.dev/pool": "sandboxes-none", "alasio.dev/net-mode": "none", "alasio.dev/binding": "0".repeat(40) });
+    const branchPooled = {
+      ...pooled,
+      namespace: "alasio-branch-try-sessions",
+      namespaceLabels: { "kubernetes.io/metadata.name": "alasio-branch-try-sessions", "alasio.dev/branch": "try" },
+    };
+    const [gateway, receiver, alasio, agent, collector, proxy] = ["sandbox-gateway", "receiver", "alasio", "node-agent", "collector", "neon-proxy"].map((component) => podOf(component));
+    assert.ok(gateway && receiver && alasio && agent && collector && proxy);
+    const [api, apiToo, notApi, internet] = [elsewhere("172.18.0.2"), elsewhere("172.18.0.3"), elsewhere("172.18.0.9"), elsewhere("1.1.1.1")];
+    assert.ok(api && apiToo && notApi && internet);
+    const reached = (from: Pod) =>
+      ([[dns, 53], [api, 6443], [apiToo, 6443], [api, 443], [notApi, 6443], [internet, 443], [collector, 4318], [alasio, 4318], [proxy, 6432], [pooled, 7290], [branchPooled, 7290], [agent, 8484], [gateway, 8080]] as const)
+        .filter(([to, port]) => reaches(policies, from, to, port))
+        .map(([to, port]) => `${to.labels["app.kubernetes.io/component"] ?? to.labels["k8s-app"] ?? to.address}:${port}`);
+    assert.deepEqual(reached(receiver), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318"]);
+    assert.deepEqual(reached(gateway), ["kube-dns:53", "172.18.0.2:6443", "172.18.0.3:6443", "collector:4318", "session:7290", "session:7290", "node-agent:8484", "sandbox-gateway:8080"]);
+    // A branch environment's pool pods reach the receiver as main's do; a pod of a namespace of no environment's, none.
+    assert.equal(connects(policies, branchPooled, receiver, 4318), true);
+    assert.equal(admits(policies, { ...pooled, namespace: "elsewhere", namespaceLabels: { "kubernetes.io/metadata.name": "elsewhere" } }, receiver, 4318), false);
+    // Where up could not read where the API server is: anywhere, as up says.
+    const unread = all<NetworkPolicyObject>(install(), "NetworkPolicy");
+    assert.deepEqual([reaches(unread, receiver, notApi, 6443), reaches(unread, gateway, internet, 443)], [true, true]);
+    assert.deepEqual([
+      apiServerUnconfined(configOf({}), null),
+      apiServerUnconfined(configOf({}), apiServer),
+      apiServerUnconfined(configOf({ networkPolicies: { enabled: false } }), null),
+      apiServerUnconfined(configOf({ workspaceStorage: { enabled: false } }), null),
+    ], [true, false, false, false]);
   });
 
   test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {

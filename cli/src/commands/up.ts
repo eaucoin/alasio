@@ -67,13 +67,19 @@ export const refuseFirst = <E>(target: ResolvedTarget, check: Effect.Effect<void
     yield* Effect.provide(checked, kubeApi(target)).pipe(Effect.catchTag("KubeconfigUnusable", () => Effect.void));
   });
 
+/** What up says where it could not read where the API server is, and so confines nothing to it. */
+export const API_SERVER_UNCONFINED =
+  "Warning: the cluster's API server could not be found (the default namespace's kubernetes Service has no EndpointSlice alasio can read), " +
+  "so the sandbox gateway and the session telemetry receiver may reach any address, not that alone beside their own peers. alasio up confines them once it can read it.";
+
 /** Where alasio runs, and what the operator does next. */
-export const announce = (target: ResolvedTarget, { bot, claude, cpuBaseline }: Installed): Effect.Effect<void> =>
+export const announce = (target: ResolvedTarget, { bot, claude, cpuBaseline, apiServerUnconfined }: Installed): Effect.Effect<void> =>
   Console.log(
     [
       `alasio ${VERSION} runs in ${describeTarget(target)}.`,
       // What keeps sessions from being snapshotted, or restored on a node, if anything.
       ...(cpuBaseline ? baselineShortfalls(cpuBaseline) : []),
+      ...(apiServerUnconfined ? [API_SERVER_UNCONFINED] : []),
       "",
       `Message ${bot.username ? `@${bot.username}` : "your bot"} on Telegram to talk to it.`,
       ...(claude ? [] : ["Claude Code has no token yet: alasio init asks for one, which `claude setup-token` makes."]),

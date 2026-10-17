@@ -56,6 +56,7 @@ const KINDS = {
   Secret: { apiVersion: "v1", plural: "secrets", namespaced: true },
   PersistentVolumeClaim: { apiVersion: "v1", plural: "persistentvolumeclaims", namespaced: true },
   Service: { apiVersion: "v1", plural: "services", namespaced: true },
+  EndpointSlice: { apiVersion: "discovery.k8s.io/v1", plural: "endpointslices", namespaced: true },
   Pod: { apiVersion: "v1", plural: "pods", namespaced: true },
   Event: { apiVersion: "v1", plural: "events", namespaced: true },
   NetworkPolicy: { apiVersion: "networking.k8s.io/v1", plural: "networkpolicies", namespaced: true },
