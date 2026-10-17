@@ -183,3 +183,12 @@ export const release = Effect.fnUntraced(function*(pool: Pool, key: string): Eff
   if (pod?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, pod.metadata.name);
   yield* kube.remove("coordination.k8s.io/v1", "Lease", pool.namespace, leaseName(key));
 });
+
+/** How many of `pool`'s pods are free and serving, and how many of its keys are bound. */
+export const counts = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<{ readonly free: number; readonly bound: number }, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  const free = ((yield* kube.list("v1", "Pod", pool.namespace, selector(freeLabels(pool)))) as V1Pod[]).filter(serving).length;
+  const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name}`)) as BindingLease[];
+  return { free, bound: leases.filter(({ spec }) => spec?.holderIdentity).length };
+});
+
