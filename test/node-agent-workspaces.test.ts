@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -36,9 +36,11 @@ test("a workspace is made with its quota, which is read back, its directories it
     assert.equal(await refusal(at.workspaces.create({ environment: "main", workspace: "../etc" }, 1024)), 400);
     assert.equal(await refusal(at.workspaces.create({ environment: "main", workspace: "fs-other" }, 0)), 400);
     assert.equal(existsSync(join(at.workspacesRoot, "main", "fs-other")), false);
-    // One whose quota is not there: JuiceFS's refusal, as the agent says it.
-    const missing = await Effect.runPromise(Effect.flip(at.workspaces.quota({ environment: "main", workspace: "fs-never" })));
-    assert.match(missing.message, /^juicefs quota get failed: no quota of \/main\/fs-never$/u);
+    // Of one not there, none; of one there whose quota JuiceFS does not answer, its refusal, as the agent says it.
+    assert.equal(await Effect.runPromise(at.workspaces.quota({ environment: "main", workspace: "fs-never" })), null);
+    mkdirSync(join(at.workspacesRoot, "main", "fs-bare", "files"), { recursive: true });
+    const unanswered = await Effect.runPromise(Effect.flip(at.workspaces.quota({ environment: "main", workspace: "fs-bare" })));
+    assert.match(unanswered.message, /^juicefs quota get failed: no quota of \/main\/fs-bare$/u);
   } finally {
     at.done();
   }
@@ -79,6 +81,35 @@ test("an attach of a workspace there is not, or by names that are none, is refus
       assert.equal(await refusal(at.workspaces.attach({ environment, workspace }, pod, "t", {})), 400, `${environment}/${workspace} into ${pod}`);
     }
     assert.deepEqual(at.mounts, []);
+  } finally {
+    at.done();
+  }
+});
+
+test("a workspace is cloned into another, of any environment, its files' owners and modes kept, its quota its own; and deleted, its quota with it", async () => {
+  const at = workspacesNode();
+  try {
+    const source = { environment: "main", workspace: "fs-source" };
+    await Effect.runPromise(at.workspaces.create(source, 1024 ** 3));
+    const sourceFiles = join(at.workspacesRoot, "main", "fs-source", "files");
+    writeFileSync(join(sourceFiles, "workspace", "kept"), "from the source");
+    chmodSync(join(sourceFiles, "workspace", "kept"), 0o640);
+    const fork = { environment: "alasio-branch-try-sessions", workspace: "fs-source" };
+    await Effect.runPromise(at.workspaces.clone(source, fork, 3 * 1024 ** 3));
+    const forked = join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source", "files", "workspace", "kept");
+    assert.equal(readFileSync(forked, "utf8"), "from the source");
+    assert.equal(statSync(forked).mode & 0o777, 0o640);
+    assert.equal((await Effect.runPromise(at.workspaces.quota(fork)))?.capacityBytes, 3 * 1024 ** 3);
+    // Of one not there, or into one there already: refused.
+    assert.equal(await refusal(at.workspaces.clone({ environment: "main", workspace: "fs-never" }, { environment: "main", workspace: "fs-other" }, 1024)), 404);
+    assert.equal(await refusal(at.workspaces.clone(source, fork, 1024)), 409);
+    // Deleted, its quota with it; again, nothing.
+    await Effect.runPromise(at.workspaces.remove(fork));
+    assert.equal(existsSync(join(at.workspacesRoot, "alasio-branch-try-sessions", "fs-source")), false);
+    await Effect.runPromise(at.workspaces.remove(fork));
+    assert.ok(at.juicefsCalls().some((call) => call.startsWith("quota delete redis://valkey.alasio.svc:6379/1 --path /alasio-branch-try-sessions/fs-source ")));
+    assert.ok(at.juicefsCalls().some((call) => call.startsWith(`clone --preserve ${sourceFiles} `)));
+    assert.equal(readFileSync(join(sourceFiles, "workspace", "kept"), "utf8"), "from the source");
   } finally {
     at.done();
   }

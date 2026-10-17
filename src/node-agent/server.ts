@@ -71,6 +71,11 @@
  *   features each sees on it, and the workspaces whose images its cache holds, by digest.
  * - `POST /workspaces`, `{ environment, workspace, quotaBytes }`: makes the workspace, its
  *   directory and its quota (./workspaces.ts) (204); again, sets its quota anew.
+ * - `POST /workspaces/clones`, `{ from, to, quotaBytes }`: makes the workspace `to`, of any
+ *   environment, a clone of `from`, its quota its own (204); 404 where `from` is not there,
+ *   409 where `to` is.
+ * - `DELETE /workspaces/<environment>/<workspace>`: deletes the workspace, its quota with it
+ *   (204), as it does one that is not there.
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
@@ -117,7 +122,7 @@ import {
 } from "./agent.ts";
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
-import { makeQuotas } from "./quotas.ts";
+import { makeJuicefs } from "./juicefs.ts";
 import { makeWorkspaces, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
 import {
   BACKGROUND_READ_SECONDS_VARIABLE,
@@ -152,6 +157,8 @@ export const MAX_WRITE_BYTES = 64 * 1024 ** 2;
 
 /** What `POST /workspaces` is given. */
 const CreateRequest = Schema.Struct({ ...WorkspaceRef.fields, quotaBytes: Schema.Number });
+/** What `POST /workspaces/clones` is given. */
+const CloneRequest = Schema.Struct({ from: WorkspaceRef, to: WorkspaceRef, quotaBytes: Schema.Number });
 
 /** What `POST /attach` is given. */
 const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String) });
@@ -169,7 +176,7 @@ const STATUS: Readonly<Record<string, number>> = {
   SnapshotOutlived: 410,
   PoliciesNotInForce: 504,
   SandboxUnsaveable: 410,
-  QuotaError: 503,
+  JuicefsError: 503,
 };
 
 const SNAPSHOT = /^\/snapshots\/([^/]+)\/([^/]+)$/u;
@@ -180,6 +187,7 @@ const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
 const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
 const QUOTA = /^\/workspaces\/([^/]+)\/([^/]+)\/quota$/u;
+const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
 
 const answer = (status: number, body: unknown): HttpServerResponse.HttpServerResponse => HttpServerResponse.jsonUnsafe(body, { status });
 
@@ -295,6 +303,11 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     if (method === "POST" && url === "/workspaces") {
       return body(CreateRequest).pipe(Effect.flatMap(({ quotaBytes, ...ref }) => workspaces.create(ref, quotaBytes)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
+    if (method === "POST" && url === "/workspaces/clones") {
+      return body(CloneRequest).pipe(Effect.flatMap(({ from, to, quotaBytes }) => workspaces.clone(from, to, quotaBytes)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+    }
+    const workspace = WORKSPACE.exec(url);
+    if (method === "DELETE" && workspace) return workspaceOf(workspace).pipe(Effect.flatMap(workspaces.remove), Effect.as(HttpServerResponse.empty({ status: 204 })));
     const quota = QUOTA.exec(url);
     if (method === "GET" && quota) {
       return workspaceOf(quota).pipe(
@@ -402,8 +415,8 @@ export const nodeAgent: Effect.Effect<void, Config.ConfigError | HttpServerError
   });
   // Workspace storage's metadata engine, where the agent is given it, which it sets quotas on alone.
   const metaUrl = yield* Config.option(Config.Redacted(META_URL_VARIABLE));
-  const quotas = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeQuotas({ metaUrl: Redacted.value(url) }) });
-  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc, quotas }) });
+  const juicefs = Option.match(metaUrl, { onNone: () => null, onSome: (url) => makeJuicefs({ metaUrl: Redacted.value(url) }) });
+  const served = yield* serveNodeAgent({ port: NODE_AGENT_PORT, token: Redacted.value(token), agent, workspaces: makeWorkspaces({ host, runsc, juicefs }) });
   // As it stops, before its API does: its restores' reads of the bucket done first.
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {

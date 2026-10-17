@@ -20,8 +20,10 @@
  * removed, so its pod can be deleted: kubelet deletes no pod whose directory holds a mount.
  *
  * A workspace is made as its session is (create): its directory, with its files' `workspace/`
- * and `home/`, its agent's, and its quota set on the directory (./quotas.ts), at once; made
- * again, it is as it was, its quota set anew. Its quota is read back as it is asked for.
+ * and `home/`, its agent's, and its quota set on the directory (./juicefs.ts), at once; made
+ * again, it is as it was, its quota set anew. Its quota is read back as it is asked for. One
+ * is made a clone of another (clone), of any environment's, its quota its own; and one is
+ * deleted, its quota with it, its files into workspace storage's trash.
  *
  * A file read or written is reached by its path from the workspace's root alone, walked one
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
@@ -34,7 +36,7 @@ import { Effect, Schema } from "effect";
 
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
-import type { Quota, QuotaError, Quotas } from "./quotas.ts";
+import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
 import { ATTACH_ROOT, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
@@ -86,9 +88,13 @@ export function mountPoints(mountinfo: string): string[] {
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
   /** Makes `ref`, as the module says, its quota `quotaBytes`. */
-  readonly create: (ref: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, WorkspaceRefused | QuotaError>;
+  readonly create: (ref: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, WorkspaceRefused | JuicefsError>;
+  /** Makes `to` a clone of `from`, its quota `quotaBytes`; refused where `from` is not there, or `to` is. */
+  readonly clone: (from: WorkspaceRef, to: WorkspaceRef, quotaBytes: number) => Effect.Effect<void, WorkspaceRefused | JuicefsError>;
+  /** Deletes `ref`, its quota with it; one that is not there is not an error. */
+  readonly remove: (ref: WorkspaceRef) => Effect.Effect<void, WorkspaceRefused | JuicefsError>;
   /** `ref`'s quota, and what it holds; null where it has none. */
-  readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | QuotaError>;
+  readonly quota: (ref: WorkspaceRef) => Effect.Effect<Quota | null, WorkspaceRefused | JuicefsError>;
   /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env` beside them. */
   readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
@@ -118,18 +124,18 @@ const confined = <A>(path: string, io: () => Promise<A>): Effect.Effect<A, Works
     },
   }).pipe(Effect.timeoutOrElse({ duration: FILE_TIMEOUT, orElse: () => Effect.fail(refused(504, `${path} was not reached within ${FILE_TIMEOUT}`)) }));
 
-/** What makeWorkspaces is given: the node's commands (mounts are made in its mount namespace), its runsc, the quotas, none where workspace storage has none, and, but for tests, where its roots are and whose files are. */
+/** What makeWorkspaces is given: the node's commands (mounts are made in its mount namespace), its runsc, JuiceFS's command, none where the agent is given no workspace storage, and, but for tests, where its roots are and whose files are. */
 export interface WorkspacesOptions {
   readonly host: HostCommands;
   readonly runsc: Pick<Runsc, "container">;
-  readonly quotas: Quotas | null;
+  readonly juicefs: Juicefs | null;
   readonly workspacesRoot?: string;
   readonly attachRoot?: string;
   readonly agentUid?: number;
 }
 
 /** The agent's workspaces, as the module says. */
-export function makeWorkspaces({ host, runsc, quotas, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -146,31 +152,58 @@ export function makeWorkspaces({ host, runsc, quotas, workspacesRoot = WORKSPACE
       Effect.map(({ stdout }) => mountPoints(stdout).filter((point) => point === directory || point.startsWith(`${directory}/`)).toSorted((a, b) => b.length - a.length)),
     );
 
-  /** The quotas, refused where there are none. */
-  const quotasOr = quotas ? Effect.succeed(quotas) : Effect.fail(refused(501, "this node agent sets no quotas, as workspace storage is not given it"));
+  /** JuiceFS's command, refused where the agent is given none. */
+  const juicefsOr = juicefs ? Effect.succeed(juicefs) : Effect.fail(refused(501, "this node agent makes no workspace, as workspace storage is not given it"));
   /** `ref`'s directory, as its quota names it, from the file system's root. */
   const quotaPath = ({ environment, workspace }: WorkspaceRef): string => `/${environment}/${workspace}`;
+  /** Whether `path` is there, on the node's mount. */
+  const there = (path: string) => Effect.promise(() => lstat(path).then(() => true, () => false));
+  /** `work` done on the node's mount, a failure of it refused as workspace storage's not answering. */
+  const onMount = (what: string, work: () => Promise<unknown>) =>
+    Effect.tryPromise({ try: work, catch: (error) => refused(503, `${what}: ${error instanceof Error ? error.message : String(error)}`) });
 
   return {
     create: (ref, quotaBytes) =>
       Effect.gen(function*() {
         const files = yield* filesOf(ref);
         if (!Number.isSafeInteger(quotaBytes) || quotaBytes <= 0) return yield* refused(400, `${quotaBytes} is no quota`);
-        const quota = yield* quotasOr;
-        yield* Effect.tryPromise({
-          try: async () => {
-            for (const directory of [join(files, "workspace"), join(files, "home")]) await mkdir(directory, { recursive: true });
-            for (const directory of [files, join(files, "workspace"), join(files, "home")]) await chown(directory, agentUid, agentUid);
-          },
-          catch: (error) => refused(503, `${ref.environment}/${ref.workspace} could not be made: ${error instanceof Error ? error.message : String(error)}`),
+        const command = yield* juicefsOr;
+        yield* onMount(`${ref.environment}/${ref.workspace} could not be made`, async () => {
+          for (const directory of [join(files, "workspace"), join(files, "home")]) await mkdir(directory, { recursive: true });
+          for (const directory of [files, join(files, "workspace"), join(files, "home")]) await chown(directory, agentUid, agentUid);
         });
-        yield* quota.set(quotaPath(ref), quotaBytes);
+        yield* command.setQuota(quotaPath(ref), quotaBytes);
+      }),
+
+    clone: (from, to, quotaBytes) =>
+      Effect.gen(function*() {
+        const source = yield* filesOf(from);
+        const destination = yield* filesOf(to);
+        if (!Number.isSafeInteger(quotaBytes) || quotaBytes <= 0) return yield* refused(400, `${quotaBytes} is no quota`);
+        const command = yield* juicefsOr;
+        if (!(yield* there(source))) return yield* refused(404, `there is no workspace ${from.environment}/${from.workspace}`);
+        if (yield* there(join(destination, ".."))) return yield* refused(409, `there is a workspace ${to.environment}/${to.workspace} already`);
+        yield* onMount(`${to.environment}/${to.workspace} could not be made`, () => mkdir(join(destination, ".."), { recursive: true }));
+        yield* command.clone(source, destination);
+        yield* command.setQuota(quotaPath(to), quotaBytes);
+      }),
+
+    remove: (ref) =>
+      Effect.gen(function*() {
+        const files = yield* filesOf(ref);
+        const command = yield* juicefsOr;
+        if (!(yield* there(join(files, "..")))) return;
+        yield* command.deleteQuota(quotaPath(ref)).pipe(Effect.catch((error) => Effect.logWarning(`${ref.environment}/${ref.workspace}'s quota was not deleted: ${error.message}`)));
+        yield* onMount(`${ref.environment}/${ref.workspace} could not be deleted`, () => rm(join(files, ".."), { recursive: true, force: true }));
       }),
 
     quota: (ref) =>
       Effect.gen(function*() {
-        yield* filesOf(ref);
-        return yield* (yield* quotasOr).get(quotaPath(ref));
+        const files = yield* filesOf(ref);
+        const command = yield* juicefsOr;
+        // Of one not there, none.
+        if (!(yield* there(join(files, "..")))) return null;
+        return yield* command.quota(quotaPath(ref));
       }),
 
     attach: (ref, pod, token, env) =>
