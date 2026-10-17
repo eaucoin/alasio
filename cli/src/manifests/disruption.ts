@@ -13,10 +13,16 @@
  *   (src/kube/busy.ts), and its namespace's budget of busy pods lets none of them be
  *   evicted: a drain waits until the turn is done. Of pods whose owner has no scale (a
  *   Sandbox's), the disruption controller cannot count how many there should be, and so
- *   allows none to be evicted, which is the rule all the same.
+ *   allows none to be evicted, which is the rule all the same;
+ * - a pod of the sandbox service's pools bound to a workspace holds what lives only in it
+ *   until its release, its REPLs' state: its namespace's budget of bound pods lets none of
+ *   them be evicted, so a drain waits until each is released, after it has been quiet
+ *   for `sessions.releaseAfter`. Bound, it is out of its Deployment, and so of no owner the
+ *   disruption controller counts, as a Sandbox's pod is.
  */
 import type { V1PodDisruptionBudget, V1TopologySpreadConstraint } from "@kubernetes/client-node";
 
+import { BINDING_LABEL } from "../../../src/binder/bindings.ts";
 import { BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { componentName, labels, selectorLabels } from "./common.ts";
 import type { Scale } from "./config.ts";
@@ -46,6 +52,16 @@ export function busyBudget(namespace: string): V1PodDisruptionBudget {
     kind: "PodDisruptionBudget",
     metadata: { name: componentName("busy"), namespace, labels: labels("alasio") },
     spec: { maxUnavailable: 0, selector: { matchLabels: { [BUSY_LABEL]: "true" } }, unhealthyPodEvictionPolicy: "AlwaysAllow" },
+  };
+}
+
+/** The budget of `namespace`'s bound pods, the sandbox service's: none of them evicted, but one not ready, as busyBudget's. */
+export function boundBudget(namespace: string): V1PodDisruptionBudget {
+  return {
+    apiVersion: "policy/v1",
+    kind: "PodDisruptionBudget",
+    metadata: { name: componentName("bound"), namespace, labels: labels("session") },
+    spec: { maxUnavailable: 0, selector: { matchExpressions: [{ key: BINDING_LABEL, operator: "Exists" }] }, unhealthyPodEvictionPolicy: "AlwaysAllow" },
   };
 }
 

@@ -115,6 +115,11 @@ test("of binders claiming a pool's free pods at once, each pod is claimed once, 
       [pod?.metadata?.labels?.[FREE_LABEL], pod?.metadata?.labels?.[POOL_LABEL], pod?.metadata?.labels?.[BINDING_LABEL], pod?.metadata?.annotations?.[KEY_ANNOTATION]],
       [undefined, of.name, keyHash(key), key],
     );
+    // Its node kept while it is bound, as what it holds lives in it alone.
+    assert.deepEqual(
+      [pod?.metadata?.annotations?.["cluster-autoscaler.kubernetes.io/safe-to-evict"], pod?.metadata?.annotations?.["karpenter.sh/do-not-disrupt"]],
+      ["false", "true"],
+    );
   }
 });
 
@@ -194,14 +199,14 @@ test("a key whose Lease names a pod gone is bound anew, to another pod", async (
 test("a bind that makes its own pod makes it bound to the key from the first, and claims none", async () => {
   const of = await pool();
   await freePods(of, 1);
-  const made: Record<string, string>[] = [];
+  const made: Record<string, string>[][] = [];
   const layer = binderOf();
   const bound = await bindIn(layer, (each) =>
     each.bind(of, "sessionfs:restored", {
       make: (labels, annotations) =>
         withKube((client) =>
           Effect.gen(function*() {
-            made.push({ ...labels });
+            made.push([{ ...labels }, { ...annotations }]);
             const pod = yield* client.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name: "restored", namespace: of.namespace, labels: { ...labels }, annotations: { ...annotations } }, spec: { containers: [{ name: "bayma", image: "agent" }] } });
             yield* serve(client, of, "restored");
             return pod;
@@ -210,7 +215,11 @@ test("a bind that makes its own pod makes it bound to the key from the first, an
     })
   );
   assert.equal(bound.pod, "restored");
-  assert.deepEqual(made, [boundLabels(of, "sessionfs:restored")]);
+  assert.deepEqual(made, [[boundLabels(of, "sessionfs:restored"), {
+    [KEY_ANNOTATION]: "sessionfs:restored",
+    "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
+    "karpenter.sh/do-not-disrupt": "true",
+  }]]);
   assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), ["restored"]);
 });
 
