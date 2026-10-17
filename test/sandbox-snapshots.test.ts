@@ -605,7 +605,8 @@ test("what no Sandbox has a use for is collected: snapshots of sessions that are
   await run(kube, Effect.scoped(Effect.gen(function*() {
     const snapshotted = yield* makeSessionSnapshots({ profile: profile(), snapshots, agents, templates: templates(profile()) });
     yield* snapshotted.watch({ token: () => Effect.succeed(null) } as unknown as Sandboxes, () => null);
-    yield* Effect.sleep("50 millis");
+    // Its first collection, in the background: waited for, as long as a loaded machine takes.
+    for (let waited = 0; asked.length < 4 && waited < 5_000; waited += 10) yield* Effect.sleep("10 millis");
   })));
   assert.deepEqual(asked, [
     "forget alasio-sessions/fs-gone",
