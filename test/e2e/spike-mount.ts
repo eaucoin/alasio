@@ -13,7 +13,7 @@ import type { V1ConfigMap, V1CronJob, V1Node, V1Pod } from "@kubernetes/client-n
 
 import { componentName, NAMESPACE } from "../../cli/src/manifests/common.ts";
 import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "../../cli/src/manifests/workspace-storage.ts";
-import { kube, ref } from "./harness.ts";
+import { kube, onNode, ref } from "./harness.ts";
 import { inPool, isReady, poolPod, ROOT, said, SPIKE_NAMESPACE } from "./spike-attach.ts";
 import { until } from "./workspace-storage.ts";
 
@@ -95,6 +95,8 @@ export function spikeMount(): void {
         const wrote = await writing;
         said("G7", "the writer", wrote.out.split("\n").slice(-40));
       } finally {
+        // Detached first, as a pod whose directory holds a mount is never deleted whole.
+        await onNode(node, `umount -l ${ROOT}/pods/${pod}/ws; umount -l ${ROOT}/jfs; true`).catch(() => undefined);
         for (const name of ["spike-mounter-a", "spike-mounter-b"]) await kube.remove(ref("Pod", name, NAMESPACE)).catch(() => undefined);
         await kube.remove(ref("Pod", pod, SPIKE_NAMESPACE)).catch(() => undefined);
         await kube.remove(ref("Namespace", SPIKE_NAMESPACE)).catch(() => undefined);

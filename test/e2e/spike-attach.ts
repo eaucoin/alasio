@@ -145,9 +145,13 @@ export function spikeAttach(): void {
         said("G1", "mounts after it", (await inAttacher("grep spike /proc/self/mountinfo | grep pods || echo none")).out);
         said("G1", "lazy unmount while held", await inAttacher(`umount -l /spike/pods/${pod}/ws`));
         said("G1", "seen in the pod after the lazy unmount", (await inPool(pod, "cat /attach/ws/workspace/marker; ls /attach/ws")).out);
+        said("G1", "lazy unmount of the one beneath, held", await inAttacher(`umount -l /spike/pods/${pod}/ws`));
+        said("G1", "seen in the pod after both", (await inPool(pod, "cat /attach/ws/workspace/marker; ls -la /attach/ws")).out);
+        said("G1", "node mounts before the pod's deletion", (await inAttacher("grep spike /proc/self/mountinfo | grep pods || echo none")).out);
+        const deleting = Date.now();
         await kube.remove(ref("Pod", pod, SPIKE_NAMESPACE));
-        await until("the pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", pod, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000);
-        said("G1", "node mounts after the pod's deletion", (await inAttacher("grep spike /proc/self/mountinfo | grep pods || echo none")).out);
+        const gone = await until("the pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", pod, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000).catch(() => false);
+        said("G1", "pod deleted, its workspace detached first", { gone, afterMs: Date.now() - deleting });
 
         // A second pod: attached, then released only after its deletion.
         const after = "pool-1";
@@ -157,9 +161,16 @@ export function spikeAttach(): void {
         await inAttacher(`mount --bind /spike/jfs/spike/a/files /spike/pods/${after}/ws`);
         await until("the second attach seen", async () => ((await inPool(after, "cat /attach/ws/workspace/marker")).out === "a" ? true : undefined), 60_000).catch(() => false);
         await inPool(after, "nohup sh -c 'exec 3</attach/ws/workspace/marker; sleep 600' >/dev/null 2>&1 & sleep 1");
+        const deletingAfter = Date.now();
         await kube.remove(ref("Pod", after, SPIKE_NAMESPACE));
-        await until("the second pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", after, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000);
-        said("G1", "plain unmount after the pod's deletion", await inAttacher(`umount /spike/pods/${after}/ws`));
+        const stopped = await until("the second pool pod's container stopped", async () => {
+          const ended = await kube.get<V1Pod>(ref("Pod", after, SPIKE_NAMESPACE));
+          return ended === null || ended.status?.containerStatuses?.every(({ state }) => state?.terminated) ? true : undefined;
+        }, 120_000).catch(() => false);
+        said("G1", "the second pod's container stopped, its workspace attached", { stopped, afterMs: Date.now() - deletingAfter });
+        said("G1", "plain unmount once its container stopped", await inAttacher(`umount /spike/pods/${after}/ws`));
+        const goneAfter = await until("the second pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", after, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000).catch(() => false);
+        said("G1", "the second pod gone once detached", { gone: goneAfter, afterMs: Date.now() - deletingAfter });
 
         // Over the root: a bind on the pod's attach directory itself, after it started.
         const root = "pool-2";
@@ -169,9 +180,9 @@ export function spikeAttach(): void {
         await inAttacher(`mount --bind /spike/jfs/spike/a/files /spike/pods/${root}`);
         const overRoot = await until("the bind over the root seen", async () => ((await inPool(root, "cat /attach/workspace/marker")).out === "a" ? true : undefined), 20_000).catch(() => false);
         said("G1", "bind over the root seen", overRoot);
-        await kube.remove(ref("Pod", root, SPIKE_NAMESPACE));
-        await until("the third pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", root, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000);
         await inAttacher(`umount -l /spike/pods/${root}`);
+        await kube.remove(ref("Pod", root, SPIKE_NAMESPACE));
+        await until("the third pool pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", root, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000).catch(() => false);
 
         // G6: a directory quota, its usage reported, and a write past it refused, in a pod.
         said("G6", "quota set", await inAttacher('juicefs quota set "$META_URL" --path /spike/a --capacity 1 2>&1 | tail -3'));
@@ -187,11 +198,11 @@ export function spikeAttach(): void {
         await inPool(quota, "rm -f /attach/ws/workspace/fill");
         await new Promise((resolve) => setTimeout(resolve, 5000));
         said("G6", "quota get after removing it", (await inAttacher('juicefs quota get "$META_URL" --path /spike/a 2>&1 | tail -6')).out);
-        await kube.remove(ref("Pod", quota, SPIKE_NAMESPACE));
-        await until("the quota pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", quota, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000);
         await inAttacher(`umount -l /spike/pods/${quota}/ws`);
+        await kube.remove(ref("Pod", quota, SPIKE_NAMESPACE));
+        await until("the quota pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", quota, SPIKE_NAMESPACE))) === null ? true : undefined), 120_000).catch(() => false);
       } finally {
-        await inAttacher("umount -l /spike/jfs; rm -rf /spike/pods").catch(() => undefined);
+        await inAttacher("for m in $(grep ' /spike/pods/' /proc/self/mountinfo | cut -d' ' -f5 | sort -r); do umount -l $m; done; umount -l /spike/jfs; rm -rf /spike/pods").catch(() => undefined);
         await kube.remove(ref("Pod", ATTACHER, NAMESPACE)).catch(() => undefined);
         await kube.remove(ref("Namespace", SPIKE_NAMESPACE)).catch(() => undefined);
       }
