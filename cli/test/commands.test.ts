@@ -564,6 +564,8 @@ test("status says each workload's state, and fails when one is not ready", async
   for (const line of ["  StatefulSet kube-system/juicefs-csi-controller: ready", "  DaemonSet kube-system/juicefs-csi-node: ready", "  StatefulSet alasio/alasio-valkey: ready"]) {
     assert.ok(healthy.printed.includes(line), line);
   }
+  // A sandbox pool's, ready once its pods run, ready or not: as many warm.
+  for (const mode of ["none", "full"]) assert.ok(healthy.printed.includes(`  Deployment alasio-sessions/sandboxes-${mode}: pool, 1 warm`), healthy.printed.join("\n"));
   // A compute neon-control has put to sleep sleeps, and is not unready.
   const compute = kube.get("/apis/apps/v1/namespaces/alasio/deployments/alasio-neon-compute");
   assert.ok(compute?.spec);
@@ -571,6 +573,14 @@ test("status says each workload's state, and fails when one is not ready", async
   const sleeping = await alasio(["status"]);
   succeeded(sleeping);
   assert.ok(sleeping.printed.includes("  Deployment alasio/alasio-neon-compute: asleep"), sleeping.printed.join("\n"));
+  // A pool whose pods do not run is not ready, as never a pod of it starts: it says so.
+  const pools = [...kube.objects.entries()].filter(([path, object]) => path.startsWith("/api/v1/namespaces/alasio-sessions/pods/") && object.metadata.labels?.["alasio.dev/pool"] === "sandboxes-none");
+  assert.ok(pools.length > 0);
+  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Pending" };
+  const unstarted = await alasio(["status"]);
+  assert.match(failure(unstarted), /^1 of alasio's \d+ workloads are not ready$/u);
+  assert.ok(unstarted.printed.includes("  Deployment alasio-sessions/sandboxes-none: 0 of 1 running"), unstarted.printed.join("\n"));
+  for (const [, pod] of pools) pod.status = { ...pod.status, phase: "Running" };
   const deployment = kube.get(DEPLOYMENT);
   assert.ok(deployment?.status);
   deployment.status["availableReplicas"] = 0;
