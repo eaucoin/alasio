@@ -12,6 +12,11 @@
  *   session.ts finish <volumeId> <replId> <execId>
  *                                            that exec, followed until it ends; `Seen`
  *   session.ts read <volumeId> <replId>      `marker + 1` and `step`; `Read`
+ *   session.ts ballast <volumeId> <replId> <mib>
+ *                                            the REPL holding <mib> MiB of random bytes, and
+ *                                            their SHA-256, untouched after
+ *   session.ts touch <volumeId> <replId>     whether those bytes are what they were: "intact",
+ *                                            "changed", or what the exec answered instead
  *
  * After `create`, the REPL is reached through the session's Service and token, as a new
  * client that takes it over: alasio's ensure is left out, which would repair a pod the gate
@@ -143,7 +148,7 @@ const seen = await Effect.runPromise(Effect.gen(function*() {
   const { sessions } = yield* loadKubeTemplates;
   if (!sessions) return yield* Effect.die(new Error("the installation gives no sessions template"));
   if (mode === "create") return yield* create(sessions).pipe(Effect.provide(SessionSandboxes.layer({ profile: sessions, stateDir: "/tmp/gate-12", env: {} })));
-  if (!volumeId || !replId) return yield* Effect.die(new Error("usage: session.ts create | set|start|finish|read <volumeId> <replId> [<n>|<execId>]"));
+  if (!volumeId || !replId) return yield* Effect.die(new Error("usage: session.ts create | set|start|finish|read|ballast|touch <volumeId> <replId> [<n>|<execId>|<mib>]"));
   if (mode === "set" && argument) {
     return yield* inRepl(sessions, volumeId, replId, async (client) => ({ result: answer(await exec(client, replId, `globalThis.step = ${Number(argument)}`)) }));
   }
@@ -162,6 +167,21 @@ const seen = await Effect.runPromise(Effect.gen(function*() {
       const done = await settled(client, replId, await call<Snapshot>(client, "wait", { session_id: replId, exec_id: argument, yield_time_ms: 60_000 }));
       return { result: answer(done), notice: done.notice ?? null };
     });
+  }
+  if (mode === "ballast" && argument) {
+    return yield* inRepl(sessions, volumeId, replId, async (client) => ({
+      result: answer(await exec(client, replId, [
+        'const { createHash, randomBytes } = require("node:crypto")',
+        `globalThis.ballast = randomBytes(${Number(argument)} * 1024 * 1024)`,
+        'globalThis.ballastSum = createHash("sha256").update(globalThis.ballast).digest("hex")',
+        "globalThis.ballast.length",
+      ].join("\n"))),
+    }));
+  }
+  if (mode === "touch") {
+    return yield* inRepl(sessions, volumeId, replId, async (client) => ({
+      result: answer(await exec(client, replId, 'require("node:crypto").createHash("sha256").update(globalThis.ballast).digest("hex") === globalThis.ballastSum ? "intact" : "changed"')),
+    }));
   }
   if (mode === "read") {
     return yield* inRepl(sessions, volumeId, replId, async (client): Promise<Read> => {
