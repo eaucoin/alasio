@@ -271,6 +271,9 @@ if (inShard("upgrade")) {
       branchTelegram?.close();
     });
 
+    /** The snapshots overlayfs holds on the node, one a line, as k3s's containerd lists them under its heading. */
+    const overlayfsSnapshots = async () => (await onNode("", "k3s ctr -n k8s.io snapshots --snapshotter overlayfs ls | tail -n +2")).trim();
+
     /** Whether the Deployment `name` of main's runs its replicas, ready. */
     const runs = async (name: string) => {
       const deployment = await kube.get<V1Deployment>(ref("Deployment", name, NAMESPACE));
@@ -513,6 +516,18 @@ if (inShard("upgrade")) {
           await tg.waitFor((call) => answered(call));
         },
       },
+      {
+        seeds: "the node's images, unpacked by overlayfs",
+        seed: async () => {
+          assert.notEqual(await overlayfsSnapshots(), "");
+        },
+        keeps: "none of them, every image pulled anew through stargz-snapshotter's daemon, alasio's own lazily",
+        check: async () => {
+          assert.equal(await overlayfsSnapshots(), "");
+          assert.match(await alasioOk("status"), /^ {2}service stargz-snapshotter, which k3s pulls images through: active$/mu);
+          if (ESTARGZ) assert.ok(await onRemoteSnapshot(NAMESPACE, await kube.runningPod(NAMESPACE, RELEASE)), "alasio's pod runs on no remote snapshot");
+        },
+      },
     ];
 
     for (const { seeds, seed } of scenarios) test(`on ${PREVIOUS}: ${seeds}`, seed);
@@ -601,6 +616,7 @@ if (inShard("upgrade")) {
       const again = await cutOver();
       assert.equal(again.code, 0, `${again.stdout}${again.stderr}`);
       assert.doesNotMatch(again.stderr, /checking that|upgrading, from the cut-over begun at /u);
+      assert.doesNotMatch(again.stderr, /stopping k3s, to remove the node's images/u);
       assert.match(again.stderr, /upgraded at \S+\n[^\n]* removing what of [^\n]* this release has no use for[^\n]*\n[^\n]* through\n$/u);
       assert.equal(await alasioGeneration(), generation);
       upgraded = Date.now();
