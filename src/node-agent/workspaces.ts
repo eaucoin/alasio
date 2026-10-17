@@ -28,8 +28,16 @@
  * A file read or written is reached by its path from the workspace's root alone, walked one
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
+ *
+ * Beside its files, which its sandbox sees, and so out of its sandbox's reach, a workspace
+ * keeps the snapshot it was last released into (`released.json`, a Released), which its
+ * gateway records as it releases it and reads as it binds it, holding its binding's Lease
+ * meanwhile, the one writer at a time: written whole or not at all, a file of its own synced
+ * then renamed over it, the directory synced after.
  */
-import { chown, lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
+import { chown, lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -37,6 +45,7 @@ import { Effect, Schema } from "effect";
 import { isValidVolumeId } from "../sandbox/names.ts";
 import { type HostCommandError, type HostCommands, onNode } from "./host.ts";
 import type { Juicefs, JuicefsError, Quota } from "./juicefs.ts";
+import { SNAPSHOT_ID } from "../kube/sandbox-shape.ts";
 import { ATTACH_ROOT, WORKSPACES_ROOT } from "./names.ts";
 import type { Runsc } from "./runsc.ts";
 import { readUnder, writeUnder } from "./volume.ts";
@@ -85,6 +94,13 @@ export function mountPoints(mountinfo: string): string[] {
   });
 }
 
+/** The snapshot a workspace was last released into: its id, and the gVisor release that took it. */
+export const Released = Schema.Struct({ snapshot: Schema.String.check(Schema.isPattern(new RegExp(`^${SNAPSHOT_ID}$`, "u"))), release: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u)) });
+export type Released = typeof Released.Type;
+
+/** The name of a workspace's record of the snapshot it was released into, beside its files. */
+const RELEASED_FILE = "released.json";
+
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
   /** Makes `ref`, as the module says, its quota `quotaBytes`. */
@@ -105,6 +121,10 @@ export interface Workspaces {
   readonly read: (ref: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Buffer, WorkspaceRefused>;
   /** Writes `bytes` as the file at `path` of `ref`'s files, its agent's, its directories made. */
   readonly write: (ref: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, WorkspaceRefused>;
+  /** The snapshot `ref` was last released into, as the module says; null where none is recorded. */
+  readonly released: (ref: WorkspaceRef) => Effect.Effect<Released | null, WorkspaceRefused>;
+  /** Records the snapshot `ref` is released into, or none, as the module says; refused where there is no such workspace. */
+  readonly setReleased: (ref: WorkspaceRef, released: Released | null) => Effect.Effect<void, WorkspaceRefused>;
 }
 
 /** How long a file of a workspace may take to read or write: the workspace's storage may not answer. */
@@ -265,6 +285,47 @@ export function makeWorkspaces({ host, runsc, juicefs, workspacesRoot = WORKSPAC
         if (!names) return yield* refused(400, `${path} is not a path of a workspace's files`);
         const root = yield* filesOf(ref);
         yield* confined(path, () => writeUnder({ root, names }, bytes, { uid: agentUid, gid: agentUid }));
+      }),
+
+    released: (ref) =>
+      Effect.gen(function*() {
+        const directory = join(yield* filesOf(ref), "..");
+        const text = yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be read`, () =>
+          readFile(join(directory, RELEASED_FILE), { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW }).catch((error: NodeJS.ErrnoException) =>
+            error.code === "ENOENT" ? null : Promise.reject(error)
+          ));
+        if (text === null) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
+          Effect.mapError(() => refused(500, `${ref.environment}/${ref.workspace}'s record of its release is not one`)),
+        );
+      }),
+
+    setReleased: (ref, released) =>
+      Effect.gen(function*() {
+        const directory = join(yield* filesOf(ref), "..");
+        if (!(yield* there(directory))) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
+        const file = join(directory, RELEASED_FILE);
+        yield* onMount(`${ref.environment}/${ref.workspace}'s release could not be recorded`, async () => {
+          if (released === null) {
+            await unlink(file).catch((error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? undefined : Promise.reject(error)));
+          } else {
+            const staged = `${file}.${randomBytes(8).toString("hex")}`;
+            const handle = await open(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+            try {
+              await handle.writeFile(JSON.stringify(released));
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+            await rename(staged, file);
+          }
+          const parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+          try {
+            await parent.sync();
+          } finally {
+            await parent.close();
+          }
+        });
       }),
   };
 }

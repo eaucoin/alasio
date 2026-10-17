@@ -10,6 +10,7 @@ import { FetchHttpClient } from "effect/http";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
+import { Released } from "../node-agent/workspaces.ts";
 
 /** Where the node agents are: their pods' namespace and labels, and the port they serve on. */
 export interface NodeAgentsLocation {
@@ -123,6 +124,10 @@ export interface NodeAgents {
   readonly removeWorkspace: (workspace: WorkspaceRef) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspaces of `environment` there are, by their names, through any agent. */
   readonly listWorkspaces: (environment: string) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
+  /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
+  readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
+  /** Records the snapshot the workspace is released into, or none, through any agent. */
+  readonly setReleased: (workspace: WorkspaceRef, released: Released | null) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /** The workspace's quota, and what it holds, through any agent; null where it has none. */
   readonly quota: (workspace: WorkspaceRef) => Effect.Effect<{ readonly capacityBytes: number; readonly usedBytes: number } | null, NodeAgentError | KubeApiError>;
   /** Writes `bytes` as the workspace's file at `path`, as any agent writes it. */
@@ -239,6 +244,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
   });
 
   /** The path of a workspace's file. */
+  const releasedPath = ({ environment, workspace }: WorkspaceRef) => `/workspaces/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}/released`;
   const filePath = ({ environment, workspace }: WorkspaceRef, path: string) => `/files/${encodeURIComponent(environment)}/${encodeURIComponent(workspace)}?path=${encodeURIComponent(path)}`;
 
   return {
@@ -262,6 +268,24 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     removeWorkspace: (workspace) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    released: (workspace) =>
+      Effect.gen(function*() {
+        const node = yield* anyNode;
+        const what = `read ${workspace.environment}/${workspace.workspace}'s release`;
+        const { status, text } = yield* send(node, what, { method: "GET", path: releasedPath(workspace), timeout: SHORT_CALL, absent: true });
+        if (status === 404) return null;
+        return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Released))(text).pipe(
+          Effect.mapError((error) => new NodeAgentError({ node, call: what, reason: `its answer is not one: ${error.message}` })),
+        );
+      }),
+    setReleased: (workspace, released) =>
+      Effect.flatMap(anyNode, (node) =>
+        send(node, `record ${workspace.environment}/${workspace.workspace}'s release into ${released?.snapshot ?? "none"}`, {
+          method: released === null ? "DELETE" : "PUT",
+          path: releasedPath(workspace),
+          ...(released === null ? {} : { body: released }),
+          timeout: SHORT_CALL,
+        })).pipe(Effect.asVoid),
     quota: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

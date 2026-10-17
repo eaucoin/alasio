@@ -77,6 +77,12 @@
  * - `DELETE /workspaces/<environment>/<workspace>`: deletes the workspace, its quota with it
  *   (204), as it does one that is not there.
  * - `GET /workspaces/<environment>`: `{ workspaces }`, the names of the environment's workspaces.
+ * - `GET /workspaces/<environment>/<workspace>/released`: `{ snapshot, release }`, the snapshot
+ *   it was last released into, as its record beside its files says (./workspaces.ts) (200);
+ *   404 where none is recorded.
+ * - `PUT /workspaces/<environment>/<workspace>/released`, `{ snapshot, release }`: records the
+ *   snapshot it is released into (204); 404 where there is no such workspace.
+ * - `DELETE /workspaces/<environment>/<workspace>/released`: records none (204).
  * - `GET /workspaces/<environment>/<workspace>/quota`: `{ capacityBytes, usedBytes }`, its
  *   quota and what it holds (200); 404 where it has none.
  * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
@@ -124,7 +130,7 @@ import {
 import { type CacheError, DIGEST, makeSnapshotCache } from "./cache.ts";
 import { makeHostCommands } from "./host.ts";
 import { makeJuicefs } from "./juicefs.ts";
-import { makeWorkspaces, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
+import { makeWorkspaces, Released, type Workspaces, WorkspaceRefused } from "./workspaces.ts";
 import {
   BACKGROUND_READ_SECONDS_VARIABLE,
   CONTAINERD,
@@ -188,6 +194,7 @@ const ENVIRONMENT = /^\/snapshots\/([^/]+)$/u;
 const CACHED = /^\/cache\/([^/]+)\/([^/?]+)(?:\?keep=([^&]*))?$/u;
 const FILES = /^\/files\/([^/]+)\/([^/?]+)\?(.*)$/u;
 const QUOTA = /^\/workspaces\/([^/]+)\/([^/]+)\/quota$/u;
+const RELEASED = /^\/workspaces\/([^/]+)\/([^/]+)\/released$/u;
 const WORKSPACE = /^\/workspaces\/([^/]+)\/([^/]+)$/u;
 const WORKSPACES = /^\/workspaces\/([^/]+)$/u;
 
@@ -319,6 +326,16 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       return workspaceOf(quota).pipe(
         Effect.flatMap(workspaces.quota),
         Effect.map((held) => (held === null ? answer(404, { error: "the workspace has no quota" }) : answer(200, held))),
+      );
+    }
+    const released = RELEASED.exec(url);
+    if (released && (method === "GET" || method === "PUT" || method === "DELETE")) {
+      return workspaceOf(released).pipe(
+        Effect.flatMap((ref) =>
+          method === "GET"
+            ? Effect.map(workspaces.released(ref), (record) => (record === null ? answer(404, { error: "the workspace records no release" }) : answer(200, record)))
+            : Effect.flatMap(method === "PUT" ? body(Released) : Effect.succeed(null), (record) => workspaces.setReleased(ref, record)).pipe(Effect.as(HttpServerResponse.empty({ status: 204 })))
+        ),
       );
     }
     if (method === "POST" && url === "/attach") {
