@@ -10,8 +10,8 @@ import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 
-import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status } from "@kubernetes/client-node";
-import { Context, Effect, Layer, Predicate, Result, Schema } from "effect";
+import { CoreV1Api, Exec, KubeConfig, type KubernetesObject, KubernetesObjectApi, PatchStrategy, setHeaderOptions, type V1Status, Watch } from "@kubernetes/client-node";
+import { Cause, Context, Effect, Layer, Predicate, Queue, Result, Schema, Stream } from "effect";
 
 /** What `exec` is given beyond the command. */
 export interface ExecOptions {
@@ -25,6 +25,19 @@ export interface ExecResult {
   readonly stdout: Buffer;
   readonly stderr: string;
 }
+
+/**
+ * A change a watch saw: an object added, modified or deleted; or a bookmark, which marks the
+ * version the watch has seen up to, and, annotated `k8s.io/initial-events-end`, that every
+ * object there was as it began has been sent.
+ */
+export interface WatchEvent {
+  readonly type: "ADDED" | "MODIFIED" | "DELETED" | "BOOKMARK";
+  readonly object: KubernetesObject;
+}
+
+/** The annotation of the bookmark that ends a watch's initial events. */
+export const INITIAL_EVENTS_END = "k8s.io/initial-events-end";
 
 /** The API refused a call, or could not be reached: the status it answered with, when it answered. */
 export class KubeApiError extends Schema.TaggedError<KubeApiError>()("KubeApiError", {
@@ -121,6 +134,13 @@ export class KubeClient extends Context.Service<KubeClient, {
    */
   readonly patchPodStatus: (namespace: string, name: string, patch: object) => Effect.Effect<void, KubeApiError>;
   /**
+   * The objects `plural` of `apiVersion` in the namespace that `labelSelector` selects, as
+   * they change: first every one there is, as ADDED, then a bookmark annotated
+   * INITIAL_EVENTS_END, then each change, until the API ends the watch, as it does now and
+   * then, when the stream ends; a watch that fails fails it.
+   */
+  readonly watch: (apiVersion: string, plural: string, namespace: string, labelSelector: string) => Stream.Stream<WatchEvent, KubeApiError>;
+  /**
    * Deletes it, with its dependents in the background; one already gone is not an error.
    * Given `resourceVersion`, only as it is at that version: 409 when it has changed since.
    */
@@ -201,6 +221,24 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
     };
   });
 
+  const watcher = new Watch(kubeConfig);
+  const watch = (apiVersion: string, plural: string, namespace: string, labelSelector: string): Stream.Stream<WatchEvent, KubeApiError> =>
+    Stream.callback<WatchEvent, KubeApiError>((queue) =>
+      Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () =>
+            watcher.watch(
+              `/${apiVersion.includes("/") ? "apis" : "api"}/${apiVersion}/namespaces/${namespace}/${plural}`,
+              { labelSelector, sendInitialEvents: true, resourceVersionMatch: "NotOlderThan", allowWatchBookmarks: true },
+              (type, object: KubernetesObject) => void Queue.offerUnsafe(queue, { type: type as WatchEvent["type"], object }),
+              (error: unknown) => void (error ? Queue.failCauseUnsafe(queue, Cause.fail(KubeApiError.of(error))) : Queue.endUnsafe(queue)),
+            ),
+          catch: KubeApiError.of,
+        }),
+        (aborting) => Effect.sync(() => aborting.abort()),
+      )
+    );
+
   return KubeClient.of({
     read: (apiVersion, kind, namespace, name) =>
       call(() => objects.read(ref(apiVersion, kind, namespace, name))).pipe(
@@ -214,6 +252,7 @@ function makeKubeClient(kubeConfig: KubeConfig): KubeClient["Service"] {
       call(() =>
         objects.patch(patchBody(apiVersion, kind, namespace, name, patch), undefined, undefined, "alasio", undefined, PatchStrategy.MergePatch)
       ),
+    watch,
     patchPodStatus: (namespace, name, patch) =>
       call(() =>
         core.patchNamespacedPodStatus({ namespace, name, body: patch, fieldManager: "alasio" }, setHeaderOptions("Content-Type", PatchStrategy.StrategicMergePatch))

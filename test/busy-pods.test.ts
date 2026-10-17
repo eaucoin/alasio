@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 
-import { ConfigProvider, Context, Effect, Exit, Layer, Logger, Scope } from "effect";
+import { ConfigProvider, Context, Effect, Exit, Layer, Logger, Scope, Stream } from "effect";
 
 import type { RunningTurn } from "../src/harness/active-turns.ts";
 import { workspacePodOf } from "../src/harness/index.ts";
@@ -61,6 +61,7 @@ async function busyPods(
     replace: unused,
     remove: unused,
     exec: unused,
+    watch: () => Stream.die("not called"),
     patchPodStatus: unused,
     list: (apiVersion, kind, namespace, labelSelector) => {
       assert.deepEqual([apiVersion, kind, labelSelector], ["v1", "Pod", "alasio.dev/busy=true"]);

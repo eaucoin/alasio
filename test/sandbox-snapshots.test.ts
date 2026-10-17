@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { KubernetesObject, V1LabelSelector, V1Node, V1Pod, V1PodTemplateSpec, V1Taint, V1Toleration } from "@kubernetes/client-node";
-import { Deferred, Effect, Fiber, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { TestClock } from "effect/testing";
 
@@ -189,6 +189,7 @@ function fakeKube(objects: Map<string, KubernetesObject> = new Map(), unreadable
       }),
     remove: () => Effect.fail(new KubeApiError({ status: 500, cause: new Error("nothing is removed") })),
     exec: () => Effect.die("nothing is run"),
+    watch: () => Stream.die("nothing is watched"),
   });
   return { objects, writes, layer: Layer.succeed(KubeClient, service) };
 }
