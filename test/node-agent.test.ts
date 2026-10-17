@@ -1093,8 +1093,8 @@ test("the agent's API attaches, detaches, reads and writes a workspace's files a
       const call = (method: string, path: string, body?: string) =>
         Effect.promise(() => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { authorization: "Bearer the token" }, ...(body === undefined ? {} : { body }) }));
       const json = (value: unknown) => JSON.stringify(value);
-      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding" }))).status, 204);
-      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding" }))).status, 409);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding", env: {} }))).status, 204);
+      assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123", pod: "pool-0", token: "binding", env: {} }))).status, 409);
       assert.equal((yield* call("POST", "/attach", json({ environment: "main", workspace: "fs-abc123" }))).status, 400);
       assert.equal((yield* call("PUT", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt", "hello")).status, 204);
       const read = yield* call("GET", "/files/main/fs-abc123?path=home/.alasio/received/1/note.txt&max=100");
@@ -1118,8 +1118,8 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       at.files("fs-abc123");
       const agents = yield* agentsOf(here.agent, at.workspaces);
       const ref = { environment: "main", workspace: "fs-abc123" };
-      yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding" });
-      const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding" }));
+      yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} });
+      const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} }));
       assert.equal(again._tag === "NodeAgentError" && again.status, 409);
       const bytes = Uint8Array.from([0, 255, 10, 13, 128]);
       yield* agents.writeFile(ref, "home/.alasio/received/1/blob", bytes);

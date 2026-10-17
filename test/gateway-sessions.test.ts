@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -132,7 +133,8 @@ const sessionsOf = (opts: SessionsOptions, nodeAgents: NodeAgents) =>
 test("a session's workspace is placed in its environment's pool of its internet, and readied by its node's agent attaching it with its binding's token", async () => {
   const env = await environment(1);
   const recorded = agents();
-  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const telemetry = { host: "localhost", port: 4318, env: { OTEL_TRACES_EXPORTER: "otlp" } };
+  const { binder, sessions } = await sessionsOf({ ...options(env, 7290), telemetry }, recorded.agents);
   const key = sessionKey("fs-abc123");
   for (const [said, why] of [
     [{ environment: env.name, mode: "none" }, null],
@@ -149,6 +151,8 @@ test("a session's workspace is placed in its environment's pool of its internet,
   const [attach] = recorded.attached;
   assert.deepEqual([attach?.node, attach?.environment, attach?.workspace, attach?.pod], ["node-a", env.namespace, "fs-abc123", bound.pod]);
   assert.deepEqual(verifyToken(bindingKey, attach?.token ?? "", Date.now()), { key, binding: bound.binding });
+  // Its bayma exports to the receiver by its address, as a session with no internet resolves no name.
+  assert.deepEqual(attach?.env, { OTEL_TRACES_EXPORTER: "otlp", OTEL_EXPORTER_OTLP_ENDPOINT: `http://${(await lookup("localhost")).address}:4318` });
 });
 
 test("a bound pod whose bayma runs an exec is kept, and its bayma asked again only once its poll comes round, with its binding's token", async () => {

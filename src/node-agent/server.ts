@@ -42,9 +42,9 @@
  * - `GET /holdings`: `{ node, releases: [{ release, cpuFeatures }], cached: [{ environment,
  *   workspace, snapshot, bytes, usedAt }] }`: this node's gVisor releases, with the CPU
  *   features each sees on it, and the snapshots in its cache.
- * - `POST /attach`, `{ environment, workspace, pod, token }`: attaches the workspace's files
- *   into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
- *   beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
+ * - `POST /attach`, `{ environment, workspace, pod, token, env }`: attaches the workspace's
+ *   files into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
+ *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
  *   there is no such workspace.
  * - `POST /detach`, `{ pod, containerIds }`: detaches what is attached into `pod`'s directory
  *   (204); 409 while any of `containerIds`, its sandbox's containers, runs.
@@ -108,7 +108,7 @@ export interface NodeAgentServerOptions {
 export const MAX_WRITE_BYTES = 64 * 1024 ** 2;
 
 /** What `POST /attach` is given. */
-const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString });
+const AttachRequest = Schema.Struct({ ...WorkspaceRef.fields, pod: Schema.NonEmptyString, token: Schema.NonEmptyString, env: Schema.Record(Schema.String, Schema.String) });
 /** What `POST /detach` is given. */
 const DetachRequest = Schema.Struct({ pod: Schema.NonEmptyString, containerIds: Schema.Array(Schema.NonEmptyString) });
 
@@ -227,7 +227,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
       );
     }
     if (method === "POST" && url === "/attach") {
-      return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, ...ref }) => workspaces.attach(ref, pod, binding)), Effect.as(HttpServerResponse.empty({ status: 204 })));
+      return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, ...ref }) => workspaces.attach(ref, pod, binding, env)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
     if (method === "POST" && url === "/detach") {
       return body(DetachRequest).pipe(Effect.flatMap(({ pod, containerIds }) => workspaces.detach(pod, containerIds)), Effect.as(HttpServerResponse.empty({ status: 204 })));

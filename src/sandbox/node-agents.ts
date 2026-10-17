@@ -85,8 +85,8 @@ export interface NodeAgents {
   readonly discard: (node: string, workspace: WorkspaceRef, keep: string | null) => Effect.Effect<readonly string[], NodeAgentError | KubeApiError>;
   /**
    * Attaches the workspace's files into the directory of the sandbox pool pod `pod` on
-   * `node`, its binding's `token` beside them. An agent refuses one whose directory holds a
-   * mount with 409.
+   * `node`, its binding's `token` and the variables `env` beside them. An agent refuses one
+   * whose directory holds a mount with 409.
    */
   readonly attach: (node: string, request: AttachRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
   /**
@@ -100,10 +100,11 @@ export interface NodeAgents {
   readonly writeFile: (workspace: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, NodeAgentError | KubeApiError>;
 }
 
-/** What an attach is of: the workspace, the pool pod it goes into, and the binding's token beside it. */
+/** What an attach is of: the workspace, the pool pod it goes into, and the binding's token and the variables its bayma runs with beside it. */
 export interface AttachRequest extends WorkspaceRef {
   readonly pod: string;
   readonly token: string;
+  readonly env: Readonly<Record<string, string>>;
 }
 
 /** How long a checkpoint, a prepare or a copy may take. */

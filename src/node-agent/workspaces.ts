@@ -3,7 +3,8 @@
  * workspace storage (WORKSPACES_ROOT, `<environment>/<workspace>/files`, holding
  * `workspace/` and `home/`), attached into the directory of a pod of a sandbox pool on its
  * node (`ATTACH_ROOT/<pod>`, which the pod mounts at /attach, its own by `subPathExpr`), at
- * `ws/`, with its binding's token beside it at `token`; detached once its sandbox can no
+ * `ws/`, with its binding's token beside it at `token`, and what its bayma is to run with at
+ * `env` (variables, each `NAME='value'`, as a shell reads them); detached once its sandbox can no
  * longer act; and a file of one read, or one received written into it, for what alasio does
  * with a session's files outside its sandbox.
  *
@@ -57,6 +58,13 @@ export interface WorkspaceRef {
   readonly workspace: string;
 }
 
+/** A variable's name, as a shell takes one. */
+const VARIABLE = /^[A-Z_][A-Z0-9_]*$/u;
+
+/** `env` as a shell reads it, each value quoted whole: `NAME='value'`, a quote in it closed, escaped, and opened again. */
+export const envFile = (env: Readonly<Record<string, string>>): string =>
+  Object.entries(env).map(([name, value]) => `${name}='${value.split("'").join("'\\''")}'\n`).join("");
+
 /** A mount point as mountinfo writes it, its octal escapes (`\040` for a space) undone. */
 const unescapeMountPoint = (field: string): string => field.replace(/\\([0-7]{3})/gu, (_escape, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
 
@@ -70,8 +78,8 @@ export function mountPoints(mountinfo: string): string[] {
 
 /** What a workspace's agent does with workspaces; see makeWorkspaces. */
 export interface Workspaces {
-  /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` beside them. */
-  readonly attach: (ref: WorkspaceRef, pod: string, token: string) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
+  /** Attaches `ref`'s files into `pod`'s directory, its binding's `token` and the variables `env` beside them. */
+  readonly attach: (ref: WorkspaceRef, pod: string, token: string, env: Readonly<Record<string, string>>) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** Detaches what is attached into `pod`'s directory, once none of `containerIds`, its sandbox's containers by their runtime's ids, runs. */
   readonly detach: (pod: string, containerIds: readonly string[]) => Effect.Effect<void, WorkspaceRefused | HostCommandError>;
   /** The file at `path` of `ref`'s files, `workspace/...` or `home/...`, of `maxBytes` at most. */
@@ -127,9 +135,11 @@ export function makeWorkspaces({ host, runsc, workspacesRoot = WORKSPACES_ROOT, 
     );
 
   return {
-    attach: (ref, pod, token) =>
+    attach: (ref, pod, token, env) =>
       Effect.gen(function*() {
         const files = yield* filesOf(ref);
+        const unnamed = Object.keys(env).find((name) => !VARIABLE.test(name));
+        if (unnamed !== undefined) return yield* refused(400, `${unnamed} is no variable's name`);
         const directory = yield* podDirectory(pod);
         const held = yield* mountsUnder(directory);
         if (held.length > 0) return yield* refused(409, `${pod}'s directory holds ${held.join(", ")}: a pod serves one binding, and nothing is mounted over another`);
@@ -141,6 +151,9 @@ export function makeWorkspaces({ host, runsc, workspacesRoot = WORKSPACES_ROOT, 
           await chown(directory, agentUid, agentUid);
           await chown(ws, agentUid, agentUid);
           // Beside the workspace, not in it: its sandbox reads it, and reaches no other's.
+          await writeFile(join(directory, "env"), envFile(env), { mode: 0o400 });
+          await chown(join(directory, "env"), agentUid, agentUid);
+          // Written last, as its bayma starts once it is there.
           await writeFile(join(directory, "token"), token, { mode: 0o400 });
           await chown(join(directory, "token"), agentUid, agentUid);
         });
