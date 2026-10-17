@@ -1819,23 +1819,26 @@ describe("the lake", () => {
         await store.append(reconciled, entries(0));
         await saveRollout(name, firstPart);
         await syncLake(db);
-        const kept = new Set((await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', 'entries', schema => 'claude')`)).map(({ data_file }) => data_file));
+        await writeTelemetry(db, telemetryRows("logs", logRequest("kept", NOW)));
+        // Each table's files before the write of the one the store loses. The telemetry's
+        // tables outlive withLake's rebuild, so they hold the files of the tests before this.
+        const filesOf = async (schema: string, table: string) =>
+          (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', '${table}', schema => '${schema}')`)).map(({ data_file }) => data_file);
+        const kept = new Set([...await filesOf("claude", "entries"), ...await filesOf("codex", "lines"), ...await filesOf("otel", "logs")]);
         await store.append(reconciled, entries(20));
         await saveRollout(name, Buffer.from(lines.slice(20).join("")), { start: firstPart.length, head: Buffer.from(lines.join("")) });
         await syncLake(db);
-        await writeTelemetry(db, telemetryRows("logs", logRequest("kept", NOW)));
         await writeTelemetry(db, telemetryRows("logs", logRequest("lost", NOW, NOW + 1n)));
         const { since: lostSince } = await one<{ since: string }>(db, `select min(Timestamp)::varchar as since from ${LAKE}.otel.logs where ServiceName = 'lost'`);
         const counts = async () => one<Record<string, bigint>>(db, `select
           (select count(*) from ${LAKE}.claude.entries) as entries, (select count(distinct seq) from ${LAKE}.claude.entries) as seqs,
           (select count(*) from ${LAKE}.claude.content_blocks) as blocks, (select count(*) from ${LAKE}.codex.lines) as lines`);
         const whole = await counts();
-        const newest = async (schema: string, table: string) =>
-          (await rows<{ data_file: string }>(db, `select data_file from ducklake_list_files('${LAKE}', '${table}', schema => '${schema}')`)).map(({ data_file }) => data_file).filter((file) => !kept.has(file)).at(-1);
-        const lost = [await newest("claude", "entries"), await newest("codex", "lines"), await newest("otel", "logs")];
-        for (const file of lost) {
-          assert.ok(file);
-          rmSync(file);
+        const written = async (schema: string, table: string) => (await filesOf(schema, table)).filter((file) => !kept.has(file));
+        const lost = [await written("claude", "entries"), await written("codex", "lines"), await written("otel", "logs")];
+        for (const files of lost) {
+          assert.equal(files.length, 1);
+          rmSync(files[0]!);
         }
         await assert.rejects(rows(db, `select sum(seq) from ${LAKE}.claude.entries`), /No such file|IO Error/iu);
         const logs: string[] = [];
