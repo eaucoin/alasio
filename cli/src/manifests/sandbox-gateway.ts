@@ -329,10 +329,28 @@ function environmentsFinder(account: string, component: string): [V1ClusterRole,
 /** The ServiceAccount `account` of alasio's namespace. */
 const serviceAccount = (account: string, component: string): V1ServiceAccount => ({ apiVersion: "v1", kind: "ServiceAccount", metadata: { name: account, namespace: NAMESPACE, labels: labels(component) } });
 
-/** The gateway's identity: its ServiceAccount, the node agents it finds, and the branch environments it finds; what it may do in each environment's pools is sandboxPoolObjects'. */
+/** The user the gateway's ServiceAccount is to the API server, which the sandbox pods' policy names as the one maker of restores' pods. */
+export const GATEWAY_USER = `system:serviceaccount:${NAMESPACE}:${GATEWAY}`;
+
+/**
+ * The gateway's identity: its ServiceAccount, the node agents it finds, the branch
+ * environments it finds, and the nodes it reads whether a restore's pod may be scheduled onto;
+ * what it may do in each environment's pools is sandboxPoolObjects'.
+ */
 function gatewayIdentity(): KubernetesObject[] {
+  const nodes = { name: `${GATEWAY}-nodes`, labels: labels(GATEWAY_COMPONENT) };
+  const nodesRole: V1ClusterRole = { apiVersion: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", metadata: nodes, rules: [{ apiGroups: [""], resources: ["nodes"], verbs: ["get"] }] };
+  const nodesBinding: V1ClusterRoleBinding = {
+    apiVersion: "rbac.authorization.k8s.io/v1",
+    kind: "ClusterRoleBinding",
+    metadata: nodes,
+    roleRef: { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole", name: nodes.name },
+    subjects: [{ kind: "ServiceAccount", name: GATEWAY, namespace: NAMESPACE }],
+  };
   return [
     serviceAccount(GATEWAY, GATEWAY_COMPONENT),
+    nodesRole,
+    nodesBinding,
     // The node agents, by their pods, which it attaches workspaces through.
     ...accountRole(GATEWAY, GATEWAY_COMPONENT, NAMESPACE, [{ apiGroups: [""], resources: ["pods"], verbs: ["list"] }]),
     ...environmentsFinder(GATEWAY, GATEWAY_COMPONENT),
@@ -576,8 +594,12 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
   const namespace = pools.none.namespace;
   return [
     ...accountRole(GATEWAY, GATEWAY_COMPONENT, namespace, [
-      // Its pools' pods, claimed by an update of the version read, and deleted as they are released.
-      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "update", "delete"] },
+      // Its pools' pods, claimed by an update of the version read, and deleted as they are released; and a restore's, made, which the sandbox pods' policy holds to its pool's template.
+      { apiGroups: [""], resources: ["pods"], verbs: ["get", "list", "watch", "create", "update", "delete"] },
+      // A restore's pod made ready once its sandbox is resumed, by its readiness gate's condition.
+      { apiGroups: [""], resources: ["pods/status"], verbs: ["patch"] },
+      // The network policies that select a restore's pod, which its node's agent waits for in force before it resumes it.
+      { apiGroups: ["networking.k8s.io"], resources: ["networkpolicies"], verbs: ["list"] },
       { apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] },
       // Its pools' templates, which a release's snapshot records.
       { apiGroups: ["apps"], resources: ["deployments"], verbs: ["get"], resourceNames: [POOLS.none, POOLS.full] },
@@ -603,6 +625,14 @@ export function sandboxServiceObjects(config: InstallConfig, carried: Carried): 
     ...sandboxPodPolicy([poolTemplate(config, pools.none, "none", carried.cpuBaseline), poolTemplate(config, pools.full, "full", carried.cpuBaseline)], {
       sessionsNamespace: sessionsNamespace(config, MAIN_ENVIRONMENT),
       sandboxController: SANDBOX_CONTROLLER_USER,
+      // Main's restores, by the gateway alone, onto each pool's template and the one before it, under the releases kept.
+      restores: poolsSnapshotted(config, carried.cpuBaseline)
+        ? {
+          restorer: GATEWAY_USER,
+          templates: (["none", "full"] as const).flatMap((mode) => [poolTemplate(config, pools[mode], mode, carried.cpuBaseline), ...(carried.previousPools[mode] ? [carried.previousPools[mode]] : [])]),
+          runtimeClasses: carried.gvisorReleases.map(gvisorRuntimeClass),
+        }
+        : null,
     }),
     ...receiverObjects(config),
     ...sandboxPoolObjects(config, MAIN_ENVIRONMENT, carried.cpuBaseline),

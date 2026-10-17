@@ -507,6 +507,57 @@ function poolPodSpec(template: V1PodTemplateSpec): Pinned {
 interface SandboxPodScope {
   readonly sessionsNamespace: string;
   readonly sandboxController: string;
+  /**
+   * Of main's snapshotted sessions, who makes a restore's pod, the sandbox gateway, by its
+   * ServiceAccount's user's name; the templates a snapshot restores onto, each pool's current
+   * one and the one before it; and the RuntimeClasses of the releases it restores under.
+   */
+  readonly restores?: { readonly restorer: string; readonly templates: readonly V1PodTemplateSpec[]; readonly runtimeClasses: readonly string[] } | null;
+}
+
+/**
+ * The image a restore's pod of main's sessions, `namespace`'s, is restored from, as the
+ * gateway's node agent prepared it: of the workspace its binding's key names, in the node's
+ * snapshot cache, under a snapshot's id.
+ */
+const restoredFromKey = (namespace: string) =>
+  new Check((expression) => {
+    const own = `${JSON.stringify(`${SNAPSHOT_CACHE_DIR}/${namespace}/`)} + variables.annotations[${JSON.stringify(KEY_ANNOTATION)}].substring(${"sessionfs:".length}) + "/"`;
+    return `type(${expression}) == string && ${expression}.startsWith(${own}) && ${expression}.substring(size(${own})).matches(${JSON.stringify(`^${SNAPSHOT_ID}$`)})`;
+  });
+
+/**
+ * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
+ * and the API server stores it: its template's, bound from the first, never free, its sandbox
+ * restored paused from the image its node's agent prepared, under one of `runtimeClasses`, on that
+ * node, and ready once resumed.
+ */
+function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
+  const restoredOn: Pinned = {
+    nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] } },
+  };
+  // Its template's spec, as the API server stores a pod of it, but what a restore gives it.
+  const restoring = poolPodSpec({
+    ...template,
+    spec: {
+      ...template.spec,
+      runtimeClassName: oneOf(...runtimeClasses),
+      readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
+      affinity: restoredOn,
+    } as unknown as V1PodSpec,
+  });
+  const { [FREE_LABEL]: _free, ...own } = (template.metadata?.labels ?? {}) as PinnedMap;
+  const labels = { ...own, [BINDING_LABEL]: matching("[0-9a-f]{40}") } as PinnedMap;
+  const annotations = {
+    ...(template.metadata?.annotations ?? {}),
+    [KEY_ANNOTATION]: matching(`sessionfs:${DNS_LABEL}`),
+    ...BUSY_ANNOTATIONS,
+    [RESTORE_ANNOTATION]: restoredFromKey(namespace),
+    [RESTORE_PAUSED_ANNOTATION]: "true",
+    vpaObservedContainers: optional(ANY_STRING),
+    vpaUpdates: optional(ANY_STRING),
+  } as PinnedMap;
+  return `(${pinned("object.spec", restoring)} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
 }
 
 /**
@@ -518,8 +569,9 @@ interface SandboxPodScope {
  *
  * - A pod made is a pod of one of `templates`, as the API server stores it (poolPodSpec), its
  *   template's labels and annotations, its ReplicaSet's template hash beside them, and what
- *   VPA notes; or, of the session Sandboxes there are until they go, one agent-sandbox's
- *   controller makes, of a Sandbox the Sandbox policy holds to its template.
+ *   VPA notes; or a restore's of main's sessions, of a template a snapshot restores onto
+ *   (restorePod), made by the gateway alone; or, of the session Sandboxes there are until they
+ *   go, one agent-sandbox's controller makes, of a Sandbox the Sandbox policy holds to its template.
  * - A pod changed keeps its spec whole (its resources change by pods/resize, which this does
  *   not match), and of its labels and annotations changes those a binding has alone (its free
  *   label taken off, its binding's put on) and those that keep its node, and of its owners lets
@@ -528,7 +580,7 @@ interface SandboxPodScope {
  *
  * It fails closed: where it cannot say, the API server refuses.
  */
-export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sessionsNamespace, sandboxController }: SandboxPodScope): KubernetesObject[] {
+export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sessionsNamespace, sandboxController, restores = null }: SandboxPodScope): KubernetesObject[] {
   const name = SANDBOX_POD_POLICY;
   const metadata = { name, labels: labels("session") };
   const made = templates.map((template) => {
@@ -536,6 +588,9 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
     const annotations = { ...(template.metadata?.annotations ?? {}), vpaObservedContainers: optional(ANY_STRING), vpaUpdates: optional(ANY_STRING) } as PinnedMap;
     return `(${pinned("object.spec", poolPodSpec(template))} && ${pinned("variables.labels", labels)} && ${pinned("variables.annotations", annotations)})`;
   });
+  const restored = restores
+    ? [`(request.namespace == ${JSON.stringify(sessionsNamespace)} && request.userInfo.username == ${JSON.stringify(restores.restorer)} && (${restores.templates.map((template) => restorePod(template, sessionsNamespace, restores.runtimeClasses)).join(" || ")}))`]
+    : [];
   const bound = [BINDING_LABEL, FREE_LABEL];
   const policy = {
     apiVersion: "admissionregistration.k8s.io/v1",
@@ -565,8 +620,8 @@ export function sandboxPodPolicy(templates: readonly V1PodTemplateSpec[], { sess
       validations: [
         { expression: "request.?subResource.orValue('') != 'ephemeralcontainers'", message: "no pod of a namespace of sessions gets an ephemeral container" },
         {
-          expression: `request.operation != 'CREATE' || !variables.pooled || ${made.join(" || ")}`,
-          message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, and nothing else",
+          expression: `request.operation != 'CREATE' || !variables.pooled || ${[...made, ...restored].join(" || ")}`,
+          message: "a pod of a sandbox pool is its pool's template, as alasio up renders it, or a restore's of one, as the sandbox gateway makes it, and nothing else",
         },
         {
           expression: `request.operation != 'CREATE' || variables.pooled || request.userInfo.username == ${JSON.stringify(sandboxController)}`,
