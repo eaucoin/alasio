@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { V1Pod } from "@kubernetes/client-node";
-import { ConfigProvider, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Schedule, Scope, Stream } from "effect";
 import { TestClock } from "effect/testing";
 
 // First: alasio's modules create their metrics as they load.
@@ -897,7 +897,7 @@ const agentsOf = (agent: NodeAgent) =>
       status: { podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }] },
     };
     const unreachable = () => Effect.die("only pods are listed");
-    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable });
+    const kube = KubeClient.of({ read: unreachable, list: () => Effect.succeed([pod]), create: unreachable, replace: unreachable, patch: unreachable, patchPodStatus: unreachable, remove: unreachable, exec: unreachable, watch: () => Stream.die("nothing is watched") });
     return yield* makeNodeAgents({ namespace: "alasio", selector: "app.kubernetes.io/component=node-agent", port }).pipe(
       Effect.provide(Layer.merge(Layer.succeed(KubeClient, kube), ConfigProvider.layer(ConfigProvider.fromEnv({ env: { ALASIO_NODE_AGENT_TOKEN: "the token" } })))),
     );
