@@ -27,6 +27,12 @@
 # 8.0.0 made exists: it refuses then too, before it changes anything. Delete each first
 # (alasio branch delete <name>), and make it again once upgraded.
 #
+# 8.0.0's log, its StatefulSet, has its claims labelled with 8.0.0's version, which this release's
+# do not carry, and Kubernetes changes no StatefulSet's claim templates: an upgrade's apply of it
+# is refused. So, before the point of no return, it deletes the log's StatefulSet, its pod and
+# claim kept running, which the upgrade makes anew and takes back; a failure before the point
+# of no return makes it again as 8.0.0 had it.
+#
 # The changes this release is made of add their steps to it, with what those steps need:
 # before the point of no return, each with what makes again what it changed (restore), as a
 # run that fails before it leaves the installation as it was; past it, before the upgrade;
@@ -45,13 +51,22 @@ fail() {
   log "FAILED: $*"
   exit 1
 }
+NS=alasio
+LOG=alasio-log
+k() { kubectl -n "$NS" "$@"; }
 # Makes again what the steps before the point of no return changed, as a run that fails
-# before it leaves the installation as it was: each step's own making again, here.
+# before it leaves the installation as it was: each step's own making again, here. The log's
+# StatefulSet, as 8.0.0 had it, from OUT, where it is deleted: it takes its pod back.
 restore() {
-  :
+  local made
+  made=$(k get statefulset "$LOG" --ignore-not-found -o name)
+  [ -e "$OUT/log-statefulset.json" ] && [ -z "$made" ] || return 0
+  log "making the log's StatefulSet again, as 8.0.0 had it"
+  jq 'del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)' "$OUT/log-statefulset.json" | k create -f - >/dev/null ||
+    log "FAILED: the log's StatefulSet is deleted, its pod running unowned, and could not be made again from $OUT/log-statefulset.json: the cut-over run again goes on, the upgrade making it anew; to run 8.0.0 as it was instead, make it from there (kubectl create -f), its metadata.uid and metadata.resourceVersion deleted"
 }
 
-command -v kubectl >/dev/null || fail "kubectl is not on root's PATH"
+for tool in jq kubectl; do command -v "$tool" >/dev/null || fail "$tool is not on root's PATH"; done
 kubectl get --raw=/readyz >/dev/null 2>&1 || fail "kubectl does not reach the cluster: give it k3s's kubeconfig (KUBECONFIG=/etc/rancher/k3s/k3s.yaml)"
 
 if [ ! -e "$OUT/point-of-no-return" ]; then
@@ -65,6 +80,14 @@ if [ ! -e "$OUT/point-of-no-return" ]; then
   branches=$(printf '%s\n' "$namespaces" | awk -F '\t' 'NF == 2 && $1 == "alasio-branch-" $2 { print $2 }')
   [ -z "$branches" ] ||
     fail "alasio upgrades main alone, and the branch environments 8.0.0 made would not run on what upgrading changes: delete each first ($(printf '%s\n' "$branches" | awk 'NR > 1 { printf ", " } { printf "alasio branch delete %s", $0 }')), and make them again once alasio is upgraded"
+  # The log's StatefulSet, where its claims carry a version, deleted, its pod and claim kept.
+  versioned=$(k get statefulset "$LOG" --ignore-not-found -o json | jq -r '[.spec.volumeClaimTemplates[]?.metadata.labels["app.kubernetes.io/version"] // empty] | first // empty') ||
+    fail "the log's StatefulSet could not be read"
+  if [ -n "$versioned" ]; then
+    k get statefulset "$LOG" -o json >"$OUT/log-statefulset.json" || fail "the log's StatefulSet could not be kept in $OUT"
+    log "deleting the log's StatefulSet, its pod and claim kept, for the upgrade to make it anew without $versioned on its claims (kept in $OUT/log-statefulset.json)"
+    k delete statefulset "$LOG" --cascade=orphan --wait=true >/dev/null || fail "the log's StatefulSet could not be deleted"
+  fi
   log "checking that the upgrade can run (upgrade-check.log)"
   bash -c "$UPGRADE_CHECK" >"$OUT/upgrade-check.log" 2>&1 || fail "UPGRADE_CHECK failed, so UPGRADE could not run (upgrade-check.log): $(tail -n 3 "$OUT/upgrade-check.log")"
   [ "${FAIL_AT:-}" != before-the-point-of-no-return ] || fail "a failure injected before the point of no return"

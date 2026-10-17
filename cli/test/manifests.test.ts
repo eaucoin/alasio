@@ -3323,3 +3323,17 @@ describe("admission", () => {
     assert.deepEqual(carriedFrom(configOf({ sessions: { enabled: false }, workspaceStorage: { enabled: false }, host: { enabled: true } }), templatesOf(first), { ...NOTHING_KEPT, cpuBaseline: BASELINE }).previousSessions, null);
   });
 });
+
+test("no StatefulSet's claim templates change from one release to the next, as Kubernetes changes none: none carries the release's version", () => {
+  for (const objects of [install(), branchObjects(configOf(), "try")]) {
+    for (const statefulSet of all<V1StatefulSet>(objects, "StatefulSet")) {
+      for (const claim of statefulSet.spec?.volumeClaimTemplates ?? []) {
+        assert.equal(claim.metadata?.labels?.["app.kubernetes.io/version"], undefined, `${statefulSet.metadata?.name}'s claim ${claim.metadata?.name}`);
+      }
+    }
+  }
+  // The log's carry its other labels, which its pods do.
+  const log = one<V1StatefulSet>(install(), "StatefulSet", "alasio-log");
+  const { "app.kubernetes.io/version": _version, ...podLabels } = log.spec?.template.metadata?.labels ?? {};
+  assert.deepEqual(log.spec?.volumeClaimTemplates?.[0]?.metadata?.labels, podLabels);
+});
