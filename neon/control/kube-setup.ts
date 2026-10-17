@@ -26,6 +26,8 @@
 import type { KubernetesObject, V1ObjectMeta, V1Secret } from "@kubernetes/client-node";
 import { Cause, Effect, Exit } from "effect";
 
+import { environmentKey } from "../../src/binder/names.ts";
+import { MAIN_ENVIRONMENT_NAME } from "../../src/branch/names.ts";
 import { makeS3Bucket, type S3Bucket, S3Error } from "../../src/node-agent/s3.ts";
 
 import { BRANCHES_SCOPE, computeId, MAIN, PROXY_SCOPE } from "./branches.ts";
@@ -77,6 +79,7 @@ export interface SecretNames {
   snapshots: string;
   nodeAgent: string;
   sandboxGateway: string;
+  sessionsCaller: string;
   /** The log's own (its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
   log: string;
   logAccess: string;
@@ -194,6 +197,7 @@ export function secretNames(prefix: string): SecretNames {
     snapshots: `${prefix}-snapshots`,
     nodeAgent: `${prefix}-node-agent`,
     sandboxGateway: `${prefix}-sandbox-gateway`,
+    sessionsCaller: `${prefix}-sessions-caller`,
     log: `${prefix}-log`,
     logAccess: `${prefix}-log-access`,
     logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
@@ -351,6 +355,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
     // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
     rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
+    // main's alasio's key to it, its own of the gateway's caller key, which signs main's sessions' tokens alone; a branch's is `alasio branch create`'s to write.
+    rendered[names.sessionsCaller] = { "caller-key": environmentKey(Buffer.from(secrets.gatewayCallerKey), MAIN_ENVIRONMENT_NAME).toString() };
   }
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
 import { test } from "node:test";
 
-import { environmentKey, mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
+import { environmentKey } from "../src/binder/names.ts";
+import { mintToken, type TokenClaims, verifyToken } from "../src/binder/tokens.ts";
 
 const secret = randomBytes(32);
 

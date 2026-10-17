@@ -45,7 +45,7 @@ export const bindingToken = (secret: Buffer, { key, binding, namespace }: { read
 
 /**
  * What `token` says, where the key `secret` names of what it says signed it, as a key the
- * claims choose (environmentKey's), and it has not stopped by `now`; else null. Its claims
+ * claims choose (./names.ts environmentKey's), and it has not stopped by `now`; else null. Its claims
  * are trusted only once its signature is checked by the key they named.
  */
 export function verifyToken(secret: Buffer | ((claims: TokenClaims) => Buffer | null), token: string, now: number): TokenClaims | null {
@@ -60,10 +60,3 @@ export function verifyToken(secret: Buffer | ((claims: TokenClaims) => Buffer | 
   if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
   return claims.value.expires !== undefined && claims.value.expires <= now ? null : claims.value;
 }
-
-/**
- * The key of the environment `environment`'s callers, of the gateway's caller key `master`:
- * its HMAC of the environment's name, so each environment's alasio, given its own alone, can
- * sign tokens of its own environment's sessions alone (cli/src/branches.ts writes a branch's).
- */
-export const environmentKey = (master: Buffer, environment: string): Buffer => createHmac("sha256", master).update(`environment:${environment}`).digest();

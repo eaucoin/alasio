@@ -36,6 +36,7 @@ import { Console, Effect, Predicate, Redacted, Result, Schedule, Schema } from "
 import { type BranchView, COMPUTE_PORT, computeId, MAIN, nameProblem, tokenSha256 } from "../../neon/control/branches.ts";
 import { scramVerifier } from "../../neon/control/scram.ts";
 import { LAKE_ROLE, ROLE } from "../../neon/control/secrets.ts";
+import { environmentKey } from "../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
@@ -47,7 +48,8 @@ import { sandboxPolicyName } from "./manifests/admission.ts";
 import { alasioPrincipal, environmentAccess, type EnvironmentLogAccess, environmentLogSecret, LOG, loaderLogSecret, loaderPrincipal, logPrincipalSecret } from "./manifests/log.ts";
 import { branchObjects } from "./manifests/branch.ts";
 import { REPLICA_NAME } from "./manifests/neon.ts";
-import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels } from "./manifests/common.ts";
+import { BRANCH_FORK_SECRET, BRANCH_LABEL, componentName, NAMESPACE, neonName, RELEASE, selectorLabels, SESSIONS_CALLER_SECRET } from "./manifests/common.ts";
+import { GATEWAY, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { LOADER_COMPONENT } from "./manifests/lake.ts";
 import { CLAUDE_SECRET, readClaudeToken, readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "./secrets.ts";
@@ -314,6 +316,10 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
     ...(yield* Effect.forEach(settings.imagePullSecrets, (secret) => copiedSecret(name, secret))),
     branchSecret(name, TELEGRAM_SECRET, { token: Redacted.value(bot.token), allowedUserIds: bot.allowedUserIds.join(",") }),
     branchSecret(name, BRANCH_FORK_SECRET, { token: forkToken(yield* requiredSecret(componentName("branches"), "fork-key"), name) }),
+    // Its callers' key to the sandbox gateway, its own of the gateway's, which signs its own sessions' tokens alone.
+    ...(sandboxServiceRuns(settings)
+      ? [branchSecret(name, SESSIONS_CALLER_SECRET, { "caller-key": environmentKey(Buffer.from(yield* requiredSecret(GATEWAY, "caller-key")), name).toString() })]
+      : []),
     branchSecret(name, environmentLogSecret({ namespace: branchNamespace(name), branch: name }), { username: alasioPrincipal(name), password: credentials.log }),
     // Its lake loader's, which reads its wake topic alone; and KEDA's, which may describe
     // how far behind that is and read nothing, which its loader's scaler reads as.

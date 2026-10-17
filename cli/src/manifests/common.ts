@@ -60,6 +60,13 @@ export function componentName(component: string): string {
 /** The Secret of a branch environment's token, which its parent forks the sessions it inherited for (src/branch/fork.ts). */
 export const BRANCH_FORK_SECRET = componentName("branch-fork");
 
+/**
+ * The Secret of an environment's callers' key to the sandbox gateway, of the gateway's
+ * (src/binder/names.ts environmentKey), in its alasio's namespace: main's, as Neon's setup
+ * renders it, and a branch environment's, as `alasio branch create` writes it.
+ */
+export const SESSIONS_CALLER_SECRET = componentName("sessions-caller");
+
 /** A Neon service's name: `alasio-neon-<component>`. */
 export function neonName(component: string): string {
   return componentName(`neon-${component}`);
