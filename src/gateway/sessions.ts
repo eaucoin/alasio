@@ -315,13 +315,27 @@ export const makeSessions = Effect.fnUntraced(function*(
 
   /**
    * Looks at each bound pod of the gateway's pools: one whose bayma ended, or was started again
-   * in it, which serves no more, is released into the snapshot taken of it live, if any, as
-   * broken; and of each that runs, the snapshot taken of it live is kept true to it
+   * in it, or whose workspace its node can reach no more (the node's mount of workspace storage
+   * ended under it, as its mount's pod killed with no successor leaves it), which serves no more,
+   * is released into the snapshot taken of it live, if any, as broken; and of each that runs, the snapshot taken of it live is kept true to it
    * (./snapshots.ts keepLive), one that can be saved no more released now.
    */
   const live: Effect.Effect<void, KubeApiError> = Effect.gen(function*() {
     // The workspaces bound in each namespace, of all its pools.
     const boundIn = new Map<string, Set<string>>();
+    // The pods each node says what is attached into is unreachable in, asked once a look.
+    const unreachableOn = new Map<string, ReadonlySet<string>>();
+    const unreachable = (node: string) =>
+      Effect.gen(function*() {
+        const known = unreachableOn.get(node);
+        if (known) return known;
+        const pods = yield* agents.attachments(node).pipe(
+          Effect.map((attachments) => new Set(attachments.filter(({ reachable }) => !reachable).map(({ pod }) => pod))),
+          Effect.catch((error) => Effect.as(Effect.logWarning(`could not ask ${node} what is attached on it: ${error.message}`), new Set<string>())),
+        );
+        unreachableOn.set(node, pods);
+        return pods;
+      });
     for (const pool of yield* pools) {
       const bound = boundIn.get(pool.namespace) ?? new Set<string>();
       boundIn.set(pool.namespace, bound);
@@ -332,8 +346,10 @@ export const makeSessions = Effect.fnUntraced(function*(
         if (!workspace || !pod || pod.metadata?.deletionTimestamp !== undefined) continue;
         bound.add(workspace);
         const bayma = pod.status?.containerStatuses?.find((status) => status.name === BAYMA_CONTAINER);
-        if (bayma && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined)) {
-          yield* Effect.logWarning(`${key}'s bayma ended in its pod ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
+        const ended = bayma !== undefined && (bayma.restartCount > 0 || bayma.state?.terminated !== undefined);
+        if (ended || (yield* unreachable(pod.spec?.nodeName ?? "")).has(pod.metadata?.name ?? "")) {
+          const why = ended ? "bayma ended in its pod" : "workspace is unreachable in its pod";
+          yield* Effect.logWarning(`${key}'s ${why} ${pod.metadata?.name}, which serves its binding no more: it is released into the snapshot taken of it live, if any`);
           yield* Effect.forkDetach(releaseFor(pool, key, pod, "broken", () =>
             Effect.andThen(
               Effect.flatMap(snapshots.liveSnapshotOf(pool, workspace), (into) => agents.setReleased({ environment: pool.namespace, workspace }, into)),

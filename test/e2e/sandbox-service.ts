@@ -5,7 +5,9 @@
  * nothing but the collector and the API server; and workspaces reached through the gateway
  * alone, by tokens of main's own key: one made, bound to a pool's pod and kept whole, every
  * write into it done, through the node's mount of workspace storage handed over to the pod
- * that replaces the one that held it; another made, given a received file, bound, held to its
+ * that replaces the one that held it; the node's mount killed with no successor, as a reboot
+ * ends it, mounted again by the DaemonSet's restart, a workspace made after it and one bound
+ * through it released as broken, then bound again with what it held; another made, given a received file, bound, held to its
  * quota, read back of what its session wrote, released, bound again, and deleted.
  *
  * Registered with sandboxService() in the workspaces shard (test/e2e/alasio.test.ts).
@@ -231,6 +233,33 @@ export function sandboxService(): void {
         if (after.status === 204) break;
       }
       assert.equal(after.status, 204, `${after.said}; ${await seen()}`);
+    });
+
+    test("a node's mount of workspace storage killed with no successor, as a node's reboot ends it, is mounted again by the DaemonSet's restart: a workspace is made after it, and one bound through it is released as broken, then bound again with what it held", async () => {
+      const workspace = "fs-e2ereboot";
+      const token = await mainToken(workspace);
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const bound = await boundPod(workspace);
+      await kube.execOk(SESSIONS, bound.name, ["sh", "-c", "printf 'kept through it' > /workspace/before && sync"], { container: "bayma" });
+      const mountPods = async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).filter(({ spec }) => spec?.nodeName === bound.node);
+      const [before] = await mountPods();
+      assert.ok(before?.metadata?.name, "the node runs no mount's pod");
+      await kube.kill(NAMESPACE, before.metadata.name);
+      await until("the DaemonSet's new pod serving the node's mount", async () =>
+        (await mountPods()).some(({ metadata, status }) => metadata?.uid !== before.metadata?.uid && status?.conditions?.some(({ type, status: is }) => type === "Ready" && is === "True")) ? true : undefined, 240_000);
+      // A workspace made after it.
+      await until("the gateway making a workspace after it", async () => ((await gatewayCall(await mainToken("fs-e2erebooted"), "POST", "/workspace")).status === 204 ? true : undefined), 60_000);
+      // The bound one, its workspace unreachable in its pod, released as broken.
+      await until("the bound pod released", async () =>
+        (await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` })).length === 0 ? true : undefined, 180_000, async () => `\n${await serviceLogs(workspace)}`);
+      assert.match(await serviceLogs(workspace), /workspace is unreachable in its pod/u);
+      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const again = await boundPod(workspace);
+      assert.notEqual(again.name, bound.name);
+      assert.equal(await kube.execOk(SESSIONS, again.name, ["cat", "/workspace/before"], { container: "bayma" }), "kept through it");
+      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
     });
 
     test("a workspace is made, given a received file, bound, held to its quota, read back of what its session wrote, released and deleted through the gateway alone", async () => {

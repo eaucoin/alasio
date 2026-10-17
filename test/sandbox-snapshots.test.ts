@@ -103,6 +103,7 @@ function fakeAgents({ current = null, holdings = [], prepare = () => null, read,
   const checkpoints: (readonly [string, CheckpointRequest])[] = [];
   const agents: NodeAgents = {
     nodes: Effect.succeed(holdings.map(({ node }) => node)),
+    attachments: () => Effect.die("no attachment is looked at"),
     checkpoint: (node, request) =>
       Effect.sync(() => {
         checkpoints.push([node, request]);

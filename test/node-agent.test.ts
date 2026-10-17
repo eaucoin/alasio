@@ -1903,6 +1903,7 @@ const unusedWorkspaces: Workspaces = {
   remove: () => Effect.die("no workspace is deleted"),
   list: () => Effect.die("no workspace is listed"),
   quota: () => Effect.die("no workspace's quota is read"),
+  attachments: Effect.die("no attachment is looked at"),
   attach: () => Effect.die("no workspace is attached"),
   detach: () => Effect.die("no workspace is detached"),
   read: () => Effect.die("no workspace's file is read"),
@@ -2450,6 +2451,11 @@ test("alasio attaches and detaches a workspace through the node's agent, and rea
       yield* agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} });
       const again = yield* Effect.flip(agents.attach("node-1", { ...ref, pod: "pool-0", token: "binding", env: {} }));
       assert.equal(again._tag === "NodeAgentError" && again.status, 409);
+      // What is attached on it, through its node's agent, reachable until its mount is not.
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ pod: "pool-0", reachable: true }]);
+      at.unreachable.add("pool-0");
+      assert.deepEqual(yield* agents.attachments("node-1"), [{ pod: "pool-0", reachable: false }]);
+      at.unreachable.delete("pool-0");
       const bytes = Uint8Array.from([0, 255, 10, 13, 128]);
       yield* agents.writeFile(ref, "home/.alasio/received/1/blob", bytes);
       assert.deepEqual(yield* agents.readFile(ref, "home/.alasio/received/1/blob", 100), bytes);

@@ -46,6 +46,9 @@ export type Prepared = typeof Prepared.Type;
 /** What an agent answers a call that fails with. */
 const Refusal = Schema.Struct({ error: Schema.String });
 
+/** What an agent answers a look at what is attached on its node with. */
+const Attachments = Schema.Struct({ attachments: Schema.Array(Schema.Struct({ pod: Schema.String, reachable: Schema.Boolean })) });
+
 /** What an agent answers a workspace's quota with. */
 const Quota = Schema.Struct({ capacityBytes: Schema.Number, usedBytes: Schema.Number });
 /** What an agent answers a listing of an environment's snapshots, a collection, and a discard, with. */
@@ -130,6 +133,8 @@ export interface NodeAgents {
    * container; an agent refuses one that is not the bayma of a pool's pod there with 403.
    */
   readonly stop: (node: string, request: StopRequest) => Effect.Effect<void, NodeAgentError | KubeApiError>;
+  /** The pods of `node` a workspace is attached into, each by whether what is attached is reachable still. */
+  readonly attachments: (node: string) => Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], NodeAgentError | KubeApiError>;
   /** The snapshot the workspace was last released into, as any agent reads its record of it; null where none is recorded. */
   readonly released: (workspace: WorkspaceRef) => Effect.Effect<Released | null, NodeAgentError | KubeApiError>;
   /** Records the snapshot the workspace is released into, or none, through any agent. */
@@ -274,6 +279,8 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     removeWorkspace: (workspace) =>
       Effect.flatMap(anyNode, (node) =>
         send(node, `delete ${workspace.environment}/${workspace.workspace}`, { method: "DELETE", path: `/workspaces/${encodeURIComponent(workspace.environment)}/${encodeURIComponent(workspace.workspace)}`, timeout: SHORT_CALL })).pipe(Effect.asVoid),
+    attachments: (node) =>
+      ask(node, "say what is attached on it", { method: "GET", path: "/attachments", timeout: SHORT_CALL }, Attachments).pipe(Effect.map(({ attachments }) => attachments)),
     stop: (node, request) => send(node, `tell ${request.namespace}/${request.pod}'s bayma to go on with its stop`, { method: "POST", path: "/stop", body: request, timeout: SHORT_CALL }).pipe(Effect.asVoid),
     released: (workspace) =>
       Effect.gen(function*() {

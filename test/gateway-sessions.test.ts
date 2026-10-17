@@ -82,6 +82,8 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
       // No workspace of theirs has a snapshot to restore, nor a record of a release, unless a test gives it one.
       current: () => Effect.succeed(null),
       released: () => Effect.succeed(null),
+      // What is attached on its node is reachable, unless a test says otherwise.
+      attachments: () => Effect.succeed([]),
       prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
       readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
       checkpoint: (node, request) =>
@@ -692,4 +694,44 @@ test("a bound pod whose bayma ended in it, or was started again, is released as 
   const lease = { apiVersion: "coordination.k8s.io/v1", kind: "Lease", metadata: { uid: "uid-gone", namespace: env.namespace, annotations: { "alasio.dev/binding-key": sessionKey("fs-gone") } }, spec: { holderIdentity: "none-9" } };
   await Effect.runPromise(sessions.recordLost(env.none, lease));
   assert.equal(recorded.asked.at(-1), `record ${env.namespace}/fs-gone released into s-live`);
+});
+
+test("a bound pod whose workspace its node can reach no more, as its node's mount of workspace storage ended under it, is released as broken, into the snapshot taken of it live; one whose workspace is reachable is kept", async () => {
+  const env = await environment(2, { gvisor: true });
+  const recorded = agents();
+  let saved = false;
+  let unreachable = "";
+  const live: NodeAgents = {
+    ...recorded.agents,
+    current: () => Effect.succeed(saved ? ({ snapshot: "s-live", release: "r1", live: { stateDir: "/home/agent/.bayma", generation: 1, running: [] } } as unknown as Manifest) : null),
+    attachments: (node) => Effect.sync(() => (recorded.asked.push(`attachments ${node}`), [{ pod: unreachable, reachable: false }])),
+  };
+  const { binder, sessions } = await sessionsOf(options(env, 7291), live);
+  const key = sessionKey("fs-unreachable");
+  const kept = sessionKey("fs-reachable");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  const other = await Effect.runPromise(binder.bind(placement.pool, kept, await Effect.runPromise(sessions.place(kept, { environment: env.name, mode: "none" }))));
+  saved = true;
+  unreachable = bound.pod;
+  // Its deletion ends it, as kubelet would.
+  const ending = (async () => {
+    for (;;) {
+      const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, bound.pod)))) as V1Pod | null;
+      if (pod?.metadata?.deletionTimestamp) {
+        await run(withKube((kube) => kube.patchPodStatus(env.namespace, bound.pod, { status: { containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-0", state: { terminated: { exitCode: 1 } } }] } })));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  })();
+  await Effect.runPromise(Effect.provide(sessions.live, Layer.fresh(KubeClient.layer)));
+  await ending;
+  for (const deadline = Date.now() + 10_000; (await run(readLease(env.none, key))) !== null; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its binding was not let go");
+  // Its node was asked once, for both.
+  assert.deepEqual(recorded.asked, ["attachments node-a", `record ${env.namespace}/fs-unreachable released into s-live`, `detach node-a ${bound.pod}`]);
+  assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "broken"));
+  assert.notEqual(await run(readLease(env.none, kept)), null);
+  assert.ok(!told.some((event) => event.kind === "workspace.released" && event.subject.key === kept));
+  assert.notEqual(other.pod, bound.pod);
 });

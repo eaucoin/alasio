@@ -6,13 +6,40 @@ import { test } from "node:test";
 
 import { Effect } from "effect";
 
-import { mountPoints, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
+import { mountPoints, reaching, WorkspaceRefused } from "../src/node-agent/workspaces.ts";
 import { workspacesNode } from "./support/node-workspaces.ts";
 
 const refusal = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.flip(effect)).then((error) => (error instanceof WorkspaceRefused ? error.status : error));
 
 test("mountinfo's mount points are read with their escapes undone", () => {
   assert.deepEqual(mountPoints("36 35 98:0 /mnt1 /mnt/a\\040b rw - ext3 /dev/root rw\n37 35 0:50 / /var rw - tmpfs tmpfs rw\n"), ["/mnt/a b", "/var"]);
+});
+
+test("what is mounted is unreachable where reading it answers ENOTCONN or EIO, as FUSE answers of a mount whose process ended, and reachable otherwise, or where it does not answer in time", async () => {
+  const failing = (code: string) => () => Promise.reject(Object.assign(new Error(code), { code }));
+  assert.equal(await reaching(failing("ENOTCONN"))("/p"), false);
+  assert.equal(await reaching(failing("EIO"))("/p"), false);
+  assert.equal(await reaching(failing("EACCES"))("/p"), true);
+  assert.equal(await reaching(() => Promise.resolve([]))("/p"), true);
+  assert.equal(await reaching(() => new Promise(() => {}), 50)("/p"), true);
+  assert.equal(await reaching()(import.meta.dirname), true);
+});
+
+test("the pods a workspace is attached into are listed each by whether it is reachable, and none other of the node's mounts", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-a");
+    at.files("fs-b");
+    at.pod("pool-0");
+    at.pod("pool-1");
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-a" }, "pool-0", "t", {}));
+    await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-b" }, "pool-1", "t", {}));
+    at.mounts.push(join(at.attachRoot, "pool-1", "ws", "deeper"), join(at.root, "elsewhere", "ws"));
+    at.unreachable.add("pool-1");
+    assert.deepEqual(await Effect.runPromise(at.workspaces.attachments), [{ pod: "pool-0", reachable: true }, { pod: "pool-1", reachable: false }]);
+  } finally {
+    at.done();
+  }
 });
 
 test("a workspace is made with its quota, which is read back, its directories its agent's, JuiceFS told the metadata engine's password out of its arguments", async () => {
