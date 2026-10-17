@@ -141,6 +141,12 @@ export interface Workspaces {
   readonly read: (ref: WorkspaceRef, path: string, maxBytes: number) => Effect.Effect<Buffer, WorkspaceRefused>;
   /** Writes `bytes` as the file at `path` of `ref`'s files, its agent's, its directories made. */
   readonly write: (ref: WorkspaceRef, path: string, bytes: Uint8Array) => Effect.Effect<void, WorkspaceRefused>;
+  /**
+   * The pods of this node a workspace is attached into, each by whether what is attached is
+   * reachable still: one whose node's mount of workspace storage ended under it, as a mount's
+   * pod killed with no successor leaves it, is not, and its sandbox serves its workspace no more.
+   */
+  readonly attachments: Effect.Effect<readonly { readonly pod: string; readonly reachable: boolean }[], HostCommandError>;
   /** Has the bayma of a bound pod go on with the stop it holds, as the module says. */
   readonly stop: (request: StopRequest) => Effect.Effect<void, WorkspaceRefused>;
   /** The snapshot `ref` was last released into, as the module says; null where none is recorded. */
@@ -173,6 +179,8 @@ export interface WorkspacesOptions {
   readonly host: HostCommands;
   /** Whether workspace storage is mounted at the workspaces' root: as its file system says, but for tests. */
   readonly mounted?: (root: string) => Promise<boolean>;
+  /** Whether what is mounted at a point is reachable: as reaching says, but for tests. */
+  readonly reaches?: (point: string) => Promise<boolean>;
   readonly runsc: Pick<Runsc, "container" | "exec">;
   readonly juicefs: Juicefs | null;
   readonly workspacesRoot?: string;
@@ -187,7 +195,21 @@ const FUSE_SUPER_MAGIC = 0x65735546;
 /** Whether `root` is FUSE's, as its file system says. */
 const fuseAt = (root: string): Promise<boolean> => statfs(root).then(({ type }) => type === FUSE_SUPER_MAGIC, () => false);
 
-export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
+/**
+ * Whether what is mounted at a point is reachable, as `read` reads its directory: not where the
+ * mount it was bound from ended under it, as FUSE answers ENOTCONN, or EIO, of one whose
+ * process ended; one that does not answer within `timeoutMs` is not taken for lost.
+ */
+export const reaching = (read: (point: string) => Promise<unknown> = readdir, timeoutMs = 5_000) => (point: string): Promise<boolean> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(true), timeoutMs);
+    read(point).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOTCONN" && error.code !== "EIO").then((reached) => {
+      clearTimeout(timer);
+      resolve(reached);
+    });
+  });
+
+export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches = reaching(), workspacesRoot = WORKSPACES_ROOT, attachRoot = ATTACH_ROOT, agentUid = AGENT_UID }: WorkspacesOptions): Workspaces {
   /** Where `ref`'s files are on the node, its names checked. */
   const filesOf = ({ environment, workspace }: WorkspaceRef): Effect.Effect<string, WorkspaceRefused> =>
     !ENVIRONMENT.test(environment) || !isValidVolumeId(workspace)
@@ -323,6 +345,11 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, workspa
         const root = yield* filesOf(ref);
         yield* confined(path, () => writeUnder({ root, names }, bytes, { uid: agentUid, gid: agentUid }));
       }),
+
+    attachments: Effect.gen(function*() {
+      const attached = (yield* mountsUnder(attachRoot)).filter((point) => point.endsWith("/ws") && point.split("/").length === attachRoot.split("/").length + 2);
+      return yield* Effect.forEach(attached, (point) => Effect.promise(() => reaches(point)).pipe(Effect.map((reachable) => ({ pod: point.split("/").at(-2) ?? "", reachable }))), { concurrency: 8 });
+    }),
 
     stop: ({ namespace, pod, containerId, hook }) =>
       Effect.gen(function*() {

@@ -54,9 +54,12 @@ export function workspacesNode() {
   chmodSync(juicefs, 0o755);
   // Workspace storage mounted at the root, unless a test says it is not.
   const storage = { mounted: true };
+  // The pods whose attached workspace is unreachable, as a test says.
+  const unreachable = new Set<string>();
   const workspaces = makeWorkspaces({
     host,
     mounted: () => Promise.resolve(storage.mounted),
+    reaches: (point) => Promise.resolve(![...unreachable].some((pod) => point === join(attachRoot, pod, "ws"))),
     juicefs: makeJuicefs({ metaUrl: "redis://:the%20password@valkey.alasio.svc:6379/1", juicefs }),
     runsc: {
       container: (id) =>
@@ -81,6 +84,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, ran, running, annotations, execs, hooks, storage, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, ran, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

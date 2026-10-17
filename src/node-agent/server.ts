@@ -89,6 +89,8 @@
  *   files into the directory of the sandbox pool pod `pod` on this node, its binding's `token`
  *   and the variables its bayma runs with, `env`, beside them (./workspaces.ts) (204); 409 when the pod's directory holds a mount, 404 when
  *   there is no such workspace.
+ * - `GET /attachments`: `{ attachments: [{ pod, reachable }] }`, the pods of this node a
+ *   workspace is attached into, each by whether what is attached is reachable still (./workspaces.ts).
  * - `POST /stop`, `{ namespace, pod, containerId, hook }`: has the bayma of the bound pod
  *   `namespace`/`pod` of a pool on this node, its container `containerId`, go on with the stop
  *   it holds, by `hook`, its `sandbox-hook stop`, run in it (./workspaces.ts) (204); 403 for a
@@ -348,6 +350,7 @@ export const serveNodeAgent = Effect.fnUntraced(function*({
     if (method === "POST" && url === "/attach") {
       return body(AttachRequest).pipe(Effect.flatMap(({ pod, token: binding, env, ...ref }) => workspaces.attach(ref, pod, binding, env)), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
+    if (method === "GET" && url === "/attachments") return workspaces.attachments.pipe(Effect.map((attachments) => answer(200, { attachments })));
     if (method === "POST" && url === "/stop") {
       return body(StopRequest).pipe(Effect.flatMap(workspaces.stop), Effect.as(HttpServerResponse.empty({ status: 204 })));
     }
