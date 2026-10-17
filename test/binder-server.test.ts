@@ -9,7 +9,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Exit, Layer, Scope } from "effect";
 
 import { Binder } from "../src/binder/binder.ts";
-import { freeLabels, type Pool, readLease } from "../src/binder/bindings.ts";
+import { activeAt, freeLabels, type Pool, readLease } from "../src/binder/bindings.ts";
 import { type BinderServer, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -88,12 +88,18 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
   const served = await front(of, stand.port);
   try {
     const key = "sessionfs:workspace";
+    const stamps: (number | null)[] = [];
     for (const _ of [1, 2]) {
       const response = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" });
       assert.equal(response.status, 200);
+      const held = await run(readLease(of, key));
+      stamps.push(held ? activeAt(held) : null);
     }
     const lease = await run(readLease(of, key));
     assert.ok(lease?.spec?.holderIdentity);
+    // Stamped active as the first came, and not again within the stamp's interval.
+    assert.ok(stamps[0] !== null && Date.now() - (stamps[0] ?? 0) < 30_000, String(stamps));
+    assert.equal(stamps[1], stamps[0]);
     const tokens = stand.sent.map(({ authorization }) => verifyToken(bindingKey, String(authorization).slice("Bearer ".length), Date.now()));
     assert.deepEqual(tokens, [{ key, binding: lease.metadata?.uid }, { key, binding: lease.metadata?.uid }]);
     assert.equal(served.inFlight(key), 0);
