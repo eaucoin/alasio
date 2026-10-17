@@ -12,7 +12,7 @@
  *   ALASIO_E2E_AGENTS=2 npm run test:e2e
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -1616,22 +1616,24 @@ if (inShard("snapshots")) {
       }, 600_000);
       const agent = (await nodeAgents()).get(node);
       assert.ok(agent, `no node agent runs ready on ${node}`);
+      // What it says as it stops, followed from before its stop: once its container is gone,
+      // its log can no more be read, though its pod is still there.
+      const log = following(NAMESPACE, agent, "node-agent", new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+      await log.started;
       const stoppedAt = Date.now();
       await kube.remove(ref("Pod", agent, NAMESPACE));
       try {
-        // What it says as it stops, read until it is gone.
-        let logged = "";
-        await until(`the node agent ${agent} gone`, async () => {
-          logged = await kube.logs(NAMESPACE, agent, "node-agent").catch(() => logged);
-          return (await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined;
-        }, 1_800_000);
+        await until(`the node agent ${agent} gone`, async () => ((await kube.get(ref("Pod", agent, NAMESPACE))) === null ? true : undefined), 1_800_000);
         t.diagnostic(`the node agent ${agent} was gone ${Date.now() - stoppedAt} ms after it was stopped`);
-        assert.match(logged, new RegExp(`the node agent of ${node} stops once the restores reading the snapshots bucket through it are done: 1 read it now`, "u"));
+        const said = await Promise.race([log.said, sleep(30_000).then(() => undefined)]);
+        assert.ok(said, `the node agent ${agent} did not say, as it stopped, that it waits on the restore reading the bucket through it`);
+        t.diagnostic(said);
         await answered;
         const summed = await repl.sum(big, held);
         assert.equal(summed.sha256, sha256);
         assert.match(summed.notice ?? "", CAME_BACK_WHOLE);
       } finally {
+        log.stop();
         await until(`a node agent ready again on ${node}`, async () => ((await nodeAgents()).has(node) ? true : undefined), 300_000);
       }
       // Saved again, as a sandbox whose background reads failed could be no more.
@@ -2404,6 +2406,33 @@ async function until<A>(what: string, check: () => Promise<A | undefined>, timeo
     if (found !== undefined) return found;
   }
   return assert.fail(`${what}, not within ${timeoutMs / 1000}s`);
+}
+
+/**
+ * The log of `container` of `pod`, followed (kubectl logs --follow) until the container ends
+ * or `stop`: `started` once its first line came, and `said` the first line `wanted` matches,
+ * as soon as it comes, or undefined if none did before the log ended.
+ */
+function following(namespace: string, pod: string, container: string, wanted: RegExp): { readonly started: Promise<void>; readonly said: Promise<string | undefined>; readonly stop: () => void } {
+  const follow = spawn("kubectl", ["--kubeconfig", paths().kubeconfig, "logs", "--follow", "--namespace", namespace, pod, "--container", container], { stdio: ["ignore", "pipe", "ignore"] });
+  let begun = () => {};
+  const started = new Promise<void>((resolve) => (begun = resolve));
+  const said = new Promise<string | undefined>((resolve) => {
+    let pending = "";
+    follow.stdout.setEncoding("utf8");
+    follow.stdout.on("data", (chunk: string) => {
+      begun();
+      const lines = `${pending}${chunk}`.split("\n");
+      pending = lines.pop() ?? "";
+      const line = lines.find((each) => wanted.test(each));
+      if (line !== undefined) resolve(line);
+    });
+    follow.once("close", () => {
+      begun();
+      resolve(wanted.test(pending) ? pending : undefined);
+    });
+  });
+  return { started, said, stop: () => follow.kill() };
 }
 
 /** Runs kubectl on the run's cluster with `args`, given `input`: whether it succeeded, what it printed, and all it said. */
