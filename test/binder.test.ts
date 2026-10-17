@@ -4,7 +4,7 @@ import { before, test } from "node:test";
 import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 
-import { BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
+import { BindStepFailed, BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
 import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, markReleasing, type Pool, POOL_LABEL, readLease, reconcile, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -318,4 +318,39 @@ test("a pod once bound is never claimed again, even labelled free again", async 
   assert.equal(await run(binder(), claim(of, "sessionfs:second")), null);
   const timedOut = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.bind(of, "sessionfs:second"))), layer));
   assert.ok(timedOut instanceof BindTimeout && timedOut.waited === "free pod", String(timedOut));
+});
+
+test("a bind readies the pod it got before it is the binding's, and one it cannot ready is deleted, its Lease let go", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const layer = binderOf();
+  const readied: string[] = [];
+  const bound = await bindIn(layer, (each) =>
+    each.bind(of, "sessionfs:workspace", {
+      prepare: (pod, binding) =>
+        Effect.gen(function*() {
+          const lease = yield* withKube((client) => client.read("coordination.k8s.io/v1", "Lease", of.namespace, leaseName("sessionfs:workspace"))).pipe(Effect.provide(binder()), Effect.orDie);
+          // Not yet the binding's: its Lease names no holder while it is readied.
+          readied.push(`${pod.metadata?.name} ${binding === lease?.metadata?.uid} ${(lease as BindingLease | null)?.spec?.holderIdentity ?? "none"}`);
+        }),
+    })
+  );
+  assert.deepEqual(readied, [`${bound.pod} true none`]);
+  const failed = await Effect.runPromise(Effect.provide(Effect.flatMap(Binder, (each) => Effect.flip(each.bind(of, "sessionfs:failing", { prepare: () => Effect.fail(new BindStepFailed({ reason: "the attach was refused" })) }))), layer));
+  assert.ok(failed instanceof BindStepFailed, String(failed));
+  assert.equal(await run(binder(), readLease(of, "sessionfs:failing")), null);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound.pod]);
+});
+
+test("a bind that finds a pod bound to the key and not yet held, as a binder that ended left it, deletes it and gets another", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  // A binder that took the Lease and claimed a pod, then ended: its Lease stale, its pod unheld.
+  const kube = binder();
+  await run(kube, takeLease(of, "sessionfs:workspace", "ended", 1_000));
+  const left = await run(kube, claim(of, "sessionfs:workspace"));
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  const bound = await bindIn(binderOf({ staleMs: 1_000 }), (each) => each.bind(of, "sessionfs:workspace"));
+  assert.notEqual(bound.pod, left?.metadata?.name);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [bound.pod]);
 });

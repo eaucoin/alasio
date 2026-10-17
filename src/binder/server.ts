@@ -26,7 +26,7 @@ import { Clock, Effect, Option, Schema, type Scope } from "effect";
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
-import { type BindOptions, Binder, type BindTimeout } from "./binder.ts";
+import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
 import { counts, type Pool } from "./bindings.ts";
 import { proxy, type Route } from "./proxy.ts";
 import { mintToken, verifyToken } from "./tokens.ts";
@@ -78,7 +78,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const flights = new Map<string, number>();
 
   /** The route to `key`'s pod: the one known, or its pod bound now. */
-  const routeOf = (key: string): Effect.Effect<Route, KubeApiError | BindTimeout> =>
+  const routeOf = (key: string): Effect.Effect<Route, KubeApiError | BindTimeout | BindStepFailed> =>
     Effect.suspend(() => {
       const known = routes.get(key);
       if (known) return Effect.succeed(known);
@@ -119,7 +119,10 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       // A caller's token, which stops; a binding's, which a bound pod takes requests with, is none.
       if (!claims || claims.expires === undefined || claims.binding !== undefined) return answer(outgoing, 401, { error: "no caller's token" });
       const { key } = claims;
-      const route = yield* routeOf(key).pipe(Effect.option);
+      const route = yield* routeOf(key).pipe(
+        Effect.tapError((error) => Effect.logWarning(`binding ${key} failed: ${error.message}`)),
+        Effect.option,
+      );
       if (Option.isNone(route)) return answer(outgoing, 503, { error: `${key} could not be bound in time` }, { "retry-after": String(RETRY_AFTER_S) });
       if (incoming.method === "POST" && url === "/bind") {
         incoming.resume();
