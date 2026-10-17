@@ -57,6 +57,7 @@ interface NetworkPolicyObject extends KubernetesObject {
     readonly podSelector: V1LabelSelector;
     readonly policyTypes?: readonly string[];
     readonly ingress?: readonly { readonly from?: readonly Peer[]; readonly ports?: readonly { readonly port?: number | string }[] }[];
+    readonly egress?: readonly { readonly to?: readonly Peer[]; readonly ports?: readonly { readonly port?: number | string }[] }[];
   };
 }
 
@@ -64,7 +65,7 @@ interface NetworkPolicyObject extends KubernetesObject {
 interface Peer {
   readonly namespaceSelector?: V1LabelSelector;
   readonly podSelector?: V1LabelSelector;
-  readonly ipBlock?: object;
+  readonly ipBlock?: { readonly cidr: string; readonly except?: readonly string[] };
 }
 
 /** A pod, as NetworkPolicies select it: by its labels, and its namespace's. */
@@ -107,6 +108,33 @@ function admits(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, po
     )
   );
 }
+
+/**
+ * Whether `policies` let `from` connect to `to` on `port` on its way out, as Kubernetes
+ * reads them: anywhere, where none of them selects `from` for egress; otherwise where a rule
+ * of one that does reaches. A pod's address is the cluster's, private: an address block
+ * reaches it unless it excepts any, as one that excepts the private networks does.
+ */
+function reaches(policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean {
+  const selecting = policies.filter(({ metadata, spec }) =>
+    metadata?.namespace === from.namespace && (spec.policyTypes ?? []).includes("Egress") && selects(spec.podSelector, from.labels)
+  );
+  const peerReaches = (peer: Peer, namespace: string) =>
+    peer.ipBlock !== undefined
+      ? (peer.ipBlock.except ?? []).length === 0
+      : (peer.namespaceSelector ? selects(peer.namespaceSelector, to.namespaceLabels) : to.namespace === namespace) &&
+        (peer.podSelector ? selects(peer.podSelector, to.labels) : true);
+  return selecting.length === 0 || selecting.some(({ metadata, spec }) =>
+    (spec.egress ?? []).some((rule) =>
+      (rule.ports === undefined || rule.ports.some((allowed) => allowed.port === undefined || allowed.port === port)) &&
+      (rule.to === undefined || rule.to.some((peer) => peerReaches(peer, metadata?.namespace ?? "")))
+    )
+  );
+}
+
+/** Whether `policies` let `from` connect to `to` on `port`: out of the one, and into the other. */
+const connects = (policies: readonly NetworkPolicyObject[], from: Pod, to: Pod, port: number): boolean =>
+  reaches(policies, from, to, port) && admits(policies, from, to, port);
 
 function configOf(file: Record<string, unknown> = {}): InstallConfig {
   const { alasio, ...rest } = file;
@@ -1480,11 +1508,12 @@ describe("telemetry", () => {
     assert.deepEqual(variable(one<V1Deployment>(without, "Deployment", "alasio-neon-compute"), "OTEL_SDK_DISABLED"), { name: "OTEL_SDK_DISABLED", value: "true" });
   });
 
-  test("admits alasio, the node agents, folder workspaces' bayma, and branch environments' alasio, compute and lake to the collector, beside the stack", () => {
+  test("admits alasio, the node agents, the sandbox service's gateway and receiver, folder workspaces' bayma, and branch environments' alasio, compute and lake to the collector, beside the stack", () => {
     const ingress = (objects: readonly KubernetesObject[]) =>
       one<KubernetesObject & { spec: { podSelector: unknown; ingress: unknown } }>(objects, "NetworkPolicy", "alasio-collector").spec;
     const alasio = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "alasio" } } };
     const nodeAgents = { podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" } } };
+    const sandboxService = ["sandbox-gateway", "receiver"].map((component) => ({ podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component } } }));
     const branches = { matchExpressions: [{ key: "alasio.dev/branch", operator: "Exists" }] };
     const ofBranches = [
       { namespaceSelector: branches, ...alasio },
@@ -1493,7 +1522,7 @@ describe("telemetry", () => {
     assert.deepEqual(ingress(install()), {
       podSelector: { matchLabels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "collector" } },
       policyTypes: ["Ingress"],
-      ingress: [{ from: [alasio, nodeAgents, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }],
+      ingress: [{ from: [alasio, nodeAgents, ...sandboxService, ...ofBranches], ports: [{ protocol: "TCP", port: 4318 }] }],
     });
     assert.deepEqual(ingress(install({ host: { enabled: true }, sessions: { runtimeClassName: "" } })).ingress, [{
       from: [alasio, { namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "alasio-host" } } }, ...ofBranches],
@@ -1910,7 +1939,7 @@ describe("the webhook intake", () => {
       [admits(policies, pod(labelsOf("alasio-collector-scraper")), webhook, 8080), admits(policies, pod(labelsOf("alasio")), webhook, 8080), admits(policies, pod({}), webhook, 443)],
       [true, false, true],
     );
-    const egress = (one<NetworkPolicyObject>(objects, "NetworkPolicy", "alasio-webhook").spec as { egress?: { to: Peer[]; ports: { port: number }[] }[] }).egress;
+    const egress = (one<NetworkPolicyObject>(objects, "NetworkPolicy", "alasio-webhook").spec as { egress?: readonly { readonly to: readonly Peer[]; readonly ports: readonly { readonly port: number }[] }[] }).egress;
     assert.deepEqual(egress?.map(({ to, ports }) => [to.map(({ podSelector }) => podSelector?.matchLabels), ports.map(({ port }) => port)]), [
       [[{ "k8s-app": "kube-dns" }], [53, 53]],
       [[{ "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "log" }], [9092]],
@@ -3251,7 +3280,7 @@ describe("admission", () => {
 });
 
 describe("the sandbox service", () => {
-  test("pools each internet's sessions as pods of the agent image under gVisor, each mounting its own directory on its node, its bayma started on its binding's token, kept free by KEDA", () => {
+  test("pools each internet's sessions as pods of the agent image under gVisor, resolving names as its internet says, each mounting its own directory on its node, its bayma started on its binding's token, kept free by KEDA", () => {
     const objects = install();
     for (const mode of ["none", "full"] as const) {
       const pool = one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`);
@@ -3264,6 +3293,8 @@ describe("the sandbox service", () => {
       assert.equal(template?.metadata?.labels?.["alasio.dev/net-mode"], mode);
       const spec = template?.spec;
       assert.deepEqual([spec?.runtimeClassName, spec?.automountServiceAccountToken, spec?.enableServiceLinks], ["gvisor", false, false]);
+      // Names resolved as its internet says: by the public resolvers, or by none but itself.
+      assert.deepEqual([spec?.dnsPolicy, spec?.dnsConfig], ["None", { nameservers: mode === "full" ? ["1.1.1.1", "8.8.8.8"] : ["127.0.0.1"] }]);
       assert.deepEqual(spec?.volumes?.[0], { name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } });
       const [bayma] = spec?.containers ?? [];
       assert.deepEqual(bayma?.volumeMounts?.[0], { name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" });
@@ -3325,6 +3356,47 @@ describe("the sandbox service", () => {
     assert.deepEqual(juicefs?.volumeMounts, [{ name: "workspaces", mountPath: "/var/lib/alasio/workspaces", mountPropagation: "Bidirectional" }]);
     assert.match(juicefs?.command?.[2] ?? "", /exec juicefs mount --no-bgjob --cache-size 1024 "\$META_URL" \/var\/lib\/alasio\/workspaces$/u);
     assert.equal(mount.spec?.template.metadata?.labels?.["alasio.dev/workload"], "juicefs-admin");
+  });
+
+  test("confines a pool's pods to the gateway in and the receiver out, with internet to the public internet beside, and admits alasio, its replicas and KEDA to the gateway, and the gateway to the node agents", () => {
+    const policies = all<NetworkPolicyObject>(install(), "NetworkPolicy");
+    const podOf = (component: string, namespace = "alasio", labels: Record<string, string> = {}): Pod => ({
+      namespace,
+      namespaceLabels: { "kubernetes.io/metadata.name": namespace },
+      labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": component, ...labels },
+    });
+    const pooled = (mode: "none" | "full", bound: boolean) =>
+      podOf("session", "alasio-sessions", { "alasio.dev/pool": `sandboxes-${mode}`, "alasio.dev/net-mode": mode, ...(bound ? { "alasio.dev/binding": "0".repeat(40) } : { "alasio.dev/free": "true" }) });
+    const [gateway, receiver, alasio, agent, collector, keda] = ["sandbox-gateway", "receiver", "alasio", "node-agent", "collector", "keda-operator"].map((component) => podOf(component));
+    assert.ok(gateway && receiver && alasio && agent && collector && keda);
+    for (const pod of [pooled("none", false), pooled("none", true), pooled("full", false), pooled("full", true)]) {
+      assert.equal(connects(policies, gateway, pod, 7290), true);
+      assert.equal(connects(policies, alasio, pod, 7290), false);
+      assert.equal(connects(policies, pooled("none", true), pod, 7290), false);
+      assert.equal(connects(policies, gateway, pod, 7291), false);
+      assert.equal(connects(policies, pod, receiver, 4318), true);
+      assert.equal(connects(policies, pod, alasio, 4318), false);
+      assert.equal(connects(policies, pod, collector, 4318), false);
+      assert.equal(connects(policies, pod, gateway, 8080), false);
+      assert.equal(connects(policies, pod, agent, 8484), false);
+      assert.equal(connects(policies, pod, pooled("full", true), 7290), false);
+    }
+    // The public internet, for a pod with internet alone, none of the private networks.
+    const internet = policies.filter(({ spec }) => (spec.egress ?? []).some(({ to }) => (to ?? []).some(({ ipBlock }) => ipBlock?.cidr === "0.0.0.0/0")));
+    const sandboxes = internet.filter(({ metadata, spec }) => metadata?.namespace === "alasio-sessions" && selects(spec.podSelector, pooled("full", true).labels));
+    assert.deepEqual(sandboxes.map(({ metadata, spec }) => [metadata?.name, spec.egress]), [["alasio-sandboxes-full-internet", [{
+      to: [{ ipBlock: { cidr: "0.0.0.0/0", except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"] } }],
+    }]]]);
+    assert.deepEqual(internet.filter(({ metadata, spec }) => metadata?.namespace === "alasio-sessions" && selects(spec.podSelector, pooled("none", true).labels)), []);
+    // The gateway, from main's alasio, its replicas and KEDA's operator, on its port alone.
+    for (const [from, admitted] of [[alasio, true], [gateway, true], [keda, true], [receiver, false], [collector, false], [podOf("alasio", "alasio-branch-try"), false]] as const) {
+      assert.equal(connects(policies, from, gateway, 8080), admitted, from.labels["app.kubernetes.io/component"]);
+    }
+    assert.equal(connects(policies, alasio, gateway, 8081), false);
+    assert.equal(connects(policies, alasio, receiver, 4318), false);
+    assert.equal(connects(policies, gateway, agent, 8484), true);
+    assert.equal(connects(policies, gateway, collector, 4318), true);
+    assert.equal(connects(policies, receiver, collector, 4318), true);
   });
 
   test("runs none of it without workspace storage, or where sandboxes are not snapshotted, as the node agents attach its workspaces", () => {
