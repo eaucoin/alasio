@@ -1699,6 +1699,21 @@ test("status says of the lake's loader whether it is awake, waking, or asleep wi
     else assert.match(failure(run), /^1 of alasio's \d+ workloads are not ready$/u);
     assert.ok(run.printed.includes(`  Deployment alasio/alasio-lake-loader: ${said ?? "0 of 1 available"}`), run.printed.join("\n"));
   }
+  // Its pod ready that the Deployment does not count yet, as one that came up after status
+  // read the Deployment: waking while the pod came up within the deadline, not ready once
+  // the Deployment has not counted it for longer.
+  pod.status["containerStatuses"] = [{ name: "loader", ready: true, restartCount: 0, image: "lake", imageID: "", state: { running: {} } }];
+  pod.metadata["creationTimestamp"] = new Date().toISOString();
+  for (const [readyAt, said] of [
+    [new Date(), "waking, 0 of 1 available"],
+    [new Date(Date.now() - 11 * 60_000), null],
+  ] as const) {
+    pod.status["conditions"] = [{ type: "Ready", status: "True", lastTransitionTime: readyAt.toISOString() }];
+    run = await alasio(["status"]);
+    if (said) succeeded(run);
+    else assert.match(failure(run), /^1 of alasio's \d+ workloads are not ready$/u);
+    assert.ok(run.printed.includes(`  Deployment alasio/alasio-lake-loader: ${said ?? "0 of 1 available"}`), run.printed.join("\n"));
+  }
   // Woken, its pod not made yet, as just after KEDA scales it: waking while KEDA last found
   // it work within the progress deadline; not ready past it, where its pods are refused, or
   // once the Deployment says it is past its deadline.
