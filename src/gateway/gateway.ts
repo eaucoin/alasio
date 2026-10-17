@@ -1,0 +1,110 @@
+/**
+ * The sandbox gateway, a program of alasio's image on the floor: the binder's front
+ * (../binder/server.ts) for session workspaces (./sessions.ts), as its configuration file
+ * (GATEWAY_CONFIG_VARIABLE, which `alasio up` renders) and its keys (CALLER_KEY_VARIABLE,
+ * BINDING_KEY_VARIABLE) say, reaching the node agents with their token, as alasio does.
+ * What a gateway that ended left between a binding's steps is set right as it starts, and
+ * every RECONCILE_MS after; bound pods are looked at for one to release every SWEEP_MS.
+ * What stops it is logged.
+ */
+import { lookup } from "node:dns/promises";
+import { readFileSync } from "node:fs";
+
+import { Cause, Config, Effect, Layer, Redacted, Schedule, Schema, type Scope } from "effect";
+import { FetchHttpClient } from "effect/http";
+
+import { Binder } from "../binder/binder.ts";
+import { reconcile } from "../binder/bindings.ts";
+import { serveBinder } from "../binder/server.ts";
+import { KubeClient } from "../kube/client.ts";
+import { makeNodeAgents } from "../sandbox/node-agents.ts";
+import { withLogScope } from "../shared/log.ts";
+import { makeSessions } from "./sessions.ts";
+
+/** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
+export const GATEWAY_CONFIG_VARIABLE = "ALASIO_GATEWAY_CONFIG";
+/** The variables of the keys callers' tokens, and bindings', are signed with: the keys' text, as the stack's setup makes them. */
+export const CALLER_KEY_VARIABLE = "CALLER_KEY";
+export const BINDING_KEY_VARIABLE = "BINDING_KEY";
+
+/** How often bound pods are looked at for one to release: each pod's bayma is asked no oftener than its poll (./sessions.ts). */
+const SWEEP_MS = 5_000;
+/** How often the pools' bindings are set right where a gateway ended between their steps. */
+const RECONCILE_MS = 60_000;
+
+/** The gateway's configuration, as `alasio up` renders it (cli/src/manifests/sandbox-gateway.ts). */
+export const GatewayConfig = Schema.Struct({
+  /** The port it serves on, and the host its replicas' headless Service resolves to, each at that port. */
+  port: Schema.Number,
+  peers: Schema.String,
+  /** The port pool pods' bayma serves on. */
+  podPort: Schema.Number,
+  /** How long a bind waits for a free pod, and an idle pod is kept. */
+  waitSeconds: Schema.Number,
+  releaseAfterSeconds: Schema.Number,
+  /** Each environment of sessions, by its name, and the namespace its pools are in. */
+  environments: Schema.Array(Schema.Struct({ name: Schema.String, namespace: Schema.String })),
+  /** Each pool's name, by its sessions' internet. */
+  pools: Schema.Struct({ none: Schema.String, full: Schema.String }),
+  /** Where the node agents are. */
+  nodeAgents: Schema.Struct({ namespace: Schema.String, selector: Schema.String, port: Schema.Number }),
+});
+export type GatewayConfig = typeof GatewayConfig.Type;
+
+/** The gateway's configuration, read from its file once, as it starts, and checked. */
+const loadConfig = Effect.gen(function*() {
+  const path = yield* Config.String(GATEWAY_CONFIG_VARIABLE);
+  const text = yield* Effect.try({ try: () => readFileSync(path, "utf8"), catch: (error) => new Error(`${GATEWAY_CONFIG_VARIABLE} ${path} cannot be read: ${String(error)}`) });
+  return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GatewayConfig))(text);
+});
+
+/** A key, its text, from the variable `name`. */
+const keyFrom = (name: string) => Effect.map(Config.Redacted(name), (key) => Buffer.from(Redacted.value(key)));
+
+/** The gateway, as the module says. */
+export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(function*() {
+  const config = yield* loadConfig;
+  const callerKey = yield* keyFrom(CALLER_KEY_VARIABLE);
+  const bindingKey = yield* keyFrom(BINDING_KEY_VARIABLE);
+  const context = yield* Layer.build(Layer.mergeAll(Layer.provideMerge(Binder.layer({ waitMs: config.waitSeconds * 1000 }), KubeClient.layer), FetchHttpClient.layer));
+  yield* Effect.gen(function*() {
+    const binder = yield* Binder;
+    const agents = yield* makeNodeAgents(config.nodeAgents);
+    const sessions = yield* makeSessions(
+      { environments: config.environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey },
+      agents,
+      binder,
+    );
+    const setRight = Effect.forEach(sessions.pools, (pool) =>
+      reconcile(pool).pipe(
+        Effect.tap(({ pods, leases }) => (pods.length + leases.length > 0 ? Effect.logInfo(`set ${pool.namespace}/${pool.name} right: deleted ${pods.join(", ") || "no pod"}, let go ${leases.join(", ") || "no Lease"}`) : Effect.void)),
+        Effect.catch((error) => Effect.logWarning(`setting ${pool.namespace}/${pool.name} right failed: ${error.message}`)),
+      ), { discard: true });
+    yield* setRight;
+    yield* Effect.forkScoped(Effect.repeat(setRight, Schedule.spaced(RECONCILE_MS)));
+    yield* Effect.forkScoped(Effect.repeat(
+      sessions.sweep.pipe(
+        Effect.tap((released) => (released.length > 0 ? Effect.logInfo(`released ${released.join(", ")}`) : Effect.void)),
+        Effect.catch((error) => Effect.logWarning(`looking at bound pods failed: ${error.message}`)),
+      ),
+      Schedule.spaced(SWEEP_MS),
+    ));
+    const served = yield* serveBinder({
+      port: config.port,
+      callerKey,
+      bindingKey,
+      podPort: config.podPort,
+      poolOf: sessions.place,
+      // Every replica's address but its own, which answers its own waiting.
+      peers: () =>
+        Effect.tryPromise(() => lookup(config.peers, { all: true })).pipe(
+          Effect.map((addresses) => addresses.map(({ address }) => `${address}:${config.port}`).filter((peer) => !peer.startsWith(`${process.env["POD_IP"] ?? ""}:`))),
+          Effect.orElseSucceed(() => []),
+        ),
+    });
+    yield* Effect.logInfo(`the sandbox gateway serves on port ${served.port}, for ${config.environments.map(({ name }) => name).join(", ")}`);
+  }).pipe(Effect.provide(context));
+}).pipe(
+  Effect.tapCause((cause) => Effect.logError(`Fatal error: ${Cause.pretty(cause)}`)),
+  withLogScope("sandbox-gateway"),
+);
