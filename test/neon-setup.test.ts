@@ -243,6 +243,9 @@ test("the stack's secrets are made once, and every service's rendered from them 
   // alasio and the node agents read the token alasio presents them from one Secret.
   assert.equal(value(kube, names.nodeAgent, "token"), root.nodeAgentToken);
   assert.match(root.nodeAgentToken, /^[\w-]{32}$/u);
+  // The sandbox gateway's keys, each its own.
+  assert.deepEqual([value(kube, names.sandboxGateway, "caller-key"), value(kube, names.sandboxGateway, "binding-key")], [root.gatewayCallerKey, root.gatewayBindingKey]);
+  assert.notEqual(root.gatewayCallerKey, root.gatewayBindingKey);
 
   // A second run keeps every secret and the key, and rewrites what derives from them.
   await setupKube({ kube, config, log: () => {} });
@@ -345,6 +348,8 @@ function stackSecrets(s3: { accessKey: string; secretKey: string }): StackSecret
     monitorKey: "m",
     verifiers: { alasio: "SCRAM-SHA-256$q", lake: "SCRAM-SHA-256$l", lake_reader: "SCRAM-SHA-256$r", grafana: "SCRAM-SHA-256$g" },
     nodeAgentToken: "n",
+    gatewayCallerKey: "gc",
+    gatewayBindingKey: "gb",
     logClusterId: "cluster",
     log: { "admin": "la", "gateway": "lg", "intake": "li", "scaler": "ls", "webhook": "lw", "alasio-main": "lm", "loader-main": "ll" },
   };

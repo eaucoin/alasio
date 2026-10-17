@@ -74,6 +74,7 @@ export interface SecretNames {
   workspaces: string;
   snapshots: string;
   nodeAgent: string;
+  sandboxGateway: string;
   /** The log's own (its cluster's id and its admin's password), its access applier's (every principal's password), and each principal's. */
   log: string;
   logAccess: string;
@@ -189,6 +190,7 @@ export function secretNames(prefix: string): SecretNames {
     workspaces: `${prefix}-workspaces-juicefs`,
     snapshots: `${prefix}-snapshots`,
     nodeAgent: `${prefix}-node-agent`,
+    sandboxGateway: `${prefix}-sandbox-gateway`,
     log: `${prefix}-log`,
     logAccess: `${prefix}-log-access`,
     logPrincipals: Object.fromEntries(LOG_PRINCIPALS.map((principal) => [principal, `${prefix}-log-${principal}`])) as Record<LogPrincipal, string>,
@@ -338,6 +340,8 @@ export function renderSecrets({ secrets, privateKeyPem, publicKeyPem, config, we
     };
     // The token alasio presents to the node agents, which they check: both read it here.
     rendered[names.nodeAgent] = { token: secrets.nodeAgentToken };
+    // The sandbox gateway's keys, beside the node agents it attaches workspaces through.
+    rendered[names.sandboxGateway] = { "caller-key": secrets.gatewayCallerKey, "binding-key": secrets.gatewayBindingKey };
   }
   if (!config.external) {
     const buckets = { neon: config.neonBucket, lake: config.lakeBucket, backups: config.backupsBucket, workspaces: workspaces?.bucket ?? null, snapshots: snapshotsBucket };

@@ -97,6 +97,13 @@ export interface StackSecrets {
   verifiers: Record<ClientRole, string>;
   /** What alasio presents to the node agents, which keep session sandboxes' snapshots, and they check. */
   nodeAgentToken: string;
+  /**
+   * The sandbox gateway's keys: what callers' tokens are signed with, which alasio mints and
+   * the gateway checks, and what bindings' tokens are, which the gateway mints and bound
+   * instances, the session telemetry receiver and the node agents take.
+   */
+  gatewayCallerKey: string;
+  gatewayBindingKey: string;
   /** The log's: the id KRaft formats its nodes with, and each principal's password, its admin's among them. */
   logClusterId: string;
   log: Record<"admin" | LogPrincipal, string>;
@@ -228,6 +235,8 @@ export function completeSecrets(existing: StoredSecrets = {}): { secrets: StackS
       [GRAFANA_ROLE]: kept(verifiers[GRAFANA_ROLE], () => scramVerifier(passwords.grafanaPassword)),
     },
     nodeAgentToken: kept(stored.nodeAgentToken, () => secret()),
+    gatewayCallerKey: kept(stored.gatewayCallerKey, () => secret()),
+    gatewayBindingKey: kept(stored.gatewayBindingKey, () => secret()),
     logClusterId: kept(stored.logClusterId, () => clusterId()),
     log: {
       ...log,
