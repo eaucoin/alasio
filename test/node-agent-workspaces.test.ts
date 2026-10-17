@@ -244,3 +244,26 @@ test("a workspace records the snapshot it was released into beside its files, ou
     at.done();
   }
 });
+
+test("nothing is made, cloned, attached or recorded where workspace storage is not mounted at the root, as for the moment its mount is handed over, nor written beneath it", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-there");
+    at.pod("pool-0");
+    at.storage.mounted = false;
+    const ref = { environment: "main", workspace: "fs-new" };
+    assert.equal(await refusal(at.workspaces.create(ref, 1024 ** 3)), 503);
+    assert.equal(existsSync(join(at.workspacesRoot, "main", "fs-new")), false);
+    assert.equal(await refusal(at.workspaces.clone({ environment: "main", workspace: "fs-there" }, ref, 1024 ** 3)), 503);
+    assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-there" }, "pool-0", "token", {})), 503);
+    assert.deepEqual(at.mounts, []);
+    assert.equal(await refusal(at.workspaces.setReleased({ environment: "main", workspace: "fs-there" }, { snapshot: "20261017T120000000Z-0000000a", release: "r" })), 503);
+    assert.deepEqual(at.juicefsCalls(), []);
+    // Mounted again: made.
+    at.storage.mounted = true;
+    await Effect.runPromise(at.workspaces.create(ref, 1024 ** 3));
+    assert.ok(existsSync(join(at.workspacesRoot, "main", "fs-new", "files", "workspace")));
+  } finally {
+    at.done();
+  }
+});
