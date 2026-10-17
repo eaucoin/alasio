@@ -5,8 +5,8 @@
  * pushed to a registry of the run's own beside the cluster, which the cluster's
  * `registries` have its nodes pull from, the stand-ins it talks to instead of Telegram
  * and a telemetry backend applied (./stand-ins.ts), and alasio started by `alasio up`,
- * running a stand-in for Codex in its place (./codex-stand-in.ts), as the run has no
- * Codex login, its Grafana then made to take the Telegram stand-in for Telegram
+ * running stand-ins for Codex and Claude Code in their place (./codex-stand-in.ts,
+ * ./claude-stand-in.ts), as the run has no login of either, its Grafana then made to take the Telegram stand-in for Telegram
  * (trustTelegramStandIn). The tests then drive it through its command line (`alasio`), the stand-ins, and the
  * cluster's API (`kube`); the run is torn down by `alasio uninstall --purge`, after what
  * the cluster was doing is said, when something of the run failed.
@@ -30,8 +30,8 @@
  *
  * The `upgrade` shard sets alasio up as the release before set it up, on the host target,
  * as the box is: by the published package of the release ALASIO_E2E_PREVIOUS names, with
- * that release's images, but for alasio's, which is the stand-in for Codex built on that
- * release's alasio image, pushed as alasio-codex-stand-in-previous. Its suite upgrades it to
+ * that release's images, but for alasio's, which is the stand-ins' built on that
+ * release's alasio image, pushed as alasio-harness-stand-ins-previous. Its suite upgrades it to
  * this checkout by the cut-over the box runs (cutOver).
  */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
@@ -152,13 +152,14 @@ export const BIG_REPL_MEBIBYTES = 1024;
 
 /**
  * The images built here: their names, and what they are built from. alasio's runs in
- * the run as alasio-codex-stand-in, alasio's with the stand-in for Codex in it
- * (./codex-stand-in.Dockerfile), built on it.
+ * the run as alasio-harness-stand-ins, alasio's with the stand-ins for its harnesses in
+ * it (./harness-stand-ins.Dockerfile), built on it.
  */
-const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-log": "neon/log", "alasio-collector": "neon/collector", "alasio-webhook": "webhook", "alasio-node": "cluster/node", "alasio-codex-stand-in": "test" } as const;
+const IMAGES = { "alasio": ".", "alasio-agent": "sandbox/agent", "alasio-lake": "neon/lake", "alasio-grafana": "neon/grafana", "alasio-log": "neon/log", "alasio-collector": "neon/collector", "alasio-webhook": "webhook", "alasio-node": "cluster/node", "alasio-harness-stand-ins": "test" } as const;
 
-/** Where alasio runs the stand-in for Codex from, in alasio-codex-stand-in. */
+/** Where alasio runs the stand-ins for Codex and Claude Code from, in alasio-harness-stand-ins. */
 const CODEX_STAND_IN = "/opt/alasio/test/e2e/codex-stand-in.ts";
+const CLAUDE_STAND_IN = "/opt/alasio/test/e2e/claude-stand-in.ts";
 
 /** The registry the images were pushed to already, when the run builds none. */
 const PUSHED = process.env["ALASIO_E2E_REGISTRY"] || undefined;
@@ -566,12 +567,13 @@ function installation(of: "previous" | "release"): Record<string, unknown> {
   const on = (node: string) => (AGENTS >= 2 ? { nodeSelector: { "kubernetes.io/hostname": `${CLUSTER}-${node}` } } : {});
   return {
     images: of === "previous"
-      ? { alasio: { repository: `${PUSHED}/alasio-codex-stand-in-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
-      : { alasio: pushed("alasio-codex-stand-in"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), log: pushed("alasio-log"), collector: pushed("alasio-collector"), webhook: pushed("alasio-webhook"), pullPolicy: "IfNotPresent" },
+      ? { alasio: { repository: `${PUSHED}/alasio-harness-stand-ins-previous`, tag: "e2e", digest: "" }, pullPolicy: "IfNotPresent" }
+      : { alasio: pushed("alasio-harness-stand-ins"), agent: pushed("alasio-agent"), lake: pushed("alasio-lake"), grafana: pushed("alasio-grafana"), log: pushed("alasio-log"), collector: pushed("alasio-collector"), webhook: pushed("alasio-webhook"), pullPolicy: "IfNotPresent" },
     alasio: {
       env: {
         TELEGRAM_API_ROOT: urlOf(TELEGRAM),
         ALASIO_CODEX_BIN: CODEX_STAND_IN,
+        ALASIO_CLAUDE_BIN: CLAUDE_STAND_IN,
       },
       resources: { requests: { cpu: "50m", memory: "256Mi" } },
       ...on("agent-1"),
@@ -735,7 +737,7 @@ export async function setUp(): Promise<void> {
     const pushHost = await startRegistry();
     for (const name of ["alasio", "alasio-agent", "alasio-lake", "alasio-grafana", "alasio-log", "alasio-collector", "alasio-webhook"] as const) await push(pushHost, name);
     // On alasio's image, which its build pulls back from the registry.
-    await push(pushHost, "alasio-codex-stand-in", ["--file", "test/e2e/codex-stand-in.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
+    await push(pushHost, "alasio-harness-stand-ins", ["--file", "test/e2e/harness-stand-ins.Dockerfile", "--build-arg", `ALASIO=${pushHost}/${imageOf("alasio")}`]);
   }
 
   console.error("# applying the stand-ins");
