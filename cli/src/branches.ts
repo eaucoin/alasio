@@ -40,6 +40,7 @@ import { environmentKey } from "../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace, forkToken } from "../../src/branch/names.ts";
 import { memoryBytes, memoryText } from "./capacity.ts";
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
+import { recordedBaseline } from "./cpu-baseline.ts";
 import { type Ran, runIn, runningPod, runningPodIn } from "./commands/common.ts";
 import { hasStatus, kind, KubeApi, type KubeApiError, type ObjectRef, refOf } from "./kube/api.ts";
 import { applyObjects } from "./kube/apply.ts";
@@ -346,7 +347,9 @@ export const createBranch = Effect.fnUntraced(function*(config: OperatorConfig, 
   yield* changeEnvironment("environment", log);
   const route = yield* ensureRoute(name, bot.allowedUserIds);
 
-  const objects = branchObjects(settings, name);
+  // Its sandbox pools main's, held to the CPU baseline main's are.
+  const { baseline } = yield* recordedBaseline;
+  const objects = branchObjects(settings, name, baseline);
   yield* Effect.forEach(objects.filter((object) => object.kind === "Namespace"), (namespace) => kube.apply(namespace), { discard: true });
   yield* Effect.forEach(secrets, (secret) => kube.apply(secret), { discard: true });
   yield* applyObjects(objects, options);

@@ -1,9 +1,11 @@
 /**
  * What the sandbox gateway (./gateway.ts) and the session telemetry receiver
  * (../receiver/receiver.ts) are configured by: their variables, and the gateway's
- * configuration file. Free of anything but Effect's Schema, so the command line, which
- * renders them, takes it without either.
+ * configuration file. Free of anything but Effect's Schema and Node's own, so the command
+ * line, which renders them, takes it without either.
  */
+import { createHash } from "node:crypto";
+
 import { Schema } from "effect";
 
 /** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
@@ -20,6 +22,33 @@ export const EVENTS_PASSWORD_FILE_VARIABLE = "EVENTS_PASSWORD_FILE";
 /** The variables of the receiver's port, and of main's sessions' namespace, beside which it takes branch environments' bindings. */
 export const RECEIVER_PORT_VARIABLE = "RECEIVER_PORT";
 export const SESSIONS_NAMESPACE_VARIABLE = "SESSIONS_NAMESPACE";
+
+/** The hash of `template`, of its JSON with every object's keys in order, as a pool's template records its own (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
+export function templateHash(template: object): string {
+  const sorted = (_key: string, value: unknown): unknown =>
+    typeof value === "object" && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : value;
+  return createHash("sha256").update(JSON.stringify(template, sorted)).digest("hex");
+}
+
+/** A pod template, as the gateway's configuration holds one: an object, as the API server takes it. */
+const Template = Schema.Record(Schema.String, Schema.Unknown);
+
+/**
+ * How main's sessions are snapshotted (./snapshots.ts), as alasio's own were: how often one whose
+ * execs run is saved live, the gVisor releases a snapshot is restored under, each by its
+ * RuntimeClass, the current one first, and each pool's template, by its sessions' internet, as
+ * `alasio up` renders it now and as it rendered it before it last changed, which a snapshot taken
+ * on it still restores onto, and nothing older.
+ */
+export const GatewaySnapshots = Schema.Struct({
+  liveEverySeconds: Schema.Number,
+  releases: Schema.Array(Schema.Struct({ release: Schema.String, runtimeClassName: Schema.String })),
+  templates: Schema.Struct({
+    none: Schema.Struct({ current: Template, previous: Schema.NullOr(Template) }),
+    full: Schema.Struct({ current: Template, previous: Schema.NullOr(Template) }),
+  }),
+});
+export type GatewaySnapshots = typeof GatewaySnapshots.Type;
 
 /** The sandbox pods' policy, which holds every pod of a sessions' namespace to its pools' templates (cli/src/manifests/admission.ts sandboxPodPolicy). */
 export const SANDBOX_POD_POLICY = "alasio-sandbox-pods";
@@ -38,6 +67,8 @@ export const GatewayConfig = Schema.Struct({
   environment: Schema.Struct({ name: Schema.String, namespace: Schema.String }),
   /** The quota of a workspace the gateway makes, in bytes. */
   quotaBytes: Schema.Number,
+  /** How main's sessions are snapshotted; none where they are not. */
+  snapshots: Schema.NullOr(GatewaySnapshots),
   /** Each pool's name, by its sessions' internet. */
   pools: Schema.Struct({ none: Schema.String, full: Schema.String }),
   /** Where the node agents are. */
