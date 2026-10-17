@@ -20,6 +20,8 @@ export function workspacesNode() {
   const attachRoot = join(root, "attach");
   const mounts: string[] = [];
   const ran: string[] = [];
+  // Of each mount made, whether a token was beside it already.
+  const tokenAtMount: boolean[] = [];
   const running = new Set<string>();
   // Of each container that runs, the annotations containerd gives its spec; what runsc ran in them, in order; and whether a hook fails.
   const annotations = new Map<string, Readonly<Record<string, string>>>();
@@ -32,7 +34,10 @@ export function workspacesNode() {
         const [name, ...args] = command;
         if (name === "cat") return { exitCode: 0, stdout: mounts.map((point, n) => `${n + 30} 1 0:50 / ${point.replaceAll(" ", "\\040")} rw - fuse.juicefs JuiceFS:workspaces rw`).join("\n"), stderr: "" };
         if (name === "test") return { exitCode: existsSync(args[1] ?? "") ? 0 : 1, stdout: "", stderr: "" };
-        if (name === "mount") mounts.push(args[2] ?? "");
+        if (name === "mount") {
+          mounts.push(args[2] ?? "");
+          tokenAtMount.push(existsSync(join(args[2] ?? "", "..", "token")));
+        }
         if (name === "umount") mounts.splice(mounts.indexOf(args[1] ?? ""), 1);
         return { exitCode: 0, stdout: "", stderr: "" };
       }),
@@ -84,6 +89,6 @@ export function workspacesNode() {
   const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
   /** What JuiceFS's command was run with, a call a line. */
   const juicefsCalls = () => (existsSync(join(root, "juicefs.log")) ? readFileSync(join(root, "juicefs.log"), "utf8").trim().split("\n") : []);
-  return { root, workspacesRoot, attachRoot, mounts, ran, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, workspacesRoot, attachRoot, mounts, ran, tokenAtMount, running, annotations, execs, hooks, storage, unreachable, workspaces, files, pod, juicefsCalls, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

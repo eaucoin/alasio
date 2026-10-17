@@ -323,14 +323,16 @@ export function makeWorkspaces({ host, runsc, juicefs, mounted = fuseAt, reaches
           await mkdir(ws);
           await chown(directory, agentUid, agentUid);
           await chown(ws, agentUid, agentUid);
+        });
+        yield* onNode(host, ["mount", "--bind", files, ws]);
+        yield* Effect.promise(async () => {
           // Beside the workspace, not in it: its sandbox reads it, and reaches no other's.
           await writeFile(join(directory, "env"), envFile(env), { mode: 0o400 });
           await chown(join(directory, "env"), agentUid, agentUid);
-          // Written last, as its bayma starts once it is there.
+          // Written last, once its workspace is there, as its bayma starts, and a restore's sandbox is restored, once it is.
           await writeFile(join(directory, "token"), token, { mode: 0o400 });
           await chown(join(directory, "token"), agentUid, agentUid);
         });
-        yield* onNode(host, ["mount", "--bind", files, ws]);
       }),
 
     detach: (pod, containerIds) =>

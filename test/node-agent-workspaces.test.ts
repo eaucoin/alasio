@@ -95,6 +95,8 @@ test("a workspace is attached into a pod's directory with its binding's token be
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "binding-token", { OTEL_EXPORTER_OTLP_ENDPOINT: "http://10.43.0.9:4318", OTEL_NOTE: "it's quoted" }));
     assert.deepEqual(at.mounts, [join(at.attachRoot, "pool-0", "ws")]);
     assert.ok(at.ran.includes(`mount --bind ${files} ${join(at.attachRoot, "pool-0", "ws")}`));
+    // Its token written once its workspace is there, as its bayma starts, and a restore is restored, once it is.
+    assert.deepEqual(at.tokenAtMount, [false]);
     const token = join(at.attachRoot, "pool-0", "token");
     assert.equal(readFileSync(token, "utf8"), "binding-token");
     assert.equal(statSync(token).mode & 0o777, 0o400);

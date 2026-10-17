@@ -6,6 +6,7 @@
  */
 import { createHash } from "node:crypto";
 
+import type { V1Container } from "@kubernetes/client-node";
 import { Schema } from "effect";
 
 /** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
@@ -28,6 +29,31 @@ export function templateHash(template: object): string {
   const sorted = (_key: string, value: unknown): unknown =>
     typeof value === "object" && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : value;
   return createHash("sha256").update(JSON.stringify(template, sorted)).digest("hex");
+}
+
+/** The init container of a restore's pod: its name, and its resources. */
+export const ATTACH_WAIT = { name: "attach-wait", resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "32Mi" } } } as const;
+
+/**
+ * The init container of a restore's pod (./snapshots.ts), of its bayma's, `bayma`'s, image,
+ * security and own directory: it waits until its workspace is attached there, its binding's
+ * token written beside it once it is, so the sandbox restored as its bayma starts finds every
+ * file it held open in it, as a restore reopens each before it resumes.
+ */
+export function attachWait(bayma: V1Container): V1Container {
+  const attach = (bayma.volumeMounts ?? []).filter(({ name }) => name === "attach");
+  const directory = attach[0]?.mountPath ?? "/attach";
+  return {
+    name: ATTACH_WAIT.name,
+    ...(bayma.image === undefined ? {} : { image: bayma.image }),
+    ...(bayma.imagePullPolicy === undefined ? {} : { imagePullPolicy: bayma.imagePullPolicy }),
+    command: ["sh", "-c", `until [ -s ${directory}/token ]; do sleep 0.2; done`],
+    // Its directory's subPathExpr names the pod by it.
+    env: (bayma.env ?? []).filter(({ name }) => name === "POD_NAME"),
+    ...(bayma.securityContext === undefined ? {} : { securityContext: bayma.securityContext }),
+    volumeMounts: attach,
+    resources: { requests: { ...ATTACH_WAIT.resources.requests }, limits: { ...ATTACH_WAIT.resources.limits } },
+  };
 }
 
 /** A pod template, as the gateway's configuration holds one: an object, as the API server takes it. */

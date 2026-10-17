@@ -627,7 +627,7 @@ function restoringAgents(current: Manifest | null, released: { snapshot: string;
   return { ...base, state, agents: restoring };
 }
 
-test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, paused until its node's agent resumes it, then spent", async () => {
+test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, its workspace attached while its init container waits for it, before its sandbox is restored, paused until its node's agent resumes it, then spent", async () => {
   const env = await environment(1, { gvisor: true });
   await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
   const snapshot = "20261017T120000000Z-0000000a";
@@ -646,7 +646,11 @@ test("a workspace released into its snapshot is restored from it as it is next b
       }
     })();
     const name = restored.metadata?.name ?? "";
-    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
+    // Its init container waits for its workspace, which is attached then, before its bayma starts, its sandbox restored.
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Pending", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { running: {} } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, state: { waiting: { reason: "PodInitializing" } } }] } })));
+    for (const deadline = Date.now() + 10_000; recorded.attached.length === 0; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its workspace was not attached while its init container waited");
+    assert.deepEqual(recorded.asked, [`prepare node-a socket retrying pages`]);
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
     for (;;) {
       const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
       if (pod.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True")) break;
@@ -658,6 +662,9 @@ test("a workspace released into its snapshot is restored from it as it is next b
     // Of the pool's template, its sandbox restored paused from the image its node's agent prepared, under the release that took it, on that node.
     assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], ["/var/cache/alasio/image", "true"]);
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
+    // Its init container, of its bayma's image, waits for its binding's token, written once its workspace is attached.
+    const [waits] = restored.spec?.initContainers ?? [];
+    assert.deepEqual([waits?.name, waits?.image, waits?.command], ["attach-wait", restored.spec?.containers[0]?.image, ["sh", "-c", "until [ -s /attach/token ]; do sleep 0.2; done"]]);
     const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
     assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
     assert.deepEqual(plain(restored.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
@@ -671,6 +678,38 @@ test("a workspace released into its snapshot is restored from it as it is next b
   assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });
   // A free pod of the pool's claimed by none.
   assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
+});
+
+test("a restore whose sandbox cannot start from its snapshot, its bayma started again only to fail, falls back at once, abandoned, its snapshot forgotten, the workspace bound to a free pod", async () => {
+  const env = await environment(2, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000000c";
+  const recorded = restoringAgents(manifestOf(env, "fs-unstarted", snapshot), { snapshot, release: "r1" });
+  const abandoned: string[] = [];
+  const agents: NodeAgents = { ...recorded.agents, abandon: (node, request) => Effect.sync(() => (abandoned.push(`${node} ${request.pod}`), [])) };
+  const { binder, sessions } = await sessionsOf(options(env, 7290), agents);
+  const key = sessionKey("fs-unstarted");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const binding = Effect.runPromise(binder.bind(placement.pool, key, placement).pipe(Effect.retry({ times: 1 })));
+    const restored = await (async () => {
+      for (;;) {
+        const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
+        if (pod?.metadata?.name?.startsWith("sandboxes-none-restore-")) return pod;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })();
+    const name = restored.metadata?.name ?? "";
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Pending", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { running: {} } }] } })));
+    for (const deadline = Date.now() + 10_000; recorded.attached.length === 0; await new Promise((resolve) => setTimeout(resolve, 100))) assert.ok(Date.now() < deadline, "its workspace was not attached");
+    // Its restore fails as its bayma starts, as a sandbox whose files are not there fails, and kubelet starts it again.
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", initContainerStatuses: [{ name: "attach-wait", image: "agent", imageID: "", ready: false, restartCount: 0, state: { terminated: { exitCode: 0 } } }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 1, state: { waiting: { reason: "CrashLoopBackOff" } }, lastState: { terminated: { exitCode: 128, reason: "StartError", message: "vfs.CompleteRestore() failed" } } }] } })));
+    const bound = await binding;
+    assert.match(bound.pod, /^none-/u);
+    assert.deepEqual(abandoned, [`node-a ${name}`]);
+    assert.ok(recorded.asked.includes(`forget fs-unstarted`), recorded.asked.join("\n"));
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=restore": 1 });
 });
 
 test("a workspace whose record names a snapshot it holds no more, or another than its current one, is bound to a free pod, its snapshot and its record forgotten", async () => {

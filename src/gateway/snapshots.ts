@@ -20,8 +20,11 @@
  * pool's template the snapshot was taken on: its current one, or the one before it, which
  * `alasio up` carries for one change of it (GatewaySnapshots templates), and nothing older; on
  * a node that has the gVisor release that took it, still kept, and the CPU features it was
- * saved with, those that hold its images first; left paused until its node's agent sees its
- * egress confined there, then resumed, and ready. Only the snapshot the record says it was
+ * saved with, those that hold its images first; its workspace attached while its init container
+ * waits for it (attach-wait), before its sandbox is restored as its bayma starts, as a restore
+ * reopens every file the sandbox held open; left paused until its node's agent sees its egress
+ * confined there, then resumed, and ready. One whose sandbox cannot start from its snapshot
+ * falls back at once. Only the snapshot the record says it was
  * released into restores, or one its node's agent compacted from it since, which is the same:
  * one it has moved on from since is stale. A restore that cannot be done now, as what it needs
  * fails for a while, is deferred, its snapshot kept, the bind refused to be tried again, for
@@ -66,7 +69,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import type { GatewaySnapshots as SnapshotsConfig } from "./names.ts";
+import { ATTACH_WAIT, attachWait, type GatewaySnapshots as SnapshotsConfig } from "./names.ts";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
@@ -92,6 +95,9 @@ const restoreDuration = meter.createHistogram("alasio.sandbox.restore.duration",
   description: "How long a session restored from its snapshot took to come back, which the request binding it waits: from its snapshot looked up to its pod ready",
   unit: "s",
 });
+
+/** What kubelet says of a container waiting that could not start, which a restore's that cannot be restored is, started again only to fail as it did. */
+const START_FAILURES: ReadonlySet<string> = new Set(["CrashLoopBackOff", "RunContainerError", "StartError", "CreateContainerError"]);
 
 /** How long a restored pod is waited for to run its containers, its images pulled. */
 const POD_RUNNING_TIMEOUT_MS = 180_000;
@@ -123,6 +129,8 @@ class RestoreRefused extends Schema.TaggedError<RestoreRefused>()("RestoreRefuse
   reason: Schema.String,
   resumed: Schema.Boolean,
   stale: Schema.optional(Schema.Boolean),
+  /** Whether no try restores it, as its sandbox could not start from its snapshot. */
+  failed: Schema.optional(Schema.Boolean),
 }) {
   override get message(): string {
     return this.reason;
@@ -389,29 +397,56 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
     });
 
   /**
-   * Lets the restored pod `name`, on `node`, restored from `snapshot`, run, once its containers
-   * run, paused, and its workspace is attached by `attach`: its node's agent resumes its sandbox
-   * once the pod's egress is confined there,
-   * and the pod is then ready, by its readiness gate. A pod that ends meanwhile, whose sandbox
-   * the agent does not resume, or whose readiness cannot be set, is refused.
+   * Why the restore's pod `pod` will not come back, where it will not: it ended, or a container of
+   * it ended, or could not start, as a sandbox that cannot be restored cannot, its container
+   * started again by kubelet only to fail as it did. Its init container, attach-wait, ends as it
+   * should once its workspace is attached.
+   */
+  const failedStart = (pod: V1Pod | null): string | null => {
+    if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded") return `its pod ended (${pod.status.reason ?? pod.status.phase})`;
+    for (const status of [...(pod?.status?.initContainerStatuses ?? []), ...(pod?.status?.containerStatuses ?? [])]) {
+      const ended = status.state?.terminated;
+      if (ended && !(status.name === ATTACH_WAIT.name && ended.exitCode === 0)) return `its ${status.name} ended (${ended.message ?? ended.reason ?? ended.exitCode})`;
+      const before = status.lastState?.terminated;
+      if (status.restartCount > 0 || before) return `its ${status.name} could not start (${before?.message ?? before?.reason ?? "started again"})`;
+      const waiting = status.state?.waiting;
+      if (waiting?.reason !== undefined && START_FAILURES.has(waiting.reason)) return `its ${status.name} could not start (${waiting.message ?? waiting.reason})`;
+    }
+    return null;
+  };
+
+  /** The restore's pod `name` of `pool`, once `until` holds of it, `what` it waits for; refused, never to be tried again, where it will not come back (failedStart), and refused where it does not within POD_RUNNING_TIMEOUT_MS. */
+  const podOnce = (pool: Pool, name: string, until: (pod: V1Pod) => boolean, what: string): Effect.Effect<V1Pod, RestoreRefused> =>
+    podOf(pool, name).pipe(
+      Effect.flatMap((pod): Effect.Effect<V1Pod, PodNotRunning | RestoreRefused> => {
+        const failed = failedStart(pod);
+        if (failed !== null) return Effect.fail(new RestoreRefused({ reason: failed, resumed: false, failed: true }));
+        return pod && until(pod) ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
+      }),
+      Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
+      Effect.catchTag("PodNotRunning", () => Effect.fail(new RestoreRefused({ reason: `its pod did not ${what} within ${POD_RUNNING_TIMEOUT_MS / 1000} s`, resumed: false }))),
+      Effect.catchTag("KubeApiError", (error) => Effect.fail(new RestoreRefused({ reason: error.message, resumed: false }))),
+    );
+
+  /**
+   * Lets the restored pod `name`, on `node`, restored from `snapshot`, run: its workspace attached
+   * by `attach` while its init container waits for it (attach-wait), before its sandbox is
+   * restored as its bayma starts, so the restore finds every file the sandbox held open; then,
+   * once its containers run, paused, its node's agent resumes its sandbox once the pod's egress is
+   * confined there, and the pod is then ready, by its readiness gate. A pod that ends meanwhile,
+   * or cannot start, whose sandbox the agent does not resume, or whose readiness cannot be set,
+   * is refused.
    */
   const resumeRestored = (pool: Pool, workspace: string, name: string, node: string, snapshot: string, attach: (pod: V1Pod) => Effect.Effect<void, BindStepFailed>): Effect.Effect<void, RestoreRefused> =>
     Effect.gen(function*() {
-      const running = yield* podOf(pool, name).pipe(
-        Effect.flatMap((pod): Effect.Effect<V1Pod, PodNotRunning | RestoreRefused> => {
-          const statuses = pod?.status?.containerStatuses ?? [];
-          if (pod?.status?.phase === "Failed" || pod?.status?.phase === "Succeeded" || statuses.some(({ state }) => state?.terminated)) {
-            return Effect.fail(new RestoreRefused({ reason: `its pod ended before it ran (${pod?.status?.reason ?? pod?.status?.phase ?? "terminated"})`, resumed: false }));
-          }
-          const ready = pod && statuses.length > 0 && statuses.every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0;
-          return ready ? Effect.succeed(pod) : Effect.fail(new PodNotRunning());
-        }),
-        Effect.retry({ while: (error) => error._tag === "PodNotRunning", schedule: Schedule.max([Schedule.spaced("500 millis"), Schedule.during(POD_RUNNING_TIMEOUT_MS)]) }),
-        Effect.catchTag("PodNotRunning", () => Effect.fail(new RestoreRefused({ reason: `its pod did not run within ${POD_RUNNING_TIMEOUT_MS / 1000} s`, resumed: false }))),
-        Effect.catchTag("KubeApiError", (error) => Effect.fail(new RestoreRefused({ reason: error.message, resumed: false }))),
+      const waiting = yield* podOnce(pool, name, (pod) => pod.status?.initContainerStatuses?.find((status) => status.name === ATTACH_WAIT.name)?.state?.running !== undefined, "wait for its workspace");
+      yield* attach(waiting).pipe(Effect.mapError((error) => new RestoreRefused({ reason: `its workspace was not attached: ${error.message}`, resumed: false })));
+      const running = yield* podOnce(
+        pool,
+        name,
+        (pod) => (pod.status?.containerStatuses ?? []).length > 0 && (pod.status?.containerStatuses ?? []).every(({ state }) => state?.running) && (pod.status?.podIPs?.length ?? 0) > 0,
+        "run",
       );
-      // Its workspace attached, its sandbox paused, before it runs.
-      yield* attach(running).pipe(Effect.mapError((error) => new RestoreRefused({ reason: `its workspace was not attached: ${error.message}`, resumed: false })));
       const containerIds = (running.status?.containerStatuses ?? []).flatMap(({ containerID }) => (containerID ? [containerID.replace(/^[a-z]+:\/\//u, "")] : []));
       const podIPs = (running.status?.podIPs ?? []).map(({ ip }) => ip);
       // The policies that select it, which its node's rules for it must name.
@@ -505,6 +540,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
+          const bayma = (base.spec?.containers ?? []).filter((container) => container.name === BAYMA_CONTAINER);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
             kind: "Pod",
@@ -518,6 +554,8 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
             spec: {
               ...base.spec,
               containers: base.spec?.containers ?? [],
+              // Its workspace attached before its sandbox is restored, as its bayma starts.
+              initContainers: [...bayma.map(attachWait), ...(base.spec?.initContainers ?? [])],
               runtimeClassName: kept.runtimeClassName,
               readinessGates: [...(base.spec?.readinessGates ?? []), { conditionType: RESUMED_CONDITION }],
               affinity: { ...base.spec?.affinity, nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },
@@ -552,12 +590,12 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           yield* agents.setReleased(ref(pool, workspace), null).pipe(Effect.catch((error) => Effect.logWarning(`could not clear ${named(pool, workspace)}'s record of its release: ${error.message}`)));
           return;
         }
-        const { reason: why, resumed, stale } = done.failure;
-        // Its sandbox never having run, its restore is abandoned; one of a snapshot that holds the session no more falls back at once.
+        const { reason: why, resumed, stale, failed } = done.failure;
+        // Its sandbox never having run, its restore is abandoned; one of a snapshot that holds the session no more, or that could not start from it, falls back at once.
         if (resumed) yield* fallBack(pool, workspace, "restore", why);
         else {
           yield* abandon(pool, workspace, of.pod, of.node);
-          yield* (stale ? fallBack(pool, workspace, "stale", why) : deferOr(pool, workspace, "restore", why)).pipe(Effect.ignore);
+          yield* (stale ? fallBack(pool, workspace, "stale", why) : failed ? fallBack(pool, workspace, "restore", why) : deferOr(pool, workspace, "restore", why)).pipe(Effect.ignore);
         }
         return yield* new BindStepFailed({ reason: `its restore did not come back: ${why}` });
       }).pipe(withLogScope("snapshots"));

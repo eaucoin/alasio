@@ -30,7 +30,7 @@ import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Vol
 
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import { SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
+import { attachWait, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
@@ -494,6 +494,7 @@ function poolPodSpec(template: V1PodTemplateSpec): Pinned {
   return defaulted({
     ...(spec as unknown as PinnedMap),
     containers: spec.containers.map(poolContainer),
+    ...(spec.initContainers ? { initContainers: spec.initContainers.map(poolContainer) } : {}),
     // The API server's of a node not ready and unreachable, in either order.
     tolerations: oneOf([...tolerations, ...DEFAULT_TOLERATIONS], [...tolerations, ...[...DEFAULT_TOLERATIONS].reverse()]),
   }, POOL_POD_DEFAULTS.pod);
@@ -530,7 +531,7 @@ const restoredFromKey = (namespace: string) =>
  * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
  * and the API server stores it: its template's, bound from the first, never free, its sandbox
  * restored paused from the image its node's agent prepared, under one of `runtimeClasses`, on that
- * node, and ready once resumed.
+ * node, its workspace attached first (attach-wait), and ready once resumed.
  */
 function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
   const restoredOn: Pinned = {
@@ -542,6 +543,8 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
     spec: {
       ...template.spec,
       runtimeClassName: oneOf(...runtimeClasses),
+      // Its workspace attached before its sandbox is restored, as its bayma starts.
+      initContainers: [...(template.spec?.containers ?? []).filter(({ name }) => name === BAYMA_CONTAINER).map(attachWait), ...(template.spec?.initContainers ?? [])],
       readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
       affinity: restoredOn,
     } as unknown as V1PodSpec,
