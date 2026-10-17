@@ -8,8 +8,10 @@
  * longer act; and a file of one read, or one received written into it, for what alasio does
  * with a session's files outside its sandbox.
  *
- * A pod's directory serves one binding in its life, as its pod does: an attach into one that
- * holds a mount at or under it is refused, so a workspace is never mounted over another,
+ * A pod's directory is made by kubelet as its pod starts, by its mount of its own: an attach
+ * into one that is not there, or is no directory, as no pod of a pool on this node has one, is
+ * refused, and none is made. It serves one binding in its life, as its pod does: an attach into
+ * one that holds a mount at or under it is refused, so a workspace is never mounted over another,
  * which the pod would go on reaching beneath it. A detach is refused while any container of
  * the pod's sandbox runs: under a sandbox that acts, a lazy unmount would leave it holding
  * descriptors into the workspace it no longer shows. Once its sandbox has ended (its
@@ -21,7 +23,7 @@
  * name at a time as ./volume.ts walks one: one any part of whose path is a symlink, or that
  * is not a regular file, is refused, and so is one not reached in time.
  */
-import { chown, mkdir, rm, writeFile } from "node:fs/promises";
+import { chown, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Effect, Schema } from "effect";
@@ -141,13 +143,15 @@ export function makeWorkspaces({ host, runsc, workspacesRoot = WORKSPACES_ROOT, 
         const unnamed = Object.keys(env).find((name) => !VARIABLE.test(name));
         if (unnamed !== undefined) return yield* refused(400, `${unnamed} is no variable's name`);
         const directory = yield* podDirectory(pod);
+        const made = yield* Effect.promise(() => lstat(directory).then((stats) => stats.isDirectory(), () => false));
+        if (!made) return yield* refused(404, `no pod of a pool on this node is named ${pod}: kubelet has made it no directory`);
         const held = yield* mountsUnder(directory);
         if (held.length > 0) return yield* refused(409, `${pod}'s directory holds ${held.join(", ")}: a pod serves one binding, and nothing is mounted over another`);
         const found = yield* host.run(["test", "-d", files]);
         if (found.exitCode !== 0) return yield* refused(404, `there is no workspace ${ref.environment}/${ref.workspace}`);
         const ws = join(directory, "ws");
         yield* Effect.promise(async () => {
-          await mkdir(ws, { recursive: true });
+          await mkdir(ws);
           await chown(directory, agentUid, agentUid);
           await chown(ws, agentUid, agentUid);
           // Beside the workspace, not in it: its sandbox reads it, and reaches no other's.
