@@ -3026,7 +3026,7 @@ describe("the lake's reader", () => {
     }
   });
 
-  test("the alert rules say which volume server is filling its disk, which Valkey nears its memory limit, which collection keeps too few copies, and how many folders are held", async () => {
+  test("the alert rules say which volume server is filling its disk, which node's disk is nearly full, which Valkey nears its memory limit, which collection keeps too few copies, and how many folders are held", async () => {
     const now = String(BigInt(Date.now()) * 1_000_000n);
     const strings = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
     const gauge = (resource: Record<string, string>, name: string, value: number, attributes: Record<string, string> = {}) => ({
@@ -3035,6 +3035,11 @@ describe("the lake's reader", () => {
     });
     // Two volume servers' disks of 1000 bytes, one with 50 to fill, the other 500; as the collector names what it scrapes for its job.
     const disk = (pod: string, type: string, bytes: number) => gauge({ "service.name": "seaweedfs" }, "SeaweedFS_volumeServer_resource", bytes, { pod, type, name: "/data" });
+    // Two nodes' filesystems of 100 GB, as their kubelets say them, one with 5 GB left, the other 80.
+    const node = (name: string, available: number) => [
+      gauge({ "k8s.node.name": name }, "k8s.node.filesystem.available", available),
+      gauge({ "k8s.node.name": name }, "k8s.node.filesystem.capacity", 100e9),
+    ];
     // Two Valkeys, one holding 95% of its limit, the other 10%, each named by its receiver.
     const valkey = (address: string, name: string, bytes: number) => gauge({ "service.name": "redis", "server.address": address }, name, bytes);
     await withLake(async (db) => {
@@ -3045,6 +3050,8 @@ describe("the lake's reader", () => {
           disk("filling-0", "avail", 50),
           disk("roomy-0", "all", 1000),
           disk("roomy-0", "avail", 500),
+          ...node("full", 5e9),
+          ...node("roomy", 80e9),
           valkey("filer-store", "redis.memory.used", 950),
           valkey("filer-store", "redis.maxmemory", 1000),
           valkey("roomy-valkey", "redis.memory.used", 100),
@@ -3066,6 +3073,8 @@ describe("the lake's reader", () => {
     try {
       const left = Object.fromEntries((await answer(reader.db, rule("The object store is filling its disk"))).map((row) => [row["server"], row["left"]]));
       assert.deepEqual([left["filling-0"], left["roomy-0"]], [5, 50]);
+      const used = Object.fromEntries((await answer(reader.db, rule("A node's disk is nearly full"))).map((row) => [row["node"], row["used"]]));
+      assert.deepEqual([used["full"], used["roomy"]], [95, 20]);
       const held = Object.fromEntries((await answer(reader.db, rule("A Valkey nears its memory limit"))).map((row) => [row["valkey"], row["held"]]));
       assert.deepEqual([held["filer-store"], held["roomy-valkey"]], [95, 10]);
       const under = Object.fromEntries((await answer(reader.db, rule("The object store keeps fewer copies than it should"))).map((row) => [row["collection"], row["volumes"]]));

@@ -175,6 +175,50 @@ groups:
               expression: left
               conditions: [{evaluator: {type: lt, params: [10]}}]
 
+      - uid: alasio-node-disk-full
+        title: A node's disk is nearly full
+        condition: full
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.node }}'s disk is {{ $values.used }}% full. Images, the caches of those stargz-snapshotter's daemon pulls lazily, which kubelet's image GC does not see, and the stack's volumes share it; a full one fails what reads them."
+        data:
+          - refId: used
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: lake
+            model:
+              refId: used
+              type: json
+              source: url
+              parser: backend
+              format: table
+              url: /query
+              url_options:
+                method: POST
+                body_type: raw
+                body_content_type: text/plain
+                data: |
+                  select ResourceAttributes['k8s.node.name'] as node,
+                    round(100 * (1 - arg_max(Value, TimeUnix) filter (where MetricName = 'k8s.node.filesystem.available')
+                      / arg_max(Value, TimeUnix) filter (where MetricName = 'k8s.node.filesystem.capacity')), 1) as used
+                  from otel.metrics_gauge
+                  where MetricName in ('k8s.node.filesystem.available', 'k8s.node.filesystem.capacity')
+                    and TimeUnix > now()::timestamp - interval 10 minute
+                  group by 1
+              root_selector: ""
+              columns:
+                - {selector: node, text: node, type: string}
+                - {selector: used, text: used, type: number}
+          - refId: full
+            datasourceUid: __expr__
+            model:
+              refId: full
+              type: threshold
+              expression: used
+              conditions: [{evaluator: {type: gt, params: [90]}}]
+
       - uid: alasio-valkey-memory
         title: A Valkey nears its memory limit
         condition: near

@@ -2052,6 +2052,8 @@ if (inShard("telemetry")) {
       // The log's, its brokers' among them, and its intake's, how far behind it is.
       await untilInLake("metric of the log's", metricRows("ServiceName = 'log' and MetricName = 'kafka_server_broker_state'"));
       await untilInLake("metric of the lake's intake's", metricRows("ServiceName = 'lake-intake' and MetricName = 'lake_telemetry_lag_records'"));
+      // Each node's filesystem, as its kubelet says it, which the disk alert reads.
+      await untilInLake("filesystem of a node's", metricRows("MetricName = 'k8s.node.filesystem.available'"));
     });
 
     describe("Grafana", () => {
