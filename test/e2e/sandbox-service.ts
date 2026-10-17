@@ -262,6 +262,62 @@ export function sandboxService(): void {
       assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
     });
 
+    test("a workspace released with processes holding its files open, a writer mid-write, an open SQLite database and a git index.lock among them, is restored whole from its snapshot as it is next bound, its processes running on, their files held", async (t) => {
+      const workspace = "fs-e2eheld";
+      const token = await mainToken(workspace);
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const first = await boundPod(workspace);
+      const pod = await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS));
+      if (pod?.spec?.runtimeClassName === undefined) return t.skip("the pools run under no gVisor here, so nothing is snapshotted");
+      const inSandbox = async (name: string, script: string) => kube.execOk(SESSIONS, name, ["sh", "-c", script], { container: "bayma" });
+      // Each started apart from the exec that starts it, as a session's processes run on.
+      await inSandbox(first.name, [
+        "mkdir -p /workspace/held/.git && cd /workspace/held",
+        `setsid sh -c 'echo $$ > writer.pid; exec 3>>counter; exec 4>.git/index.lock; i=0; while :; do i=$((i + 1)); echo $i >&3; sleep 0.2; done' </dev/null >/dev/null 2>&1 &`,
+        `setsid python3 -c '${[
+          "import os, sqlite3, time",
+          "open(\"db.pid\", \"w\").write(str(os.getpid()))",
+          "db = sqlite3.connect(\"db.sqlite\")",
+          "db.execute(\"create table if not exists t (n integer)\")",
+          "db.commit()",
+          "n = 0",
+          "while True:",
+          "    n += 1",
+          "    db.execute(\"insert into t values (?)\", (n,))",
+          "    if n % 5 == 0: db.commit()",
+          "    time.sleep(0.1)",
+        ].join("\n")}' </dev/null >/dev/null 2>&1 &`,
+        "sleep 3",
+      ].join("\n"));
+      const written = Number((await inSandbox(first.name, "wc -l < /workspace/held/counter")).trim());
+      assert.ok(written > 5, `${written} lines written`);
+      // Released mid-write: saved whole into its snapshot.
+      const released = await gatewayCall(token, "POST", "/release");
+      assert.equal(released.status, 204, `${released.said}\n${await serviceLogs(workspace)}`);
+      await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", first.name, SESSIONS))) === null ? true : undefined), 180_000);
+      // Bound again: restored, by a pod of its own, its processes running on from where they were, their files held.
+      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 300_000);
+      const restored = await boundPod(workspace);
+      assert.match(restored.name, /^sandboxes-none-restore-/u, await serviceLogs(workspace));
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      const held = await inSandbox(restored.name, [
+        "cd /workspace/held",
+        'kill -0 "$(cat writer.pid)" && echo "writer runs"',
+        'kill -0 "$(cat db.pid)" && echo "database runs"',
+        'readlink "/proc/$(cat writer.pid)/fd/4"',
+        "awk 'NR != $1 { gap = 1 } END { print (gap ? \"a gap\" : \"whole\"), NR }' counter",
+        `python3 -c 'import sqlite3; db = sqlite3.connect("db.sqlite"); print(db.execute("pragma integrity_check").fetchone()[0], db.execute("select count(*) from t").fetchone()[0] > 0)'`,
+      ].join("; "));
+      assert.match(held, /^writer runs$/mu, held);
+      assert.match(held, /^database runs$/mu, held);
+      assert.match(held, /^\/workspace\/held\/\.git\/index\.lock$/mu, held);
+      const [, kept] = /^whole (\d+)$/mu.exec(held) ?? [];
+      assert.ok(Number(kept) > written, held);
+      assert.match(held, /^ok True$/mu, held);
+      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+    });
+
     test("a workspace is made, given a received file, bound, held to its quota, read back of what its session wrote, released and deleted through the gateway alone", async () => {
       const workspace = "fs-e2eclaim";
       const token = await mainToken(workspace);
