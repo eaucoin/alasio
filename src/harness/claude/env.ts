@@ -12,6 +12,10 @@ import { withoutTelemetry } from "../../telemetry/index.ts";
  * alasio's own telemetry settings are left out: they would relabel or redirect Claude
  * Code's and reach bayma and everything run through it. The process itself gets
  * telemetry settings of its own (./telemetry.ts).
+ *
+ * The login's claude.ai connectors are never loaded (CLAUDEAI_CONNECTORS): a turn's tools
+ * are the MCP servers alasio gives it, and nothing the account connected on claude.ai,
+ * which the CLI would otherwise reach through Anthropic's MCP proxy.
  */
 export function buildClaudeEnv(): Record<string, string> {
   const env: Record<string, string> = {};
@@ -21,5 +25,9 @@ export function buildClaudeEnv(): Record<string, string> {
     }
   }
   env["HOME"] = env["HOME"] || homedir();
+  env[CLAUDEAI_CONNECTORS] = "false";
   return env;
 }
+
+/** The CLI's switch for loading the login's claude.ai connectors, as its own help names it (or its disableClaudeAiConnectors setting). */
+export const CLAUDEAI_CONNECTORS = "ENABLE_CLAUDEAI_MCP_SERVERS";
