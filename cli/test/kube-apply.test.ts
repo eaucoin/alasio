@@ -257,6 +257,35 @@ test("a workload one of whose pods stops within its grace, as a node agent's doe
   assert.match(error.message, /^not ready within 0\.3s, still waiting for:\n {2}DaemonSet alasio\/alasio-node-agent: 0 of 1 nodes ready; pod alasio-node-agent-before on machine stopping/u);
 });
 
+test("a stopping pod whose container has ended is said to say nothing last, not what the kubelet answers in its log's place", async (t) => {
+  const { kube, run } = await rig(t);
+  for (const [logged, saying] of [
+    ["serving\nstopping now\n", ", last saying: stopping now"],
+    ["unable to retrieve container logs for containerd://5a9aca661f7f4f9ccc21f1425fec61d6c81964a5d156a8a42fdbafb138bdb0a3", ""],
+  ] as const) {
+    kube.stuck.add("alasio-node-agent");
+    kube.put("pods", {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: {
+        name: "alasio-node-agent-before",
+        namespace: "alasio",
+        labels: { "app.kubernetes.io/name": "alasio", "app.kubernetes.io/instance": "alasio", "app.kubernetes.io/component": "node-agent" },
+        deletionTimestamp: new Date(Date.now() - 1000).toISOString(),
+        finalizers: ["example.com/held"],
+      },
+      spec: { nodeName: "machine", containers: [{ name: "node-agent", image: "alasio" }] },
+      status: { phase: "Running" },
+    });
+    kube.logs.set("alasio-node-agent-before/node-agent", logged);
+    const error = await run(Effect.flip(applyInstallation(objectsOf(), { timeout: "300 millis", poll: "10 millis" })));
+    assert.equal(error._tag, "NotReadyInTime");
+    const pod = /pod alasio-node-agent-before on machine stopping, as it may until [^,;\n)]+(.*)$/mu.exec(error.message);
+    assert.ok(pod, error.message);
+    assert.equal(pod[1], saying, error.message);
+  }
+});
+
 test("a Job that fails fails the apply, saying why, before any workload is applied", async (t) => {
   const { kube, run } = await rig(t);
   kube.failing.add("alasio-neon-setup");

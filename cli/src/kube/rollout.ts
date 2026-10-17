@@ -265,13 +265,20 @@ const awaitAll = Effect.fnUntraced(function*(
 /** The object `ref`, or null when there is none. */
 const current = (ref: ObjectRef): Effect.Effect<KubernetesObject | null, KubeApiError, KubeApi> => Effect.flatMap(KubeApi, (kube) => kube.get(ref));
 
-/** What a pod last logged, of its first container: its last line, alone read, or nothing where it cannot be read. */
+/** What the kubelet answers, in the log's place, for a container that has ended while its pod is still there. */
+const UNRETRIEVABLE_LOG = /^unable to retrieve container logs for /u;
+
+/**
+ * What a pod last logged, of its first container: its last line, alone read, or nothing
+ * where it cannot be read, as once that container has ended.
+ */
 const lastLogged = (pod: V1Pod): Effect.Effect<string, never, KubeApi> =>
   Effect.flatMap(KubeApi, (kube) =>
     kube.logs(pod.metadata?.namespace ?? "", pod.metadata?.name ?? "", { container: pod.spec?.containers[0]?.name ?? "", tailLines: 1 }).pipe(
       Stream.decodeText,
       Stream.mkString,
       Effect.map((text) => text.trimEnd().split("\n").at(-1)?.trim() ?? ""),
+      Effect.map((line) => (UNRETRIEVABLE_LOG.test(line) ? "" : line)),
       Effect.orElseSucceed(() => ""),
     ));
 
