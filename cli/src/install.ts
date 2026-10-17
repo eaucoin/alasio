@@ -20,9 +20,9 @@ import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
-import type { CpuBaseline } from "./manifests/alasio.ts";
+import type { CpuBaseline, Kept } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.ts";
-import { GATEWAY, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
+import { GATEWAY, mountServices as mountServicesOf, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -32,6 +32,14 @@ import { ensureRoute, registerBot, type WebhookNotServing } from "./webhook.ts";
 
 /** alasio's namespace. */
 const NAMESPACE_OBJECT: V1Namespace = { apiVersion: "v1", kind: "Namespace", metadata: { name: NAMESPACE, labels: labels("alasio") } };
+
+/** The UIDs of the Services `names` of alasio's namespace, as the nodes' mount reaches them by address (../manifests/sandbox-gateway.ts mountServices), each by its name, null where it is not there. */
+export const readMountServices = (names: readonly string[]) =>
+  Effect.gen(function*() {
+    const api = yield* KubeApi;
+    const read = yield* Effect.forEach(names, (name) => Effect.map(api.get({ ...kind("Service"), namespace: NAMESPACE, name }), (service) => [name, service?.metadata?.uid ?? null] as const));
+    return Object.fromEntries(read) as Kept["mountServices"];
+  });
 
 /** The objects of the installation `config` describes, with what it carries forward from the one it replaces. */
 export function installationObjects(config: InstallConfig, carried: Carried = NOTHING_CARRIED): readonly KubernetesObject[] {
@@ -139,6 +147,8 @@ interface Checked {
   readonly checksum: string | null;
   /** Where the cluster's API server is, null where it cannot be read (./api-server.ts). */
   readonly apiServer: ApiServer | null;
+  /** The UIDs of the Services the nodes' mount reaches by address, as the cluster has them before this up (Kept mountServices). */
+  readonly mountServices: Kept["mountServices"];
 }
 
 /**
@@ -166,14 +176,15 @@ export const checkInstallation = Effect.fnUntraced(function*(
   const key = yield* readBotChecksumKey;
   const checksum = key === null ? null : botChecksum(bot, key);
   const apiServer = yield* readApiServer;
+  const mountServices = yield* readMountServices(mountServicesOf(settings));
   const liveGateway = (yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: GATEWAY }))?.data?.["config.json"];
-  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer }, liveGateway));
+  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer, mountServices }, liveGateway));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings);
   yield* checkApplicable(objects);
-  return { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer };
+  return { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices };
 });
 
 /**
@@ -191,7 +202,7 @@ export const install = Effect.fnUntraced(function*(
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer, mountServices } = yield* checkInstallation(config);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);
@@ -200,7 +211,7 @@ export const install = Effect.fnUntraced(function*(
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {
-    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer }, liveGateway)), options);
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer, mountServices }, liveGateway)), options);
   }
   return { ...installed, cpuBaseline: decision };
 });

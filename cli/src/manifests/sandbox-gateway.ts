@@ -26,6 +26,7 @@
  *   the node agent, which attaches workspaces from it: a new one takes its mount over before
  *   the old goes.
  */
+import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import type {
@@ -92,7 +93,7 @@ import { boundBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
-import { JUICEFS_ADMIN, WORKSPACES_CREDENTIALS } from "./workspace-storage.ts";
+import { JUICEFS_ADMIN, VALKEY, VALKEY_ADDRESS, WORKSPACES_CREDENTIALS, workspacesBucketUrl } from "./workspace-storage.ts";
 
 /** The gateway's name, its pods' component, and its Service's; the headless Service its replicas find each other by. */
 export const GATEWAY = componentName("sandbox-gateway");
@@ -476,6 +477,25 @@ export const JUICEFS_CACHE = "/var/lib/alasio/juicefs-cache";
 /** What JuiceFS's mount says once it has handed its FUSE session over to another mount of the same mount point, and ends. */
 export const HANDED_OVER = "transfer FUSE session to others";
 
+/**
+ * The Services the nodes' mount of workspace storage reaches by the addresses it resolves them to
+ * as it starts (workspaceMountScript): the metadata engine's, Valkey's, and the bundled object
+ * store's, where the bucket is its.
+ */
+export const mountServices = (config: InstallConfig): readonly string[] => [VALKEY, ...(config.objectStore.bundled.enabled ? [componentName("seaweedfs")] : [])];
+
+/** The annotation of the mount's template that changes, rolling it, where what it reaches by address does. */
+export const MOUNT_SERVICES_ANNOTATION = "checksum/storage-services";
+
+/**
+ * What the mount reaches by address, as a checksum: the UIDs of its Services, `uids`, and the
+ * URLs it resolves, so a Service made anew, whose address is another, or another bucket, rolls it.
+ */
+function mountServicesChecksum(config: InstallConfig, uids: Kept["mountServices"]): string {
+  const reached = { metadata: VALKEY_ADDRESS, bucket: workspacesBucketUrl(config), services: Object.fromEntries(mountServices(config).map((name) => [name, uids[name] ?? null])) };
+  return createHash("sha256").update(JSON.stringify(reached)).digest("hex").slice(0, 16);
+}
+
 /** Where a workspace mount's script finds what it works with: but for tests, the node's and the image's own. */
 export interface MountPaths {
   readonly run: string;
@@ -519,8 +539,9 @@ export const MOUNT_PATHS: MountPaths = {
  * In the node's mount namespace its juicefs reads the node's resolv.conf, which resolves none of
  * the cluster's names, its network the pod's still: so the metadata engine's and the bucket's,
  * where they are a Service's, are resolved here, by the pod's DNS, and it is given their
- * addresses. A Service's address lasts as long as it does; one made anew is reached once the pod
- * is started again.
+ * addresses. A Service's address lasts as long as it does: `up` rolls the mount where one is made
+ * anew, or the bucket is another (MOUNT_SERVICES_ANNOTATION), and the pod that replaces it reaches
+ * the new address.
  *
  * Its juicefs, run in the node's mount namespace, is still this pod's process, of its cgroup: the
  * pod's teardown kills it. So a pod hands its mount over before it is torn down, never after: the
@@ -602,7 +623,7 @@ export function workspaceMountReady(root: string, paths: Pick<MountPaths, "run" 
  * release, of the version the mount image is (../../../Dockerfile), privileged, as it enters
  * the node's mount namespace.
  */
-function workspaceMount(config: InstallConfig): V1DaemonSet {
+function workspaceMount(config: InstallConfig, mountServices: Kept["mountServices"]): V1DaemonSet {
   const credential = (name: string, key: string): V1EnvVar => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
   const nodePaths = [["bin", JUICEFS_BIN], ["state", JUICEFS_STATE], ["cache", JUICEFS_CACHE]] as const;
   return {
@@ -613,7 +634,10 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
       selector: { matchLabels: selectorLabels(WORKSPACE_MOUNT_COMPONENT) },
       updateStrategy: { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } },
       template: {
-        metadata: { labels: { ...labels(WORKSPACE_MOUNT_COMPONENT), ...JUICEFS_ADMIN } },
+        metadata: {
+          labels: { ...labels(WORKSPACE_MOUNT_COMPONENT), ...JUICEFS_ADMIN },
+          annotations: { [MOUNT_SERVICES_ANNOTATION]: mountServicesChecksum(config, mountServices) },
+        },
         spec: {
           ...priority("floor"),
           ...imagePullSecrets(config),
@@ -674,7 +698,7 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
 /** The sandbox service's objects: its gateway, its receiver, and the nodes' mount, main's alone, which serve every environment, and main's pools. */
 export function sandboxServiceObjects(config: InstallConfig, carried: Carried): KubernetesObject[] {
   if (!sandboxServiceRuns(config)) return [];
-  const mount = workspaceMount(config);
+  const mount = workspaceMount(config, carried.mountServices);
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
   return [
     ...gatewayIdentity(),

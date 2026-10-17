@@ -3,7 +3,8 @@
  * run by sh with stand-ins for juicefs, for the node's mount table and for entering the node's
  * mount namespace: its juicefs copied to the node and run there; idle once its mount is handed
  * over, a failure once it ends any other way, ready only while its own mount serves the node's
- * mount point; and a mount left by a juicefs gone unmounted before it mounts.
+ * mount point; and a mount left by a juicefs gone unmounted before it mounts. And the Services
+ * it reaches by address, as up reads them, which roll it as they are made anew.
  */
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
@@ -13,7 +14,12 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { Effect } from "effect";
+
+import { readMountServices } from "../src/install.ts";
+import { KubeApi } from "../src/kube/api.ts";
 import { HANDED_OVER, type MountPaths, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
+import { serveFakeKube } from "./support/fake-kube.ts";
 
 /** What juicefs's stand-in does: serve until it is ended, hand its mount over, or fail. */
 type Juicefs = "serves" | "hands over" | "fails";
@@ -168,4 +174,18 @@ test("a mount whose metadata engine or bucket is no Service of the cluster's is 
   assert.equal(await unresolved.ended, 1);
   assert.match(unresolved.out(), /alasio-gone\.alasio\.svc\.cluster\.local resolves to no address/u);
   assert.deepEqual(unresolved.inNode(), []);
+});
+
+test("up reads the UIDs of the Services the mount reaches by address, none of one not there", async (t) => {
+  const kube = await serveFakeKube();
+  const directory = mkdtempSync(join(tmpdir(), "alasio-mount-services-"));
+  t.after(async () => {
+    await kube.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const kubeconfig = join(directory, "kubeconfig");
+  writeFileSync(kubeconfig, kube.kubeconfig);
+  kube.put("services", { apiVersion: "v1", kind: "Service", metadata: { name: "alasio-valkey", namespace: "alasio", uid: "uid-valkey" }, spec: {} });
+  const read = await Effect.runPromise(Effect.provide(readMountServices(["alasio-valkey", "alasio-seaweedfs"]), KubeApi.layer({ path: kubeconfig })));
+  assert.deepEqual(read, { "alasio-valkey": "uid-valkey", "alasio-seaweedfs": null });
 });
