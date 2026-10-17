@@ -468,7 +468,7 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
         // Each node tried in turn: one that cannot restore it (409) leaves the others; one whose bucket or agent fails may pass.
         const failures: (NodeAgentError | KubeApiError)[] = [];
         for (const node of able.success.nodes) {
-          const prepared = yield* agents.prepare(node, ref(pool, workspace)).pipe(Effect.result);
+          const prepared = yield* agents.prepare(node, ref(pool, workspace), kept.gofer ?? undefined).pipe(Effect.result);
           if (prepared._tag === "Failure") {
             failures.push(prepared.failure);
             yield* Effect.logWarning(prepared.failure.message);

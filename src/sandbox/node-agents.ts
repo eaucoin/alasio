@@ -8,6 +8,7 @@ import { Config, Duration, Effect, Redacted, Schedule, Schema } from "effect";
 import { FetchHttpClient } from "effect/http";
 
 import { type KubeApiError, KubeClient } from "../kube/client.ts";
+import type { Gofer } from "../node-agent/names.ts";
 import { type AbandonRequest, type CheckpointRequest, type Killed, Manifest, POLICY_WAIT_MS, type ResumeRequest, type WorkspaceRef } from "../node-agent/agent.ts";
 import { NODE_AGENT_TOKEN_VARIABLE, OPERATION_LIMIT_SECONDS } from "../node-agent/names.ts";
 import { Released, type StopRequest } from "../node-agent/workspaces.ts";
@@ -72,8 +73,11 @@ export interface NodeAgents {
   readonly nodes: Effect.Effect<readonly string[], KubeApiError>;
   /** Snapshots the sandbox of the container `request` names, on `node`, and commits it: its manifest. The sandbox ends. */
   readonly checkpoint: (node: string, request: CheckpointRequest) => Effect.Effect<Manifest, NodeAgentError | KubeApiError>;
-  /** The workspace's current snapshot, prepared on `node` for a restore there. */
-  readonly prepare: (node: string, workspace: WorkspaceRef) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
+  /**
+   * The workspace's current snapshot, prepared on `node` for a restore there, its checkpoint
+   * gofer as `gofer` says, where it says; the agent's own way where not.
+   */
+  readonly prepare: (node: string, workspace: WorkspaceRef, gofer?: Gofer) => Effect.Effect<Prepared, NodeAgentError | KubeApiError>;
   /** The workspace's current snapshot, or null when it has none, as an agent reads it. */
   readonly current: (workspace: WorkspaceRef) => Effect.Effect<Manifest | null, NodeAgentError | KubeApiError>;
   /** Makes the current snapshot of `from` that of `to` too: `to`'s manifest. An agent refuses one of `from` without a snapshot with 404. */
@@ -234,7 +238,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
    * prepare) of the workspace `request` names, which it runs whatever becomes of this
    * call: started, then asked how it stands until it has ended, within LONG_CALL.
    */
-  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
+  const operate = <A, I>(node: string, what: string, path: string, request: WorkspaceRef & { readonly gofer?: Gofer }, value: Schema.Codec<A, I>): Effect.Effect<A, NodeAgentError | KubeApiError> =>
     Effect.gen(function*() {
       yield* send(node, what, { method: "POST", path, body: request, timeout: SHORT_CALL });
       const standing = { method: "GET", path: `${path}/${encodeURIComponent(request.environment)}/${encodeURIComponent(request.workspace)}`, timeout: SHORT_CALL } as const;
@@ -314,7 +318,7 @@ export const makeNodeAgents = Effect.fnUntraced(function*(location: NodeAgentsLo
     writeFile: (workspace, path, bytes) =>
       Effect.flatMap(anyNode, (node) => send(node, `write ${path} of ${workspace.environment}/${workspace.workspace}`, { method: "PUT", path: filePath(workspace, path), bytes, timeout: SHORT_CALL })).pipe(Effect.asVoid),
     checkpoint: (node, request) => operate(node, `snapshot ${request.environment}/${request.workspace}`, "/checkpoints", request, Manifest),
-    prepare: (node, workspace) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", workspace, Prepared),
+    prepare: (node, workspace, gofer) => operate(node, `prepare ${workspace.environment}/${workspace.workspace}'s snapshot`, "/prepare", gofer ? { ...workspace, gofer } : workspace, Prepared),
     current: (workspace) =>
       Effect.gen(function*() {
         const node = yield* anyNode;

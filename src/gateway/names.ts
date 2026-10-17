@@ -42,7 +42,12 @@ const Template = Schema.Record(Schema.String, Schema.Unknown);
  */
 export const GatewaySnapshots = Schema.Struct({
   liveEverySeconds: Schema.Number,
-  releases: Schema.Array(Schema.Struct({ release: Schema.String, runtimeClassName: Schema.String })),
+  /** Each kept release, its RuntimeClass, and the checkpoint gofer a restore of a snapshot it took asks for, if any (../node-agent/names.ts goferOf). */
+  releases: Schema.Array(Schema.Struct({
+    release: Schema.String,
+    runtimeClassName: Schema.String,
+    gofer: Schema.NullOr(Schema.Struct({ transport: Schema.Literals(["socket", "tcp"]), pagesRetry: Schema.Boolean })),
+  })),
   templates: Schema.Struct({
     none: Schema.Struct({ current: Template, previous: Schema.NullOr(Template) }),
     full: Schema.Struct({ current: Template, previous: Schema.NullOr(Template) }),

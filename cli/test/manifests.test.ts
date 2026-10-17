@@ -51,7 +51,7 @@ import type { VerticalPodAutoscaler } from "../src/manifests/sizing.ts";
 import { filerStoreBackupHours } from "../src/manifests/config.ts";
 import { carriedFrom, decodeInstallConfig, type InstallConfig, manifests, NOTHING_CARRIED, NOTHING_KEPT } from "../src/manifests/index.ts";
 import { filerStoreRestore } from "../src/manifests/object-store.ts";
-import { STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
+import { goferOf, STORE_PROXY_PORT } from "../../src/node-agent/names.ts";
 import { apiServerUnconfined } from "../src/install.ts";
 import { carriedPools, workspaceMountReady, workspaceMountScript } from "../src/manifests/sandbox-gateway.ts";
 import { templateHash } from "../../src/gateway/names.ts";
@@ -3466,6 +3466,14 @@ describe("the sandbox service", () => {
     assert.deepEqual(carriedPools(configOf(cpu("102m")), gatewayOf(first), { ...kept, cpuBaseline: null }), { none: null, full: null });
   });
 
+  test("a restore of a snapshot taken under a release at or past the first that restores through a socket asks for its checkpoint gofer through a socket, reading again pages a read of failed; one before it, or where none is named, the agent's own way", () => {
+    assert.deepEqual(
+      ["20260921.0-eaucoin.8", "20260921.0-eaucoin.9", "20260921.1-eaucoin.1"].map((release) => goferOf(release, "20260921.0-eaucoin.9")),
+      [null, { transport: "socket", pagesRetry: true }, { transport: "socket", pagesRetry: true }],
+    );
+    assert.equal(goferOf("20260921.0-eaucoin.9", ""), null);
+  });
+
   test("binds through a gateway of alasio's image, configured with its pools and the node agents, its keys the stack's, which may claim and delete its pools' pods and hold their Leases alone", () => {
     const objects = install();
     const gateway = one<V1Deployment>(objects, "Deployment", "alasio-sandbox-gateway");
@@ -3495,7 +3503,8 @@ describe("the sandbox service", () => {
       // Main's sessions snapshotted as alasio's own were, under the releases kept, each pool's template as the pool runs it, none carried before it.
       snapshots: {
         liveEverySeconds: 600,
-        releases: NOTHING_KEPT.gvisorReleases.map((release) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}` })),
+        // Each restored through the checkpoint gofer as it restores best: over TCP, the agent's own way, as the pins name no release that restores through a socket.
+        releases: NOTHING_KEPT.gvisorReleases.map((release) => ({ release, runtimeClassName: `gvisor-${release.split(".").join("-")}`, gofer: null })),
         templates: Object.fromEntries((["none", "full"] as const).map((mode) => [mode, { current: JSON.parse(JSON.stringify(one<V1Deployment>(objects, "Deployment", `sandboxes-${mode}`).spec?.template)), previous: null }])),
       },
     });
