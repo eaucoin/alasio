@@ -57,16 +57,32 @@ export class BindTimeout extends Schema.TaggedError<BindTimeout>()("BindTimeout"
  * Makes the pod of a binding itself, rather than claim one: given the labels and annotations
  * the pod is to carry from the first, the pod made.
  */
-export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) => Effect.Effect<V1Pod, KubeApiError>;
+export type MakePod = (labels: Readonly<Record<string, string>>, annotations: Readonly<Record<string, string>>) => Effect.Effect<V1Pod, KubeApiError | BindStepFailed>;
 
-/** What a bind is given beyond its pool and key: a pod's maker, where it makes its own. */
+/**
+ * Readies the pod got for a binding before it is the binding's, as by attaching what it
+ * serves: given the pod, and the binding, its Lease's uid.
+ */
+export type PreparePod = (pod: V1Pod, binding: string) => Effect.Effect<void, BindStepFailed>;
+
+/** What a bind is given beyond its pool and key: a pod's maker, where it makes its own, and what readies the pod. */
 export interface BindOptions {
   readonly make?: MakePod | undefined;
+  readonly prepare?: PreparePod | undefined;
+}
+
+/** A step of a bind its caller gives, making or readying its pod, failed: why. */
+export class BindStepFailed extends Schema.TaggedError<BindStepFailed>()("BindStepFailed", {
+  reason: Schema.String,
+}) {
+  override get message(): string {
+    return this.reason;
+  }
 }
 
 export class Binder extends Context.Service<Binder, {
   /** The key bound in the pool, as the module says. */
-  readonly bind: (pool: Pool, key: string, options?: BindOptions) => Effect.Effect<Bound, KubeApiError | BindTimeout>;
+  readonly bind: (pool: Pool, key: string, options?: BindOptions) => Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed>;
   /**
    * Releases the key's binding, binds of it waiting meanwhile: `before` run, as a checkpoint
    * of its pod, then its pod deleted, then its Lease. Whether it was released: false where it
@@ -108,14 +124,15 @@ export class Binder extends Context.Service<Binder, {
           });
 
         /**
-         * A pod for the binding whose Lease this bind took: one already bound to the key, as by
-         * a binder that ended after it claimed; one made; or a free one claimed, waited for while
-         * `lost` says the Lease is still this bind's.
+         * A pod for the binding whose Lease this bind took: one made, or a free one claimed,
+         * waited for while `lost` says the Lease is still this bind's. One bound to the key
+         * already, as by a binder that ended after it claimed it, readied or not, is deleted
+         * first: a pod serves one binding, as it was got for it.
          */
-        const podFor = (pool: Pool, key: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<V1Pod, KubeApiError | BindTimeout> =>
+        const podFor = (pool: Pool, key: string, make: MakePod | undefined, deadline: number, lost: () => boolean): Effect.Effect<V1Pod, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const already = yield* provide(boundPod(pool, key));
-            if (already) return already;
+            if (already?.metadata?.name) yield* kube.remove("v1", "Pod", pool.namespace, already.metadata.name);
             if (make) return yield* make(boundLabels(pool, key), { [KEY_ANNOTATION]: key });
             const claimed = yield* provide(claim(pool, key));
             if (claimed) return claimed;
@@ -162,16 +179,26 @@ export class Binder extends Context.Service<Binder, {
           });
 
         /**
-         * Binds `key` with the Lease `taken` this bind took: a pod got for it (podFor), its
-         * Lease renewed the while (renewing), then the pod named its holder. The Lease and the
-         * pod's name, or null where another binder took the Lease over meanwhile, which then
-         * finds the pod bound to the key, and holds it. A bind that gets no pod lets the
-         * Lease go.
+         * Binds `key` with the Lease `taken` this bind took: a pod got for it (podFor) and
+         * readied (`prepare`), its Lease renewed the while (renewing), then the pod named its
+         * holder. The Lease and the pod's name, or null where another binder took the Lease over
+         * meanwhile, which then gets a pod of its own. A bind that gets no pod, or cannot ready
+         * the one it got, which is then deleted, lets the Lease go.
          */
-        const underWay = (pool: Pool, key: string, taken: BindingLease, make: MakePod | undefined, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string } | null, KubeApiError | BindTimeout> =>
+        const underWay = (pool: Pool, key: string, taken: BindingLease, { make, prepare }: BindOptions, deadline: number): Effect.Effect<{ readonly lease: BindingLease; readonly name: string } | null, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
-            // A bind that gets no pod lets the Lease go, as last renewed, for the next to take.
-            const { value: pod, lease } = yield* renewing(taken, (lost) => podFor(pool, key, make, deadline, lost), (held) => provide(releaseLease(held)).pipe(Effect.ignore));
+            const readied = (lost: () => boolean) =>
+              Effect.gen(function*() {
+                const pod = yield* podFor(pool, key, make, deadline, lost);
+                if (prepare) {
+                  yield* prepare(pod, taken.metadata?.uid ?? "").pipe(
+                    Effect.tapError(() => kube.remove("v1", "Pod", pool.namespace, pod.metadata?.name ?? "").pipe(Effect.ignore)),
+                  );
+                }
+                return pod;
+              });
+            // A bind that gets no pod readied lets the Lease go, as last renewed, for the next to take.
+            const { value: pod, lease } = yield* renewing(taken, readied, (held) => provide(releaseLease(held)).pipe(Effect.ignore));
             const name = pod.metadata?.name ?? "";
             const holding = lease ? yield* provide(holdLease(lease, name)) : null;
             return holding ? { lease: holding, name } : null;
@@ -198,13 +225,13 @@ export class Binder extends Context.Service<Binder, {
             return true;
           });
 
-        const bind = (pool: Pool, key: string, { make }: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout> =>
+        const bind = (pool: Pool, key: string, options: BindOptions = {}): Effect.Effect<Bound, KubeApiError | BindTimeout | BindStepFailed> =>
           Effect.gen(function*() {
             const deadline = (yield* Clock.currentTimeMillis) + waitMs;
             for (;;) {
               const taken = yield* provide(takeLease(pool, key, binder, staleMs));
               if (taken.taken) {
-                const bound = yield* underWay(pool, key, taken.lease, make, deadline);
+                const bound = yield* underWay(pool, key, taken.lease, options, deadline);
                 if (bound === null) continue;
                 return yield* servingBy(pool, key, bound.lease.metadata?.uid ?? "", bound.name, deadline);
               }
