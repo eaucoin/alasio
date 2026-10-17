@@ -16,7 +16,8 @@
  *   token is beside it (sandbox/agent/start.sh). KEDA keeps `min` free, and makes more, to
  *   `max`, for the binds that wait; a bound pod is out of its Deployment, which replaces it.
  *   A pod that ends is ended: it serves one binding. Its template changes as a whole: the old
- *   free pods go as the new come, as none is ready before it is bound.
+ *   free pods go as the new come, as none is ready before it is bound. A bound pod is evicted
+ *   by no drain (./disruption.ts boundBudget).
  * - The session telemetry receiver (src/receiver/): alasio's image, as its own program,
  *   watching the pools' Leases, which bound pods' bayma exports to.
  * - The node's mount of workspace storage, a pod of each node's own, held through upgrades of
@@ -60,6 +61,7 @@ import {
   sha256,
 } from "./common.ts";
 import { durationSeconds, type InstallConfig } from "./config.ts";
+import { boundBudget } from "./disruption.ts";
 import { priority } from "./priorities.ts";
 import { scaledObject } from "./scalers.ts";
 import { verticalPodAutoscaler } from "./sizing.ts";
@@ -384,6 +386,7 @@ export function sandboxServiceObjects(config: InstallConfig, environment: Enviro
     ...gatewayObjects(config, environment),
     ...poolObjects(config, pools.none, "none"),
     ...poolObjects(config, pools.full, "full"),
+    boundBudget(pools.none.namespace),
     ...receiverObjects(config, environment),
     mount,
     // Sized as recommended alone: replaced, it takes every workspace attached on its node with it.
