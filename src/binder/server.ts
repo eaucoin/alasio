@@ -10,7 +10,8 @@
  *   `peers` names them; asked without a token, as KEDA's metrics-api trigger asks.
  * - `GET /waiting/<namespace>/<pool>`: `{ waiting }`, this replica's alone, as its peers ask.
  * - anything else: passed to the pod the token's key is bound to, the key bound first where
- *   it is not (./proxy.ts), with the binding's token for the caller's; 503 with a Retry-After
+ *   it is not (./proxy.ts), with the binding's token for the caller's, the key's Lease
+ *   stamped active now and then, as what releases it reads; 503 with a Retry-After
  *   where it could not be bound now (its pool had no pod for it in time, its pod could not
  *   be readied), or its pod was not reached, its route then forgotten, so the next request
  *   binds the key anew; 403 where the gateway binds it nowhere, as its token says it is bound.
@@ -28,12 +29,14 @@ import { type KubeApiError, KubeClient } from "../kube/client.ts";
 import { withLogScope } from "../shared/log.ts";
 import { BearerToken } from "../shared/tokens.ts";
 import { type BindOptions, Binder, type BindStepFailed, type BindTimeout } from "./binder.ts";
-import { counts, type Pool } from "./bindings.ts";
+import { counts, type Pool, touchLease } from "./bindings.ts";
 import { proxy, type Route } from "./proxy.ts";
 import { mintToken, verifyToken } from "./tokens.ts";
 
 /** What a Retry-After asks a caller to wait, in seconds, before it asks again. */
 const RETRY_AFTER_S = 1;
+/** How often a key's Lease is stamped with its requests, at most, by one replica: well within any wait to release it. */
+const ACTIVE_STAMP_MS = 30_000;
 
 /** A key bound nowhere, as its caller's token says it is bound: why, answered 403. */
 export class PlacementRefused extends Schema.TaggedError<PlacementRefused>()("PlacementRefused", { reason: Schema.String }) {
@@ -82,18 +85,28 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
   const binder = yield* Binder;
   const kube = yield* KubeClient;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
-  const routes = new Map<string, Route>();
+  const routes = new Map<string, Route & { readonly pool: Pool }>();
   const flights = new Map<string, number>();
+  const stamped = new Map<string, number>();
+
+  /** Stamps `key`'s Lease with a request now, at most every ACTIVE_STAMP_MS from this replica, so whatever releases it sees it active. */
+  const active = (key: string, pool: Pool): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis;
+      if (now - (stamped.get(key) ?? 0) < ACTIVE_STAMP_MS) return;
+      stamped.set(key, now);
+      yield* Effect.provideService(touchLease(pool, key, now), KubeClient, kube).pipe(Effect.catch((error) => Effect.logDebug(`stamping ${key}'s binding active failed: ${error.message}`)));
+    });
 
   /** The route to `key`'s pod: the one known, or its pod bound now, with `options`. */
-  const routeOf = (key: string, options: Readonly<Record<string, string>>): Effect.Effect<Route, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
+  const routeOf = (key: string, options: Readonly<Record<string, string>>): Effect.Effect<Route & { readonly pool: Pool }, KubeApiError | BindTimeout | BindStepFailed | PlacementRefused> =>
     Effect.suspend(() => {
       const known = routes.get(key);
       if (known) return Effect.succeed(known);
       return poolOf(key, options).pipe(
-        Effect.flatMap(({ pool, ...options }) => binder.bind(pool, key, options)),
-        Effect.map(({ binding, address }) => {
-          const route = { address, port: podPort, token: mintToken(bindingKey, { key, binding }) };
+        Effect.flatMap(({ pool, ...placed }) => binder.bind(pool, key, placed).pipe(Effect.map((bound) => ({ ...bound, pool })))),
+        Effect.map(({ binding, address, pool }) => {
+          const route = { address, port: podPort, token: mintToken(bindingKey, { key, binding }), pool };
           routes.set(key, route);
           return route;
         }),
@@ -137,6 +150,7 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
         incoming.resume();
         return answer(outgoing, 204);
       }
+      yield* active(key, route.success.pool);
       flights.set(key, (flights.get(key) ?? 0) + 1);
       const proxied = yield* Effect.promise(() => proxy(incoming, outgoing, route.success)).pipe(
         Effect.ensuring(Effect.sync(() => void flights.set(key, (flights.get(key) ?? 1) - 1))),

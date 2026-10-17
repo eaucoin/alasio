@@ -143,6 +143,31 @@ export const markReleasing = Effect.fnUntraced(function*(lease: BindingLease, bi
   );
 });
 
+/** The annotation of a binding's Lease saying when a request of its key last came, in ms: stamped by its binders, now and then. */
+export const ACTIVE_ANNOTATION = "alasio.dev/active-at";
+
+/** Stamps the Lease of `key`'s binding with a request of it at `now`; one gone, or changed meanwhile, is left. */
+export const touchLease = Effect.fnUntraced(function*(pool: Pool, key: string, now: number): Effect.fn.Return<void, KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  yield* kube.patch("coordination.k8s.io/v1", "Lease", pool.namespace, leaseName(key), { metadata: { annotations: { [ACTIVE_ANNOTATION]: String(now) } } }).pipe(
+    Effect.catchIf(hasStatus(404), () => Effect.void),
+    Effect.asVoid,
+  );
+});
+
+/** When a request of the binding `lease` last came, as its binders stamped it; null where none ever did. */
+export const activeAt = (lease: BindingLease): number | null => {
+  const at = Number(lease.metadata?.annotations?.[ACTIVE_ANNOTATION]);
+  return Number.isFinite(at) && at > 0 ? at : null;
+};
+
+/** The bindings of `pool` whose pods are named, as their Leases hold them. */
+export const heldLeases = Effect.fnUntraced(function*(pool: Pool): Effect.fn.Return<readonly BindingLease[], KubeApiError, KubeClient> {
+  const kube = yield* KubeClient;
+  const leases = (yield* kube.list("coordination.k8s.io/v1", "Lease", pool.namespace, `${POOL_LABEL}=${pool.name},${BINDING_LABEL}`)) as BindingLease[];
+  return leases.filter(({ spec }) => spec?.holderIdentity);
+});
+
 /** Takes the releasing mark off the Lease `lease`, by an update conditioned on its version: the Lease, or null where it changed meanwhile. */
 export const unmarkReleasing = Effect.fnUntraced(function*(lease: BindingLease): Effect.fn.Return<BindingLease | null, KubeApiError, KubeClient> {
   const kube = yield* KubeClient;
