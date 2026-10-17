@@ -5,7 +5,7 @@ import type { V1Pod } from "@kubernetes/client-node";
 import { Effect, Fiber, Layer } from "effect";
 
 import { BindTimeout, Binder, type BinderOptions } from "../src/binder/binder.ts";
-import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL, readLease, release, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
+import { BINDING_LABEL, type BindingLease, boundLabels, claim, FREE_LABEL, freeLabels, KEY_ANNOTATION, keyHash, leaseName, type Pool, POOL_LABEL, readLease, reconcile, release, releaseLease, renewLease, takeLease } from "../src/binder/bindings.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
 
@@ -245,4 +245,23 @@ test("a binding under way is renewed however long its pod takes to make, so no o
   const second = await bindIn(binderOf(timing), (each) => each.bind(of, "sessionfs:slow", { make: slow }));
   assert.equal(made, 1);
   assert.deepEqual(second, await first);
+});
+
+test("reconciling a pool deletes a bound pod no Lease names and lets go a Lease whose pod is gone, and leaves a binding whole, or under way", async () => {
+  const of = await pool();
+  await freePods(of, 3);
+  const layer = binderOf();
+  const whole = await bindIn(layer, (each) => each.bind(of, "sessionfs:whole"));
+  // A pod claimed by a bind that ended before it named it, then gave its Lease up.
+  const orphan = await run(binder(), claim(of, "sessionfs:orphan"));
+  // A Lease whose pod was deleted.
+  const gone = await bindIn(layer, (each) => each.bind(of, "sessionfs:gone"));
+  await run(binder(), withKube((client) => client.remove("v1", "Pod", of.namespace, gone.pod)));
+  // A binding under way.
+  await run(binder(), takeLease(of, "sessionfs:under-way", "binder"));
+  const set = await run(binder(), reconcile(of));
+  assert.deepEqual(set, { pods: [orphan?.metadata?.name], leases: [leaseName("sessionfs:gone")] });
+  assert.ok(await run(binder(), readLease(of, "sessionfs:under-way")));
+  assert.equal((await run(binder(), readLease(of, "sessionfs:whole")))?.spec?.holderIdentity, whole.pod);
+  assert.deepEqual((await boundPods(of)).map(({ metadata }) => metadata?.name), [whole.pod]);
 });
