@@ -39,6 +39,7 @@ import type { Manifest } from "../../src/node-agent/agent.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, SNAPSHOT_CACHE_DIR, STORE_PROXY_PORT, UNSYNCED_DOWNLOAD_BYTES } from "../../src/node-agent/names.ts";
 import type { NetMode } from "../../src/sandbox/index.ts";
 import { ANSWER } from "./codex-stand-in.ts";
+import { sandboxService } from "./sandbox-service.ts";
 import type { FolderBaymaSeen } from "./folder-bayma.ts";
 import {
   AGENTS,
@@ -1807,6 +1808,7 @@ if (inShard("workspaces")) {
   });
 
   workspaceStorage();
+  sandboxService();
 }
 
 /** How many rows of the lake's `otel` metric tables `condition` selects, as SQL. */
