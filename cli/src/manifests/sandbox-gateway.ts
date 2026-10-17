@@ -21,7 +21,8 @@
  * - The session telemetry receiver (src/receiver/): alasio's image, as its own program,
  *   watching the pools' Leases, which bound pods' bayma exports to.
  * - The node's mount of workspace storage, a pod of each node's own, held through upgrades of
- *   the node agent, which attaches workspaces from it: changed only as its pod is deleted.
+ *   the node agent, which attaches workspaces from it: a new one takes its mount over before
+ *   the old goes.
  */
 import type {
   KubernetesObject,
@@ -336,11 +337,61 @@ function receiverObjects(config: InstallConfig, environment: Environment): Kuber
   return [account, role, binding, deployment, verticalPodAutoscaler(deployment, "InPlace"), service];
 }
 
+/** Where a workspace mount's pod keeps what is its own: its juicefs's log and pid, and whether it has handed its mount over. */
+export const MOUNT_RUN = "/run/alasio";
+/** Where JuiceFS keeps a mount's open handles on the node, which the mount that takes it over reads: every mount pod's on the node, at /tmp. */
+export const JUICEFS_STATE = "/var/lib/alasio/juicefs-state";
+/** What JuiceFS's mount says once it has handed its FUSE session over to another mount of the same mount point, and ends. */
+export const HANDED_OVER = "transfer FUSE session to others";
+
+/**
+ * The script of a workspace mount's pod: JuiceFS's mount of workspace storage at `root`, its
+ * log copied out; and, once it ends, idle where it ended by handing its mount over, as it
+ * said, to the mount of the pod that replaces it, until its own pod is deleted, or, where it
+ * ended any other way, a failure, so kubelet starts it again and it mounts anew. Asked to end
+ * while it mounts, it has its mount end too. `run` is MOUNT_RUN but for tests.
+ */
+export function workspaceMountScript(root: string, cacheSizeMiB: number, run = MOUNT_RUN): string {
+  return [
+    `run=${run}`,
+    `mkdir -p ${root} "$run"`,
+    `rm -f "$run/handed-over"`,
+    `juicefs mount --no-bgjob --cache-size ${cacheSizeMiB} "$META_URL" ${root} > "$run/juicefs.log" 2>&1 &`,
+    "pid=$!",
+    `echo "$pid" > "$run/juicefs.pid"`,
+    `tail -n +1 -f "$run/juicefs.log" &`,
+    "tailer=$!",
+    `trap 'kill -TERM "$pid"' TERM INT`,
+    `wait "$pid"; code=$?`,
+    // A TERM's wait ends as the trap runs; the mount's own end is waited for.
+    `while kill -0 "$pid" 2>/dev/null; do wait "$pid"; code=$?; done`,
+    "sleep 1",
+    `kill "$tailer" 2>/dev/null`,
+    `if grep -qF '${HANDED_OVER}' "$run/juicefs.log"; then`,
+    `  touch "$run/handed-over"`,
+    "  echo 'the mount is handed over to the pod that replaces this one, which is idle until it is deleted'",
+    "  trap 'exit 0' TERM INT",
+    "  while :; do sleep 3600 & wait $!; done",
+    "fi",
+    `echo "juicefs mount ended ($code) without handing its mount over" >&2`,
+    `[ "$code" -ne 0 ] && exit "$code"`,
+    "exit 1",
+  ].join("\n");
+}
+
+/** The readiness of a workspace mount's pod: its own juicefs runs, it has not handed its mount over, and `root` is FUSE's. */
+export function workspaceMountReady(root: string, run = MOUNT_RUN): string {
+  return `[ ! -e ${run}/handed-over ] && kill -0 "$(cat ${run}/juicefs.pid)" 2>/dev/null && case "$(stat -f -c %T ${root})" in fuse*) true;; *) false;; esac`;
+}
+
 /**
  * The node's mount of workspace storage, at WORKSPACES_ROOT, its pod's own and the node's
- * (Bidirectional), which the node agent attaches workspaces from: changed only as its pod
- * is deleted (OnDelete), as a mount held by a pod that goes takes every attached workspace
- * with it.
+ * (Bidirectional), which the node agent attaches workspaces from. A mount held by a pod that
+ * goes takes every workspace attached from it with it, so a new pod of it starts beside the
+ * old (maxSurge), and its mount of the same mount point takes the old's FUSE session over,
+ * which needs them to share the node's PIDs and JuiceFS's state (JUICEFS_STATE); the old pod
+ * idles once it has handed its mount over (workspaceMountScript), not ready, and is deleted
+ * once the new is ready.
  */
 function workspaceMount(config: InstallConfig): V1DaemonSet {
   const credential = (name: string, key: string): V1EnvVar => ({ name, valueFrom: { secretKeyRef: { name: WORKSPACES_CREDENTIALS, key } } });
@@ -350,7 +401,7 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
     metadata: { name: WORKSPACE_MOUNT, namespace: NAMESPACE, labels: labels(WORKSPACE_MOUNT_COMPONENT) },
     spec: {
       selector: { matchLabels: selectorLabels(WORKSPACE_MOUNT_COMPONENT) },
-      updateStrategy: { type: "OnDelete" },
+      updateStrategy: { type: "RollingUpdate", rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } },
       template: {
         metadata: { labels: { ...labels(WORKSPACE_MOUNT_COMPONENT), ...JUICEFS_ADMIN } },
         spec: {
@@ -359,17 +410,28 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
           ...given("nodeSelector", { ...config.sessions.nodeSelector }),
           ...given("tolerations", [...config.sessions.tolerations]),
           automountServiceAccountToken: false,
+          // The mount that takes another's over signals it, by its PID on the node.
+          hostPID: true,
           containers: [{
             name: WORKSPACE_MOUNT_COMPONENT,
             image: imageReference(config.workspaceStorage.csi.mountImage),
             imagePullPolicy: "IfNotPresent",
-            command: ["sh", "-c", `mkdir -p ${WORKSPACES_ROOT} && exec juicefs mount --no-bgjob --cache-size ${config.workspaceStorage.cacheSizeMiB} "$META_URL" ${WORKSPACES_ROOT}`],
+            command: ["sh", "-c", workspaceMountScript(WORKSPACES_ROOT, config.workspaceStorage.cacheSizeMiB)],
             env: [credential("META_URL", "metaurl"), credential("ACCESS_KEY", "access-key"), credential("SECRET_KEY", "secret-key")],
+            readinessProbe: { exec: { command: ["sh", "-c", workspaceMountReady(WORKSPACES_ROOT)] }, periodSeconds: 2 },
             securityContext: { privileged: true },
             resources: config.workspaceStorage.mount.resources,
-            volumeMounts: [{ name: "workspaces", mountPath: WORKSPACES_ROOT, mountPropagation: "Bidirectional" }],
+            volumeMounts: [
+              { name: "workspaces", mountPath: WORKSPACES_ROOT, mountPropagation: "Bidirectional" },
+              { name: "state", mountPath: "/tmp" },
+              { name: "run", mountPath: MOUNT_RUN },
+            ],
           }],
-          volumes: [{ name: "workspaces", hostPath: { path: WORKSPACES_ROOT, type: "DirectoryOrCreate" } }],
+          volumes: [
+            { name: "workspaces", hostPath: { path: WORKSPACES_ROOT, type: "DirectoryOrCreate" } },
+            { name: "state", hostPath: { path: JUICEFS_STATE, type: "DirectoryOrCreate" } },
+            { name: "run", emptyDir: {} },
+          ],
         },
       },
     },
@@ -389,7 +451,7 @@ export function sandboxServiceObjects(config: InstallConfig, environment: Enviro
     boundBudget(pools.none.namespace),
     ...receiverObjects(config, environment),
     mount,
-    // Sized as recommended alone: replaced, it takes every workspace attached on its node with it.
+    // Sized as recommended alone, as a pod of it is only replaced, by one that takes its mount over.
     verticalPodAutoscaler(mount, "Recommended"),
   ];
 }
