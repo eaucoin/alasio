@@ -19,6 +19,7 @@ import { componentName, NAMESPACE, neonName, RELEASE } from "../manifests/common
 import { LOADER_COMPONENT } from "../manifests/lake.ts";
 import { REPLICA_NAME } from "../manifests/neon.ts";
 import { MASTER, METRICS_PORT, VOLUME_SERVER } from "../manifests/object-store.ts";
+import { GATEWAY_COMPONENT, GATEWAY_PORT } from "../manifests/sandbox-gateway.ts";
 import type { ScaledObject } from "../manifests/scalers.ts";
 import type { VerticalPodAutoscaler } from "../manifests/sizing.ts";
 import { describeReplication, describeVolumeServer, volumeServerDisk } from "../object-store.ts";
@@ -29,7 +30,7 @@ import { installConfig } from "../install.ts";
 import { readTelegramBot, TELEGRAM_SECRET, type TelegramBot } from "../secrets.ts";
 import { describeBots, type EnvironmentBot } from "../webhook.ts";
 import { branchNamespace } from "../../../src/branch/names.ts";
-import { notRunning, runIn } from "./common.ts";
+import { notRunning, runIn, runningPodIn } from "./common.ts";
 
 /** Some of alasio's workloads do not run as they should. */
 export class Unhealthy extends Schema.TaggedError<Unhealthy>()("Unhealthy", {
@@ -144,6 +145,44 @@ const objectStore = (workloads: readonly KubernetesObject[]): Effect.Effect<stri
     return [describeReplication(replication), ...disks.map((line) => `  ${line}`)];
   });
 
+/** Whether `workload` is a sandbox pool's, ready once its pods run, each ready only once bound. */
+const isPool = (workload: KubernetesObject): boolean => workload.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] === "true";
+
+/** A pool's counts, as the sandbox gateway says them (src/binder/server.ts `/counts`). */
+const PoolCounts = Schema.fromJsonString(Schema.Struct({ free: Schema.Number, bound: Schema.Number, waiting: Schema.Number }));
+
+/**
+ * What each sandbox pool of `workloads` holds, as the gateway counts it, asked in its pod: its
+ * free pods running (warm), its bindings, and the binds waiting for a free pod in every replica
+ * of the gateway; by the pool's `namespace/name`, or why it is not seen, the same for every pool.
+ */
+type Counted = { readonly counted: string } | { readonly unseen: string };
+const poolCounts = (workloads: readonly KubernetesObject[]): Effect.Effect<ReadonlyMap<string, Counted>, KubeApiError, KubeApi> =>
+  Effect.gen(function*() {
+    const pools = workloads.filter(isPool);
+    if (pools.length === 0) return new Map();
+    const unseen = (why: string) => new Map<string, Counted>(pools.map(({ metadata }) => [`${metadata?.namespace}/${metadata?.name}`, { unseen: why }]));
+    const gateway = yield* runningPodIn(NAMESPACE, GATEWAY_COMPONENT).pipe(Effect.option);
+    if (Option.isNone(gateway)) return unseen("the sandbox gateway does not run");
+    const said = yield* Effect.forEach(pools, ({ metadata }) => {
+      const pool = `${metadata?.namespace}/${metadata?.name}`;
+      return runIn({ namespace: NAMESPACE, pod: gateway.value, container: GATEWAY_COMPONENT }, ["curl", "-sS", "--max-time", "5", `http://127.0.0.1:${GATEWAY_PORT}/counts/${pool}`]).pipe(
+        Effect.map(({ exitCode, stdout, stderr }) => {
+          const counted = exitCode === 0 ? Schema.decodeUnknownOption(PoolCounts)(stdout) : Option.none();
+          return [pool, Option.match(counted, {
+            onNone: (): Counted => ({ unseen: `the sandbox gateway did not count them: ${(stderr || stdout).trim() || `exit ${exitCode}`}` }),
+            onSome: ({ free, bound, waiting }): Counted => ({ counted: `${free} warm, ${bound} bound, ${waiting} waiting` }),
+          })] as const;
+        }),
+      );
+    }).pipe(
+      Effect.map((each) => new Map<string, Counted>(each)),
+      Effect.catchIf((error) => error._tag === "KubeApiError" && hasStatus(403)(error), () => Effect.succeed(unseen("this kubeconfig may not run commands in the sandbox gateway's pods"))),
+      Effect.catch((error) => Effect.succeed(unseen(`asking the sandbox gateway failed: ${error.message}`))),
+    );
+    return said;
+  });
+
 /**
  * A compute that is ready, a primary or a read replica: asleep at no replica, as
  * neon-control puts one no client has used for a while, until the next connection wakes
@@ -194,9 +233,13 @@ function unwakeable(scaler: ScaledObject | undefined): string | null {
  * The loader asleep is ready only while its ScaledObject would wake it (unwakeable): what
  * it says, and whether it is ready.
  */
-function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined): { said: string; ready: boolean } {
-  // A sandbox pool's, ready as its pods run: as many warm, each ready only once bound.
-  if (workload.metadata?.annotations?.[READY_ONCE_BOUND_ANNOTATION] === "true") return { said: `pool, ${workload.spec?.replicas ?? 1} warm`, ready: true };
+function describeReady(workload: ScaledWorkload, computes: ReadonlyMap<string, ComputeTimes>, scaler: ScaledObject | undefined, pools: ReadonlyMap<string, Counted>): { said: string; ready: boolean } {
+  // A sandbox pool's, ready as its pods run, each ready only once bound: what it holds, as the gateway counts it.
+  if (isPool(workload)) {
+    const counted = pools.get(`${workload.metadata?.namespace}/${workload.metadata?.name}`);
+    const replicas = `${workload.spec?.replicas ?? 1} warm`;
+    return { said: `pool, ${counted && "counted" in counted ? counted.counted : `${replicas}${counted ? `, its bindings not seen, as ${counted.unseen}` : ""}`}`, ready: true };
+  }
   switch (workload.metadata?.name) {
     case neonName("compute"):
     case REPLICA_NAME:
@@ -311,6 +354,7 @@ export const status = Command.make("status", {}, () =>
         const sizings = (yield* installedOf<VerticalPodAutoscaler>(kind("VerticalPodAutoscaler"))).objects;
         yield* Console.log(`alasio${version ? ` ${version}` : ""}, in ${describeTarget(target)} (${kube.server}):`);
         const computes = yield* computeTimes;
+        const pools = yield* poolCounts(workloads);
         let notReady = 0;
         for (const workload of workloads as readonly ScaledWorkload[]) {
           const state = yield* readinessOf(workload);
@@ -319,7 +363,7 @@ export const status = Command.make("status", {}, () =>
           const scale = workload.kind === "DaemonSet" ? "" : `${describeScale(workload, scaler)}; `;
           const sizing = `    ${scale}${describeSizing(workload, of(sizings, workload, ({ spec }) => spec.targetRef.name))}`;
           if (state._tag === "Ready") {
-            const { said, ready } = describeReady(workload, computes, scaler);
+            const { said, ready } = describeReady(workload, computes, scaler, pools);
             if (!ready) notReady += 1;
             yield* Console.log(`  ${describeRef(refOf(workload))}: ${said}`);
             yield* Console.log(sizing);
@@ -376,7 +420,8 @@ export const status = Command.make("status", {}, () =>
       "Says where alasio runs (and, for the cluster on this machine, k3s's service and node, or its nodes in Docker, and this " +
         "machine's inotify limits when they are too low for it), its version, and each of its workloads: ready (a compute awake, or " +
         "asleep, as one no client has used for a while is until the next connection wakes it, and when it was last woken; the lake's loader " +
-        "awake, or asleep with nothing left to load until alasio writes again), waking (a compute or the loader whose pod starts, within " +
+        "awake, or asleep with nothing left to load until alasio writes again; a sandbox pool with its warm pods, its bindings and the binds " +
+        "waiting for a pod, as the sandbox gateway counts them), waking (a compute or the loader whose pod starts, within " +
         "its Deployment's progress deadline), or what it is at and " +
         "why; its replicas, and its scale where KEDA moves it; and its pods' requests, beside " +
         "what VPA recommends once it has measured them; where sessions are snapshotted, the CPU baseline they are held to, and the nodes that lack it, and the gVisor releases kept, with the snapshots naming each. Of the bundled object store, the copies it keeps of each object, and of each " +
