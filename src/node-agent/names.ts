@@ -24,9 +24,10 @@ export const STORE_PROXY_PORT = 8485;
  * (STORE_SOCKET), and those restores' tokens, read back as it starts again
  * (STORE_TOKENS_FILE), each only root's. Of the pods alasio makes, the agent alone mounts the
  * node's /run (cli/src/manifests/node-agent.ts), and the sessions' pods are held to their
- * templates, which mount none of it (cli/src/manifests/admission.ts sandboxPodPolicy); the
- * host profile's mounts, which the operator gives alasio and the folder's bayma, are the
- * operator's to keep off it.
+ * templates, which mount none of it (cli/src/manifests/admission.ts sandboxPodPolicy). The
+ * host profile's mounts, which the operator gives alasio and the folder's bayma, could reach
+ * it, but both run as the operator's user (1000 unless the profile says), whom the socket's
+ * and the file's mode, 0600 and root's, keep out.
  */
 export const NODE_AGENT_RUN_DIR = "/run/alasio/node-agent";
 /** The variable that moves NODE_AGENT_RUN_DIR, as a test of the agent's own process does. */
