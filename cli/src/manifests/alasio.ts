@@ -26,6 +26,7 @@ import { BRANCH_FORK_PORT, branchSessionsNamespace } from "../../../src/branch/n
 import { decodeKubeTemplates, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import { CPU_FEATURES_ANNOTATION } from "../../../src/kube/sandbox-shape.ts";
 import { gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE } from "../../../src/node-agent/names.ts";
+import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
@@ -263,18 +264,21 @@ export type CpuBaseline = readonly string[] | null;
 /**
  * What `alasio up` finds the cluster keeps: for the sessions' snapshots, the CPU baseline
  * it holds them to, which up keeps while every node it surveys has it (../cpu-baseline.ts),
- * and the gVisor releases it keeps, the current one first (../kept-releases.ts); and the
+ * and the gVisor releases it keeps, the current one first (../kept-releases.ts); the
  * checksum of the bot's Secret (../secrets.ts botChecksum), which alasio reads only as it
- * starts, so its pod carries it, and is replaced when the bot or its users change.
+ * starts, so its pod carries it, and is replaced when the bot or its users change; and where
+ * its API server is (../api-server.ts), which the NetworkPolicies of what may reach it alone
+ * name, null where it cannot be read.
  */
 export interface Kept {
   readonly cpuBaseline: CpuBaseline;
   readonly gvisorReleases: readonly string[];
   readonly botChecksum: string | null;
+  readonly apiServer: ApiServer | null;
 }
 
-/** What a cluster keeps where up has found nothing of it yet: no baseline, the releases pinned, and no bot. */
-export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null };
+/** What a cluster keeps where up has found nothing of it yet: no baseline, the releases pinned, no bot, and no API server known. */
+export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null, apiServer: null };
 
 /**
  * What `alasio up` carries forward from the installation it replaces: the sessions'

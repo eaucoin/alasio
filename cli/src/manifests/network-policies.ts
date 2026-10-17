@@ -9,6 +9,7 @@ import type { V1NetworkPolicy, V1NetworkPolicyEgressRule, V1NetworkPolicyIngress
 
 import { COMPUTE_CTL_PORT, COMPUTE_PORT } from "../../../neon/control/branches.ts";
 import { BRANCH_FORK_PORT } from "../../../src/branch/names.ts";
+import type { ApiServer } from "../api-server.ts";
 import { POOL_LABEL } from "../../../src/binder/bindings.ts";
 import { NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
 import { NODE_AGENT_PORT } from "../../../src/node-agent/names.ts";
@@ -418,7 +419,7 @@ function collectorPolicy(config: InstallConfig): NetworkPolicy {
       from: [
         { podSelector: { matchLabels: selectorLabels("alasio") } },
         ...(nodeAgentRuns(config) ? [NODE_AGENT] : []),
-        ...(sandboxServiceRuns(config) ? [SANDBOX_GATEWAY, { podSelector: { matchLabels: selectorLabels(RECEIVER_COMPONENT) } }] : []),
+        ...(sandboxServiceRuns(config) ? [SANDBOX_GATEWAY, SANDBOX_RECEIVER] : []),
         ...(host.enabled ? [{ namespaceSelector: namespaceNamed(host.namespace) }] : []),
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: selectorLabels("alasio") } },
         { namespaceSelector: BRANCH_NAMESPACES, podSelector: { matchLabels: STACK } },
@@ -517,46 +518,83 @@ const POOLED = { matchExpressions: [{ key: POOL_LABEL, operator: "Exists" }] };
 /** The sandbox service's gateway's pods, as a peer. */
 const SANDBOX_GATEWAY = { podSelector: { matchLabels: selectorLabels(SANDBOX_GATEWAY_COMPONENT) } };
 
+/** The sandbox service's receiver's pods, as a peer. */
+const SANDBOX_RECEIVER = { podSelector: { matchLabels: selectorLabels(RECEIVER_COMPONENT) } };
+
 /**
- * The sandbox service's (./sandbox-gateway.ts), of main's sessions:
- *
- * - a pool's pods, free or bound, take the gateway alone, on bayma's port, and reach the
- *   receiver alone, on its port, at the address their binding gives them, and a pod with
- *   internet the public internet beside, none of the cluster's or its network's private
- *   addresses, as a session does;
- * - the gateway takes main's alasio, which binds through it, its own replicas, which pass each
- *   other what is bound on the pods each holds, and KEDA's operator (kedaOperator), which asks
- *   it how many binds wait for a pool, on its port alone;
- * - the receiver takes the pools' pods alone, on its port.
- *
- * The gateway and the receiver reach what they need unconfined, as alasio does: the API
- * server is among it, at an address of the node's own that no rule selects alike in every
- * cluster.
+ * The cluster's API server, as an egress rule: its addresses on its ports, as `alasio up`
+ * read them (../api-server.ts); or, where it could not, anywhere, which up warns of.
  */
-function sandboxServicePolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
+function apiServerRule(apiServer: ApiServer | null): V1NetworkPolicyEgressRule {
+  if (!apiServer) return {};
+  return { to: apiServer.addresses.map((address) => ({ ipBlock: { cidr: `${address}/32` } })), ports: apiServer.ports.map((port) => ({ protocol: "TCP", port })) };
+}
+
+/**
+ * The sandbox service's pools' pods (./sandbox-gateway.ts) of `environment`, free or bound:
+ * they take main's gateway alone, on bayma's port, and reach main's receiver alone, on its
+ * port, at the address their binding gives them, and a pod with internet the public internet
+ * beside, none of the cluster's or its network's private addresses, as a session does.
+ */
+function poolPolicies(config: InstallConfig, environment: Environment): NetworkPolicy[] {
   const namespace = sessionsNamespace(config, environment);
-  const port = config.telemetry.receiverPort;
   return [
     policy(componentName("sandboxes"), namespace, "session", {
       podSelector: POOLED,
       policyTypes: ["Ingress", "Egress"],
       ingress: [{ from: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_GATEWAY }], ports: [{ protocol: "TCP", port: POOL_POD_PORT }] }],
-      egress: [{ to: [{ namespaceSelector: namespaceNamed(NAMESPACE), podSelector: { matchLabels: selectorLabels(RECEIVER_COMPONENT) } }], ports: [{ protocol: "TCP", port }] }],
+      egress: [{ to: [{ namespaceSelector: namespaceNamed(NAMESPACE), ...SANDBOX_RECEIVER }], ports: [{ protocol: "TCP", port: config.telemetry.receiverPort }] }],
     }),
     policy(componentName("sandboxes-full-internet"), namespace, "session", {
       podSelector: { ...POOLED, matchLabels: { [NET_MODE_LABEL]: "full" } },
       policyTypes: ["Egress"],
       egress: [{ to: [{ ipBlock: { cidr: "0.0.0.0/0", except: [...config.sessions.blockedCidrs] } }] }],
     }),
+  ];
+}
+
+/**
+ * The sandbox service's gateway and receiver, which take what sandboxes send, and so reach
+ * what they need of the cluster alone:
+ *
+ * - the gateway takes main's alasio, which binds through it, its own replicas, which pass each
+ *   other what is bound on the pods each holds, and KEDA's operator (kedaOperator), which asks
+ *   it how many binds wait for a pool, on its port alone; it reaches the cluster's DNS, the
+ *   pools' pods of every environment on bayma's port, the node agents, its replicas, the
+ *   collector where it runs, and the API server;
+ * - the receiver takes the pools' pods alone, of main's sessions and of branch environments',
+ *   on its port; it reaches the cluster's DNS, the collector where it runs, and the API server.
+ *
+ * The API server is reached at its addresses, as `apiServer` says (apiServerRule).
+ */
+function sandboxServicePolicies(config: InstallConfig, apiServer: ApiServer | null): NetworkPolicy[] {
+  const port = config.telemetry.receiverPort;
+  const pools = [
+    { namespaceSelector: namespaceNamed(sessionsNamespace(config, MAIN_ENVIRONMENT)), podSelector: POOLED },
+    { namespaceSelector: BRANCH_NAMESPACES, podSelector: POOLED },
+  ];
+  const collector: V1NetworkPolicyEgressRule[] = collectorRuns(config)
+    ? [{ to: [{ podSelector: { matchLabels: selectorLabels(GATEWAY_COMPONENT) } }], ports: [{ protocol: "TCP", port: COLLECTOR_PORT }] }]
+    : [];
+  return [
     policy(SANDBOX_GATEWAY_NAME, NAMESPACE, SANDBOX_GATEWAY_COMPONENT, {
       ...SANDBOX_GATEWAY,
-      policyTypes: ["Ingress"],
+      policyTypes: ["Ingress", "Egress"],
       ingress: [{ from: [{ podSelector: { matchLabels: selectorLabels("alasio") } }, SANDBOX_GATEWAY, kedaOperator(config)], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] }],
+      egress: [
+        CLUSTER_DNS,
+        { to: pools, ports: [{ protocol: "TCP", port: POOL_POD_PORT }] },
+        { to: [NODE_AGENT], ports: [{ protocol: "TCP", port: NODE_AGENT_PORT }] },
+        { to: [SANDBOX_GATEWAY], ports: [{ protocol: "TCP", port: SANDBOX_GATEWAY_PORT }] },
+        ...collector,
+        apiServerRule(apiServer),
+      ],
     }),
     policy(RECEIVER, NAMESPACE, RECEIVER_COMPONENT, {
-      podSelector: { matchLabels: selectorLabels(RECEIVER_COMPONENT) },
-      policyTypes: ["Ingress"],
-      ingress: [{ from: [{ namespaceSelector: namespaceNamed(namespace), podSelector: POOLED }], ports: [{ protocol: "TCP", port }] }],
+      ...SANDBOX_RECEIVER,
+      policyTypes: ["Ingress", "Egress"],
+      ingress: [{ from: pools, ports: [{ protocol: "TCP", port }] }],
+      egress: [CLUSTER_DNS, ...collector, apiServerRule(apiServer)],
     }),
   ];
 }
@@ -587,10 +625,11 @@ function alasioPolicy(config: InstallConfig, environment: Environment): NetworkP
 
 /**
  * The NetworkPolicies of the alasio of `environment`, unless they are turned off: main's,
- * and those that admit branch environments to what of main's they share; or a branch
+ * and those that admit branch environments to what of main's they share, what reaches its
+ * API server reaching it where `apiServer` says (../api-server.ts); or a branch
  * environment's own.
  */
-export function networkPolicyObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT): NetworkPolicy[] {
+export function networkPolicyObjects(config: InstallConfig, environment: Environment = MAIN_ENVIRONMENT, apiServer: ApiServer | null = null): NetworkPolicy[] {
   if (!config.networkPolicies.enabled) return [];
   const { sessions, host } = config;
   if (environment.branch !== null) {
@@ -616,6 +655,6 @@ export function networkPolicyObjects(config: InstallConfig, environment: Environ
     ...(lakeRuns(config) ? [lakeQueryPolicy(config)] : []),
     ...(config.workspaceStorage.enabled ? workspaceStoragePolicies(config) : []),
     ...(nodeAgentRuns(config) ? nodeAgentPolicies(config) : []),
-    ...(sandboxServiceRuns(config) ? sandboxServicePolicies(config, environment) : []),
+    ...(sandboxServiceRuns(config) ? [...poolPolicies(config, environment), ...sandboxServicePolicies(config, apiServer)] : []),
   ];
 }
