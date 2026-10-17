@@ -2,9 +2,11 @@
  * The sandbox service as alasio installs it (cli/src/manifests/sandbox-gateway.ts), on the
  * cluster the workspaces shard runs: a workspace made by a node agent with its quota, as a
  * Valkey user of its own that runs no command Valkey calls dangerous; the receiver reaching
- * nothing but the collector and the API server; and a workspace made and bound to a pool's pod
- * through the gateway alone, by a token of main's own key, kept whole, every write into it done, through the node's mount of workspace
- * storage handed over to the pod that replaces the one that held it.
+ * nothing but the collector and the API server; and workspaces reached through the gateway
+ * alone, by tokens of main's own key: one made, bound to a pool's pod and kept whole, every
+ * write into it done, through the node's mount of workspace storage handed over to the pod
+ * that replaces the one that held it; another made, given a received file, bound, held to its
+ * quota, read back of what its session wrote, released, bound again, and deleted.
  *
  * Registered with sandboxService() in the workspaces shard (test/e2e/alasio.test.ts).
  */
@@ -37,6 +39,34 @@ async function agentCall(method: string, path: string, body?: unknown): Promise<
   ], { container: "node-agent" });
   const lines = printed.trimEnd().split("\n");
   return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
+}
+
+/** A caller's token of the workspace `workspace` of main's sessions, signed by main's own key, as main's alasio signs one. */
+async function mainToken(workspace: string): Promise<string> {
+  const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
+  return mintToken(environmentKey(Buffer.from(callerKey), "main"), { key: sessionKey(workspace), expires: Date.now() + 600_000, options: { environment: "main", mode: "none" } });
+}
+
+/** What the gateway answers `method path` with, asked as alasio asks it, from its pod, with `token`, `body` sent as it is: its status, and what it said. */
+async function gatewayCall(token: string, method: string, path: string, body?: string): Promise<{ readonly status: number; readonly said: string }> {
+  const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
+  const printed = await kube.execOk(NAMESPACE, alasioPod, [
+    "sh",
+    "-c",
+    `curl -sS -w '\n%{http_code}' -X ${method} -H "authorization: Bearer $1"${body === undefined ? "" : " --data-binary @-"} "http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}$2"`,
+    "sh",
+    token,
+    path,
+  ], { container: "alasio", ...(body === undefined ? {} : { stdin: body }) });
+  const lines = printed.split("\n");
+  return { status: Number(lines.at(-1)), said: lines.slice(0, -1).join("\n") };
+}
+
+/** The pod of main's sessions bound to `workspace`, once it is: its name and node. */
+async function boundPod(workspace: string): Promise<{ readonly name: string; readonly node: string }> {
+  const [bound] = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` });
+  assert.ok(bound?.metadata?.name, `no pod is bound to ${workspace}`);
+  return { name: bound.metadata.name, node: bound.spec?.nodeName ?? "" };
 }
 
 /** Makes the workspace `workspace` of the sessions' namespace through a node agent, of `quotaBytes`. */
@@ -87,25 +117,18 @@ export function sandboxService(): void {
 
     test("a workspace made and bound to a pool's pod through the gateway keeps every write into it as the node's mount of workspace storage is handed over to the pod that replaces the one that held it", async () => {
       const workspace = "fs-e2etakeover";
-      const key = sessionKey(workspace);
       // Made and bound as alasio makes and binds it: a caller's token of the key, signed by main's key, through the gateway alone.
-      const callerKey = await kube.secret(NAMESPACE, GATEWAY, "caller-key");
-      const token = mintToken(environmentKey(Buffer.from(callerKey), "main"), { key, expires: Date.now() + 600_000, options: { environment: "main", mode: "none" } });
-      const alasioPod = await kube.runningPod(NAMESPACE, RELEASE);
-      const gatewayAsk = (path: string) =>
-        kube.exec(NAMESPACE, alasioPod, ["sh", "-c", `curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'authorization: Bearer ${token}' http://${GATEWAY}.${NAMESPACE}.svc:${GATEWAY_PORT}${path}`], { container: "alasio" });
-      await until("the gateway making the workspace", async () => ((await gatewayAsk("/workspace")).stdout.trim() === "204" ? true : undefined), 120_000);
+      const token = await mainToken(workspace);
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
       const made = await agentCall("GET", `/workspaces/${SESSIONS}/${workspace}/quota`);
       assert.equal(made.status, 200, made.said);
-      await until("the gateway binding the workspace", async () => ((await gatewayAsk("/bind")).stdout.trim() === "204" ? true : undefined), 180_000);
-      const [bound] = await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(key)}` });
-      const pod = bound?.metadata?.name ?? "";
-      assert.ok(pod, "no pod is bound to the workspace");
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const { name: pod, node } = await boundPod(workspace);
       // Written into all through the handover, each write's outcome said.
       const writing = kube.exec(SESSIONS, pod, ["sh", "-c", WRITER("/workspace/takeover", 75)], { container: "bayma" });
       await new Promise((resolve) => setTimeout(resolve, 10_000));
       const mountPods = async () =>
-        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).filter(({ spec }) => spec?.nodeName === bound?.spec?.nodeName);
+        (await kube.list<V1Pod>("Pod", { namespace: NAMESPACE, labelSelector: selectorOf(selectorLabels("workspace-mount")) })).filter(({ spec }) => spec?.nodeName === node);
       const [before] = await mountPods();
       await kube.patch(ref("DaemonSet", WORKSPACE_MOUNT, NAMESPACE), { spec: { template: { metadata: { annotations: { "alasio.dev/e2e-restartedAt": new Date().toISOString() } } } } });
       await until("the node's mount handed over to a new pod, and the old pod gone", async () => {
@@ -121,6 +144,49 @@ export function sandboxService(): void {
       assert.ok(outcomes.length > 500, `${outcomes.length} writes`);
       const kept = (await kube.execOk(SESSIONS, pod, ["sh", "-c", "ls /workspace/takeover | wc -l"], { container: "bayma" })).trim();
       assert.equal(Number(kept), outcomes.length);
+    });
+
+    test("a workspace is made, given a received file, bound, held to its quota, read back of what its session wrote, released and deleted through the gateway alone", async () => {
+      const workspace = "fs-e2eclaim";
+      const token = await mainToken(workspace);
+      const inSandbox = async (script: string) => kube.execOk(SESSIONS, (await boundPod(workspace)).name, ["sh", "-c", script], { container: "bayma" });
+      await until("the gateway making the workspace", async () => ((await gatewayCall(token, "POST", "/workspace")).status === 204 ? true : undefined), 120_000);
+      // A received file, as alasio writes one into the workspace before the turn that names it.
+      const received = await gatewayCall(token, "PUT", "/workspace/files?path=workspace/received/note.txt", "a file received on Telegram\n");
+      assert.equal(received.status, 204, received.said);
+      // Claimed: a pool's pod bound to it, the file in its sandbox.
+      await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      const claimed = await boundPod(workspace);
+      assert.equal(await inSandbox("cat /workspace/received/note.txt"), "a file received on Telegram\n");
+      // Held to its quota, the pool's sessions' size, 1Gi in the run.
+      const quota = await inSandbox([
+        "cd /workspace",
+        'fallocate -l 900M quota-a && echo "took 900M"',
+        'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
+        "rm -f quota-a quota-b",
+      ].join("; "));
+      assert.match(quota, /^took 900M$/mu);
+      assert.match(quota, /quota exceeded/iu);
+      assert.doesNotMatch(quota, /took 300M more/u);
+      // A reply's media, as the session wrote it, read back as alasio reads it to send.
+      await inSandbox("mkdir -p /workspace/out && printf 'a chart, drawn' > /workspace/out/reply.txt");
+      const reply = await gatewayCall(token, "GET", "/workspace/files?path=workspace/out/reply.txt");
+      assert.deepEqual([reply.status, reply.said], [200, "a chart, drawn"]);
+      // Released as its caller asks: its pod gone, and its binding, its workspace kept.
+      const released = await gatewayCall(token, "POST", "/release");
+      assert.equal(released.status, 204, released.said);
+      await until("the released pod gone", async () => ((await kube.get<V1Pod>(ref("Pod", claimed.name, SESSIONS))) === null ? true : undefined), 180_000);
+      assert.deepEqual(await kube.list<V1Pod>("Pod", { namespace: SESSIONS, labelSelector: `${BINDING_LABEL}=${keyHash(sessionKey(workspace))}` }), []);
+      assert.equal((await gatewayCall(token, "GET", "/workspace/quota")).status, 200);
+      // Bound again, to another pod, with what it held.
+      await until("the gateway binding the workspace again", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
+      assert.notEqual((await boundPod(workspace)).name, claimed.name);
+      assert.equal(await inSandbox("cat /workspace/out/reply.txt"), "a chart, drawn");
+      // Deleted once released, and not before.
+      assert.equal((await gatewayCall(token, "DELETE", "/workspace")).status, 409);
+      assert.equal((await gatewayCall(token, "POST", "/release")).status, 204);
+      await until("the gateway deleting the workspace", async () => ((await gatewayCall(token, "DELETE", "/workspace")).status === 204 ? true : undefined), 180_000);
+      assert.equal((await gatewayCall(token, "GET", "/workspace/quota")).status, 404);
     });
   });
 }
