@@ -203,9 +203,17 @@ export function sandboxService(): void {
       assert.equal(Number(kept), outcomes.length);
       // The node's mount whole after it: a workspace made since is made in workspace storage, as the node agent sees it, and the node.
       const agent = (await nodeAgents()).get(node) ?? "";
-      const seen = async () =>
-        (await kube.exec(NAMESPACE, agent, ["sh", "-c", `stat -f -c 'agent sees %T' ${WORKSPACES_ROOT}; grep ' ${WORKSPACES_ROOT}' /proc/1/mountinfo || echo 'the node mounts nothing there'`], { container: "node-agent" })).stdout.trim();
-      const after = await gatewayCall(await mainToken("fs-e2eafter"), "POST", "/workspace");
+      const seen = async () => {
+        const mount = (await kube.exec(NAMESPACE, agent, ["sh", "-c", `stat -f -c 'agent sees %T' ${WORKSPACES_ROOT}; grep -E ' ${WORKSPACES_ROOT}| fuse' /proc/1/mountinfo || echo 'the node mounts nothing there'`], { container: "node-agent" })).stdout.trim();
+        const logged = await Promise.all((await mountPods()).map(async ({ metadata }) => `${metadata?.name}: ${(await kube.logs(NAMESPACE, metadata?.name ?? "", "workspace-mount").catch((error: unknown) => String(error))).split("\n").slice(-15).join("\n")}`));
+        return [mount, ...logged].join("\n");
+      };
+      // Within the mount's look, once a second, at whether the node has lost its mount.
+      let after = { status: 0, said: "" };
+      for (const deadline = Date.now() + 30_000; Date.now() < deadline; await new Promise((resolve) => setTimeout(resolve, 2_000))) {
+        after = await gatewayCall(await mainToken("fs-e2eafter"), "POST", "/workspace");
+        if (after.status === 204) break;
+      }
       assert.equal(after.status, 204, `${after.said}; ${await seen()}`);
     });
 
@@ -221,13 +229,16 @@ export function sandboxService(): void {
       await until("the gateway binding the workspace", async () => ((await gatewayCall(token, "POST", "/bind")).status === 204 ? true : undefined), 180_000);
       const claimed = await boundPod(workspace);
       assert.equal(await inSandbox("cat /workspace/received/note.txt"), "a file received on Telegram\n");
-      // Held to its quota, the pool's sessions' size, 1Gi in the run.
-      const quota = await inSandbox([
-        "cd /workspace",
-        'fallocate -l 900M quota-a && echo "took 900M"',
-        'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
-        "rm -f quota-a quota-b",
-      ].join("; "));
+      // Held to its quota, the pool's sessions' size, 1Gi in the run, once the node's mount has read it, as JuiceFS's client reads its quotas anew every few seconds.
+      const fill = () =>
+        inSandbox([
+          "cd /workspace",
+          'fallocate -l 900M quota-a && echo "took 900M"',
+          'fallocate -l 300M quota-b 2>&1 && echo "took 300M more"',
+          "rm -f quota-a quota-b",
+        ].join("; "));
+      let quota = await fill();
+      for (const deadline = Date.now() + 60_000; !/quota exceeded/iu.test(quota) && Date.now() < deadline; quota = await fill()) await new Promise((resolve) => setTimeout(resolve, 5_000));
       assert.match(quota, /^took 900M$/mu);
       assert.match(quota, /quota exceeded/iu);
       assert.doesNotMatch(quota, /took 300M more/u);
