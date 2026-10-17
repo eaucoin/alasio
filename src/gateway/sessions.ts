@@ -48,6 +48,7 @@ import { isValidVolumeId, volumeIdOfKey } from "../sandbox/names.ts";
 import type { Events, EventInput } from "../events/events.ts";
 import { meter } from "../telemetry/index.ts";
 import type { Environments } from "./environments.ts";
+import type { GatewaySnapshots as GatewaySnapshotsConfig } from "./names.ts";
 import { makeGatewaySnapshots } from "./snapshots.ts";
 
 /** The metrics of the gateway's sessions, as the module says. */
@@ -95,6 +96,9 @@ export interface SessionsOptions {
   readonly events: Events["Service"];
   /** The quota of a workspace made or forked, in bytes. */
   readonly quotaBytes: number;
+  /** How main's sessions are snapshotted (./snapshots.ts), none where they are not, and main's sessions' namespace. */
+  readonly snapshots?: GatewaySnapshotsConfig | null;
+  readonly mainNamespace?: string;
 }
 
 /** The most of a workspace's file read where the caller says no less: a received file's, as the node agents write one. */
@@ -135,12 +139,12 @@ export interface Sessions {
 
 /** The gateway's sessions, as the module says, on the node agents, the binder, and the KubeClient. */
 export const makeSessions = Effect.fnUntraced(function*(
-  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, events, quotaBytes }: SessionsOptions,
+  { environments, pools: poolNames, releaseAfterMs, podPort, bindingKey, idlePollMs = IDLE_POLL_MS, telemetry, events, quotaBytes, snapshots: snapshotsConfig = null, mainNamespace = "" }: SessionsOptions,
   agents: NodeAgents,
   binder: Binder["Service"],
 ): Effect.fn.Return<Sessions, never, KubeClient> {
   const kube = yield* KubeClient;
-  const snapshots = yield* makeGatewaySnapshots(agents);
+  const snapshots = yield* makeGatewaySnapshots({ agents, snapshots: snapshotsConfig, mainNamespace });
   const pools = Effect.map(environments.current, (current) => current.flatMap(({ namespace }) => (Object.values(poolNames) as string[]).map((name): Pool => ({ name, namespace }))));
   /** The address `host` resolves to. */
   const addressOf = (host: string): Effect.Effect<string, BindStepFailed> =>
@@ -155,22 +159,26 @@ export const makeSessions = Effect.fnUntraced(function*(
       const mode = options["mode"];
       if (mode !== "none" && mode !== "full") return yield* new PlacementRefused({ reason: `a session's internet is none or full, not ${mode ?? "unsaid"}` });
       const pool = { name: poolNames[mode], namespace: environment.namespace };
+      // Restored from the snapshot it was released into, where it was, by a pod of its own (./snapshots.ts).
+      const restoring = snapshots.restoring(pool, volumeId, mode);
       return {
         pool,
+        make: restoring.make,
         // Released as it is when idle: saved whole first, then detached, then deleted.
         release: ({ pod }) => endAndDetach(pool, volumeId, pod).pipe(Effect.tap(() => released(pool, "asked"))),
         // Its workspace attached, its binding's token beside it, on which its bayma starts.
-        prepare: (pod, binding) =>
-          Effect.gen(function*() {
-            const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
-            yield* timed(attachDuration, pool, agents.attach(pod.spec?.nodeName ?? "", {
-              environment: environment.namespace,
-              workspace: volumeId,
-              pod: pod.metadata?.name ?? "",
-              token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
-              env,
-            })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
-          }),
+        prepare: (got, binding) =>
+          restoring.ready(got, (pod) =>
+            Effect.gen(function*() {
+              const env = telemetry ? { ...telemetry.env, OTEL_EXPORTER_OTLP_ENDPOINT: `http://${yield* addressOf(telemetry.host)}:${telemetry.port}` } : {};
+              yield* timed(attachDuration, pool, agents.attach(pod.spec?.nodeName ?? "", {
+                environment: environment.namespace,
+                workspace: volumeId,
+                pod: pod.metadata?.name ?? "",
+                token: bindingToken(bindingKey, { key, binding, namespace: environment.namespace }),
+                env,
+              })).pipe(Effect.mapError((error) => new BindStepFailed({ reason: error.message })));
+            })),
       };
     });
 

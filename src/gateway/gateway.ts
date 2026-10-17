@@ -75,7 +75,7 @@ export const gateway: Effect.Effect<void, unknown, Scope.Scope> = Effect.gen(fun
     const environments = yield* makeEnvironments({ main: config.environment });
     const events = yield* eventsOf;
     const sessions = yield* makeSessions(
-      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events, quotaBytes: config.quotaBytes },
+      { environments, pools: config.pools, releaseAfterMs: config.releaseAfterSeconds * 1000, podPort: config.podPort, bindingKey, events, quotaBytes: config.quotaBytes, snapshots: config.snapshots, mainNamespace: config.environment.namespace },
       agents,
       binder,
     );

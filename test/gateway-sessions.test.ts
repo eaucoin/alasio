@@ -6,8 +6,9 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { before, test } from "node:test";
 
-import type { V1Deployment, V1Pod } from "@kubernetes/client-node";
+import type { V1Deployment, V1Pod, V1PodSpec, V1PodTemplateSpec } from "@kubernetes/client-node";
 import { Effect, Layer } from "effect";
+import { TestClock } from "effect/testing";
 
 import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
@@ -19,6 +20,7 @@ import type { EventInput } from "../src/events/events.ts";
 import { ATTACH_DURATION, DETACH_DURATION, makeSessions, RELEASES, type SessionsOptions } from "../src/gateway/sessions.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import type { CheckpointRequest, Manifest } from "../src/node-agent/agent.ts";
+import { DEFER_FOR_MS } from "../src/gateway/snapshots.ts";
 import { type AttachRequest, NodeAgentError, type NodeAgents } from "../src/sandbox/node-agents.ts";
 import { sessionKey } from "../src/sandbox/names.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -77,8 +79,11 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
     saved,
     agents: {
       nodes: Effect.succeed(["node-a"]),
-      prepare: unused, current: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
-      readFile: unused, writeFile: unused, released: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
+      // No workspace of theirs has a snapshot to restore, nor a record of a release, unless a test gives it one.
+      current: () => Effect.succeed(null),
+      released: () => Effect.succeed(null),
+      prepare: unused, copy: unused, forget: unused, resume: unused, holdings: unused, workspaces: unused, discard: unused, spend: unused, collect: unused, abandon: unused,
+      readFile: unused, writeFile: unused, createWorkspace: unused, cloneWorkspace: unused, removeWorkspace: unused, listWorkspaces: unused, quota: unused,
       checkpoint: (node, request) =>
         Effect.gen(function*() {
           asked.push(`checkpoint ${node} ${request.pod}`);
@@ -105,27 +110,28 @@ function agents(checkpoint: "saves" | "fails, ending it" | "fails" | "unsaveable
 }
 
 /** An environment of the test's own, its pools' namespace, with `count` free pods of the `none` pool on node-a, serving at the loopback. */
-async function environment(count: number, { gvisor = false, holdsStop = false } = {}): Promise<SessionsEnvironment & { none: Pool }> {
+async function environment(count: number, { gvisor = false, holdsStop = false } = {}): Promise<SessionsEnvironment & { none: Pool; template: V1PodTemplateSpec }> {
   const namespace = `sessions-${(namespaces += 1)}`;
   const none: Pool = { name: "sandboxes-none", namespace };
+  let template: V1PodTemplateSpec = {};
   await run(withKube((kube) =>
     Effect.gen(function*() {
       yield* kube.create({ apiVersion: "v1", kind: "Namespace", metadata: { name: namespace } });
       // The pool's template, as its snapshots record it.
       // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
       const spec = holdsStop ? { containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) } : BAYMA_SPEC;
-      const template = { metadata: { labels: { ...freeLabels(none) } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
+      template = { metadata: { labels: { ...freeLabels(none) }, annotations: { "alasio.dev/session-template": "t-current" } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
       for (let n = 0; n < count; n += 1) {
         const name = `none-${n}`;
-        yield* kube.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace, labels: { ...freeLabels(none) } }, spec: { nodeName: "node-a", ...template.spec } });
+        yield* kube.create<V1Pod>({ apiVersion: "v1", kind: "Pod", metadata: { name, namespace, labels: { ...freeLabels(none) } }, spec: { nodeName: "node-a", ...template.spec } as V1PodSpec });
         yield* kube.patchPodStatus(namespace, name, {
           status: { phase: "Running", podIP: "127.0.0.1", conditions: [{ type: "Ready", status: "True" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: true, restartCount: 0, containerID: `containerd://c-${n}`, state: { running: {} } }] },
         });
       }
     })
   ));
-  return { name: `env-${namespaces}`, namespace, parent: null, none };
+  return { name: `env-${namespaces}`, namespace, parent: null, none, template };
 }
 
 /** The environments `list`, as found: those alone. */
@@ -138,8 +144,15 @@ const found = (list: readonly SessionsEnvironment[]): Environments => ({
 /** What the sessions told of, as each environment's alasio reads it. */
 const told: EventInput[] = [];
 
-const options = (env: SessionsEnvironment, podPort: number): SessionsOptions => ({
+/** The gateway's sessions' options, of the environment `env`, main, whose sessions are snapshotted under the release `r1`, onto its pool's template. */
+const options = (env: SessionsEnvironment & { template?: V1PodTemplateSpec }, podPort: number): SessionsOptions => ({
   environments: found([env]),
+  mainNamespace: env.namespace,
+  snapshots: {
+    liveEverySeconds: 600,
+    releases: [{ release: "r1", runtimeClassName: "gvisor-r1" }],
+    templates: { none: { current: { ...env.template }, previous: null }, full: { current: { ...env.template }, previous: null } },
+  },
   pools: { none: "sandboxes-none", full: "sandboxes-full" },
   releaseAfterMs: 60_000,
   podPort,
@@ -452,4 +465,129 @@ test("a release whose sandbox can be saved no more has its bayma go on with the 
   } finally {
     stand.close();
   }
+});
+
+/** Its snapshot `snapshot` of the workspace `workspace` of `env`, taken under `r1` on its pool's template. */
+const manifestOf = (env: SessionsEnvironment & { template: V1PodTemplateSpec }, workspace: string, snapshot: string): Manifest => ({
+  environment: env.namespace,
+  workspace,
+  snapshot,
+  release: "r1",
+  cpuFeatures: ["sse"],
+  podTemplate: { ...env.template },
+  layers: [{ digest: `sha256:${"a".repeat(64)}`, files: [] }],
+  bytes: 0,
+  takenAt: "2026-10-17T12:00:00Z",
+  pauseMs: 0,
+  uploadMs: 0,
+});
+
+/** Node agents as `agents` makes them, which hold `current` of the workspace, and its record of `released`; their prepare does as `prepare` says. */
+function restoringAgents(current: Manifest | null, released: { snapshot: string; release: string } | null, { prepare = "prepares" as "prepares" | "fails" } = {}) {
+  const base = agents();
+  const state = { current, released };
+  const restoring: NodeAgents = {
+    ...base.agents,
+    released: () => Effect.sync(() => state.released),
+    setReleased: (ref, into) => Effect.sync(() => (base.asked.push(`record ${ref.environment}/${ref.workspace} released into ${into?.snapshot ?? "none"}`), void (state.released = into))),
+    current: () => Effect.sync(() => state.current),
+    holdings: (node) => Effect.succeed({ node, releases: [{ release: "r1", cpuFeatures: ["sse", "avx"] }], cached: [] }),
+    prepare: (node) =>
+      prepare === "fails"
+        ? Effect.fail(new NodeAgentError({ node, call: "prepare", status: 502, reason: "the snapshots bucket failed" }))
+        : Effect.sync(() => (base.asked.push(`prepare ${node}`), { manifest: state.current as Manifest, imagePath: "/var/cache/alasio/image", source: "cache" as const })),
+    resume: (node, request) => Effect.sync(() => void base.asked.push(`resume ${node} ${request.pod} ${request.snapshot}`)),
+    spend: (_ref, snapshot) => Effect.sync(() => (base.asked.push(`spend ${snapshot}`), void (state.current = null))),
+    forget: (ref) => Effect.sync(() => (base.asked.push(`forget ${ref.workspace}`), void (state.current = null))),
+  };
+  return { ...base, state, agents: restoring };
+}
+
+test("a workspace released into its snapshot is restored from it as it is next bound, by a pod of its own of the pool's template, paused until its node's agent resumes it, then spent", async () => {
+  const env = await environment(1, { gvisor: true });
+  await run(withKube((kube) => kube.create({ apiVersion: "node.k8s.io/v1", kind: "RuntimeClass", metadata: { name: "gvisor-r1" }, handler: "runsc-r1" } as never)).pipe(Effect.ignore));
+  const snapshot = "20261017T120000000Z-0000000a";
+  const recorded = restoringAgents(manifestOf(env, "fs-restored", snapshot), { snapshot, release: "r1" });
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-restored");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const counted = await added("alasio.sandbox.restores", async () => {
+    const binding = Effect.runPromise(binder.bind(placement.pool, key, placement));
+    // Its pod runs, as kubelet would run it, then, once resumed, is ready.
+    const restored = await (async () => {
+      for (;;) {
+        const [pod] = (await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/binding")))) as V1Pod[];
+        if (pod?.metadata?.name?.startsWith("sandboxes-none-restore-")) return pod;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })();
+    const name = restored.metadata?.name ?? "";
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { phase: "Running", podIP: "127.0.0.1", podIPs: [{ ip: "127.0.0.1" }], containerStatuses: [{ name: "bayma", image: "agent", imageID: "", ready: false, restartCount: 0, containerID: "containerd://c-restored", state: { running: {} } }] } })));
+    for (;;) {
+      const pod = (await run(withKube((kube) => kube.read("v1", "Pod", env.namespace, name)))) as V1Pod;
+      if (pod.status?.conditions?.some(({ type, status }) => type === "alasio.dev/resumed" && status === "True")) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await run(withKube((kube) => kube.patchPodStatus(env.namespace, name, { status: { conditions: [{ type: "Ready", status: "True" }] } })));
+    const bound = await binding;
+    assert.equal(bound.pod, name);
+    // Of the pool's template, its sandbox restored paused from the image its node's agent prepared, under the release that took it, on that node.
+    assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], ["/var/cache/alasio/image", "true"]);
+    assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
+    const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
+    assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
+    assert.deepEqual(plain(restored.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
+    // Bound from the first, and no pool's free pod, which its ReplicaSet would take for its own.
+    assert.equal(restored.metadata?.labels?.["alasio.dev/free"], undefined);
+    assert.equal(restored.metadata?.annotations?.["alasio.dev/binding-key"], key);
+    assert.deepEqual(recorded.asked, [`prepare node-a`, `resume node-a ${name} ${snapshot}`, `spend ${snapshot}`, `record ${env.namespace}/fs-restored released into none`]);
+    assert.equal(recorded.attached[0]?.pod, name);
+  });
+  assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=restored": 1 });
+  // A free pod of the pool's claimed by none.
+  assert.equal(((await run(withKube((kube) => kube.list("v1", "Pod", env.namespace, "alasio.dev/free=true")))) as V1Pod[]).length, 1);
+});
+
+test("a workspace whose record names a snapshot it holds no more, or another than its current one, is bound to a free pod, its snapshot and its record forgotten", async () => {
+  for (const [current, into, why] of [
+    [null, "20261017T120000000Z-0000000a", "a record of a snapshot gone"],
+    ["20261017T130000000Z-0000000b", "20261017T120000000Z-0000000a", "a record of a snapshot moved on from"],
+    ["20261017T130000000Z-0000000b", null, "a snapshot no release recorded"],
+  ] as const) {
+    const env = await environment(1, { gvisor: true });
+    const recorded = restoringAgents(current ? manifestOf(env, "fs-stale", current) : null, into ? { snapshot: into, release: "r1" } : null);
+    const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+    const key = sessionKey("fs-stale");
+    const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+    const counted = await added("alasio.sandbox.restores", async () => assert.equal((await Effect.runPromise(binder.bind(placement.pool, key, placement))).pod, "none-0", why));
+    assert.deepEqual(counted, { "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=stale": 1 }, why);
+    assert.deepEqual([recorded.state.current, recorded.state.released], [null, null], why);
+    assert.deepEqual(recorded.asked, [`forget fs-stale`, `record ${env.namespace}/fs-stale released into none`], why);
+  }
+});
+
+test("a restore whose snapshot cannot be prepared now is deferred, the bind refused to be tried again, its snapshot kept; and one deferred for long enough falls back", async () => {
+  const env = await environment(1, { gvisor: true });
+  const snapshot = "20261017T120000000Z-0000000a";
+  const recorded = restoringAgents(manifestOf(env, "fs-deferred", snapshot), { snapshot, release: "r1" }, { prepare: "fails" });
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-deferred");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  // Its deferrals timed by a clock of the test's, from its first.
+  const later = await added("alasio.sandbox.restores", () =>
+    Effect.runPromise(Effect.gen(function*() {
+      const refused = yield* Effect.flip(binder.bind(placement.pool, key, placement));
+      assert.match(refused.message, /deferred, to be tried again: .*the snapshots bucket failed/u);
+      assert.equal(recorded.state.current?.snapshot, snapshot);
+      assert.equal(yield* Effect.promise(() => run(readLease(env.none, key))), null);
+      // Deferred for long enough: bound to a free pod, its snapshot forgotten.
+      yield* TestClock.adjust(DEFER_FOR_MS);
+      return yield* binder.bind(placement.pool, key, placement);
+    }).pipe(Effect.provide(TestClock.layer()))));
+  assert.deepEqual(later, {
+    "alasio.sandbox.restore.outcome=deferred,alasio.sandbox.restore.fallback=prepare": 1,
+    "alasio.sandbox.restore.outcome=fallback,alasio.sandbox.restore.fallback=prepare": 1,
+  });
+  assert.equal(recorded.state.current, null);
+  assert.equal((await run(readLease(env.none, key)))?.spec?.holderIdentity, "none-0");
 });
