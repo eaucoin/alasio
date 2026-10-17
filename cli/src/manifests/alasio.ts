@@ -19,6 +19,7 @@ import type {
   V1RoleBinding,
   V1Service,
   V1ServiceAccount,
+  V1PodTemplateSpec,
   V1Volume,
 } from "@kubernetes/client-node";
 
@@ -32,7 +33,7 @@ import type { ApiServer } from "../api-server.ts";
 import { gvisorReleases, NODE_PINS } from "../cluster/node.ts";
 import { imageReference } from "../images.ts";
 import { alasioAccount, busyLabelPolicy, cloneJobPolicy, resumedConditionPolicy, sandboxPolicy, sandboxPolicyName, secretPolicy } from "./admission.ts";
-import { sandboxServiceRuns } from "./sandbox-gateway.ts";
+import { carriedPools, sandboxServiceRuns } from "./sandbox-gateway.ts";
 import { alasioGroup, environmentLogSecret, environmentName, lakeWakeTopic, LOG_BROKERS, telegramTopic } from "./log.ts";
 import {
   BRANCH_FORK_SECRET,
@@ -198,7 +199,7 @@ function sessionsProfile(config: InstallConfig, environment: Environment, { cpuB
 }
 
 /** How long a session's bayma holds a stop alasio did not make (sessions.snapshots.stopWait). */
-function stopWaitSeconds(config: InstallConfig): number {
+export function stopWaitSeconds(config: InstallConfig): number {
   // A duration, as the configuration checks it.
   return durationSeconds(config.sessions.snapshots.stopWait) ?? 0;
 }
@@ -304,17 +305,23 @@ export interface Kept {
 export const NOTHING_KEPT: Kept = { cpuBaseline: null, gvisorReleases: gvisorReleases(NODE_PINS), botChecksum: null, apiServer: null };
 
 /**
- * What `alasio up` carries forward from the installation it replaces: the sessions'
+ * What `alasio up` carries forward from the installation it replaces: the sandbox pools'
+ * templates before the current ones (./sandbox-gateway.ts carriedPools); the sessions'
  * profile before the current one, whose template their snapshots may still restore onto
  * (src/sandbox/snapshots.ts), and the Sandbox policy pins beside the current one
  * (./admission.ts), until the template changes again; and what the cluster keeps.
  */
 export interface Carried extends Kept {
   readonly previousSessions: SessionsProfile | null;
+  /** Each sandbox pool's template before the current one, by its sessions' internet, as the gateway's configuration carried it (./sandbox-gateway.ts carriedPools). */
+  readonly previousPools: PreviousPools;
 }
 
+/** Each sandbox pool's template before the current one, by its sessions' internet; none where it has not changed. */
+export type PreviousPools = Readonly<Record<"none" | "full", V1PodTemplateSpec | null>>;
+
 /** Nothing carried forward: a first installation's, and a branch environment's. */
-export const NOTHING_CARRIED: Carried = { previousSessions: null, ...NOTHING_KEPT };
+export const NOTHING_CARRIED: Carried = { previousSessions: null, previousPools: { none: null, full: null }, ...NOTHING_KEPT };
 
 /** The ConfigMap of the templates, by its name. */
 export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
@@ -333,8 +340,9 @@ export const SANDBOX_TEMPLATES = componentName("sandbox-templates");
  * (./alasio.ts identity). Were alasio given that, it could write any pod template into
  * the ConfigMap, and the next `up` would let it make Sandboxes of it.
  */
-export function carriedFrom(config: InstallConfig, live: string | undefined, kept: Kept): Carried {
-  const nothing = { ...NOTHING_CARRIED, ...kept };
+export function carriedFrom(config: InstallConfig, live: string | undefined, kept: Kept, liveGateway?: string): Carried {
+  const previousPools = carriedPools(config, liveGateway, kept);
+  const nothing = { ...NOTHING_CARRIED, ...kept, previousPools };
   if (!config.sessions.enabled || live === undefined) return nothing;
   // Carried as the ConfigMap held them, which alasio read as they are: the profile a snapshot recorded the hash of.
   if (Result.isFailure(decodeKubeTemplates(SANDBOX_TEMPLATES, live))) return nothing;
@@ -342,7 +350,7 @@ export function carriedFrom(config: InstallConfig, live: string | undefined, kep
   if (!held.sessions) return nothing;
   // The current profile as the ConfigMap holds it, to compare with what it held.
   const current = JSON.parse(goJson(sessionsProfile(config, MAIN_ENVIRONMENT, kept), "")) as SessionsProfile;
-  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions, ...kept };
+  return { previousSessions: isDeepStrictEqual(held.sessions.podTemplate, current.podTemplate) ? (held.previousSessions ?? null) : held.sessions, previousPools, ...kept };
 }
 
 /**

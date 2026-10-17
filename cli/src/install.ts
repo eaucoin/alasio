@@ -7,7 +7,7 @@
  * given the webhook intake before it starts, and main's bot registered with Telegram once it
  * serves it (./webhook.ts).
  */
-import type { KubernetesObject, V1Namespace } from "@kubernetes/client-node";
+import type { KubernetesObject, V1ConfigMap, V1Namespace } from "@kubernetes/client-node";
 import { Effect, Result, Schema } from "effect";
 
 import { type ApiServer, readApiServer } from "./api-server.ts";
@@ -15,14 +15,14 @@ import { gvisorReleases as gvisorReleasesOf, NODE_PINS } from "./cluster/node.ts
 import { installConfigOf, type OperatorConfig, OperatorConfigError, targetKind } from "./config.ts";
 import { type BaselineDecision, decideCpuBaseline, recordedBaseline, sameBaseline, surveyCpu } from "./cpu-baseline.ts";
 import { clusterReleases } from "./kept-releases.ts";
-import { describeRef, hasStatus, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
+import { describeRef, hasStatus, kind, KubeApi, type KubeApiError, refOf } from "./kube/api.ts";
 import { type ApplyError, applyInstallation, labelled } from "./kube/apply.ts";
 import { type AutoscalerMismatch, checkAutoscalers } from "./kube/autoscalers.ts";
 import { checkObjectStoreLayout, checkObjectStoreScale, type ObjectStoreScaleRefused } from "./kube/object-store-scale.ts";
 import type { WaitOptions } from "./kube/rollout.ts";
 import type { CpuBaseline } from "./manifests/alasio.ts";
 import { labels, NAMESPACE, neonName, nodeAgentRuns } from "./manifests/common.ts";
-import { sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
+import { GATEWAY, sandboxServiceRuns } from "./manifests/sandbox-gateway.ts";
 import type { InstallConfig } from "./manifests/config.ts";
 import { type Carried, carriedFrom, manifests, NOTHING_CARRIED } from "./manifests/index.ts";
 import { checkNeonStorage, type PageserversLowered, type ShardsLowered, type StorageDatabaseUnread, type StorageUnverified } from "./neon-storage.ts";
@@ -130,6 +130,8 @@ interface Checked {
   readonly objects: readonly KubernetesObject[];
   /** The templates the cluster runs, as their ConfigMap records them, and the CPU baseline they hold sessions to. */
   readonly live: string | undefined;
+  /** The sandbox gateway's configuration the cluster runs, as its ConfigMap holds it, which carries its pools' templates before the current ones. */
+  readonly liveGateway: string | undefined;
   readonly recorded: CpuBaseline;
   /** The releases the cluster keeps, as its RuntimeClasses say, which the sessions' snapshots restore with. */
   readonly gvisorReleases: readonly string[];
@@ -164,13 +166,14 @@ export const checkInstallation = Effect.fnUntraced(function*(
   const key = yield* readBotChecksumKey;
   const checksum = key === null ? null : botChecksum(bot, key);
   const apiServer = yield* readApiServer;
-  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer }));
+  const liveGateway = (yield* (yield* KubeApi).get<V1ConfigMap>({ ...kind("ConfigMap"), namespace: NAMESPACE, name: GATEWAY }))?.data?.["config.json"];
+  const objects = installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: recorded, gvisorReleases, botChecksum: checksum, apiServer }, liveGateway));
   yield* checkAutoscalers(objects, settings);
   yield* checkObjectStoreLayout(objects);
   yield* checkObjectStoreScale(objects);
   yield* checkNeonStorage(settings);
   yield* checkApplicable(objects);
-  return { bot, settings, objects, live, recorded, gvisorReleases, checksum, apiServer };
+  return { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer };
 });
 
 /**
@@ -188,7 +191,7 @@ export const install = Effect.fnUntraced(function*(
   KubeApi | TelegramBotApi
 > {
   yield* ensureBotChecksumKey;
-  const { bot, settings, objects, live, recorded, gvisorReleases, checksum, apiServer } = yield* checkInstallation(config);
+  const { bot, settings, objects, live, liveGateway, recorded, gvisorReleases, checksum, apiServer } = yield* checkInstallation(config);
   const route = yield* ensureRoute("main", bot.allowedUserIds);
   yield* applyInstallation(objects, options);
   yield* registerBot(settings, "main", bot, route, options);
@@ -197,7 +200,7 @@ export const install = Effect.fnUntraced(function*(
   const decision = decideCpuBaseline(yield* surveyCpu, recorded);
   // Carried from the installation before this one, as the first apply carried it.
   if (!sameBaseline(decision.baseline, recorded)) {
-    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer })), options);
+    yield* applyInstallation(installationObjects(settings, carriedFrom(settings, live, { cpuBaseline: decision.baseline, gvisorReleases, botChecksum: checksum, apiServer }, liveGateway)), options);
   }
   return { ...installed, cpuBaseline: decision };
 });

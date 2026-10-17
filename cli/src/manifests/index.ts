@@ -52,7 +52,7 @@ export function manifests(config: InstallConfig, carried: Carried = NOTHING_CARR
     ...collectorObjects(config),
     ...workspaceStorageObjects(config),
     ...nodeAgentObjects(config),
-    ...sandboxServiceObjects(config),
+    ...sandboxServiceObjects(config, carried),
     ...networkPolicyObjects(config, MAIN_ENVIRONMENT, carried.apiServer),
     ...headroomObjects(config),
   ];

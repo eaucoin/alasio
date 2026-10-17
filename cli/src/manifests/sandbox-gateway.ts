@@ -26,6 +26,8 @@
  *   the node agent, which attaches workspaces from it: a new one takes its mount over before
  *   the old goes.
  */
+import { isDeepStrictEqual } from "node:util";
+
 import type {
   KubernetesObject,
   V1ClusterRole,
@@ -41,6 +43,7 @@ import type {
   V1Service,
   V1ServiceAccount,
 } from "@kubernetes/client-node";
+import { Schema } from "effect";
 
 import { freeLabels, type Pool } from "../../../src/binder/names.ts";
 import { MAIN_ENVIRONMENT_NAME } from "../../../src/branch/names.ts";
@@ -51,16 +54,18 @@ import {
   EVENTS_PASSWORD_FILE_VARIABLE,
   EVENTS_USERNAME_VARIABLE,
   GATEWAY_CONFIG_VARIABLE,
+  GatewayConfig as GatewayConfigSchema,
   type GatewayConfig,
   RECEIVER_PORT_VARIABLE,
   SESSIONS_NAMESPACE_VARIABLE,
+  templateHash,
 } from "../../../src/gateway/names.ts";
-import { BAYMA_CONTAINER, NET_MODE_LABEL } from "../../../src/kube/sandbox-shape.ts";
-import { ATTACH_ROOT, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
+import { BAYMA_CONTAINER, BAYMA_STOP_SECONDS, CPU_FEATURES_ANNOTATION, NET_MODE_LABEL, SESSION_TEMPLATE_ANNOTATION, STOP_WAIT_ARG } from "../../../src/kube/sandbox-shape.ts";
+import { ATTACH_ROOT, gvisorRuntimeClass, NODE_AGENT_PORT, NODE_AGENT_TOKEN_VARIABLE, WORKSPACES_ROOT } from "../../../src/node-agent/names.ts";
 import { memoryBytes } from "../capacity.ts";
 import { imageReference } from "../images.ts";
 import { READY_ONCE_BOUND_ANNOTATION } from "../kube/rollout.ts";
-import { sessionsNamespace } from "./alasio.ts";
+import { type Carried, type CpuBaseline, type Kept, type PreviousPools, sessionsNamespace, stopWaitSeconds } from "./alasio.ts";
 import {
   componentName,
   type Environment,
@@ -118,10 +123,51 @@ export const poolsOf = (config: InstallConfig, environment: Environment): Record
   return { none: { name: POOLS.none, namespace }, full: { name: POOLS.full, namespace } };
 };
 
-/** The template of a pool's pods, as the module says: a session's, under its internet `mode`. */
-export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS): V1PodTemplateSpec {
+/**
+ * Each sandbox pool's template before the current one, as the gateway's configuration it
+ * replaces, `liveGateway` (its ConfigMap's `config.json`), carried it: the one it rendered, where
+ * the template changes, or else the one it carried; none where it rendered none, as where its
+ * sessions were not snapshotted. A template is carried for one change of it, and no more, as
+ * alasio's sessions' profile is (./alasio.ts carriedFrom); and pinned into the sandbox pods'
+ * policy for the restores of the snapshots taken on it, read back from the cluster: the
+ * ConfigMap is that trust's anchor, which only the operator, by `alasio up`, writes. Pure, for tests.
+ */
+export function carriedPools(config: InstallConfig, liveGateway: string | undefined, kept: Kept): PreviousPools {
+  const none: PreviousPools = { none: null, full: null };
+  if (!sandboxServiceRuns(config) || !poolsSnapshotted(config, kept.cpuBaseline) || liveGateway === undefined) return none;
+  const held = Schema.decodeUnknownOption(Schema.fromJsonString(GatewayConfigSchema))(liveGateway);
+  if (held._tag === "None" || held.value.snapshots === null) return none;
+  const pools = poolsOf(config, MAIN_ENVIRONMENT);
+  const carry = (mode: keyof typeof POOLS): V1PodTemplateSpec | null => {
+    const { current, previous } = held.value.snapshots?.templates[mode] ?? { current: {}, previous: null };
+    const now = JSON.parse(JSON.stringify(poolTemplate(config, pools[mode], mode, kept.cpuBaseline))) as unknown;
+    return (isDeepStrictEqual(current, now) ? previous : current) as V1PodTemplateSpec | null;
+  };
+  return { none: carry("none"), full: carry("full") };
+}
+
+/** Whether the sandbox pools' sessions are snapshotted: where the node agents run, which save them, and the nodes' CPU baseline is recorded, which they are held to. */
+export const poolsSnapshotted = (config: InstallConfig, cpuBaseline: CpuBaseline): cpuBaseline is readonly string[] => nodeAgentRuns(config) && cpuBaseline !== null;
+
+/**
+ * The template of a pool's pods, as the module says: a session's, under its internet `mode`.
+ * Where its sessions are snapshotted (poolsSnapshotted), as main's are by the gateway, it holds
+ * them to the nodes' CPU baseline `cpuBaseline`, its bayma holds a stop it is not given for the
+ * gateway's save (sessions.snapshots.stopWait), and it records its own hash
+ * (SESSION_TEMPLATE_ANNOTATION), which a snapshot taken on it names it by. Every environment's
+ * pools have the same.
+ */
+export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS, cpuBaseline: CpuBaseline): V1PodTemplateSpec {
+  const template = unhashedPoolTemplate(config, pool, mode, cpuBaseline);
+  if (!poolsSnapshotted(config, cpuBaseline)) return template;
+  return { ...template, metadata: { ...template.metadata, annotations: { ...template.metadata?.annotations, [SESSION_TEMPLATE_ANNOTATION]: templateHash(template) } } };
+}
+
+/** A pool's template, as poolTemplate says, but its hash. */
+function unhashedPoolTemplate(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS, cpuBaseline: CpuBaseline): V1PodTemplateSpec {
   const { sessions } = config;
   const agent = imageReference(config.images.agent);
+  const snapshotted = poolsSnapshotted(config, cpuBaseline);
   return {
     metadata: {
       labels: { "app.kubernetes.io/part-of": "alasio", "app.kubernetes.io/instance": RELEASE, "app.kubernetes.io/component": POOL_COMPONENT, [NET_MODE_LABEL]: mode, ...freeLabels(pool) },
@@ -131,11 +177,14 @@ export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof type
         "dev.gvisor.spec.mount.tmp.share": "container",
         "dev.gvisor.spec.mount.tmp.type": "tmpfs",
         "dev.gvisor.spec.mount.tmp.options": "rw",
+        ...(snapshotted ? { [CPU_FEATURES_ANNOTATION]: cpuBaseline.join(",") } : {}),
       },
     },
     spec: {
       ...(sessions.runtimeClassName ? { runtimeClassName: sessions.runtimeClassName } : {}),
       ...priority("turn"),
+      // Ended by other than the gateway, bayma holds its stop for the gateway's save, then stops.
+      ...(snapshotted ? { terminationGracePeriodSeconds: stopWaitSeconds(config) + BAYMA_STOP_SECONDS } : {}),
       securityContext: restrictedPod(1000, 1000),
       automountServiceAccountToken: false,
       enableServiceLinks: false,
@@ -151,7 +200,20 @@ export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof type
         imagePullPolicy: config.images.pullPolicy,
         // bayma, and its hook as a release's snapshot runs it, once its workspace is attached.
         command: ["/usr/bin/tini", "-s", "--", "/usr/local/bin/alasio-start", "node", "/opt/bayma/bayma.js"],
-        args: ["mcp-http", "--host", "0.0.0.0", "--port", String(POOL_POD_PORT), "--state-dir", "/home/agent/.bayma", "--token-file", "/attach/token", "--telemetry-token-file", "/attach/token"],
+        args: [
+          "mcp-http",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          String(POOL_POD_PORT),
+          "--state-dir",
+          "/home/agent/.bayma",
+          "--token-file",
+          "/attach/token",
+          "--telemetry-token-file",
+          "/attach/token",
+          ...(snapshotted ? [STOP_WAIT_ARG, String(stopWaitSeconds(config) * 1000)] : []),
+        ],
         workingDir: "/attach",
         env: [
           { name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } },
@@ -175,8 +237,8 @@ export function poolTemplate(config: InstallConfig, pool: Pool, mode: keyof type
 }
 
 /** A pool's Deployment, and the ScaledObject that keeps its free pods. */
-function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS): KubernetesObject[] {
-  const template = poolTemplate(config, pool, mode);
+function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS, cpuBaseline: CpuBaseline): KubernetesObject[] {
+  const template = poolTemplate(config, pool, mode, cpuBaseline);
   const deployment: V1Deployment = {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -200,7 +262,9 @@ function poolObjects(config: InstallConfig, pool: Pool, mode: keyof typeof POOLS
 }
 
 /** The gateway's configuration, as src/gateway/gateway.ts reads it. */
-function gatewayConfig(config: InstallConfig): GatewayConfig {
+function gatewayConfig(config: InstallConfig, carried: Carried): GatewayConfig {
+  const pools = poolsOf(config, MAIN_ENVIRONMENT);
+  const templates = (mode: keyof typeof POOLS) => ({ current: { ...poolTemplate(config, pools[mode], mode, carried.cpuBaseline) }, previous: carried.previousPools[mode] ? { ...carried.previousPools[mode] } : null });
   return {
     port: GATEWAY_PORT,
     peers: `${GATEWAY_PEERS}.${NAMESPACE}.svc.cluster.local`,
@@ -211,6 +275,14 @@ function gatewayConfig(config: InstallConfig): GatewayConfig {
     environment: { name: MAIN_ENVIRONMENT_NAME, namespace: sessionsNamespace(config, MAIN_ENVIRONMENT) },
     // A new session's volume's size, as the configuration checks it.
     quotaBytes: memoryBytes(config.sessions.storage.size),
+    // As alasio's own sessions were snapshotted (./alasio.ts sessionSnapshots), under the releases the cluster keeps.
+    snapshots: poolsSnapshotted(config, carried.cpuBaseline)
+      ? {
+        liveEverySeconds: durationSeconds(config.sessions.snapshots.liveEvery) ?? 0,
+        releases: carried.gvisorReleases.map((release) => ({ release, runtimeClassName: gvisorRuntimeClass(release) })),
+        templates: { none: templates("none"), full: templates("full") },
+      }
+      : null,
     pools: { none: POOLS.none, full: POOLS.full },
     nodeAgents: {
       namespace: NAMESPACE,
@@ -268,8 +340,8 @@ function gatewayIdentity(): KubernetesObject[] {
 }
 
 /** The gateway's Deployment, its configuration's ConfigMap, and its Services. */
-function gatewayObjects(config: InstallConfig): KubernetesObject[] {
-  const rendered = JSON.stringify(gatewayConfig(config), null, 2);
+function gatewayObjects(config: InstallConfig, carried: Carried): KubernetesObject[] {
+  const rendered = JSON.stringify(gatewayConfig(config, carried), null, 2);
   const configMap: V1ConfigMap = { apiVersion: "v1", kind: "ConfigMap", metadata: { name: GATEWAY, namespace: NAMESPACE, labels: labels(GATEWAY_COMPONENT) }, data: { "config.json": rendered } };
   const key = (variable: string, field: string): V1EnvVar => ({ name: variable, valueFrom: { secretKeyRef: { name: GATEWAY, key: field } } });
   const deployment: V1Deployment = {
@@ -498,7 +570,7 @@ function workspaceMount(config: InstallConfig): V1DaemonSet {
  * environment's (./branch.ts): its pools, the budget of their bound pods, and what the gateway
  * may do there, binding in its pools, and the receiver, watching their Leases.
  */
-export function sandboxPoolObjects(config: InstallConfig, environment: Environment): KubernetesObject[] {
+export function sandboxPoolObjects(config: InstallConfig, environment: Environment, cpuBaseline: CpuBaseline): KubernetesObject[] {
   if (!sandboxServiceRuns(config)) return [];
   const pools = poolsOf(config, environment);
   const namespace = pools.none.namespace;
@@ -513,27 +585,27 @@ export function sandboxPoolObjects(config: InstallConfig, environment: Environme
       { apiGroups: [""], resources: ["events"], verbs: ["list"] },
     ]),
     ...accountRole(RECEIVER, RECEIVER_COMPONENT, namespace, [{ apiGroups: ["coordination.k8s.io"], resources: ["leases"], verbs: ["list", "watch"] }]),
-    ...poolObjects(config, pools.none, "none"),
-    ...poolObjects(config, pools.full, "full"),
+    ...poolObjects(config, pools.none, "none", cpuBaseline),
+    ...poolObjects(config, pools.full, "full", cpuBaseline),
     boundBudget(namespace),
   ];
 }
 
 /** The sandbox service's objects: its gateway, its receiver, and the nodes' mount, main's alone, which serve every environment, and main's pools. */
-export function sandboxServiceObjects(config: InstallConfig): KubernetesObject[] {
+export function sandboxServiceObjects(config: InstallConfig, carried: Carried): KubernetesObject[] {
   if (!sandboxServiceRuns(config)) return [];
   const mount = workspaceMount(config);
   const pools = poolsOf(config, MAIN_ENVIRONMENT);
   return [
     ...gatewayIdentity(),
-    ...gatewayObjects(config),
+    ...gatewayObjects(config, carried),
     // Every pod of every environment's sessions held to the pools' templates, as Pod Security cannot.
-    ...sandboxPodPolicy([poolTemplate(config, pools.none, "none"), poolTemplate(config, pools.full, "full")], {
+    ...sandboxPodPolicy([poolTemplate(config, pools.none, "none", carried.cpuBaseline), poolTemplate(config, pools.full, "full", carried.cpuBaseline)], {
       sessionsNamespace: sessionsNamespace(config, MAIN_ENVIRONMENT),
       sandboxController: SANDBOX_CONTROLLER_USER,
     }),
     ...receiverObjects(config),
-    ...sandboxPoolObjects(config, MAIN_ENVIRONMENT),
+    ...sandboxPoolObjects(config, MAIN_ENVIRONMENT, carried.cpuBaseline),
     mount,
     // Sized as recommended alone, as a pod of it is only replaced, by one that takes its mount over.
     verticalPodAutoscaler(mount, "Recommended"),

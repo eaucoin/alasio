@@ -21,7 +21,7 @@
 import type { KubernetesObject, V1Role, V1RoleBinding } from "@kubernetes/client-node";
 
 import { branchNamespace } from "../../../src/branch/names.ts";
-import { alasioObjects, sessionsNamespace } from "./alasio.ts";
+import { alasioObjects, type CpuBaseline, sessionsNamespace } from "./alasio.ts";
 import { BRANCH_LABEL, componentName, type Environment, labels, NAMESPACE, RELEASE } from "./common.ts";
 import type { InstallConfig } from "./config.ts";
 import { lakeObjects } from "./lake.ts";
@@ -59,8 +59,12 @@ function parentAccess(config: InstallConfig, environment: Environment): Kubernet
   return [role, binding];
 }
 
-/** The objects of the branch environment `name`, of the configuration `config` (main's, overridden, without the host profile). */
-export function branchObjects(config: InstallConfig, name: string): KubernetesObject[] {
+/**
+ * The objects of the branch environment `name`, of the configuration `config` (main's,
+ * overridden, without the host profile), its sandbox pools main's, held to the CPU baseline
+ * `cpuBaseline` main's are.
+ */
+export function branchObjects(config: InstallConfig, name: string, cpuBaseline: CpuBaseline): KubernetesObject[] {
   const environment = branchEnvironment(name);
   return [
     ...alasioObjects(config, environment),
@@ -69,6 +73,6 @@ export function branchObjects(config: InstallConfig, name: string): KubernetesOb
     ...lakeObjects(config, environment),
     ...networkPolicyObjects(config, environment),
     ...(config.sessions.enabled ? parentAccess(config, environment) : []),
-    ...sandboxPoolObjects(config, environment),
+    ...sandboxPoolObjects(config, environment, cpuBaseline),
   ].map((object) => branchLabelled(object, name));
 }
