@@ -11,7 +11,7 @@ import { Effect, Exit, Layer, Scope } from "effect";
 import { Binder } from "../src/binder/binder.ts";
 import { activeAt, readLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
-import { type BinderServer, PlacementRefused, serveBinder } from "../src/binder/server.ts";
+import { type BinderServer, NO_BIND_HEADER, PlacementRefused, serveBinder } from "../src/binder/server.ts";
 import { mintToken, verifyToken } from "../src/binder/tokens.ts";
 import { KubeClient } from "../src/kube/client.ts";
 import { startKubeApiServer } from "./support/kube-apiserver.ts";
@@ -106,6 +106,48 @@ test("a caller's request binds its key and reaches the key's pod with the bindin
     assert.equal(served.inFlight(key), 0);
   } finally {
     await served.close();
+    stand.close();
+  }
+});
+
+test("a no-bind request for an unbound key takes no Lease and claims no pod; one for a bound key is served, the header its own", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  const free = () => run(withKube((kube) => kube.list("v1", "Pod", of.namespace, "alasio.dev/free=true"))).then((listed) => listed.length);
+  try {
+    const key = "sessionfs:workspace";
+    const ask = (method: string, path: string) => fetch(`http://127.0.0.1:${served.port}${path}`, { method, headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, ...(method === "POST" ? { body: "{}" } : {}) });
+    for (const [method, path] of [["GET", "/status"], ["POST", "/mcp"], ["POST", "/bind"]] as const) {
+      const unbound = await ask(method, path);
+      assert.deepEqual([unbound.status, await unbound.json()], [409, { bound: false }], `${method} ${path}`);
+    }
+    assert.equal(await run(readLease(of, key)), null);
+    assert.deepEqual([await free(), stand.sent.length], [2, 0]);
+    // Bound by a request that may bind: then served, without the header.
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key) }, body: "{}" })).status, 200);
+    assert.equal((await ask("GET", "/status")).status, 200);
+    assert.deepEqual(stand.sent.map((headers) => headers[NO_BIND_HEADER]), [undefined, undefined]);
+  } finally {
+    await served.close();
+    stand.close();
+  }
+});
+
+test("a no-bind request, of a front that never bound its key, is served by the binding another front made", async () => {
+  const of = await pool();
+  await freePods(of, 1);
+  const stand = await pods();
+  const [binding, reading] = [await front(of, stand.port), await front(of, stand.port)];
+  try {
+    const key = "sessionfs:elsewhere";
+    assert.equal((await fetch(`http://127.0.0.1:${binding.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const read = await fetch(`http://127.0.0.1:${reading.port}/status`, { headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" } });
+    assert.equal(read.status, 200);
+  } finally {
+    await binding.close();
+    await reading.close();
     stand.close();
   }
 });

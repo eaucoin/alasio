@@ -92,6 +92,8 @@ export class Binder extends Context.Service<Binder, {
   readonly release: <E = never>(pool: Pool, key: string, before?: (bound: { readonly pod: string; readonly binding: string }) => Effect.Effect<void, E>) => Effect.Effect<boolean, KubeApiError | E>;
   /** How many binds of the pool wait for a free pod now, in this binder. */
   readonly waiting: (pool: Pool) => Effect.Effect<number>;
+  /** The key's binding as it is now, its pod serving it; null where it has none so, binding nothing and taking no Lease. */
+  readonly bound: (pool: Pool, key: string) => Effect.Effect<Bound | null, KubeApiError>;
 }>()("alasio/binder/Binder") {
   /** On the KubeClient, each bind waiting up to `waitMs`. */
   static readonly layer = ({ waitMs, renewMs = RENEW_MS, staleMs = BINDING_TIMEOUT_MS }: BinderOptions): Layer.Layer<Binder, never, KubeClient> =>
@@ -257,8 +259,19 @@ export class Binder extends Context.Service<Binder, {
             }
           });
 
+        const bound = (pool: Pool, key: string): Effect.Effect<Bound | null, KubeApiError> =>
+          Effect.gen(function*() {
+            const lease = yield* provide(readLease(pool, key));
+            const holder = lease?.spec?.holderIdentity;
+            if (!lease || !holder || lease.metadata?.annotations?.[RELEASING_ANNOTATION]) return null;
+            const pod = yield* provide(boundPod(pool, key));
+            if (pod?.metadata?.name !== holder || !serving(pod) || !pod.status?.podIP) return null;
+            return { binding: lease.metadata?.uid ?? "", pod: holder, address: pod.status.podIP };
+          });
+
         return Binder.of({
           bind,
+          bound,
           release: (pool, key, before = () => Effect.void) => releaseBinding(pool, key, before),
           waiting: (pool) => Effect.sync(() => waits.get(poolKey(pool)) ?? 0),
         });
