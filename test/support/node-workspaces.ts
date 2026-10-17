@@ -1,7 +1,7 @@
 /**
  * A node agent's workspaces on directories of a test's own, the node's mount table a
- * stand-in's: what its commands mount and unmount, in order; and which of its sandboxes'
- * containers run.
+ * stand-in's: what its commands mount and unmount, in order; which of its sandboxes'
+ * containers run; and its pods' directories, as kubelet makes them.
  */
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,6 +45,8 @@ export function workspacesNode() {
     mkdirSync(join(directory, "home"), { recursive: true });
     return directory;
   };
-  return { root, workspacesRoot, attachRoot, mounts, ran, running, workspaces, files, done: () => rmSync(root, { recursive: true, force: true }) };
+  /** `name`'s directory, as kubelet makes it as a pod of a pool starts. */
+  const pod = (name: string) => mkdirSync(join(attachRoot, name), { recursive: true });
+  return { root, workspacesRoot, attachRoot, mounts, ran, running, workspaces, files, pod, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 

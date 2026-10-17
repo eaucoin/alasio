@@ -20,6 +20,7 @@ test("a workspace is attached into a pod's directory with its binding's token be
   try {
     const files = at.files("fs-abc123");
     at.files("fs-def456");
+    at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "binding-token", { OTEL_EXPORTER_OTLP_ENDPOINT: "http://10.43.0.9:4318", OTEL_NOTE: "it's quoted" }));
     assert.deepEqual(at.mounts, [join(at.attachRoot, "pool-0", "ws")]);
     assert.ok(at.ran.includes(`mount --bind ${files} ${join(at.attachRoot, "pool-0", "ws")}`));
@@ -42,6 +43,7 @@ test("an attach of a workspace there is not, or by names that are none, is refus
   const at = workspacesNode();
   try {
     at.files("fs-abc123");
+    at.pod("pool-0");
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", { "NOT A NAME": "x" })), 400);
     assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-missing" }, "pool-0", "t", {})), 404);
     for (const [environment, workspace, pod] of [["main", "../etc", "pool-0"], ["Main", "fs-abc123", "pool-0"], ["main", "fs-abc123", "../pool"], ["main", "fs-abc123", "a/b"]] as const) {
@@ -53,10 +55,27 @@ test("an attach of a workspace there is not, or by names that are none, is refus
   }
 });
 
+test("an attach into a pod's directory kubelet has not made, or that is no directory, is refused, and none is made", async () => {
+  const at = workspacesNode();
+  try {
+    at.files("fs-abc123");
+    assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {})), 404);
+    assert.equal(existsSync(join(at.attachRoot, "pool-0")), false);
+    // One whose name is a symlink, to a directory of another's.
+    at.pod("pool-1");
+    symlinkSync(join(at.attachRoot, "pool-1"), join(at.attachRoot, "pool-2"));
+    assert.equal(await refusal(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-2", "t", {})), 404);
+    assert.deepEqual([at.mounts, existsSync(join(at.attachRoot, "pool-1", "token"))], [[], false]);
+  } finally {
+    at.done();
+  }
+});
+
 test("a detach is refused while the pod's sandbox runs, and once it has ended unmounts lazily all under its directory, deepest first, and removes it", async () => {
   const at = workspacesNode();
   try {
     at.files("fs-abc123");
+    at.pod("pool-0");
     await Effect.runPromise(at.workspaces.attach({ environment: "main", workspace: "fs-abc123" }, "pool-0", "t", {}));
     // A mount beneath, as a sandbox's own might leave one.
     at.mounts.push(join(at.attachRoot, "pool-0", "ws", "workspace", "inner"));
