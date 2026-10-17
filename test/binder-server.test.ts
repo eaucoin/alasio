@@ -234,6 +234,31 @@ test("a bind asked ahead binds the key; one whose pool has no pod in time is ans
   }
 });
 
+test("a bind asked ahead, and a no-bind request, of a key whose binding another let go since, as an idle or broken one is, ask how it is bound now, not the route last known", async () => {
+  const of = await pool();
+  await freePods(of, 2);
+  const stand = await pods();
+  const served = await front(of, stand.port);
+  const other = await front(of, stand.port);
+  try {
+    const key = "sessionfs:let-go";
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const first = (await run(readLease(of, key)))?.spec?.holderIdentity;
+    assert.ok(first);
+    // Let go through another front, as the gateway's sweep, or its look at broken bindings, lets one go.
+    assert.equal((await fetch(`http://127.0.0.1:${other.port}/release`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const unbound = await fetch(`http://127.0.0.1:${served.port}/mcp`, { method: "POST", headers: { authorization: caller(key), [NO_BIND_HEADER]: "never" }, body: "{}" });
+    assert.deepEqual([unbound.status, await unbound.json()], [409, { bound: false }]);
+    assert.equal((await fetch(`http://127.0.0.1:${served.port}/bind`, { method: "POST", headers: { authorization: caller(key) } })).status, 204);
+    const again = (await run(readLease(of, key)))?.spec?.holderIdentity;
+    assert.ok(again && again !== first, `${first} then ${again}`);
+  } finally {
+    stand.close();
+    await served.close();
+    await other.close();
+  }
+});
+
 test("a key whose pod is not reached is answered 503, and its next request binds it anew", async () => {
   const of = await pool();
   // At an address of the loopback nothing listens at.

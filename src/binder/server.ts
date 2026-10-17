@@ -4,7 +4,8 @@
  * many each pool waits for.
  *
  * - `POST /bind`: binds the token's key ahead of any request (204), so its pod is got while
- *   nothing waits on it; 503 with a Retry-After where its pool had no pod for it in time.
+ *   nothing waits on it, as the key is bound now, whatever route the front last knew of it;
+ *   503 with a Retry-After where its pool had no pod for it in time.
  * - `POST /release`: releases the token's key's binding, as its placement says what comes
  *   before (204), as it does where it has none; 503 where it could not be released now, its
  *   binding kept.
@@ -213,6 +214,10 @@ export const serveBinder = Effect.fnUntraced(function*({ port, host = "0.0.0.0",
       }
       const unbound = incoming.headers[NO_BIND_HEADER] === "never";
       delete incoming.headers[NO_BIND_HEADER];
+      // A bind asked ahead, and a request that binds nothing, asks how the key is bound now, not
+      // the route this front last knew, which a release by another, as an idle or broken binding's,
+      // leaves behind.
+      if (unbound || (incoming.method === "POST" && url === "/bind")) routes.delete(key);
       const routed = yield* routeOf(key, claims.options ?? {}, unbound).pipe(Effect.result);
       if (routed._tag === "Failure") {
         if (routed.failure._tag === "PlacementRefused") return answer(outgoing, 403, { error: routed.failure.message });
