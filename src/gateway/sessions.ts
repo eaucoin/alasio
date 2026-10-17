@@ -252,7 +252,11 @@ export const makeSessions = Effect.fnUntraced(function*(
       ),
   });
 
-  /** The bound pods ending though the gateway did not end them whose release runs, by their uid. */
+  /**
+   * The bound pods ending though the gateway did not end them whose release runs, or has run, by
+   * their uid: one is released once, its release one of none where its binding is another's to
+   * release, as a broken one's is, however long its pod takes to go.
+   */
   const draining = new Set<string>();
   /** Saves `pod`, bound to `workspace` of `pool` and ending, where its bayma holds its stop, then detaches its workspace once its containers stopped. */
   const drained = (pool: Pool, workspace: string, pod: V1Pod): Effect.Effect<void, KubeApiError | NodeAgentError | BindStepFailed> =>
@@ -264,8 +268,10 @@ export const makeSessions = Effect.fnUntraced(function*(
     });
   const drain: Effect.Effect<readonly string[], KubeApiError> = Effect.gen(function*() {
     const started: string[] = [];
+    const listed = new Set<string>();
     for (const pool of yield* pools) {
       const pods = (yield* kube.list("v1", "Pod", pool.namespace, `${BINDING_LABEL},${POOL_LABEL}=${pool.name}`)) as V1Pod[];
+      for (const pod of pods) listed.add(pod.metadata?.uid ?? "");
       for (const pod of pods) {
         const uid = pod.metadata?.uid ?? "";
         const key = pod.metadata?.annotations?.[KEY_ANNOTATION] ?? "";
@@ -281,11 +287,13 @@ export const makeSessions = Effect.fnUntraced(function*(
               ? Effect.andThen(released(pool, "deleted"), tell(pool, (environment) => ({ kind: "workspace.released", environment, source: "sandbox-gateway", subject: subject(key), binding, reason: "deleted" })))
               : Effect.void
           ),
-          Effect.catch((error) => Effect.logWarning(`releasing ${key}, as its pod ends, failed: ${error.message}`)),
-          Effect.ensuring(Effect.sync(() => void draining.delete(uid))),
+          // One whose release failed is tried again as it is next looked at.
+          Effect.catch((error) => Effect.andThen(Effect.sync(() => void draining.delete(uid)), Effect.logWarning(`releasing ${key}, as its pod ends, failed: ${error.message}`))),
         ));
       }
     }
+    // Those gone, forgotten.
+    for (const uid of draining) if (!listed.has(uid)) draining.delete(uid);
     return started;
   });
 

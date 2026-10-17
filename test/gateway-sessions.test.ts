@@ -12,7 +12,7 @@ import { TestClock } from "effect/testing";
 
 import { added } from "./support/metrics.ts";
 import { Binder } from "../src/binder/binder.ts";
-import { readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
+import { markReleasing, readLease, releaseLease, takeLease, touchLease } from "../src/binder/bindings.ts";
 import { freeLabels, type Pool } from "../src/binder/names.ts";
 import { verifyToken } from "../src/binder/tokens.ts";
 import type { Environments, SessionsEnvironment } from "../src/gateway/environments.ts";
@@ -803,6 +803,25 @@ test("a bound pod ended by other than the gateway, as a drain ends one, is saved
   assert.deepEqual(counted, { "alasio.sandbox.stop_release.outcome=snapshotted": 1 });
   assert.deepEqual(recorded.asked, [`checkpoint node-a ${bound.pod}`, `record ${env.namespace}/fs-drained released into s-1`, `detach node-a ${bound.pod}`]);
   assert.ok(told.some((event) => event.kind === "workspace.released" && event.subject.key === key && event.reason === "deleted" && event.binding === bound.binding));
+});
+
+test("a bound pod ending whose binding another releases, as a broken one's is, is begun released once, however long its pod takes to go", async () => {
+  const env = await environment(1, { gvisor: true, holdsStop: true });
+  const recorded = agents();
+  const { binder, sessions } = await sessionsOf(options(env, 7290), recorded.agents);
+  const key = sessionKey("fs-elsewhere");
+  const placement = await Effect.runPromise(sessions.place(key, { environment: env.name, mode: "none" }));
+  const bound = await Effect.runPromise(binder.bind(placement.pool, key, placement));
+  const lease = await run(readLease(env.none, key));
+  assert.ok(lease);
+  await run(markReleasing(lease, "another-binder"));
+  await run(withKube((kube) => kube.remove("v1", "Pod", env.namespace, bound.pod)));
+  const drain = () => Effect.runPromise(Effect.provide(sessions.drain, Layer.fresh(KubeClient.layer)));
+  assert.deepEqual(await drain(), [key]);
+  // Its release one of none, as another's runs.
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.deepEqual(await drain(), []);
+  assert.deepEqual(recorded.asked, []);
 });
 
 /** A stand-in for bayma's /status that says its state generation too, as bayma 0.14 does. */
