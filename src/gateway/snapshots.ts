@@ -57,6 +57,8 @@
  * workspace has a use for is collected (collect), as alasio's were: those of workspaces gone,
  * what no snapshot of a workspace needs, and what a node caches that none needs.
  */
+import { randomBytes } from "node:crypto";
+
 import type { V1Deployment, V1NetworkPolicy, V1Node, V1Pod, V1PodTemplateSpec, V1Toleration } from "@kubernetes/client-node";
 import { Clock, Effect, Schedule, Schema, Semaphore } from "effect";
 
@@ -70,7 +72,7 @@ import type { NodeAgentError, NodeAgents } from "../sandbox/node-agents.ts";
 import { type Fallback, holdsStop, hookOf, selects, stateDirOf, stopHookOf } from "../sandbox/snapshots.ts";
 import { withLogScope } from "../shared/log.ts";
 import { meter, withAlasioSpan } from "../telemetry/index.ts";
-import { ATTACH_WAIT, attachWait, type GatewaySnapshots as SnapshotsConfig } from "./names.ts";
+import { ATTACH_WAIT, attachWait, type GatewaySnapshots as SnapshotsConfig, ownDirectory } from "./names.ts";
 
 const releases = meter.createCounter("alasio.sandbox.releases", {
   description:
@@ -551,22 +553,24 @@ export const makeGatewaySnapshots = Effect.fnUntraced(function*({ agents, snapsh
           const from = prepared.success.manifest;
           yield* Effect.logInfo(`restoring ${named(pool, workspace)} on ${node} from its snapshot ${from.snapshot}, taken at ${from.takenAt} under gVisor ${from.release}`);
           const { [FREE_LABEL]: _free, ...own } = base.metadata?.labels ?? {};
-          const bayma = (base.spec?.containers ?? []).filter((container) => container.name === BAYMA_CONTAINER);
+          // Named before it is made, as its own directory is by its name (ownDirectory).
+          const name = `${pool.name}-restore-${randomBytes(4).readUInt32BE().toString(36).padStart(7, "0").slice(-7)}`;
+          const spec = ownDirectory({ containers: [], ...base.spec }, name);
+          const bayma = spec.containers.filter((container) => container.name === BAYMA_CONTAINER);
           const pod = yield* kube.create<V1Pod>({
             apiVersion: "v1",
             kind: "Pod",
             metadata: {
-              generateName: `${pool.name}-restore-`,
+              name,
               namespace: pool.namespace,
               labels: { ...own, ...labels },
               // Left paused, until its node's agent sees its egress confined (resumeRestored).
               annotations: { ...base.metadata?.annotations, ...annotations, [RESTORE_ANNOTATION]: prepared.success.imagePath, [RESTORE_PAUSED_ANNOTATION]: "true" },
             },
             spec: {
-              ...base.spec,
-              containers: base.spec?.containers ?? [],
+              ...spec,
               // Its workspace attached before its sandbox is restored, as its bayma starts.
-              initContainers: [...bayma.map(attachWait), ...(base.spec?.initContainers ?? [])],
+              initContainers: [...bayma.map(attachWait), ...(spec.initContainers ?? [])],
               runtimeClassName: kept.runtimeClassName,
               readinessGates: [...(base.spec?.readinessGates ?? []), { conditionType: RESUMED_CONDITION }],
               affinity: { ...base.spec?.affinity, nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [node] }] }] } } },

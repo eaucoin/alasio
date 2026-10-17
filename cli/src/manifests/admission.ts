@@ -30,7 +30,7 @@ import type { KubernetesObject, V1Container, V1PodSpec, V1PodTemplateSpec, V1Vol
 
 import { BINDING_LABEL, FREE_LABEL, KEY_ANNOTATION, POOL_LABEL } from "../../../src/binder/names.ts";
 import { branchNamespace, branchSessionsNamespace } from "../../../src/branch/names.ts";
-import { attachWait, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
+import { ATTACH_VOLUME, attachWait, ownDirectory, SANDBOX_POD_POLICY } from "../../../src/gateway/names.ts";
 import { BUSY_ANNOTATIONS, BUSY_LABEL } from "../../../src/kube/busy-label.ts";
 import { CLONE_VARIABLES, type HostProfile, type SessionsProfile } from "../../../src/kube/config.ts";
 import {
@@ -58,6 +58,7 @@ import {
   tokenSecretName,
   WORKLOAD_LABEL,
 } from "../../../src/kube/sandbox-shape.ts";
+import { ATTACH_ROOT } from "../../../src/node-agent/names.ts";
 import { componentName, labels, NAMESPACE, neonName, RELEASE } from "./common.ts";
 
 /** A field's test, beyond its being a rendered value: given the field's CEL expression and how deep it is, the CEL that holds where it passes. */
@@ -527,6 +528,9 @@ const restoredFromKey = (namespace: string) =>
     return `type(${expression}) == string && ${expression}.startsWith(${own}) && ${expression}.substring(size(${own})).matches(${JSON.stringify(`^${SNAPSHOT_ID}$`)})`;
   });
 
+/** A restore's pod's own directory on its node: its own name's, under every pod's. */
+const OWN_DIRECTORY = new Check((expression) => `${expression} == ${JSON.stringify(`${ATTACH_ROOT}/`)} + object.metadata.name`);
+
 /**
  * A restore's pod of the pool template `template`, as the gateway makes it (src/gateway/snapshots.ts)
  * and the API server stores it: its template's, bound from the first, never free, its sandbox
@@ -534,6 +538,9 @@ const restoredFromKey = (namespace: string) =>
  * node, its workspace attached first (attach-wait), and ready once resumed.
  */
 function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClasses: readonly string[]): string {
+  // Its own directory named by its volume's path, its own name's (ownDirectory).
+  const owned = ownDirectory(template.spec ?? { containers: [] }, "");
+  const volumes = (owned.volumes ?? []).map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: OWN_DIRECTORY, type: "DirectoryOrCreate" } } : volume));
   const restoredOn: Pinned = {
     nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: [matching(NODE_NAME)] }] }] } },
   };
@@ -541,10 +548,11 @@ function restorePod(template: V1PodTemplateSpec, namespace: string, runtimeClass
   const restoring = poolPodSpec({
     ...template,
     spec: {
-      ...template.spec,
+      ...owned,
+      volumes,
       runtimeClassName: oneOf(...runtimeClasses),
       // Its workspace attached before its sandbox is restored, as its bayma starts.
-      initContainers: [...(template.spec?.containers ?? []).filter(({ name }) => name === BAYMA_CONTAINER).map(attachWait), ...(template.spec?.initContainers ?? [])],
+      initContainers: [...owned.containers.filter(({ name }) => name === BAYMA_CONTAINER).map(attachWait), ...(owned.initContainers ?? [])],
       readinessGates: [...((template.spec?.readinessGates ?? []) as unknown as Pinned[]), { conditionType: RESUMED_CONDITION }],
       affinity: restoredOn,
     } as unknown as V1PodSpec,

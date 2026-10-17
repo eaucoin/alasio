@@ -16,7 +16,7 @@ import { request } from "node:https";
 import { gvisorReleases, NODE_PINS } from "../cli/src/cluster/node.ts";
 import { decodeInstallConfig, manifests, NOTHING_CARRIED } from "../cli/src/manifests/index.ts";
 import { GATEWAY_USER } from "../cli/src/manifests/sandbox-gateway.ts";
-import { attachWait } from "../src/gateway/names.ts";
+import { attachWait, ownDirectory } from "../src/gateway/names.ts";
 import { gvisorRuntimeClass, SNAPSHOT_CACHE_DIR } from "../src/node-agent/names.ts";
 import { refusedByPolicy } from "../src/gateway/refusals.ts";
 import { KubeClient } from "../src/kube/client.ts";
@@ -182,14 +182,16 @@ test("no pod but a pool's is made in a namespace of sessions", async () => {
 });
 
 /** A restore's pod of the pool's, as the gateway makes it of its template, of the workspace `workspace`, changed as `change` says. */
+let restores = 0;
 function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<string, unknown>; spec: V1PodSpec }) => void = () => {}): V1Pod {
+  const own = ownDirectory(template?.spec as V1PodSpec, `sandboxes-none-restore-${restores + 1}`);
   const { ["alasio.dev/free"]: _free, ...labels } = template?.metadata?.labels ?? {};
   const [release] = gvisorReleases(NODE_PINS);
   const pod = structuredClone({
     apiVersion: "v1",
     kind: "Pod",
     metadata: {
-      generateName: "sandboxes-none-restore-",
+      name: `sandboxes-none-restore-${(restores += 1)}`,
       namespace: SESSIONS,
       labels: { ...labels, "alasio.dev/binding": "0".repeat(40) },
       annotations: {
@@ -202,9 +204,9 @@ function restorePod(workspace = "fs-abc123", change: (pod: { metadata: Record<st
       },
     },
     spec: {
-      ...(template?.spec as V1PodSpec),
+      ...own,
       runtimeClassName: gvisorRuntimeClass(release ?? ""),
-      initContainers: (template?.spec?.containers ?? []).filter(({ name }) => name === "bayma").map(attachWait),
+      initContainers: own.containers.filter(({ name }) => name === "bayma").map(attachWait),
       readinessGates: [{ conditionType: "alasio.dev/resumed" }],
       affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }] } } },
     },
@@ -225,6 +227,8 @@ test("a restore's pod of a pool's template is made by the sandbox gateway alone,
     "on any node": (pod) => void delete pod.spec.affinity,
     "another image": (pod) => void (pod.spec.containers[0]!.image = "busybox"),
     "an init container of its own": (pod) => void (pod.spec.initContainers![0]!.command = ["sh", "-c", "cat /attach/token"]),
+    "another pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach/sandboxes-none-0"),
+    "every pod's directory": (pod) => void (pod.spec.volumes!.find(({ name }) => name === "attach")!.hostPath!.path = "/var/lib/alasio/attach"),
   };
   for (const [what, change] of Object.entries(changes)) {
     const refused = await madeAs(GATEWAY_USER, restorePod("fs-abc123", change));

@@ -44,7 +44,16 @@ let namespaces = 0;
 
 /** A pool pod's bayma, as its template runs it, with the state directory its hook is told. */
 const BAYMA_SPEC = {
-  containers: [{ name: "bayma", image: "agent", command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"], args: ["mcp-http", "--state-dir", "/home/agent/.bayma"] }],
+  containers: [{
+    name: "bayma",
+    image: "agent",
+    command: ["/usr/bin/tini", "-s", "--", "node", "/opt/bayma/bayma.js"],
+    args: ["mcp-http", "--state-dir", "/home/agent/.bayma"],
+    env: [{ name: "POD_NAME", valueFrom: { fieldRef: { fieldPath: "metadata.name" } } }],
+    // Its own directory on its node, as a pool's template mounts it.
+    volumeMounts: [{ name: "attach", mountPath: "/attach", subPathExpr: "$(POD_NAME)", mountPropagation: "HostToContainer" }],
+  }],
+  volumes: [{ name: "attach", hostPath: { path: "/var/lib/alasio/attach", type: "DirectoryOrCreate" } }],
 };
 
 /** A stand-in for bayma's /status, answering what `status` says now, and the bearers it was asked with. */
@@ -124,7 +133,7 @@ async function environment(count: number, { gvisor = false, holdsStop = false } 
       // The pool's template, as its snapshots record it.
       // Its bayma holding its stop for a save, where it is told to, as a pool's of snapshotted sessions does.
       const spec = holdsStop
-        ? { terminationGracePeriodSeconds: 90, containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) }
+        ? { terminationGracePeriodSeconds: 90, volumes: BAYMA_SPEC.volumes, containers: BAYMA_SPEC.containers.map((container) => ({ ...container, args: [...container.args, "--stop-wait-ms", "60000"] })) }
         : BAYMA_SPEC;
       template = { metadata: { labels: { ...freeLabels(none) }, annotations: { "alasio.dev/session-template": "t-current" } }, spec: { ...spec, ...(gvisor ? { runtimeClassName: "gvisor" } : {}) } };
       yield* kube.create<V1Deployment>({ apiVersion: "apps/v1", kind: "Deployment", metadata: { name: none.name, namespace }, spec: { replicas: 0, selector: { matchLabels: { ...freeLabels(none) } }, template } });
@@ -662,10 +671,13 @@ test("a workspace released into its snapshot is restored from it as it is next b
     // Of the pool's template, its sandbox restored paused from the image its node's agent prepared, under the release that took it, on that node.
     assert.deepEqual([restored.metadata?.annotations?.["dev.gvisor.internal.restore.host-image-path"], restored.metadata?.annotations?.["dev.gvisor.internal.restore.paused"]], ["/var/cache/alasio/image", "true"]);
     assert.equal(restored.spec?.runtimeClassName, "gvisor-r1");
+    const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
     // Its init container, of its bayma's image, waits for its binding's token, written once its workspace is attached.
     const [waits] = restored.spec?.initContainers ?? [];
     assert.deepEqual([waits?.name, waits?.image, waits?.command], ["attach-wait", restored.spec?.containers[0]?.image, ["sh", "-c", "until [ -s /attach/token ]; do sleep 0.2; done"]]);
-    const plain = (value: unknown) => JSON.parse(JSON.stringify(value)) as unknown;
+    // Its own directory named by its volume's path, not a subpath, so its workspace, attached first, is bound into its containers with it.
+    assert.deepEqual(plain(restored.spec?.volumes?.find(({ name }) => name === "attach")), { name: "attach", hostPath: { path: `/var/lib/alasio/attach/${name}`, type: "DirectoryOrCreate" } });
+    for (const container of [waits, restored.spec?.containers[0]]) assert.deepEqual(plain(container?.volumeMounts), [{ name: "attach", mountPath: "/attach", mountPropagation: "HostToContainer" }]);
     assert.deepEqual(plain(restored.spec?.readinessGates), [{ conditionType: "alasio.dev/resumed" }]);
     assert.deepEqual(plain(restored.spec?.affinity?.nodeAffinity?.requiredDuringSchedulingIgnoredDuringExecution?.nodeSelectorTerms), [{ matchFields: [{ key: "metadata.name", operator: "In", values: ["node-a"] }] }]);
     // Bound from the first, and no pool's free pod, which its ReplicaSet would take for its own.

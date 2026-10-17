@@ -6,8 +6,10 @@
  */
 import { createHash } from "node:crypto";
 
-import type { V1Container } from "@kubernetes/client-node";
+import type { V1Container, V1PodSpec } from "@kubernetes/client-node";
 import { Schema } from "effect";
+
+import { ATTACH_ROOT } from "../node-agent/names.ts";
 
 /** The variable of the path of the gateway's configuration, a GatewayConfig as JSON. */
 export const GATEWAY_CONFIG_VARIABLE = "ALASIO_GATEWAY_CONFIG";
@@ -31,6 +33,37 @@ export function templateHash(template: object): string {
   return createHash("sha256").update(JSON.stringify(template, sorted)).digest("hex");
 }
 
+/** The volume of a pool's pod's own directory on its node, which its workspace is attached under (cli/src/manifests/sandbox-gateway.ts poolTemplate). */
+export const ATTACH_VOLUME = "attach";
+
+/**
+ * The spec `spec`, a pool's template's, of a restore's pod named `name`: its own directory on its
+ * node named by its volume's path, not by a subpath of the directory of every pod's. A subpath is
+ * bound into its container alone, without what is mounted beneath it, as kubelet binds one; a
+ * volume's path is bound with it, so the workspace attached before its sandbox is restored is
+ * there as the restore reopens the files it held open.
+ */
+export function ownDirectory(spec: V1PodSpec, name: string): V1PodSpec {
+  const unsubpathed = (container: V1Container): V1Container => ({
+    ...container,
+    ...(container.volumeMounts
+      ? {
+        volumeMounts: container.volumeMounts.map((mount) => {
+          if (mount.name !== ATTACH_VOLUME) return mount;
+          const { subPathExpr: _subPath, ...own } = mount;
+          return own;
+        }),
+      }
+      : {}),
+  });
+  return {
+    ...spec,
+    containers: spec.containers.map(unsubpathed),
+    ...(spec.initContainers ? { initContainers: spec.initContainers.map(unsubpathed) } : {}),
+    ...(spec.volumes ? { volumes: spec.volumes.map((volume) => (volume.name === ATTACH_VOLUME ? { name: ATTACH_VOLUME, hostPath: { path: `${ATTACH_ROOT}/${name}`, type: "DirectoryOrCreate" } } : volume)) } : {}),
+  };
+}
+
 /** The init container of a restore's pod: its name, and its resources. */
 export const ATTACH_WAIT = { name: "attach-wait", resources: { requests: { cpu: "10m", memory: "16Mi" }, limits: { memory: "32Mi" } } } as const;
 
@@ -41,7 +74,7 @@ export const ATTACH_WAIT = { name: "attach-wait", resources: { requests: { cpu: 
  * file it held open in it, as a restore reopens each before it resumes.
  */
 export function attachWait(bayma: V1Container): V1Container {
-  const attach = (bayma.volumeMounts ?? []).filter(({ name }) => name === "attach");
+  const attach = (bayma.volumeMounts ?? []).filter(({ name }) => name === ATTACH_VOLUME);
   const directory = attach[0]?.mountPath ?? "/attach";
   return {
     name: ATTACH_WAIT.name,
